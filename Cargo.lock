@@ -499,7 +499,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "doppler_indexer-rs"
+name = "doppler-indexer-rs"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
