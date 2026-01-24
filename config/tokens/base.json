@@ -1,0 +1,35 @@
+{
+    "Weth": {
+        "address": "0x4200000000000000000000000000000000000006"
+    },
+    "Usdc": {
+        "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    },
+    "Usdt": {
+        "address": "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
+    },
+    "Eurc": {
+        "address": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+        "pool": {
+            "type": "v4",
+            "address": "0xb18fad93e3c5a5f932d901f0c22c5639a832d6f29a4392fff3393fb734dd0720",
+            "quote_token": "Usdc"
+        }
+    },
+    "Fxh": {
+        "address": "0x5fc2843838e65eb0b5d33654628f446d54602791",
+        "pool": {
+            "type": "v3",
+            "address": "0xC3e7433ae4d929092F8dFf62F7E2f15f23bC3E63",
+            "quote_token": "Weth"
+        }
+    },
+    "Noice": {
+        "address": "0x9cb41fd9dc6891bae8187029461bfaadf6cc0c69",
+        "pool": {
+            "type": "v3",
+            "address": "0xeff7f8fe083d7a446717b992bf84391253e54789",
+            "quote_token": "Weth"
+        }
+    }
+}

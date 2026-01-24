@@ -1,0 +1,39 @@
+{
+    "chains": [
+        {
+            "name": "base",
+            "chain_id": 8453,
+            "rpc_url_env_var": "BASE_RPC_URL",            
+            "contracts": "contracts/base",
+            "tokens": "tokens/base.json"
+        }
+    ],
+    "raw_data_collection": {
+        "fields": {
+            "block_fields": [
+                "number",
+                "timestamp",
+                "transactions",
+                "uncles"
+            ],
+            "receipt_fields": [
+                "block_number",
+                "timestamp",
+                "transaction_hash",
+                "from",
+                "to",
+                "logs"
+            ],
+            "log_fields": [
+                "block_number",
+                "timestamp",
+                "transaction_hash",
+                "log_index",
+                "address",
+                "topics",
+                "data"
+            ]
+        },
+        "contract_logs_only": true        
+    }
+}

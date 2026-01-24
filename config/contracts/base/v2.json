@@ -1,0 +1,11 @@
+{
+    "UniswapV2Factory": {
+        "address": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6"
+    },
+    "UniswapV2Migrator": {
+        "address": "0x5F3bA43D44375286296Cb85F1EA2EBfa25dde731"
+    },
+    "NimCustomV2Migrator": {
+        "address": "0xf76b53f9bc94f531add7b980f119cf386ebf0cb8"
+    }
+}
