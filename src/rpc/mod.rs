@@ -1,5 +1,7 @@
 mod alchemy;
 mod rpc;
+mod unified;
 
 pub use alchemy::{AlchemyClient, AlchemyConfig, ComputeUnitCost};
 pub use rpc::{RpcClient, RpcClientConfig, RpcError};
+pub use unified::UnifiedRpcClient;
