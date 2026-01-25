@@ -1,3 +1,5 @@
+mod raw_data;
+mod rpc;
 mod types;
 
 use std::path::Path;

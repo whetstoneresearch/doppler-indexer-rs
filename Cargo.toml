@@ -5,6 +5,16 @@ edition = "2021"
 
 [dependencies]
 alloy-primitives = { version = "1.5.2", features = ["serde"] }
+alloy = { version = "1.0", features = ["full", "provider-http", "rpc-types"] }
 anyhow = "1.0.100"
+async-trait = "0.1"
+futures = "0.3"
+governor = "0.10"
+nonzero_ext = "0.3"
+rand = "0.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2.5"
