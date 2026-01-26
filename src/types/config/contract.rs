@@ -5,14 +5,14 @@ use alloy_primitives::{Address, U256};
 use serde::Deserialize;
 use crate::types::config::eth_call::EthCallConfig;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ContractConfig {
     pub address: AddressOrAddresses,
     pub start_block: Option<U256>,
-    pub calls: Option<EthCallConfig>
+    pub calls: Option<Vec<EthCallConfig>>
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum AddressOrAddresses {
     Single(Address),

@@ -16,7 +16,7 @@ pub struct ChainConfigRaw {
     pub tokens: TokensOrPath,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChainConfig {
     pub name: String,
     pub chain_id: u64,

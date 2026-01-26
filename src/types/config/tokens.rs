@@ -4,13 +4,13 @@ use std::path::Path;
 use alloy_primitives::{Address, FixedBytes};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenConfig {
     pub address: Address,
     pub pool: Option<PoolConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolType {
     V2,
@@ -18,14 +18,14 @@ pub enum PoolType {
     V4,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum AddressOrPoolId {
     PoolId(FixedBytes<32>),
     Address(Address),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
     #[serde(rename = "type")]
     pub pool_type: PoolType,
