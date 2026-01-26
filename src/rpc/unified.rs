@@ -1,5 +1,5 @@
-use alloy::primitives::BlockNumber;
-use alloy::rpc::types::{Block, BlockNumberOrTag};
+use alloy::primitives::{BlockNumber, B256};
+use alloy::rpc::types::{Block, BlockNumberOrTag, TransactionReceipt};
 
 use crate::rpc::alchemy::AlchemyClient;
 use crate::rpc::rpc::{RpcClient, RpcError};
@@ -51,6 +51,16 @@ impl UnifiedRpcClient {
         match self {
             Self::Standard(client) => client.get_blocks_batch(block_numbers, full_transactions).await,
             Self::Alchemy(client) => client.get_blocks_batch(block_numbers, full_transactions).await,
+        }
+    }
+
+    pub async fn get_transaction_receipts_batch(
+        &self,
+        hashes: Vec<B256>,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        match self {
+            Self::Standard(client) => client.get_transaction_receipts_batch(hashes).await,
+            Self::Alchemy(client) => client.get_transaction_receipts_batch(hashes).await,
         }
     }
 }
