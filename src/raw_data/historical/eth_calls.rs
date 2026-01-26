@@ -5,6 +5,7 @@ use std::sync::Arc;
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
+use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, UInt64Array};
@@ -18,6 +19,7 @@ use tokio::sync::mpsc::Receiver;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
+use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig, ParamError, ParamValue};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 #[derive(Debug, Error)]
@@ -33,6 +35,9 @@ pub enum EthCallCollectionError {
 
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+
+    #[error("Parameter error: {0}")]
+    Param(#[from] ParamError),
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +68,9 @@ struct BlockInfo {
 struct CallConfig {
     contract_name: String,
     address: Address,
-    function_selector: [u8; 4],
     function_name: String,
+    encoded_calldata: Bytes,
+    param_values: Vec<Vec<u8>>,
 }
 
 /// Result of an eth_call
@@ -74,6 +80,7 @@ struct CallResult {
     block_timestamp: u64,
     contract_address: [u8; 20],
     value_bytes: Vec<u8>,
+    param_values: Vec<Vec<u8>>,
 }
 
 pub async fn collect_eth_calls(
@@ -96,10 +103,14 @@ pub async fn collect_eth_calls(
         return Ok(());
     }
 
+    // Find max param count across all configs for schema
+    let max_params = call_configs.iter().map(|c| c.param_values.len()).max().unwrap_or(0);
+
     tracing::info!(
-        "Starting eth_call collection for chain {} with {} call configs",
+        "Starting eth_call collection for chain {} with {} call configs (max {} params)",
         chain.name,
-        call_configs.len()
+        call_configs.len(),
+        max_params
     );
 
     let existing_files = scan_existing_parquet_files(&output_dir);
@@ -133,6 +144,7 @@ pub async fn collect_eth_calls(
                     &output_dir,
                     &existing_files,
                     rpc_batch_size,
+                    max_params,
                 )
                 .await?;
             }
@@ -162,12 +174,39 @@ pub async fn collect_eth_calls(
             &output_dir,
             &existing_files,
             rpc_batch_size,
+            max_params,
         )
         .await?;
     }
 
     tracing::info!("Eth_call collection complete for chain {}", chain.name);
     Ok(())
+}
+
+/// Generate all combinations of parameter values (cartesian product)
+fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
+    if params.is_empty() {
+        return Ok(vec![vec![]]);
+    }
+
+    let mut result = vec![vec![]];
+
+    for param in params {
+        let mut new_result = Vec::new();
+        for existing in &result {
+            for value in &param.values {
+                let mut combo = existing.clone();
+                // Parse and encode the value
+                let dyn_val = param.param_type.parse_value(value)?;
+                let encoded = dyn_val.abi_encode();
+                combo.push((param.param_type.clone(), value.clone(), encoded));
+                new_result.push(combo);
+            }
+        }
+        result = new_result;
+    }
+
+    Ok(result)
 }
 
 fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallCollectionError> {
@@ -181,17 +220,41 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
 
         if let Some(calls) = &contract.calls {
             for call in calls {
-                // Parse function selector from function signature
-                // e.g., "totalSupply()" -> keccak256("totalSupply()")[0..4]
                 let selector = compute_function_selector(&call.function);
+                let function_name = call.function
+                    .split('(')
+                    .next()
+                    .unwrap_or(&call.function)
+                    .to_string();
+
+                // Generate all parameter combinations
+                let param_combinations = generate_param_combinations(&call.params)?;
 
                 for address in &addresses {
-                    configs.push(CallConfig {
-                        contract_name: contract_name.clone(),
-                        address: *address,
-                        function_selector: selector,
-                        function_name: call.function.split('(').next().unwrap_or(&call.function).to_string(),
-                    });
+                    for param_combo in &param_combinations {
+                        // Convert to DynSolValues for encoding
+                        let dyn_values: Vec<DynSolValue> = param_combo
+                            .iter()
+                            .map(|(param_type, value, _)| param_type.parse_value(value))
+                            .collect::<Result<_, _>>()?;
+
+                        // Encode full calldata
+                        let encoded_calldata = encode_call_with_params(selector, &dyn_values);
+
+                        // Store encoded params for parquet
+                        let param_values: Vec<Vec<u8>> = param_combo
+                            .iter()
+                            .map(|(_, _, encoded)| encoded.clone())
+                            .collect();
+
+                        configs.push(CallConfig {
+                            contract_name: contract_name.clone(),
+                            address: *address,
+                            function_name: function_name.clone(),
+                            encoded_calldata,
+                            param_values,
+                        });
+                    }
                 }
             }
         }
@@ -216,6 +279,7 @@ async fn process_range(
     output_dir: &Path,
     existing_files: &HashSet<String>,
     rpc_batch_size: usize,
+    max_params: usize,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -263,7 +327,7 @@ async fn process_range(
             for config in configs {
                 let tx = TransactionRequest::default()
                     .to(config.address)
-                    .input(Bytes::copy_from_slice(&config.function_selector).into());
+                    .input(config.encoded_calldata.clone().into());
                 let block_id = BlockId::Number(BlockNumberOrTag::Number(block.block_number));
                 pending_calls.push((tx, block_id, block, config));
             }
@@ -294,6 +358,7 @@ async fn process_range(
                             block_timestamp: block.timestamp,
                             contract_address: config.address.0 .0,
                             value_bytes: bytes.to_vec(),
+                            param_values: config.param_values.clone(),
                         });
                     }
                     Err(e) => {
@@ -309,6 +374,7 @@ async fn process_range(
                             block_timestamp: block.timestamp,
                             contract_address: config.address.0 .0,
                             value_bytes: Vec::new(),
+                            param_values: config.param_values.clone(),
                         });
                     }
                 }
@@ -319,13 +385,14 @@ async fn process_range(
             }
         }
 
-        all_results.sort_by_key(|r| (r.block_number, r.contract_address));
+        all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
         #[cfg(feature = "bench")]
         let write_start = Instant::now();
         write_results_to_parquet(
             &all_results,
             &output_dir.join(&file_name),
+            max_params,
         )?;
         #[cfg(feature = "bench")]
         {
@@ -365,20 +432,32 @@ fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     files
 }
 
-fn build_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
+fn build_schema(num_params: usize) -> Arc<Schema> {
+    let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
         Field::new("contract_address", DataType::FixedSizeBinary(20), false),
         Field::new("value", DataType::Binary, false),
-    ]))
+    ];
+
+    // Add param columns
+    for i in 0..num_params {
+        fields.push(Field::new(
+            &format!("param_{}", i),
+            DataType::Binary,
+            true, // nullable since not all calls have params
+        ));
+    }
+
+    Arc::new(Schema::new(fields))
 }
 
 fn write_results_to_parquet(
     results: &[CallResult],
     output_path: &Path,
+    num_params: usize,
 ) -> Result<(), EthCallCollectionError> {
-    let schema = build_schema();
+    let schema = build_schema(num_params);
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
     let arr: UInt64Array = results.iter().map(|r| Some(r.block_number)).collect();
@@ -397,6 +476,19 @@ fn write_results_to_parquet(
         .map(|r| Some(r.value_bytes.as_slice()))
         .collect();
     arrays.push(Arc::new(arr));
+
+    // Add param columns
+    for i in 0..num_params {
+        let arr: BinaryArray = results
+            .iter()
+            .map(|r| {
+                r.param_values
+                    .get(i)
+                    .map(|v| v.as_slice())
+            })
+            .collect();
+        arrays.push(Arc::new(arr));
+    }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 

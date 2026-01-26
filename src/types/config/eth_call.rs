@@ -1,14 +1,291 @@
+use alloy::dyn_abi::DynSolValue;
+use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ParamError {
+    #[error("Invalid address format: {0}")]
+    InvalidAddress(String),
+
+    #[error("Invalid number format: {0}")]
+    InvalidNumber(String),
+
+    #[error("Invalid hex format: {0}")]
+    InvalidHex(String),
+
+    #[error("Type mismatch: expected {expected}, got {got}")]
+    TypeMismatch { expected: String, got: String },
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EthCallConfig {
     pub function: String,
     pub output_type: EvmType,
+    #[serde(default)]
+    pub params: Vec<ParamConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ParamConfig {
+    #[serde(rename = "type")]
+    pub param_type: EvmType,
+    pub values: Vec<ParamValue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ParamValue {
+    String(String),
+    Number(u64),
+    Bool(bool),
+}
+
+impl ParamValue {
+    pub fn as_string(&self) -> Result<String, ParamError> {
+        match self {
+            ParamValue::String(s) => Ok(s.clone()),
+            ParamValue::Number(n) => Ok(n.to_string()),
+            ParamValue::Bool(b) => Ok(b.to_string()),
+        }
+    }
+
+    pub fn as_bool(&self) -> Result<bool, ParamError> {
+        match self {
+            ParamValue::Bool(b) => Ok(*b),
+            ParamValue::String(s) => match s.to_lowercase().as_str() {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(ParamError::TypeMismatch {
+                    expected: "bool".to_string(),
+                    got: s.clone(),
+                }),
+            },
+            ParamValue::Number(n) => Ok(*n != 0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvmType {
+    // Signed integers
     Int256,
-    Uint256
+    Int128,
+    Int64,
+    Int32,
+    Int8,
+    // Unsigned integers
+    Uint256,
+    Uint128,
+    Uint80,
+    Uint64,
+    Uint32,
+    Uint16,
+    Uint8,
+    // Other types
+    Address,
+    Bool,
+    Bytes32,
+    Bytes,
+    String,
+}
+
+impl EvmType {
+    /// Convert a ParamValue to a DynSolValue for ABI encoding
+    pub fn parse_value(&self, value: &ParamValue) -> Result<DynSolValue, ParamError> {
+        match self {
+            EvmType::Uint256 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 256))
+            }
+            EvmType::Uint128 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 128))
+            }
+            EvmType::Uint80 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 80))
+            }
+            EvmType::Uint64 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 64))
+            }
+            EvmType::Uint32 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 32))
+            }
+            EvmType::Uint16 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 16))
+            }
+            EvmType::Uint8 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 8))
+            }
+            EvmType::Int256 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 256))
+            }
+            EvmType::Int128 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 128))
+            }
+            EvmType::Int64 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 64))
+            }
+            EvmType::Int32 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 32))
+            }
+            EvmType::Int8 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 8))
+            }
+            EvmType::Address => {
+                let s = value.as_string()?;
+                let addr = s
+                    .parse::<Address>()
+                    .map_err(|_| ParamError::InvalidAddress(s))?;
+                Ok(DynSolValue::Address(addr))
+            }
+            EvmType::Bool => {
+                let b = value.as_bool()?;
+                Ok(DynSolValue::Bool(b))
+            }
+            EvmType::Bytes32 => {
+                let s = value.as_string()?;
+                let bytes = s
+                    .parse::<B256>()
+                    .map_err(|_| ParamError::InvalidHex(s))?;
+                Ok(DynSolValue::FixedBytes(bytes, 32))
+            }
+            EvmType::Bytes => {
+                let s = value.as_string()?;
+                let hex_str = s.strip_prefix("0x").unwrap_or(&s);
+                let bytes =
+                    hex::decode(hex_str).map_err(|_| ParamError::InvalidHex(s))?;
+                Ok(DynSolValue::Bytes(bytes))
+            }
+            EvmType::String => {
+                let s = value.as_string()?;
+                Ok(DynSolValue::String(s))
+            }
+        }
+    }
+}
+
+fn parse_uint256(s: &str) -> Result<U256, ParamError> {
+    let s = s.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        U256::from_str_radix(&s[2..], 16).map_err(|_| ParamError::InvalidNumber(s.to_string()))
+    } else {
+        U256::from_str_radix(s, 10).map_err(|_| ParamError::InvalidNumber(s.to_string()))
+    }
+}
+
+fn parse_int256(s: &str) -> Result<I256, ParamError> {
+    let s = s.trim();
+    let is_negative = s.starts_with('-');
+    let s = if is_negative { &s[1..] } else { s };
+
+    let abs_val = parse_uint256(s)?;
+
+    if is_negative {
+        // Convert to negative: -x = ~x + 1 in two's complement
+        // For I256, we use try_from and negate
+        Ok(-I256::try_from(abs_val).map_err(|_| ParamError::InvalidNumber(s.to_string()))?)
+    } else {
+        I256::try_from(abs_val).map_err(|_| ParamError::InvalidNumber(s.to_string()))
+    }
+}
+
+/// Encode function call with parameters
+/// The function signature should be like "balanceOf(address)" or "transfer(address,uint256)"
+pub fn encode_call_with_params(
+    function_selector: [u8; 4],
+    params: &[DynSolValue],
+) -> Bytes {
+    if params.is_empty() {
+        return Bytes::copy_from_slice(&function_selector);
+    }
+
+    // ABI encode the parameters
+    let encoded_params = DynSolValue::Tuple(params.to_vec()).abi_encode_params();
+
+    // Concatenate selector + encoded params
+    let mut calldata = Vec::with_capacity(4 + encoded_params.len());
+    calldata.extend_from_slice(&function_selector);
+    calldata.extend_from_slice(&encoded_params);
+
+    Bytes::from(calldata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_address() {
+        let value = ParamValue::String("0x1234567890abcdef1234567890abcdef12345678".to_string());
+        let result = EvmType::Address.parse_value(&value).unwrap();
+        assert!(matches!(result, DynSolValue::Address(_)));
+    }
+
+    #[test]
+    fn test_parse_uint256() {
+        let value = ParamValue::String("1000000000000000000".to_string());
+        let result = EvmType::Uint256.parse_value(&value).unwrap();
+        assert!(matches!(result, DynSolValue::Uint(_, 256)));
+    }
+
+    #[test]
+    fn test_parse_uint256_hex() {
+        let value = ParamValue::String("0xde0b6b3a7640000".to_string());
+        let result = EvmType::Uint256.parse_value(&value).unwrap();
+        if let DynSolValue::Uint(v, _) = result {
+            assert_eq!(v, U256::from(1000000000000000000u64));
+        } else {
+            panic!("Expected Uint");
+        }
+    }
+
+    #[test]
+    fn test_parse_bool() {
+        let value = ParamValue::Bool(true);
+        let result = EvmType::Bool.parse_value(&value).unwrap();
+        assert!(matches!(result, DynSolValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_encode_call_no_params() {
+        let selector = [0x18, 0x16, 0x0d, 0xdd]; // totalSupply()
+        let result = encode_call_with_params(selector, &[]);
+        assert_eq!(result.len(), 4);
+        assert_eq!(&result[..], &selector);
+    }
+
+    #[test]
+    fn test_encode_call_with_address() {
+        let selector = [0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
+        let addr = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+        let params = vec![DynSolValue::Address(addr)];
+        let result = encode_call_with_params(selector, &params);
+        assert_eq!(result.len(), 4 + 32); // selector + padded address
+    }
 }
