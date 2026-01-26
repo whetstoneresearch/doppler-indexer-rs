@@ -1,31 +1,23 @@
-use alloy::primitives::{BlockNumber, B256};
-use alloy::rpc::types::{Block, BlockNumberOrTag, TransactionReceipt};
+use alloy::primitives::{BlockNumber, Bytes, B256};
+use alloy::rpc::types::{Block, BlockId, BlockNumberOrTag, TransactionReceipt};
 
 use crate::rpc::alchemy::AlchemyClient;
 use crate::rpc::rpc::{RpcClient, RpcError};
 
-/// Unified RPC client that automatically selects between standard RPC and Alchemy
-/// based on the URL. Uses Alchemy's compute unit rate limiting when the URL
-/// contains "alchemy".
 pub enum UnifiedRpcClient {
     Standard(RpcClient),
     Alchemy(AlchemyClient),
 }
 
-impl UnifiedRpcClient {
-    /// Creates a new UnifiedRpcClient from a URL string.
-    /// Automatically detects Alchemy URLs and uses compute unit rate limiting.
+impl UnifiedRpcClient {    
     pub fn from_url(url: &str) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
-            // Default 330 CU/s for Alchemy free tier
             Ok(Self::Alchemy(AlchemyClient::from_url(url, 330)?))
         } else {
             Ok(Self::Standard(RpcClient::from_url(url)?))
         }
     }
 
-    /// Creates a new UnifiedRpcClient from a URL with custom Alchemy compute units per second.
-    /// Falls back to standard RPC if URL doesn't contain "alchemy".
     pub fn from_url_with_alchemy_cu(url: &str, compute_units_per_second: u32) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
             Ok(Self::Alchemy(AlchemyClient::from_url(url, compute_units_per_second)?))
@@ -34,7 +26,6 @@ impl UnifiedRpcClient {
         }
     }
 
-    /// Gets the current block number.
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
         match self {
             Self::Standard(client) => client.get_block_number().await,
@@ -42,7 +33,6 @@ impl UnifiedRpcClient {
         }
     }
 
-    /// Gets multiple blocks in a batch.
     pub async fn get_blocks_batch(
         &self,
         block_numbers: Vec<BlockNumberOrTag>,
@@ -61,6 +51,16 @@ impl UnifiedRpcClient {
         match self {
             Self::Standard(client) => client.get_transaction_receipts_batch(hashes).await,
             Self::Alchemy(client) => client.get_transaction_receipts_batch(hashes).await,
+        }
+    }
+
+    pub async fn call_batch(
+        &self,
+        calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
+    ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError> {
+        match self {
+            Self::Standard(client) => client.call_batch(calls).await,
+            Self::Alchemy(client) => client.call_batch(calls).await,
         }
     }
 }

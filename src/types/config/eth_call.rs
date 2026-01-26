@@ -6,7 +6,7 @@ pub struct EthCallConfig {
     pub output_type: EvmType,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvmType {
     Int256,

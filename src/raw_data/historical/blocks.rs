@@ -99,6 +99,7 @@ pub async fn collect_blocks(
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
     tx_sender: Option<Sender<(u64, u64, Vec<B256>)>>,
+    eth_call_sender: Option<Sender<(u64, u64)>>,
 ) -> Result<(), BlockCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/blocks", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -168,11 +169,19 @@ pub async fn collect_blocks(
                     let (records, tx_data) =
                         process_blocks_minimal(&blocks, batch_start, fields.clone())?;
 
-                    // Send tx data to receipts channel immediately after each RPC batch
                     if let Some(sender) = &tx_sender {
-                        for (block_number, timestamp, tx_hashes) in tx_data {
+                        for (block_number, timestamp, tx_hashes) in &tx_data {
                             sender
-                                .send((block_number, timestamp, tx_hashes))
+                                .send((*block_number, *timestamp, tx_hashes.clone()))
+                                .await
+                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                        }
+                    }
+
+                    if let Some(sender) = &eth_call_sender {
+                        for (block_number, timestamp, _) in &tx_data {
+                            sender
+                                .send((*block_number, *timestamp))
                                 .await
                                 .map_err(|_| BlockCollectionError::ChannelSend)?;
                         }
@@ -217,11 +226,19 @@ pub async fn collect_blocks(
                     let process_start = Instant::now();
                     let (records, tx_data) = process_blocks_full(&blocks, batch_start)?;
 
-                    // Send tx data to receipts channel immediately after each RPC batch
                     if let Some(sender) = &tx_sender {
-                        for (block_number, timestamp, tx_hashes) in tx_data {
+                        for (block_number, timestamp, tx_hashes) in &tx_data {
                             sender
-                                .send((block_number, timestamp, tx_hashes))
+                                .send((*block_number, *timestamp, tx_hashes.clone()))
+                                .await
+                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                        }
+                    }
+
+                    if let Some(sender) = &eth_call_sender {
+                        for (block_number, timestamp, _) in &tx_data {
+                            sender
+                                .send((*block_number, *timestamp))
                                 .await
                                 .map_err(|_| BlockCollectionError::ChannelSend)?;
                         }

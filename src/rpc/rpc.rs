@@ -345,6 +345,43 @@ impl RpcClient {
 
         Ok(all_results)
     }
+
+    pub async fn call_batch(
+        &self,
+        calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
+    ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError> {
+        if !self.config.batching_enabled {
+            let mut results = Vec::with_capacity(calls.len());
+            for (tx, block) in calls {
+                results.push(self.call(&tx, Some(block)).await);
+            }
+            return Ok(results);
+        }
+
+        let mut all_results = Vec::with_capacity(calls.len());
+
+        for chunk in calls.chunks(self.config.max_batch_size) {
+            self.wait_for_rate_limit().await;
+
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|(tx, block)| async move {
+                    self.provider
+                        .call(tx.clone())
+                        .block(*block)
+                        .await
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+
+            for result in results {
+                all_results.push(result.map_err(|e| RpcError::ProviderError(e.to_string())));
+            }
+        }
+
+        Ok(all_results)
+    }
 }
 
 impl std::fmt::Debug for RpcClient {
