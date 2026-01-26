@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "bench")]
+use std::time::Instant;
 
 use alloy::primitives::B256;
 use alloy::rpc::types::{Block, BlockNumberOrTag};
@@ -138,7 +140,12 @@ pub async fn collect_blocks(
     for range in ranges {
         tracing::info!("Fetching blocks {}-{}", range.start, range.end - 1);
 
-        match block_fields {
+        #[cfg(feature = "bench")]
+        let mut rpc_time = std::time::Duration::ZERO;
+        #[cfg(feature = "bench")]
+        let mut process_time = std::time::Duration::ZERO;
+
+        let record_count = match block_fields {
             Some(fields) => {
                 let mut all_records = Vec::with_capacity((range.end - range.start) as usize);
 
@@ -148,7 +155,16 @@ pub async fn collect_blocks(
                         .map(BlockNumberOrTag::Number)
                         .collect();
 
+                    #[cfg(feature = "bench")]
+                    let rpc_start = Instant::now();
                     let blocks = client.get_blocks_batch(block_numbers, false).await?;
+                    #[cfg(feature = "bench")]
+                    {
+                        rpc_time += rpc_start.elapsed();
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let process_start = Instant::now();
                     let (records, tx_data) =
                         process_blocks_minimal(&blocks, batch_start, fields.clone())?;
 
@@ -163,9 +179,22 @@ pub async fn collect_blocks(
                     }
 
                     all_records.extend(records);
+                    #[cfg(feature = "bench")]
+                    {
+                        process_time += process_start.elapsed();
+                    }
                 }
 
+                let count = all_records.len();
+                #[cfg(feature = "bench")]
+                let write_start = Instant::now();
                 write_minimal_blocks_to_parquet(&all_records, &schema, fields, &output_dir.join(range.file_name()))?;
+                #[cfg(feature = "bench")]
+                {
+                    let write_time = write_start.elapsed();
+                    crate::bench::record("blocks", range.start, range.end, count, rpc_time, process_time, write_time);
+                }
+                count
             }
             None => {
                 let mut all_records = Vec::with_capacity((range.end - range.start) as usize);
@@ -176,7 +205,16 @@ pub async fn collect_blocks(
                         .map(BlockNumberOrTag::Number)
                         .collect();
 
+                    #[cfg(feature = "bench")]
+                    let rpc_start = Instant::now();
                     let blocks = client.get_blocks_batch(block_numbers, false).await?;
+                    #[cfg(feature = "bench")]
+                    {
+                        rpc_time += rpc_start.elapsed();
+                    }
+
+                    #[cfg(feature = "bench")]
+                    let process_start = Instant::now();
                     let (records, tx_data) = process_blocks_full(&blocks, batch_start)?;
 
                     // Send tx data to receipts channel immediately after each RPC batch
@@ -190,15 +228,28 @@ pub async fn collect_blocks(
                     }
 
                     all_records.extend(records);
+                    #[cfg(feature = "bench")]
+                    {
+                        process_time += process_start.elapsed();
+                    }
                 }
 
+                let count = all_records.len();
+                #[cfg(feature = "bench")]
+                let write_start = Instant::now();
                 write_full_blocks_to_parquet(&all_records, &schema, &output_dir.join(range.file_name()))?;
+                #[cfg(feature = "bench")]
+                {
+                    let write_time = write_start.elapsed();
+                    crate::bench::record("blocks", range.start, range.end, count, rpc_time, process_time, write_time);
+                }
+                count
             }
-        }
+        };
 
         tracing::info!(
             "Wrote {} blocks to {}",
-            range.end - range.start,
+            record_count,
             output_dir.join(range.file_name()).display()
         );
     }

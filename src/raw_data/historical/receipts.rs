@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "bench")]
+use std::time::Instant;
 
 use alloy::primitives::B256;
 use alloy::rpc::types::Log;
@@ -241,10 +243,24 @@ async fn process_range(
     let mut all_minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut all_full_records: Vec<FullReceiptRecord> = Vec::new();
 
+    #[cfg(feature = "bench")]
+    let mut rpc_time = std::time::Duration::ZERO;
+    #[cfg(feature = "bench")]
+    let mut process_time = std::time::Duration::ZERO;
+
     for chunk in tx_block_info.chunks(rpc_batch_size) {
         let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
-        let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
 
+        #[cfg(feature = "bench")]
+        let rpc_start = Instant::now();
+        let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
+        #[cfg(feature = "bench")]
+        {
+            rpc_time += rpc_start.elapsed();
+        }
+
+        #[cfg(feature = "bench")]
+        let process_start = Instant::now();
         let mut batch_logs: Vec<LogData> = Vec::new();
 
         match receipt_fields {
@@ -267,9 +283,15 @@ async fn process_range(
                     .map_err(|_| ReceiptCollectionError::ChannelSend)?;
             }
         }
+        #[cfg(feature = "bench")]
+        {
+            process_time += process_start.elapsed();
+        }
     }
 
     // Write all accumulated records to parquet
+    #[cfg(feature = "bench")]
+    let write_start = Instant::now();
     match receipt_fields {
         Some(fields) => {
             write_minimal_receipts_to_parquet(&all_minimal_records, schema, fields, &output_dir.join(range.file_name()))?;
@@ -284,6 +306,12 @@ async fn process_range(
     } else {
         all_full_records.len()
     };
+
+    #[cfg(feature = "bench")]
+    {
+        let write_time = write_start.elapsed();
+        crate::bench::record("receipts", range.start, range.end, total_receipts, rpc_time, process_time, write_time);
+    }
 
     tracing::info!(
         "Wrote {} receipts to {}",

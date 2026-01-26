@@ -1,3 +1,5 @@
+#[cfg(feature = "bench")]
+mod bench;
 mod raw_data;
 mod rpc;
 mod types;
@@ -24,6 +26,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
+
+    #[cfg(feature = "bench")]
+    {
+        std::fs::create_dir_all("data")?;
+        bench::init(Path::new("data/bench.csv"))?;
+        tracing::info!("Benchmarking enabled, writing to data/bench.csv");
+    }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
