@@ -3,6 +3,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawDataCollectionConfig {
     pub parquet_block_range: Option<u32>,
+    pub rpc_batch_size: Option<u32>,
     pub fields: FieldsConfig,
     pub contract_logs_only: Option<bool>,
 }
