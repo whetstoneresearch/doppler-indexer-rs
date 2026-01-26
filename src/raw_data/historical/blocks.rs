@@ -133,31 +133,72 @@ pub async fn collect_blocks(
 
     let block_fields = &raw_data_config.fields.block_fields;
     let schema = build_block_schema(block_fields);
+    let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as u64;
 
     for range in ranges {
         tracing::info!("Fetching blocks {}-{}", range.start, range.end - 1);
 
-        let block_numbers: Vec<BlockNumberOrTag> = (range.start..range.end)
-            .map(BlockNumberOrTag::Number)
-            .collect();
-
-        let blocks = client.get_blocks_batch(block_numbers, false).await?;
-
         match block_fields {
             Some(fields) => {
-                let records =
-                    process_blocks_minimal(&blocks, &range, &tx_sender, fields.clone()).await?;
-                write_minimal_blocks_to_parquet(&records, &schema, fields, &output_dir.join(range.file_name()))?;
+                let mut all_records = Vec::with_capacity((range.end - range.start) as usize);
+
+                for batch_start in (range.start..range.end).step_by(rpc_batch_size as usize) {
+                    let batch_end = std::cmp::min(batch_start + rpc_batch_size, range.end);
+                    let block_numbers: Vec<BlockNumberOrTag> = (batch_start..batch_end)
+                        .map(BlockNumberOrTag::Number)
+                        .collect();
+
+                    let blocks = client.get_blocks_batch(block_numbers, false).await?;
+                    let (records, tx_data) =
+                        process_blocks_minimal(&blocks, batch_start, fields.clone())?;
+
+                    // Send tx data to receipts channel immediately after each RPC batch
+                    if let Some(sender) = &tx_sender {
+                        for (block_number, timestamp, tx_hashes) in tx_data {
+                            sender
+                                .send((block_number, timestamp, tx_hashes))
+                                .await
+                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                        }
+                    }
+
+                    all_records.extend(records);
+                }
+
+                write_minimal_blocks_to_parquet(&all_records, &schema, fields, &output_dir.join(range.file_name()))?;
             }
             None => {
-                let records = process_blocks_full(&blocks, &range, &tx_sender).await?;
-                write_full_blocks_to_parquet(&records, &schema, &output_dir.join(range.file_name()))?;
+                let mut all_records = Vec::with_capacity((range.end - range.start) as usize);
+
+                for batch_start in (range.start..range.end).step_by(rpc_batch_size as usize) {
+                    let batch_end = std::cmp::min(batch_start + rpc_batch_size, range.end);
+                    let block_numbers: Vec<BlockNumberOrTag> = (batch_start..batch_end)
+                        .map(BlockNumberOrTag::Number)
+                        .collect();
+
+                    let blocks = client.get_blocks_batch(block_numbers, false).await?;
+                    let (records, tx_data) = process_blocks_full(&blocks, batch_start)?;
+
+                    // Send tx data to receipts channel immediately after each RPC batch
+                    if let Some(sender) = &tx_sender {
+                        for (block_number, timestamp, tx_hashes) in tx_data {
+                            sender
+                                .send((block_number, timestamp, tx_hashes))
+                                .await
+                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                        }
+                    }
+
+                    all_records.extend(records);
+                }
+
+                write_full_blocks_to_parquet(&all_records, &schema, &output_dir.join(range.file_name()))?;
             }
         }
 
         tracing::info!(
             "Wrote {} blocks to {}",
-            blocks.len(),
+            range.end - range.start,
             output_dir.join(range.file_name()).display()
         );
     }
@@ -165,16 +206,16 @@ pub async fn collect_blocks(
     Ok(())
 }
 
-async fn process_blocks_minimal(
+fn process_blocks_minimal(
     blocks: &[Option<Block>],
-    range: &BlockRange,
-    tx_sender: &Option<Sender<(u64, u64, Vec<B256>)>>,
+    start_block: u64,
     _fields: Vec<BlockField>,
-) -> Result<Vec<MinimalBlockRecord>, BlockCollectionError> {
+) -> Result<(Vec<MinimalBlockRecord>, Vec<(u64, u64, Vec<B256>)>), BlockCollectionError> {
     let mut records = Vec::with_capacity(blocks.len());
+    let mut tx_data = Vec::with_capacity(blocks.len());
 
     for (i, block_opt) in blocks.iter().enumerate() {
-        let block_number = range.start + i as u64;
+        let block_number = start_block + i as u64;
         let block = block_opt
             .as_ref()
             .ok_or(BlockCollectionError::BlockNotFound(block_number))?;
@@ -182,12 +223,7 @@ async fn process_blocks_minimal(
         let tx_hashes: Vec<B256> = block.transactions.hashes().collect();
         let timestamp = block.header.timestamp;
 
-        if let Some(sender) = tx_sender {
-            sender
-                .send((block_number, timestamp, tx_hashes.clone()))
-                .await
-                .map_err(|_| BlockCollectionError::ChannelSend)?;
-        }
+        tx_data.push((block_number, timestamp, tx_hashes.clone()));
 
         records.push(MinimalBlockRecord {
             number: block_number,
@@ -198,18 +234,18 @@ async fn process_blocks_minimal(
         });
     }
 
-    Ok(records)
+    Ok((records, tx_data))
 }
 
-async fn process_blocks_full(
+fn process_blocks_full(
     blocks: &[Option<Block>],
-    range: &BlockRange,
-    tx_sender: &Option<Sender<(u64, u64, Vec<B256>)>>,
-) -> Result<Vec<FullBlockRecord>, BlockCollectionError> {
+    start_block: u64,
+) -> Result<(Vec<FullBlockRecord>, Vec<(u64, u64, Vec<B256>)>), BlockCollectionError> {
     let mut records = Vec::with_capacity(blocks.len());
+    let mut tx_data = Vec::with_capacity(blocks.len());
 
     for (i, block_opt) in blocks.iter().enumerate() {
-        let block_number = range.start + i as u64;
+        let block_number = start_block + i as u64;
         let block = block_opt
             .as_ref()
             .ok_or(BlockCollectionError::BlockNotFound(block_number))?;
@@ -217,12 +253,7 @@ async fn process_blocks_full(
         let tx_hashes: Vec<B256> = block.transactions.hashes().collect();
         let timestamp = block.header.timestamp;
 
-        if let Some(sender) = tx_sender {
-            sender
-                .send((block_number, timestamp, tx_hashes.clone()))
-                .await
-                .map_err(|_| BlockCollectionError::ChannelSend)?;
-        }
+        tx_data.push((block_number, timestamp, tx_hashes.clone()));
 
         let header = &block.header;
         let inner = &header.inner;
@@ -256,7 +287,7 @@ async fn process_blocks_full(
         });
     }
 
-    Ok(records)
+    Ok((records, tx_data))
 }
 
 fn compute_ranges_to_fetch(
