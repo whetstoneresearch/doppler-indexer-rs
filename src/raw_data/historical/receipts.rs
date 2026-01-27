@@ -76,7 +76,6 @@ struct MinimalReceiptRecord {
     to_address: Option<[u8; 20]>,
 }
 
-/// Log data to be sent to the logs collector
 #[derive(Debug, Clone)]
 pub struct LogData {
     pub block_number: u64,
@@ -88,7 +87,6 @@ pub struct LogData {
     pub data: Vec<u8>,
 }
 
-/// Block info received from blocks collector
 #[derive(Debug)]
 struct BlockInfo {
     block_number: u64,
@@ -102,6 +100,7 @@ pub async fn collect_receipts(
     raw_data_config: &RawDataCollectionConfig,
     mut block_rx: Receiver<(u64, u64, Vec<B256>)>,
     log_tx: Option<Sender<Vec<LogData>>>,
+    factory_log_tx: Option<Sender<Vec<LogData>>>,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -111,10 +110,8 @@ pub async fn collect_receipts(
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
 
-    // Track which ranges we've already written
     let existing_files = scan_existing_parquet_files(&output_dir);
 
-    // Accumulate block info by range
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
 
     tracing::info!("Starting receipt collection for chain {}", chain.name);
@@ -131,7 +128,6 @@ pub async fn collect_receipts(
                 tx_hashes,
             });
 
-        // Check if we have a complete range (all blocks from range_start to range_start + range_size - 1)
         if let Some(blocks) = range_data.get(&range_start) {
             let expected_blocks: HashSet<u64> =
                 (range_start..range_start + range_size).collect();
@@ -144,7 +140,6 @@ pub async fn collect_receipts(
                     end: range_start + range_size,
                 };
 
-                // Skip if already exists
                 if existing_files.contains(&range.file_name()) {
                     tracing::info!(
                         "Skipping receipts for blocks {}-{} (already exists)",
@@ -164,6 +159,7 @@ pub async fn collect_receipts(
                     &schema,
                     &output_dir,
                     &log_tx,
+                    &factory_log_tx,
                     rpc_batch_size,
                 )
                 .await?;
@@ -171,7 +167,6 @@ pub async fn collect_receipts(
         }
     }
 
-    // Process any remaining partial ranges
     for (range_start, blocks) in range_data {
         if blocks.is_empty() {
             continue;
@@ -200,6 +195,7 @@ pub async fn collect_receipts(
             &schema,
             &output_dir,
             &log_tx,
+            &factory_log_tx,
             rpc_batch_size,
         )
         .await?;
@@ -217,11 +213,11 @@ async fn process_range(
     schema: &Arc<Schema>,
     output_dir: &Path,
     log_tx: &Option<Sender<Vec<LogData>>>,
+    factory_log_tx: &Option<Sender<Vec<LogData>>>,
     rpc_batch_size: usize,
 ) -> Result<(), ReceiptCollectionError> {
     tracing::info!("Fetching receipts for blocks {}-{}", range.start, range.end - 1);
 
-    // Collect all tx hashes with their block info
     let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
     for block in &blocks {
         for tx_hash in &block.tx_hashes {
@@ -238,8 +234,6 @@ async fn process_range(
         return Ok(());
     }
 
-    // Fetch receipts in smaller RPC batches, sending logs after each batch
-    // This allows overlapping log collection with receipt fetching
     let mut all_minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut all_full_records: Vec<FullReceiptRecord> = Vec::new();
 
@@ -274,9 +268,15 @@ async fn process_range(
             }
         }
 
-        // Send logs to logs collector immediately after each RPC batch
-        if let Some(sender) = log_tx {
-            if !batch_logs.is_empty() {
+        if !batch_logs.is_empty() {
+            if let Some(sender) = factory_log_tx {
+                sender
+                    .send(batch_logs.clone())
+                    .await
+                    .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+            }
+
+            if let Some(sender) = log_tx {
                 sender
                     .send(batch_logs)
                     .await
@@ -289,7 +289,6 @@ async fn process_range(
         }
     }
 
-    // Write all accumulated records to parquet
     #[cfg(feature = "bench")]
     let write_start = Instant::now();
     match receipt_fields {
@@ -335,7 +334,6 @@ fn process_receipts_minimal(
             .as_ref()
             .ok_or(ReceiptCollectionError::ReceiptNotFound(tx_hash))?;
 
-        // Extract logs
         extract_logs(&receipt.inner.logs(), block_number, timestamp, tx_hash, all_logs);
 
         records.push(MinimalReceiptRecord {
@@ -366,7 +364,6 @@ fn process_receipts_full(
         let inner = &receipt.inner;
         let logs = inner.logs();
 
-        // Extract logs
         extract_logs(&logs, block_number, timestamp, tx_hash, all_logs);
 
         records.push(FullReceiptRecord {
@@ -520,7 +517,6 @@ fn write_minimal_receipts_to_parquet(
                 arrays.push(Arc::new(arr));
             }
             ReceiptField::Logs => {
-                // For minimal records, we don't have log_count - use 0 as placeholder
                 let arr: UInt32Array = records.iter().map(|_| Some(0u32)).collect();
                 arrays.push(Arc::new(arr));
             }

@@ -7,12 +7,16 @@ The log collection module receives logs extracted from transaction receipts and 
 ```rust
 use doppler_indexer_rs::raw_data::historical::logs::collect_logs;
 use doppler_indexer_rs::raw_data::historical::receipts::LogData;
+use doppler_indexer_rs::raw_data::historical::factories::FactoryAddressData;
 use tokio::sync::mpsc;
 
 // Channel from receipt collector
 let (log_tx, log_rx) = mpsc::channel(1000);
 
-collect_logs(&chain_config, &raw_data_config, log_rx).await?;
+// Optional factory channel (for contract_logs_only filtering)
+let factory_rx: Option<Receiver<FactoryAddressData>> = None;
+
+collect_logs(&chain_config, &raw_data_config, log_rx, factory_rx).await?;
 ```
 
 ## Function Signature
@@ -22,6 +26,7 @@ pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     log_rx: Receiver<Vec<LogData>>,
+    factory_rx: Option<Receiver<FactoryAddressData>>,
 ) -> Result<(), LogCollectionError>
 ```
 
@@ -29,9 +34,10 @@ pub async fn collect_logs(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `chain` | `&ChainConfig` | Chain configuration with name |
+| `chain` | `&ChainConfig` | Chain configuration with name and contracts |
 | `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
 | `log_rx` | `Receiver<Vec<LogData>>` | Channel receiving logs from receipt collector |
+| `factory_rx` | `Option<Receiver<FactoryAddressData>>` | Optional channel receiving factory addresses for filtering |
 
 ### Input Channel Message Format
 
@@ -60,8 +66,45 @@ data/raw/ethereum/logs/
 
 1. Receives batches of logs from receipt collector
 2. Groups logs by block range
-3. Writes complete ranges to Parquet files
-4. Processes remaining partial ranges when channel closes
+3. If `contract_logs_only` is enabled:
+   - Waits for factory addresses from the factory collector (if factories are configured)
+   - Filters logs to only include those from configured contracts or factory-created contracts
+4. Writes complete ranges to Parquet files
+5. Processes remaining partial ranges when channel closes
+
+## Contract Logs Only Filtering
+
+When `contract_logs_only: true` is set in the raw_data_collection config, the log collector filters logs to only include those from:
+
+1. **Configured contract addresses** - Any address listed in the contracts config
+2. **Factory-created contract addresses** - Addresses discovered by the factory collector
+
+This significantly reduces storage and processing overhead when you're only interested in specific contracts.
+
+### Configuration
+
+```json
+{
+  "raw_data_collection": {
+    "parquet_block_range": 1000,
+    "contract_logs_only": true,
+    "fields": {
+      "log_fields": ["block_number", "timestamp", "address", "topics", "data"]
+    }
+  }
+}
+```
+
+### Factory Integration
+
+When factories are configured and `contract_logs_only` is enabled:
+
+1. The log collector receives factory addresses from the factory collector
+2. For each block range, it waits for factory address data before filtering and writing
+3. Logs from newly discovered factory contracts are included in the output
+4. This allows tracking events from dynamically created contracts without knowing their addresses in advance
+
+See [Factory Collection](./FACTORY_COLLECTION.md) for more details on factory address discovery.
 
 ## Resumability
 
@@ -109,6 +152,8 @@ When no fields are specified, all log fields are stored:
 
 ## Data Flow
 
+### Basic Flow (without factories)
+
 ```
 ┌─────────────┐                              ┌──────────────────┐                              ┌─────────────┐
 │   blocks.rs │ ───(block info)────────────▶ │   receipts.rs    │ ───(Vec<LogData>)──────────▶ │   logs.rs   │
@@ -116,6 +161,35 @@ When no fields are specified, all log fields are stored:
                                              │  extracts logs   │                              │ writes logs │
                                              │  from receipts   │                              │ to parquet  │
                                              └──────────────────┘                              └─────────────┘
+```
+
+### With Factory Filtering (contract_logs_only: true)
+
+```
+┌─────────────┐                              ┌──────────────────┐
+│   blocks.rs │ ───(block info)────────────▶ │   receipts.rs    │
+└─────────────┘                              │                  │
+                                             │  extracts logs   │
+                                             │  from receipts   │
+                                             └────────┬─────────┘
+                                                      │
+                                     ┌────────────────┼────────────────┐
+                                     │                │                │
+                                     ▼                ▼                │
+                              ┌─────────────┐  ┌─────────────┐         │
+                              │   logs.rs   │  │ factories.rs│         │
+                              │             │  │             │         │
+                              │ waits for   │  │  extracts   │         │
+                              │ factory     │◀─│  factory    │         │
+                              │ addresses   │  │  addresses  │         │
+                              └─────────────┘  └─────────────┘         │
+                                     │                                 │
+                                     ▼                                 │
+                              ┌─────────────┐                          │
+                              │  filtered   │                          │
+                              │  parquet    │                          │
+                              │  output     │                          │
+                              └─────────────┘                          │
 ```
 
 ## Topics Structure

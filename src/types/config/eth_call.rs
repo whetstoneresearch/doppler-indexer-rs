@@ -69,13 +69,11 @@ impl ParamValue {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EvmType {
-    // Signed integers
     Int256,
     Int128,
     Int64,
     Int32,
     Int8,
-    // Unsigned integers
     Uint256,
     Uint128,
     Uint80,
@@ -83,7 +81,6 @@ pub enum EvmType {
     Uint32,
     Uint16,
     Uint8,
-    // Other types
     Address,
     Bool,
     Bytes32,
@@ -92,7 +89,6 @@ pub enum EvmType {
 }
 
 impl EvmType {
-    /// Convert a ParamValue to a DynSolValue for ABI encoding
     pub fn parse_value(&self, value: &ParamValue) -> Result<DynSolValue, ParamError> {
         match self {
             EvmType::Uint256 => {
@@ -205,16 +201,12 @@ fn parse_int256(s: &str) -> Result<I256, ParamError> {
     let abs_val = parse_uint256(s)?;
 
     if is_negative {
-        // Convert to negative: -x = ~x + 1 in two's complement
-        // For I256, we use try_from and negate
         Ok(-I256::try_from(abs_val).map_err(|_| ParamError::InvalidNumber(s.to_string()))?)
     } else {
         I256::try_from(abs_val).map_err(|_| ParamError::InvalidNumber(s.to_string()))
     }
 }
 
-/// Encode function call with parameters
-/// The function signature should be like "balanceOf(address)" or "transfer(address,uint256)"
 pub fn encode_call_with_params(
     function_selector: [u8; 4],
     params: &[DynSolValue],
@@ -223,10 +215,8 @@ pub fn encode_call_with_params(
         return Bytes::copy_from_slice(&function_selector);
     }
 
-    // ABI encode the parameters
     let encoded_params = DynSolValue::Tuple(params.to_vec()).abi_encode_params();
 
-    // Concatenate selector + encoded params
     let mut calldata = Vec::with_capacity(4 + encoded_params.len());
     calldata.extend_from_slice(&function_selector);
     calldata.extend_from_slice(&encoded_params);
@@ -272,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_encode_call_no_params() {
-        let selector = [0x18, 0x16, 0x0d, 0xdd]; // totalSupply()
+        let selector = [0x18, 0x16, 0x0d, 0xdd];
         let result = encode_call_with_params(selector, &[]);
         assert_eq!(result.len(), 4);
         assert_eq!(&result[..], &selector);
@@ -280,12 +270,12 @@ mod tests {
 
     #[test]
     fn test_encode_call_with_address() {
-        let selector = [0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
+        let selector = [0x70, 0xa0, 0x82, 0x31];
         let addr = "0x1234567890abcdef1234567890abcdef12345678"
             .parse::<Address>()
             .unwrap();
         let params = vec![DynSolValue::Address(addr)];
         let result = encode_call_with_params(selector, &params);
-        assert_eq!(result.len(), 4 + 32); // selector + padded address
+        assert_eq!(result.len(), 4 + 32);
     }
 }

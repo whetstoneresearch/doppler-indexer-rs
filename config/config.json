@@ -6,7 +6,8 @@
             "rpc_url_env_var": "BASE_RPC_URL",            
             "start_block": 26602741,
             "contracts": "contracts/base",
-            "tokens": "tokens/base.json"
+            "tokens": "tokens/base.json",
+            "factories": "factories/base.json"
         }
     ],
     "raw_data_collection": {

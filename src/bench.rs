@@ -16,7 +16,6 @@ pub fn init(path: &Path) -> std::io::Result<()> {
     let mut guard = BENCH_FILE.lock().unwrap();
     *guard = Some(file);
 
-    // Write CSV header
     if let Some(f) = guard.as_mut() {
         writeln!(f, "collector,range_start,range_end,record_count,rpc_ms,process_ms,write_ms")?;
     }

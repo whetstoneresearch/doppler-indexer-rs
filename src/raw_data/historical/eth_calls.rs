@@ -16,10 +16,11 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
 
+use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig, ParamError, ParamValue};
+use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, ParamConfig, ParamError, ParamValue};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 #[derive(Debug, Error)]
@@ -58,7 +59,7 @@ impl BlockRange {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BlockInfo {
     block_number: u64,
     timestamp: u64,
@@ -73,7 +74,6 @@ struct CallConfig {
     param_values: Vec<Vec<u8>>,
 }
 
-/// Result of an eth_call
 #[derive(Debug)]
 struct CallResult {
     block_number: u64,
@@ -88,6 +88,7 @@ pub async fn collect_eth_calls(
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
     mut block_rx: Receiver<(u64, u64)>,
+    mut factory_rx: Option<Receiver<FactoryAddressData>>,
 ) -> Result<(), EthCallCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -96,57 +97,168 @@ pub async fn collect_eth_calls(
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
 
     let call_configs = build_call_configs(&chain.contracts)?;
+    let factory_call_configs = build_factory_call_configs(&chain.contracts);
 
-    if call_configs.is_empty() {
+    let has_regular_calls = !call_configs.is_empty();
+    let has_factory_calls = !factory_call_configs.is_empty() && factory_rx.is_some();
+
+    if !has_regular_calls && !has_factory_calls {
         tracing::info!("No eth_calls configured for chain {}", chain.name);
         while block_rx.recv().await.is_some() {}
         return Ok(());
     }
 
-    // Find max param count across all configs for schema
-    let max_params = call_configs.iter().map(|c| c.param_values.len()).max().unwrap_or(0);
+    let max_params = call_configs
+        .iter()
+        .map(|c| c.param_values.len())
+        .max()
+        .unwrap_or(0);
+
+    let factory_max_params = factory_call_configs
+        .values()
+        .flat_map(|configs| configs.iter().map(|c| c.params.len()))
+        .max()
+        .unwrap_or(0);
 
     tracing::info!(
-        "Starting eth_call collection for chain {} with {} call configs (max {} params)",
+        "Starting eth_call collection for chain {} with {} regular configs, {} factory collections",
         chain.name,
         call_configs.len(),
-        max_params
+        factory_call_configs.len()
     );
 
     let existing_files = scan_existing_parquet_files(&output_dir);
 
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
+    let mut range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
+    let mut range_regular_done: HashSet<u64> = HashSet::new();
+    let mut range_factory_done: HashSet<u64> = HashSet::new();
 
-    while let Some((block_number, timestamp)) = block_rx.recv().await {
-        let range_start = (block_number / range_size) * range_size;
+    loop {
+        tokio::select! {
+            block_result = block_rx.recv() => {
+                match block_result {
+                    Some((block_number, timestamp)) => {
+                        let range_start = (block_number / range_size) * range_size;
 
-        range_data.entry(range_start).or_default().push(BlockInfo {
-            block_number,
-            timestamp,
-        });
+                        range_data.entry(range_start).or_default().push(BlockInfo {
+                            block_number,
+                            timestamp,
+                        });
 
-        if let Some(blocks) = range_data.get(&range_start) {
-            let expected_blocks: HashSet<u64> = (range_start..range_start + range_size).collect();
-            let received_blocks: HashSet<u64> = blocks.iter().map(|b| b.block_number).collect();
+                        if let Some(blocks) = range_data.get(&range_start) {
+                            let expected_blocks: HashSet<u64> =
+                                (range_start..range_start + range_size).collect();
+                            let received_blocks: HashSet<u64> =
+                                blocks.iter().map(|b| b.block_number).collect();
 
-            if expected_blocks.is_subset(&received_blocks) {
-                let range = BlockRange {
-                    start: range_start,
-                    end: range_start + range_size,
-                };
+                            if expected_blocks.is_subset(&received_blocks)
+                                && !range_regular_done.contains(&range_start)
+                            {
+                                let range = BlockRange {
+                                    start: range_start,
+                                    end: range_start + range_size,
+                                };
 
-                let blocks = range_data.remove(&range_start).unwrap();
-                process_range(
-                    &range,
-                    blocks,
-                    client,
-                    &call_configs,
-                    &output_dir,
-                    &existing_files,
-                    rpc_batch_size,
-                    max_params,
-                )
-                .await?;
+                                if has_regular_calls {
+                                    process_range(
+                                        &range,
+                                        blocks.clone(),
+                                        client,
+                                        &call_configs,
+                                        &output_dir,
+                                        &existing_files,
+                                        rpc_batch_size,
+                                        max_params,
+                                    )
+                                    .await?;
+                                }
+                                range_regular_done.insert(range_start);
+
+                                if let Some(factory_data) = range_factory_data.get(&range_start) {
+                                    if has_factory_calls && !range_factory_done.contains(&range_start) {
+                                        process_factory_range(
+                                            &range,
+                                            blocks,
+                                            client,
+                                            factory_data,
+                                            &factory_call_configs,
+                                            &output_dir,
+                                            &existing_files,
+                                            rpc_batch_size,
+                                            factory_max_params,
+                                        )
+                                        .await?;
+                                        range_factory_done.insert(range_start);
+                                    }
+                                }
+
+                                if range_regular_done.contains(&range_start)
+                                    && (!has_factory_calls || range_factory_done.contains(&range_start))
+                                {
+                                    range_data.remove(&range_start);
+                                    range_factory_data.remove(&range_start);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if !has_factory_calls || factory_rx.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            factory_result = async {
+                match &mut factory_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match factory_result {
+                    Some(factory_data) => {
+                        let range_start = factory_data.range_start;
+                        let range_end = factory_data.range_end;
+
+                        range_factory_data.insert(range_start, factory_data.clone());
+
+                        if range_regular_done.contains(&range_start) {
+                            if has_factory_calls && !range_factory_done.contains(&range_start) {
+                                let range = BlockRange {
+                                    start: range_start,
+                                    end: range_end,
+                                };
+
+                                if let Some(blocks) = range_data.get(&range_start) {
+                                    process_factory_range(
+                                        &range,
+                                        blocks,
+                                        client,
+                                        &factory_data,
+                                        &factory_call_configs,
+                                        &output_dir,
+                                        &existing_files,
+                                        rpc_batch_size,
+                                        factory_max_params,
+                                    )
+                                    .await?;
+                                }
+                                range_factory_done.insert(range_start);
+                            }
+
+                            if range_regular_done.contains(&range_start)
+                                && (!has_factory_calls || range_factory_done.contains(&range_start))
+                            {
+                                range_data.remove(&range_start);
+                                range_factory_data.remove(&range_start);
+                            }
+                        }
+                    }
+                    None => {
+                        factory_rx = None;
+                    }
+                }
             }
         }
     }
@@ -166,24 +278,254 @@ pub async fn collect_eth_calls(
             end: max_block + 1,
         };
 
-        process_range(
-            &range,
-            blocks,
-            client,
-            &call_configs,
-            &output_dir,
-            &existing_files,
-            rpc_batch_size,
-            max_params,
-        )
-        .await?;
+        if has_regular_calls && !range_regular_done.contains(&range_start) {
+            process_range(
+                &range,
+                blocks.clone(),
+                client,
+                &call_configs,
+                &output_dir,
+                &existing_files,
+                rpc_batch_size,
+                max_params,
+            )
+            .await?;
+        }
+
+        if has_factory_calls {
+            if let Some(factory_data) = range_factory_data.get(&range_start) {
+                if !range_factory_done.contains(&range_start) {
+                    process_factory_range(
+                        &range,
+                        &blocks,
+                        client,
+                        factory_data,
+                        &factory_call_configs,
+                        &output_dir,
+                        &existing_files,
+                        rpc_batch_size,
+                        factory_max_params,
+                    )
+                    .await?;
+                }
+            }
+        }
     }
 
     tracing::info!("Eth_call collection complete for chain {}", chain.name);
     Ok(())
 }
 
-/// Generate all combinations of parameter values (cartesian product)
+fn build_factory_call_configs(contracts: &Contracts) -> HashMap<String, Vec<EthCallConfig>> {
+    let mut configs: HashMap<String, Vec<EthCallConfig>> = HashMap::new();
+
+    for (_, contract) in contracts {
+        if let Some(factories) = &contract.factories {
+            for factory in factories {
+                if !factory.calls.is_empty() {
+                    configs.insert(factory.collection_name.clone(), factory.calls.clone());
+                }
+            }
+        }
+    }
+
+    configs
+}
+
+async fn process_factory_range(
+    range: &BlockRange,
+    blocks: &[BlockInfo],
+    client: &UnifiedRpcClient,
+    factory_data: &FactoryAddressData,
+    factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+    rpc_batch_size: usize,
+    max_params: usize,
+) -> Result<(), EthCallCollectionError> {
+    let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
+    for (_block, addrs) in &factory_data.addresses_by_block {
+        for (_, addr, collection_name) in addrs {
+            addresses_by_collection
+                .entry(collection_name.clone())
+                .or_default()
+                .insert(*addr);
+        }
+    }
+
+    for (collection_name, call_configs) in factory_call_configs {
+        let addresses = match addresses_by_collection.get(collection_name) {
+            Some(addrs) if !addrs.is_empty() => addrs,
+            _ => continue,
+        };
+
+        for call_config in call_configs {
+            let selector = compute_function_selector(&call_config.function);
+            let function_name = call_config
+                .function
+                .split('(')
+                .next()
+                .unwrap_or(&call_config.function)
+                .to_string();
+
+            let file_name = format!(
+                "eth_calls_{}_{}_{}-{}.parquet",
+                collection_name,
+                function_name,
+                range.start,
+                range.end - 1
+            );
+
+            if existing_files.contains(&file_name) {
+                tracing::debug!(
+                    "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
+                    collection_name,
+                    function_name,
+                    range.start,
+                    range.end - 1
+                );
+                continue;
+            }
+
+            let param_combinations = generate_param_combinations(&call_config.params)?;
+
+            let mut configs: Vec<CallConfig> = Vec::new();
+            for address in addresses {
+                for param_combo in &param_combinations {
+                    let dyn_values: Vec<DynSolValue> = param_combo
+                        .iter()
+                        .map(|(param_type, value, _)| param_type.parse_value(value))
+                        .collect::<Result<_, _>>()?;
+
+                    let encoded_calldata = encode_call_with_params(selector, &dyn_values);
+                    let param_values: Vec<Vec<u8>> =
+                        param_combo.iter().map(|(_, _, encoded)| encoded.clone()).collect();
+
+                    configs.push(CallConfig {
+                        contract_name: collection_name.clone(),
+                        address: *address,
+                        function_name: function_name.clone(),
+                        encoded_calldata,
+                        param_values,
+                    });
+                }
+            }
+
+            if configs.is_empty() {
+                continue;
+            }
+
+            tracing::info!(
+                "Fetching factory eth_calls for {}.{} blocks {}-{} ({} addresses)",
+                collection_name,
+                function_name,
+                range.start,
+                range.end - 1,
+                addresses.len()
+            );
+
+            #[cfg(feature = "bench")]
+            let mut rpc_time = std::time::Duration::ZERO;
+            #[cfg(feature = "bench")]
+            let mut process_time = std::time::Duration::ZERO;
+
+            let mut all_results: Vec<CallResult> = Vec::new();
+            let mut pending_calls: Vec<(TransactionRequest, BlockId, &BlockInfo, &CallConfig)> =
+                Vec::new();
+
+            for block in blocks {
+                for config in &configs {
+                    let tx = TransactionRequest::default()
+                        .to(config.address)
+                        .input(config.encoded_calldata.clone().into());
+                    let block_id = BlockId::Number(BlockNumberOrTag::Number(block.block_number));
+                    pending_calls.push((tx, block_id, block, config));
+                }
+            }
+
+            for chunk in pending_calls.chunks(rpc_batch_size) {
+                let calls: Vec<(TransactionRequest, BlockId)> = chunk
+                    .iter()
+                    .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
+                    .collect();
+
+                #[cfg(feature = "bench")]
+                let rpc_start = Instant::now();
+                let results = client.call_batch(calls).await?;
+                #[cfg(feature = "bench")]
+                {
+                    rpc_time += rpc_start.elapsed();
+                }
+
+                #[cfg(feature = "bench")]
+                let process_start = Instant::now();
+                for (i, result) in results.into_iter().enumerate() {
+                    let (_, _, block, config) = &chunk[i];
+                    match result {
+                        Ok(bytes) => {
+                            all_results.push(CallResult {
+                                block_number: block.block_number,
+                                block_timestamp: block.timestamp,
+                                contract_address: config.address.0.0,
+                                value_bytes: bytes.to_vec(),
+                                param_values: config.param_values.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Factory eth_call failed for {}.{} at block {}: {}",
+                                collection_name,
+                                function_name,
+                                block.block_number,
+                                e
+                            );
+                            all_results.push(CallResult {
+                                block_number: block.block_number,
+                                block_timestamp: block.timestamp,
+                                contract_address: config.address.0.0,
+                                value_bytes: Vec::new(),
+                                param_values: config.param_values.clone(),
+                            });
+                        }
+                    }
+                }
+                #[cfg(feature = "bench")]
+                {
+                    process_time += process_start.elapsed();
+                }
+            }
+
+            all_results
+                .sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
+
+            #[cfg(feature = "bench")]
+            let write_start = Instant::now();
+            write_results_to_parquet(&all_results, &output_dir.join(&file_name), max_params)?;
+            #[cfg(feature = "bench")]
+            {
+                let write_time = write_start.elapsed();
+                crate::bench::record(
+                    &format!("eth_calls_{}.{}", collection_name, function_name),
+                    range.start,
+                    range.end,
+                    all_results.len(),
+                    rpc_time,
+                    process_time,
+                    write_time,
+                );
+            }
+
+            tracing::info!(
+                "Wrote {} factory eth_call results to {}",
+                all_results.len(),
+                output_dir.join(&file_name).display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
     if params.is_empty() {
         return Ok(vec![vec![]]);
@@ -195,8 +537,7 @@ fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmTyp
         let mut new_result = Vec::new();
         for existing in &result {
             for value in &param.values {
-                let mut combo = existing.clone();
-                // Parse and encode the value
+                let mut combo = existing.clone();                
                 let dyn_val = param.param_type.parse_value(value)?;
                 let encoded = dyn_val.abi_encode();
                 combo.push((param.param_type.clone(), value.clone(), encoded));
@@ -227,21 +568,17 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
                     .unwrap_or(&call.function)
                     .to_string();
 
-                // Generate all parameter combinations
                 let param_combinations = generate_param_combinations(&call.params)?;
 
                 for address in &addresses {
                     for param_combo in &param_combinations {
-                        // Convert to DynSolValues for encoding
                         let dyn_values: Vec<DynSolValue> = param_combo
                             .iter()
                             .map(|(param_type, value, _)| param_type.parse_value(value))
                             .collect::<Result<_, _>>()?;
 
-                        // Encode full calldata
                         let encoded_calldata = encode_call_with_params(selector, &dyn_values);
 
-                        // Store encoded params for parquet
                         let param_values: Vec<Vec<u8>> = param_combo
                             .iter()
                             .map(|(_, _, encoded)| encoded.clone())
@@ -440,12 +777,11 @@ fn build_schema(num_params: usize) -> Arc<Schema> {
         Field::new("value", DataType::Binary, false),
     ];
 
-    // Add param columns
     for i in 0..num_params {
         fields.push(Field::new(
             &format!("param_{}", i),
             DataType::Binary,
-            true, // nullable since not all calls have params
+            true,
         ));
     }
 
@@ -477,7 +813,6 @@ fn write_results_to_parquet(
         .collect();
     arrays.push(Arc::new(arr));
 
-    // Add param columns
     for i in 0..num_params {
         let arr: BinaryArray = results
             .iter()

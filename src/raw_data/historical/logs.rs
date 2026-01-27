@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, FixedSizeBinaryArray, ListBuilder, FixedSizeBinaryBuilder, UInt32Array,
+    ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, UInt32Array,
     UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
@@ -14,8 +14,10 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
 
+use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::LogData;
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::{LogField, RawDataCollectionConfig};
 
 #[derive(Debug, Error)]
@@ -68,6 +70,7 @@ pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     mut log_rx: Receiver<Vec<LogData>>,
+    mut factory_rx: Option<Receiver<FactoryAddressData>>,
 ) -> Result<(), LogCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -75,36 +78,103 @@ pub async fn collect_logs(
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let log_fields = &raw_data_config.fields.log_fields;
     let schema = build_log_schema(log_fields);
+    let contract_logs_only = raw_data_config.contract_logs_only.unwrap_or(false);
 
-    // Track which ranges we've already written
+    let configured_addresses: HashSet<[u8; 20]> = if contract_logs_only {
+        build_configured_addresses(&chain.contracts)
+    } else {
+        HashSet::new()
+    };
+
     let existing_files = scan_existing_parquet_files(&output_dir);
 
-    // Accumulate logs by range
     let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
-    // Track which blocks we've seen in each range
     let mut range_blocks: HashMap<u64, HashSet<u64>> = HashMap::new();
 
-    tracing::info!("Starting log collection for chain {}", chain.name);
+    let mut range_factory_addresses: HashMap<u64, HashSet<[u8; 20]>> = HashMap::new();
+    let mut range_factory_received: HashSet<u64> = HashSet::new();
 
-    while let Some(logs) = log_rx.recv().await {
-        for log in logs {
-            let range_start = (log.block_number / range_size) * range_size;
+    let has_factory_rx = factory_rx.is_some();
+    let needs_factory_wait = has_factory_rx && contract_logs_only;
 
-            range_blocks
-                .entry(range_start)
-                .or_default()
-                .insert(log.block_number);
+    tracing::info!(
+        "Starting log collection for chain {} (contract_logs_only: {}, waiting for factories: {})",
+        chain.name,
+        contract_logs_only,
+        needs_factory_wait
+    );
 
-            range_data.entry(range_start).or_default().push(log);
+    loop {
+        tokio::select! {
+            log_result = log_rx.recv() => {
+                match log_result {
+                    Some(logs) => {
+                        for log in logs {
+                            let range_start = (log.block_number / range_size) * range_size;
+
+                            range_blocks
+                                .entry(range_start)
+                                .or_default()
+                                .insert(log.block_number);
+
+                            range_data.entry(range_start).or_default().push(log);
+                        }
+                    }
+                    None => {
+                        if !needs_factory_wait || factory_rx.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            factory_result = async {
+                match &mut factory_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match factory_result {
+                    Some(factory_data) => {
+                        let range_start = factory_data.range_start;
+
+                        let factory_addrs: HashSet<[u8; 20]> = factory_data
+                            .addresses_by_block
+                            .values()
+                            .flatten()
+                            .map(|(_, addr, _)| addr.0.0)
+                            .collect();
+
+                        tracing::debug!(
+                            "Received {} factory addresses for range {}",
+                            factory_addrs.len(),
+                            range_start
+                        );
+
+                        range_factory_addresses
+                            .entry(range_start)
+                            .or_default()
+                            .extend(factory_addrs);
+
+                        range_factory_received.insert(range_start);
+                    }
+                    None => {
+                        factory_rx = None;
+                    }
+                }
+            }
         }
 
-        // Check for complete ranges and write them
         let complete_ranges: Vec<u64> = range_blocks
             .iter()
             .filter(|(range_start, blocks)| {
                 let expected: HashSet<u64> =
                     (**range_start..**range_start + range_size).collect();
-                expected.is_subset(blocks)
+                let blocks_complete = expected.is_subset(blocks);
+
+                let factory_ready = !needs_factory_wait || range_factory_received.contains(range_start);
+
+                blocks_complete && factory_ready
             })
             .map(|(range_start, _)| *range_start)
             .collect();
@@ -115,7 +185,6 @@ pub async fn collect_logs(
                 end: range_start + range_size,
             };
 
-            // Skip if already exists
             if existing_files.contains(&range.file_name()) {
                 tracing::info!(
                     "Skipping logs for blocks {}-{} (already exists)",
@@ -124,18 +193,39 @@ pub async fn collect_logs(
                 );
                 range_data.remove(&range_start);
                 range_blocks.remove(&range_start);
+                range_factory_addresses.remove(&range_start);
+                range_factory_received.remove(&range_start);
                 continue;
             }
 
-            if let Some(logs) = range_data.remove(&range_start) {
+            if let Some(mut logs) = range_data.remove(&range_start) {
                 range_blocks.remove(&range_start);
+                let factory_addrs = range_factory_addresses.remove(&range_start).unwrap_or_default();
+                range_factory_received.remove(&range_start);
+
+                if contract_logs_only {
+                    let before_count = logs.len();
+                    logs = logs
+                        .into_iter()
+                        .filter(|log| {
+                            configured_addresses.contains(&log.address)
+                                || factory_addrs.contains(&log.address)
+                        })
+                        .collect();
+                    tracing::debug!(
+                        "Filtered logs from {} to {} for range {}",
+                        before_count,
+                        logs.len(),
+                        range_start
+                    );
+                }
+
                 process_range(&range, logs, log_fields, &schema, &output_dir)?;
             }
         }
     }
 
-    // Process any remaining partial ranges
-    for (range_start, logs) in range_data {
+    for (range_start, mut logs) in range_data {
         if logs.is_empty() {
             continue;
         }
@@ -155,11 +245,39 @@ pub async fn collect_logs(
             continue;
         }
 
+        if contract_logs_only {
+            let factory_addrs = range_factory_addresses.remove(&range_start).unwrap_or_default();
+            logs = logs
+                .into_iter()
+                .filter(|log| {
+                    configured_addresses.contains(&log.address)
+                        || factory_addrs.contains(&log.address)
+                })
+                .collect();
+        }
+
         process_range(&range, logs, log_fields, &schema, &output_dir)?;
     }
 
     tracing::info!("Log collection complete for chain {}", chain.name);
     Ok(())
+}
+
+fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
+    let mut addresses = HashSet::new();
+    for (_, contract) in contracts {
+        match &contract.address {
+            AddressOrAddresses::Single(addr) => {
+                addresses.insert(addr.0.0);
+            }
+            AddressOrAddresses::Multiple(addrs) => {
+                for addr in addrs {
+                    addresses.insert(addr.0.0);
+                }
+            }
+        }
+    }
+    addresses
 }
 
 fn process_range(
@@ -377,7 +495,6 @@ fn write_full_logs_to_parquet(
     )?;
     arrays.push(Arc::new(arr));
 
-    // Build topics list array for full records
     let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
     for record in records {
         for topic in &record.topics {

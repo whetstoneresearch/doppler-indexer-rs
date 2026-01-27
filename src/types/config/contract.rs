@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{keccak256, Address, U256};
 use serde::Deserialize;
 use crate::types::config::eth_call::EthCallConfig;
 
@@ -9,7 +9,72 @@ use crate::types::config::eth_call::EthCallConfig;
 pub struct ContractConfig {
     pub address: AddressOrAddresses,
     pub start_block: Option<U256>,
-    pub calls: Option<Vec<EthCallConfig>>
+    pub calls: Option<Vec<EthCallConfig>>,
+    #[serde(default)]
+    pub factories: Option<Vec<FactoryConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FactoryConfig {
+    pub collection_name: String,
+    pub factory_events: FactoryEventConfig,
+    pub factory_parameters: String,
+    #[serde(default)]
+    pub calls: Vec<EthCallConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FactoryEventConfig {
+    pub name: String,
+    pub topics_signature: String,
+    pub data_signature: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum FactoryParameterLocation {
+    Topic(usize),
+    Data(usize),
+}
+
+impl FactoryConfig {
+    pub fn compute_event_signature(&self) -> [u8; 32] {
+        let mut all_types = Vec::new();
+
+        if !self.factory_events.topics_signature.is_empty() {
+            all_types.push(self.factory_events.topics_signature.as_str());
+        }
+        if !self.factory_events.data_signature.is_empty() {
+            all_types.push(self.factory_events.data_signature.as_str());
+        }
+
+        let full_sig = format!("{}({})",
+            self.factory_events.name,
+            all_types.join(","));
+
+        keccak256(full_sig.as_bytes()).0
+    }
+
+    pub fn parse_factory_parameter(&self) -> FactoryParameterLocation {
+        let param = self.factory_parameters.trim();
+
+        if param.starts_with("topics[") {
+            let idx_str = param
+                .strip_prefix("topics[")
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or("0");
+            let idx = idx_str.parse::<usize>().unwrap_or(0);
+            FactoryParameterLocation::Topic(idx)
+        } else if param.starts_with("data[") {
+            let idx_str = param
+                .strip_prefix("data[")
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or("0");
+            let idx = idx_str.parse::<usize>().unwrap_or(0);
+            FactoryParameterLocation::Data(idx)
+        } else {
+            FactoryParameterLocation::Data(0)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

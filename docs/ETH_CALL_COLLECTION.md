@@ -150,8 +150,72 @@ collector,range_start,range_end,record_count,rpc_ms,process_ms,write_ms
 eth_calls_USDC.totalSupply,0,10000,10000,5230,45,12
 ```
 
+## Factory Contract Calls
+
+The eth_call collector supports executing calls on factory-created contracts. When factories are configured with `calls`, those calls are executed on dynamically discovered contract addresses.
+
+### Configuration
+
+Factory calls are defined within the `factories` array of a contract:
+
+```json
+{
+    "Airlock": {
+        "address": "0x660eAaEdEBc968f8f3694354FA8EC0b4c5Ba8D12",
+        "factories": [
+            {
+                "collection_name": "DERC20",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address",
+                    "data_signature": "address,address,address"
+                },
+                "factory_parameters": "data[0]",
+                "calls": [
+                    {"function": "totalSupply()", "output_type": "uint256"},
+                    {"function": "name()", "output_type": "string"},
+                    {"function": "symbol()", "output_type": "string"}
+                ]
+            }
+        ]
+    }
+}
+```
+
+### Output Files
+
+Factory eth_call results are written to the same directory as regular eth_calls, using the collection name in place of the contract name:
+
+```
+eth_calls_{collection}_{function}_{start}-{end}.parquet
+```
+
+Example: `eth_calls_DERC20_totalSupply_0-9999.parquet`
+
+### Processing Flow
+
+1. Regular eth_calls are executed immediately when a block range completes (no waiting)
+2. Factory eth_calls are executed when factory addresses arrive from the factory collector
+3. Both regular and factory results are written independently
+4. Factory calls use the same schema as regular calls
+
+### Performance Considerations
+
+Factory calls scale with the number of discovered contracts:
+
+```
+total_factory_calls = num_factory_addresses × num_calls × blocks_per_range
+```
+
+For frequently-used factories (e.g., token deployers), this can generate many calls. Consider:
+- Limiting the `calls` configuration to essential functions
+- Using larger `parquet_block_range` to amortize overhead
+- Monitoring RPC compute unit usage
+
+See [Factory Collection](./FACTORY_COLLECTION.md) for details on how factory addresses are discovered.
+
 ## Limitations
 
-- Only parameterless function calls are currently supported
 - No state override support (calls use the actual on-chain state)
 - Results are stored as raw bytes; decoding is left to the consumer
+- Factory calls require the factory collector to discover addresses first

@@ -4,14 +4,15 @@ mod raw_data;
 mod rpc;
 mod types;
 
-use std::path::Path;
 use std::env;
+use std::path::Path;
 
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
+use raw_data::historical::factories::collect_factories;
 use raw_data::historical::logs::collect_logs;
 use raw_data::historical::receipts::collect_receipts;
 use rpc::UnifiedRpcClient;
@@ -21,8 +22,7 @@ use types::config::indexer::IndexerConfig;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info"))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -40,48 +40,135 @@ async fn main() -> anyhow::Result<()> {
     for chain in &config.chains {
         tracing::info!("Processing chain: {}", chain.name);
 
-        let rpc_url = env::var(&chain.rpc_url_env_var)
-            .map_err(|_| anyhow::anyhow!(
+        let rpc_url = env::var(&chain.rpc_url_env_var).map_err(|_| {
+            anyhow::anyhow!(
                 "Environment variable {} not set for chain {}",
                 chain.rpc_url_env_var,
                 chain.name
-            ))?;
+            )
+        })?;
 
         let client = UnifiedRpcClient::from_url(&rpc_url)?;
         tracing::info!("Connected to RPC for chain {}", chain.name);
+
+        let has_factories = chain
+            .contracts
+            .values()
+            .any(|c| c.factories.as_ref().map(|f| !f.is_empty()).unwrap_or(false));
+
+        let contract_logs_only = config
+            .raw_data_collection
+            .contract_logs_only
+            .unwrap_or(false);
+        let needs_factory_filtering = has_factories && contract_logs_only;
+
+        let has_factory_calls = chain.contracts.values().any(|c| {
+            c.factories
+                .as_ref()
+                .map(|factories| factories.iter().any(|f| !f.calls.is_empty()))
+                .unwrap_or(false)
+        });
+
+        tracing::info!(
+            "Chain {} - has_factories: {}, contract_logs_only: {}, has_factory_calls: {}",
+            chain.name,
+            has_factories,
+            contract_logs_only,
+            has_factory_calls
+        );
 
         let (block_tx, block_rx) = mpsc::channel(1000);
         let (log_tx, log_rx) = mpsc::channel(1000);
         let (eth_call_tx, eth_call_rx) = mpsc::channel(1000);
 
+        let (factory_log_tx, factory_log_rx) = if has_factories {
+            let (tx, rx) = mpsc::channel(1000);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (logs_factory_tx, logs_factory_rx) = if needs_factory_filtering {
+            let (tx, rx) = mpsc::channel(100);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (eth_calls_factory_tx, eth_calls_factory_rx) = if has_factory_calls {
+            let (tx, rx) = mpsc::channel(100);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let raw_data_config = config.raw_data_collection.clone();
         let raw_data_config2 = config.raw_data_collection.clone();
         let raw_data_config3 = config.raw_data_collection.clone();
         let raw_data_config4 = config.raw_data_collection.clone();
+        let raw_data_config5 = config.raw_data_collection.clone();
         let chain_clone = chain.clone();
         let chain_clone2 = chain.clone();
         let chain_clone3 = chain.clone();
         let chain_clone4 = chain.clone();
-
+        let chain_clone5 = chain.clone();
+        
         let blocks_handle = tokio::spawn(async move {
-            collect_blocks(&chain_clone, &client, &raw_data_config, Some(block_tx), Some(eth_call_tx)).await
+            collect_blocks(
+                &chain_clone,
+                &client,
+                &raw_data_config,
+                Some(block_tx),
+                Some(eth_call_tx),
+            )
+            .await
         });
 
         let receipts_handle = tokio::spawn(async move {
             let rpc_url = env::var(&chain_clone2.rpc_url_env_var).unwrap();
             let client = UnifiedRpcClient::from_url(&rpc_url).unwrap();
-            collect_receipts(&chain_clone2, &client, &raw_data_config2, block_rx, Some(log_tx)).await
+            collect_receipts(
+                &chain_clone2,
+                &client,
+                &raw_data_config2,
+                block_rx,
+                Some(log_tx),
+                factory_log_tx,
+            )
+            .await
         });
 
         let logs_handle = tokio::spawn(async move {
-            collect_logs(&chain_clone3, &raw_data_config3, log_rx).await
+            collect_logs(&chain_clone3, &raw_data_config3, log_rx, logs_factory_rx).await
         });
 
         let eth_calls_handle = tokio::spawn(async move {
             let rpc_url = env::var(&chain_clone4.rpc_url_env_var).unwrap();
             let client = UnifiedRpcClient::from_url(&rpc_url).unwrap();
-            collect_eth_calls(&chain_clone4, &client, &raw_data_config4, eth_call_rx).await
+            collect_eth_calls(
+                &chain_clone4,
+                &client,
+                &raw_data_config4,
+                eth_call_rx,
+                eth_calls_factory_rx,
+            )
+            .await
         });
+
+        let factories_handle = if has_factories {
+            Some(tokio::spawn(async move {
+                collect_factories(
+                    &chain_clone5,
+                    &raw_data_config5,
+                    factory_log_rx.unwrap(),
+                    logs_factory_tx,
+                    eth_calls_factory_tx,
+                )
+                .await
+            }))
+        } else {
+            None
+        };
 
         let (blocks_result, receipts_result, logs_result, eth_calls_result) =
             tokio::try_join!(blocks_handle, receipts_handle, logs_handle, eth_calls_handle)?;
@@ -90,6 +177,10 @@ async fn main() -> anyhow::Result<()> {
         receipts_result?;
         logs_result?;
         eth_calls_result?;
+
+        if let Some(handle) = factories_handle {
+            handle.await??;
+        }
 
         tracing::info!("Completed collection for chain {}", chain.name);
     }

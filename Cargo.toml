@@ -25,6 +25,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 
-# Parquet support
 arrow = { version = "54", default-features = false, features = ["prettyprint"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }

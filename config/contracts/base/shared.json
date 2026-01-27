@@ -1,6 +1,20 @@
 {
     "Airlock": {
-        "address": "0x660eAaEdEBc968f8f3694354FA8EC0b4c5Ba8D12"        
+        "address": "0x660eAaEdEBc968f8f3694354FA8EC0b4c5Ba8D12",
+        "factories": [
+            {
+                "collection_name": "DERC20",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address",
+                    "data_signature": "address,address,address"
+                },
+                "factory_parameters": "data[0]",
+                "calls": [
+                    {"function": "totalSupply()", "output_type": "uint256"}
+                ]
+            }
+        ]
     },
     "UniversalRouter": {
         "address": "0x6ff5693b99212da76ad316178a184ab56d299b43"

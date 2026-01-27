@@ -120,7 +120,8 @@ Each contract entry is keyed by a human-readable name:
 |-------|------|----------|-------------|
 | `address` | string \| string[] | Yes | Single address or array of addresses |
 | `start_block` | number | No | Override chain-level start block for this contract |
-| `calls` | object | No | eth_call configuration for reading contract state |
+| `calls` | array | No | eth_call configuration for reading contract state |
+| `factories` | array | No | Factory configurations for tracking dynamically created contracts |
 
 ### Multiple Addresses
 
@@ -158,6 +159,65 @@ Contracts can include `calls` to read on-chain state:
 **Output Types:**
 - `int256` - Signed 256-bit integer
 - `uint256` - Unsigned 256-bit integer
+
+### Factory Configuration
+
+Factories allow tracking contracts that are dynamically created by other contracts (e.g., token deployments, liquidity pool creations). The indexer monitors specified events and extracts the addresses of newly created contracts.
+
+```json
+{
+    "Airlock": {
+        "address": "0x660eAaEdEBc968f8f3694354FA8EC0b4c5Ba8D12",
+        "factories": [
+            {
+                "collection_name": "DERC20",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address",
+                    "data_signature": "address,address,address"
+                },
+                "factory_parameters": "data[0]",
+                "calls": [
+                    {"function": "totalSupply()", "output_type": "uint256"}
+                ]
+            }
+        ]
+    }
+}
+```
+
+**Factory Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `collection_name` | string | Yes | Identifier for this group of factory-created contracts |
+| `factory_events` | object | Yes | Event signature information for matching |
+| `factory_parameters` | string | Yes | Which parameter contains the created contract address |
+| `calls` | array | No | eth_call configs to execute on factory-created contracts |
+
+**Factory Event Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Event name (e.g., "Create", "PairCreated") |
+| `topics_signature` | string | Comma-separated types of indexed parameters |
+| `data_signature` | string | Comma-separated types of non-indexed parameters |
+
+**Factory Parameters Format:**
+
+The `factory_parameters` field specifies where to extract the created contract address:
+- `topics[1]` - First indexed parameter (after event signature)
+- `topics[2]` - Second indexed parameter
+- `data[0]` - First non-indexed parameter
+- `data[1]` - Second non-indexed parameter
+
+Only address-type parameters can be used for extraction.
+
+**Factory Integration with `contract_logs_only`:**
+
+When `contract_logs_only` is `true`, logs from factory-created contracts are automatically included in the filtered output. This allows tracking events from dynamically created contracts without explicitly listing their addresses.
+
+See [Factory Collection](./FACTORY_COLLECTION.md) for detailed documentation.
 
 ## Tokens Configuration
 
