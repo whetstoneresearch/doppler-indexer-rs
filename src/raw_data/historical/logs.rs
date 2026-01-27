@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
 
 use crate::raw_data::historical::factories::FactoryAddressData;
-use crate::raw_data::historical::receipts::LogData;
+use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::{LogField, RawDataCollectionConfig};
@@ -72,7 +72,7 @@ struct MinimalLogRecord {
 pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
-    mut log_rx: Receiver<Vec<LogData>>,
+    mut log_rx: Receiver<LogMessage>,
     mut factory_rx: Option<Receiver<FactoryAddressData>>,
 ) -> Result<(), LogCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
@@ -92,10 +92,12 @@ pub async fn collect_logs(
     let existing_files = scan_existing_parquet_files(&output_dir);
 
     let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
-    let mut range_blocks: HashMap<u64, HashSet<u64>> = HashMap::new();
-
     let mut range_factory_addresses: HashMap<u64, HashSet<[u8; 20]>> = HashMap::new();
-    let mut range_factory_received: HashSet<u64> = HashSet::new();
+
+    // Ranges that have received RangeComplete but are waiting for factory data
+    let mut pending_ranges: HashMap<u64, u64> = HashMap::new(); // range_start -> range_end
+    // Ranges that have received factory data
+    let mut factory_ready: HashSet<u64> = HashSet::new();
 
     let has_factory_rx = factory_rx.is_some();
     let needs_factory_wait = has_factory_rx && contract_logs_only;
@@ -111,22 +113,50 @@ pub async fn collect_logs(
         tokio::select! {
             log_result = log_rx.recv() => {
                 match log_result {
-                    Some(logs) => {
-                        for log in logs {
-                            let range_start = (log.block_number / range_size) * range_size;
+                    Some(message) => {
+                        match message {
+                            LogMessage::Logs(logs) => {
+                                for log in logs {
+                                    let range_start = (log.block_number / range_size) * range_size;
+                                    range_data.entry(range_start).or_default().push(log);
+                                }
+                            }
+                            LogMessage::RangeComplete { range_start, range_end } => {
+                                // Check if we can process this range now
+                                let factory_data_ready = !needs_factory_wait || factory_ready.contains(&range_start);
 
-                            range_blocks
-                                .entry(range_start)
-                                .or_default()
-                                .insert(log.block_number);
-
-                            range_data.entry(range_start).or_default().push(log);
+                                if factory_data_ready {
+                                    process_completed_range(
+                                        range_start,
+                                        range_end,
+                                        &mut range_data,
+                                        &mut range_factory_addresses,
+                                        contract_logs_only,
+                                        &configured_addresses,
+                                        log_fields,
+                                        &schema,
+                                        &output_dir,
+                                        &existing_files,
+                                    )
+                                    .await?;
+                                    factory_ready.remove(&range_start);
+                                } else {
+                                    // Wait for factory data
+                                    pending_ranges.insert(range_start, range_end);
+                                }
+                            }
+                            LogMessage::AllRangesComplete => {
+                                // All ranges from receipts are done, but we might still be waiting for factory data
+                                if pending_ranges.is_empty() {
+                                    break;
+                                }
+                                // Continue looping to receive remaining factory data
+                            }
                         }
                     }
                     None => {
-                        if !needs_factory_wait || factory_rx.is_none() {
-                            break;
-                        }
+                        // Channel closed unexpectedly
+                        break;
                     }
                 }
             }
@@ -159,111 +189,91 @@ pub async fn collect_logs(
                             .or_default()
                             .extend(factory_addrs);
 
-                        range_factory_received.insert(range_start);
+                        // Check if this range was pending
+                        if let Some(pending_end) = pending_ranges.remove(&range_start) {
+                            process_completed_range(
+                                range_start,
+                                pending_end,
+                                &mut range_data,
+                                &mut range_factory_addresses,
+                                contract_logs_only,
+                                &configured_addresses,
+                                log_fields,
+                                &schema,
+                                &output_dir,
+                                &existing_files,
+                            )
+                            .await?;
+                        } else {
+                            // Factory data arrived before RangeComplete, mark as ready
+                            factory_ready.insert(range_start);
+                        }
                     }
                     None => {
                         factory_rx = None;
+                        // If we have no pending ranges and factory channel is closed, we might be done
+                        if pending_ranges.is_empty() {
+                            break;
+                        }
                     }
                 }
             }
         }
-
-        let complete_ranges: Vec<u64> = range_blocks
-            .iter()
-            .filter(|(range_start, blocks)| {
-                let expected: HashSet<u64> =
-                    (**range_start..**range_start + range_size).collect();
-                let blocks_complete = expected.is_subset(blocks);
-
-                let factory_ready = !needs_factory_wait || range_factory_received.contains(range_start);
-
-                blocks_complete && factory_ready
-            })
-            .map(|(range_start, _)| *range_start)
-            .collect();
-
-        for range_start in complete_ranges {
-            let range = BlockRange {
-                start: range_start,
-                end: range_start + range_size,
-            };
-
-            if existing_files.contains(&range.file_name()) {
-                tracing::info!(
-                    "Skipping logs for blocks {}-{} (already exists)",
-                    range.start,
-                    range.end - 1
-                );
-                range_data.remove(&range_start);
-                range_blocks.remove(&range_start);
-                range_factory_addresses.remove(&range_start);
-                range_factory_received.remove(&range_start);
-                continue;
-            }
-
-            if let Some(mut logs) = range_data.remove(&range_start) {
-                range_blocks.remove(&range_start);
-                let factory_addrs = range_factory_addresses.remove(&range_start).unwrap_or_default();
-                range_factory_received.remove(&range_start);
-
-                if contract_logs_only {
-                    let before_count = logs.len();
-                    logs = logs
-                        .into_iter()
-                        .filter(|log| {
-                            configured_addresses.contains(&log.address)
-                                || factory_addrs.contains(&log.address)
-                        })
-                        .collect();
-                    tracing::debug!(
-                        "Filtered logs from {} to {} for range {}",
-                        before_count,
-                        logs.len(),
-                        range_start
-                    );
-                }
-
-                process_range(&range, logs, log_fields, &schema, &output_dir).await?;
-            }
-        }
-    }
-
-    for (range_start, mut logs) in range_data {
-        if logs.is_empty() {
-            continue;
-        }
-
-        let max_block = logs.iter().map(|l| l.block_number).max().unwrap_or(range_start);
-        let range = BlockRange {
-            start: range_start,
-            end: max_block + 1,
-        };
-
-        if existing_files.contains(&range.file_name()) {
-            tracing::info!(
-                "Skipping logs for blocks {}-{} (already exists)",
-                range.start,
-                range.end - 1
-            );
-            continue;
-        }
-
-        if contract_logs_only {
-            let factory_addrs = range_factory_addresses.remove(&range_start).unwrap_or_default();
-            logs = logs
-                .into_iter()
-                .filter(|log| {
-                    configured_addresses.contains(&log.address)
-                        || factory_addrs.contains(&log.address)
-                })
-                .collect();
-        }
-
-        process_range(&range, logs, log_fields, &schema, &output_dir).await?;
     }
 
     tracing::info!("Log collection complete for chain {}", chain.name);
     Ok(())
+}
+
+async fn process_completed_range(
+    range_start: u64,
+    range_end: u64,
+    range_data: &mut HashMap<u64, Vec<LogData>>,
+    range_factory_addresses: &mut HashMap<u64, HashSet<[u8; 20]>>,
+    contract_logs_only: bool,
+    configured_addresses: &HashSet<[u8; 20]>,
+    log_fields: &Option<Vec<LogField>>,
+    schema: &Arc<Schema>,
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<(), LogCollectionError> {
+    let range = BlockRange {
+        start: range_start,
+        end: range_end,
+    };
+
+    if existing_files.contains(&range.file_name()) {
+        tracing::info!(
+            "Skipping logs for blocks {}-{} (already exists)",
+            range.start,
+            range.end - 1
+        );
+        range_data.remove(&range_start);
+        range_factory_addresses.remove(&range_start);
+        return Ok(());
+    }
+
+    let mut logs = range_data.remove(&range_start).unwrap_or_default();
+    let factory_addrs = range_factory_addresses.remove(&range_start).unwrap_or_default();
+
+    if contract_logs_only {
+        let before_count = logs.len();
+        logs = logs
+            .into_iter()
+            .filter(|log| {
+                configured_addresses.contains(&log.address)
+                    || factory_addrs.contains(&log.address)
+            })
+            .collect();
+        tracing::debug!(
+            "Filtered logs from {} to {} for range {}",
+            before_count,
+            logs.len(),
+            range_start
+        );
+    }
+
+    process_range(&range, logs, log_fields, schema, output_dir).await
 }
 
 fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {

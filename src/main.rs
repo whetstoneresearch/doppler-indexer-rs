@@ -14,7 +14,7 @@ use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
 use raw_data::historical::factories::collect_factories;
 use raw_data::historical::logs::collect_logs;
-use raw_data::historical::receipts::collect_receipts;
+use raw_data::historical::receipts::{collect_receipts, LogMessage};
 use rpc::UnifiedRpcClient;
 use types::config::indexer::IndexerConfig;
 
@@ -85,11 +85,11 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(1000);
 
         let (block_tx, block_rx) = mpsc::channel(channel_capacity);
-        let (log_tx, log_rx) = mpsc::channel(channel_capacity);
+        let (log_tx, log_rx) = mpsc::channel::<LogMessage>(channel_capacity);
         let (eth_call_tx, eth_call_rx) = mpsc::channel(channel_capacity);
 
         let (factory_log_tx, factory_log_rx) = if has_factories {
-            let (tx, rx) = mpsc::channel(channel_capacity);
+            let (tx, rx) = mpsc::channel::<LogMessage>(channel_capacity);
             (Some(tx), Some(rx))
         } else {
             (None, None)

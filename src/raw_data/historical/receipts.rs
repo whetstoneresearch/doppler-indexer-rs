@@ -90,6 +90,13 @@ pub struct LogData {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub enum LogMessage {
+    Logs(Vec<LogData>),
+    RangeComplete { range_start: u64, range_end: u64 },
+    AllRangesComplete,
+}
+
 #[derive(Debug)]
 struct BlockInfo {
     block_number: u64,
@@ -102,8 +109,8 @@ pub async fn collect_receipts(
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
     mut block_rx: Receiver<(u64, u64, Vec<B256>)>,
-    log_tx: Option<Sender<Vec<LogData>>>,
-    factory_log_tx: Option<Sender<Vec<LogData>>>,
+    log_tx: Option<Sender<LogMessage>>,
+    factory_log_tx: Option<Sender<LogMessage>>,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -150,6 +157,9 @@ pub async fn collect_receipts(
                         range.end - 1
                     );
                     range_data.remove(&range_start);
+
+                    // Still need to signal range complete for skipped ranges
+                    send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
                     continue;
                 }
 
@@ -166,6 +176,8 @@ pub async fn collect_receipts(
                     rpc_batch_size,
                 )
                 .await?;
+
+                send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
             }
         }
     }
@@ -187,6 +199,7 @@ pub async fn collect_receipts(
                 range.start,
                 range.end - 1
             );
+            send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
             continue;
         }
 
@@ -202,9 +215,52 @@ pub async fn collect_receipts(
             rpc_batch_size,
         )
         .await?;
+
+        send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+    }
+
+    // Signal that all ranges are complete
+    if let Some(sender) = &factory_log_tx {
+        sender
+            .send(LogMessage::AllRangesComplete)
+            .await
+            .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+    }
+    if let Some(sender) = &log_tx {
+        sender
+            .send(LogMessage::AllRangesComplete)
+            .await
+            .map_err(|_| ReceiptCollectionError::ChannelSend)?;
     }
 
     tracing::info!("Receipt collection complete for chain {}", chain.name);
+    Ok(())
+}
+
+async fn send_range_complete(
+    factory_log_tx: &Option<Sender<LogMessage>>,
+    log_tx: &Option<Sender<LogMessage>>,
+    range_start: u64,
+    range_end: u64,
+) -> Result<(), ReceiptCollectionError> {
+    let message = LogMessage::RangeComplete {
+        range_start,
+        range_end,
+    };
+
+    if let Some(sender) = factory_log_tx {
+        sender
+            .send(message.clone())
+            .await
+            .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+    }
+    if let Some(sender) = log_tx {
+        sender
+            .send(message)
+            .await
+            .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+    }
+
     Ok(())
 }
 
@@ -215,8 +271,8 @@ async fn process_range(
     receipt_fields: &Option<Vec<ReceiptField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
-    log_tx: &Option<Sender<Vec<LogData>>>,
-    factory_log_tx: &Option<Sender<Vec<LogData>>>,
+    log_tx: &Option<Sender<LogMessage>>,
+    factory_log_tx: &Option<Sender<LogMessage>>,
     rpc_batch_size: usize,
 ) -> Result<(), ReceiptCollectionError> {
     tracing::info!("Fetching receipts for blocks {}-{}", range.start, range.end - 1);
@@ -274,14 +330,14 @@ async fn process_range(
         if !batch_logs.is_empty() {
             if let Some(sender) = factory_log_tx {
                 sender
-                    .send(batch_logs.clone())
+                    .send(LogMessage::Logs(batch_logs.clone()))
                     .await
                     .map_err(|_| ReceiptCollectionError::ChannelSend)?;
             }
 
             if let Some(sender) = log_tx {
                 sender
-                    .send(batch_logs)
+                    .send(LogMessage::Logs(batch_logs))
                     .await
                     .map_err(|_| ReceiptCollectionError::ChannelSend)?;
             }

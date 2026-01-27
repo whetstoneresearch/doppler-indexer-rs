@@ -14,7 +14,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::historical::receipts::LogData;
+use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
     AddressOrAddresses, Contracts, FactoryParameterLocation,
@@ -68,7 +68,7 @@ struct FactoryMatcher {
 pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
-    mut log_rx: Receiver<Vec<LogData>>,
+    mut log_rx: Receiver<LogMessage>,
     logs_factory_tx: Option<Sender<FactoryAddressData>>,
     eth_calls_factory_tx: Option<Sender<FactoryAddressData>>,
 ) -> Result<(), FactoryCollectionError> {
@@ -104,84 +104,48 @@ pub async fn collect_factories(
 
     if matchers.is_empty() {
         tracing::info!("No factories configured for chain {}", chain.name);
-        let mut range_blocks: HashMap<u64, HashSet<u64>> = HashMap::new();
 
-        while let Some(logs) = log_rx.recv().await {
-            for log in logs {
-                let range_start = (log.block_number / range_size) * range_size;
-                range_blocks
-                    .entry(range_start)
-                    .or_default()
-                    .insert(log.block_number);
-            }
-
-            let complete_ranges: Vec<u64> = range_blocks
-                .iter()
-                .filter(|(range_start, blocks)| {
-                    let expected: HashSet<u64> =
-                        (**range_start..**range_start + range_size).collect();
-                    expected.is_subset(blocks)
-                })
-                .map(|(range_start, _)| *range_start)
-                .collect();
-
-            for range_start in complete_ranges {
-                range_blocks.remove(&range_start);
-                let range_end = range_start + range_size;
-
-                let empty_data = FactoryAddressData {
+        // No factories to match - just forward range completions with empty data
+        while let Some(message) = log_rx.recv().await {
+            match message {
+                LogMessage::Logs(_) => {
+                    // No matchers, nothing to do with logs
+                }
+                LogMessage::RangeComplete {
                     range_start,
                     range_end,
-                    addresses_by_block: HashMap::new(),
-                };
+                } => {
+                    let empty_data = FactoryAddressData {
+                        range_start,
+                        range_end,
+                        addresses_by_block: HashMap::new(),
+                    };
 
-                if let Some(ref tx) = logs_factory_tx {
-                    tx.send(empty_data.clone())
-                        .await
-                        .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                    if let Some(ref tx) = logs_factory_tx {
+                        tx.send(empty_data.clone())
+                            .await
+                            .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                    }
+
+                    if let Some(ref tx) = eth_calls_factory_tx {
+                        tx.send(empty_data)
+                            .await
+                            .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                    }
                 }
-
-                if let Some(ref tx) = eth_calls_factory_tx {
-                    tx.send(empty_data)
-                        .await
-                        .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                LogMessage::AllRangesComplete => {
+                    break;
                 }
             }
         }
 
-        for (range_start, blocks) in range_blocks {
-            if blocks.is_empty() {
-                continue;
-            }
-            let max_block = *blocks.iter().max().unwrap_or(&range_start);
-            let range_end = max_block + 1;
-
-            let empty_data = FactoryAddressData {
-                range_start,
-                range_end,
-                addresses_by_block: HashMap::new(),
-            };
-
-            if let Some(ref tx) = logs_factory_tx {
-                tx.send(empty_data.clone())
-                    .await
-                    .map_err(|_| FactoryCollectionError::ChannelSend)?;
-            }
-
-            if let Some(ref tx) = eth_calls_factory_tx {
-                tx.send(empty_data)
-                    .await
-                    .map_err(|_| FactoryCollectionError::ChannelSend)?;
-            }
-        }
-
+        tracing::info!("Factory collection complete for chain {}", chain.name);
         return Ok(());
     }
 
     let existing_files = scan_existing_parquet_files(&output_dir);
 
     let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
-    let mut range_blocks: HashMap<u64, HashSet<u64>> = HashMap::new();
 
     tracing::info!(
         "Starting factory collection for chain {} with {} matchers",
@@ -189,31 +153,19 @@ pub async fn collect_factories(
         matchers.len()
     );
 
-    while let Some(logs) = log_rx.recv().await {
-        for log in logs {
-            let range_start = (log.block_number / range_size) * range_size;
-            range_blocks
-                .entry(range_start)
-                .or_default()
-                .insert(log.block_number);
-            range_data.entry(range_start).or_default().push(log);
-        }
-
-        let complete_ranges: Vec<u64> = range_blocks
-            .iter()
-            .filter(|(range_start, blocks)| {
-                let expected: HashSet<u64> =
-                    (**range_start..**range_start + range_size).collect();
-                expected.is_subset(blocks)
-            })
-            .map(|(range_start, _)| *range_start)
-            .collect();
-
-        for range_start in complete_ranges {
-            let range_end = range_start + range_size;
-
-            if let Some(logs) = range_data.remove(&range_start) {
-                range_blocks.remove(&range_start);
+    while let Some(message) = log_rx.recv().await {
+        match message {
+            LogMessage::Logs(logs) => {
+                for log in logs {
+                    let range_start = (log.block_number / range_size) * range_size;
+                    range_data.entry(range_start).or_default().push(log);
+                }
+            }
+            LogMessage::RangeComplete {
+                range_start,
+                range_end,
+            } => {
+                let logs = range_data.remove(&range_start).unwrap_or_default();
 
                 let factory_data = process_range(
                     range_start,
@@ -237,41 +189,9 @@ pub async fn collect_factories(
                         .map_err(|_| FactoryCollectionError::ChannelSend)?;
                 }
             }
-        }
-    }
-
-    for (range_start, logs) in range_data {
-        if logs.is_empty() {
-            continue;
-        }
-
-        let max_block = logs
-            .iter()
-            .map(|l| l.block_number)
-            .max()
-            .unwrap_or(range_start);
-        let range_end = max_block + 1;
-
-        let factory_data = process_range(
-            range_start,
-            range_end,
-            logs,
-            &matchers,
-            &output_dir,
-            &existing_files,
-        )
-        .await?;
-
-        if let Some(ref tx) = logs_factory_tx {
-            tx.send(factory_data.clone())
-                .await
-                .map_err(|_| FactoryCollectionError::ChannelSend)?;
-        }
-
-        if let Some(ref tx) = eth_calls_factory_tx {
-            tx.send(factory_data)
-                .await
-                .map_err(|_| FactoryCollectionError::ChannelSend)?;
+            LogMessage::AllRangesComplete => {
+                break;
+            }
         }
     }
 
