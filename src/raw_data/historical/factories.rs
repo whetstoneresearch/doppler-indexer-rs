@@ -37,6 +37,9 @@ pub enum FactoryCollectionError {
 
     #[error("ABI decode error: {0}")]
     AbiDecode(String),
+
+    #[error("Task join error: {0}")]
+    JoinError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +222,8 @@ pub async fn collect_factories(
                     &matchers,
                     &output_dir,
                     &existing_files,
-                )?;
+                )
+                .await?;
 
                 if let Some(ref tx) = logs_factory_tx {
                     tx.send(factory_data.clone())
@@ -255,7 +259,8 @@ pub async fn collect_factories(
             &matchers,
             &output_dir,
             &existing_files,
-        )?;
+        )
+        .await?;
 
         if let Some(ref tx) = logs_factory_tx {
             tx.send(factory_data.clone())
@@ -329,7 +334,7 @@ fn parse_data_signature(sig: &str) -> Vec<DynSolType> {
         .collect()
 }
 
-fn process_range(
+async fn process_range(
     range_start: u64,
     range_end: u64,
     logs: Vec<LogData>,
@@ -386,8 +391,8 @@ fn process_range(
         }
     }
 
-    let mut by_collection: HashMap<String, Vec<&FactoryRecord>> = HashMap::new();
-    for record in &records {
+    let mut by_collection: HashMap<String, Vec<FactoryRecord>> = HashMap::new();
+    for record in records {
         by_collection
             .entry(record.collection_name.clone())
             .or_default()
@@ -412,11 +417,17 @@ fn process_range(
             continue;
         }
 
-        write_factory_records_to_parquet(&collection_records, &output_dir.join(&file_name))?;
+        let record_count = collection_records.len();
+        let output_path = output_dir.join(&file_name);
+        tokio::task::spawn_blocking(move || {
+            write_factory_records_to_parquet(&collection_records, &output_path)
+        })
+        .await
+        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
 
         tracing::info!(
             "Wrote {} factory addresses for {} to {}",
-            collection_records.len(),
+            record_count,
             collection_name,
             output_dir.join(&file_name).display()
         );
@@ -454,7 +465,7 @@ fn decode_address_from_data(data: &[u8], types: &[DynSolType], index: usize) -> 
 }
 
 fn write_factory_records_to_parquet(
-    records: &[&FactoryRecord],
+    records: &[FactoryRecord],
     output_path: &Path,
 ) -> Result<(), FactoryCollectionError> {
     let schema = Arc::new(Schema::new(vec![

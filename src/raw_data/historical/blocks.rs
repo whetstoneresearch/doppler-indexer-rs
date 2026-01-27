@@ -41,6 +41,9 @@ pub enum BlockCollectionError {
 
     #[error("Channel send error")]
     ChannelSend,
+
+    #[error("Task join error: {0}")]
+    JoinError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -195,9 +198,16 @@ pub async fn collect_blocks(
                 }
 
                 let count = all_records.len();
+                let schema_clone = schema.clone();
+                let fields_vec = fields.to_vec();
+                let output_path = output_dir.join(range.file_name());
                 #[cfg(feature = "bench")]
                 let write_start = Instant::now();
-                write_minimal_blocks_to_parquet(&all_records, &schema, fields, &output_dir.join(range.file_name()))?;
+                tokio::task::spawn_blocking(move || {
+                    write_minimal_blocks_to_parquet(&all_records, &schema_clone, &fields_vec, &output_path)
+                })
+                .await
+                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
                 #[cfg(feature = "bench")]
                 {
                     let write_time = write_start.elapsed();
@@ -252,9 +262,15 @@ pub async fn collect_blocks(
                 }
 
                 let count = all_records.len();
+                let schema_clone = schema.clone();
+                let output_path = output_dir.join(range.file_name());
                 #[cfg(feature = "bench")]
                 let write_start = Instant::now();
-                write_full_blocks_to_parquet(&all_records, &schema, &output_dir.join(range.file_name()))?;
+                tokio::task::spawn_blocking(move || {
+                    write_full_blocks_to_parquet(&all_records, &schema_clone, &output_path)
+                })
+                .await
+                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
                 #[cfg(feature = "bench")]
                 {
                     let write_time = write_start.elapsed();

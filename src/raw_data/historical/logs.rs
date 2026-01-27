@@ -30,6 +30,9 @@ pub enum LogCollectionError {
 
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+
+    #[error("Task join error: {0}")]
+    JoinError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -220,7 +223,7 @@ pub async fn collect_logs(
                     );
                 }
 
-                process_range(&range, logs, log_fields, &schema, &output_dir)?;
+                process_range(&range, logs, log_fields, &schema, &output_dir).await?;
             }
         }
     }
@@ -256,7 +259,7 @@ pub async fn collect_logs(
                 .collect();
         }
 
-        process_range(&range, logs, log_fields, &schema, &output_dir)?;
+        process_range(&range, logs, log_fields, &schema, &output_dir).await?;
     }
 
     tracing::info!("Log collection complete for chain {}", chain.name);
@@ -280,7 +283,7 @@ fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
     addresses
 }
 
-fn process_range(
+async fn process_range(
     range: &BlockRange,
     logs: Vec<LogData>,
     log_fields: &Option<Vec<LogField>>,
@@ -308,7 +311,14 @@ fn process_range(
                     data: l.data,
                 })
                 .collect();
-            write_minimal_logs_to_parquet(&records, schema, fields, &output_dir.join(range.file_name()))?;
+            let schema_clone = schema.clone();
+            let fields_vec = fields.to_vec();
+            let output_path = output_dir.join(range.file_name());
+            tokio::task::spawn_blocking(move || {
+                write_minimal_logs_to_parquet(&records, &schema_clone, &fields_vec, &output_path)
+            })
+            .await
+            .map_err(|e| LogCollectionError::JoinError(e.to_string()))??;
         }
         None => {
             let records: Vec<FullLogRecord> = logs
@@ -323,7 +333,13 @@ fn process_range(
                     data: l.data,
                 })
                 .collect();
-            write_full_logs_to_parquet(&records, schema, &output_dir.join(range.file_name()))?;
+            let schema_clone = schema.clone();
+            let output_path = output_dir.join(range.file_name());
+            tokio::task::spawn_blocking(move || {
+                write_full_logs_to_parquet(&records, &schema_clone, &output_path)
+            })
+            .await
+            .map_err(|e| LogCollectionError::JoinError(e.to_string()))??;
         }
     }
 

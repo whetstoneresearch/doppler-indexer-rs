@@ -39,6 +39,9 @@ pub enum EthCallCollectionError {
 
     #[error("Parameter error: {0}")]
     Param(#[from] ParamError),
+
+    #[error("Task join error: {0}")]
+    JoinError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -498,9 +501,15 @@ async fn process_factory_range(
             all_results
                 .sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
+            let result_count = all_results.len();
+            let output_path = output_dir.join(&file_name);
             #[cfg(feature = "bench")]
             let write_start = Instant::now();
-            write_results_to_parquet(&all_results, &output_dir.join(&file_name), max_params)?;
+            tokio::task::spawn_blocking(move || {
+                write_results_to_parquet(&all_results, &output_path, max_params)
+            })
+            .await
+            .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
             #[cfg(feature = "bench")]
             {
                 let write_time = write_start.elapsed();
@@ -508,7 +517,7 @@ async fn process_factory_range(
                     &format!("eth_calls_{}.{}", collection_name, function_name),
                     range.start,
                     range.end,
-                    all_results.len(),
+                    result_count,
                     rpc_time,
                     process_time,
                     write_time,
@@ -517,7 +526,7 @@ async fn process_factory_range(
 
             tracing::info!(
                 "Wrote {} factory eth_call results to {}",
-                all_results.len(),
+                result_count,
                 output_dir.join(&file_name).display()
             );
         }
@@ -724,13 +733,15 @@ async fn process_range(
 
         all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
+        let result_count = all_results.len();
+        let output_path = output_dir.join(&file_name);
         #[cfg(feature = "bench")]
         let write_start = Instant::now();
-        write_results_to_parquet(
-            &all_results,
-            &output_dir.join(&file_name),
-            max_params,
-        )?;
+        tokio::task::spawn_blocking(move || {
+            write_results_to_parquet(&all_results, &output_path, max_params)
+        })
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
         #[cfg(feature = "bench")]
         {
             let write_time = write_start.elapsed();
@@ -738,7 +749,7 @@ async fn process_range(
                 &format!("eth_calls_{}.{}", contract_name, function_name),
                 range.start,
                 range.end,
-                all_results.len(),
+                result_count,
                 rpc_time,
                 process_time,
                 write_time,
@@ -747,7 +758,7 @@ async fn process_range(
 
         tracing::info!(
             "Wrote {} eth_call results to {}",
-            all_results.len(),
+            result_count,
             output_dir.join(&file_name).display()
         );
     }

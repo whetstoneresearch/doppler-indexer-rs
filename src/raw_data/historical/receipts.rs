@@ -38,6 +38,9 @@ pub enum ReceiptCollectionError {
 
     #[error("Channel send error")]
     ChannelSend,
+
+    #[error("Task join error: {0}")]
+    JoinError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -291,19 +294,30 @@ async fn process_range(
 
     #[cfg(feature = "bench")]
     let write_start = Instant::now();
-    match receipt_fields {
+    let total_receipts = match receipt_fields {
         Some(fields) => {
-            write_minimal_receipts_to_parquet(&all_minimal_records, schema, fields, &output_dir.join(range.file_name()))?;
+            let count = all_minimal_records.len();
+            let schema_clone = schema.clone();
+            let fields_vec = fields.to_vec();
+            let output_path = output_dir.join(range.file_name());
+            tokio::task::spawn_blocking(move || {
+                write_minimal_receipts_to_parquet(&all_minimal_records, &schema_clone, &fields_vec, &output_path)
+            })
+            .await
+            .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+            count
         }
         None => {
-            write_full_receipts_to_parquet(&all_full_records, schema, &output_dir.join(range.file_name()))?;
+            let count = all_full_records.len();
+            let schema_clone = schema.clone();
+            let output_path = output_dir.join(range.file_name());
+            tokio::task::spawn_blocking(move || {
+                write_full_receipts_to_parquet(&all_full_records, &schema_clone, &output_path)
+            })
+            .await
+            .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+            count
         }
-    }
-
-    let total_receipts = if receipt_fields.is_some() {
-        all_minimal_records.len()
-    } else {
-        all_full_records.len()
     };
 
     #[cfg(feature = "bench")]
