@@ -7,7 +7,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
-use governor::clock::{QuantaClock, QuantaInstant};
+use governor::clock::{Clock, QuantaClock, QuantaInstant};
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Jitter, Quota, RateLimiter};
@@ -135,20 +135,35 @@ impl AlchemyClient {
         &self.inner
     }
 
+    /// Atomically consume N compute units, waiting if necessary.
+    /// This replaces the old per-unit loop which added up to N*jitter latency.
     async fn consume_compute_units(&self, cost: ComputeUnitCost) {
-        let units = cost.cost();
-        for _ in 0..units {
-            self.cu_rate_limiter
-                .until_ready_with_jitter(self.jitter)
-                .await;
-        }
+        self.consume_compute_units_raw(cost.cost()).await;
     }
 
+    /// Atomically consume N compute units, waiting if necessary.
     async fn consume_compute_units_raw(&self, units: u32) {
-        for _ in 0..units {
-            self.cu_rate_limiter
-                .until_ready_with_jitter(self.jitter)
-                .await;
+        let units = match NonZeroU32::new(units) {
+            Some(n) => n,
+            None => return, // Zero cost, nothing to consume
+        };
+
+        loop {
+            match self.cu_rate_limiter.check_n(units) {
+                Ok(Ok(())) => return,
+                Ok(Err(not_until)) => {
+                    let wait_time = not_until.wait_time_from(self.cu_rate_limiter.clock().now());
+                    tokio::time::sleep(wait_time).await;
+                }
+                Err(_insufficient_capacity) => {
+                    for _ in 0..units.get() {
+                        self.cu_rate_limiter
+                            .until_ready_with_jitter(self.jitter)
+                            .await;
+                    }
+                    return;
+                }
+            }
         }
     }
 
