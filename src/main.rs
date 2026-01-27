@@ -77,26 +77,33 @@ async fn main() -> anyhow::Result<()> {
             has_factory_calls
         );
 
-        let (block_tx, block_rx) = mpsc::channel(1000);
-        let (log_tx, log_rx) = mpsc::channel(1000);
-        let (eth_call_tx, eth_call_rx) = mpsc::channel(1000);
+        // Channel capacities from config, with sensible defaults
+        let channel_capacity = config.raw_data_collection.channel_capacity.unwrap_or(1000);
+        let factory_channel_capacity = config
+            .raw_data_collection
+            .factory_channel_capacity
+            .unwrap_or(1000);
+
+        let (block_tx, block_rx) = mpsc::channel(channel_capacity);
+        let (log_tx, log_rx) = mpsc::channel(channel_capacity);
+        let (eth_call_tx, eth_call_rx) = mpsc::channel(channel_capacity);
 
         let (factory_log_tx, factory_log_rx) = if has_factories {
-            let (tx, rx) = mpsc::channel(1000);
+            let (tx, rx) = mpsc::channel(channel_capacity);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
 
         let (logs_factory_tx, logs_factory_rx) = if needs_factory_filtering {
-            let (tx, rx) = mpsc::channel(100);
+            let (tx, rx) = mpsc::channel(factory_channel_capacity);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
 
         let (eth_calls_factory_tx, eth_calls_factory_rx) = if has_factory_calls {
-            let (tx, rx) = mpsc::channel(100);
+            let (tx, rx) = mpsc::channel(factory_channel_capacity);
             (Some(tx), Some(rx))
         } else {
             (None, None)

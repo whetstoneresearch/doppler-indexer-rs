@@ -6,6 +6,10 @@ pub struct RawDataCollectionConfig {
     pub rpc_batch_size: Option<u32>,
     pub fields: FieldsConfig,
     pub contract_logs_only: Option<bool>,
+    /// Capacity for main channels (blocks, logs, eth_calls). Default: 1000
+    pub channel_capacity: Option<usize>,
+    /// Capacity for factory-related channels. Default: 1000
+    pub factory_channel_capacity: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
