@@ -433,7 +433,7 @@ fn build_block_schema(fields: &Option<Vec<BlockField>>) -> Arc<Schema> {
                             .push(Field::new("transaction_count", DataType::UInt32, false));
                         arrow_fields.push(Field::new(
                             "transaction_hashes",
-                            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                             false,
                         ));
                     }
@@ -472,7 +472,7 @@ fn build_block_schema(fields: &Option<Vec<BlockField>>) -> Arc<Schema> {
                 Field::new("transaction_count", DataType::UInt32, false),
                 Field::new(
                     "transaction_hashes",
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                     false,
                 ),
                 Field::new("uncle_count", DataType::UInt32, false),
