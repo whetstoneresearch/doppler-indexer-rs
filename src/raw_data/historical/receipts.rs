@@ -14,7 +14,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
-
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{RawDataCollectionConfig, ReceiptField};
@@ -124,7 +123,12 @@ pub async fn collect_receipts(
 
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
 
-    tracing::info!("Starting receipt collection for chain {}", chain.name);
+    tracing::info!(
+        "Starting receipt collection for chain {} (log_tx: {}, factory_log_tx: {})",
+        chain.name,
+        log_tx.is_some(),
+        factory_log_tx.is_some()
+    );
 
     while let Some((block_number, timestamp, tx_hashes)) = block_rx.recv().await {
         let range_start = (block_number / range_size) * range_size;
@@ -243,6 +247,7 @@ async fn send_range_complete(
     range_start: u64,
     range_end: u64,
 ) -> Result<(), ReceiptCollectionError> {
+    tracing::debug!("receipts: sending RangeComplete for {}-{}", range_start, range_end);
     let message = LogMessage::RangeComplete {
         range_start,
         range_end,
@@ -301,12 +306,24 @@ async fn process_range(
     #[cfg(feature = "bench")]
     let mut process_time = std::time::Duration::ZERO;
 
-    for chunk in tx_block_info.chunks(rpc_batch_size) {
+    for (chunk_idx, chunk) in tx_block_info.chunks(rpc_batch_size).enumerate() {
         let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
+
+        tracing::debug!(
+            "receipts: fetching batch {}, {} transactions",
+            chunk_idx,
+            tx_hashes.len()
+        );
 
         #[cfg(feature = "bench")]
         let rpc_start = Instant::now();
-        let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
+        let receipts = match client.get_transaction_receipts_batch(tx_hashes).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("receipts: RPC error fetching receipts: {:?}", e);
+                return Err(e.into());
+            }
+        };
         #[cfg(feature = "bench")]
         {
             rpc_time += rpc_start.elapsed();
@@ -318,16 +335,29 @@ async fn process_range(
 
         match receipt_fields {
             Some(_) => {
-                let records = process_receipts_minimal(&receipts, chunk, &mut batch_logs)?;
+                let records = match process_receipts_minimal(&receipts, chunk, &mut batch_logs) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("receipts: error processing minimal receipts: {:?}", e);
+                        return Err(e);
+                    }
+                };
                 all_minimal_records.extend(records);
             }
             None => {
-                let records = process_receipts_full(&receipts, chunk, &mut batch_logs)?;
+                let records = match process_receipts_full(&receipts, chunk, &mut batch_logs) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("receipts: error processing full receipts: {:?}", e);
+                        return Err(e);
+                    }
+                };
                 all_full_records.extend(records);
             }
         }
 
         if !batch_logs.is_empty() {
+            tracing::debug!("receipts: sending {} logs to channels", batch_logs.len());
             if let Some(sender) = factory_log_tx {
                 sender
                     .send(LogMessage::Logs(batch_logs.clone()))
@@ -400,9 +430,10 @@ fn process_receipts_minimal(
 
     for (i, receipt_opt) in receipts.iter().enumerate() {
         let (tx_hash, block_number, timestamp) = tx_block_info[i];
-        let receipt = receipt_opt
-            .as_ref()
-            .ok_or(ReceiptCollectionError::ReceiptNotFound(tx_hash))?;
+
+        let Some(receipt) = receipt_opt.as_ref() else {
+            continue;
+        };
 
         extract_logs(&receipt.inner.logs(), block_number, timestamp, tx_hash, all_logs);
 
@@ -427,9 +458,10 @@ fn process_receipts_full(
 
     for (i, receipt_opt) in receipts.iter().enumerate() {
         let (tx_hash, block_number, timestamp) = tx_block_info[i];
-        let receipt = receipt_opt
-            .as_ref()
-            .ok_or(ReceiptCollectionError::ReceiptNotFound(tx_hash))?;
+
+        let Some(receipt) = receipt_opt.as_ref() else {
+            continue;
+        };
 
         let inner = &receipt.inner;
         let logs = inner.logs();
