@@ -663,3 +663,140 @@ fn write_parquet(
 
     Ok(())
 }
+
+#[derive(Debug, Clone)]
+pub struct BlockInfoForDownstream {
+    pub block_number: u64,
+    pub timestamp: u64,
+    pub tx_hashes: Vec<B256>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExistingBlockRange {
+    pub start: u64,
+    pub end: u64,
+    pub file_path: PathBuf,
+}
+
+pub fn get_existing_block_ranges(chain_name: &str) -> Vec<ExistingBlockRange> {
+    let blocks_dir = PathBuf::from(format!("data/raw/{}/blocks", chain_name));
+    let mut ranges = Vec::new();
+
+    let entries = match std::fs::read_dir(&blocks_dir) {
+        Ok(entries) => entries,
+        Err(_) => return ranges,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().map(|e| e == "parquet").unwrap_or(false) {
+            continue;
+        }
+
+        let file_name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        // Parse "blocks_START-END" format
+        if !file_name.starts_with("blocks_") {
+            continue;
+        }
+
+        let range_part = &file_name[7..]; // Skip "blocks_"
+        let range_parts: Vec<&str> = range_part.split('-').collect();
+        if range_parts.len() != 2 {
+            continue;
+        }
+
+        let start: u64 = match range_parts[0].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let end: u64 = match range_parts[1].parse::<u64>() {
+            Ok(v) => v + 1, // Convert inclusive end to exclusive
+            Err(_) => continue,
+        };
+
+        ranges.push(ExistingBlockRange {
+            start,
+            end,
+            file_path: path,
+        });
+    }
+
+    ranges.sort_by_key(|r| r.start);
+    ranges
+}
+
+pub fn read_block_info_from_parquet(
+    file_path: &Path,
+) -> Result<Vec<BlockInfoForDownstream>, BlockCollectionError> {
+    use arrow::array::{Array, ListArray, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(file_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        .build()
+        .map_err(|e| BlockCollectionError::Parquet(e))?;
+
+    let mut blocks = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result.map_err(BlockCollectionError::Arrow)?;
+
+        let block_numbers = batch
+            .column_by_name("number")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+
+        let timestamps = batch
+            .column_by_name("timestamp")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+
+        let tx_hashes_col = batch.column_by_name("transaction_hashes");
+
+        if let (Some(numbers), Some(times)) = (block_numbers, timestamps) {
+            for i in 0..batch.num_rows() {
+                let block_number = numbers.value(i);
+                let timestamp = times.value(i);
+
+                // Extract transaction hashes from the list column
+                let tx_hashes: Vec<B256> = if let Some(col) = tx_hashes_col {
+                    if let Some(list_array) = col.as_any().downcast_ref::<ListArray>() {
+                        let values = list_array.value(i);
+                        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
+                            (0..string_array.len())
+                                .filter_map(|j| {
+                                    let hash_str = string_array.value(j);
+                                    // Parse "0x..." format
+                                    let hash_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
+                                    let bytes = hex::decode(hash_str).ok()?;
+                                    if bytes.len() == 32 {
+                                        Some(B256::from_slice(&bytes))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                blocks.push(BlockInfoForDownstream {
+                    block_number,
+                    timestamp,
+                    tx_hashes,
+                });
+            }
+        }
+    }
+
+    blocks.sort_by_key(|b| b.block_number);
+    Ok(blocks)
+}

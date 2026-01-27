@@ -156,6 +156,7 @@ pub async fn collect_logs(
                     }
                     None => {
                         // Channel closed unexpectedly
+                        tracing::warn!("log_rx channel closed unexpectedly");
                         break;
                     }
                 }
@@ -210,9 +211,11 @@ pub async fn collect_logs(
                         }
                     }
                     None => {
+                        tracing::debug!("factory_rx channel closed, pending_ranges: {}", pending_ranges.len());
                         factory_rx = None;
                         // If we have no pending ranges and factory channel is closed, we might be done
                         if pending_ranges.is_empty() {
+                            tracing::warn!("factory_rx closed with no pending ranges - breaking");
                             break;
                         }
                     }

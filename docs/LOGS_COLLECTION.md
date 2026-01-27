@@ -108,7 +108,29 @@ See [Factory Collection](./FACTORY_COLLECTION.md) for more details on factory ad
 
 ## Resumability
 
-Collection is resumable. On each run, existing Parquet files are scanned and their ranges are skipped. To re-collect a range, delete the corresponding file.
+Collection is resumable through coordination with the receipt collector:
+
+### Catchup Behavior
+
+The logs collector itself doesn't perform independent catchup. Instead, the receipt collector handles this by:
+
+1. Checking if logs parquet files exist for each block range
+2. Re-processing ranges where logs files are missing (even if receipt files exist)
+3. Sending log data to the logs collector, which then writes the parquet files
+
+This ensures that if the indexer crashes after writing receipts but before logs complete, the logs will be regenerated on the next run.
+
+### Skipping Existing Ranges
+
+During normal operation, the logs collector skips ranges where the parquet file already exists. This check happens before writing, not during accumulation.
+
+### Empty Range Handling
+
+Parquet files are written even for ranges with no logs (either because no events occurred, or because all logs were filtered out by `contract_logs_only`). This marks the range as processed and prevents unnecessary re-processing.
+
+### Manual Re-collection
+
+To re-collect logs for a range, delete the corresponding file from `data/raw/{chain}/logs/`. You may also need to delete the corresponding receipts file to trigger the receipt collector's catchup logic.
 
 ## Field Configuration
 

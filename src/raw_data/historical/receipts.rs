@@ -14,6 +14,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
+use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
+use crate::raw_data::historical::factories::get_factory_collection_names;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{RawDataCollectionConfig, ReceiptField};
@@ -123,6 +125,9 @@ pub async fn collect_receipts(
 
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
 
+    // Check if factories need to wait for us before processing
+    let has_factories = factory_log_tx.is_some();
+
     tracing::info!(
         "Starting receipt collection for chain {} (log_tx: {}, factory_log_tx: {})",
         chain.name,
@@ -130,6 +135,117 @@ pub async fn collect_receipts(
         factory_log_tx.is_some()
     );
 
+    // =========================================================================
+    // Catchup phase: Process any ranges where blocks exist but receipts don't
+    // Also check for missing logs files - if receipts exist but logs don't, we
+    // need to re-process to regenerate the logs data
+    // Also check for missing factory files - if factories are configured but
+    // factory files don't exist, we need to re-process
+    // =========================================================================
+    let block_ranges = get_existing_block_ranges(&chain.name);
+    let mut catchup_count = 0;
+
+    // Check existing logs files
+    let logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
+    let existing_logs_files = scan_existing_logs_files(&logs_dir);
+
+    // Check existing factory files if factories are configured
+    let factory_collections = get_factory_collection_names(&chain.contracts);
+    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain.name));
+    let existing_factory_files = if !factory_collections.is_empty() {
+        scan_factory_files(&factories_dir)
+    } else {
+        HashSet::new()
+    };
+
+    for block_range in &block_ranges {
+        let range = BlockRange {
+            start: block_range.start,
+            end: block_range.end,
+        };
+
+        let receipts_exist = existing_files.contains(&range.file_name());
+        let logs_file_name = format!("logs_{}-{}.parquet", range.start, range.end - 1);
+        let logs_exist = existing_logs_files.contains(&logs_file_name);
+
+        // Check if all factory files exist for this range
+        let factories_exist = factory_collections.is_empty()
+            || factory_collections.iter().all(|collection| {
+                let file_name = format!("{}_{}-{}.parquet", collection, range.start, range.end - 1);
+                existing_factory_files.contains(&file_name)
+            });
+
+        // Skip only if receipts, logs, AND factories all exist (or aren't needed)
+        // If any are missing, we need to re-process the range
+        if receipts_exist && (logs_exist || log_tx.is_none()) && factories_exist {
+            // Still need to signal range complete for downstream collectors
+            // when catching up, so they know this range is done
+            if has_factories {
+                send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+            }
+            continue;
+        }
+
+        // Read block info from the existing parquet file
+        let block_infos = match read_block_info_from_parquet(&block_range.file_path) {
+            Ok(infos) => infos,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read block info from {}: {}",
+                    block_range.file_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        if block_infos.is_empty() {
+            continue;
+        }
+
+        tracing::info!(
+            "Catchup: processing receipts for blocks {}-{} from existing block file",
+            range.start,
+            range.end - 1
+        );
+
+        let blocks: Vec<BlockInfo> = block_infos
+            .into_iter()
+            .map(|info| BlockInfo {
+                block_number: info.block_number,
+                timestamp: info.timestamp,
+                tx_hashes: info.tx_hashes,
+            })
+            .collect();
+
+        process_range(
+            &range,
+            blocks,
+            client,
+            receipt_fields,
+            &schema,
+            &output_dir,
+            &log_tx,
+            &factory_log_tx,
+            rpc_batch_size,
+        )
+        .await?;
+
+        send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+        catchup_count += 1;
+    }
+
+    if catchup_count > 0 {
+        tracing::info!(
+            "Catchup complete: processed {} receipt ranges for chain {}",
+            catchup_count,
+            chain.name
+        );
+    }
+
+    // =========================================================================
+    // Normal phase: Process new blocks from the channel
+    // =========================================================================
     while let Some((block_number, timestamp, tx_hashes)) = block_rx.recv().await {
         let range_start = (block_number / range_size) * range_size;
 
@@ -289,15 +405,6 @@ async fn process_range(
         }
     }
 
-    if tx_block_info.is_empty() {
-        tracing::info!(
-            "No transactions in blocks {}-{}, skipping",
-            range.start,
-            range.end - 1
-        );
-        return Ok(());
-    }
-
     let mut all_minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut all_full_records: Vec<FullReceiptRecord> = Vec::new();
 
@@ -305,6 +412,15 @@ async fn process_range(
     let mut rpc_time = std::time::Duration::ZERO;
     #[cfg(feature = "bench")]
     let mut process_time = std::time::Duration::ZERO;
+
+    if tx_block_info.is_empty() {
+        tracing::info!(
+            "No transactions in blocks {}-{}, writing empty receipts file",
+            range.start,
+            range.end - 1
+        );
+        // Fall through to write empty parquet file
+    }
 
     for (chunk_idx, chunk) in tx_block_info.chunks(rpc_batch_size).enumerate() {
         let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
@@ -514,6 +630,34 @@ fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if name.starts_with("receipts_") && name.ends_with(".parquet") {
+                    files.insert(name.to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
+fn scan_existing_logs_files(dir: &Path) -> HashSet<String> {
+    let mut files = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("logs_") && name.ends_with(".parquet") {
+                    files.insert(name.to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
+fn scan_factory_files(dir: &Path) -> HashSet<String> {
+    let mut files = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".parquet") {
                     files.insert(name.to_string());
                 }
             }

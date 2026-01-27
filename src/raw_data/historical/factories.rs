@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::Address;
-use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, StringBuilder, UInt64Array};
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, StringBuilder, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -153,9 +153,18 @@ pub async fn collect_factories(
         matchers.len()
     );
 
-    while let Some(message) = log_rx.recv().await {
+    loop {
+        let message = match log_rx.recv().await {
+            Some(msg) => msg,
+            None => {
+                tracing::warn!("factories: log_rx channel closed unexpectedly");
+                break;
+            }
+        };
+
         match message {
             LogMessage::Logs(logs) => {
+                tracing::debug!("factories: received {} logs", logs.len());
                 for log in logs {
                     let range_start = (log.block_number / range_size) * range_size;
                     range_data.entry(range_start).or_default().push(log);
@@ -165,6 +174,7 @@ pub async fn collect_factories(
                 range_start,
                 range_end,
             } => {
+                tracing::debug!("factories: received RangeComplete for {}-{}", range_start, range_end);
                 let logs = range_data.remove(&range_start).unwrap_or_default();
 
                 let factory_data = process_range(
@@ -319,6 +329,8 @@ async fn process_range(
             .push(record);
     }
 
+    let collections_with_events: HashSet<String> = by_collection.keys().cloned().collect();
+
     for (collection_name, collection_records) in by_collection {
         let file_name = format!(
             "{}_{}-{}.parquet",
@@ -351,6 +363,32 @@ async fn process_range(
             collection_name,
             output_dir.join(&file_name).display()
         );
+    }
+
+    for matcher in matchers {
+        let collection_name = &matcher.collection_name;
+        if !collections_with_events.contains(collection_name) {
+            let file_name = format!(
+                "{}_{}-{}.parquet",
+                collection_name,
+                range_start,
+                range_end - 1
+            );
+
+            if !existing_files.contains(&file_name) {
+                let output_path = output_dir.join(&file_name);
+                tokio::task::spawn_blocking(move || write_empty_factory_parquet(&output_path))
+                    .await
+                    .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+
+                tracing::debug!(
+                    "Wrote empty factory file for {} range {}-{}",
+                    collection_name,
+                    range_start,
+                    range_end - 1
+                );
+            }
+        }
     }
 
     Ok(FactoryAddressData {
@@ -588,4 +626,54 @@ pub fn get_factory_call_configs(
     }
 
     configs
+}
+
+pub fn get_factory_collection_names(contracts: &Contracts) -> Vec<String> {
+    let mut names = Vec::new();
+
+    for (_, contract) in contracts {
+        if let Some(factories) = &contract.factories {
+            for factory in factories {
+                if !names.contains(&factory.collection_name) {
+                    names.push(factory.collection_name.clone());
+                }
+            }
+        }
+    }
+
+    names
+}
+
+fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollectionError> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("block_timestamp", DataType::UInt64, false),
+        Field::new("factory_address", DataType::FixedSizeBinary(20), false),
+        Field::new("collection_name", DataType::Utf8, false),
+    ]));
+
+    let block_numbers: UInt64Array = std::iter::empty::<Option<u64>>().collect();
+    let timestamps: UInt64Array = std::iter::empty::<Option<u64>>().collect();
+    let addresses = FixedSizeBinaryArray::try_from_iter(std::iter::empty::<&[u8]>())?;
+    let names: StringArray = std::iter::empty::<Option<&str>>().collect();
+
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(block_numbers),
+        Arc::new(timestamps),
+        Arc::new(addresses),
+        Arc::new(names),
+    ];
+
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+
+    let file = File::create(output_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
 }

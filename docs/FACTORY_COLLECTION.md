@@ -306,15 +306,34 @@ GROUP BY collection_name;
 
 ## Resumability
 
-Collection is fully resumable:
+Collection is fully resumable with multiple safeguards:
 
-1. **Factory parquet skipping**: Existing parquet files are scanned on startup and their ranges are skipped during collection
-2. **Downstream collector notification**: On startup, factory addresses from existing parquet files are read and sent to the logs and eth_calls collectors. This allows those collectors to process ranges that they haven't yet handled, even if the factory collector already processed them in a previous run
+### Factory Parquet Skipping
+
+Existing parquet files are scanned on startup and their ranges are skipped during collection.
+
+### Empty Range Handling
+
+For each block range processed, the factory collector writes a parquet file for **every configured collection**, even if no factory events were found for that collection in the range. This ensures:
+
+1. The receipt collector's catchup logic can verify factory processing is complete
+2. Ranges with no factory activity aren't re-processed on subsequent runs
+3. Downstream collectors know the range was fully processed
+
+### Downstream Collector Notification
+
+On startup, factory addresses from existing parquet files are read and sent to the logs and eth_calls collectors. This allows those collectors to process ranges that they haven't yet handled, even if the factory collector already processed them in a previous run.
+
+### Catchup Coordination
+
+The receipt collector checks for factory files during its catchup phase. If block files exist but factory files are missing for any configured collection, the receipt collector will re-process that range, which triggers factory collection.
 
 This means if you have:
-- Factory parquet files for ranges 0-999, 1000-1999, 2000-2999
-- Logs parquet files for ranges 0-999, 1000-1999 (missing 2000-2999)
+- Block parquet files for ranges 0-999, 1000-1999, 2000-2999
+- Factory parquet files for ranges 0-999, 1000-1999 (missing 2000-2999)
 
-On the next run, the logs collector will receive factory addresses for all three ranges, allowing it to properly filter logs for range 2000-2999.
+On the next run, the receipt collector will detect the missing factory files and re-process range 2000-2999, ensuring factory collection completes.
 
-To re-collect a factory range, delete the corresponding file from `data/derived/{chain}/factories/`.
+### Manual Re-collection
+
+To re-collect a factory range, delete the corresponding file from `data/derived/{chain}/factories/`. Note that you may also need to delete the corresponding receipts file to trigger re-processing.

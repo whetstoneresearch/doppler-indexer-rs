@@ -214,6 +214,26 @@ For frequently-used factories (e.g., token deployers), this can generate many ca
 
 See [Factory Collection](./FACTORY_COLLECTION.md) for details on how factory addresses are discovered.
 
+## Resumability
+
+Collection is fully resumable with catchup logic for regular eth_calls:
+
+### Catchup Phase (Regular Calls)
+
+On startup, the eth_call collector performs a catchup phase for regular (non-factory) calls:
+
+1. **Scans existing block files** - Reads `data/raw/{chain}/blocks/` to find all available block ranges
+2. **Checks existing eth_call files** - For each block range, checks if eth_call parquet files exist for all configured contract/function pairs
+3. **Re-processes missing ranges** - If any eth_call files are missing, reads block info from the existing block parquet file and executes the calls
+
+### Factory Calls
+
+Factory eth_calls are handled during the normal processing phase (not during catchup). When the factory collector sends addresses, those calls are executed regardless of what catchup has processed. This is because factory addresses may not be known until the factory collector processes the corresponding log data.
+
+### Manual Re-collection
+
+To re-collect eth_calls for a range, delete the corresponding file from `data/raw/{chain}/eth_calls/`.
+
 ## Limitations
 
 - No state override support (calls use the actual on-chain state)

@@ -81,7 +81,28 @@ data/raw/ethereum/receipts/
 
 ## Resumability
 
-Collection is resumable. On each run, existing Parquet files are scanned and their ranges are skipped. To re-collect a range, delete the corresponding file.
+Collection is fully resumable with comprehensive catchup logic:
+
+### Catchup Phase
+
+On startup, the receipt collector performs a catchup phase before listening for new blocks:
+
+1. **Scans existing block files** - Reads `data/raw/{chain}/blocks/` to find all available block ranges
+2. **Checks downstream files** - For each block range, checks if:
+   - Receipt parquet file exists
+   - Logs parquet file exists (if log collection is enabled)
+   - Factory parquet files exist for all configured collections (if factories are configured)
+3. **Re-processes missing ranges** - If any downstream files are missing, reads block info from the existing block parquet file and re-processes that range
+
+This ensures that if the indexer crashes after writing block files but before completing receipt/log/factory collection, those ranges will be automatically re-processed on restart.
+
+### Empty Range Handling
+
+If a block range contains no transactions, the collector writes an empty parquet file to mark the range as processed. This prevents unnecessary re-processing on subsequent runs.
+
+### Manual Re-collection
+
+To re-collect a range, delete the corresponding file from `data/raw/{chain}/receipts/`. Note that you may also need to delete the corresponding logs and factory files if you want those to be regenerated.
 
 ## Field Configuration
 

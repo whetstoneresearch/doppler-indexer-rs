@@ -16,6 +16,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
 
+use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
@@ -136,6 +137,82 @@ pub async fn collect_eth_calls(
     let mut range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
     let mut range_regular_done: HashSet<u64> = HashSet::new();
     let mut range_factory_done: HashSet<u64> = HashSet::new();
+
+    if has_regular_calls {
+        let block_ranges = get_existing_block_ranges(&chain.name);
+        let mut catchup_count = 0;
+
+        for block_range in &block_ranges {
+            let range = BlockRange {
+                start: block_range.start,
+                end: block_range.end,
+            };
+
+            let all_exist = call_configs.iter().all(|config| {
+                existing_files.contains(&range.file_name(&config.contract_name, &config.function_name))
+            });
+
+            if all_exist {
+                range_regular_done.insert(range.start);
+                continue;
+            }
+
+            let block_infos = match read_block_info_from_parquet(&block_range.file_path) {
+                Ok(infos) => infos,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read block info from {}: {}",
+                        block_range.file_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if block_infos.is_empty() {
+                continue;
+            }
+
+            tracing::info!(
+                "Catchup: processing eth_calls for blocks {}-{} from existing block file",
+                range.start,
+                range.end - 1
+            );
+
+            let blocks: Vec<BlockInfo> = block_infos
+                .into_iter()
+                .map(|info| BlockInfo {
+                    block_number: info.block_number,
+                    timestamp: info.timestamp,
+                })
+                .collect();
+
+            range_data.insert(range.start, blocks.clone());
+
+            process_range(
+                &range,
+                blocks,
+                client,
+                &call_configs,
+                &output_dir,
+                &existing_files,
+                rpc_batch_size,
+                max_params,
+            )
+            .await?;
+
+            range_regular_done.insert(range.start);
+            catchup_count += 1;
+        }
+
+        if catchup_count > 0 {
+            tracing::info!(
+                "Catchup complete: processed {} eth_call ranges for chain {}",
+                catchup_count,
+                chain.name
+            );
+        }
+    }
 
     loop {
         tokio::select! {
