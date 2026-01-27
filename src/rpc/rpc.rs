@@ -292,7 +292,13 @@ impl RpcClient {
         if !self.config.batching_enabled {
             let mut results = Vec::with_capacity(hashes.len());
             for hash in hashes {
-                results.push(self.get_transaction_receipt(hash).await?);
+                match self.get_transaction_receipt(hash).await {
+                    Ok(receipt) => results.push(receipt),
+                    Err(e) => {                        
+                        tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                        results.push(None);
+                    }
+                }
             }
             return Ok(results);
         }
@@ -309,8 +315,14 @@ impl RpcClient {
 
             let results = futures::future::join_all(futures).await;
 
-            for result in results {
-                all_results.push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(receipt) => all_results.push(receipt),
+                    Err(e) => {
+                        tracing::debug!("Skipping receipt for tx {:?}: {}", chunk[i], e);
+                        all_results.push(None);
+                    }
+                }
             }
         }
 
