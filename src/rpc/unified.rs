@@ -12,7 +12,7 @@ pub enum UnifiedRpcClient {
 impl UnifiedRpcClient {    
     pub fn from_url(url: &str) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
-            Ok(Self::Alchemy(AlchemyClient::from_url(url, 330)?))
+            Ok(Self::Alchemy(AlchemyClient::from_url(url, 500)?))
         } else {
             Ok(Self::Standard(RpcClient::from_url(url)?))
         }
@@ -51,6 +51,17 @@ impl UnifiedRpcClient {
         match self {
             Self::Standard(client) => client.get_transaction_receipts_batch(hashes).await,
             Self::Alchemy(client) => client.get_transaction_receipts_batch(hashes).await,
+        }
+    }
+
+    pub async fn get_block_receipts(
+        &self,
+        method_name: &str,
+        block_number: BlockNumberOrTag,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        match self {
+            Self::Standard(client) => client.get_block_receipts(method_name, block_number).await,
+            Self::Alchemy(client) => client.get_block_receipts(method_name, block_number).await,
         }
     }
 

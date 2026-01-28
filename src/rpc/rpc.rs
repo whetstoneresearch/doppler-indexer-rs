@@ -196,6 +196,54 @@ impl RpcClient {
             .map_err(|e| RpcError::ProviderError(e.to_string()))
     }
 
+    pub async fn get_block_receipts(
+        &self,
+        method_name: &str,
+        block_number: BlockNumberOrTag,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        self.wait_for_rate_limit().await;
+
+        let block_param = match block_number {
+            BlockNumberOrTag::Number(n) => format!("0x{:x}", n),
+            BlockNumberOrTag::Latest => "latest".to_string(),
+            BlockNumberOrTag::Earliest => "earliest".to_string(),
+            BlockNumberOrTag::Pending => "pending".to_string(),
+            BlockNumberOrTag::Safe => "safe".to_string(),
+            BlockNumberOrTag::Finalized => "finalized".to_string(),
+        };
+
+        let method = method_name.to_string();
+
+        let raw_receipts: Vec<serde_json::Value> = self
+            .provider
+            .client()
+            .request(method, (block_param,))
+            .await
+            .map_err(|e| RpcError::ProviderError(e.to_string()))?;
+
+        // Parse each receipt individually, returning None for failures
+        let receipts: Vec<Option<TransactionReceipt>> = raw_receipts
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                match serde_json::from_value::<TransactionReceipt>(value) {
+                    Ok(receipt) => Some(receipt),
+                    Err(e) => {
+                        tracing::debug!(
+                            "Skipping receipt {} in block {:?}: {}",
+                            i,
+                            block_number,
+                            e
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        Ok(receipts)
+    }
+
     pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {
         self.wait_for_rate_limit().await;
         self.provider

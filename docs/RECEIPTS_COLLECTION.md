@@ -75,9 +75,57 @@ data/raw/ethereum/receipts/
 
 1. Receives block info (block number, timestamp, tx hashes) from block collector
 2. Accumulates messages until a complete block range is received
-3. Fetches all transaction receipts for the range via batch RPC
+3. Fetches transaction receipts (see [Fetching Strategies](#fetching-strategies) below)
 4. Extracts logs from receipts and forwards to log collector
 5. Writes receipt data to Parquet file
+
+## Fetching Strategies
+
+The receipt collector supports two fetching strategies, configured per-chain via `block_receipts_method`:
+
+### Per-Transaction Fetching (Default)
+
+When `block_receipts_method` is not set, receipts are fetched individually using `eth_getTransactionReceipt`:
+
+- Transactions are batched into chunks (configurable via `rpc_batch_size`, default 100)
+- Each batch is fetched concurrently using `futures::join_all`
+- Rate limiting is applied per batch
+
+This is the most compatible approach and works with all RPC providers.
+
+### Block-Level Fetching
+
+When `block_receipts_method` is set (e.g., `"eth_getBlockReceipts"`), all receipts for a block are fetched in a single RPC call:
+
+```json
+{
+    "name": "optimism",
+    "chain_id": 10,
+    "rpc_url_env_var": "OPTIMISM_RPC_URL",
+    "block_receipts_method": "eth_getBlockReceipts"
+}
+```
+
+**Advantages:**
+- Fewer RPC calls (1 per block vs N per block)
+- More efficient for blocks with many transactions
+- Reduces rate limiting overhead
+
+**Behavior:**
+- Blocks are processed sequentially (no batching) due to large response sizes
+- Rate limiting is applied per block request
+- For Alchemy, each call consumes 500 compute units
+
+**Unsupported Transaction Types:**
+
+Some chains (e.g., Optimism, Base) have transaction types that may not deserialize correctly with standard Ethereum receipt types (e.g., L2 deposit transactions). The collector handles this gracefully:
+
+1. The response is first deserialized as raw JSON (`Vec<serde_json::Value>`)
+2. Each receipt is then parsed individually
+3. Receipts that fail to parse are logged at debug level and skipped
+4. Processing continues with the successfully parsed receipts
+
+This matches the behavior of per-transaction fetching, where individual failures don't abort the entire batch.
 
 ## Resumability
 
@@ -180,6 +228,8 @@ When no fields are specified, all receipt fields are stored:
 
 ## Example Configuration
 
+### Standard (Per-Transaction Fetching)
+
 ```json
 {
   "chains": [
@@ -201,7 +251,30 @@ When no fields are specified, all receipt fields are stored:
 }
 ```
 
+### With Block-Level Fetching (L2 Chains)
+
+```json
+{
+  "chains": [
+    {
+      "name": "optimism",
+      "chain_id": 10,
+      "rpc_url_env_var": "OPTIMISM_RPC_URL",
+      "start_block": "100000000",
+      "block_receipts_method": "eth_getBlockReceipts"
+    }
+  ],
+  "raw_data_collection": {
+    "parquet_block_range": 1000,
+    "fields": {
+      "receipt_fields": ["block_number", "timestamp", "transaction_hash", "from", "to"]
+    }
+  }
+}
+```
+
 This configuration:
-- Writes 10,000 blocks worth of receipts per Parquet file
+- Uses `eth_getBlockReceipts` for efficient block-level receipt fetching
+- Handles L2 deposit transactions gracefully (skips unsupported types)
+- Writes 1,000 blocks worth of receipts per Parquet file
 - Stores only the specified receipt fields (minimal schema)
-- Coordinates with block and log collectors via channels

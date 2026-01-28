@@ -14,6 +14,7 @@ pub struct ChainConfigRaw {
     pub start_block: Option<U256>,
     pub contracts: ContractsOrPath,
     pub tokens: TokensOrPath,
+    pub block_receipts_method: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,7 @@ pub struct ChainConfig {
     pub start_block: Option<U256>,
     pub contracts: Contracts,
     pub tokens: Tokens,
+    pub block_receipts_method: Option<String>,
 }
 
 pub fn resolve_chain_config(raw_config: ChainConfigRaw, base_dir: &Path) -> anyhow::Result<ChainConfig> {
@@ -60,5 +62,6 @@ pub fn resolve_chain_config(raw_config: ChainConfigRaw, base_dir: &Path) -> anyh
         start_block: raw_config.start_block,
         contracts,
         tokens,
+        block_receipts_method: raw_config.block_receipts_method,
     })
 }

@@ -40,6 +40,7 @@ An array of chain configurations. Each chain requires:
 | `start_block` | number | No | Block number to start indexing from |
 | `contracts` | object \| string | Yes | Inline contracts object or path to contracts file/directory |
 | `tokens` | object \| string | Yes | Inline tokens object or path to tokens file/directory |
+| `block_receipts_method` | string | No | RPC method for fetching all receipts in a block (e.g., `eth_getBlockReceipts`) |
 
 Example:
 ```json
@@ -52,6 +53,28 @@ Example:
     "tokens": "tokens/base.json"
 }
 ```
+
+#### Block Receipts Method
+
+Some RPC providers support fetching all transaction receipts for a block in a single call (e.g., `eth_getBlockReceipts`). This is more efficient than fetching receipts individually, especially for blocks with many transactions.
+
+```json
+{
+    "name": "optimism",
+    "chain_id": 10,
+    "rpc_url_env_var": "OPTIMISM_RPC_URL",
+    "block_receipts_method": "eth_getBlockReceipts",
+    "contracts": "contracts/optimism",
+    "tokens": "tokens/optimism.json"
+}
+```
+
+When configured:
+- Receipts are fetched one block at a time using the specified method
+- Individual receipts that fail to deserialize (e.g., L2 deposit transactions) are skipped gracefully
+- Rate limiting is applied per block request
+
+When omitted, the default per-transaction batching is used (`eth_getTransactionReceipt` for each transaction).
 
 ### Raw Data Collection
 

@@ -24,6 +24,7 @@ impl ComputeUnitCost {
     pub const GET_BLOCK_BY_HASH: Self = Self(16);
     pub const GET_TRANSACTION_BY_HASH: Self = Self(17);
     pub const GET_TRANSACTION_RECEIPT: Self = Self(15);
+    pub const GET_BLOCK_RECEIPTS: Self = Self(500);
     pub const GET_LOGS: Self = Self(75);
     pub const GET_BALANCE: Self = Self(19);
     pub const GET_CODE: Self = Self(19);
@@ -231,6 +232,16 @@ impl AlchemyClient {
             .get_transaction_receipt(hash)
             .await
             .map_err(|e| RpcError::ProviderError(e.to_string()))
+    }
+
+    pub async fn get_block_receipts(
+        &self,
+        method_name: &str,
+        block_number: BlockNumberOrTag,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        self.consume_compute_units(ComputeUnitCost::GET_BLOCK_RECEIPTS)
+            .await;
+        self.inner.get_block_receipts(method_name, block_number).await
     }
 
     pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {

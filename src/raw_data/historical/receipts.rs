@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "bench")]
 use std::time::Instant;
 
 use alloy::primitives::B256;
@@ -105,6 +104,61 @@ struct BlockInfo {
     tx_hashes: Vec<B256>,
 }
 
+/// Tracks channel backpressure metrics for monitoring
+#[derive(Debug, Default)]
+struct ChannelMetrics {
+    /// Total time spent blocked on sends
+    total_send_wait_time: std::time::Duration,
+    /// Number of sends performed
+    send_count: u64,
+    /// Number of sends where channel was >50% full
+    high_pressure_sends: u64,
+    /// Number of sends where channel was >90% full
+    critical_pressure_sends: u64,
+    /// Maximum time spent on a single send
+    max_send_time: std::time::Duration,
+    /// Total logs sent
+    total_logs_sent: u64,
+}
+
+impl ChannelMetrics {
+    fn record_send(&mut self, send_time: std::time::Duration, capacity_before: usize, max_capacity: usize) {
+        self.send_count += 1;
+        self.total_send_wait_time += send_time;
+
+        if send_time > self.max_send_time {
+            self.max_send_time = send_time;
+        }
+
+        let fill_ratio = 1.0 - (capacity_before as f64 / max_capacity as f64);
+        if fill_ratio > 0.9 {
+            self.critical_pressure_sends += 1;
+        } else if fill_ratio > 0.5 {
+            self.high_pressure_sends += 1;
+        }
+    }
+
+    fn log_summary(&self, channel_name: &str) {
+        if self.send_count == 0 {
+            return;
+        }
+
+        let avg_send_time = self.total_send_wait_time.as_micros() as f64 / self.send_count as f64;
+        tracing::info!(
+            "Channel '{}' backpressure summary: sends={}, avg_send_time={:.1}µs, max_send_time={:.1}ms, high_pressure={} ({:.1}%), critical_pressure={} ({:.1}%), total_logs={}",
+            channel_name,
+            self.send_count,
+            avg_send_time,
+            self.max_send_time.as_secs_f64() * 1000.0,
+            self.high_pressure_sends,
+            (self.high_pressure_sends as f64 / self.send_count as f64) * 100.0,
+            self.critical_pressure_sends,
+            (self.critical_pressure_sends as f64 / self.send_count as f64) * 100.0,
+            self.total_logs_sent,
+        );
+    }
+}
+
 pub async fn collect_receipts(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,
@@ -128,11 +182,21 @@ pub async fn collect_receipts(
     // Check if factories need to wait for us before processing
     let has_factories = factory_log_tx.is_some();
 
+    // Get channel capacities for backpressure monitoring
+    let log_tx_capacity = log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
+    let factory_log_tx_capacity = factory_log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
+
+    // Initialize channel metrics for backpressure tracking
+    let mut log_tx_metrics = ChannelMetrics::default();
+    let mut factory_log_tx_metrics = ChannelMetrics::default();
+
     tracing::info!(
-        "Starting receipt collection for chain {} (log_tx: {}, factory_log_tx: {})",
+        "Starting receipt collection for chain {} (log_tx: {}, factory_log_tx: {}, log_tx_capacity: {}, factory_log_tx_capacity: {})",
         chain.name,
         log_tx.is_some(),
-        factory_log_tx.is_some()
+        factory_log_tx.is_some(),
+        log_tx_capacity,
+        factory_log_tx_capacity
     );
 
     // =========================================================================
@@ -228,6 +292,11 @@ pub async fn collect_receipts(
             &log_tx,
             &factory_log_tx,
             rpc_batch_size,
+            &mut log_tx_metrics,
+            &mut factory_log_tx_metrics,
+            log_tx_capacity,
+            factory_log_tx_capacity,
+            chain.block_receipts_method.as_deref(),
         )
         .await?;
 
@@ -294,6 +363,11 @@ pub async fn collect_receipts(
                     &log_tx,
                     &factory_log_tx,
                     rpc_batch_size,
+                    &mut log_tx_metrics,
+                    &mut factory_log_tx_metrics,
+                    log_tx_capacity,
+                    factory_log_tx_capacity,
+                    chain.block_receipts_method.as_deref(),
                 )
                 .await?;
 
@@ -302,7 +376,7 @@ pub async fn collect_receipts(
         }
     }
 
-    for (range_start, blocks) in range_data {
+    for (range_start, blocks) in range_data.drain() {
         if blocks.is_empty() {
             continue;
         }
@@ -333,6 +407,11 @@ pub async fn collect_receipts(
             &log_tx,
             &factory_log_tx,
             rpc_batch_size,
+            &mut log_tx_metrics,
+            &mut factory_log_tx_metrics,
+            log_tx_capacity,
+            factory_log_tx_capacity,
+            chain.block_receipts_method.as_deref(),
         )
         .await?;
 
@@ -351,6 +430,14 @@ pub async fn collect_receipts(
             .send(LogMessage::AllRangesComplete)
             .await
             .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+    }
+
+    // Log channel backpressure summaries
+    if log_tx.is_some() {
+        log_tx_metrics.log_summary("log_tx");
+    }
+    if factory_log_tx.is_some() {
+        factory_log_tx_metrics.log_summary("factory_log_tx");
     }
 
     tracing::info!("Receipt collection complete for chain {}", chain.name);
@@ -385,6 +472,96 @@ async fn send_range_complete(
     Ok(())
 }
 
+async fn send_logs_to_channels(
+    batch_logs: Vec<LogData>,
+    log_tx: &Option<Sender<LogMessage>>,
+    factory_log_tx: &Option<Sender<LogMessage>>,
+    log_tx_metrics: &mut ChannelMetrics,
+    factory_log_tx_metrics: &mut ChannelMetrics,
+    log_tx_capacity: usize,
+    factory_log_tx_capacity: usize,
+    total_channel_send_time: &mut std::time::Duration,
+) -> Result<(), ReceiptCollectionError> {
+    let log_count = batch_logs.len();
+    tracing::debug!("receipts: sending {} logs to channels", log_count);
+
+    if let Some(sender) = factory_log_tx {
+        let capacity_before = sender.capacity();
+        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / factory_log_tx_capacity as f64);
+
+        if fill_pct > 90.0 {
+            tracing::warn!(
+                "receipts: factory_log_tx channel at {:.1}% capacity ({}/{}) - downstream may be slow",
+                fill_pct,
+                factory_log_tx_capacity - capacity_before,
+                factory_log_tx_capacity
+            );
+        } else if fill_pct > 50.0 {
+            tracing::debug!(
+                "receipts: factory_log_tx channel at {:.1}% capacity",
+                fill_pct
+            );
+        }
+
+        let send_start = Instant::now();
+        sender
+            .send(LogMessage::Logs(batch_logs.clone()))
+            .await
+            .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+        let send_time = send_start.elapsed();
+        *total_channel_send_time += send_time;
+
+        factory_log_tx_metrics.record_send(send_time, capacity_before, factory_log_tx_capacity);
+        factory_log_tx_metrics.total_logs_sent += log_count as u64;
+
+        if send_time.as_millis() > 100 {
+            tracing::warn!(
+                "receipts: factory_log_tx send took {:.1}ms (blocked on backpressure)",
+                send_time.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    if let Some(sender) = log_tx {
+        let capacity_before = sender.capacity();
+        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / log_tx_capacity as f64);
+
+        if fill_pct > 90.0 {
+            tracing::warn!(
+                "receipts: log_tx channel at {:.1}% capacity ({}/{}) - downstream may be slow",
+                fill_pct,
+                log_tx_capacity - capacity_before,
+                log_tx_capacity
+            );
+        } else if fill_pct > 50.0 {
+            tracing::debug!(
+                "receipts: log_tx channel at {:.1}% capacity",
+                fill_pct
+            );
+        }
+
+        let send_start = Instant::now();
+        sender
+            .send(LogMessage::Logs(batch_logs))
+            .await
+            .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+        let send_time = send_start.elapsed();
+        *total_channel_send_time += send_time;
+
+        log_tx_metrics.record_send(send_time, capacity_before, log_tx_capacity);
+        log_tx_metrics.total_logs_sent += log_count as u64;
+
+        if send_time.as_millis() > 100 {
+            tracing::warn!(
+                "receipts: log_tx send took {:.1}ms (blocked on backpressure)",
+                send_time.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn process_range(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
@@ -395,106 +572,227 @@ async fn process_range(
     log_tx: &Option<Sender<LogMessage>>,
     factory_log_tx: &Option<Sender<LogMessage>>,
     rpc_batch_size: usize,
+    log_tx_metrics: &mut ChannelMetrics,
+    factory_log_tx_metrics: &mut ChannelMetrics,
+    log_tx_capacity: usize,
+    factory_log_tx_capacity: usize,
+    block_receipts_method: Option<&str>,
 ) -> Result<(), ReceiptCollectionError> {
-    tracing::info!("Fetching receipts for blocks {}-{}", range.start, range.end - 1);
-
-    let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
-    for block in &blocks {
-        for tx_hash in &block.tx_hashes {
-            tx_block_info.push((*tx_hash, block.block_number, block.timestamp));
-        }
-    }
+    let range_start_time = Instant::now();
 
     let mut all_minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut all_full_records: Vec<FullReceiptRecord> = Vec::new();
+
+    // Timing metrics (always tracked)
+    let mut total_rpc_time = std::time::Duration::ZERO;
+    let mut total_process_time = std::time::Duration::ZERO;
+    let mut total_channel_send_time = std::time::Duration::ZERO;
 
     #[cfg(feature = "bench")]
     let mut rpc_time = std::time::Duration::ZERO;
     #[cfg(feature = "bench")]
     let mut process_time = std::time::Duration::ZERO;
 
-    if tx_block_info.is_empty() {
+    // Use block-level fetching if a method is configured, otherwise use per-tx batching
+    if let Some(method) = block_receipts_method {
+        // Block-level receipt fetching - one block at a time (no batching due to large responses)
+        let total_blocks = blocks.len();
         tracing::info!(
-            "No transactions in blocks {}-{}, writing empty receipts file",
-            range.start,
-            range.end - 1
-        );
-        // Fall through to write empty parquet file
-    }
-
-    for (chunk_idx, chunk) in tx_block_info.chunks(rpc_batch_size).enumerate() {
-        let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
-
-        tracing::debug!(
-            "receipts: fetching batch {}, {} transactions",
-            chunk_idx,
-            tx_hashes.len()
+            "Fetching receipts for blocks {}-{}: {} blocks using {}",
+            range.start, range.end - 1, total_blocks, method
         );
 
-        #[cfg(feature = "bench")]
-        let rpc_start = Instant::now();
-        let receipts = match client.get_transaction_receipts_batch(tx_hashes).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("receipts: RPC error fetching receipts: {:?}", e);
-                return Err(e.into());
+        for (block_idx, block) in blocks.iter().enumerate() {
+            if block.tx_hashes.is_empty() {
+                continue;
             }
-        };
-        #[cfg(feature = "bench")]
-        {
-            rpc_time += rpc_start.elapsed();
+
+            tracing::debug!(
+                "receipts: fetching block {}/{} (block {})",
+                block_idx + 1,
+                total_blocks,
+                block.block_number
+            );
+
+            let rpc_start = Instant::now();
+            let receipts = match client
+                .get_block_receipts(method, alloy::rpc::types::BlockNumberOrTag::Number(block.block_number))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(
+                        "receipts: RPC error fetching block receipts for block {}: {:?}",
+                        block.block_number,
+                        e
+                    );
+                    return Err(e.into());
+                }
+            };
+            let rpc_elapsed = rpc_start.elapsed();
+            total_rpc_time += rpc_elapsed;
+            #[cfg(feature = "bench")]
+            {
+                rpc_time += rpc_elapsed;
+            }
+
+            let process_start = Instant::now();
+            let mut batch_logs: Vec<LogData> = Vec::new();
+
+            // Build tx_block_info from the receipts themselves
+            // Each receipt has a transaction_hash field we can use
+            let tx_block_info: Vec<(B256, u64, u64)> = receipts
+                .iter()
+                .filter_map(|r| r.as_ref())
+                .map(|r| (r.transaction_hash, block.block_number, block.timestamp))
+                .collect();
+
+            match receipt_fields {
+                Some(_) => {
+                    let records = match process_receipts_minimal(&receipts, &tx_block_info, &mut batch_logs) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("receipts: error processing minimal receipts: {:?}", e);
+                            return Err(e);
+                        }
+                    };
+                    all_minimal_records.extend(records);
+                }
+                None => {
+                    let records = match process_receipts_full(&receipts, &tx_block_info, &mut batch_logs) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("receipts: error processing full receipts: {:?}", e);
+                            return Err(e);
+                        }
+                    };
+                    all_full_records.extend(records);
+                }
+            }
+
+            // Track processing time (up until channel sends)
+            let process_elapsed = process_start.elapsed();
+            total_process_time += process_elapsed;
+
+            if !batch_logs.is_empty() {
+                send_logs_to_channels(
+                    batch_logs,
+                    log_tx,
+                    factory_log_tx,
+                    log_tx_metrics,
+                    factory_log_tx_metrics,
+                    log_tx_capacity,
+                    factory_log_tx_capacity,
+                    &mut total_channel_send_time,
+                )
+                .await?;
+            }
+
+            #[cfg(feature = "bench")]
+            {
+                process_time += process_elapsed;
+            }
+        }
+    } else {
+        // Per-transaction batched fetching (existing logic)
+        let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
+        for block in &blocks {
+            for tx_hash in &block.tx_hashes {
+                tx_block_info.push((*tx_hash, block.block_number, block.timestamp));
+            }
         }
 
-        #[cfg(feature = "bench")]
-        let process_start = Instant::now();
-        let mut batch_logs: Vec<LogData> = Vec::new();
+        let total_txs = tx_block_info.len();
+        let total_batches = (total_txs + rpc_batch_size - 1) / rpc_batch_size;
+        tracing::info!(
+            "Fetching receipts for blocks {}-{}: {} transactions in {} batches",
+            range.start, range.end - 1, total_txs, total_batches
+        );
 
-        match receipt_fields {
-            Some(_) => {
-                let records = match process_receipts_minimal(&receipts, chunk, &mut batch_logs) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("receipts: error processing minimal receipts: {:?}", e);
-                        return Err(e);
-                    }
-                };
-                all_minimal_records.extend(records);
-            }
-            None => {
-                let records = match process_receipts_full(&receipts, chunk, &mut batch_logs) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("receipts: error processing full receipts: {:?}", e);
-                        return Err(e);
-                    }
-                };
-                all_full_records.extend(records);
-            }
+        if tx_block_info.is_empty() {
+            tracing::info!(
+                "No transactions in blocks {}-{}, writing empty receipts file",
+                range.start,
+                range.end - 1
+            );
+            // Fall through to write empty parquet file
         }
 
-        if !batch_logs.is_empty() {
-            tracing::debug!("receipts: sending {} logs to channels", batch_logs.len());
-            if let Some(sender) = factory_log_tx {
-                sender
-                    .send(LogMessage::Logs(batch_logs.clone()))
-                    .await
-                    .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+        for (chunk_idx, chunk) in tx_block_info.chunks(rpc_batch_size).enumerate() {
+            let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
+
+            tracing::debug!(
+                "receipts: fetching batch {}/{}, {} transactions",
+                chunk_idx + 1,
+                total_batches,
+                tx_hashes.len()
+            );
+
+            let rpc_start = Instant::now();
+            let receipts = match client.get_transaction_receipts_batch(tx_hashes).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("receipts: RPC error fetching receipts: {:?}", e);
+                    return Err(e.into());
+                }
+            };
+            let rpc_elapsed = rpc_start.elapsed();
+            total_rpc_time += rpc_elapsed;
+            #[cfg(feature = "bench")]
+            {
+                rpc_time += rpc_elapsed;
             }
 
-            if let Some(sender) = log_tx {
-                sender
-                    .send(LogMessage::Logs(batch_logs))
-                    .await
-                    .map_err(|_| ReceiptCollectionError::ChannelSend)?;
+            let process_start = Instant::now();
+            let mut batch_logs: Vec<LogData> = Vec::new();
+
+            match receipt_fields {
+                Some(_) => {
+                    let records = match process_receipts_minimal(&receipts, chunk, &mut batch_logs) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("receipts: error processing minimal receipts: {:?}", e);
+                            return Err(e);
+                        }
+                    };
+                    all_minimal_records.extend(records);
+                }
+                None => {
+                    let records = match process_receipts_full(&receipts, chunk, &mut batch_logs) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::error!("receipts: error processing full receipts: {:?}", e);
+                            return Err(e);
+                        }
+                    };
+                    all_full_records.extend(records);
+                }
             }
-        }
-        #[cfg(feature = "bench")]
-        {
-            process_time += process_start.elapsed();
+
+            // Track processing time (up until channel sends)
+            let process_elapsed = process_start.elapsed();
+            total_process_time += process_elapsed;
+
+            if !batch_logs.is_empty() {
+                send_logs_to_channels(
+                    batch_logs,
+                    log_tx,
+                    factory_log_tx,
+                    log_tx_metrics,
+                    factory_log_tx_metrics,
+                    log_tx_capacity,
+                    factory_log_tx_capacity,
+                    &mut total_channel_send_time,
+                )
+                .await?;
+            }
+            #[cfg(feature = "bench")]
+            {
+                process_time += process_elapsed;
+            }
         }
     }
 
-    #[cfg(feature = "bench")]
     let write_start = Instant::now();
     let total_receipts = match receipt_fields {
         Some(fields) => {
@@ -521,17 +819,33 @@ async fn process_range(
             count
         }
     };
+    let total_write_time = write_start.elapsed();
 
     #[cfg(feature = "bench")]
     {
-        let write_time = write_start.elapsed();
-        crate::bench::record("receipts", range.start, range.end, total_receipts, rpc_time, process_time, write_time);
+        crate::bench::record("receipts", range.start, range.end, total_receipts, rpc_time, process_time, total_write_time);
     }
 
+    let total_time = range_start_time.elapsed();
+    let rpc_pct = (total_rpc_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+    let process_pct = (total_process_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+    let channel_pct = (total_channel_send_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+    let write_pct = (total_write_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+
     tracing::info!(
-        "Wrote {} receipts to {}",
+        "Receipts {}-{}: {} receipts in {:.1}s | RPC: {:.1}s ({:.0}%) | Process: {:.1}s ({:.0}%) | Channel: {:.1}s ({:.0}%) | Write: {:.1}s ({:.0}%)",
+        range.start,
+        range.end - 1,
         total_receipts,
-        output_dir.join(range.file_name()).display()
+        total_time.as_secs_f64(),
+        total_rpc_time.as_secs_f64(),
+        rpc_pct,
+        total_process_time.as_secs_f64(),
+        process_pct,
+        total_channel_send_time.as_secs_f64(),
+        channel_pct,
+        total_write_time.as_secs_f64(),
+        write_pct
     );
 
     Ok(())
