@@ -1,6 +1,50 @@
 {
     "ZoraFactory": {
-        "address": "0x777777751622c0d3258f214F9DF38E35BF45baF3"
+        "address": "0x777777751622c0d3258f214F9DF38E35BF45baF3",
+        "factories": [
+            {
+                "collection_name": "ZoraCreatorCoinV4",
+                "factory_events": [
+                    {
+                        "name": "CreatorCoinCreated",
+                        "topics_signature": "address,address,address",
+                        "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
+                        "factory_parameters": "data[4]"
+                    }
+                ]
+            },
+            {
+                "collection_name": "ZoraCreatorCoinHook",
+                "factory_events": [
+                    {
+                        "name": "CreatorCoinCreated",
+                        "topics_signature": "address,address,address",
+                        "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
+                        "factory_parameters": "data[5][4]"
+                    }
+                ]
+            },
+            {
+                "collection_name": "ZoraCoinV4",
+                "factory_events": {
+                    "name": "CoinCreatedV4",
+                    "topics_signature": "address,address,address",
+                    "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
+                    "factory_parameters": "data[4]"
+                }
+            },
+            {
+                "collection_name": "ZoraV4Hook",
+                "factory_events": [
+                    {
+                        "name": "CoinCreatedV4",
+                        "topics_signature": "address,address,address",
+                        "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
+                        "factory_parameters": "data[5][4]"
+                    }
+                ]
+            }
+        ]
     },
     "ZoraToken": {
         "address": "0x1111111111166b7FE7bd91427724B487980aFc69"

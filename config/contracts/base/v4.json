@@ -12,6 +12,18 @@
             "0x82Ac010C67f70BACf7655cd8948a4AD92A173CAC", 
             "0xED344444633B965cd148F8fFCE3765938A179094",
             "0x53b4c21a6Cb61D64F636ABBfa6E8E90E6558e8ad"
+        ],
+        "factories": [
+            {
+                "collection_name": "DopplerV4Pool",
+                "factory_events": [
+                    {
+                        "name": "Create",
+                        "topics_signature":  "address,address,address",
+                        "factory_parameters": "topics[1]"
+                    }
+                ]
+            }
         ]
     },
     "UniswapV4Migrator": {

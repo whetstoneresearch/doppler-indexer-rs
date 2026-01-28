@@ -36,6 +36,6 @@
                 "data"
             ]
         },
-        "contract_logs_only": true        
+        "contract_logs_only": false        
     }
 }

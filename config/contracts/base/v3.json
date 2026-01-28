@@ -3,10 +3,30 @@
         "address": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
     },
     "UniswapV3Initializer": {
-        "address": "0xaA47D2977d622DBdFD33eeF6a8276727c52EB4e5"
+        "address": "0xaA47D2977d622DBdFD33eeF6a8276727c52EB4e5",
+        "factories": [
+            {
+                "collection_name": "DopplerV3Pool",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address,address,address",
+                    "factory_parameters": "topics[1]"                
+                }
+            }
+        ]
     },
     "LockableUniswapV3Initializer": {
-        "address": "0xE0dC4012AC9C868F09c6e4b20d66ED46D6F258d0"
+        "address": "0xE0dC4012AC9C868F09c6e4b20d66ED46D6F258d0",
+        "factories": [
+            {
+                "collection_name": "DopplerLockableV3Pool",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address,address,address",
+                    "factory_parameters": "topics[1]"                
+                }
+            }
+        ]
     },
     "UniswapV3Migrator": {
         "address": "0x9C18A677902d2068be71e1A6bb11051fb69C74d5"
