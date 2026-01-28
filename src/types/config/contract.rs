@@ -17,8 +17,7 @@ pub struct ContractConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FactoryConfig {
     pub collection_name: String,
-    pub factory_events: FactoryEventConfig,
-    pub factory_parameters: String,
+    pub factory_events: FactoryEventConfigOrArray,
     #[serde(default)]
     pub calls: Vec<EthCallConfig>,
 }
@@ -27,30 +26,82 @@ pub struct FactoryConfig {
 pub struct FactoryEventConfig {
     pub name: String,
     pub topics_signature: String,
-    pub data_signature: String,
+    #[serde(default)]
+    pub data_signature: Option<String>,
+    pub factory_parameters: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum FactoryEventConfigOrArray {
+    Single(FactoryEventConfig),
+    Multiple(Vec<FactoryEventConfig>),
+}
+
+impl FactoryEventConfigOrArray {
+    pub fn into_vec(self) -> Vec<FactoryEventConfig> {
+        match self {
+            Self::Single(config) => vec![config],
+            Self::Multiple(configs) => configs,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum FactoryParameterLocation {
     Topic(usize),
-    Data(usize),
+    Data(Vec<usize>),
 }
 
-impl FactoryConfig {
+fn parse_bracket_indices(param: &str) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut chars = param.chars().peekable();
+
+    // Skip prefix (data/topics)
+    while let Some(c) = chars.peek() {
+        if *c == '[' {
+            break;
+        }
+        chars.next();
+    }
+
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let mut num_str = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc == ']' {
+                    chars.next();
+                    break;
+                }
+                num_str.push(nc);
+                chars.next();
+            }
+            if let Ok(idx) = num_str.parse::<usize>() {
+                indices.push(idx);
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        indices.push(0);
+    }
+    indices
+}
+
+impl FactoryEventConfig {
     pub fn compute_event_signature(&self) -> [u8; 32] {
         let mut all_types = Vec::new();
 
-        if !self.factory_events.topics_signature.is_empty() {
-            all_types.push(self.factory_events.topics_signature.as_str());
+        if !self.topics_signature.is_empty() {
+            all_types.push(self.topics_signature.as_str());
         }
-        if !self.factory_events.data_signature.is_empty() {
-            all_types.push(self.factory_events.data_signature.as_str());
+        if let Some(ref data_sig) = self.data_signature {
+            if !data_sig.is_empty() {
+                all_types.push(data_sig.as_str());
+            }
         }
 
-        let full_sig = format!("{}({})",
-            self.factory_events.name,
-            all_types.join(","));
-
+        let full_sig = format!("{}({})", self.name, all_types.join(","));
         keccak256(full_sig.as_bytes()).0
     }
 
@@ -65,14 +116,9 @@ impl FactoryConfig {
             let idx = idx_str.parse::<usize>().unwrap_or(0);
             FactoryParameterLocation::Topic(idx)
         } else if param.starts_with("data[") {
-            let idx_str = param
-                .strip_prefix("data[")
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or("0");
-            let idx = idx_str.parse::<usize>().unwrap_or(0);
-            FactoryParameterLocation::Data(idx)
+            FactoryParameterLocation::Data(parse_bracket_indices(param))
         } else {
-            FactoryParameterLocation::Data(0)
+            FactoryParameterLocation::Data(vec![0])
         }
     }
 }

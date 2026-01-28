@@ -220,26 +220,34 @@ fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
 
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                let event_topic0 = factory.compute_event_signature();
-                let param_location = factory.parse_factory_parameter();
+                let events = factory.factory_events.clone().into_vec();
 
-                let data_types = parse_data_signature(&factory.factory_events.data_signature);
+                for event in events {
+                    let event_topic0 = event.compute_event_signature();
+                    let param_location = event.parse_factory_parameter();
 
-                for addr in &contract_addresses {
-                    tracing::debug!(
-                        "Created factory matcher for {} -> {} (topic0: 0x{})",
-                        contract_name,
-                        factory.collection_name,
-                        hex::encode(&event_topic0[..8])
-                    );
+                    let data_types = event
+                        .data_signature
+                        .as_ref()
+                        .map(|sig| parse_data_signature(sig))
+                        .unwrap_or_default();
 
-                    matchers.push(FactoryMatcher {
-                        factory_contract_address: *addr,
-                        event_topic0,
-                        param_location: param_location.clone(),
-                        data_types: data_types.clone(),
-                        collection_name: factory.collection_name.clone(),
-                    });
+                    for addr in &contract_addresses {
+                        tracing::debug!(
+                            "Created factory matcher for {} -> {} (topic0: 0x{})",
+                            contract_name,
+                            factory.collection_name,
+                            hex::encode(&event_topic0[..8])
+                        );
+
+                        matchers.push(FactoryMatcher {
+                            factory_contract_address: *addr,
+                            event_topic0,
+                            param_location: param_location.clone(),
+                            data_types: data_types.clone(),
+                            collection_name: factory.collection_name.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -296,8 +304,8 @@ async fn process_range(
                         None
                     }
                 }
-                FactoryParameterLocation::Data(idx) => {
-                    decode_address_from_data(&log.data, &matcher.data_types, *idx)
+                FactoryParameterLocation::Data(indices) => {
+                    decode_address_from_data(&log.data, &matcher.data_types, indices)
                 }
             };
 
@@ -398,22 +406,43 @@ async fn process_range(
     })
 }
 
-fn decode_address_from_data(data: &[u8], types: &[DynSolType], index: usize) -> Option<[u8; 20]> {
-    if types.is_empty() || index >= types.len() {
+fn extract_address_recursive(values: &[DynSolValue], indices: &[usize]) -> Option<[u8; 20]> {
+    if indices.is_empty() {
+        return None;
+    }
+
+    let first_idx = indices[0];
+    if first_idx >= values.len() {
+        return None;
+    }
+
+    let value = &values[first_idx];
+
+    if indices.len() == 1 {
+        // Last index - extract address
+        if let DynSolValue::Address(addr) = value {
+            return Some(addr.0 .0);
+        }
+        None
+    } else {
+        // More indices to traverse - must be a tuple
+        if let DynSolValue::Tuple(inner_values) = value {
+            extract_address_recursive(inner_values, &indices[1..])
+        } else {
+            None
+        }
+    }
+}
+
+fn decode_address_from_data(data: &[u8], types: &[DynSolType], indices: &[usize]) -> Option<[u8; 20]> {
+    if types.is_empty() || indices.is_empty() {
         return None;
     }
 
     let tuple_type = DynSolType::Tuple(types.to_vec());
 
     match tuple_type.abi_decode(data) {
-        Ok(DynSolValue::Tuple(values)) => {
-            if index < values.len() {
-                if let DynSolValue::Address(addr) = &values[index] {
-                    return Some(addr.0 .0);
-                }
-            }
-            None
-        }
+        Ok(DynSolValue::Tuple(values)) => extract_address_recursive(&values, indices),
         Ok(_) => None,
         Err(e) => {
             tracing::warn!("Failed to decode factory event data: {}", e);
