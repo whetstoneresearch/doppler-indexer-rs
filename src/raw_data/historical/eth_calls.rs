@@ -21,7 +21,7 @@ use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, ParamConfig, ParamError, ParamValue};
+use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 #[derive(Debug, Error)]
@@ -70,6 +70,25 @@ struct CallConfig {
     function_name: String,
     encoded_calldata: Bytes,
     param_values: Vec<Vec<u8>>,
+    frequency: Frequency,
+}
+
+#[derive(Debug, Clone)]
+struct OnceCallConfig {
+    function_name: String,
+    encoded_calldata: Bytes,
+}
+
+#[derive(Debug)]
+struct OnceCallResult {
+    block_number: u64,
+    block_timestamp: u64,
+    contract_address: [u8; 20],
+    function_results: HashMap<String, Vec<u8>>,
+}
+
+struct FrequencyState {
+    last_call_times: HashMap<(String, String), u64>,
 }
 
 #[derive(Debug)]
@@ -97,10 +116,15 @@ pub async fn collect_eth_calls(
     let call_configs = build_call_configs(&chain.contracts)?;
     let factory_call_configs = build_factory_call_configs(&chain.contracts);
 
-    let has_regular_calls = !call_configs.is_empty();
-    let has_factory_calls = !factory_call_configs.is_empty() && factory_rx.is_some();
+    let once_configs = build_once_call_configs(&chain.contracts);
+    let factory_once_configs = build_factory_once_call_configs(&factory_call_configs);
 
-    if !has_regular_calls && !has_factory_calls {
+    let has_regular_calls = !call_configs.is_empty();
+    let has_once_calls = !once_configs.is_empty();
+    let has_factory_calls = !factory_call_configs.is_empty() && factory_rx.is_some();
+    let has_factory_once_calls = !factory_once_configs.is_empty() && factory_rx.is_some();
+
+    if !has_regular_calls && !has_once_calls && !has_factory_calls && !has_factory_once_calls {
         tracing::info!("No eth_calls configured for chain {}", chain.name);
         while block_rx.recv().await.is_some() {}
         return Ok(());
@@ -118,11 +142,17 @@ pub async fn collect_eth_calls(
         .max()
         .unwrap_or(0);
 
+    let mut frequency_state = FrequencyState {
+        last_call_times: HashMap::new(),
+    };
+
     tracing::info!(
-        "Starting eth_call collection for chain {} with {} regular configs, {} factory collections",
+        "Starting eth_call collection for chain {} with {} regular configs, {} once configs, {} factory collections, {} factory once configs",
         chain.name,
         call_configs.len(),
-        factory_call_configs.len()
+        once_configs.len(),
+        factory_call_configs.len(),
+        factory_once_configs.len()
     );
 
     let existing_files = scan_existing_parquet_files(&base_output_dir);
@@ -184,17 +214,33 @@ pub async fn collect_eth_calls(
 
             range_data.insert(range.start, blocks.clone());
 
-            process_range(
-                &range,
-                blocks,
-                client,
-                &call_configs,
-                &base_output_dir,
-                &existing_files,
-                rpc_batch_size,
-                max_params,
-            )
-            .await?;
+            if has_regular_calls {
+                process_range(
+                    &range,
+                    blocks.clone(),
+                    client,
+                    &call_configs,
+                    &base_output_dir,
+                    &existing_files,
+                    rpc_batch_size,
+                    max_params,
+                    &mut frequency_state,
+                )
+                .await?;
+            }
+
+            if has_once_calls {
+                process_once_calls_regular(
+                    &range,
+                    &blocks,
+                    client,
+                    &once_configs,
+                    &chain.contracts,
+                    &base_output_dir,
+                    &existing_files,
+                )
+                .await?;
+            }
 
             range_regular_done.insert(range.start);
             catchup_count += 1;
@@ -244,8 +290,21 @@ pub async fn collect_eth_calls(
                                             &existing_files,
                                             rpc_batch_size,
                                             factory_max_params,
+                                            &mut frequency_state,
                                         )
                                         .await?;
+
+                                        if has_factory_once_calls {
+                                            process_factory_once_calls(
+                                                &range,
+                                                client,
+                                                &factory_data,
+                                                &factory_once_configs,
+                                                &base_output_dir,
+                                                &existing_files,
+                                            )
+                                            .await?;
+                                        }
                                     }
                                     range_factory_done.insert(range_start);
                                 }
@@ -304,6 +363,20 @@ pub async fn collect_eth_calls(
                                         &existing_files,
                                         rpc_batch_size,
                                         max_params,
+                                        &mut frequency_state,
+                                    )
+                                    .await?;
+                                }
+
+                                if has_once_calls {
+                                    process_once_calls_regular(
+                                        &range,
+                                        blocks,
+                                        client,
+                                        &once_configs,
+                                        &chain.contracts,
+                                        &base_output_dir,
+                                        &existing_files,
                                     )
                                     .await?;
                                 }
@@ -321,10 +394,23 @@ pub async fn collect_eth_calls(
                                             &existing_files,
                                             rpc_batch_size,
                                             factory_max_params,
+                                            &mut frequency_state,
                                         )
                                         .await?;
-                                        range_factory_done.insert(range_start);
                                     }
+
+                                    if has_factory_once_calls {
+                                        process_factory_once_calls(
+                                            &range,
+                                            client,
+                                            factory_data,
+                                            &factory_once_configs,
+                                            &base_output_dir,
+                                            &existing_files,
+                                        )
+                                        .await?;
+                                    }
+                                    range_factory_done.insert(range_start);
                                 }
 
                                 if range_regular_done.contains(&range_start)
@@ -373,8 +459,21 @@ pub async fn collect_eth_calls(
                                         &existing_files,
                                         rpc_batch_size,
                                         factory_max_params,
+                                        &mut frequency_state,
                                     )
                                     .await?;
+
+                                    if has_factory_once_calls {
+                                        process_factory_once_calls(
+                                            &range,
+                                            client,
+                                            &factory_data,
+                                            &factory_once_configs,
+                                            &base_output_dir,
+                                            &existing_files,
+                                        )
+                                        .await?;
+                                    }
                                 }
                                 range_factory_done.insert(range_start);
                             }
@@ -420,6 +519,20 @@ pub async fn collect_eth_calls(
                 &existing_files,
                 rpc_batch_size,
                 max_params,
+                &mut frequency_state,
+            )
+            .await?;
+        }
+
+        if has_once_calls && !range_regular_done.contains(&range_start) {
+            process_once_calls_regular(
+                &range,
+                &blocks,
+                client,
+                &once_configs,
+                &chain.contracts,
+                &base_output_dir,
+                &existing_files,
             )
             .await?;
         }
@@ -437,8 +550,21 @@ pub async fn collect_eth_calls(
                         &existing_files,
                         rpc_batch_size,
                         factory_max_params,
+                        &mut frequency_state,
                     )
                     .await?;
+
+                    if has_factory_once_calls {
+                        process_factory_once_calls(
+                            &range,
+                            client,
+                            factory_data,
+                            &factory_once_configs,
+                            &base_output_dir,
+                            &existing_files,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -474,6 +600,7 @@ async fn process_factory_range(
     existing_files: &HashSet<String>,
     rpc_batch_size: usize,
     max_params: usize,
+    frequency_state: &mut FrequencyState,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for (_block, addrs) in &factory_data.addresses_by_block {
@@ -492,6 +619,10 @@ async fn process_factory_range(
         };
 
         for call_config in call_configs {
+            if call_config.frequency.is_once() {
+                continue;
+            }
+
             let selector = compute_function_selector(&call_config.function);
             let function_name = call_config
                 .function
@@ -534,6 +665,7 @@ async fn process_factory_range(
                         function_name: function_name.clone(),
                         encoded_calldata,
                         param_values,
+                        frequency: call_config.frequency.clone(),
                     });
                 }
             }
@@ -542,13 +674,31 @@ async fn process_factory_range(
                 continue;
             }
 
+            let state_key = (collection_name.clone(), function_name.clone());
+            let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
+
+            let filtered_blocks = filter_blocks_for_frequency(blocks, &call_config.frequency, last_call_ts);
+
+            if filtered_blocks.is_empty() {
+                tracing::debug!(
+                    "No blocks match frequency {:?} for factory {}.{} in range {}-{}",
+                    call_config.frequency,
+                    collection_name,
+                    function_name,
+                    range.start,
+                    range.end - 1
+                );
+                continue;
+            }
+
             tracing::info!(
-                "Fetching factory eth_calls for {}.{} blocks {}-{} ({} addresses)",
+                "Fetching factory eth_calls for {}.{} blocks {}-{} ({} addresses, {} blocks after frequency filter)",
                 collection_name,
                 function_name,
                 range.start,
                 range.end - 1,
-                addresses.len()
+                addresses.len(),
+                filtered_blocks.len()
             );
 
             #[cfg(feature = "bench")]
@@ -560,7 +710,7 @@ async fn process_factory_range(
             let mut pending_calls: Vec<(TransactionRequest, BlockId, &BlockInfo, &CallConfig)> =
                 Vec::new();
 
-            for block in blocks {
+            for block in &filtered_blocks {
                 for config in &configs {
                     let tx = TransactionRequest::default()
                         .to(config.address)
@@ -655,6 +805,15 @@ async fn process_factory_range(
                 result_count,
                 sub_dir.join(&file_name).display()
             );
+
+            if let Frequency::Duration(_) = call_config.frequency {
+                if let Some(last_block) = filtered_blocks.last() {
+                    frequency_state.last_call_times.insert(
+                        (collection_name.clone(), function_name.clone()),
+                        last_block.timestamp,
+                    );
+                }
+            }
         }
     }
 
@@ -696,6 +855,10 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
 
         if let Some(calls) = &contract.calls {
             for call in calls {
+                if call.frequency.is_once() {
+                    continue;
+                }
+
                 let selector = compute_function_selector(&call.function);
                 let function_name = call.function
                     .split('(')
@@ -725,6 +888,7 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
                             function_name: function_name.clone(),
                             encoded_calldata,
                             param_values,
+                            frequency: call.frequency.clone(),
                         });
                     }
                 }
@@ -733,6 +897,338 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
     }
 
     Ok(configs)
+}
+
+fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
+    let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+
+    for (contract_name, contract) in contracts {
+        if let Some(calls) = &contract.calls {
+            for call in calls {
+                if call.frequency.is_once() {
+                    let selector = compute_function_selector(&call.function);
+                    let function_name = call.function
+                        .split('(')
+                        .next()
+                        .unwrap_or(&call.function)
+                        .to_string();
+
+                    // For "once" calls, we don't support params (they're typically view functions)
+                    let encoded_calldata = Bytes::copy_from_slice(&selector);
+
+                    configs.entry(contract_name.clone()).or_default().push(OnceCallConfig {
+                        function_name,
+                        encoded_calldata,
+                    });
+                }
+            }
+        }
+    }
+
+    configs
+}
+
+fn build_factory_once_call_configs(factory_call_configs: &HashMap<String, Vec<EthCallConfig>>) -> HashMap<String, Vec<OnceCallConfig>> {
+    let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+
+    for (collection_name, call_configs) in factory_call_configs {
+        for call in call_configs {
+            if call.frequency.is_once() {
+                let selector = compute_function_selector(&call.function);
+                let function_name = call.function
+                    .split('(')
+                    .next()
+                    .unwrap_or(&call.function)
+                    .to_string();
+
+                let encoded_calldata = Bytes::copy_from_slice(&selector);
+
+                configs.entry(collection_name.clone()).or_default().push(OnceCallConfig {
+                    function_name,
+                    encoded_calldata,
+                });
+            }
+        }
+    }
+
+    configs
+}
+
+fn filter_blocks_for_frequency<'a>(
+    blocks: &'a [BlockInfo],
+    frequency: &Frequency,
+    last_call_timestamp: Option<u64>,
+) -> Vec<&'a BlockInfo> {
+    match frequency {
+        Frequency::EveryBlock => blocks.iter().collect(),
+        Frequency::Once => vec![], // handled separately
+        Frequency::EveryNBlocks(n) => blocks.iter().filter(|b| b.block_number % n == 0).collect(),
+        Frequency::Duration(secs) => {
+            let mut result = vec![];
+            let mut last_ts = last_call_timestamp.unwrap_or(0);
+            for block in blocks {
+                if block.timestamp >= last_ts + secs {
+                    result.push(block);
+                    last_ts = block.timestamp;
+                }
+            }
+            result
+        }
+    }
+}
+
+async fn process_once_calls_regular(
+    range: &BlockRange,
+    blocks: &[BlockInfo],
+    client: &UnifiedRpcClient,
+    once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    contracts: &Contracts,
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<(), EthCallCollectionError> {
+    let first_block = match blocks.first() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    for (contract_name, call_configs) in once_configs {
+        if call_configs.is_empty() {
+            continue;
+        }
+
+        let file_name = range.file_name();
+        let rel_path = format!("{}/once/{}", contract_name, file_name);
+
+        if existing_files.contains(&rel_path) {
+            tracing::debug!(
+                "Skipping once eth_calls for {} blocks {}-{} (already exists)",
+                contract_name,
+                range.start,
+                range.end - 1
+            );
+            continue;
+        }
+
+        let contract = match contracts.get(contract_name) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let addresses = match &contract.address {
+            AddressOrAddresses::Single(addr) => vec![*addr],
+            AddressOrAddresses::Multiple(addrs) => addrs.clone(),
+        };
+
+        let block_id = BlockId::Number(BlockNumberOrTag::Number(first_block.block_number));
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, String)> = Vec::new();
+
+        for address in &addresses {
+            for call_config in call_configs {
+                let tx = TransactionRequest::default()
+                    .to(*address)
+                    .input(call_config.encoded_calldata.clone().into());
+                pending_calls.push((tx, block_id, *address, call_config.function_name.clone()));
+            }
+        }
+
+        if pending_calls.is_empty() {
+            continue;
+        }
+
+        let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+            .iter()
+            .map(|(tx, bid, _, _)| (tx.clone(), *bid))
+            .collect();
+
+        let batch_results = client.call_batch(batch_calls).await?;
+
+        let mut results_by_address: HashMap<Address, HashMap<String, Vec<u8>>> = HashMap::new();
+
+        for (i, result) in batch_results.into_iter().enumerate() {
+            let (_, _, address, function_name) = &pending_calls[i];
+
+            let function_results = results_by_address.entry(*address).or_default();
+
+            match result {
+                Ok(bytes) => {
+                    function_results.insert(function_name.clone(), bytes.to_vec());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "once eth_call failed for {}.{} at block {}: {}",
+                        contract_name,
+                        function_name,
+                        first_block.block_number,
+                        e
+                    );
+                    function_results.insert(function_name.clone(), Vec::new());
+                }
+            }
+        }
+
+        let results: Vec<OnceCallResult> = addresses
+            .iter()
+            .filter_map(|addr| {
+                results_by_address.remove(addr).map(|function_results| OnceCallResult {
+                    block_number: first_block.block_number,
+                    block_timestamp: first_block.timestamp,
+                    contract_address: addr.0.0,
+                    function_results,
+                })
+            })
+            .collect();
+
+        if !results.is_empty() {
+            let function_names: Vec<String> = call_configs
+                .iter()
+                .map(|c| c.function_name.clone())
+                .collect();
+
+            let sub_dir = output_dir.join(contract_name).join("once");
+            std::fs::create_dir_all(&sub_dir)?;
+            let output_path = sub_dir.join(&file_name);
+
+            tracing::info!(
+                "Writing {} once eth_call results to {}",
+                results.len(),
+                output_path.display()
+            );
+
+            write_once_results_to_parquet(&results, &output_path, &function_names)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_factory_once_calls(
+    range: &BlockRange,
+    client: &UnifiedRpcClient,
+    factory_data: &FactoryAddressData,
+    once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<(), EthCallCollectionError> {
+    for (collection_name, call_configs) in once_configs {
+        if call_configs.is_empty() {
+            continue;
+        }
+
+        let file_name = range.file_name();
+        let rel_path = format!("{}/once/{}", collection_name, file_name);
+
+        if existing_files.contains(&rel_path) {
+            tracing::debug!(
+                "Skipping factory once eth_calls for {} blocks {}-{} (already exists)",
+                collection_name,
+                range.start,
+                range.end - 1
+            );
+            continue;
+        }
+
+        let mut address_discovery: HashMap<Address, (u64, u64)> = HashMap::new(); // addr -> (block, timestamp)
+
+        for (block_num, addrs) in &factory_data.addresses_by_block {
+            for (timestamp, addr, coll_name) in addrs {
+                if coll_name == collection_name {
+                    address_discovery.entry(*addr).or_insert((*block_num, *timestamp));
+                }
+            }
+        }
+
+        if address_discovery.is_empty() {
+            continue;
+        }
+
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> = Vec::new();
+
+        for (address, (block_number, timestamp)) in &address_discovery {
+            let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
+
+            for call_config in call_configs {
+                let tx = TransactionRequest::default()
+                    .to(*address)
+                    .input(call_config.encoded_calldata.clone().into());
+                pending_calls.push((
+                    tx,
+                    block_id,
+                    *address,
+                    *block_number,
+                    *timestamp,
+                    call_config.function_name.clone(),
+                ));
+            }
+        }
+
+        if pending_calls.is_empty() {
+            continue;
+        }
+
+        let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+            .iter()
+            .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
+            .collect();
+
+        let batch_results = client.call_batch(batch_calls).await?;
+
+        let mut results_by_address: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> = HashMap::new();
+
+        for (i, result) in batch_results.into_iter().enumerate() {
+            let (_, _, address, block_number, timestamp, function_name) = &pending_calls[i];
+
+            let entry = results_by_address
+                .entry(*address)
+                .or_insert_with(|| (*block_number, *timestamp, HashMap::new()));
+
+            match result {
+                Ok(bytes) => {
+                    entry.2.insert(function_name.clone(), bytes.to_vec());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "factory once eth_call failed for {}.{} at block {}: {}",
+                        collection_name,
+                        function_name,
+                        block_number,
+                        e
+                    );
+                    entry.2.insert(function_name.clone(), Vec::new());
+                }
+            }
+        }
+
+        let results: Vec<OnceCallResult> = results_by_address
+            .into_iter()
+            .map(|(address, (block_number, timestamp, function_results))| OnceCallResult {
+                block_number,
+                block_timestamp: timestamp,
+                contract_address: address.0.0,
+                function_results,
+            })
+            .collect();
+
+        if !results.is_empty() {
+            let function_names: Vec<String> = call_configs
+                .iter()
+                .map(|c| c.function_name.clone())
+                .collect();
+
+            let sub_dir = output_dir.join(collection_name).join("once");
+            std::fs::create_dir_all(&sub_dir)?;
+            let output_path = sub_dir.join(&file_name);
+
+            tracing::info!(
+                "Writing {} factory once eth_call results to {}",
+                results.len(),
+                output_path.display()
+            );
+
+            write_once_results_to_parquet(&results, &output_path, &function_names)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn compute_function_selector(signature: &str) -> [u8; 4] {
@@ -752,6 +1248,7 @@ async fn process_range(
     existing_files: &HashSet<String>,
     rpc_batch_size: usize,
     max_params: usize,
+    frequency_state: &mut FrequencyState,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -769,7 +1266,7 @@ async fn process_range(
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path) {
-            tracing::info!(
+            tracing::debug!(
                 "Skipping eth_calls for {}.{} blocks {}-{} (already exists)",
                 contract_name,
                 function_name,
@@ -779,12 +1276,32 @@ async fn process_range(
             continue;
         }
 
+        let frequency = &configs[0].frequency;
+
+        let state_key = (contract_name.clone(), function_name.clone());
+        let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
+
+        let filtered_blocks = filter_blocks_for_frequency(&blocks, frequency, last_call_ts);
+
+        if filtered_blocks.is_empty() {
+            tracing::debug!(
+                "No blocks match frequency {:?} for {}.{} in range {}-{}",
+                frequency,
+                contract_name,
+                function_name,
+                range.start,
+                range.end - 1
+            );
+            continue;
+        }
+
         tracing::info!(
-            "Fetching eth_calls for {}.{} blocks {}-{}",
+            "Fetching eth_calls for {}.{} blocks {}-{} ({} blocks after frequency filter)",
             contract_name,
             function_name,
             range.start,
-            range.end - 1
+            range.end - 1,
+            filtered_blocks.len()
         );
 
         #[cfg(feature = "bench")]
@@ -796,7 +1313,7 @@ async fn process_range(
 
         let mut pending_calls: Vec<(TransactionRequest, BlockId, &BlockInfo, &CallConfig)> = Vec::new();
 
-        for block in &blocks {
+        for block in &filtered_blocks {
             for config in configs {
                 let tx = TransactionRequest::default()
                     .to(config.address)
@@ -890,6 +1407,15 @@ async fn process_range(
             result_count,
             sub_dir.join(&file_name).display()
         );
+
+        if let Frequency::Duration(_) = frequency {
+            if let Some(last_block) = filtered_blocks.last() {
+                frequency_state.last_call_times.insert(
+                    (contract_name.clone(), function_name.clone()),
+                    last_block.timestamp,
+                );
+            }
+        }
     }
 
     Ok(())
@@ -988,6 +1514,70 @@ fn write_results_to_parquet(
             .map(|r| {
                 r.param_values
                     .get(i)
+                    .map(|v| v.as_slice())
+            })
+            .collect();
+        arrays.push(Arc::new(arr));
+    }
+
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+
+    let file = File::create(output_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
+    let mut fields = vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("block_timestamp", DataType::UInt64, false),
+        Field::new("address", DataType::FixedSizeBinary(20), false),
+    ];
+
+    for fn_name in function_names {
+        fields.push(Field::new(
+            &format!("{}_result", fn_name),
+            DataType::Binary,
+            true,
+        ));
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+fn write_once_results_to_parquet(
+    results: &[OnceCallResult],
+    output_path: &Path,
+    function_names: &[String],
+) -> Result<(), EthCallCollectionError> {
+    let schema = build_once_schema(function_names);
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    let arr: UInt64Array = results.iter().map(|r| Some(r.block_number)).collect();
+    arrays.push(Arc::new(arr));
+
+    let arr: UInt64Array = results.iter().map(|r| Some(r.block_timestamp)).collect();
+    arrays.push(Arc::new(arr));
+
+    let arr = FixedSizeBinaryArray::try_from_iter(
+        results.iter().map(|r| r.contract_address.as_slice()),
+    )?;
+    arrays.push(Arc::new(arr));
+
+    for fn_name in function_names {
+        let arr: BinaryArray = results
+            .iter()
+            .map(|r| {
+                r.function_results
+                    .get(fn_name)
+                    .filter(|v| !v.is_empty())
                     .map(|v| v.as_slice())
             })
             .collect();

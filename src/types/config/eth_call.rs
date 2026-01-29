@@ -1,6 +1,8 @@
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
+use serde::de::{self, Visitor};
 use serde::Deserialize;
+use std::fmt;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,12 +20,147 @@ pub enum ParamError {
     TypeMismatch { expected: String, got: String },
 }
 
+#[derive(Debug, Error)]
+pub enum FrequencyError {
+    #[error("Invalid duration format: {0}")]
+    InvalidDuration(String),
+}
+
+/// Frequency at which to make eth_calls
+#[derive(Debug, Clone, PartialEq)]
+pub enum Frequency {
+    /// Call every block (default)
+    EveryBlock,
+    /// Call once per address (at discovery for factory, at start_block for regular)
+    Once,
+    /// Call every N blocks
+    EveryNBlocks(u64),
+    /// Call at time intervals (stored as seconds)
+    Duration(u64),
+}
+
+impl Default for Frequency {
+    fn default() -> Self {
+        Frequency::EveryBlock
+    }
+}
+
+impl Frequency {
+    pub fn is_once(&self) -> bool {
+        matches!(self, Frequency::Once)
+    }
+
+    fn parse_duration_string(s: &str) -> Result<u64, FrequencyError> {
+        let s = s.trim().to_lowercase();
+
+        if let Some(num_str) = s.strip_suffix('s') {
+            return num_str
+                .parse::<u64>()
+                .map_err(|_| FrequencyError::InvalidDuration(s.clone()));
+        }
+        if let Some(num_str) = s.strip_suffix('m') {
+            return num_str
+                .parse::<u64>()
+                .map(|n| n * 60)
+                .map_err(|_| FrequencyError::InvalidDuration(s.clone()));
+        }
+        if let Some(num_str) = s.strip_suffix('h') {
+            return num_str
+                .parse::<u64>()
+                .map(|n| n * 3600)
+                .map_err(|_| FrequencyError::InvalidDuration(s.clone()));
+        }
+        if let Some(num_str) = s.strip_suffix('d') {
+            return num_str
+                .parse::<u64>()
+                .map(|n| n * 86400)
+                .map_err(|_| FrequencyError::InvalidDuration(s.clone()));
+        }
+
+        Err(FrequencyError::InvalidDuration(s))
+    }
+}
+
+impl<'de> Deserialize<'de> for Frequency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FrequencyVisitor;
+
+        impl<'de> Visitor<'de> for FrequencyVisitor {
+            type Value = Frequency;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "\"once\", a positive integer, or a duration string like \"5m\", \"1h\", \"1d\"",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Frequency, E>
+            where
+                E: de::Error,
+            {
+                let lower = value.to_lowercase();
+                if lower == "once" {
+                    return Ok(Frequency::Once);
+                }
+
+                if lower.ends_with('s')
+                    || lower.ends_with('m')
+                    || lower.ends_with('h')
+                    || lower.ends_with('d')
+                {
+                    let secs = Frequency::parse_duration_string(value).map_err(de::Error::custom)?;
+                    return Ok(Frequency::Duration(secs));
+                }
+
+                if let Ok(n) = value.parse::<u64>() {
+                    if n == 0 {
+                        return Err(de::Error::custom("frequency must be positive"));
+                    }
+                    return Ok(Frequency::EveryNBlocks(n));
+                }
+
+                Err(de::Error::custom(format!(
+                    "invalid frequency: expected \"once\", number, or duration like \"5m\", got \"{}\"",
+                    value
+                )))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Frequency, E>
+            where
+                E: de::Error,
+            {
+                if value == 0 {
+                    return Err(de::Error::custom("frequency must be positive"));
+                }
+                Ok(Frequency::EveryNBlocks(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Frequency, E>
+            where
+                E: de::Error,
+            {
+                if value <= 0 {
+                    return Err(de::Error::custom("frequency must be positive"));
+                }
+                Ok(Frequency::EveryNBlocks(value as u64))
+            }
+        }
+
+        deserializer.deserialize_any(FrequencyVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EthCallConfig {
     pub function: String,
     pub output_type: EvmType,
     #[serde(default)]
     pub params: Vec<ParamConfig>,
+    #[serde(default)]
+    pub frequency: Frequency,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -277,5 +414,67 @@ mod tests {
         let params = vec![DynSolValue::Address(addr)];
         let result = encode_call_with_params(selector, &params);
         assert_eq!(result.len(), 4 + 32);
+    }
+
+    #[test]
+    fn test_frequency_deserialize_once() {
+        let json = r#""once""#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert_eq!(freq, Frequency::Once);
+    }
+
+    #[test]
+    fn test_frequency_deserialize_blocks() {
+        let json = r#"100"#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert_eq!(freq, Frequency::EveryNBlocks(100));
+    }
+
+    #[test]
+    fn test_frequency_deserialize_duration_minutes() {
+        let json = r#""5m""#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert_eq!(freq, Frequency::Duration(300));
+    }
+
+    #[test]
+    fn test_frequency_deserialize_duration_hours() {
+        let json = r#""1h""#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert_eq!(freq, Frequency::Duration(3600));
+    }
+
+    #[test]
+    fn test_frequency_deserialize_duration_days() {
+        let json = r#""1d""#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert_eq!(freq, Frequency::Duration(86400));
+    }
+
+    #[test]
+    fn test_frequency_default() {
+        assert_eq!(Frequency::default(), Frequency::EveryBlock);
+    }
+
+    #[test]
+    fn test_eth_call_config_with_frequency() {
+        let json = r#"{
+            "function": "name()",
+            "output_type": "string",
+            "frequency": "once"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.function, "name()");
+        assert_eq!(config.frequency, Frequency::Once);
+    }
+
+    #[test]
+    fn test_eth_call_config_default_frequency() {
+        let json = r#"{
+            "function": "latestAnswer()",
+            "output_type": "int256"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.frequency, Frequency::EveryBlock);
     }
 }
