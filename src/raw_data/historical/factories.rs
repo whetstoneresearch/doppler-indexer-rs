@@ -332,14 +332,10 @@ async fn process_range(
     let collections_with_events: HashSet<String> = by_collection.keys().cloned().collect();
 
     for (collection_name, collection_records) in by_collection {
-        let file_name = format!(
-            "{}_{}-{}.parquet",
-            collection_name,
-            range_start,
-            range_end - 1
-        );
+        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+        let rel_path = format!("{}/{}", collection_name, file_name);
 
-        if existing_files.contains(&file_name) {
+        if existing_files.contains(&rel_path) {
             tracing::debug!(
                 "Skipping factory parquet for {} blocks {}-{} (already exists)",
                 collection_name,
@@ -350,7 +346,9 @@ async fn process_range(
         }
 
         let record_count = collection_records.len();
-        let output_path = output_dir.join(&file_name);
+        let sub_dir = output_dir.join(&collection_name);
+        std::fs::create_dir_all(&sub_dir)?;
+        let output_path = sub_dir.join(&file_name);
         tokio::task::spawn_blocking(move || {
             write_factory_records_to_parquet(&collection_records, &output_path)
         })
@@ -361,22 +359,20 @@ async fn process_range(
             "Wrote {} factory addresses for {} to {}",
             record_count,
             collection_name,
-            output_dir.join(&file_name).display()
+            sub_dir.join(&file_name).display()
         );
     }
 
     for matcher in matchers {
         let collection_name = &matcher.collection_name;
         if !collections_with_events.contains(collection_name) {
-            let file_name = format!(
-                "{}_{}-{}.parquet",
-                collection_name,
-                range_start,
-                range_end - 1
-            );
+            let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+            let rel_path = format!("{}/{}", collection_name, file_name);
 
-            if !existing_files.contains(&file_name) {
-                let output_path = output_dir.join(&file_name);
+            if !existing_files.contains(&rel_path) {
+                let sub_dir = output_dir.join(collection_name);
+                std::fs::create_dir_all(&sub_dir)?;
+                let output_path = sub_dir.join(&file_name);
                 tokio::task::spawn_blocking(move || write_empty_factory_parquet(&output_path))
                     .await
                     .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
@@ -487,11 +483,27 @@ fn write_factory_records_to_parquet(
 
 fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".parquet") {
-                    files.insert(name.to_string());
+
+    // Scan nested directories: dir/collection/*.parquet
+    if let Ok(collection_entries) = std::fs::read_dir(dir) {
+        for collection_entry in collection_entries.flatten() {
+            let collection_path = collection_entry.path();
+            if !collection_path.is_dir() {
+                continue;
+            }
+            let collection_name = match collection_entry.file_name().to_str() {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            if let Ok(file_entries) = std::fs::read_dir(&collection_path) {
+                for file_entry in file_entries.flatten() {
+                    if let Some(name) = file_entry.file_name().to_str() {
+                        if name.ends_with(".parquet") {
+                            // Store as collection/filename
+                            files.insert(format!("{}/{}", collection_name, name));
+                        }
+                    }
                 }
             }
         }
@@ -504,124 +516,132 @@ fn load_factory_addresses_from_parquet(
 ) -> Result<Vec<FactoryAddressData>, FactoryCollectionError> {
     let mut results = Vec::new();
 
-    let entries = match std::fs::read_dir(dir) {
+    // Scan nested directories: dir/collection/*.parquet
+    let collection_entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(results),
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.extension().map(|e| e == "parquet").unwrap_or(false) {
+    for collection_entry in collection_entries.flatten() {
+        let collection_path = collection_entry.path();
+        if !collection_path.is_dir() {
             continue;
         }
 
-        let file_name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
-
-        let parts: Vec<&str> = file_name.rsplitn(2, '_').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-
-        let range_part = parts[0];
-        let range_parts: Vec<&str> = range_part.split('-').collect();
-        if range_parts.len() != 2 {
-            continue;
-        }
-
-        let range_start: u64 = match range_parts[0].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let range_end: u64 = match range_parts[1].parse::<u64>() {
-            Ok(v) => v + 1,
+        let file_entries = match std::fs::read_dir(&collection_path) {
+            Ok(entries) => entries,
             Err(_) => continue,
         };
 
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("Failed to open factory parquet {}: {}", path.display(), e);
+        for file_entry in file_entries.flatten() {
+            let path = file_entry.path();
+            if !path.extension().map(|e| e == "parquet").unwrap_or(false) {
                 continue;
             }
-        };
 
-        let reader = match ParquetRecordBatchReaderBuilder::try_new(file) {
-            Ok(builder) => match builder.build() {
-                Ok(reader) => reader,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to build parquet reader for {}: {}",
-                        path.display(),
-                        e
-                    );
-                    continue;
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Failed to read factory parquet {}: {}", path.display(), e);
+            // Filename is now just "start-end.parquet"
+            let file_name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            let range_parts: Vec<&str> = file_name.split('-').collect();
+            if range_parts.len() != 2 {
                 continue;
             }
-        };
 
-        let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
+            let range_start: u64 = match range_parts[0].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let range_end: u64 = match range_parts[1].parse::<u64>() {
+                Ok(v) => v + 1,
+                Err(_) => continue,
+            };
 
-        for batch_result in reader {
-            let batch = match batch_result {
-                Ok(b) => b,
+            let file = match File::open(&path) {
+                Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!("Failed to read batch from {}: {}", path.display(), e);
+                    tracing::warn!("Failed to open factory parquet {}: {}", path.display(), e);
                     continue;
                 }
             };
 
-            let block_numbers = batch
-                .column_by_name("block_number")
-                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let reader = match ParquetRecordBatchReaderBuilder::try_new(file) {
+                Ok(builder) => match builder.build() {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to build parquet reader for {}: {}",
+                            path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read factory parquet {}: {}", path.display(), e);
+                    continue;
+                }
+            };
 
-            let timestamps = batch
-                .column_by_name("block_timestamp")
-                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+            let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
 
-            let addresses = batch
-                .column_by_name("factory_address")
-                .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+            for batch_result in reader {
+                let batch = match batch_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Failed to read batch from {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
 
-            let collection_names = batch.column_by_name("collection_name").and_then(|c| {
-                c.as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-            });
+                let block_numbers = batch
+                    .column_by_name("block_number")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
 
-            if let (Some(blocks), Some(times), Some(addrs), Some(names)) =
-                (block_numbers, timestamps, addresses, collection_names)
-            {
-                for i in 0..batch.num_rows() {
-                    let block = blocks.value(i);
-                    let timestamp = times.value(i);
-                    let addr_bytes = addrs.value(i);
-                    let collection = names.value(i);
+                let timestamps = batch
+                    .column_by_name("block_timestamp")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
 
-                    if addr_bytes.len() == 20 {
-                        let mut addr = [0u8; 20];
-                        addr.copy_from_slice(addr_bytes);
-                        addresses_by_block.entry(block).or_default().push((
-                            timestamp,
-                            Address::from(addr),
-                            collection.to_string(),
-                        ));
+                let addresses = batch
+                    .column_by_name("factory_address")
+                    .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+
+                let collection_names = batch.column_by_name("collection_name").and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                });
+
+                if let (Some(blocks), Some(times), Some(addrs), Some(names)) =
+                    (block_numbers, timestamps, addresses, collection_names)
+                {
+                    for i in 0..batch.num_rows() {
+                        let block = blocks.value(i);
+                        let timestamp = times.value(i);
+                        let addr_bytes = addrs.value(i);
+                        let collection = names.value(i);
+
+                        if addr_bytes.len() == 20 {
+                            let mut addr = [0u8; 20];
+                            addr.copy_from_slice(addr_bytes);
+                            addresses_by_block.entry(block).or_default().push((
+                                timestamp,
+                                Address::from(addr),
+                                collection.to_string(),
+                            ));
+                        }
                     }
                 }
             }
-        }
 
-        if !addresses_by_block.is_empty() {
-            results.push(FactoryAddressData {
-                range_start,
-                range_end,
-                addresses_by_block,
-            });
+            if !addresses_by_block.is_empty() {
+                results.push(FactoryAddressData {
+                    range_start,
+                    range_end,
+                    addresses_by_block,
+                });
+            }
         }
     }
 

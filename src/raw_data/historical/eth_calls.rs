@@ -52,14 +52,8 @@ struct BlockRange {
 }
 
 impl BlockRange {
-    fn file_name(&self, contract_name: &str, function_name: &str) -> String {
-        format!(
-            "eth_calls_{}_{}_{}-{}.parquet",
-            contract_name,
-            function_name,
-            self.start,
-            self.end - 1
-        )
+    fn file_name(&self) -> String {
+        format!("{}-{}.parquet", self.start, self.end - 1)
     }
 }
 
@@ -94,8 +88,8 @@ pub async fn collect_eth_calls(
     mut block_rx: Receiver<(u64, u64)>,
     mut factory_rx: Option<Receiver<FactoryAddressData>>,
 ) -> Result<(), EthCallCollectionError> {
-    let output_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
-    std::fs::create_dir_all(&output_dir)?;
+    let base_output_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
+    std::fs::create_dir_all(&base_output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
@@ -131,7 +125,7 @@ pub async fn collect_eth_calls(
         factory_call_configs.len()
     );
 
-    let existing_files = scan_existing_parquet_files(&output_dir);
+    let existing_files = scan_existing_parquet_files(&base_output_dir);
 
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
     let mut range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
@@ -149,7 +143,8 @@ pub async fn collect_eth_calls(
             };
 
             let all_exist = call_configs.iter().all(|config| {
-                existing_files.contains(&range.file_name(&config.contract_name, &config.function_name))
+                let rel_path = format!("{}/{}/{}", config.contract_name, config.function_name, range.file_name());
+                existing_files.contains(&rel_path)
             });
 
             if all_exist {
@@ -194,7 +189,7 @@ pub async fn collect_eth_calls(
                 blocks,
                 client,
                 &call_configs,
-                &output_dir,
+                &base_output_dir,
                 &existing_files,
                 rpc_batch_size,
                 max_params,
@@ -245,7 +240,7 @@ pub async fn collect_eth_calls(
                                             client,
                                             &factory_data,
                                             &factory_call_configs,
-                                            &output_dir,
+                                            &base_output_dir,
                                             &existing_files,
                                             rpc_batch_size,
                                             factory_max_params,
@@ -305,7 +300,7 @@ pub async fn collect_eth_calls(
                                         blocks.clone(),
                                         client,
                                         &call_configs,
-                                        &output_dir,
+                                        &base_output_dir,
                                         &existing_files,
                                         rpc_batch_size,
                                         max_params,
@@ -322,7 +317,7 @@ pub async fn collect_eth_calls(
                                             client,
                                             factory_data,
                                             &factory_call_configs,
-                                            &output_dir,
+                                            &base_output_dir,
                                             &existing_files,
                                             rpc_batch_size,
                                             factory_max_params,
@@ -374,7 +369,7 @@ pub async fn collect_eth_calls(
                                         client,
                                         &factory_data,
                                         &factory_call_configs,
-                                        &output_dir,
+                                        &base_output_dir,
                                         &existing_files,
                                         rpc_batch_size,
                                         factory_max_params,
@@ -421,7 +416,7 @@ pub async fn collect_eth_calls(
                 blocks.clone(),
                 client,
                 &call_configs,
-                &output_dir,
+                &base_output_dir,
                 &existing_files,
                 rpc_batch_size,
                 max_params,
@@ -438,7 +433,7 @@ pub async fn collect_eth_calls(
                         client,
                         factory_data,
                         &factory_call_configs,
-                        &output_dir,
+                        &base_output_dir,
                         &existing_files,
                         rpc_batch_size,
                         factory_max_params,
@@ -505,15 +500,10 @@ async fn process_factory_range(
                 .unwrap_or(&call_config.function)
                 .to_string();
 
-            let file_name = format!(
-                "eth_calls_{}_{}_{}-{}.parquet",
-                collection_name,
-                function_name,
-                range.start,
-                range.end - 1
-            );
+            let file_name = range.file_name();
+            let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
-            if existing_files.contains(&file_name) {
+            if existing_files.contains(&rel_path) {
                 tracing::debug!(
                     "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
                     collection_name,
@@ -636,7 +626,9 @@ async fn process_factory_range(
                 .sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let result_count = all_results.len();
-            let output_path = output_dir.join(&file_name);
+            let sub_dir = output_dir.join(collection_name).join(&function_name);
+            std::fs::create_dir_all(&sub_dir)?;
+            let output_path = sub_dir.join(&file_name);
             #[cfg(feature = "bench")]
             let write_start = Instant::now();
             tokio::task::spawn_blocking(move || {
@@ -661,7 +653,7 @@ async fn process_factory_range(
             tracing::info!(
                 "Wrote {} factory eth_call results to {}",
                 result_count,
-                output_dir.join(&file_name).display()
+                sub_dir.join(&file_name).display()
             );
         }
     }
@@ -773,9 +765,10 @@ async fn process_range(
     }
 
     for ((contract_name, function_name), configs) in &grouped_configs {
-        let file_name = range.file_name(contract_name, function_name);
+        let file_name = range.file_name();
+        let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
-        if existing_files.contains(&file_name) {
+        if existing_files.contains(&rel_path) {
             tracing::info!(
                 "Skipping eth_calls for {}.{} blocks {}-{} (already exists)",
                 contract_name,
@@ -868,7 +861,9 @@ async fn process_range(
         all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
         let result_count = all_results.len();
-        let output_path = output_dir.join(&file_name);
+        let sub_dir = output_dir.join(contract_name).join(function_name);
+        std::fs::create_dir_all(&sub_dir)?;
+        let output_path = sub_dir.join(&file_name);
         #[cfg(feature = "bench")]
         let write_start = Instant::now();
         tokio::task::spawn_blocking(move || {
@@ -893,7 +888,7 @@ async fn process_range(
         tracing::info!(
             "Wrote {} eth_call results to {}",
             result_count,
-            output_dir.join(&file_name).display()
+            sub_dir.join(&file_name).display()
         );
     }
 
@@ -902,11 +897,40 @@ async fn process_range(
 
 fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("eth_calls_") && name.ends_with(".parquet") {
-                    files.insert(name.to_string());
+
+    // Scan nested directories: dir/contract/function/*.parquet
+    if let Ok(contract_entries) = std::fs::read_dir(dir) {
+        for contract_entry in contract_entries.flatten() {
+            let contract_path = contract_entry.path();
+            if !contract_path.is_dir() {
+                continue;
+            }
+            let contract_name = match contract_entry.file_name().to_str() {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            if let Ok(function_entries) = std::fs::read_dir(&contract_path) {
+                for function_entry in function_entries.flatten() {
+                    let function_path = function_entry.path();
+                    if !function_path.is_dir() {
+                        continue;
+                    }
+                    let function_name = match function_entry.file_name().to_str() {
+                        Some(name) => name.to_string(),
+                        None => continue,
+                    };
+
+                    if let Ok(file_entries) = std::fs::read_dir(&function_path) {
+                        for file_entry in file_entries.flatten() {
+                            if let Some(name) = file_entry.file_name().to_str() {
+                                if name.ends_with(".parquet") {
+                                    // Store as contract/function/filename
+                                    files.insert(format!("{}/{}/{}", contract_name, function_name, name));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
