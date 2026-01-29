@@ -641,10 +641,13 @@ async fn process_range(
 
             // Build tx_block_info from the receipts themselves
             // Each receipt has a transaction_hash field we can use
+            // Note: We must maintain 1:1 correspondence with receipts (don't filter out None)
             let tx_block_info: Vec<(B256, u64, u64)> = receipts
                 .iter()
-                .filter_map(|r| r.as_ref())
-                .map(|r| (r.transaction_hash, block.block_number, block.timestamp))
+                .map(|r| {
+                    let tx_hash = r.as_ref().map_or(B256::ZERO, |r| r.transaction_hash);
+                    (tx_hash, block.block_number, block.timestamp)
+                })
                 .collect();
 
             match receipt_fields {
