@@ -40,12 +40,131 @@ eth_calls are configured per-contract in your chain config:
 
 ### Call Configuration
 
-| Field | Description |
-|-------|-------------|
-| `function` | The function signature (e.g., `totalSupply()`, `balanceOf(address)`). Used to compute the 4-byte selector. |
-| `output_type` | The return type: `uint256` or `int256`. Used by consumers to decode the binary result. |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `function` | string | Yes | - | The function signature (e.g., `totalSupply()`). Used to compute the 4-byte selector. |
+| `output_type` | string | Yes | - | The return type. Used by consumers to decode the binary result. |
+| `frequency` | string/number | No | every block | How often to make the call (see Frequency section below). |
 
 **Note:** Currently only parameterless functions are supported. Functions with arguments would require additional configuration for the encoded parameters.
+
+## Frequency
+
+The `frequency` field controls how often eth_calls are made. This is useful for optimizing RPC usage when certain data doesn't need to be fetched every block.
+
+### Frequency Options
+
+| Value | Behavior |
+|-------|----------|
+| *(omitted)* | Call every block (default) |
+| `"once"` | Call once per contract address |
+| `100` (any positive integer) | Call every N blocks |
+| `"5m"`, `"1h"`, `"1d"` | Call at time intervals |
+
+### Duration Format
+
+Duration strings use a number followed by a unit suffix:
+
+| Suffix | Unit |
+|--------|------|
+| `s` | seconds |
+| `m` | minutes |
+| `h` | hours |
+| `d` | days |
+
+Examples: `"30s"`, `"5m"`, `"1h"`, `"7d"`
+
+### Example Configuration
+
+```json
+{
+  "contracts": {
+    "USDC": {
+      "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "calls": [
+        {
+          "function": "totalSupply()",
+          "output_type": "uint256"
+        },
+        {
+          "function": "name()",
+          "output_type": "string",
+          "frequency": "once"
+        },
+        {
+          "function": "decimals()",
+          "output_type": "uint8",
+          "frequency": "once"
+        }
+      ]
+    },
+    "ChainlinkOracle": {
+      "address": "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
+      "calls": [
+        {
+          "function": "latestAnswer()",
+          "output_type": "int256",
+          "frequency": "1h"
+        },
+        {
+          "function": "description()",
+          "output_type": "string",
+          "frequency": "once"
+        }
+      ]
+    }
+  }
+}
+```
+
+### Frequency Behavior
+
+**Every Block (default):**
+- Calls are made at every block in the range
+- Results stored in per-function parquet files
+
+**Once:**
+- For regular contracts: called at the first block in each range
+- For factory contracts: called at the block where the address was discovered
+- All "once" functions for a contract are combined into a single parquet file
+- Useful for immutable data like `name()`, `symbol()`, `decimals()`
+
+**Every N Blocks:**
+- Calls are made only when `block_number % N == 0`
+- Useful for reducing RPC usage on slowly-changing data
+
+**Duration-based:**
+- Calls are made when `current_timestamp >= last_call_timestamp + duration_seconds`
+- Uses actual block timestamps, not estimated intervals
+- On restart, the last call timestamp is inferred from existing parquet files
+
+### "Once" Storage Format
+
+Functions with `frequency: "once"` are stored differently from regular calls:
+
+**Path:** `data/raw/{chain}/eth_calls/{contract}/once/{start}-{end}.parquet`
+
+**Schema:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_number` | UInt64 | Block where the call was made |
+| `block_timestamp` | UInt64 | Unix timestamp of the block |
+| `address` | FixedSizeBinary(20) | Contract address |
+| `{function}_result` | Binary | Raw result for each "once" function |
+
+All "once" functions for a contract/collection are combined into columns in the same file, with one row per unique contract address.
+
+Example for a factory with `name()`, `symbol()`, `decimals()` as "once" calls:
+```
+data/raw/base/eth_calls/DERC20/once/0-9999.parquet
+  - block_number
+  - block_timestamp
+  - address
+  - name_result
+  - symbol_result
+  - decimals_result
+```
 
 ## Data Flow
 

@@ -173,15 +173,48 @@ Contracts can include `calls` to read on-chain state:
             {
                 "function": "latestAnswer()",
                 "output_type": "int256"
+            },
+            {
+                "function": "description()",
+                "output_type": "string",
+                "frequency": "once"
             }
         ]
     }
 }
 ```
 
+**Call Fields:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `function` | string | Yes | - | Function signature (e.g., `totalSupply()`) |
+| `output_type` | string | Yes | - | Return type for decoding |
+| `frequency` | string/number | No | every block | How often to make the call |
+
 **Output Types:**
-- `int256` - Signed 256-bit integer
-- `uint256` - Unsigned 256-bit integer
+- `int256`, `int128`, `int64`, `int32`, `int8` - Signed integers
+- `uint256`, `uint128`, `uint80`, `uint64`, `uint32`, `uint16`, `uint8` - Unsigned integers
+- `address` - 20-byte address
+- `bool` - Boolean
+- `bytes32` - Fixed 32-byte value
+- `bytes` - Variable-length bytes
+- `string` - UTF-8 string
+
+**Frequency Options:**
+
+| Value | Description |
+|-------|-------------|
+| *(omitted)* | Call every block (default behavior) |
+| `"once"` | Call once per contract address |
+| `100` | Call every 100 blocks (any positive integer) |
+| `"5m"` | Call every 5 minutes |
+| `"1h"` | Call every 1 hour |
+| `"1d"` | Call every 1 day |
+
+Duration suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days)
+
+See [eth_call Collection](./ETH_CALL_COLLECTION.md) for detailed documentation on frequency behavior.
 
 ### Factory Configuration
 

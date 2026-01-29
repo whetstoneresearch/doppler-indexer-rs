@@ -44,7 +44,7 @@ Factories are configured within the `factories` array of a contract:
 | `collection_name` | string | Yes | Identifier for this group of factory-created contracts |
 | `factory_events` | object | Yes | Event signature information for matching |
 | `factory_parameters` | string | Yes | Which parameter contains the created contract address |
-| `calls` | array | No | eth_call configs to execute on factory-created contracts |
+| `calls` | array | No | eth_call configs to execute on factory-created contracts (supports `frequency`) |
 
 ### Factory Events
 
@@ -181,6 +181,10 @@ When factories have `calls` configured:
 1. Regular eth_calls execute immediately (don't wait for factory data)
 2. Factory eth_calls execute when factory addresses arrive
 3. Factory call results use the collection name in the directory path (e.g., `eth_calls/DERC20/totalSupply/0-9999.parquet`)
+4. Calls with `frequency: "once"` are made at the discovery block and stored in `eth_calls/{collection}/once/`
+5. Calls with block-based or duration-based frequency are filtered accordingly
+
+See [eth_call Collection](./ETH_CALL_COLLECTION.md) for detailed frequency documentation.
 
 ## Example Use Cases
 
@@ -203,13 +207,17 @@ Track all tokens deployed by a token factory:
                 "factory_parameters": "data[0]",
                 "calls": [
                     {"function": "totalSupply()", "output_type": "uint256"},
-                    {"function": "decimals()", "output_type": "uint8"}
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"},
+                    {"function": "decimals()", "output_type": "uint8", "frequency": "once"}
                 ]
             }
         ]
     }
 }
 ```
+
+**Note:** Using `frequency: "once"` for immutable fields like `name`, `symbol`, and `decimals` significantly reduces RPC usage. These calls are made once when the contract is first discovered.
 
 ### Uniswap V2 Pairs
 
