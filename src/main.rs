@@ -177,17 +177,25 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        let (blocks_result, receipts_result, logs_result, eth_calls_result) =
-            tokio::try_join!(blocks_handle, receipts_handle, logs_handle, eth_calls_handle)?;
+        let (blocks_result, receipts_result, logs_result, eth_calls_result, factories_result) =
+            tokio::try_join!(
+                blocks_handle,
+                receipts_handle,
+                logs_handle,
+                eth_calls_handle,
+                async {
+                    match factories_handle {
+                        Some(handle) => handle.await,
+                        None => Ok(Ok(())),
+                    }
+                }
+            )?;
 
         blocks_result?;
         receipts_result?;
         logs_result?;
         eth_calls_result?;
-
-        if let Some(handle) = factories_handle {
-            handle.await??;
-        }
+        factories_result?;
 
         tracing::info!("Completed collection for chain {}", chain.name);
     }
