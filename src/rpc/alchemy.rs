@@ -57,8 +57,8 @@ impl AlchemyConfig {
                 .expect("compute_units_per_second must be > 0"),
             max_batch_size: 100,
             batching_enabled: true,
-            jitter_min_ms: 5,
-            jitter_max_ms: 50,
+            jitter_min_ms: 1,
+            jitter_max_ms: 10,
         }
     }
 
@@ -86,8 +86,8 @@ impl Default for AlchemyConfig {
             compute_units_per_second: NonZeroU32::new(330).unwrap(),
             max_batch_size: 100,
             batching_enabled: true,
-            jitter_min_ms: 5,
-            jitter_max_ms: 50,
+            jitter_min_ms: 1,
+            jitter_max_ms: 10,
         }
     }
 }
@@ -242,6 +242,40 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_BLOCK_RECEIPTS)
             .await;
         self.inner.get_block_receipts(method_name, block_number).await
+    }
+
+    pub async fn get_block_receipts_concurrent(
+        &self,
+        method_name: &str,
+        block_numbers: Vec<BlockNumberOrTag>,
+        concurrency: usize,
+    ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
+        if block_numbers.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut all_results = Vec::with_capacity(block_numbers.len());
+        let cost_per_block = ComputeUnitCost::GET_BLOCK_RECEIPTS.cost();
+
+        for chunk in block_numbers.chunks(concurrency) {
+            let total_cost = chunk.len() as u32 * cost_per_block;
+            self.consume_compute_units_raw(total_cost).await;
+
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|&block_number| {
+                    self.inner.get_block_receipts(method_name, block_number)
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+
+            for result in results {
+                all_results.push(result?);
+            }
+        }
+
+        Ok(all_results)
     }
 
     pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {

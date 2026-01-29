@@ -65,6 +65,26 @@ impl UnifiedRpcClient {
         }
     }
 
+    pub async fn get_block_receipts_concurrent(
+        &self,
+        method_name: &str,
+        block_numbers: Vec<BlockNumberOrTag>,
+        concurrency: usize,
+    ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
+        match self {
+            Self::Standard(client) => {
+                client
+                    .get_block_receipts_concurrent(method_name, block_numbers, concurrency)
+                    .await
+            }
+            Self::Alchemy(client) => {
+                client
+                    .get_block_receipts_concurrent(method_name, block_numbers, concurrency)
+                    .await
+            }
+        }
+    }
+
     pub async fn call_batch(
         &self,
         calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
