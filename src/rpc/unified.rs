@@ -12,7 +12,7 @@ pub enum UnifiedRpcClient {
 impl UnifiedRpcClient {    
     pub fn from_url(url: &str) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
-            Ok(Self::Alchemy(AlchemyClient::from_url(url, 500)?))
+            Ok(Self::Alchemy(AlchemyClient::from_url(url, 9500)?))
         } else {
             Ok(Self::Standard(RpcClient::from_url(url)?))
         }
