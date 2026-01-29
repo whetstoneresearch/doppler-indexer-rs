@@ -63,13 +63,13 @@ blocks collector ──(block_number, timestamp)──> eth_calls collector ─�
 
 ### File Naming
 
-Files are written to `data/raw/{chain}/eth_calls/` with the naming convention:
+Files are written to `data/raw/{chain}/eth_calls/{contract_name}/{function_name}/` with the naming convention:
 
 ```
-eth_calls_{contract_name}_{function_name}_{start_block}-{end_block}.parquet
+{start_block}-{end_block}.parquet
 ```
 
-Example: `eth_calls_USDC_totalSupply_0-9999.parquet`
+Example: `data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet`
 
 ### Parquet Schema
 
@@ -184,13 +184,13 @@ Factory calls are defined within the `factories` array of a contract:
 
 ### Output Files
 
-Factory eth_call results are written to the same directory as regular eth_calls, using the collection name in place of the contract name:
+Factory eth_call results are written to the same directory structure as regular eth_calls, using the collection name in place of the contract name:
 
 ```
-eth_calls_{collection}_{function}_{start}-{end}.parquet
+data/raw/{chain}/eth_calls/{collection}/{function}/{start}-{end}.parquet
 ```
 
-Example: `eth_calls_DERC20_totalSupply_0-9999.parquet`
+Example: `data/raw/base/eth_calls/DERC20/totalSupply/0-9999.parquet`
 
 ### Processing Flow
 
@@ -232,7 +232,7 @@ Factory eth_calls are handled during the normal processing phase (not during cat
 
 ### Manual Re-collection
 
-To re-collect eth_calls for a range, delete the corresponding file from `data/raw/{chain}/eth_calls/`.
+To re-collect eth_calls for a range, delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/`.
 
 ## Limitations
 

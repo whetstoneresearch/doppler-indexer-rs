@@ -111,13 +111,13 @@ pub async fn collect_factories(
 
 ### Parquet Files
 
-Factory addresses are written to `data/derived/{chain}/factories/` with the naming convention:
+Factory addresses are written to `data/derived/{chain}/factories/{collection_name}/` with the naming convention:
 
 ```
-{collection_name}_{start_block}-{end_block}.parquet
+{start_block}-{end_block}.parquet
 ```
 
-Example: `DERC20_0-9999.parquet`
+Example: `data/derived/base/factories/DERC20/0-9999.parquet`
 
 ### Parquet Schema
 
@@ -180,7 +180,7 @@ When `contract_logs_only: true` is configured:
 When factories have `calls` configured:
 1. Regular eth_calls execute immediately (don't wait for factory data)
 2. Factory eth_calls execute when factory addresses arrive
-3. Factory call results use the collection name in the file name (e.g., `eth_calls_DERC20_totalSupply_0-9999.parquet`)
+3. Factory call results use the collection name in the directory path (e.g., `eth_calls/DERC20/totalSupply/0-9999.parquet`)
 
 ## Example Use Cases
 
@@ -284,7 +284,7 @@ SELECT
     block_timestamp,
     encode(factory_address, 'hex') as token_address,
     collection_name
-FROM read_parquet('data/derived/base/factories/*.parquet')
+FROM read_parquet('data/derived/base/factories/**/*.parquet')
 WHERE collection_name = 'DERC20'
   AND block_timestamp BETWEEN 1700000000 AND 1700100000
 ORDER BY block_number;
@@ -293,7 +293,7 @@ ORDER BY block_number;
 SELECT
     collection_name,
     COUNT(*) as contract_count
-FROM read_parquet('data/derived/base/factories/*.parquet')
+FROM read_parquet('data/derived/base/factories/**/*.parquet')
 GROUP BY collection_name;
 ```
 
@@ -336,4 +336,4 @@ On the next run, the receipt collector will detect the missing factory files and
 
 ### Manual Re-collection
 
-To re-collect a factory range, delete the corresponding file from `data/derived/{chain}/factories/`. Note that you may also need to delete the corresponding receipts file to trigger re-processing.
+To re-collect a factory range, delete the corresponding file from `data/derived/{chain}/factories/{collection}/`. Note that you may also need to delete the corresponding receipts file to trigger re-processing.
