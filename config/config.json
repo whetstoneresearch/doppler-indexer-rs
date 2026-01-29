@@ -12,7 +12,11 @@
         }
     ],
     "raw_data_collection": {
-        "parquet_block_range": 10000,
+        "channel_capacity": 5000,
+        "factory_channel_capacity": 5000,
+        "block_receipt_concurrency": 15,
+        "parquet_block_range": 100,
+        "rpc_batch_size": 1000,
         "fields": {
             "block_fields": [
                 "number",

@@ -214,7 +214,66 @@ pub async fn collect_eth_calls(
         }
     }
 
+    let mut block_rx_closed = false;
+
     loop {
+        if block_rx_closed {
+            if !has_factory_calls {
+                break;
+            }
+
+            match &mut factory_rx {
+                Some(rx) => {
+                    match rx.recv().await {
+                        Some(factory_data) => {
+                            let range_start = factory_data.range_start;
+                            let range_end = factory_data.range_end;
+
+                            range_factory_data.insert(range_start, factory_data.clone());
+
+                            if range_regular_done.contains(&range_start) {
+                                if !range_factory_done.contains(&range_start) {
+                                    let range = BlockRange {
+                                        start: range_start,
+                                        end: range_end,
+                                    };
+
+                                    if let Some(blocks) = range_data.get(&range_start) {
+                                        process_factory_range(
+                                            &range,
+                                            blocks,
+                                            client,
+                                            &factory_data,
+                                            &factory_call_configs,
+                                            &output_dir,
+                                            &existing_files,
+                                            rpc_batch_size,
+                                            factory_max_params,
+                                        )
+                                        .await?;
+                                    }
+                                    range_factory_done.insert(range_start);
+                                }
+
+                                if range_regular_done.contains(&range_start)
+                                    && range_factory_done.contains(&range_start)
+                                {
+                                    range_data.remove(&range_start);
+                                    range_factory_data.remove(&range_start);
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::debug!("eth_calls: factory channel closed, exiting loop");
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
+            continue;
+        }
+
         tokio::select! {
             block_result = block_rx.recv() => {
                 match block_result {
@@ -283,9 +342,7 @@ pub async fn collect_eth_calls(
                         }
                     }
                     None => {
-                        if !has_factory_calls || factory_rx.is_none() {
-                            break;
-                        }
+                        block_rx_closed = true;
                     }
                 }
             }

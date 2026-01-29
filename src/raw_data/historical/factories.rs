@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::Address;
-use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, StringBuilder, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, StringBuilder, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -87,15 +87,13 @@ pub async fn collect_factories(
 
         for factory_data in existing_factory_data {
             if let Some(ref tx) = logs_factory_tx {
-                tx.send(factory_data.clone())
-                    .await
-                    .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                if tx.send(factory_data.clone()).await.is_err() {
+                    return Err(FactoryCollectionError::ChannelSend);
+                }
             }
 
             if let Some(ref tx) = eth_calls_factory_tx {
-                tx.send(factory_data)
-                    .await
-                    .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                let _ = tx.send(factory_data).await;
             }
         }
     }
@@ -103,14 +101,11 @@ pub async fn collect_factories(
     let matchers = build_factory_matchers(&chain.contracts);
 
     if matchers.is_empty() {
-        tracing::info!("No factories configured for chain {}", chain.name);
+        tracing::info!("No factory matchers configured for chain {}, forwarding empty ranges", chain.name);
 
-        // No factories to match - just forward range completions with empty data
         while let Some(message) = log_rx.recv().await {
             match message {
-                LogMessage::Logs(_) => {
-                    // No matchers, nothing to do with logs
-                }
+                LogMessage::Logs(_) => {}
                 LogMessage::RangeComplete {
                     range_start,
                     range_end,
@@ -122,15 +117,13 @@ pub async fn collect_factories(
                     };
 
                     if let Some(ref tx) = logs_factory_tx {
-                        tx.send(empty_data.clone())
-                            .await
-                            .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                        if tx.send(empty_data.clone()).await.is_err() {
+                            return Err(FactoryCollectionError::ChannelSend);
+                        }
                     }
 
                     if let Some(ref tx) = eth_calls_factory_tx {
-                        tx.send(empty_data)
-                            .await
-                            .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                        let _ = tx.send(empty_data).await;
                     }
                 }
                 LogMessage::AllRangesComplete => {
@@ -139,7 +132,6 @@ pub async fn collect_factories(
             }
         }
 
-        tracing::info!("Factory collection complete for chain {}", chain.name);
         return Ok(());
     }
 
@@ -156,15 +148,11 @@ pub async fn collect_factories(
     loop {
         let message = match log_rx.recv().await {
             Some(msg) => msg,
-            None => {
-                tracing::warn!("factories: log_rx channel closed unexpectedly");
-                break;
-            }
+            None => break,
         };
 
         match message {
             LogMessage::Logs(logs) => {
-                tracing::debug!("factories: received {} logs", logs.len());
                 for log in logs {
                     let range_start = (log.block_number / range_size) * range_size;
                     range_data.entry(range_start).or_default().push(log);
@@ -174,10 +162,9 @@ pub async fn collect_factories(
                 range_start,
                 range_end,
             } => {
-                tracing::debug!("factories: received RangeComplete for {}-{}", range_start, range_end);
                 let logs = range_data.remove(&range_start).unwrap_or_default();
 
-                let factory_data = process_range(
+                let factory_data = match process_range(
                     range_start,
                     range_end,
                     logs,
@@ -185,18 +172,23 @@ pub async fn collect_factories(
                     &output_dir,
                     &existing_files,
                 )
-                .await?;
+                .await
+                {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Factory processing failed for range {}-{}: {:?}", range_start, range_end, e);
+                        return Err(e);
+                    }
+                };
 
                 if let Some(ref tx) = logs_factory_tx {
-                    tx.send(factory_data.clone())
-                        .await
-                        .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                    if tx.send(factory_data.clone()).await.is_err() {
+                        return Err(FactoryCollectionError::ChannelSend);
+                    }
                 }
 
                 if let Some(ref tx) = eth_calls_factory_tx {
-                    tx.send(factory_data)
-                        .await
-                        .map_err(|_| FactoryCollectionError::ChannelSend)?;
+                    let _ = tx.send(factory_data).await;
                 }
             }
             LogMessage::AllRangesComplete => {
@@ -683,7 +675,8 @@ fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollecti
 
     let block_numbers: UInt64Array = std::iter::empty::<Option<u64>>().collect();
     let timestamps: UInt64Array = std::iter::empty::<Option<u64>>().collect();
-    let addresses = FixedSizeBinaryArray::try_from_iter(std::iter::empty::<&[u8]>())?;
+    // Use builder to create empty FixedSizeBinaryArray (try_from_iter fails with empty iterators)
+    let addresses = FixedSizeBinaryBuilder::new(20).finish();
     let names: StringArray = std::iter::empty::<Option<&str>>().collect();
 
     let arrays: Vec<ArrayRef> = vec![

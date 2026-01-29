@@ -10,6 +10,10 @@ pub struct RawDataCollectionConfig {
     pub channel_capacity: Option<usize>,
     /// Capacity for factory-related channels. Default: 1000
     pub factory_channel_capacity: Option<usize>,
+    /// Number of blocks to fetch receipts for concurrently when using block_receipts_method.
+    /// Higher values improve throughput but use more memory and compute units.
+    /// Default: 10
+    pub block_receipt_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

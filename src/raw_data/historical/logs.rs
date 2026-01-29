@@ -213,11 +213,6 @@ pub async fn collect_logs(
                     None => {
                         tracing::debug!("factory_rx channel closed, pending_ranges: {}", pending_ranges.len());
                         factory_rx = None;
-                        // If we have no pending ranges and factory channel is closed, we might be done
-                        if pending_ranges.is_empty() {
-                            tracing::warn!("factory_rx closed with no pending ranges - breaking");
-                            break;
-                        }
                     }
                 }
             }
@@ -414,7 +409,7 @@ fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {
                             DataType::List(Arc::new(Field::new(
                                 "item",
                                 DataType::FixedSizeBinary(32),
-                                false,
+                                true,
                             ))),
                             false,
                         ));
@@ -438,7 +433,7 @@ fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {
                 DataType::List(Arc::new(Field::new(
                     "item",
                     DataType::FixedSizeBinary(32),
-                    false,
+                    true, 
                 ))),
                 false,
             ),
@@ -466,9 +461,13 @@ fn write_minimal_logs_to_parquet(
                 arrays.push(Arc::new(arr));
             }
             LogField::TransactionHash => {
-                let arr = FixedSizeBinaryArray::try_from_iter(
-                    records.iter().map(|r| r.transaction_hash.as_slice()),
-                )?;
+                let arr = if records.is_empty() {
+                    FixedSizeBinaryBuilder::new(32).finish()
+                } else {
+                    FixedSizeBinaryArray::try_from_iter(
+                        records.iter().map(|r| r.transaction_hash.as_slice()),
+                    )?
+                };
                 arrays.push(Arc::new(arr));
             }
             LogField::LogIndex => {
@@ -476,9 +475,13 @@ fn write_minimal_logs_to_parquet(
                 arrays.push(Arc::new(arr));
             }
             LogField::Address => {
-                let arr = FixedSizeBinaryArray::try_from_iter(
-                    records.iter().map(|r| r.address.as_slice()),
-                )?;
+                let arr = if records.is_empty() {
+                    FixedSizeBinaryBuilder::new(20).finish()
+                } else {
+                    FixedSizeBinaryArray::try_from_iter(
+                        records.iter().map(|r| r.address.as_slice()),
+                    )?
+                };
                 arrays.push(Arc::new(arr));
             }
             LogField::Topics => {
@@ -511,17 +514,25 @@ fn write_full_logs_to_parquet(
     let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp)).collect();
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        records.iter().map(|r| r.transaction_hash.as_slice()),
-    )?;
+    let arr = if records.is_empty() {
+        FixedSizeBinaryBuilder::new(32).finish()
+    } else {
+        FixedSizeBinaryArray::try_from_iter(
+            records.iter().map(|r| r.transaction_hash.as_slice()),
+        )?
+    };
     arrays.push(Arc::new(arr));
 
     let arr: UInt32Array = records.iter().map(|r| Some(r.log_index)).collect();
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        records.iter().map(|r| r.address.as_slice()),
-    )?;
+    let arr = if records.is_empty() {
+        FixedSizeBinaryBuilder::new(20).finish()
+    } else {
+        FixedSizeBinaryArray::try_from_iter(
+            records.iter().map(|r| r.address.as_slice()),
+        )?
+    };
     arrays.push(Arc::new(arr));
 
     let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
