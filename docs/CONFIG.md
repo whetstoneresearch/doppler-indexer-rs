@@ -83,8 +83,12 @@ Controls how raw blockchain data is collected and stored:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `parquet_block_range` | number | No | Number of blocks per parquet file |
+| `rpc_batch_size` | number | No | Batch size for RPC requests |
 | `fields` | object | Yes | Specifies which fields to collect |
 | `contract_logs_only` | boolean | No | If true, only collect logs from configured contracts |
+| `channel_capacity` | number | No | Capacity for main channels (blocks, logs, eth_calls). Default: 1000 |
+| `factory_channel_capacity` | number | No | Capacity for factory-related channels. Default: 1000 |
+| `block_receipt_concurrency` | number | No | Number of blocks to fetch receipts for concurrently when using `block_receipts_method`. Default: 10 |
 
 #### Fields Configuration
 
@@ -145,6 +149,29 @@ Each contract entry is keyed by a human-readable name:
 | `start_block` | number | No | Override chain-level start block for this contract |
 | `calls` | array | No | eth_call configuration for reading contract state |
 | `factories` | array | No | Factory configurations for tracking dynamically created contracts |
+| `events` | array | No | Event signatures to decode from this contract's logs |
+
+### Event Configuration
+
+Events specify which contract events to decode:
+
+```json
+{
+    "UniswapV4PoolManager": {
+        "address": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+        "events": [
+            {"signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1)"},
+            {"signature": "Transfer(address indexed from, address indexed to, uint256 value)"}
+        ]
+    }
+}
+```
+
+**Event Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `signature` | string | Yes | Full ABI signature string including parameter names and types |
 
 ### Multiple Addresses
 
@@ -190,7 +217,42 @@ Contracts can include `calls` to read on-chain state:
 |-------|------|----------|---------|-------------|
 | `function` | string | Yes | - | Function signature (e.g., `totalSupply()`) |
 | `output_type` | string | Yes | - | Return type for decoding |
+| `params` | array | No | - | Parameters to pass to the function call |
 | `frequency` | string/number | No | every block | How often to make the call |
+
+**Parameterized Calls:**
+
+For functions that require parameters, use the `params` field to specify input values:
+
+```json
+{
+    "ERC20Token": {
+        "address": "0x...",
+        "calls": [
+            {
+                "function": "balanceOf(address)",
+                "output_type": "uint256",
+                "params": [
+                    {
+                        "type": "address",
+                        "values": [
+                            "0x1234567890abcdef1234567890abcdef12345678",
+                            "0xabcdef1234567890abcdef1234567890abcdef12"
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+}
+```
+
+Each parameter object has:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | EVM type (address, uint256, bool, etc.) |
+| `values` | array | Array of values - each value generates a separate call |
 
 **Output Types:**
 - `int256`, `int128`, `int64`, `int32`, `int8` - Signed integers
@@ -230,9 +292,9 @@ Factories allow tracking contracts that are dynamically created by other contrac
                 "factory_events": {
                     "name": "Create",
                     "topics_signature": "address",
-                    "data_signature": "address,address,address"
+                    "data_signature": "address,address,address",
+                    "factory_parameters": "data[0]"
                 },
-                "factory_parameters": "data[0]",
                 "calls": [
                     {"function": "totalSupply()", "output_type": "uint256"}
                 ]
@@ -247,17 +309,41 @@ Factories allow tracking contracts that are dynamically created by other contrac
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `collection_name` | string | Yes | Identifier for this group of factory-created contracts |
-| `factory_events` | object | Yes | Event signature information for matching |
-| `factory_parameters` | string | Yes | Which parameter contains the created contract address |
+| `factory_events` | object \| array | Yes | Event signature(s) for matching factory creation events |
 | `calls` | array | No | eth_call configs to execute on factory-created contracts |
+| `events` | array | No | Event signatures to decode from factory-created contract logs |
 
 **Factory Event Fields:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Event name (e.g., "Create", "PairCreated") |
-| `topics_signature` | string | Comma-separated types of indexed parameters |
-| `data_signature` | string | Comma-separated types of non-indexed parameters |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Event name (e.g., "Create", "PairCreated") |
+| `topics_signature` | string | Yes | Comma-separated types of indexed parameters |
+| `data_signature` | string | No | Comma-separated types of non-indexed parameters |
+| `factory_parameters` | string | Yes | Which parameter contains the created contract address |
+
+**Multiple Factory Events:**
+
+A factory can track multiple creation events by providing an array:
+
+```json
+{
+    "factory_events": [
+        {
+            "name": "PoolCreated",
+            "topics_signature": "address,address",
+            "data_signature": "address",
+            "factory_parameters": "data[0]"
+        },
+        {
+            "name": "PairCreated",
+            "topics_signature": "address,address",
+            "data_signature": "address,uint256",
+            "factory_parameters": "data[0]"
+        }
+    ]
+}
+```
 
 **Factory Parameters Format:**
 

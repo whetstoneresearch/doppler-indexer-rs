@@ -5,7 +5,7 @@ The receipt collection module fetches transaction receipts via RPC and writes th
 ## Usage
 
 ```rust
-use doppler_indexer_rs::raw_data::historical::receipts::collect_receipts;
+use doppler_indexer_rs::raw_data::historical::receipts::{collect_receipts, LogMessage};
 use doppler_indexer_rs::rpc::UnifiedRpcClient;
 use tokio::sync::mpsc;
 
@@ -14,9 +14,18 @@ let client = UnifiedRpcClient::from_url(&rpc_url)?;
 // Channel from block collector
 let (block_tx, block_rx) = mpsc::channel(1000);
 // Channel to log collector
-let (log_tx, log_rx) = mpsc::channel(1000);
+let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
+// Channel to factory collector (optional)
+let (factory_log_tx, factory_log_rx) = mpsc::channel::<LogMessage>(1000);
 
-collect_receipts(&chain_config, &client, &raw_data_config, block_rx, Some(log_tx)).await?;
+collect_receipts(
+    &chain_config,
+    &client,
+    &raw_data_config,
+    block_rx,
+    Some(log_tx),
+    Some(factory_log_tx),
+).await?;
 ```
 
 ## Function Signature
@@ -27,7 +36,8 @@ pub async fn collect_receipts(
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
     block_rx: Receiver<(u64, u64, Vec<B256>)>,
-    log_tx: Option<Sender<Vec<LogData>>>,
+    log_tx: Option<Sender<LogMessage>>,
+    factory_log_tx: Option<Sender<LogMessage>>,
 ) -> Result<(), ReceiptCollectionError>
 ```
 
@@ -35,11 +45,12 @@ pub async fn collect_receipts(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `chain` | `&ChainConfig` | Chain configuration with name |
+| `chain` | `&ChainConfig` | Chain configuration with name and optional `block_receipts_method` |
 | `client` | `&UnifiedRpcClient` | Shared RPC client for fetching receipts |
-| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
+| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size, batch sizes, and field configuration |
 | `block_rx` | `Receiver<(u64, u64, Vec<B256>)>` | Channel receiving block info from block collector |
-| `log_tx` | `Option<Sender<Vec<LogData>>>` | Optional channel for forwarding logs |
+| `log_tx` | `Option<Sender<LogMessage>>` | Optional channel for forwarding logs to log collector |
+| `factory_log_tx` | `Option<Sender<LogMessage>>` | Optional channel for forwarding logs to factory collector |
 
 ### Input Channel Message Format
 
@@ -50,7 +61,21 @@ Receives from block collector:
 
 ### Output Channel Message Format
 
-When `log_tx` is provided, sends `Vec<LogData>` where each `LogData` contains:
+Both `log_tx` and `factory_log_tx` receive `LogMessage` enum variants:
+
+```rust
+pub enum LogMessage {
+    Logs(Vec<LogData>),
+    RangeComplete { range_start: u64, range_end: u64 },
+    AllRangesComplete,
+}
+```
+
+- `Logs(Vec<LogData>)` - Batch of extracted logs
+- `RangeComplete` - Signals a block range has been fully processed
+- `AllRangesComplete` - Signals all ranges are done (sent when channel closes)
+
+Each `LogData` contains:
 - `block_number: u64`
 - `block_timestamp: u64`
 - `transaction_hash: B256`
@@ -112,7 +137,7 @@ When `block_receipts_method` is set (e.g., `"eth_getBlockReceipts"`), all receip
 - Reduces rate limiting overhead
 
 **Behavior:**
-- Blocks are processed sequentially (no batching) due to large response sizes
+- Blocks are fetched concurrently (configurable via `block_receipt_concurrency`, default 10)
 - Rate limiting is applied per block request
 - For Alchemy, each call consumes 500 compute units
 
@@ -207,13 +232,40 @@ When no fields are specified, all receipt fields are stored:
                                                              │  4. Extract logs │
                                                              └────────┬─────────┘
                                                                       │
-                                                              Vec<LogData>
-                                                                      │
-                                                                      ▼
-                                                             ┌──────────────────┐
-                                                             │     logs.rs      │
-                                                             └──────────────────┘
+                                                               LogMessage
+                                                              ┌───────┴───────┐
+                                                              │               │
+                                                              ▼               ▼
+                                                     ┌──────────────┐  ┌──────────────┐
+                                                     │   logs.rs    │  │ factories.rs │
+                                                     └──────────────┘  └──────────────┘
 ```
+
+## Configuration Options
+
+The following `raw_data_collection` options affect receipt collection:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `parquet_block_range` | 1000 | Number of blocks per Parquet file |
+| `rpc_batch_size` | 100 | Transactions per RPC batch (per-transaction fetching only) |
+| `block_receipt_concurrency` | 10 | Concurrent block receipt requests (block-level fetching only) |
+
+## Backpressure Monitoring
+
+The receipt collector monitors channel backpressure to help diagnose performance bottlenecks:
+
+- **High pressure warning**: Logged when channel is >90% full
+- **Summary metrics**: Logged at completion with:
+  - Total sends and average send time
+  - High pressure sends (>50% full)
+  - Critical pressure sends (>90% full)
+  - Maximum single send time
+
+If you see frequent high-pressure warnings, consider:
+- Increasing channel capacity
+- Optimizing downstream consumers (logs/factories)
+- Reducing `parquet_block_range` to process smaller batches
 
 ## Error Handling
 
@@ -224,7 +276,8 @@ When no fields are specified, all receipt fields are stored:
 | `Parquet` | Parquet write error |
 | `Arrow` | Arrow array construction error |
 | `ReceiptNotFound` | RPC returned null for a transaction hash |
-| `ChannelSend` | Log receiver dropped the channel |
+| `ChannelSend` | Log or factory receiver dropped the channel |
+| `JoinError` | Blocking task (parquet write) failed to join |
 
 ## Example Configuration
 

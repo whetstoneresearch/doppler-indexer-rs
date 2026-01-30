@@ -6,17 +6,21 @@ The log collection module receives logs extracted from transaction receipts and 
 
 ```rust
 use doppler_indexer_rs::raw_data::historical::logs::collect_logs;
-use doppler_indexer_rs::raw_data::historical::receipts::LogData;
+use doppler_indexer_rs::raw_data::historical::receipts::{LogData, LogMessage};
 use doppler_indexer_rs::raw_data::historical::factories::FactoryAddressData;
+use doppler_indexer_rs::raw_data::decoding::DecoderMessage;
 use tokio::sync::mpsc;
 
-// Channel from receipt collector
-let (log_tx, log_rx) = mpsc::channel(1000);
+// Channel from receipt collector (sends LogMessage)
+let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
 
 // Optional factory channel (for contract_logs_only filtering)
 let factory_rx: Option<Receiver<FactoryAddressData>> = None;
 
-collect_logs(&chain_config, &raw_data_config, log_rx, factory_rx).await?;
+// Optional decoder channel (for ABI decoding)
+let decoder_tx: Option<Sender<DecoderMessage>> = None;
+
+collect_logs(&chain_config, &raw_data_config, log_rx, factory_rx, decoder_tx).await?;
 ```
 
 ## Function Signature
@@ -25,8 +29,9 @@ collect_logs(&chain_config, &raw_data_config, log_rx, factory_rx).await?;
 pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
-    log_rx: Receiver<Vec<LogData>>,
+    log_rx: Receiver<LogMessage>,
     factory_rx: Option<Receiver<FactoryAddressData>>,
+    decoder_tx: Option<Sender<DecoderMessage>>,
 ) -> Result<(), LogCollectionError>
 ```
 
@@ -36,12 +41,27 @@ pub async fn collect_logs(
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with name and contracts |
 | `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
-| `log_rx` | `Receiver<Vec<LogData>>` | Channel receiving logs from receipt collector |
+| `log_rx` | `Receiver<LogMessage>` | Channel receiving log messages from receipt collector |
 | `factory_rx` | `Option<Receiver<FactoryAddressData>>` | Optional channel receiving factory addresses for filtering |
+| `decoder_tx` | `Option<Sender<DecoderMessage>>` | Optional channel for sending logs to the decoder for ABI decoding |
 
 ### Input Channel Message Format
 
-Receives `Vec<LogData>` from receipt collector where each `LogData` contains:
+Receives `LogMessage` enum from receipt collector with the following variants:
+
+```rust
+pub enum LogMessage {
+    Logs(Vec<LogData>),
+    RangeComplete { range_start: u64, range_end: u64 },
+    AllRangesComplete,
+}
+```
+
+- **`Logs(Vec<LogData>)`** - A batch of log data to accumulate
+- **`RangeComplete`** - Signals that all logs for a block range have been sent and the range can be written
+- **`AllRangesComplete`** - Signals that all ranges are finished (end of collection)
+
+Each `LogData` contains:
 - `block_number: u64`
 - `block_timestamp: u64`
 - `transaction_hash: B256`
@@ -49,6 +69,20 @@ Receives `Vec<LogData>` from receipt collector where each `LogData` contains:
 - `address: [u8; 20]`
 - `topics: Vec<[u8; 32]>`
 - `data: Vec<u8>`
+
+### Output Channel (Decoder)
+
+When `decoder_tx` is provided, the collector sends `DecoderMessage` for each completed range:
+
+```rust
+pub enum DecoderMessage {
+    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData> },
+    AllComplete,
+}
+```
+
+- **`LogsReady`** - Sends the filtered logs for a completed range to the decoder
+- **`AllComplete`** - Signals that all log collection is finished
 
 ## Output
 
@@ -64,13 +98,17 @@ data/raw/ethereum/logs/
 
 ## Processing Flow
 
-1. Receives batches of logs from receipt collector
-2. Groups logs by block range
-3. If `contract_logs_only` is enabled:
-   - Waits for factory addresses from the factory collector (if factories are configured)
-   - Filters logs to only include those from configured contracts or factory-created contracts
-4. Writes complete ranges to Parquet files
-5. Processes remaining partial ranges when channel closes
+1. Receives `LogMessage` from the receipt collector via channel
+2. For `LogMessage::Logs`: accumulates logs into per-range buckets
+3. For `LogMessage::RangeComplete`: signals a range is ready to process
+   - If `contract_logs_only` is enabled and factories are configured, waits for factory addresses
+   - Filters logs to configured contracts and factory-created contracts (if filtering enabled)
+   - Sends logs to decoder (if decoder channel provided)
+   - Writes range to Parquet file
+4. For `LogMessage::AllRangesComplete`: signals collection is finished
+   - Waits for any pending ranges that need factory data
+   - Sends `DecoderMessage::AllComplete` to decoder (if configured)
+   - Exits the collection loop
 
 ## Contract Logs Only Filtering
 
@@ -105,6 +143,27 @@ When factories are configured and `contract_logs_only` is enabled:
 4. This allows tracking events from dynamically created contracts without knowing their addresses in advance
 
 See [Factory Collection](./FACTORY_COLLECTION.md) for more details on factory address discovery.
+
+## Decoder Integration
+
+When a `decoder_tx` channel is provided, the log collector forwards logs to the decoder for ABI-based event decoding. This enables automatic parsing of event data into human-readable format.
+
+### How It Works
+
+1. After filtering and before writing to parquet, logs are sent to the decoder via `DecoderMessage::LogsReady`
+2. The decoder receives the logs along with the block range information
+3. When all log collection is complete, `DecoderMessage::AllComplete` is sent to signal the decoder to finish
+
+### Configuration
+
+To enable decoding, provide a decoder channel when calling `collect_logs`:
+
+```rust
+let (decoder_tx, decoder_rx) = mpsc::channel(1000);
+collect_logs(&chain, &config, log_rx, factory_rx, Some(decoder_tx)).await?;
+```
+
+See [Decoding](./DECODING.md) for more details on ABI-based event and call decoding.
 
 ## Resumability
 
@@ -178,7 +237,7 @@ When no fields are specified, all log fields are stored:
 
 ```
 ┌─────────────┐                              ┌──────────────────┐                              ┌─────────────┐
-│   blocks.rs │ ───(block info)────────────▶ │   receipts.rs    │ ───(Vec<LogData>)──────────▶ │   logs.rs   │
+│   blocks.rs │ ───(block info)────────────▶ │   receipts.rs    │ ───(LogMessage)────────────▶ │   logs.rs   │
 └─────────────┘                              │                  │                              │             │
                                              │  extracts logs   │                              │ writes logs │
                                              │  from receipts   │                              │ to parquet  │
@@ -214,6 +273,29 @@ When no fields are specified, all log fields are stored:
                               └─────────────┘                          │
 ```
 
+### With Decoder Integration
+
+When a decoder channel is provided, the log collector sends logs for ABI decoding:
+
+```
+┌──────────────────┐                              ┌─────────────┐
+│   receipts.rs    │ ───(LogMessage)────────────▶ │   logs.rs   │
+│                  │                              │             │
+│  extracts logs   │                              │ filters &   │
+│  from receipts   │                              │ accumulates │
+└──────────────────┘                              └──────┬──────┘
+                                                         │
+                                    ┌────────────────────┼────────────────────┐
+                                    │                    │                    │
+                                    ▼                    ▼                    ▼
+                             ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+                             │   parquet   │      │  decoder.rs │      │  AllComplete│
+                             │   output    │      │             │      │   signal    │
+                             └─────────────┘      │ decodes via │      └─────────────┘
+                                                  │ ABIs        │
+                                                  └─────────────┘
+```
+
 ## Topics Structure
 
 EVM logs have up to 4 topics:
@@ -229,6 +311,7 @@ The `topics` column stores these as a list of 32-byte values, preserving the ord
 | `Io` | File system error |
 | `Parquet` | Parquet write error |
 | `Arrow` | Arrow array construction error |
+| `JoinError` | Tokio task join error (from spawn_blocking) |
 
 Note: Log collection does not make RPC calls directly, so there are no RPC-related errors.
 
@@ -298,8 +381,8 @@ let mut tasks = JoinSet::new();
 
 // Spawn collectors
 tasks.spawn(collect_blocks(chain.clone(), client.clone(), config.clone(), Some(block_tx)));
-tasks.spawn(collect_receipts(chain.clone(), client.clone(), config.clone(), block_rx, Some(log_tx)));
-tasks.spawn(collect_logs(chain.clone(), config.clone(), log_rx));
+tasks.spawn(collect_receipts(chain.clone(), client.clone(), config.clone(), block_rx, Some(log_tx), None));
+tasks.spawn(collect_logs(chain.clone(), config.clone(), log_rx, None, None));
 
 // Wait for all to complete
 while let Some(result) = tasks.join_next().await {

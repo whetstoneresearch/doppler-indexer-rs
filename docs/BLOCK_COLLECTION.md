@@ -12,7 +12,12 @@ use tokio::sync::mpsc;
 let client = UnifiedRpcClient::from_url(&rpc_url)?;
 let (tx, rx) = mpsc::channel(1000);
 
-collect_blocks(&chain_config, &client, &raw_data_config, Some(tx)).await?;
+// Basic usage with transaction sender only
+collect_blocks(&chain_config, &client, &raw_data_config, Some(tx), None).await?;
+
+// With both transaction and eth_call senders
+let (eth_call_tx, eth_call_rx) = mpsc::channel(1000);
+collect_blocks(&chain_config, &client, &raw_data_config, Some(tx), Some(eth_call_tx)).await?;
 ```
 
 ## Function Signature
@@ -23,6 +28,7 @@ pub async fn collect_blocks(
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
     tx_sender: Option<Sender<(u64, u64, Vec<B256>)>>,
+    eth_call_sender: Option<Sender<(u64, u64)>>,
 ) -> Result<(), BlockCollectionError>
 ```
 
@@ -32,8 +38,9 @@ pub async fn collect_blocks(
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with name and start block |
 | `client` | `&UnifiedRpcClient` | Shared RPC client (enables rate limit sharing across operations) |
-| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
+| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size, RPC batch size, and field configuration |
 | `tx_sender` | `Option<Sender<(u64, u64, Vec<B256>)>>` | Optional channel for receipt/log collection |
+| `eth_call_sender` | `Option<Sender<(u64, u64)>>` | Optional channel for eth_call data collection |
 
 ### Channel Message Format
 
@@ -41,6 +48,10 @@ When `tx_sender` is provided, each block sends a tuple:
 - `u64` - Block number
 - `u64` - Block timestamp
 - `Vec<B256>` - Transaction hashes in the block
+
+When `eth_call_sender` is provided, each block sends a tuple:
+- `u64` - Block number
+- `u64` - Block timestamp
 
 ## Output
 
@@ -144,6 +155,7 @@ Both clients share the same interface, allowing rate limits to be shared across 
 | `Arrow` | Arrow array construction error |
 | `BlockNotFound` | RPC returned null for a block number |
 | `ChannelSend` | Receiver dropped the channel |
+| `JoinError` | Tokio task join failed (e.g., during Parquet write) |
 
 ## Example Configuration
 
@@ -159,6 +171,7 @@ Both clients share the same interface, allowing rate limits to be shared across 
   ],
   "raw_data_collection": {
     "parquet_block_range": 10000,
+    "rpc_batch_size": 100,
     "fields": {
       "block_fields": null
     }
@@ -169,5 +182,40 @@ Both clients share the same interface, allowing rate limits to be shared across 
 This configuration:
 - Collects blocks starting from 17,000,000 (aligned to 17,000,000 since 17000000 % 10000 == 0)
 - Writes 10,000 blocks per Parquet file
+- Fetches 100 blocks per RPC batch request (default: 100)
 - Stores all block fields (full schema)
 - Reads RPC URL from `ETHEREUM_RPC_URL` environment variable
+
+## Helper Functions
+
+### Reading Existing Block Data
+
+Two helper functions are available for reading previously collected block data:
+
+#### `get_existing_block_ranges`
+
+```rust
+pub fn get_existing_block_ranges(chain_name: &str) -> Vec<ExistingBlockRange>
+```
+
+Scans the output directory and returns all existing Parquet file ranges for a chain. Useful for determining what data has already been collected.
+
+**Returns:** `Vec<ExistingBlockRange>` sorted by start block, where each range contains:
+- `start: u64` - First block number (inclusive)
+- `end: u64` - Last block number (exclusive)
+- `file_path: PathBuf` - Path to the Parquet file
+
+#### `read_block_info_from_parquet`
+
+```rust
+pub fn read_block_info_from_parquet(
+    file_path: &Path,
+) -> Result<Vec<BlockInfoForDownstream>, BlockCollectionError>
+```
+
+Reads block information from a Parquet file. Useful for downstream processing that needs block data without re-fetching from RPC.
+
+**Returns:** `Vec<BlockInfoForDownstream>` sorted by block number, where each block contains:
+- `block_number: u64` - The block number
+- `timestamp: u64` - The block timestamp
+- `tx_hashes: Vec<B256>` - Transaction hashes in the block

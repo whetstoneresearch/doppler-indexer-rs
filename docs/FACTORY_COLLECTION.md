@@ -78,6 +78,7 @@ The `factory_parameters` field specifies where to extract the created contract a
 | `topics[2]` | Second indexed parameter |
 | `data[0]` | First non-indexed parameter |
 | `data[1]` | Second non-indexed parameter |
+| `data[0][1]` | Nested tuple access - second element of first tuple |
 | etc. | Continue pattern as needed |
 
 **Example:** For a `PairCreated(address indexed token0, address indexed token1, address pair, uint)` event:
@@ -85,15 +86,33 @@ The `factory_parameters` field specifies where to extract the created contract a
 - `topics[2]` = token1 address
 - `data[0]` = pair address (the created contract)
 
+**Nested Tuple Example:** For an event like `Created((address,uint256,address) params)` where the address is in a tuple:
+- `data[0][0]` = first address in the tuple
+- `data[0][2]` = third address in the tuple
+
+When using nested access, the `data_signature` should include the tuple type:
+```json
+{
+    "factory_events": {
+        "name": "Created",
+        "topics_signature": "",
+        "data_signature": "(address,uint256,address)"
+    },
+    "factory_parameters": "data[0][0]"
+}
+```
+
 ## Function Signature
 
 ```rust
 pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
-    log_rx: Receiver<Vec<LogData>>,
+    log_rx: Receiver<LogMessage>,
     logs_factory_tx: Option<Sender<FactoryAddressData>>,
     eth_calls_factory_tx: Option<Sender<FactoryAddressData>>,
+    log_decoder_tx: Option<Sender<DecoderMessage>>,
+    call_decoder_tx: Option<Sender<DecoderMessage>>,
 ) -> Result<(), FactoryCollectionError>
 ```
 
@@ -103,9 +122,21 @@ pub async fn collect_factories(
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with contracts |
 | `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size configuration |
-| `log_rx` | `Receiver<Vec<LogData>>` | Channel receiving logs from receipt collector |
+| `log_rx` | `Receiver<LogMessage>` | Channel receiving log messages from receipt collector |
 | `logs_factory_tx` | `Option<Sender<FactoryAddressData>>` | Channel to send addresses to logs collector |
 | `eth_calls_factory_tx` | `Option<Sender<FactoryAddressData>>` | Channel to send addresses to eth_calls collector |
+| `log_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to log decoder |
+| `call_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to call decoder |
+
+### LogMessage Protocol
+
+The factory collector receives messages via the `LogMessage` enum:
+
+| Variant | Description |
+|---------|-------------|
+| `Logs(Vec<LogData>)` | Batch of log entries to process |
+| `RangeComplete { range_start, range_end }` | Signals a block range is complete, triggers parquet writing |
+| `AllRangesComplete` | Signals all ranges are done, collector can shut down |
 
 ## Output
 
@@ -146,24 +177,24 @@ The `addresses_by_block` map contains `(timestamp, address, collection_name)` tu
 
 ```
 ┌──────────────────┐                              ┌─────────────────┐
-│   receipts.rs    │ ───(Vec<LogData>)──────────▶ │  factories.rs   │
+│   receipts.rs    │ ───(LogMessage)────────────▶ │  factories.rs   │
 │                  │                              │                 │
 │  extracts logs   │                              │ matches factory │
 │  from receipts   │                              │ events, extracts│
 └──────────────────┘                              │ addresses       │
                                                   └────────┬────────┘
                                                            │
-                              ┌─────────────────────────────┼────────────────────────────┐
-                              │                             │                            │
-                              ▼                             ▼                            ▼
-                    ┌─────────────────┐         ┌─────────────────┐         ┌──────────────────┐
-                    │    logs.rs      │         │  eth_calls.rs   │         │    parquet       │
-                    │                 │         │                 │         │                  │
-                    │  filters logs   │         │ executes calls  │         │ data/derived/    │
-                    │  to include     │         │ on factory      │         │ {chain}/         │
-                    │  factory        │         │ contracts       │         │ factories/       │
-                    │  contracts      │         │                 │         │                  │
-                    └─────────────────┘         └─────────────────┘         └──────────────────┘
+              ┌────────────────────┬───────────────────────┼───────────────────────┬────────────────────┐
+              │                    │                       │                       │                    │
+              ▼                    ▼                       ▼                       ▼                    ▼
+    ┌─────────────────┐  ┌─────────────────┐   ┌──────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+    │    logs.rs      │  │  eth_calls.rs   │   │    parquet       │   │  log_decoder    │   │  call_decoder   │
+    │                 │  │                 │   │                  │   │                 │   │                 │
+    │  filters logs   │  │ executes calls  │   │ data/derived/    │   │ decodes logs    │   │ decodes calls   │
+    │  to include     │  │ on factory      │   │ {chain}/         │   │ from factory    │   │ from factory    │
+    │  factory        │  │ contracts       │   │ factories/       │   │ contracts       │   │ contracts       │
+    │  contracts      │  │                 │   │                  │   │                 │   │                 │
+    └─────────────────┘  └─────────────────┘   └──────────────────┘   └─────────────────┘   └─────────────────┘
 ```
 
 ## Integration with Other Collectors
@@ -185,6 +216,32 @@ When factories have `calls` configured:
 5. Calls with block-based or duration-based frequency are filtered accordingly
 
 See [eth_call Collection](./ETH_CALL_COLLECTION.md) for detailed frequency documentation.
+
+### Decoders
+
+Factory addresses are also sent to the log and call decoders via `DecoderMessage::FactoryAddresses`. This allows:
+1. Log decoder to decode events from factory-created contracts using their ABIs
+2. Call decoder to decode eth_call results from factory contracts
+
+The decoder messages include the block range and a map of collection names to addresses discovered in that range.
+
+## Helper Functions
+
+The module exports helper functions for working with factory configurations:
+
+```rust
+// Get eth_call configs for each factory collection
+pub fn get_factory_call_configs(contracts: &Contracts)
+    -> HashMap<String, Vec<EthCallConfig>>
+
+// Get list of all factory collection names
+pub fn get_factory_collection_names(contracts: &Contracts)
+    -> Vec<String>
+```
+
+These are useful for:
+- Building the eth_calls collector configuration
+- Checking which collections exist before processing
 
 ## Example Use Cases
 
@@ -278,6 +335,7 @@ A single contract can have multiple factory configurations:
 | `Arrow` | Arrow array construction error |
 | `ChannelSend` | Failed to send data to downstream collector |
 | `AbiDecode` | Failed to decode event data (logged as warning, doesn't stop collection) |
+| `JoinError` | Tokio task join error during blocking parquet writes |
 
 ABI decode errors are logged but don't stop collection. This allows the indexer to continue even if some events have unexpected data formats.
 
@@ -311,6 +369,7 @@ GROUP BY collection_name;
 - ABI decoding for data extraction adds overhead
 - Large numbers of factory contracts increase eth_call RPC costs
 - Consider using `parquet_block_range` to balance file count vs. size
+- When no factory matchers are configured, the collector simply forwards empty `FactoryAddressData` to downstream collectors without writing any files
 
 ## Resumability
 
@@ -319,6 +378,20 @@ Collection is fully resumable with multiple safeguards:
 ### Factory Parquet Skipping
 
 Existing parquet files are scanned on startup and their ranges are skipped during collection.
+
+### Catchup Phase
+
+On startup, before processing new logs from the channel, the factory collector performs a catchup phase:
+
+1. Scans `data/raw/{chain}/logs/` for existing log parquet files
+2. For each log file, checks if corresponding factory files exist for all configured collections
+3. If any factory files are missing, reads logs from the existing parquet file and processes them
+4. This avoids re-fetching receipts when logs already exist but factory processing was interrupted
+
+This is particularly useful when:
+- Factory collection was interrupted mid-run
+- New factory configurations are added to existing contracts
+- Factory files were manually deleted for re-processing
 
 ### Empty Range Handling
 

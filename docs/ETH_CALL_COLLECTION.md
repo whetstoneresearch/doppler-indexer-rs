@@ -42,11 +42,87 @@ eth_calls are configured per-contract in your chain config:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `function` | string | Yes | - | The function signature (e.g., `totalSupply()`). Used to compute the 4-byte selector. |
+| `function` | string | Yes | - | The function signature (e.g., `totalSupply()`, `balanceOf(address)`). Used to compute the 4-byte selector. |
 | `output_type` | string | Yes | - | The return type. Used by consumers to decode the binary result. |
+| `params` | array | No | `[]` | Parameters to pass to the function (see Parameters section below). |
 | `frequency` | string/number | No | every block | How often to make the call (see Frequency section below). |
 
-**Note:** Currently only parameterless functions are supported. Functions with arguments would require additional configuration for the encoded parameters.
+### Supported Types
+
+The `output_type` field (and parameter types) support the following EVM types:
+
+| Type | Description |
+|------|-------------|
+| `uint8`, `uint16`, `uint32`, `uint64`, `uint80`, `uint128`, `uint256` | Unsigned integers of various sizes |
+| `int8`, `int32`, `int64`, `int128`, `int256` | Signed integers of various sizes |
+| `address` | 20-byte Ethereum address |
+| `bool` | Boolean value |
+| `bytes32` | Fixed 32-byte value |
+| `bytes` | Dynamic byte array |
+| `string` | Dynamic string |
+
+## Parameters
+
+Functions with arguments are supported via the `params` configuration. Each parameter specifies a type and a list of values. The collector generates all combinations of parameter values (cartesian product).
+
+### Parameter Configuration
+
+```json
+{
+  "function": "balanceOf(address)",
+  "output_type": "uint256",
+  "params": [
+    {
+      "type": "address",
+      "values": [
+        "0x1234567890abcdef1234567890abcdef12345678",
+        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+      ]
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | Yes | The EVM type of the parameter (see Supported Types above). |
+| `values` | array | Yes | List of values to call the function with. |
+
+### Multi-Parameter Example
+
+For functions with multiple parameters, provide multiple param configs. The collector calls the function with every combination:
+
+```json
+{
+  "function": "allowance(address,address)",
+  "output_type": "uint256",
+  "params": [
+    {
+      "type": "address",
+      "values": ["0xOwner1...", "0xOwner2..."]
+    },
+    {
+      "type": "address",
+      "values": ["0xSpender1...", "0xSpender2..."]
+    }
+  ]
+}
+```
+
+This generates 4 calls: `(Owner1, Spender1)`, `(Owner1, Spender2)`, `(Owner2, Spender1)`, `(Owner2, Spender2)`.
+
+### Parameter Value Formats
+
+| Type | Format Examples |
+|------|-----------------|
+| `address` | `"0x1234..."` (40 hex chars with 0x prefix) |
+| `uint*` / `int*` | `"1000000"` (decimal) or `"0xde0b6b3a7640000"` (hex) |
+| `bool` | `true`, `false`, `"true"`, `"false"`, `1`, `0` |
+| `bytes32` | `"0x..."` (64 hex chars with 0x prefix) |
+| `bytes` | `"0x..."` (hex with 0x prefix) |
+| `string` | `"any string value"` |
+
+**Note:** Functions with `frequency: "once"` do not support parameters.
 
 ## Frequency
 
@@ -95,6 +171,20 @@ Examples: `"30s"`, `"5m"`, `"1h"`, `"7d"`
           "function": "decimals()",
           "output_type": "uint8",
           "frequency": "once"
+        },
+        {
+          "function": "balanceOf(address)",
+          "output_type": "uint256",
+          "frequency": "1h",
+          "params": [
+            {
+              "type": "address",
+              "values": [
+                "0x47ac0fb4f2d84898e4d9e7b4dab3c24507a6d503",
+                "0x0a59649758aa4d66e25f08dd01271e891fe52199"
+              ]
+            }
+          ]
         }
       ]
     },
@@ -198,26 +288,38 @@ Example: `data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet`
 | `block_timestamp` | UInt64 | Unix timestamp of the block |
 | `contract_address` | FixedSizeBinary(20) | The contract address called |
 | `value` | Binary | Raw bytes returned by eth_call |
+| `param_0`, `param_1`, ... | Binary | ABI-encoded parameter values (only present if function has parameters) |
 
 ### Decoding Values
 
-The `value` column contains raw bytes from the eth_call response. To decode:
+The `value` column contains raw ABI-encoded bytes from the eth_call response. To decode:
 
 1. Look up the `contract_address` in your config to find the `output_type`
 2. Decode the bytes according to the type:
-   - `uint256`: 32-byte big-endian unsigned integer
-   - `int256`: 32-byte big-endian signed integer (two's complement)
+   - `uint*`: 32-byte big-endian unsigned integer (left-padded with zeros)
+   - `int*`: 32-byte big-endian signed integer (two's complement)
+   - `address`: 32 bytes, last 20 bytes are the address
+   - `bool`: 32 bytes, last byte is 0 or 1
+   - `bytes32`: 32 bytes, direct value
+   - `string`/`bytes`: ABI-encoded with offset + length + data
 
 Example in Python:
 ```python
 import pandas as pd
 
-df = pd.read_parquet("eth_calls_USDC_totalSupply_0-9999.parquet")
+df = pd.read_parquet("data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet")
 
 # Decode uint256
 df['decoded_value'] = df['value'].apply(
     lambda x: int.from_bytes(x, byteorder='big') if x else None
 )
+
+# For parameterized calls, decode param columns too
+if 'param_0' in df.columns:
+    # param_0 contains ABI-encoded parameter (e.g., address is 32 bytes, last 20 are the address)
+    df['param_0_address'] = df['param_0'].apply(
+        lambda x: '0x' + x[-20:].hex() if x else None
+    )
 ```
 
 ## Error Handling
@@ -249,10 +351,14 @@ The collector respects the `rpc_batch_size` configuration:
 Each eth_call costs compute units on rate-limited providers (e.g., Alchemy). With many contracts and functions configured, costs can add up quickly:
 
 ```
-total_calls_per_range = num_contracts × num_functions × parquet_block_range
+total_calls_per_range = num_contracts × num_functions × num_param_combinations × blocks_per_range
 ```
 
-For example, 10 contracts with 2 functions each over 10,000 blocks = 200,000 eth_calls per parquet file.
+For example:
+- 10 contracts with 2 functions each over 10,000 blocks = 200,000 eth_calls per parquet file
+- 1 contract with `balanceOf(address)` and 100 tracked addresses over 10,000 blocks = 1,000,000 eth_calls
+
+Use `frequency` settings to reduce call volume for slowly-changing data.
 
 ## Benchmarking
 
@@ -358,3 +464,4 @@ To re-collect eth_calls for a range, delete the corresponding file from `data/ra
 - No state override support (calls use the actual on-chain state)
 - Results are stored as raw bytes; decoding is left to the consumer
 - Factory calls require the factory collector to discover addresses first
+- Functions with `frequency: "once"` do not support parameters (use parameterless view functions like `name()`, `symbol()`, `decimals()`)
