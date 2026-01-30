@@ -35,8 +35,8 @@ pub enum ReceiptCollectionError {
     #[error("Receipt not found for tx: {0}")]
     ReceiptNotFound(B256),
 
-    #[error("Channel send error")]
-    ChannelSend,
+    #[error("Channel send error: {0}")]
+    ChannelSend(String),
 
     #[error("Task join error: {0}")]
     JoinError(String),
@@ -410,12 +410,18 @@ pub async fn collect_receipts(
 
     if let Some(sender) = &factory_log_tx {
         if sender.send(LogMessage::AllRangesComplete).await.is_err() {
-            return Err(ReceiptCollectionError::ChannelSend);
+            tracing::error!("Failed to send AllRangesComplete to factory_log_tx - receiver dropped");
+            return Err(ReceiptCollectionError::ChannelSend(
+                "factory_log_tx (AllRangesComplete) - receiver dropped".to_string(),
+            ));
         }
     }
     if let Some(sender) = &log_tx {
         if sender.send(LogMessage::AllRangesComplete).await.is_err() {
-            return Err(ReceiptCollectionError::ChannelSend);
+            tracing::error!("Failed to send AllRangesComplete to log_tx - receiver dropped");
+            return Err(ReceiptCollectionError::ChannelSend(
+                "log_tx (AllRangesComplete) - receiver dropped".to_string(),
+            ));
         }
     }
 
@@ -444,12 +450,28 @@ async fn send_range_complete(
 
     if let Some(sender) = factory_log_tx {
         if sender.send(message.clone()).await.is_err() {
-            return Err(ReceiptCollectionError::ChannelSend);
+            tracing::error!(
+                "Failed to send RangeComplete({}-{}) to factory_log_tx - receiver dropped",
+                range_start,
+                range_end
+            );
+            return Err(ReceiptCollectionError::ChannelSend(format!(
+                "factory_log_tx (RangeComplete {}-{}) - receiver dropped",
+                range_start, range_end
+            )));
         }
     }
     if let Some(sender) = log_tx {
         if sender.send(message).await.is_err() {
-            return Err(ReceiptCollectionError::ChannelSend);
+            tracing::error!(
+                "Failed to send RangeComplete({}-{}) to log_tx - receiver dropped",
+                range_start,
+                range_end
+            );
+            return Err(ReceiptCollectionError::ChannelSend(format!(
+                "log_tx (RangeComplete {}-{}) - receiver dropped",
+                range_start, range_end
+            )));
         }
     }
 
@@ -481,7 +503,14 @@ async fn send_logs_to_channels(
 
         let send_start = Instant::now();
         if sender.send(LogMessage::Logs(batch_logs.clone())).await.is_err() {
-            return Err(ReceiptCollectionError::ChannelSend);
+            tracing::error!(
+                "Failed to send {} logs to factory_log_tx - receiver dropped",
+                log_count
+            );
+            return Err(ReceiptCollectionError::ChannelSend(format!(
+                "factory_log_tx (Logs batch of {}) - receiver dropped",
+                log_count
+            )));
         }
         let send_time = send_start.elapsed();
         *total_channel_send_time += send_time;
@@ -503,7 +532,14 @@ async fn send_logs_to_channels(
 
         let send_start = Instant::now();
         if sender.send(LogMessage::Logs(batch_logs)).await.is_err() {
-            return Err(ReceiptCollectionError::ChannelSend);
+            tracing::error!(
+                "Failed to send {} logs to log_tx - receiver dropped",
+                log_count
+            );
+            return Err(ReceiptCollectionError::ChannelSend(format!(
+                "log_tx (Logs batch of {}) - receiver dropped",
+                log_count
+            )));
         }
         let send_time = send_start.elapsed();
         *total_channel_send_time += send_time;

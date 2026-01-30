@@ -289,6 +289,7 @@ impl AlchemyClient {
             let total_cost = chunk.len() as u32 * cost_per_block;
             self.consume_compute_units_raw(total_cost).await;
 
+            let chunk_block_numbers: Vec<_> = chunk.to_vec();
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|&block_number| {
@@ -298,8 +299,19 @@ impl AlchemyClient {
 
             let results = futures::future::join_all(futures).await;
 
-            for result in results {
-                all_results.push(result?);
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(receipts) => all_results.push(receipts),
+                    Err(e) => {
+                        let failed_block = chunk_block_numbers.get(i);
+                        tracing::error!(
+                            "get_block_receipts failed for block {:?}: {}",
+                            failed_block,
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
 

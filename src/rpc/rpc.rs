@@ -461,6 +461,7 @@ impl RpcClient {
         for chunk in block_numbers.chunks(concurrency) {
             self.wait_for_rate_limit().await;
 
+            let chunk_block_numbers: Vec<_> = chunk.to_vec();
             let futures: Vec<_> = chunk
                 .iter()
                 .map(|&block_number| {
@@ -470,8 +471,19 @@ impl RpcClient {
 
             let results = futures::future::join_all(futures).await;
 
-            for result in results {
-                all_results.push(result?);
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(receipts) => all_results.push(receipts),
+                    Err(e) => {
+                        let failed_block = chunk_block_numbers.get(i);
+                        tracing::error!(
+                            "get_block_receipts failed for block {:?}: {}",
+                            failed_block,
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
 

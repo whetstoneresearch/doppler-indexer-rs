@@ -34,8 +34,8 @@ pub enum FactoryCollectionError {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
-    #[error("Channel send error")]
-    ChannelSend,
+    #[error("Channel send error: {0}")]
+    ChannelSend(String),
 
     #[error("ABI decode error: {0}")]
     AbiDecode(String),
@@ -92,7 +92,15 @@ pub async fn collect_factories(
         for factory_data in existing_factory_data {
             if let Some(ref tx) = logs_factory_tx {
                 if tx.send(factory_data.clone()).await.is_err() {
-                    return Err(FactoryCollectionError::ChannelSend);
+                    tracing::error!(
+                        "Failed to send existing factory data for range {}-{} to logs_factory_tx - receiver dropped",
+                        factory_data.range_start,
+                        factory_data.range_end
+                    );
+                    return Err(FactoryCollectionError::ChannelSend(format!(
+                        "logs_factory_tx (existing data {}-{}) - receiver dropped",
+                        factory_data.range_start, factory_data.range_end
+                    )));
                 }
             }
 
@@ -148,7 +156,15 @@ pub async fn collect_factories(
 
                     if let Some(ref tx) = logs_factory_tx {
                         if tx.send(empty_data.clone()).await.is_err() {
-                            return Err(FactoryCollectionError::ChannelSend);
+                            tracing::error!(
+                                "Failed to send empty factory data for range {}-{} to logs_factory_tx - receiver dropped",
+                                range_start,
+                                range_end
+                            );
+                            return Err(FactoryCollectionError::ChannelSend(format!(
+                                "logs_factory_tx (empty data {}-{}) - receiver dropped",
+                                range_start, range_end
+                            )));
                         }
                     }
 
@@ -253,7 +269,15 @@ pub async fn collect_factories(
         // Send factory data to downstream consumers
         if let Some(ref tx) = logs_factory_tx {
             if tx.send(factory_data.clone()).await.is_err() {
-                return Err(FactoryCollectionError::ChannelSend);
+                tracing::error!(
+                    "Failed to send catchup factory data for range {}-{} to logs_factory_tx - receiver dropped",
+                    factory_data.range_start,
+                    factory_data.range_end
+                );
+                return Err(FactoryCollectionError::ChannelSend(format!(
+                    "logs_factory_tx (catchup {}-{}) - receiver dropped",
+                    factory_data.range_start, factory_data.range_end
+                )));
             }
         }
 
@@ -347,7 +371,15 @@ pub async fn collect_factories(
 
                 if let Some(ref tx) = logs_factory_tx {
                     if tx.send(factory_data.clone()).await.is_err() {
-                        return Err(FactoryCollectionError::ChannelSend);
+                        tracing::error!(
+                            "Failed to send factory data for range {}-{} to logs_factory_tx - receiver dropped",
+                            factory_data.range_start,
+                            factory_data.range_end
+                        );
+                        return Err(FactoryCollectionError::ChannelSend(format!(
+                            "logs_factory_tx ({}-{}) - receiver dropped",
+                            factory_data.range_start, factory_data.range_end
+                        )));
                     }
                 }
 

@@ -39,8 +39,8 @@ pub enum BlockCollectionError {
     #[error("Block not found: {0}")]
     BlockNotFound(u64),
 
-    #[error("Channel send error")]
-    ChannelSend,
+    #[error("Channel send error: {0}")]
+    ChannelSend(String),
 
     #[error("Task join error: {0}")]
     JoinError(String),
@@ -177,7 +177,16 @@ pub async fn collect_blocks(
                             sender
                                 .send((*block_number, *timestamp, tx_hashes.clone()))
                                 .await
-                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                                .map_err(|_| {
+                                    tracing::error!(
+                                        "Failed to send block {} to receipts channel - receiver dropped",
+                                        block_number
+                                    );
+                                    BlockCollectionError::ChannelSend(format!(
+                                        "block_tx (block {}) - receiver dropped",
+                                        block_number
+                                    ))
+                                })?;
                         }
                     }
 
@@ -186,7 +195,16 @@ pub async fn collect_blocks(
                             sender
                                 .send((*block_number, *timestamp))
                                 .await
-                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                                .map_err(|_| {
+                                    tracing::error!(
+                                        "Failed to send block {} to eth_call channel - receiver dropped",
+                                        block_number
+                                    );
+                                    BlockCollectionError::ChannelSend(format!(
+                                        "eth_call_tx (block {}) - receiver dropped",
+                                        block_number
+                                    ))
+                                })?;
                         }
                     }
 
@@ -241,7 +259,16 @@ pub async fn collect_blocks(
                             sender
                                 .send((*block_number, *timestamp, tx_hashes.clone()))
                                 .await
-                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                                .map_err(|_| {
+                                    tracing::error!(
+                                        "Failed to send block {} to receipts channel - receiver dropped",
+                                        block_number
+                                    );
+                                    BlockCollectionError::ChannelSend(format!(
+                                        "block_tx (block {}) - receiver dropped",
+                                        block_number
+                                    ))
+                                })?;
                         }
                     }
 
@@ -250,7 +277,16 @@ pub async fn collect_blocks(
                             sender
                                 .send((*block_number, *timestamp))
                                 .await
-                                .map_err(|_| BlockCollectionError::ChannelSend)?;
+                                .map_err(|_| {
+                                    tracing::error!(
+                                        "Failed to send block {} to eth_call channel - receiver dropped",
+                                        block_number
+                                    );
+                                    BlockCollectionError::ChannelSend(format!(
+                                        "eth_call_tx (block {}) - receiver dropped",
+                                        block_number
+                                    ))
+                                })?;
                         }
                     }
 
