@@ -11,10 +11,8 @@
                     "factory_parameters": "data[0]"
                 },
                 "calls": [
-                    {"function": "name", "output_type": "string"},
-                    {"function": "symbol", "output_type": "string"},
-                    {"function": "decimals", "output_type": "uint8"},
-                    {"function": "totalSupply()", "output_type": "uint256"}
+                    {"function": "name", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol", "output_type": "string", "frequency": "once"}
                 ]
             },
             {

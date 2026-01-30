@@ -1,5 +1,6 @@
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
+use arrow::datatypes::DataType;
 use serde::de::{self, Visitor};
 use serde::Deserialize;
 use std::fmt;
@@ -317,6 +318,28 @@ impl EvmType {
                 let s = value.as_string()?;
                 Ok(DynSolValue::String(s))
             }
+        }
+    }
+
+    /// Convert EvmType to Arrow DataType for parquet writing
+    pub fn to_arrow_type(&self) -> DataType {
+        match self {
+            // Large integers stored as strings to preserve precision
+            EvmType::Int256 | EvmType::Int128 => DataType::Utf8,
+            EvmType::Int64 => DataType::Int64,
+            EvmType::Int32 => DataType::Int32,
+            EvmType::Int8 => DataType::Int8,
+            // Large unsigned integers stored as strings to preserve precision
+            EvmType::Uint256 | EvmType::Uint128 | EvmType::Uint80 => DataType::Utf8,
+            EvmType::Uint64 => DataType::UInt64,
+            EvmType::Uint32 => DataType::UInt32,
+            EvmType::Uint16 => DataType::UInt16,
+            EvmType::Uint8 => DataType::UInt8,
+            EvmType::Address => DataType::FixedSizeBinary(20),
+            EvmType::Bool => DataType::Boolean,
+            EvmType::Bytes32 => DataType::FixedSizeBinary(32),
+            EvmType::Bytes => DataType::Binary,
+            EvmType::String => DataType::Utf8,
         }
     }
 }

@@ -11,6 +11,10 @@
                         "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
                         "factory_parameters": "data[4]"
                     }
+                ],
+                "calls": [
+                    {"function": "name", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol", "output_type": "string", "frequency": "once"}
                 ]
             },
             {
@@ -22,6 +26,10 @@
                         "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
                         "factory_parameters": "data[5][4]"
                     }
+                ],
+                "calls": [
+                    {"function": "name", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol", "output_type": "string", "frequency": "once"}
                 ]
             },
             {
@@ -31,7 +39,11 @@
                     "topics_signature": "address,address,address",
                     "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
                     "factory_parameters": "data[4]"
-                }
+                },
+                "calls": [
+                    {"function": "name", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol", "output_type": "string", "frequency": "once"}
+                ]
             },
             {
                 "collection_name": "ZoraV4Hook",
@@ -42,6 +54,10 @@
                         "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
                         "factory_parameters": "data[5][4]"
                     }
+                ],
+                "calls": [
+                    {"function": "name", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol", "output_type": "string", "frequency": "once"}
                 ]
             }
         ]

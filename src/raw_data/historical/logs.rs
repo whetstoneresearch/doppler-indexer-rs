@@ -12,8 +12,9 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::raw_data::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::types::config::chain::ChainConfig;
@@ -74,6 +75,7 @@ pub async fn collect_logs(
     raw_data_config: &RawDataCollectionConfig,
     mut log_rx: Receiver<LogMessage>,
     mut factory_rx: Option<Receiver<FactoryAddressData>>,
+    decoder_tx: Option<Sender<DecoderMessage>>,
 ) -> Result<(), LogCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -137,6 +139,7 @@ pub async fn collect_logs(
                                         &schema,
                                         &output_dir,
                                         &existing_files,
+                                        &decoder_tx,
                                     )
                                     .await?;
                                     factory_ready.remove(&range_start);
@@ -203,6 +206,7 @@ pub async fn collect_logs(
                                 &schema,
                                 &output_dir,
                                 &existing_files,
+                                &decoder_tx,
                             )
                             .await?;
                         } else {
@@ -217,6 +221,11 @@ pub async fn collect_logs(
                 }
             }
         }
+    }
+
+    // Signal decoder that all ranges are complete
+    if let Some(tx) = decoder_tx {
+        let _ = tx.send(DecoderMessage::AllComplete).await;
     }
 
     tracing::info!("Log collection complete for chain {}", chain.name);
@@ -234,6 +243,7 @@ async fn process_completed_range(
     schema: &Arc<Schema>,
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), LogCollectionError> {
     let range = BlockRange {
         start: range_start,
@@ -269,6 +279,15 @@ async fn process_completed_range(
             logs.len(),
             range_start
         );
+    }
+
+    // Send logs to decoder before processing (decoder will receive them for live decoding)
+    if let Some(tx) = decoder_tx {
+        let _ = tx.send(DecoderMessage::LogsReady {
+            range_start,
+            range_end,
+            logs: logs.clone(),
+        }).await;
     }
 
     process_range(&range, logs, log_fields, schema, output_dir).await

@@ -10,6 +10,7 @@ use std::path::Path;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+use raw_data::decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
 use raw_data::historical::factories::collect_factories;
@@ -109,16 +110,69 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
+        // Check if decoding is needed
+        let has_events = chain.contracts.values().any(|c| {
+            c.events.as_ref().map(|e| !e.is_empty()).unwrap_or(false)
+                || c.factories
+                    .as_ref()
+                    .map(|f| {
+                        f.iter()
+                            .any(|fc| fc.events.as_ref().map(|e| !e.is_empty()).unwrap_or(false))
+                    })
+                    .unwrap_or(false)
+        });
+
+        let has_calls = chain.contracts.values().any(|c| {
+            c.calls.as_ref().map(|calls| !calls.is_empty()).unwrap_or(false)
+                || c.factories
+                    .as_ref()
+                    .map(|f| f.iter().any(|fc| !fc.calls.is_empty()))
+                    .unwrap_or(false)
+        });
+
+        let decode_logs_enabled = has_events;
+        let decode_calls_enabled = has_calls;
+
+        tracing::info!(
+            "Chain {} - decode_logs: {}, decode_calls: {}",
+            chain.name,
+            decode_logs_enabled,
+            decode_calls_enabled
+        );
+
+        // Create decoder channels
+        let (log_decoder_tx, log_decoder_rx) = if decode_logs_enabled {
+            let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (call_decoder_tx, call_decoder_rx) = if decode_calls_enabled {
+            let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let raw_data_config = config.raw_data_collection.clone();
         let raw_data_config2 = config.raw_data_collection.clone();
         let raw_data_config3 = config.raw_data_collection.clone();
         let raw_data_config4 = config.raw_data_collection.clone();
         let raw_data_config5 = config.raw_data_collection.clone();
+        let raw_data_config6 = config.raw_data_collection.clone();
+        let raw_data_config7 = config.raw_data_collection.clone();
         let chain_clone = chain.clone();
         let chain_clone2 = chain.clone();
         let chain_clone3 = chain.clone();
         let chain_clone4 = chain.clone();
         let chain_clone5 = chain.clone();
+        let chain_clone6 = chain.clone();
+        let chain_clone7 = chain.clone();
+
+        // Clone decoder senders for factories (needs both)
+        let log_decoder_tx_for_factories = log_decoder_tx.clone();
+        let call_decoder_tx_for_factories = call_decoder_tx.clone();
         
         let blocks_handle = tokio::spawn(async move {
             collect_blocks(
@@ -146,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
         let logs_handle = tokio::spawn(async move {
-            collect_logs(&chain_clone3, &raw_data_config3, log_rx, logs_factory_rx).await
+            collect_logs(&chain_clone3, &raw_data_config3, log_rx, logs_factory_rx, log_decoder_tx).await
         });
 
         let eth_calls_handle = tokio::spawn(async move {
@@ -158,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                 &raw_data_config4,
                 eth_call_rx,
                 eth_calls_factory_rx,
+                call_decoder_tx,
             )
             .await
         });
@@ -170,6 +225,8 @@ async fn main() -> anyhow::Result<()> {
                     factory_log_rx.unwrap(),
                     logs_factory_tx,
                     eth_calls_factory_tx,
+                    log_decoder_tx_for_factories,
+                    call_decoder_tx_for_factories,
                 )
                 .await
             }))
@@ -177,7 +234,34 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        let (blocks_result, receipts_result, logs_result, eth_calls_result, factories_result) =
+        // Spawn decoder tasks
+        let log_decoder_handle = if decode_logs_enabled {
+            Some(tokio::spawn(async move {
+                decode_logs(
+                    &chain_clone6,
+                    &raw_data_config6,
+                    log_decoder_rx.unwrap(),
+                )
+                .await
+            }))
+        } else {
+            None
+        };
+
+        let call_decoder_handle = if decode_calls_enabled {
+            Some(tokio::spawn(async move {
+                decode_eth_calls(
+                    &chain_clone7,
+                    &raw_data_config7,
+                    call_decoder_rx.unwrap(),
+                )
+                .await
+            }))
+        } else {
+            None
+        };
+
+        let (blocks_result, receipts_result, logs_result, eth_calls_result, factories_result, log_decoder_result, call_decoder_result) =
             tokio::try_join!(
                 blocks_handle,
                 receipts_handle,
@@ -185,6 +269,18 @@ async fn main() -> anyhow::Result<()> {
                 eth_calls_handle,
                 async {
                     match factories_handle {
+                        Some(handle) => handle.await,
+                        None => Ok(Ok(())),
+                    }
+                },
+                async {
+                    match log_decoder_handle {
+                        Some(handle) => handle.await,
+                        None => Ok(Ok(())),
+                    }
+                },
+                async {
+                    match call_decoder_handle {
                         Some(handle) => handle.await,
                         None => Ok(Ok(())),
                     }
@@ -196,6 +292,8 @@ async fn main() -> anyhow::Result<()> {
         logs_result?;
         eth_calls_result?;
         factories_result?;
+        log_decoder_result?;
+        call_decoder_result?;
 
         tracing::info!("Completed collection for chain {}", chain.name);
     }

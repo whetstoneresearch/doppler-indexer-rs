@@ -14,7 +14,6 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
-use crate::raw_data::historical::factories::get_factory_collection_names;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{RawDataCollectionConfig, ReceiptField};
@@ -214,14 +213,8 @@ pub async fn collect_receipts(
     let logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
     let existing_logs_files = scan_existing_logs_files(&logs_dir);
 
-    // Check existing factory files if factories are configured
-    let factory_collections = get_factory_collection_names(&chain.contracts);
-    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain.name));
-    let existing_factory_files = if !factory_collections.is_empty() {
-        scan_factory_files(&factories_dir)
-    } else {
-        HashSet::new()
-    };
+    // Note: Factory catchup is handled by the factories module reading from logs files directly.
+    // Receipts catchup only needs to check for receipts and logs.
 
     for block_range in &block_ranges {
         let range = BlockRange {
@@ -233,16 +226,9 @@ pub async fn collect_receipts(
         let logs_file_name = format!("logs_{}-{}.parquet", range.start, range.end - 1);
         let logs_exist = existing_logs_files.contains(&logs_file_name);
 
-        // Check if all factory files exist for this range
-        let factories_exist = factory_collections.is_empty()
-            || factory_collections.iter().all(|collection| {
-                let file_name = format!("{}_{}-{}.parquet", collection, range.start, range.end - 1);
-                existing_factory_files.contains(&file_name)
-            });
-
-        // Skip only if receipts, logs, AND factories all exist (or aren't needed)
-        // If any are missing, we need to re-process the range
-        if receipts_exist && (logs_exist || log_tx.is_none()) && factories_exist {
+        // Skip if receipts and logs both exist (or logs aren't needed)
+        // Factory catchup is handled separately by factories.rs reading from logs files
+        if receipts_exist && (logs_exist || log_tx.is_none()) {
             // Still need to signal range complete for downstream collectors
             // when catching up, so they know this range is done
             if has_factories {
@@ -933,20 +919,6 @@ fn scan_existing_logs_files(dir: &Path) -> HashSet<String> {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if name.starts_with("logs_") && name.ends_with(".parquet") {
-                    files.insert(name.to_string());
-                }
-            }
-        }
-    }
-    files
-}
-
-fn scan_factory_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".parquet") {
                     files.insert(name.to_string());
                 }
             }

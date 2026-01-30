@@ -14,8 +14,9 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::raw_data::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
@@ -106,6 +107,7 @@ pub async fn collect_eth_calls(
     raw_data_config: &RawDataCollectionConfig,
     mut block_rx: Receiver<(u64, u64)>,
     mut factory_rx: Option<Receiver<FactoryAddressData>>,
+    decoder_tx: Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     let base_output_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
     std::fs::create_dir_all(&base_output_dir)?;
@@ -568,6 +570,11 @@ pub async fn collect_eth_calls(
                 }
             }
         }
+    }
+
+    // Signal decoder that all ranges are complete
+    if let Some(tx) = decoder_tx {
+        let _ = tx.send(DecoderMessage::AllComplete).await;
     }
 
     tracing::info!("Eth_call collection complete for chain {}", chain.name);

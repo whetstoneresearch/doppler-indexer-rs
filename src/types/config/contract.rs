@@ -5,6 +5,14 @@ use alloy_primitives::{keccak256, Address, U256};
 use serde::Deserialize;
 use crate::types::config::eth_call::EthCallConfig;
 
+/// Configuration for an event to decode
+/// Signature format: "Transfer(address indexed from, address indexed to, uint256 value)"
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventConfig {
+    /// Full ABI signature string
+    pub signature: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContractConfig {
     pub address: AddressOrAddresses,
@@ -12,6 +20,9 @@ pub struct ContractConfig {
     pub calls: Option<Vec<EthCallConfig>>,
     #[serde(default)]
     pub factories: Option<Vec<FactoryConfig>>,
+    /// Events to decode from this contract's logs
+    #[serde(default)]
+    pub events: Option<Vec<EventConfig>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -20,6 +31,9 @@ pub struct FactoryConfig {
     pub factory_events: FactoryEventConfigOrArray,
     #[serde(default)]
     pub calls: Vec<EthCallConfig>,
+    /// Events to decode from factory-created contract logs
+    #[serde(default)]
+    pub events: Option<Vec<EventConfig>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
