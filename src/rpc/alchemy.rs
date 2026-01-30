@@ -13,7 +13,7 @@ use governor::state::{InMemoryState, NotKeyed};
 use governor::{Jitter, Quota, RateLimiter};
 use url::Url;
 
-use crate::rpc::rpc::{RpcClient, RpcClientConfig, RpcError};
+use crate::rpc::rpc::{with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputeUnitCost(pub u32);
@@ -47,6 +47,7 @@ pub struct AlchemyConfig {
     pub batching_enabled: bool,
     pub jitter_min_ms: u64,
     pub jitter_max_ms: u64,
+    pub retry: RetryConfig,
 }
 
 impl AlchemyConfig {
@@ -59,6 +60,7 @@ impl AlchemyConfig {
             batching_enabled: true,
             jitter_min_ms: 1,
             jitter_max_ms: 10,
+            retry: RetryConfig::default(),
         }
     }
 
@@ -77,6 +79,11 @@ impl AlchemyConfig {
         self.jitter_max_ms = max_ms;
         self
     }
+
+    pub fn with_retry(mut self, config: RetryConfig) -> Self {
+        self.retry = config;
+        self
+    }
 }
 
 impl Default for AlchemyConfig {
@@ -88,6 +95,7 @@ impl Default for AlchemyConfig {
             batching_enabled: true,
             jitter_min_ms: 1,
             jitter_max_ms: 10,
+            retry: RetryConfig::default(),
         }
     }
 }
@@ -136,6 +144,10 @@ impl AlchemyClient {
         &self.inner
     }
 
+    pub fn retry_config(&self) -> &RetryConfig {
+        &self.config.retry
+    }
+
     /// Atomically consume N compute units, waiting if necessary.
     /// This replaces the old per-unit loop which added up to N*jitter latency.
     async fn consume_compute_units(&self, cost: ComputeUnitCost) {
@@ -169,13 +181,16 @@ impl AlchemyClient {
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
-            .await;
-        self.inner
-            .provider()
-            .get_block_number()
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        with_retry(&self.config.retry, "get_block_number", || async {
+            self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
+                .await;
+            self.inner
+                .provider()
+                .get_block_number()
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn get_block(
@@ -187,19 +202,23 @@ impl AlchemyClient {
             BlockId::Hash(_) => ComputeUnitCost::GET_BLOCK_BY_HASH,
             BlockId::Number(_) => ComputeUnitCost::GET_BLOCK_BY_NUMBER,
         };
-        self.consume_compute_units(cost).await;
+        let op_name = format!("eth_getBlockByNumber({:?})", block_id);
 
-        let builder = self.inner.provider().get_block(block_id);
-        if full_transactions {
-            builder
-                .full()
-                .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
-        } else {
-            builder
-                .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
-        }
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(cost).await;
+            let builder = self.inner.provider().get_block(block_id);
+            if full_transactions {
+                builder
+                    .full()
+                    .await
+                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+            } else {
+                builder
+                    .await
+                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+            }
+        })
+        .await
     }
 
     pub async fn get_block_by_number(
@@ -212,26 +231,34 @@ impl AlchemyClient {
     }
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
-            .await;
-        self.inner
-            .provider()
-            .get_transaction_by_hash(hash)
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        let op_name = format!("eth_getTransactionByHash({:?})", hash);
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
+                .await;
+            self.inner
+                .provider()
+                .get_transaction_by_hash(hash)
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn get_transaction_receipt(
         &self,
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
-            .await;
-        self.inner
-            .provider()
-            .get_transaction_receipt(hash)
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        let op_name = format!("eth_getTransactionReceipt({:?})", hash);
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
+                .await;
+            self.inner
+                .provider()
+                .get_transaction_receipt(hash)
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn get_block_receipts(
@@ -239,6 +266,7 @@ impl AlchemyClient {
         method_name: &str,
         block_number: BlockNumberOrTag,
     ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        // Note: inner.get_block_receipts already has retry logic
         self.consume_compute_units(ComputeUnitCost::GET_BLOCK_RECEIPTS)
             .await;
         self.inner.get_block_receipts(method_name, block_number).await
@@ -279,12 +307,21 @@ impl AlchemyClient {
     }
 
     pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::GET_LOGS).await;
-        self.inner
-            .provider()
-            .get_logs(filter)
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        let filter = filter.clone();
+        let op_name = format!(
+            "eth_getLogs(blocks {:?}-{:?})",
+            filter.get_from_block(),
+            filter.get_to_block()
+        );
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(ComputeUnitCost::GET_LOGS).await;
+            self.inner
+                .provider()
+                .get_logs(&filter)
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn get_balance(
@@ -292,14 +329,18 @@ impl AlchemyClient {
         address: Address,
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
-            .await;
-        self.inner
-            .provider()
-            .get_balance(address)
-            .block_id(block.unwrap_or(BlockId::latest()))
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
+                .await;
+            self.inner
+                .provider()
+                .get_balance(address)
+                .block_id(block.unwrap_or(BlockId::latest()))
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn get_code(
@@ -307,13 +348,17 @@ impl AlchemyClient {
         address: Address,
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::GET_CODE).await;
-        self.inner
-            .provider()
-            .get_code_at(address)
-            .block_id(block.unwrap_or(BlockId::latest()))
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        let op_name = format!("eth_getCode({:?}, {:?})", address, block);
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(ComputeUnitCost::GET_CODE).await;
+            self.inner
+                .provider()
+                .get_code_at(address)
+                .block_id(block.unwrap_or(BlockId::latest()))
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn call(
@@ -321,13 +366,18 @@ impl AlchemyClient {
         tx: &alloy::rpc::types::TransactionRequest,
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
-        self.consume_compute_units(ComputeUnitCost::ETH_CALL).await;
-        self.inner
-            .provider()
-            .call(tx.clone())
-            .block(block.unwrap_or(BlockId::latest()))
-            .await
-            .map_err(|e| RpcError::ProviderError(e.to_string()))
+        let tx = tx.clone();
+        let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
+        with_retry(&self.config.retry, &op_name, || async {
+            self.consume_compute_units(ComputeUnitCost::ETH_CALL).await;
+            self.inner
+                .provider()
+                .call(tx.clone())
+                .block(block.unwrap_or(BlockId::latest()))
+                .await
+                .map_err(|e| RpcError::ProviderError(e.to_string()))
+        })
+        .await
     }
 
     pub async fn get_blocks_batch(
@@ -346,29 +396,49 @@ impl AlchemyClient {
         let mut all_results = Vec::with_capacity(block_numbers.len());
         let cost_per_block = ComputeUnitCost::GET_BLOCK_BY_NUMBER.cost();
 
-        for chunk in block_numbers.chunks(self.config.max_batch_size) {
-            let total_cost = chunk.len() as u32 * cost_per_block;
-            self.consume_compute_units_raw(total_cost).await;
+        for (chunk_idx, chunk) in block_numbers.chunks(self.config.max_batch_size).enumerate() {
+            let chunk_vec: Vec<BlockNumberOrTag> = chunk.to_vec();
+            let total_cost = chunk_vec.len() as u32 * cost_per_block;
+            let first_block = chunk_vec.first().map(|b| format!("{:?}", b)).unwrap_or_default();
+            let last_block = chunk_vec.last().map(|b| format!("{:?}", b)).unwrap_or_default();
+            let op_name = format!(
+                "eth_getBlockByNumber[batch {}] blocks {}-{}",
+                chunk_idx, first_block, last_block
+            );
 
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|&number| {
-                    let builder = self.inner.provider().get_block(BlockId::Number(number));
-                    async move {
-                        if full_transactions {
-                            builder.full().await
-                        } else {
-                            builder.await
-                        }
+            let chunk_results: Vec<Option<Block>> = with_retry(
+                &self.config.retry,
+                &op_name,
+                || async {
+                    self.consume_compute_units_raw(total_cost).await;
+
+                    let futures: Vec<_> = chunk_vec
+                        .iter()
+                        .map(|&number| {
+                            let builder = self.inner.provider().get_block(BlockId::Number(number));
+                            async move {
+                                if full_transactions {
+                                    builder.full().await
+                                } else {
+                                    builder.await
+                                }
+                            }
+                        })
+                        .collect();
+
+                    let results = futures::future::join_all(futures).await;
+
+                    let mut chunk_results = Vec::with_capacity(results.len());
+                    for result in results {
+                        chunk_results
+                            .push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
                     }
-                })
-                .collect();
+                    Ok(chunk_results)
+                },
+            )
+            .await?;
 
-            let results = futures::future::join_all(futures).await;
-
-            for result in results {
-                all_results.push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
-            }
+            all_results.extend(chunk_results);
         }
 
         Ok(all_results)
@@ -432,20 +502,39 @@ impl AlchemyClient {
         let mut all_results = Vec::with_capacity(filters.len());
         let cost_per_logs = ComputeUnitCost::GET_LOGS.cost();
 
-        for chunk in filters.chunks(self.config.max_batch_size) {
-            let total_cost = chunk.len() as u32 * cost_per_logs;
-            self.consume_compute_units_raw(total_cost).await;
+        for (chunk_idx, chunk) in filters.chunks(self.config.max_batch_size).enumerate() {
+            let chunk_vec: Vec<Filter> = chunk.to_vec();
+            let total_cost = chunk_vec.len() as u32 * cost_per_logs;
+            let op_name = format!(
+                "eth_getLogs[batch {}] ({} filters)",
+                chunk_idx,
+                chunk_vec.len()
+            );
 
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|filter| self.inner.provider().get_logs(filter))
-                .collect();
+            let chunk_results: Vec<Vec<Log>> = with_retry(
+                &self.config.retry,
+                &op_name,
+                || async {
+                    self.consume_compute_units_raw(total_cost).await;
 
-            let results = futures::future::join_all(futures).await;
+                    let futures: Vec<_> = chunk_vec
+                        .iter()
+                        .map(|filter| self.inner.provider().get_logs(filter))
+                        .collect();
 
-            for result in results {
-                all_results.push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
-            }
+                    let results = futures::future::join_all(futures).await;
+
+                    let mut chunk_results = Vec::with_capacity(results.len());
+                    for result in results {
+                        chunk_results
+                            .push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
+                    }
+                    Ok(chunk_results)
+                },
+            )
+            .await?;
+
+            all_results.extend(chunk_results);
         }
 
         Ok(all_results)
@@ -466,26 +555,42 @@ impl AlchemyClient {
         let mut all_results = Vec::with_capacity(calls.len());
         let cost_per_call = ComputeUnitCost::ETH_CALL.cost();
 
-        for chunk in calls.chunks(self.config.max_batch_size) {
-            let total_cost = chunk.len() as u32 * cost_per_call;
-            self.consume_compute_units_raw(total_cost).await;
+        for (chunk_idx, chunk) in calls.chunks(self.config.max_batch_size).enumerate() {
+            let chunk_vec: Vec<(alloy::rpc::types::TransactionRequest, BlockId)> =
+                chunk.to_vec();
+            let total_cost = chunk_vec.len() as u32 * cost_per_call;
+            let first_block = chunk_vec.first().map(|(_, b)| format!("{:?}", b)).unwrap_or_default();
+            let last_block = chunk_vec.last().map(|(_, b)| format!("{:?}", b)).unwrap_or_default();
+            let to_addr = chunk_vec.first().and_then(|(tx, _)| tx.to).map(|a| format!("{:?}", a)).unwrap_or_else(|| "unknown".to_string());
+            let op_name = format!(
+                "eth_call[batch {}] to={} blocks {}-{} ({} calls)",
+                chunk_idx, to_addr, first_block, last_block, chunk_vec.len()
+            );
 
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|(tx, block)| async move {
-                    self.inner
-                        .provider()
-                        .call(tx.clone())
-                        .block(*block)
-                        .await
-                })
-                .collect();
+            let chunk_results: Vec<Result<Bytes, RpcError>> = with_retry(
+                &self.config.retry,
+                &op_name,
+                || async {
+                    self.consume_compute_units_raw(total_cost).await;
 
-            let results = futures::future::join_all(futures).await;
+                    let futures: Vec<_> = chunk_vec
+                        .iter()
+                        .map(|(tx, block)| async move {
+                            self.inner.provider().call(tx.clone()).block(*block).await
+                        })
+                        .collect();
 
-            for result in results {
-                all_results.push(result.map_err(|e| RpcError::ProviderError(e.to_string())));
-            }
+                    let results = futures::future::join_all(futures).await;
+
+                    Ok(results
+                        .into_iter()
+                        .map(|r| r.map_err(|e| RpcError::ProviderError(e.to_string())))
+                        .collect())
+                },
+            )
+            .await?;
+
+            all_results.extend(chunk_results);
         }
 
         Ok(all_results)
