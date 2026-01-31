@@ -251,7 +251,7 @@ async fn process_completed_range(
     };
 
     if existing_files.contains(&range.file_name()) {
-        tracing::info!(
+        tracing::debug!(
             "Skipping logs for blocks {}-{} (already exists)",
             range.start,
             range.end - 1
