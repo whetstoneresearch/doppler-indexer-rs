@@ -1,16 +1,14 @@
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, BlockNumber, Bytes, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
-use governor::clock::{Clock, QuantaClock, QuantaInstant};
-use governor::middleware::NoOpMiddleware;
-use governor::state::{InMemoryState, NotKeyed};
-use governor::{Jitter, Quota, RateLimiter};
+use tokio::sync::Mutex;
 use url::Url;
 
 use crate::rpc::rpc::{with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError};
@@ -36,8 +34,108 @@ impl ComputeUnitCost {
     }
 }
 
-pub type ComputeUnitRateLimiter =
-    RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware<QuantaInstant>>;
+/// A sliding window rate limiter that tracks compute unit usage over a 10-second window.
+/// Alchemy measures rate limits over 10-second windows at 10x the per-second rate.
+/// Unlike token bucket algorithms, this prevents burst accumulation - you cannot "save up"
+/// compute units by being idle.
+#[derive(Debug)]
+pub struct SlidingWindowRateLimiter {
+    /// Maximum compute units allowed in the window
+    max_in_window: u32,
+    /// Window duration (10 seconds for Alchemy)
+    window: Duration,
+    /// Record of (timestamp, units) for recent consumption
+    history: Mutex<VecDeque<(Instant, u32)>>,
+}
+
+impl SlidingWindowRateLimiter {
+    pub fn new(max_per_second: u32) -> Self {
+        Self {
+            // Alchemy uses 10-second windows at 10x the per-second rate
+            max_in_window: max_per_second * 10,
+            window: Duration::from_secs(10),
+            history: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Calculate current usage within the sliding window
+    fn current_usage(history: &VecDeque<(Instant, u32)>, now: Instant, window: Duration) -> u32 {
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        history
+            .iter()
+            .filter(|(ts, _)| *ts > cutoff)
+            .map(|(_, units)| *units)
+            .sum()
+    }
+
+    /// Remove expired entries from history
+    fn cleanup(history: &mut VecDeque<(Instant, u32)>, now: Instant, window: Duration) {
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        while let Some((ts, _)) = history.front() {
+            if *ts <= cutoff {
+                history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Wait until we can consume the requested units, then record them.
+    /// Returns immediately if there's capacity, otherwise waits.
+    pub async fn acquire(&self, units: u32) {
+        if units == 0 {
+            return;
+        }
+
+        loop {
+            let wait_time = {
+                let mut history = self.history.lock().await;
+                let now = Instant::now();
+
+                // Clean up old entries
+                Self::cleanup(&mut history, now, self.window);
+
+                let current = Self::current_usage(&history, now, self.window);
+                let available = self.max_in_window.saturating_sub(current);
+
+                if units <= available {
+                    // We have capacity - record and return
+                    history.push_back((now, units));
+                    return;
+                }
+
+                // Calculate how long until enough capacity frees up
+                // Find the oldest entry that, if expired, would give us enough room
+                let needed = units - available;
+                let mut accumulated = 0u32;
+                let mut wait_until = now;
+
+                for (ts, u) in history.iter() {
+                    accumulated += u;
+                    if accumulated >= needed {
+                        // When this entry expires, we'll have enough room
+                        wait_until = *ts + self.window;
+                        break;
+                    }
+                }
+
+                // Add a small buffer to ensure the entry has expired
+                wait_until
+                    .saturating_duration_since(now)
+                    .saturating_add(Duration::from_millis(1))
+            };
+
+            // Wait outside the lock
+            tokio::time::sleep(wait_time).await;
+        }
+    }
+
+    /// Get current usage (for debugging/metrics)
+    pub async fn current_usage_async(&self) -> u32 {
+        let history = self.history.lock().await;
+        Self::current_usage(&history, Instant::now(), self.window)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AlchemyConfig {
@@ -45,8 +143,6 @@ pub struct AlchemyConfig {
     pub compute_units_per_second: NonZeroU32,
     pub max_batch_size: usize,
     pub batching_enabled: bool,
-    pub jitter_min_ms: u64,
-    pub jitter_max_ms: u64,
     pub retry: RetryConfig,
 }
 
@@ -58,8 +154,6 @@ impl AlchemyConfig {
                 .expect("compute_units_per_second must be > 0"),
             max_batch_size: 100,
             batching_enabled: true,
-            jitter_min_ms: 1,
-            jitter_max_ms: 10,
             retry: RetryConfig::default(),
         }
     }
@@ -71,12 +165,6 @@ impl AlchemyConfig {
 
     pub fn with_batching(mut self, enabled: bool) -> Self {
         self.batching_enabled = enabled;
-        self
-    }
-
-    pub fn with_jitter(mut self, min_ms: u64, max_ms: u64) -> Self {
-        self.jitter_min_ms = min_ms;
-        self.jitter_max_ms = max_ms;
         self
     }
 
@@ -93,8 +181,6 @@ impl Default for AlchemyConfig {
             compute_units_per_second: NonZeroU32::new(330).unwrap(),
             max_batch_size: 100,
             batching_enabled: true,
-            jitter_min_ms: 1,
-            jitter_max_ms: 10,
             retry: RetryConfig::default(),
         }
     }
@@ -102,8 +188,7 @@ impl Default for AlchemyConfig {
 
 pub struct AlchemyClient {
     inner: RpcClient,
-    cu_rate_limiter: Arc<ComputeUnitRateLimiter>,
-    jitter: Jitter,
+    rate_limiter: Arc<SlidingWindowRateLimiter>,
     config: AlchemyConfig,
 }
 
@@ -115,18 +200,13 @@ impl AlchemyClient {
 
         let inner = RpcClient::new(rpc_config)?;
 
-        let quota = Quota::per_second(config.compute_units_per_second);
-        let cu_rate_limiter = Arc::new(RateLimiter::direct(quota));
-
-        let jitter = Jitter::new(
-            Duration::from_millis(config.jitter_min_ms),
-            Duration::from_millis(config.jitter_max_ms),
-        );
+        let rate_limiter = Arc::new(SlidingWindowRateLimiter::new(
+            config.compute_units_per_second.get(),
+        ));
 
         Ok(Self {
             inner,
-            cu_rate_limiter,
-            jitter,
+            rate_limiter,
             config,
         })
     }
@@ -148,42 +228,21 @@ impl AlchemyClient {
         &self.config.retry
     }
 
-    /// Atomically consume N compute units, waiting if necessary.
-    /// This replaces the old per-unit loop which added up to N*jitter latency.
+    /// Consume compute units, waiting if necessary.
+    /// Uses sliding window rate limiting to prevent burst accumulation.
     async fn consume_compute_units(&self, cost: ComputeUnitCost) {
-        self.consume_compute_units_raw(cost.cost()).await;
+        self.rate_limiter.acquire(cost.cost()).await;
     }
 
-    /// Atomically consume N compute units, waiting if necessary.
+    /// Consume a raw number of compute units, waiting if necessary.
     async fn consume_compute_units_raw(&self, units: u32) {
-        let units = match NonZeroU32::new(units) {
-            Some(n) => n,
-            None => return, // Zero cost, nothing to consume
-        };
-
-        loop {
-            match self.cu_rate_limiter.check_n(units) {
-                Ok(Ok(())) => return,
-                Ok(Err(not_until)) => {
-                    let wait_time = not_until.wait_time_from(self.cu_rate_limiter.clock().now());
-                    tokio::time::sleep(wait_time).await;
-                }
-                Err(_insufficient_capacity) => {
-                    for _ in 0..units.get() {
-                        self.cu_rate_limiter
-                            .until_ready_with_jitter(self.jitter)
-                            .await;
-                    }
-                    return;
-                }
-            }
-        }
+        self.rate_limiter.acquire(units).await;
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
+        self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
+            .await;
         with_retry(&self.config.retry, "get_block_number", || async {
-            self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
-                .await;
             self.inner
                 .provider()
                 .get_block_number()
@@ -204,8 +263,8 @@ impl AlchemyClient {
         };
         let op_name = format!("eth_getBlockByNumber({:?})", block_id);
 
+        self.consume_compute_units(cost).await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(cost).await;
             let builder = self.inner.provider().get_block(block_id);
             if full_transactions {
                 builder
@@ -232,9 +291,9 @@ impl AlchemyClient {
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
+        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
+            .await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
-                .await;
             self.inner
                 .provider()
                 .get_transaction_by_hash(hash)
@@ -249,9 +308,9 @@ impl AlchemyClient {
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
+        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
+            .await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
-                .await;
             self.inner
                 .provider()
                 .get_transaction_receipt(hash)
@@ -325,8 +384,8 @@ impl AlchemyClient {
             filter.get_from_block(),
             filter.get_to_block()
         );
+        self.consume_compute_units(ComputeUnitCost::GET_LOGS).await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(ComputeUnitCost::GET_LOGS).await;
             self.inner
                 .provider()
                 .get_logs(&filter)
@@ -342,9 +401,9 @@ impl AlchemyClient {
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
+        self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
+            .await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
-                .await;
             self.inner
                 .provider()
                 .get_balance(address)
@@ -361,8 +420,8 @@ impl AlchemyClient {
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
         let op_name = format!("eth_getCode({:?}, {:?})", address, block);
+        self.consume_compute_units(ComputeUnitCost::GET_CODE).await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(ComputeUnitCost::GET_CODE).await;
             self.inner
                 .provider()
                 .get_code_at(address)
@@ -380,8 +439,8 @@ impl AlchemyClient {
     ) -> Result<Bytes, RpcError> {
         let tx = tx.clone();
         let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
+        self.consume_compute_units(ComputeUnitCost::ETH_CALL).await;
         with_retry(&self.config.retry, &op_name, || async {
-            self.consume_compute_units(ComputeUnitCost::ETH_CALL).await;
             self.inner
                 .provider()
                 .call(tx.clone())
@@ -418,12 +477,11 @@ impl AlchemyClient {
                 chunk_idx, first_block, last_block
             );
 
+            self.consume_compute_units_raw(total_cost).await;
             let chunk_results: Vec<Option<Block>> = with_retry(
                 &self.config.retry,
                 &op_name,
                 || async {
-                    self.consume_compute_units_raw(total_cost).await;
-
                     let futures: Vec<_> = chunk_vec
                         .iter()
                         .map(|&number| {
@@ -523,12 +581,11 @@ impl AlchemyClient {
                 chunk_vec.len()
             );
 
+            self.consume_compute_units_raw(total_cost).await;
             let chunk_results: Vec<Vec<Log>> = with_retry(
                 &self.config.retry,
                 &op_name,
                 || async {
-                    self.consume_compute_units_raw(total_cost).await;
-
                     let futures: Vec<_> = chunk_vec
                         .iter()
                         .map(|filter| self.inner.provider().get_logs(filter))
@@ -579,12 +636,11 @@ impl AlchemyClient {
                 chunk_idx, to_addr, first_block, last_block, chunk_vec.len()
             );
 
+            self.consume_compute_units_raw(total_cost).await;
             let chunk_results: Vec<Result<Bytes, RpcError>> = with_retry(
                 &self.config.retry,
                 &op_name,
                 || async {
-                    self.consume_compute_units_raw(total_cost).await;
-
                     let futures: Vec<_> = chunk_vec
                         .iter()
                         .map(|(tx, block)| async move {
