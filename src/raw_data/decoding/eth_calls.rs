@@ -750,12 +750,15 @@ fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCa
         EvmType::Int128 => DynSolType::Int(128),
         EvmType::Int64 => DynSolType::Int(64),
         EvmType::Int32 => DynSolType::Int(32),
+        EvmType::Int24 => DynSolType::Int(24),
+        EvmType::Int16 => DynSolType::Int(16),
         EvmType::Int8 => DynSolType::Int(8),
         EvmType::Uint256 => DynSolType::Uint(256),
         EvmType::Uint128 => DynSolType::Uint(128),
         EvmType::Uint80 => DynSolType::Uint(80),
         EvmType::Uint64 => DynSolType::Uint(64),
         EvmType::Uint32 => DynSolType::Uint(32),
+        EvmType::Uint24 => DynSolType::Uint(24),
         EvmType::Uint16 => DynSolType::Uint(16),
         EvmType::Uint8 => DynSolType::Uint(8),
         EvmType::Address => DynSolType::Address,
@@ -957,7 +960,7 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint16 => {
+        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
             let arr: UInt64Array = records
                 .iter()
                 .map(|r| match &r.decoded_value {
@@ -989,7 +992,7 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int64 | EvmType::Int32 => {
+        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
             let arr: Int64Array = records
                 .iter()
                 .map(|r| match &r.decoded_value {
@@ -1088,7 +1091,7 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint16 => {
+        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
             let arr: UInt64Array = records
                 .iter()
                 .map(|r| match r.decoded_values.get(function_name) {
@@ -1120,7 +1123,7 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int64 | EvmType::Int32 => {
+        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
             let arr: Int64Array = records
                 .iter()
                 .map(|r| match r.decoded_values.get(function_name) {

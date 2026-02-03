@@ -8,7 +8,7 @@ use std::time::Instant;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -306,6 +306,21 @@ pub async fn collect_eth_calls(
     // Catchup phase for event-triggered calls: Read from existing log parquet files
     // =========================================================================
     if has_event_triggered_calls {
+        // CRITICAL: Load historical factory addresses BEFORE processing event triggers
+        // This ensures we can properly filter events from factory-created contracts
+        let historical_factory_addrs = load_historical_factory_addresses(&chain.name, &event_call_configs);
+        for (collection_name, addrs) in historical_factory_addrs {
+            tracing::info!(
+                "Loaded {} historical factory addresses for collection {}",
+                addrs.len(),
+                collection_name
+            );
+            factory_addresses
+                .entry(collection_name)
+                .or_default()
+                .extend(addrs);
+        }
+
         let log_ranges = get_existing_log_ranges(&chain.name);
         let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let mut event_catchup_count = 0;
@@ -1024,6 +1039,11 @@ fn extract_value_from_32_bytes(
             let encoded = DynSolValue::Uint(val, 32).abi_encode();
             Ok((DynSolValue::Uint(val, 32), encoded))
         }
+        EvmType::Uint24 => {
+            let val = U256::from_be_bytes(*bytes);
+            let encoded = DynSolValue::Uint(val, 24).abi_encode();
+            Ok((DynSolValue::Uint(val, 24), encoded))
+        }
         EvmType::Uint16 => {
             let val = U256::from_be_bytes(*bytes);
             let encoded = DynSolValue::Uint(val, 16).abi_encode();
@@ -1058,6 +1078,16 @@ fn extract_value_from_32_bytes(
             let val = I256::from_be_bytes(*bytes);
             let encoded = DynSolValue::Int(val, 32).abi_encode();
             Ok((DynSolValue::Int(val, 32), encoded))
+        }
+        EvmType::Int24 => {
+            let val = I256::from_be_bytes(*bytes);
+            let encoded = DynSolValue::Int(val, 24).abi_encode();
+            Ok((DynSolValue::Int(val, 24), encoded))
+        }
+        EvmType::Int16 => {
+            let val = I256::from_be_bytes(*bytes);
+            let encoded = DynSolValue::Int(val, 16).abi_encode();
+            Ok((DynSolValue::Int(val, 16), encoded))
         }
         EvmType::Int8 => {
             let val = I256::from_be_bytes(*bytes);
@@ -1167,15 +1197,32 @@ async fn process_event_triggers(
                 let target_address = if let Some(addr) = config.target_address {
                     addr
                 } else {
-                    // Factory collection - use event emitter, but check if it's a known factory address
+                    // Factory collection - use event emitter, but ONLY if it's a known factory address
                     let emitter = Address::from(trigger.emitter_address);
-                    if let Some(known_addresses) = factory_addresses.get(&config.contract_name) {
-                        if !known_addresses.contains(&emitter) {
-                            // Skip - event emitter is not a known factory address
+                    match factory_addresses.get(&config.contract_name) {
+                        Some(known_addresses) => {
+                            if !known_addresses.contains(&emitter) {
+                                // Skip - event emitter is not a known factory address
+                                tracing::trace!(
+                                    "Skipping event trigger: emitter {:?} not in known addresses for {}",
+                                    emitter,
+                                    config.contract_name
+                                );
+                                continue;
+                            }
+                            emitter
+                        }
+                        None => {
+                            // No factory addresses known yet for this collection
+                            // Skip this trigger - it will be caught up later when addresses are loaded
+                            // This prevents making calls to random addresses during the race window
+                            tracing::debug!(
+                                "Skipping event trigger for {}: no factory addresses loaded yet (will be processed during catchup)",
+                                config.contract_name
+                            );
                             continue;
                         }
                     }
-                    emitter
                 };
 
                 // Build parameters
@@ -1405,6 +1452,136 @@ fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
+/// Load historical factory addresses from parquet files for event trigger catchup
+/// This ensures factory addresses are known before processing historical event triggers
+fn load_historical_factory_addresses(
+    chain_name: &str,
+    event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
+) -> HashMap<String, HashSet<Address>> {
+    let mut result: HashMap<String, HashSet<Address>> = HashMap::new();
+
+    // Get collection names that need factory addresses (is_factory = true)
+    let factory_collections: HashSet<String> = event_call_configs
+        .values()
+        .flatten()
+        .filter(|c| c.is_factory)
+        .map(|c| c.contract_name.clone())
+        .collect();
+
+    if factory_collections.is_empty() {
+        return result;
+    }
+
+    let factories_dir = PathBuf::from(format!("data/raw/{}/factories", chain_name));
+    if !factories_dir.exists() {
+        tracing::debug!(
+            "No factories directory found at {}, skipping historical factory address loading",
+            factories_dir.display()
+        );
+        return result;
+    }
+
+    // Scan factory directories
+    if let Ok(entries) = std::fs::read_dir(&factories_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let collection_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Only load if this collection is needed for event triggers
+            if !factory_collections.contains(&collection_name) {
+                continue;
+            }
+
+            // Read parquet files in this collection
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for file_entry in files.flatten() {
+                    let file_path = file_entry.path();
+                    if !file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                        continue;
+                    }
+
+                    if let Ok(addresses) = read_factory_addresses_from_parquet(&file_path) {
+                        result
+                            .entry(collection_name.clone())
+                            .or_default()
+                            .extend(addresses.into_iter().map(Address::from));
+                    }
+                }
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        tracing::info!(
+            "Loaded historical factory addresses for {} collections",
+            result.len()
+        );
+        for (name, addrs) in &result {
+            tracing::debug!("  {} - {} addresses", name, addrs.len());
+        }
+    }
+
+    result
+}
+
+/// Read factory addresses from a parquet file
+fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, std::io::Error> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = match ParquetRecordBatchReaderBuilder::try_new(file) {
+        Ok(builder) => match builder.build() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Failed to build parquet reader for {}: {}", path.display(), e);
+                return Ok(HashSet::new());
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Failed to create parquet reader for {}: {}", path.display(), e);
+            return Ok(HashSet::new());
+        }
+    };
+
+    let mut addresses = HashSet::new();
+
+    for batch_result in reader {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Failed to read batch from {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        if let Some(col_idx) = batch.schema().index_of("address").ok() {
+            let col = batch.column(col_idx);
+            if let Some(addr_array) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                for i in 0..addr_array.len() {
+                    if !addr_array.is_null(i) {
+                        let bytes = addr_array.value(i);
+                        if bytes.len() == 20 {
+                            let mut addr = [0u8; 20];
+                            addr.copy_from_slice(bytes);
+                            addresses.insert(addr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(addresses)
+}
+
 /// Existing log range info for catchup
 #[derive(Debug, Clone)]
 struct ExistingLogRange {
@@ -1579,6 +1756,8 @@ fn event_output_exists(
     }
 
     // Check for any file that overlaps with this range
+    // Note: range_end is EXCLUSIVE (e.g., 200 means up to block 199)
+    // Output files are named {min_block}-{max_block} where both are INCLUSIVE
     if let Ok(entries) = std::fs::read_dir(&sub_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1589,9 +1768,11 @@ fn event_output_exists(
             if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
                 let parts: Vec<&str> = file_stem.split('-').collect();
                 if parts.len() == 2 {
-                    if let (Ok(file_start), Ok(file_end)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                        // Check for overlap
-                        if file_start <= range_end && file_end >= range_start {
+                    if let (Ok(file_start), Ok(file_end_inclusive)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                        // Convert to exclusive end for consistent comparison
+                        // Ranges overlap if: start1 < end2 AND start2 < end1 (using exclusive ends)
+                        let file_end_exclusive = file_end_inclusive + 1;
+                        if range_start < file_end_exclusive && file_start < range_end {
                             return true;
                         }
                     }

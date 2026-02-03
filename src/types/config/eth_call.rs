@@ -309,12 +309,15 @@ pub enum EvmType {
     Int128,
     Int64,
     Int32,
+    Int24,
+    Int16,
     Int8,
     Uint256,
     Uint128,
     Uint80,
     Uint64,
     Uint32,
+    Uint24,
     Uint16,
     Uint8,
     Address,
@@ -352,6 +355,11 @@ impl EvmType {
                 let val = parse_uint256(&s)?;
                 Ok(DynSolValue::Uint(val, 32))
             }
+            EvmType::Uint24 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 24))
+            }
             EvmType::Uint16 => {
                 let s = value.as_string()?;
                 let val = parse_uint256(&s)?;
@@ -381,6 +389,16 @@ impl EvmType {
                 let s = value.as_string()?;
                 let val = parse_int256(&s)?;
                 Ok(DynSolValue::Int(val, 32))
+            }
+            EvmType::Int24 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 24))
+            }
+            EvmType::Int16 => {
+                let s = value.as_string()?;
+                let val = parse_int256(&s)?;
+                Ok(DynSolValue::Int(val, 16))
             }
             EvmType::Int8 => {
                 let s = value.as_string()?;
@@ -425,12 +443,13 @@ impl EvmType {
             // Large integers stored as strings to preserve precision
             EvmType::Int256 | EvmType::Int128 => DataType::Utf8,
             EvmType::Int64 => DataType::Int64,
-            EvmType::Int32 => DataType::Int32,
+            EvmType::Int32 | EvmType::Int24 => DataType::Int32,
+            EvmType::Int16 => DataType::Int16,
             EvmType::Int8 => DataType::Int8,
             // Large unsigned integers stored as strings to preserve precision
             EvmType::Uint256 | EvmType::Uint128 | EvmType::Uint80 => DataType::Utf8,
             EvmType::Uint64 => DataType::UInt64,
-            EvmType::Uint32 => DataType::UInt32,
+            EvmType::Uint32 | EvmType::Uint24 => DataType::UInt32,
             EvmType::Uint16 => DataType::UInt16,
             EvmType::Uint8 => DataType::UInt8,
             EvmType::Address => DataType::FixedSizeBinary(20),

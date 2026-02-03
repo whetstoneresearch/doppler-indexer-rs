@@ -248,6 +248,9 @@ pub fn extract_event_triggers(
     matchers: &[EventTriggerMatcher],
 ) -> Vec<EventTriggerData> {
     let mut triggers = Vec::new();
+    // Track which (block_number, log_index, source_name) tuples we've already added
+    // to avoid duplicates when multiple matchers have the same event signature
+    let mut seen: HashSet<(u64, u32, String)> = HashSet::new();
 
     for log in logs {
         if log.topics.is_empty() {
@@ -265,6 +268,13 @@ pub fn extract_event_triggers(
             if !matcher.is_factory && !matcher.addresses.contains(&log.address) {
                 continue;
             }
+
+            // Avoid duplicate triggers for the same log and source
+            let key = (log.block_number, log.log_index, matcher.source_name.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
 
             triggers.push(EventTriggerData {
                 block_number: log.block_number,
