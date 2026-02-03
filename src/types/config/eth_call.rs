@@ -27,6 +27,15 @@ pub enum FrequencyError {
     InvalidDuration(String),
 }
 
+/// Configuration for event-triggered eth_calls
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EventTriggerConfig {
+    /// Contract name or factory collection name that emits the trigger event
+    pub source: String,
+    /// Event signature (e.g., "Transfer(address,address,uint256)")
+    pub event: String,
+}
+
 /// Frequency at which to make eth_calls
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frequency {
@@ -38,6 +47,8 @@ pub enum Frequency {
     EveryNBlocks(u64),
     /// Call at time intervals (stored as seconds)
     Duration(u64),
+    /// Call when specific events are emitted
+    OnEvents(EventTriggerConfig),
 }
 
 impl Default for Frequency {
@@ -49,6 +60,17 @@ impl Default for Frequency {
 impl Frequency {
     pub fn is_once(&self) -> bool {
         matches!(self, Frequency::Once)
+    }
+
+    pub fn is_on_events(&self) -> bool {
+        matches!(self, Frequency::OnEvents(_))
+    }
+
+    pub fn as_on_events(&self) -> Option<&EventTriggerConfig> {
+        match self {
+            Frequency::OnEvents(config) => Some(config),
+            _ => None,
+        }
     }
 
     fn parse_duration_string(s: &str) -> Result<u64, FrequencyError> {
@@ -94,7 +116,7 @@ impl<'de> Deserialize<'de> for Frequency {
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str(
-                    "\"once\", a positive integer, or a duration string like \"5m\", \"1h\", \"1d\"",
+                    "\"once\", a positive integer, a duration string like \"5m\", or {\"on_events\": {...}}",
                 )
             }
 
@@ -148,6 +170,32 @@ impl<'de> Deserialize<'de> for Frequency {
                 }
                 Ok(Frequency::EveryNBlocks(value as u64))
             }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Frequency, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                let mut on_events: Option<EventTriggerConfig> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "on_events" => {
+                            if on_events.is_some() {
+                                return Err(de::Error::duplicate_field("on_events"));
+                            }
+                            on_events = Some(map.next_value()?);
+                        }
+                        _ => {
+                            return Err(de::Error::unknown_field(&key, &["on_events"]));
+                        }
+                    }
+                }
+
+                match on_events {
+                    Some(config) => Ok(Frequency::OnEvents(config)),
+                    None => Err(de::Error::missing_field("on_events")),
+                }
+            }
         }
 
         deserializer.deserialize_any(FrequencyVisitor)
@@ -164,11 +212,61 @@ pub struct EthCallConfig {
     pub frequency: Frequency,
 }
 
+/// Parameter configuration for eth_calls
+/// Supports static values, event data binding, and self-address for factory collections
 #[derive(Debug, Clone, Deserialize)]
-pub struct ParamConfig {
-    #[serde(rename = "type")]
-    pub param_type: EvmType,
-    pub values: Vec<ParamValue>,
+#[serde(untagged)]
+pub enum ParamConfig {
+    /// Static values (original behavior): {"type": "address", "values": ["0x..."]}
+    Static {
+        #[serde(rename = "type")]
+        param_type: EvmType,
+        values: Vec<ParamValue>,
+    },
+    /// Bind from event data (for on_events frequency): {"type": "address", "from_event": "topics[1]"}
+    FromEvent {
+        #[serde(rename = "type")]
+        param_type: EvmType,
+        from_event: String,
+    },
+    /// Self address (event emitter, for factory collections): {"type": "address", "source": "self"}
+    SelfAddress {
+        #[serde(rename = "type")]
+        param_type: EvmType,
+        source: String,
+    },
+}
+
+impl ParamConfig {
+    /// Get the parameter type
+    pub fn param_type(&self) -> &EvmType {
+        match self {
+            ParamConfig::Static { param_type, .. } => param_type,
+            ParamConfig::FromEvent { param_type, .. } => param_type,
+            ParamConfig::SelfAddress { param_type, .. } => param_type,
+        }
+    }
+
+    /// Get static values if this is a Static param config
+    pub fn values(&self) -> Option<&Vec<ParamValue>> {
+        match self {
+            ParamConfig::Static { values, .. } => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Get the event field reference if this is a FromEvent param config
+    pub fn from_event(&self) -> Option<&str> {
+        match self {
+            ParamConfig::FromEvent { from_event, .. } => Some(from_event),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a self-address param (source: "self")
+    pub fn is_self_address(&self) -> bool {
+        matches!(self, ParamConfig::SelfAddress { source, .. } if source == "self")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -499,5 +597,106 @@ mod tests {
         }"#;
         let config: EthCallConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.frequency, Frequency::EveryBlock);
+    }
+
+    #[test]
+    fn test_frequency_deserialize_on_events() {
+        let json = r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert!(freq.is_on_events());
+        let config = freq.as_on_events().unwrap();
+        assert_eq!(config.source, "Token");
+        assert_eq!(config.event, "Transfer(address,address,uint256)");
+    }
+
+    #[test]
+    fn test_frequency_on_events_helpers() {
+        let freq = Frequency::OnEvents(EventTriggerConfig {
+            source: "Pool".to_string(),
+            event: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_string(),
+        });
+        assert!(freq.is_on_events());
+        assert!(!freq.is_once());
+        assert!(freq.as_on_events().is_some());
+    }
+
+    #[test]
+    fn test_eth_call_config_with_on_events() {
+        let json = r#"{
+            "function": "slot0()",
+            "output_type": "uint256",
+            "frequency": {
+                "on_events": {
+                    "source": "V3Pool",
+                    "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"
+                }
+            }
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.function, "slot0()");
+        assert!(config.frequency.is_on_events());
+        let trigger = config.frequency.as_on_events().unwrap();
+        assert_eq!(trigger.source, "V3Pool");
+    }
+
+    #[test]
+    fn test_param_config_static() {
+        let json = r#"{"type": "address", "values": ["0x1234567890abcdef1234567890abcdef12345678"]}"#;
+        let param: ParamConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(*param.param_type(), EvmType::Address);
+        assert!(param.values().is_some());
+        assert_eq!(param.values().unwrap().len(), 1);
+        assert!(param.from_event().is_none());
+        assert!(!param.is_self_address());
+    }
+
+    #[test]
+    fn test_param_config_from_event() {
+        let json = r#"{"type": "address", "from_event": "topics[1]"}"#;
+        let param: ParamConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(*param.param_type(), EvmType::Address);
+        assert!(param.values().is_none());
+        assert_eq!(param.from_event(), Some("topics[1]"));
+        assert!(!param.is_self_address());
+    }
+
+    #[test]
+    fn test_param_config_from_event_data() {
+        let json = r#"{"type": "uint256", "from_event": "data[0]"}"#;
+        let param: ParamConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(*param.param_type(), EvmType::Uint256);
+        assert_eq!(param.from_event(), Some("data[0]"));
+    }
+
+    #[test]
+    fn test_param_config_self_address() {
+        let json = r#"{"type": "address", "source": "self"}"#;
+        let param: ParamConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(*param.param_type(), EvmType::Address);
+        assert!(param.values().is_none());
+        assert!(param.from_event().is_none());
+        assert!(param.is_self_address());
+    }
+
+    #[test]
+    fn test_eth_call_config_with_from_event_param() {
+        let json = r#"{
+            "function": "balanceOf(address)",
+            "output_type": "uint256",
+            "frequency": {
+                "on_events": {
+                    "source": "Token",
+                    "event": "Transfer(address,address,uint256)"
+                }
+            },
+            "params": [
+                {"type": "address", "from_event": "topics[2]"}
+            ]
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.function, "balanceOf(address)");
+        assert!(config.frequency.is_on_events());
+        assert_eq!(config.params.len(), 1);
+        assert_eq!(config.params[0].from_event(), Some("topics[2]"));
     }
 }

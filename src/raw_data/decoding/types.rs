@@ -23,6 +23,16 @@ pub struct OnceCallResult {
     pub results: HashMap<String, Vec<u8>>,
 }
 
+/// Event-triggered eth_call result data for decoding
+#[derive(Debug, Clone)]
+pub struct EventCallResult {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub target_address: [u8; 20],
+    pub value: Vec<u8>,
+}
+
 /// Message sent through decoder channels
 #[derive(Debug)]
 pub enum DecoderMessage {
@@ -46,6 +56,14 @@ pub enum DecoderMessage {
         range_end: u64,
         contract_name: String,
         results: Vec<OnceCallResult>,
+    },
+    /// Event-triggered eth_call results ready for decoding
+    EventCallsReady {
+        range_start: u64,
+        range_end: u64,
+        contract_name: String,
+        function_name: String,
+        results: Vec<EventCallResult>,
     },
     /// Factory addresses discovered for a range (needed for factory log/call decoding)
     FactoryAddresses {

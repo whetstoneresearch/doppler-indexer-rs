@@ -15,8 +15,11 @@ use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
 use raw_data::historical::factories::collect_factories;
 use raw_data::historical::logs::collect_logs;
-use raw_data::historical::receipts::{collect_receipts, LogMessage};
+use raw_data::historical::receipts::{
+    build_event_trigger_matchers, collect_receipts, EventTriggerMessage, LogMessage,
+};
 use rpc::UnifiedRpcClient;
+use types::config::eth_call::Frequency;
 use types::config::indexer::IndexerConfig;
 
 #[tokio::main]
@@ -70,12 +73,29 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(false)
         });
 
+        // Check if any calls use on_events frequency
+        let has_event_triggered_calls = chain.contracts.values().any(|c| {
+            c.calls
+                .as_ref()
+                .map(|calls| calls.iter().any(|call| matches!(call.frequency, Frequency::OnEvents(_))))
+                .unwrap_or(false)
+                || c.factories
+                    .as_ref()
+                    .map(|factories| {
+                        factories.iter().any(|f| {
+                            f.calls.iter().any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
+                        })
+                    })
+                    .unwrap_or(false)
+        });
+
         tracing::info!(
-            "Chain {} - has_factories: {}, contract_logs_only: {}, has_factory_calls: {}",
+            "Chain {} - has_factories: {}, contract_logs_only: {}, has_factory_calls: {}, has_event_triggered_calls: {}",
             chain.name,
             has_factories,
             contract_logs_only,
-            has_factory_calls
+            has_factory_calls,
+            has_event_triggered_calls
         );
 
         // Channel capacities from config, with sensible defaults
@@ -108,6 +128,21 @@ async fn main() -> anyhow::Result<()> {
             (Some(tx), Some(rx))
         } else {
             (None, None)
+        };
+
+        // Create event trigger channel for on_events frequency calls
+        let (event_trigger_tx, event_trigger_rx) = if has_event_triggered_calls {
+            let (tx, rx) = mpsc::channel::<EventTriggerMessage>(channel_capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Build event trigger matchers from contracts config
+        let event_matchers = if has_event_triggered_calls {
+            build_event_trigger_matchers(&chain.contracts)
+        } else {
+            Vec::new()
         };
 
         // Check if decoding is needed
@@ -195,6 +230,8 @@ async fn main() -> anyhow::Result<()> {
                 block_rx,
                 Some(log_tx),
                 factory_log_tx,
+                event_trigger_tx,
+                event_matchers,
             )
             .await
         });
@@ -212,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
                 &raw_data_config4,
                 eth_call_rx,
                 eth_calls_factory_rx,
+                event_trigger_rx,
                 call_decoder_tx,
             )
             .await

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy::primitives::B256;
+use alloy::primitives::{keccak256, B256};
 use alloy::rpc::types::Log;
 use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -16,6 +16,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
+use crate::types::config::eth_call::Frequency;
 use crate::types::config::raw_data::{RawDataCollectionConfig, ReceiptField};
 
 #[derive(Debug, Error)]
@@ -96,6 +98,190 @@ pub enum LogMessage {
     AllRangesComplete,
 }
 
+/// Data from an event that triggered an eth_call
+#[derive(Debug, Clone)]
+pub struct EventTriggerData {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    /// Address that emitted the event
+    pub emitter_address: [u8; 20],
+    /// Matched source name (contract or factory collection)
+    pub source_name: String,
+    /// Event signature hash (topic[0])
+    pub event_signature: [u8; 32],
+    /// All topics including topic0
+    pub topics: Vec<[u8; 32]>,
+    /// ABI-encoded event data
+    pub data: Vec<u8>,
+}
+
+/// Message for event-triggered eth_calls channel
+#[derive(Debug, Clone)]
+pub enum EventTriggerMessage {
+    /// Batch of event triggers from a range
+    Triggers(Vec<EventTriggerData>),
+    /// A block range is complete
+    RangeComplete { range_start: u64, range_end: u64 },
+    /// All ranges are complete
+    AllComplete,
+}
+
+/// Matcher for detecting events that should trigger eth_calls
+#[derive(Debug, Clone)]
+pub struct EventTriggerMatcher {
+    /// Source name (contract name or factory collection name)
+    pub source_name: String,
+    /// Addresses to match (empty for factory collections - matched dynamically)
+    pub addresses: HashSet<[u8; 20]>,
+    /// Whether this is a factory collection (addresses discovered dynamically)
+    pub is_factory: bool,
+    /// Event signature hash (keccak256 of signature)
+    pub event_topic0: [u8; 32],
+}
+
+/// Build event trigger matchers from contract configurations
+pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMatcher> {
+    let mut matchers = Vec::new();
+    let mut seen: HashSet<(String, [u8; 32])> = HashSet::new();
+
+    for (contract_name, contract) in contracts {
+        // Check contract-level calls for on_events
+        if let Some(calls) = &contract.calls {
+            for call in calls {
+                if let Frequency::OnEvents(config) = &call.frequency {
+                    let key = (config.source.clone(), compute_event_signature_hash(&config.event));
+                    if !seen.contains(&key) {
+                        if let Some(matcher) = build_matcher_for_source(
+                            &config.source,
+                            &config.event,
+                            contracts,
+                        ) {
+                            matchers.push(matcher);
+                            seen.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check factory calls for on_events
+        if let Some(factories) = &contract.factories {
+            for factory in factories {
+                for call in &factory.calls {
+                    if let Frequency::OnEvents(config) = &call.frequency {
+                        let key = (config.source.clone(), compute_event_signature_hash(&config.event));
+                        if !seen.contains(&key) {
+                            if let Some(matcher) = build_matcher_for_source(
+                                &config.source,
+                                &config.event,
+                                contracts,
+                            ) {
+                                matchers.push(matcher);
+                                seen.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    matchers
+}
+
+fn build_matcher_for_source(
+    source: &str,
+    event_signature: &str,
+    contracts: &Contracts,
+) -> Option<EventTriggerMatcher> {
+    let event_topic0 = compute_event_signature_hash(event_signature);
+
+    // Check if source is a contract name
+    if let Some(contract) = contracts.get(source) {
+        let addresses = match &contract.address {
+            AddressOrAddresses::Single(addr) => {
+                let mut set = HashSet::new();
+                set.insert(addr.0 .0);
+                set
+            }
+            AddressOrAddresses::Multiple(addrs) => {
+                addrs.iter().map(|a| a.0 .0).collect()
+            }
+        };
+        return Some(EventTriggerMatcher {
+            source_name: source.to_string(),
+            addresses,
+            is_factory: false,
+            event_topic0,
+        });
+    }
+
+    // Check if source is a factory collection name
+    for (_, contract) in contracts {
+        if let Some(factories) = &contract.factories {
+            for factory in factories {
+                if factory.collection_name == source {
+                    return Some(EventTriggerMatcher {
+                        source_name: source.to_string(),
+                        addresses: HashSet::new(), // Factory addresses discovered dynamically
+                        is_factory: true,
+                        event_topic0,
+                    });
+                }
+            }
+        }
+    }
+
+    tracing::warn!("Unknown event trigger source: {}", source);
+    None
+}
+
+/// Compute the keccak256 hash of an event signature
+fn compute_event_signature_hash(signature: &str) -> [u8; 32] {
+    keccak256(signature.as_bytes()).0
+}
+
+/// Extract event triggers from a batch of logs
+pub fn extract_event_triggers(
+    logs: &[LogData],
+    matchers: &[EventTriggerMatcher],
+) -> Vec<EventTriggerData> {
+    let mut triggers = Vec::new();
+
+    for log in logs {
+        if log.topics.is_empty() {
+            continue;
+        }
+
+        for matcher in matchers {
+            // Check topic0 match
+            if log.topics[0] != matcher.event_topic0 {
+                continue;
+            }
+
+            // Check address match (for non-factory matchers)
+            // For factory matchers, we send all matching events - eth_calls will filter
+            if !matcher.is_factory && !matcher.addresses.contains(&log.address) {
+                continue;
+            }
+
+            triggers.push(EventTriggerData {
+                block_number: log.block_number,
+                block_timestamp: log.block_timestamp,
+                log_index: log.log_index,
+                emitter_address: log.address,
+                source_name: matcher.source_name.clone(),
+                event_signature: log.topics[0],
+                topics: log.topics.clone(),
+                data: log.data.clone(),
+            });
+        }
+    }
+
+    triggers
+}
+
 #[derive(Debug)]
 struct BlockInfo {
     block_number: u64,
@@ -165,6 +351,8 @@ pub async fn collect_receipts(
     mut block_rx: Receiver<(u64, u64, Vec<B256>)>,
     log_tx: Option<Sender<LogMessage>>,
     factory_log_tx: Option<Sender<LogMessage>>,
+    event_trigger_tx: Option<Sender<EventTriggerMessage>>,
+    event_matchers: Vec<EventTriggerMatcher>,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -231,8 +419,8 @@ pub async fn collect_receipts(
         if receipts_exist && (logs_exist || log_tx.is_none()) {
             // Still need to signal range complete for downstream collectors
             // when catching up, so they know this range is done
-            if has_factories {
-                send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+            if has_factories || event_trigger_tx.is_some() {
+                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
             }
             continue;
         }
@@ -278,6 +466,8 @@ pub async fn collect_receipts(
             &output_dir,
             &log_tx,
             &factory_log_tx,
+            &event_trigger_tx,
+            &event_matchers,
             rpc_batch_size,
             &mut log_tx_metrics,
             &mut factory_log_tx_metrics,
@@ -288,7 +478,7 @@ pub async fn collect_receipts(
         )
         .await?;
 
-        send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+        send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
         catchup_count += 1;
     }
 
@@ -336,7 +526,7 @@ pub async fn collect_receipts(
                     range_data.remove(&range_start);
 
                     // Still need to signal range complete for skipped ranges
-                    send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+                    send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
                     continue;
                 }
 
@@ -350,6 +540,8 @@ pub async fn collect_receipts(
                     &output_dir,
                     &log_tx,
                     &factory_log_tx,
+                    &event_trigger_tx,
+                    &event_matchers,
                     rpc_batch_size,
                     &mut log_tx_metrics,
                     &mut factory_log_tx_metrics,
@@ -360,7 +552,7 @@ pub async fn collect_receipts(
                 )
                 .await?;
 
-                send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
             }
         }
     }
@@ -382,7 +574,7 @@ pub async fn collect_receipts(
                 range.start,
                 range.end - 1
             );
-            send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+            send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
             continue;
         }
 
@@ -395,6 +587,8 @@ pub async fn collect_receipts(
             &output_dir,
             &log_tx,
             &factory_log_tx,
+            &event_trigger_tx,
+            &event_matchers,
             rpc_batch_size,
             &mut log_tx_metrics,
             &mut factory_log_tx_metrics,
@@ -405,7 +599,7 @@ pub async fn collect_receipts(
         )
         .await?;
 
-        send_range_complete(&factory_log_tx, &log_tx, range.start, range.end).await?;
+        send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
     }
 
     if let Some(sender) = &factory_log_tx {
@@ -421,6 +615,14 @@ pub async fn collect_receipts(
             tracing::error!("Failed to send AllRangesComplete to log_tx - receiver dropped");
             return Err(ReceiptCollectionError::ChannelSend(
                 "log_tx (AllRangesComplete) - receiver dropped".to_string(),
+            ));
+        }
+    }
+    if let Some(sender) = &event_trigger_tx {
+        if sender.send(EventTriggerMessage::AllComplete).await.is_err() {
+            tracing::error!("Failed to send AllComplete to event_trigger_tx - receiver dropped");
+            return Err(ReceiptCollectionError::ChannelSend(
+                "event_trigger_tx (AllComplete) - receiver dropped".to_string(),
             ));
         }
     }
@@ -440,6 +642,7 @@ pub async fn collect_receipts(
 async fn send_range_complete(
     factory_log_tx: &Option<Sender<LogMessage>>,
     log_tx: &Option<Sender<LogMessage>>,
+    event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
     range_start: u64,
     range_end: u64,
 ) -> Result<(), ReceiptCollectionError> {
@@ -470,6 +673,19 @@ async fn send_range_complete(
             );
             return Err(ReceiptCollectionError::ChannelSend(format!(
                 "log_tx (RangeComplete {}-{}) - receiver dropped",
+                range_start, range_end
+            )));
+        }
+    }
+    if let Some(sender) = event_trigger_tx {
+        if sender.send(EventTriggerMessage::RangeComplete { range_start, range_end }).await.is_err() {
+            tracing::error!(
+                "Failed to send RangeComplete({}-{}) to event_trigger_tx - receiver dropped",
+                range_start,
+                range_end
+            );
+            return Err(ReceiptCollectionError::ChannelSend(format!(
+                "event_trigger_tx (RangeComplete {}-{}) - receiver dropped",
                 range_start, range_end
             )));
         }
@@ -560,6 +776,8 @@ async fn process_range(
     output_dir: &Path,
     log_tx: &Option<Sender<LogMessage>>,
     factory_log_tx: &Option<Sender<LogMessage>>,
+    event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
+    event_matchers: &[EventTriggerMatcher],
     rpc_batch_size: usize,
     log_tx_metrics: &mut ChannelMetrics,
     factory_log_tx_metrics: &mut ChannelMetrics,
@@ -675,6 +893,13 @@ async fn process_range(
             total_process_time += process_elapsed;
 
             if !batch_logs.is_empty() {
+                // Extract event triggers before sending logs (logs are consumed by send)
+                let triggers = if !event_matchers.is_empty() {
+                    extract_event_triggers(&batch_logs, event_matchers)
+                } else {
+                    Vec::new()
+                };
+
                 send_logs_to_channels(
                     batch_logs,
                     log_tx,
@@ -686,6 +911,15 @@ async fn process_range(
                     &mut total_channel_send_time,
                 )
                 .await?;
+
+                // Send event triggers if any
+                if !triggers.is_empty() {
+                    if let Some(tx) = event_trigger_tx {
+                        tx.send(EventTriggerMessage::Triggers(triggers))
+                            .await
+                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                    }
+                }
             }
 
             #[cfg(feature = "bench")]
@@ -771,6 +1005,13 @@ async fn process_range(
             total_process_time += process_elapsed;
 
             if !batch_logs.is_empty() {
+                // Extract event triggers before sending logs (logs are consumed by send)
+                let triggers = if !event_matchers.is_empty() {
+                    extract_event_triggers(&batch_logs, event_matchers)
+                } else {
+                    Vec::new()
+                };
+
                 send_logs_to_channels(
                     batch_logs,
                     log_tx,
@@ -782,6 +1023,15 @@ async fn process_range(
                     &mut total_channel_send_time,
                 )
                 .await?;
+
+                // Send event triggers if any
+                if !triggers.is_empty() {
+                    if let Some(tx) = event_trigger_tx {
+                        tx.send(EventTriggerMessage::Triggers(triggers))
+                            .await
+                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                    }
+                }
             }
             #[cfg(feature = "bench")]
             {
