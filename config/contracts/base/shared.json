@@ -41,10 +41,7 @@
     "ChainlinkEthOracle": {
         "address": "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
         "calls": [
-            {
-                "function": "latestAnswer()",
-                "output_type": "int256"
-            }
+            { "function": "latestAnswer()", "output_type": "int256", "frequency": "15m" }
         ]
     },
     "ChainlinkUsdcOracle": {
