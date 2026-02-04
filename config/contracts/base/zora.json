@@ -13,8 +13,8 @@
                     }
                 ],
                 "calls": [
-                    {"function": "name", "output_type": "string", "frequency": "once"},
-                    {"function": "symbol", "output_type": "string", "frequency": "once"}
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"}
                 ],
                 "events": [
                     { "signature": "LiquidityMigrated((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) fromPoolKey, bytes32 fromPoolKeyHash, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) toPoolKey, bytes32 toPoolKeyHash)" },
@@ -30,10 +30,6 @@
                         "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
                         "factory_parameters": "data[5][4]"
                     }
-                ],
-                "calls": [
-                    {"function": "name", "output_type": "string", "frequency": "once"},
-                    {"function": "symbol", "output_type": "string", "frequency": "once"}
                 ],
                 "events": [
                     { "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"}
@@ -64,10 +60,6 @@
                         "data_signature": "address,string,string,string,address,(address,address,uint24,int24,address),bytes32,string",
                         "factory_parameters": "data[5][4]"
                     }
-                ],
-                "calls": [
-                    {"function": "name", "output_type": "string", "frequency": "once"},
-                    {"function": "symbol", "output_type": "string", "frequency": "once"}
                 ],
                 "events": [
                     { "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"}
