@@ -11,6 +11,9 @@ use crate::types::config::eth_call::EthCallConfig;
 pub struct EventConfig {
     /// Full ABI signature string
     pub signature: String,
+    /// Optional custom name for output directory (defaults to event name from signature)
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

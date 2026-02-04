@@ -131,11 +131,22 @@ Decoded log files contain:
 | `{tuple_name}.{field_name}` | varies | Flattened tuple fields (e.g., `key.currency0`) |
 | `{tuple_name}.hash` | FixedSizeBinary(32) | Hash of indexed tuple (cannot be decoded) |
 
+### Event Configuration
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `signature` | string | Yes | Full Solidity event signature |
+| `name` | string | No | Custom name for output directory (defaults to event name from signature) |
+
+The optional `name` field allows you to customize the directory name used for decoded parquet files. This is useful when you want a more descriptive name or need to differentiate events with the same signature from different sources.
+
 ### Output Location
 
 ```
 data/derived/{chain}/decoded/logs/{contract_name}/{event_name}/{start}-{end}.parquet
 ```
+
+Where `{event_name}` is either the custom `name` from config, or the event name parsed from the signature.
 
 **Example with Uniswap V4:**
 
@@ -154,6 +165,27 @@ For a config like:
 Output:
 ```
 data/derived/base/decoded/logs/UniswapV4PoolManager/Swap/1000000-1000999.parquet
+```
+
+**Example with custom name:**
+
+```json
+{
+  "UniswapV4PoolManager": {
+    "address": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+    "events": [
+      {
+        "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)",
+        "name": "PoolSwap"
+      }
+    ]
+  }
+}
+```
+
+Output:
+```
+data/derived/base/decoded/logs/UniswapV4PoolManager/PoolSwap/1000000-1000999.parquet
 ```
 
 With columns: `block_number`, `block_timestamp`, `transaction_hash`, `log_index`, `contract_address`, `id`, `sender`, `amount0`, `amount1`, `sqrtPriceX96`, `liquidity`, `tick`, `fee`

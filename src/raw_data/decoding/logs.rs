@@ -52,6 +52,8 @@ pub enum LogDecodingError {
 struct EventMatcher {
     /// Contract or collection name (used for output directory)
     name: String,
+    /// Event name for output directory (from config name field, or parsed from signature)
+    event_name: String,
     /// Parsed event definition
     event: ParsedEvent,
     /// Addresses to match (for regular contracts)
@@ -214,8 +216,13 @@ fn build_event_matchers(
         if let Some(events) = &contract.events {
             for event_config in events {
                 let parsed = ParsedEvent::from_signature(&event_config.signature)?;
+                let event_name = event_config
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| parsed.name.clone());
                 regular.push(EventMatcher {
                     name: contract_name.clone(),
+                    event_name,
                     event: parsed,
                     addresses: addresses.clone(),
                     is_factory: false,
@@ -233,8 +240,13 @@ fn build_event_matchers(
                         if let Ok(parsed) = ParsedEvent::from_signature(&event_config.signature) {
                             // Deduplicate by topic0
                             if !entry.iter().any(|m| m.event.topic0 == parsed.topic0) {
+                                let event_name = event_config
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| parsed.name.clone());
                                 entry.push(EventMatcher {
                                     name: resolved.collection_name.clone(),
+                                    event_name,
                                     event: parsed,
                                     addresses: HashSet::new(),
                                     is_factory: true,
@@ -345,7 +357,7 @@ fn check_all_decoded(
 
     // Check regular matchers
     for matcher in regular_matchers {
-        let rel_path = format!("{}/{}/{}", matcher.name, matcher.event.name, file_name);
+        let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
         if !existing.contains(&rel_path) {
             return false;
         }
@@ -354,7 +366,7 @@ fn check_all_decoded(
     // Check factory matchers
     for (_, matchers) in factory_matchers {
         for matcher in matchers {
-            let rel_path = format!("{}/{}/{}", matcher.name, matcher.event.name, file_name);
+            let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
             if !existing.contains(&rel_path) {
                 return false;
             }
@@ -665,7 +677,7 @@ async fn process_logs(
             }
 
             if let Some(decoded) = decode_log(log, &matcher.event)? {
-                let key = (matcher.name.clone(), matcher.event.name.clone());
+                let key = (matcher.name.clone(), matcher.event_name.clone());
                 decoded_by_event
                     .entry(key)
                     .or_insert_with(|| (Vec::new(), &matcher.event))
@@ -691,7 +703,7 @@ async fn process_logs(
                 }
 
                 if let Some(decoded) = decode_log(log, &matcher.event)? {
-                    let key = (collection_name.clone(), matcher.event.name.clone());
+                    let key = (collection_name.clone(), matcher.event_name.clone());
                     decoded_by_event
                         .entry(key)
                         .or_insert_with(|| (Vec::new(), &matcher.event))
@@ -724,7 +736,7 @@ async fn process_logs(
     let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
 
     for matcher in regular_matchers {
-        let output_dir = output_base.join(&matcher.name).join(&matcher.event.name);
+        let output_dir = output_base.join(&matcher.name).join(&matcher.event_name);
         let output_path = output_dir.join(&file_name);
 
         if !output_path.exists() {
@@ -735,7 +747,7 @@ async fn process_logs(
 
     for (_, matchers) in factory_matchers {
         for matcher in matchers {
-            let output_dir = output_base.join(&matcher.name).join(&matcher.event.name);
+            let output_dir = output_base.join(&matcher.name).join(&matcher.event_name);
             let output_path = output_dir.join(&file_name);
 
             if !output_path.exists() {
