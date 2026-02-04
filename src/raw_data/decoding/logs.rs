@@ -17,7 +17,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
 
-use super::event_parsing::ParsedEvent;
+use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
 use crate::types::config::chain::ChainConfig;
@@ -59,6 +59,7 @@ struct EventMatcher {
 }
 
 /// Decoded log record ready for writing
+/// The decoded_values are flattened to match event.flattened_fields
 #[derive(Debug)]
 struct DecodedLogRecord {
     block_number: u64,
@@ -66,7 +67,7 @@ struct DecodedLogRecord {
     transaction_hash: [u8; 32],
     log_index: u32,
     contract_address: [u8; 20],
-    /// Decoded parameters in order
+    /// Decoded parameters flattened to match flattened_fields order
     decoded_values: Vec<DecodedValue>,
 }
 
@@ -84,6 +85,8 @@ enum DecodedValue {
     Bytes32([u8; 32]),
     Bytes(Vec<u8>),
     String(String),
+    /// Named tuple of (field_name, field_value) pairs - for intermediate decoding
+    NamedTuple(Vec<(std::string::String, DecodedValue)>),
 }
 
 pub async fn decode_logs(
@@ -741,6 +744,7 @@ async fn process_logs(
 }
 
 /// Decode a single log
+/// Returns decoded values flattened to match event.flattened_fields order
 fn decode_log(
     log: &LogData,
     event: &ParsedEvent,
@@ -748,7 +752,8 @@ fn decode_log(
     let indexed_params = event.indexed_params();
     let data_params = event.data_params();
 
-    let mut decoded_values = Vec::new();
+    // Collect decoded values per param (may be nested for tuples)
+    let mut param_values: Vec<DecodedValue> = Vec::new();
 
     // Decode indexed params from topics (topics[1..])
     for (i, param) in indexed_params.iter().enumerate() {
@@ -758,8 +763,17 @@ fn decode_log(
         }
 
         let topic = &log.topics[topic_idx];
+
+        // Check if this is an indexed tuple - store as hash
+        if param.tuple_fields.is_some() {
+            if let Some(TupleFieldInfo::Tuple(_)) = &param.tuple_fields {
+                param_values.push(DecodedValue::Bytes32(*topic));
+                continue;
+            }
+        }
+
         let value = decode_topic(topic, &param.param_type)?;
-        decoded_values.push(value);
+        param_values.push(value);
     }
 
     // Decode non-indexed params from data
@@ -770,9 +784,9 @@ fn decode_log(
 
         match tuple_type.abi_decode(&log.data) {
             Ok(DynSolValue::Tuple(values)) => {
-                for value in values {
-                    let decoded = convert_dyn_sol_value(&value)?;
-                    decoded_values.push(decoded);
+                for (value, param) in values.iter().zip(data_params.iter()) {
+                    let decoded = convert_dyn_sol_value_with_tuple_info(value, &param.tuple_fields)?;
+                    param_values.push(decoded);
                 }
             }
             Ok(_) => return Ok(None),
@@ -783,14 +797,81 @@ fn decode_log(
         }
     }
 
+    // Flatten param_values to match flattened_fields order
+    let flattened = flatten_param_values(&param_values, &event.params);
+
+    // Verify we have the right number of values
+    if flattened.len() != event.flattened_fields.len() {
+        tracing::debug!(
+            "Flattened values count {} doesn't match flattened_fields count {}",
+            flattened.len(),
+            event.flattened_fields.len()
+        );
+        return Ok(None);
+    }
+
     Ok(Some(DecodedLogRecord {
         block_number: log.block_number,
         block_timestamp: log.block_timestamp,
         transaction_hash: log.transaction_hash.0,
         log_index: log.log_index,
         contract_address: log.address,
-        decoded_values,
+        decoded_values: flattened,
     }))
+}
+
+/// Flatten param_values to match the order of flattened_fields
+fn flatten_param_values(values: &[DecodedValue], params: &[EventParam]) -> Vec<DecodedValue> {
+    let mut result = Vec::new();
+
+    for (value, param) in values.iter().zip(params.iter()) {
+        flatten_single_value(value, param, &mut result);
+    }
+
+    result
+}
+
+/// Recursively flatten a single value based on its param info
+fn flatten_single_value(value: &DecodedValue, param: &EventParam, output: &mut Vec<DecodedValue>) {
+    // Check if this is an indexed tuple (stored as hash)
+    if param.indexed {
+        if let Some(TupleFieldInfo::Tuple(_)) = &param.tuple_fields {
+            // Indexed tuple - just add the hash directly
+            output.push(value.clone());
+            return;
+        }
+    }
+
+    match (&param.tuple_fields, value) {
+        (Some(TupleFieldInfo::Tuple(field_infos)), DecodedValue::NamedTuple(named_values)) => {
+            // Flatten the named tuple
+            if let DynSolType::Tuple(types) = &param.param_type {
+                for ((field_name, field_info), field_type) in field_infos.iter().zip(types.iter()) {
+                    // Find the matching value
+                    let field_value = named_values
+                        .iter()
+                        .find(|(n, _)| n == field_name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(DecodedValue::Bytes(vec![]));
+
+                    // Create sub-param for recursion
+                    let sub_param = EventParam {
+                        name: field_name.clone(),
+                        param_type: field_type.clone(),
+                        type_string: String::new(),
+                        indexed: param.indexed,
+                        tuple_fields: Some(field_info.clone()),
+                    };
+
+                    flatten_single_value(&field_value, &sub_param, output);
+                }
+            }
+        }
+        _ => {
+            // Leaf value - add directly
+            output.push(value.clone());
+        }
+    }
 }
 
 /// Decode a value from a topic
@@ -826,24 +907,43 @@ fn decode_topic(topic: &[u8; 32], param_type: &DynSolType) -> Result<DecodedValu
     }
 }
 
-/// Convert DynSolValue to DecodedValue
+/// Convert DynSolValue to DecodedValue, handling tuples with field info
+fn convert_dyn_sol_value_with_tuple_info(
+    value: &DynSolValue,
+    tuple_fields: &Option<TupleFieldInfo>,
+) -> Result<DecodedValue, LogDecodingError> {
+    match (value, tuple_fields) {
+        (DynSolValue::Tuple(values), Some(TupleFieldInfo::Tuple(field_infos))) => {
+            // Named tuple - create named values
+            let mut named_values = Vec::new();
+            for ((field_name, field_info), val) in field_infos.iter().zip(values.iter()) {
+                let decoded = convert_dyn_sol_value_with_tuple_info(val, &Some(field_info.clone()))?;
+                named_values.push((field_name.clone(), decoded));
+            }
+            Ok(DecodedValue::NamedTuple(named_values))
+        }
+        _ => convert_dyn_sol_value(value),
+    }
+}
+
+/// Convert DynSolValue to DecodedValue (for simple types)
 fn convert_dyn_sol_value(value: &DynSolValue) -> Result<DecodedValue, LogDecodingError> {
     match value {
         DynSolValue::Address(addr) => Ok(DecodedValue::Address(addr.0 .0)),
         DynSolValue::Uint(val, bits) => {
-            if *bits <= 64 {
-                Ok(DecodedValue::Uint64((*val).try_into().unwrap_or(u64::MAX)))
-            } else if *bits <= 8 {
+            if *bits <= 8 {
                 Ok(DecodedValue::Uint8((*val).try_into().unwrap_or(u8::MAX)))
+            } else if *bits <= 64 {
+                Ok(DecodedValue::Uint64((*val).try_into().unwrap_or(u64::MAX)))
             } else {
                 Ok(DecodedValue::Uint256(*val))
             }
         }
         DynSolValue::Int(val, bits) => {
-            if *bits <= 64 {
-                Ok(DecodedValue::Int64((*val).try_into().unwrap_or(i64::MAX)))
-            } else if *bits <= 8 {
+            if *bits <= 8 {
                 Ok(DecodedValue::Int8((*val).try_into().unwrap_or(i8::MAX)))
+            } else if *bits <= 64 {
+                Ok(DecodedValue::Int64((*val).try_into().unwrap_or(i64::MAX)))
             } else {
                 Ok(DecodedValue::Int256(*val))
             }
@@ -857,6 +957,19 @@ fn convert_dyn_sol_value(value: &DynSolValue) -> Result<DecodedValue, LogDecodin
         DynSolValue::FixedBytes(bytes, _) => Ok(DecodedValue::Bytes(bytes.to_vec())),
         DynSolValue::Bytes(bytes) => Ok(DecodedValue::Bytes(bytes.clone())),
         DynSolValue::String(s) => Ok(DecodedValue::String(s.clone())),
+        DynSolValue::Tuple(values) => {
+            // Unnamed tuple - flatten directly
+            // This shouldn't happen for our named tuple signatures
+            let named = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let decoded = convert_dyn_sol_value(v)?;
+                    Ok((format!("field_{}", i), decoded))
+                })
+                .collect::<Result<Vec<_>, LogDecodingError>>()?;
+            Ok(DecodedValue::NamedTuple(named))
+        }
         _ => Err(LogDecodingError::Decode(format!(
             "Unsupported value type: {:?}",
             value
@@ -864,13 +977,13 @@ fn convert_dyn_sol_value(value: &DynSolValue) -> Result<DecodedValue, LogDecodin
     }
 }
 
-/// Write decoded logs to parquet
+/// Write decoded logs to parquet using flattened fields
 fn write_decoded_logs_to_parquet(
     records: &[DecodedLogRecord],
     event: &ParsedEvent,
     output_path: &Path,
 ) -> Result<(), LogDecodingError> {
-    // Build schema
+    // Build schema using flattened fields
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
@@ -879,15 +992,13 @@ fn write_decoded_logs_to_parquet(
         Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
-    // Add fields for each decoded parameter
-    for param in &event.params {
-        let data_type = param_type_to_arrow(&param.param_type);
-        let field_name = if param.name.is_empty() {
-            format!("param_{}", fields.len() - 5)
-        } else {
-            param.name.clone()
-        };
-        fields.push(Field::new(&field_name, data_type, true));
+    // Add fields from flattened_fields
+    for flattened in &event.flattened_fields {
+        fields.push(Field::new(
+            &flattened.full_name,
+            flattened.arrow_type.clone(),
+            true,
+        ));
     }
 
     let schema = Arc::new(Schema::new(fields));
@@ -927,9 +1038,9 @@ fn write_decoded_logs_to_parquet(
         arrays.push(Arc::new(arr));
     }
 
-    // Decoded parameters
-    for (param_idx, param) in event.params.iter().enumerate() {
-        let arr = build_param_array(records, param_idx, &param.param_type)?;
+    // Flattened decoded parameters
+    for (field_idx, flattened) in event.flattened_fields.iter().enumerate() {
+        let arr = build_flattened_field_array(records, field_idx, &flattened.leaf_type)?;
         arrays.push(arr);
     }
 
@@ -948,50 +1059,19 @@ fn write_decoded_logs_to_parquet(
     Ok(())
 }
 
-/// Convert param type to Arrow DataType
-fn param_type_to_arrow(param_type: &DynSolType) -> DataType {
-    match param_type {
-        DynSolType::Address => DataType::FixedSizeBinary(20),
-        DynSolType::Uint(bits) => {
-            if *bits <= 8 {
-                DataType::UInt8
-            } else if *bits <= 64 {
-                DataType::UInt64
-            } else {
-                DataType::Utf8 // Large uints as strings
-            }
-        }
-        DynSolType::Int(bits) => {
-            if *bits <= 8 {
-                DataType::Int8
-            } else if *bits <= 64 {
-                DataType::Int64
-            } else {
-                DataType::Utf8 // Large ints as strings
-            }
-        }
-        DynSolType::Bool => DataType::Boolean,
-        DynSolType::FixedBytes(32) => DataType::FixedSizeBinary(32),
-        DynSolType::FixedBytes(_) => DataType::Binary,
-        DynSolType::Bytes => DataType::Binary,
-        DynSolType::String => DataType::Utf8,
-        _ => DataType::Binary, // Fallback for complex types
-    }
-}
-
-/// Build an Arrow array for a decoded parameter
-fn build_param_array(
+/// Build an Arrow array for a flattened field
+fn build_flattened_field_array(
     records: &[DecodedLogRecord],
-    param_idx: usize,
-    param_type: &DynSolType,
+    field_idx: usize,
+    leaf_type: &DynSolType,
 ) -> Result<ArrayRef, LogDecodingError> {
-    match param_type {
+    match leaf_type {
         DynSolType::Address => {
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
             } else {
                 let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match r.decoded_values.get(param_idx) {
+                    match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Address(addr)) => addr.as_slice(),
                         _ => &[0u8; 20][..],
                     }
@@ -1003,7 +1083,7 @@ fn build_param_array(
             if *bits <= 8 {
                 let arr: arrow::array::UInt8Array = records
                     .iter()
-                    .map(|r| match r.decoded_values.get(param_idx) {
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Uint8(v)) => Some(*v),
                         Some(DecodedValue::Uint64(v)) => Some(*v as u8),
                         _ => None,
@@ -1013,8 +1093,9 @@ fn build_param_array(
             } else if *bits <= 64 {
                 let arr: UInt64Array = records
                     .iter()
-                    .map(|r| match r.decoded_values.get(param_idx) {
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Uint64(v)) => Some(*v),
+                        Some(DecodedValue::Uint8(v)) => Some(*v as u64),
                         Some(DecodedValue::Uint256(v)) => (*v).try_into().ok(),
                         _ => None,
                     })
@@ -1023,7 +1104,7 @@ fn build_param_array(
             } else {
                 let arr: StringArray = records
                     .iter()
-                    .map(|r| match r.decoded_values.get(param_idx) {
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Uint256(v)) => Some(v.to_string()),
                         Some(DecodedValue::Uint64(v)) => Some(v.to_string()),
                         _ => None,
@@ -1036,7 +1117,7 @@ fn build_param_array(
             if *bits <= 8 {
                 let arr: Int8Array = records
                     .iter()
-                    .map(|r| match r.decoded_values.get(param_idx) {
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Int8(v)) => Some(*v),
                         Some(DecodedValue::Int64(v)) => Some(*v as i8),
                         _ => None,
@@ -1046,8 +1127,9 @@ fn build_param_array(
             } else if *bits <= 64 {
                 let arr: Int64Array = records
                     .iter()
-                    .map(|r| match r.decoded_values.get(param_idx) {
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Int64(v)) => Some(*v),
+                        Some(DecodedValue::Int8(v)) => Some(*v as i64),
                         Some(DecodedValue::Int256(v)) => (*v).try_into().ok(),
                         _ => None,
                     })
@@ -1056,7 +1138,7 @@ fn build_param_array(
             } else {
                 let arr: StringArray = records
                     .iter()
-                    .map(|r| match r.decoded_values.get(param_idx) {
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Int256(v)) => Some(v.to_string()),
                         Some(DecodedValue::Int64(v)) => Some(v.to_string()),
                         _ => None,
@@ -1068,7 +1150,7 @@ fn build_param_array(
         DynSolType::Bool => {
             let arr: BooleanArray = records
                 .iter()
-                .map(|r| match r.decoded_values.get(param_idx) {
+                .map(|r| match r.decoded_values.get(field_idx) {
                     Some(DecodedValue::Bool(v)) => Some(*v),
                     _ => None,
                 })
@@ -1080,7 +1162,7 @@ fn build_param_array(
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
             } else {
                 let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match r.decoded_values.get(param_idx) {
+                    match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Bytes32(b)) => b.as_slice(),
                         _ => &[0u8; 32][..],
                     }
@@ -1091,7 +1173,7 @@ fn build_param_array(
         DynSolType::String => {
             let arr: StringArray = records
                 .iter()
-                .map(|r| match r.decoded_values.get(param_idx) {
+                .map(|r| match r.decoded_values.get(field_idx) {
                     Some(DecodedValue::String(s)) => Some(s.as_str()),
                     _ => None,
                 })
@@ -1102,7 +1184,7 @@ fn build_param_array(
             // Fallback: Binary
             let arr: BinaryArray = records
                 .iter()
-                .map(|r| match r.decoded_values.get(param_idx) {
+                .map(|r| match r.decoded_values.get(field_idx) {
                     Some(DecodedValue::Bytes(b)) => Some(b.as_slice()),
                     Some(DecodedValue::Bytes32(b)) => Some(b.as_slice()),
                     _ => None,

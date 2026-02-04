@@ -50,7 +50,7 @@ The `event_parsing` module parses Solidity event signatures to extract:
 - Canonical signature (types only, for topic0 computation)
 - topic0 hash (keccak256 of canonical signature)
 
-**Example:**
+**Example (simple params):**
 ```
 Input:  "Transfer(address indexed from, address indexed to, uint256 value)"
 Output:
@@ -61,6 +61,40 @@ Output:
       {name: "from", type: address, indexed: true},
       {name: "to", type: address, indexed: true},
       {name: "value", type: uint256, indexed: false}
+    ]
+  - flattened_fields: ["from", "to", "value"]
+```
+
+### Named Tuple Support
+
+The parser supports named tuples in event signatures, which are common in protocols like Uniswap V4. Named tuples are automatically flattened into individual columns with dot-notation field names.
+
+**Example (named tuples):**
+```
+Input:  "ModifyLiquidity((address currency0, address currency1, uint24 fee) key, (int24 tickLower, int24 tickUpper) params)"
+Output:
+  - name: "ModifyLiquidity"
+  - canonical: "ModifyLiquidity((address,address,uint24),(int24,int24))"
+  - flattened_fields: [
+      "key.currency0",
+      "key.currency1",
+      "key.fee",
+      "params.tickLower",
+      "params.tickUpper"
+    ]
+```
+
+**Indexed Tuples:**
+
+When a tuple parameter is marked as `indexed`, the EVM stores only its keccak256 hash in the topic. Since the original values cannot be recovered, indexed tuples are stored as a single `bytes32` column with a `.hash` suffix.
+
+```
+Input:  "Swap(address indexed sender, (address currency0, address currency1) indexed poolKey, uint256 amount)"
+Output:
+  - flattened_fields: [
+      "sender",           # address - decoded from topic
+      "poolKey.hash",     # bytes32 - keccak256 hash of the tuple
+      "amount"            # uint256 - decoded from data
     ]
 ```
 
@@ -75,9 +109,12 @@ Logs are matched against configured events using:
 
 1. **Indexed parameters** are decoded from topics (topics[1..n])
    - Simple types (address, uint, int, bool, bytes32) are decoded directly
-   - Complex types (arrays, strings, structs) are stored as their keccak256 hash
+   - Complex types (arrays, strings, tuples) are stored as their keccak256 hash
+   - Indexed tuples are stored with a `.hash` suffix (e.g., `poolKey.hash`)
 
 2. **Non-indexed parameters** are ABI-decoded from the log data field as a tuple
+   - Named tuples are recursively flattened into individual columns
+   - Field names use dot-notation (e.g., `key.currency0`, `params.tickLower`)
 
 ### Output Schema
 
@@ -91,12 +128,46 @@ Decoded log files contain:
 | `log_index` | UInt32 | Log index within transaction |
 | `contract_address` | FixedSizeBinary(20) | Emitting contract address |
 | `{param_name}` | varies | One column per event parameter |
+| `{tuple_name}.{field_name}` | varies | Flattened tuple fields (e.g., `key.currency0`) |
+| `{tuple_name}.hash` | FixedSizeBinary(32) | Hash of indexed tuple (cannot be decoded) |
 
 ### Output Location
 
 ```
 data/derived/{chain}/decoded/logs/{contract_name}/{event_name}/{start}-{end}.parquet
 ```
+
+**Example with Uniswap V4:**
+
+For a config like:
+```json
+{
+  "UniswapV4PoolManager": {
+    "address": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+    "events": [
+      { "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)" }
+    ]
+  }
+}
+```
+
+Output:
+```
+data/derived/base/decoded/logs/UniswapV4PoolManager/Swap/1000000-1000999.parquet
+```
+
+With columns: `block_number`, `block_timestamp`, `transaction_hash`, `log_index`, `contract_address`, `id`, `sender`, `amount0`, `amount1`, `sqrtPriceX96`, `liquidity`, `tick`, `fee`
+
+**Example with named tuples:**
+
+For a config with named tuple parameters:
+```json
+{
+  "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)"
+}
+```
+
+Output columns: `block_number`, `block_timestamp`, `transaction_hash`, `log_index`, `contract_address`, `key.currency0`, `key.currency1`, `key.fee`, `key.tickSpacing`, `key.hooks`, `params.tickLower`, `params.tickUpper`, `params.liquidityDelta`, `params.salt`
 
 ## Eth Call Decoding
 
