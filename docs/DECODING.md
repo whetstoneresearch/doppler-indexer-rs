@@ -275,9 +275,9 @@ On startup, the decoder:
 1. Scans `data/derived/{chain}/decoded/` for existing decoded files
 2. Scans `data/raw/{chain}/logs/` and `data/raw/{chain}/eth_calls/` for raw files
 3. Skips ranges that are already fully decoded
-4. Processes any missing ranges
+4. Processes any missing ranges **concurrently** (configurable parallelism)
 
-For factory events during catchup, the decoder loads factory addresses from `data/raw/{chain}/factories/` parquet files.
+For factory events during catchup, the decoder loads factory addresses from `data/derived/{chain}/factories/` parquet files.
 
 ## Error Handling
 
@@ -288,6 +288,28 @@ For factory events during catchup, the decoder loads factory addresses from `dat
 ## Performance Considerations
 
 - Decoding runs concurrently with data collection
+- **Catchup phase processes multiple files in parallel** for faster historical data processing
 - Uses Snappy compression for output parquet files
 - Processes data in block ranges matching the configured `parquet_block_range`
 - Factory addresses are cached per range to avoid repeated lookups
+
+### Concurrency Configuration
+
+The `decoding_concurrency` setting controls how many files are processed in parallel during the catchup phase:
+
+```json
+{
+  "raw_data_collection": {
+    "decoding_concurrency": 8
+  }
+}
+```
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `decoding_concurrency` | integer | 4 | Number of concurrent decoding tasks during catchup |
+
+**Tuning recommendations:**
+- Set to the number of CPU cores for CPU-bound workloads
+- Consider memory usage when increasing (each task loads a full parquet file)
+- Monitor with `htop` to verify CPU utilization during catchup
