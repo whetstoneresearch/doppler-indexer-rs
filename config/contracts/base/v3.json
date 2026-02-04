@@ -42,7 +42,7 @@
         ],
         "events": [
             { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
-            { "signature": "Lock(address indexed pool, tuple(address beneficiary, uint96 shares)[] beneficiaries)" }
+            { "signature": "Lock(address indexed pool, (address beneficiary, uint96 shares)[] beneficiaries)" }
         ]
     },
     "UniswapV3Migrator": {
