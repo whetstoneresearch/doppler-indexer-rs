@@ -13,7 +13,10 @@
         "pool": {
             "type": "v4",
             "address": "0xb18fad93e3c5a5f932d901f0c22c5639a832d6f29a4392fff3393fb734dd0720",
-            "quote_token": "Usdc"
+            "quote_token": "Usdc",
+            "calls": [
+                { "function": "getSlot0(bytes32)", "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)" }
+            ]
         }
     },
     "Fxh": {
@@ -21,7 +24,10 @@
         "pool": {
             "type": "v3",
             "address": "0xC3e7433ae4d929092F8dFf62F7E2f15f23bC3E63",
-            "quote_token": "Weth"
+            "quote_token": "Weth",
+            "calls": [
+                { "function": "slot0()", "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)" }
+            ]
         }
     },
     "Noice": {
@@ -29,7 +35,21 @@
         "pool": {
             "type": "v3",
             "address": "0xeff7f8fe083d7a446717b992bf84391253e54789",
-            "quote_token": "Weth"
+            "quote_token": "Weth",
+            "calls": [
+                { "function": "slot0()", "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)" }
+            ]
+        }
+    },
+    "Zora": {
+        "address": "0x1111111111166b7FE7bd91427724B487980aFc69",
+        "pool": {
+            "type": "v3",
+            "address": "0xedc625b74537ee3a10874f53d170e9c17a906b9c",
+            "quote_token": "Usdc",
+            "calls": [
+                { "function": "slot0()", "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)" }
+            ]
         }
     }
 }

@@ -11,8 +11,11 @@
                     "factory_parameters": "data[0]"
                 },
                 "calls": [
-                    {"function": "name", "output_type": "string", "frequency": "once"},
-                    {"function": "symbol", "output_type": "string", "frequency": "once"}
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"}
+                ],
+                "events": [
+                    { "signature": "Transfer(address indexed from, address indexed to, uint256 value)" }
                 ]
             },
             {
@@ -21,8 +24,15 @@
                     "name": "Migrate",
                     "topics_signature": "address,address",
                     "factory_parameters": "topics[2]"
-                }
+                },
+                "events": [
+                    { "name": "v2Swap", "signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)" },
+                    { "signature": "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)" }
+                ]
             }
+        ],
+        "events": [
+            { "signature": "Migrate(address indexed asset, address indexed pool)" }
         ]
     },
     "UniversalRouter": {
@@ -42,5 +52,8 @@
     },
     "ChainlinkUsdtOracle": {
         "address": "0xf19d560eb8d2adf07bd6d13ed03e1d11215721f9"
+    },
+    "Multicall3": {
+        "address": "0xcA11bde05977b3631167028862bE2a173976CA11"
     }
 }

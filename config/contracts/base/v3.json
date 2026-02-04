@@ -11,8 +11,16 @@
                     "name": "Create",
                     "topics_signature": "address,address,address",
                     "factory_parameters": "topics[1]"                
-                }
+                },
+                "events": [
+                    { "signature": "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)" }
+                ]
             }
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
         ]
     },
     "LockableUniswapV3Initializer": {
@@ -24,8 +32,17 @@
                     "name": "Create",
                     "topics_signature": "address,address,address",
                     "factory_parameters": "topics[1]"                
-                }
+                },
+                "events": [
+                    { "signature": "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)" }
+                ]
             }
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
+            { "signature": "Lock(address indexed pool, tuple(address beneficiary, uint96 shares)[] beneficiaries)" }
         ]
     },
     "UniswapV3Migrator": {

@@ -15,6 +15,10 @@
                 "calls": [
                     {"function": "name", "output_type": "string", "frequency": "once"},
                     {"function": "symbol", "output_type": "string", "frequency": "once"}
+                ],
+                "events": [
+                    { "signature": "LiquidityMigrated((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) fromPoolKey, bytes32 fromPoolKeyHash, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) toPoolKey, bytes32 toPoolKeyHash)" },
+                    { "signature": "CoinTransfer(address indexed sender, address indexed recipient, uint256 amount, uint256 senderBalance, uint256 recipientBalance)" }
                 ]
             },
             {
@@ -30,6 +34,9 @@
                 "calls": [
                     {"function": "name", "output_type": "string", "frequency": "once"},
                     {"function": "symbol", "output_type": "string", "frequency": "once"}
+                ],
+                "events": [
+                    { "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"}
                 ]
             },
             {
@@ -41,12 +48,15 @@
                     "factory_parameters": "data[4]"
                 },
                 "calls": [
-                    {"function": "name", "output_type": "string", "frequency": "once"},
-                    {"function": "symbol", "output_type": "string", "frequency": "once"}
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"}
+                ],
+                "events": [
+                    { "signature": "CoinTransfer(address indexed sender, address indexed recipient, uint256 amount, uint256 senderBalance, uint256 recipientBalance)" }
                 ]
             },
             {
-                "collection_name": "ZoraV4Hook",
+                "collection_name": "ZoraContentCoinHook",
                 "factory_events": [
                     {
                         "name": "CoinCreatedV4",
@@ -58,20 +68,27 @@
                 "calls": [
                     {"function": "name", "output_type": "string", "frequency": "once"},
                     {"function": "symbol", "output_type": "string", "frequency": "once"}
+                ],
+                "events": [
+                    { "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"}
                 ]
             }
+        ],
+        "events": [
+            { "signature": "CoinCreatedV4(address indexed caller, address indexed payoutRecipient, address indexed platformReferrer, address currency, string uri, string name, string symbol, address coin, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bytes32 poolKeyHash, string version)"},
+            { "signature": "CreatorCoinCreated(address indexed caller, address indexed payoutRecipient, address indexed platformReferrer, address currency, string uri, string name, string symbol, address coin, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bytes32 poolKeyHash, string version)"}
         ]
     },
-    "ZoraToken": {
-        "address": "0x1111111111166b7FE7bd91427724B487980aFc69"
-    },
-    "ZoraTokenPool": {
-        "address": "0xedc625b74537ee3a10874f53d170e9c17a906b9c"
-    },
     "CreatorCoinHook": {
-        "address": "0xd61A675F8a0c67A73DC3B54FB7318B4D91409040"
+        "address": "0xd61A675F8a0c67A73DC3B54FB7318B4D91409040",
+        "events": [
+            { "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"}
+        ]
     },
     "ContentCoinHook": {
-        "address": "0x9ea932730A7787000042e34390B8E435dD839040"
+        "address": "0x9ea932730A7787000042e34390B8E435dD839040",
+        "events": [
+            { "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"}
+        ]
     }
 }

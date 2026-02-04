@@ -1,6 +1,11 @@
 {
     "UniswapV4PoolManager": {
-        "address": "0x498581ff718922c3f8e6a244956af099b2652b2b"
+        "address": "0x498581ff718922c3f8e6a244956af099b2652b2b",
+        "events": [
+            { "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)" },
+            { "signature": "Donate(bytes32 indexed id, address indexed sender, uint256 amount0, uint256 amount1)"},
+            { "signature": "Initialize(PoolId indexed id, Currency indexed currency0, Currency indexed currency1, uint24 fee, int24 tickSpacing, IHooks hooks, uint160 sqrtPriceX96, int24 tick)"}
+        ]
     },
     "UniswapV4StateView": {
         "address": "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71"
@@ -22,20 +27,29 @@
                         "topics_signature":  "address,address,address",
                         "factory_parameters": "topics[1]"
                     }
+                ],
+                "events": [
+                    { "signature": "Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)" }
                 ]
             }
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
         ]
     },
     "UniswapV4Migrator": {
         "address": [
-            "0xa24e35a5d71d02a59b41e7c93567626302da1958",
+            "0xd3b4cf7fd24381e90a4f012fc6c5976b87b9b3ce",
             "0x166109c4ee7fe69164631caa937daa5f5cebfef0"
+        ],
+        "events": [
+            { "signature": "Migrate(bytes32 indexed poolId, uint160 sqrtPriceX96, int24 lowerTick, int24 upperTick, uint256 liquidity, uint256 reserves0, uint256 reserves1)"}
         ]
     },
     "UniswapV4MigratorHook": {
-        "address": [
-            "0x1370ad7fda3b054eca3532a066b968433e736000",
-            "0x45178a8d6d368d612b7552b217802b7f97262000"
+        "address": "0xd6fecff347c6203a41874e8d77de669b54e7a500",
+        "events": [
+            { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
         ]
     },
     "DopplerLens": {
