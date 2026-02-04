@@ -213,7 +213,7 @@ pub async fn collect_eth_calls(
     let mut range_regular_done: HashSet<u64> = HashSet::new();
     let mut range_factory_done: HashSet<u64> = HashSet::new();
 
-    if has_regular_calls {
+    if has_regular_calls || has_token_calls || has_once_calls {
         let block_ranges = get_existing_block_ranges(&chain.name);
         let mut catchup_count = 0;
 
@@ -223,12 +223,20 @@ pub async fn collect_eth_calls(
                 end: block_range.end,
             };
 
-            let all_exist = call_configs.iter().all(|config| {
+            // Check if all regular call files exist for this range
+            let regular_calls_done = !has_regular_calls || call_configs.iter().all(|config| {
                 let rel_path = format!("{}/{}/{}", config.contract_name, config.function_name, range.file_name());
                 existing_files.contains(&rel_path)
             });
 
-            if all_exist {
+            // Check if all token pool call files exist for this range
+            let token_calls_done = !has_token_calls || token_call_configs.iter().all(|config| {
+                let rel_path = format!("{}_pool/{}/{}", config.token_name, config.function_name, range.file_name());
+                existing_files.contains(&rel_path)
+            });
+
+            // Skip this range only if ALL call types have their files
+            if regular_calls_done && token_calls_done {
                 range_regular_done.insert(range.start);
                 continue;
             }
