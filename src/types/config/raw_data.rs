@@ -14,6 +14,10 @@ pub struct RawDataCollectionConfig {
     /// Higher values improve throughput but use more memory and compute units.
     /// Default: 10
     pub block_receipt_concurrency: Option<usize>,
+    /// Number of concurrent decoding tasks for log and eth_call decoding.
+    /// Higher values improve throughput during catchup but use more memory.
+    /// Default: 4
+    pub decoding_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

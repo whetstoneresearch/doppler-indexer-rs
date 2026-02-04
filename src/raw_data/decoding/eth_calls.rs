@@ -16,6 +16,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use super::types::{DecoderMessage, EthCallResult, OnceCallResult};
 use crate::types::config::chain::ChainConfig;
@@ -125,6 +127,7 @@ pub async fn decode_eth_calls(
             &output_base,
             &regular_configs,
             &once_configs,
+            raw_data_config,
         )
         .await?;
     }
@@ -265,15 +268,38 @@ fn build_decode_configs(
     (regular, once)
 }
 
+///// Work item for concurrent catchup processing
+enum CatchupWorkItem {
+    Regular {
+        file_path: PathBuf,
+        range_start: u64,
+        range_end: u64,
+        config: CallDecodeConfig,
+    },
+    Once {
+        file_path: PathBuf,
+        range_start: u64,
+        range_end: u64,
+        contract_name: String,
+        configs: Vec<CallDecodeConfig>,
+    },
+}
+
 /// Catchup phase: decode existing raw eth_call files
 async fn catchup_decode_eth_calls(
     raw_calls_dir: &Path,
     output_base: &Path,
     regular_configs: &[CallDecodeConfig],
     once_configs: &[CallDecodeConfig],
+    raw_data_config: &RawDataCollectionConfig,
 ) -> Result<(), EthCallDecodingError> {
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
+
     // Scan existing decoded files
     let existing_decoded = scan_existing_decoded_files(output_base);
+
+    // Collect all work items
+    let mut work_items = Vec::new();
 
     // Scan raw call directories
     if let Ok(contract_entries) = std::fs::read_dir(raw_calls_dir) {
@@ -300,18 +326,18 @@ async fn catchup_decode_eth_calls(
 
                     let is_once = function_name == "once";
 
-                    // Find matching config
                     if is_once {
-                        let configs: Vec<&CallDecodeConfig> = once_configs
+                        let configs: Vec<CallDecodeConfig> = once_configs
                             .iter()
                             .filter(|c| c.contract_name == contract_name)
+                            .cloned()
                             .collect();
 
                         if configs.is_empty() {
                             continue;
                         }
 
-                        // Process once call files
+                        // Collect once call files
                         if let Ok(file_entries) = std::fs::read_dir(&function_path) {
                             for file_entry in file_entries.flatten() {
                                 let file_path = file_entry.path();
@@ -327,8 +353,7 @@ async fn catchup_decode_eth_calls(
                                     file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
                                 // Check if already decoded
-                                let rel_path =
-                                    format!("{}/once/{}", contract_name, file_name);
+                                let rel_path = format!("{}/once/{}", contract_name, file_name);
                                 if existing_decoded.contains(&rel_path) {
                                     continue;
                                 }
@@ -348,17 +373,13 @@ async fn catchup_decode_eth_calls(
                                     Err(_) => continue,
                                 };
 
-                                // Read and decode
-                                let results = read_once_calls_from_parquet(&file_path, &configs)?;
-                                process_once_calls(
-                                    &results,
+                                work_items.push(CatchupWorkItem::Once {
+                                    file_path,
                                     range_start,
                                     range_end,
-                                    &contract_name,
-                                    &configs,
-                                    output_base,
-                                )
-                                .await?;
+                                    contract_name: contract_name.clone(),
+                                    configs: configs.clone(),
+                                });
                             }
                         }
                     } else {
@@ -371,9 +392,9 @@ async fn catchup_decode_eth_calls(
                         if config.is_none() {
                             continue;
                         }
-                        let config = config.unwrap();
+                        let config = config.unwrap().clone();
 
-                        // Process regular call files
+                        // Collect regular call files
                         if let Ok(file_entries) = std::fs::read_dir(&function_path) {
                             for file_entry in file_entries.flatten() {
                                 let file_path = file_entry.path();
@@ -410,21 +431,82 @@ async fn catchup_decode_eth_calls(
                                     Err(_) => continue,
                                 };
 
-                                // Read and decode
-                                let results = read_regular_calls_from_parquet(&file_path)?;
-                                process_regular_calls(
-                                    &results,
+                                work_items.push(CatchupWorkItem::Regular {
+                                    file_path,
                                     range_start,
                                     range_end,
-                                    config,
-                                    output_base,
-                                )
-                                .await?;
+                                    config: config.clone(),
+                                });
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    if work_items.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Eth_call decoding catchup: processing {} files with concurrency {}",
+        work_items.len(),
+        concurrency
+    );
+
+    // Process work items concurrently
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let output_base = Arc::new(output_base.to_path_buf());
+    let mut join_set = JoinSet::new();
+
+    for item in work_items {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let output_base = output_base.clone();
+
+        join_set.spawn(async move {
+            let _permit = permit; // Hold permit until task completes
+
+            match item {
+                CatchupWorkItem::Regular {
+                    file_path,
+                    range_start,
+                    range_end,
+                    config,
+                } => {
+                    let results = read_regular_calls_from_parquet(&file_path)?;
+                    process_regular_calls(&results, range_start, range_end, &config, &output_base)
+                        .await
+                }
+                CatchupWorkItem::Once {
+                    file_path,
+                    range_start,
+                    range_end,
+                    contract_name,
+                    configs,
+                } => {
+                    let config_refs: Vec<&CallDecodeConfig> = configs.iter().collect();
+                    let results = read_once_calls_from_parquet(&file_path, &config_refs)?;
+                    process_once_calls(
+                        &results,
+                        range_start,
+                        range_end,
+                        &contract_name,
+                        &config_refs,
+                        &output_base,
+                    )
+                    .await
+                }
+            }
+        });
+    }
+
+    // Collect results and propagate errors
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(EthCallDecodingError::JoinError(e.to_string())),
         }
     }
 

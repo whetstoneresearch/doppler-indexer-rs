@@ -16,6 +16,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
@@ -48,7 +50,7 @@ pub enum LogDecodingError {
 }
 
 /// Matcher for a specific event on specific addresses
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EventMatcher {
     /// Contract or collection name (used for output directory)
     name: String,
@@ -146,6 +148,7 @@ pub async fn decode_logs(
             &regular_matchers,
             &factory_matchers,
             chain,
+            raw_data_config,
         )
         .await?;
     }
@@ -284,13 +287,16 @@ fn build_event_matchers(
 async fn catchup_decode_logs(
     raw_logs_dir: &Path,
     output_base: &Path,
-    range_size: u64,
+    _range_size: u64,
     regular_matchers: &[EventMatcher],
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     chain: &ChainConfig,
+    raw_data_config: &RawDataCollectionConfig,
 ) -> Result<(), LogDecodingError> {
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
+
     // Scan existing decoded files
-    let existing_decoded = scan_existing_decoded_files(output_base);
+    let existing_decoded = Arc::new(scan_existing_decoded_files(output_base));
 
     // Scan raw log files
     let entries = std::fs::read_dir(raw_logs_dir)?;
@@ -328,7 +334,7 @@ async fn catchup_decode_logs(
     );
 
     // Load factory addresses from factory parquet files for catchup
-    let factory_addresses = load_factory_addresses_for_catchup(chain)?;
+    let factory_addresses = Arc::new(load_factory_addresses_for_catchup(chain)?);
 
     let total_factory_addrs: usize = factory_addresses
         .values()
@@ -341,50 +347,91 @@ async fn catchup_decode_logs(
         factory_addresses.len()
     );
 
-    for (range_start, range_end, file_path) in raw_files {
-        // Check if all events for this range are already decoded
-        let all_decoded = check_all_decoded(
-            range_start,
-            range_end,
-            regular_matchers,
-            factory_matchers,
-            &existing_decoded,
-        );
+    // Filter files that need processing
+    let files_to_process: Vec<_> = raw_files
+        .into_iter()
+        .filter(|(range_start, range_end, _)| {
+            let all_decoded = check_all_decoded(
+                *range_start,
+                *range_end,
+                regular_matchers,
+                factory_matchers,
+                &existing_decoded,
+            );
+            if all_decoded {
+                tracing::debug!(
+                    "Log decoding catchup: skipping range {}-{}, all events already decoded",
+                    range_start,
+                    range_end - 1
+                );
+            }
+            !all_decoded
+        })
+        .collect();
 
-        if all_decoded {
+    if files_to_process.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Log decoding catchup: processing {} files with concurrency {}",
+        files_to_process.len(),
+        concurrency
+    );
+
+    // Wrap shared data in Arc for concurrent access
+    let regular_matchers = Arc::new(regular_matchers.to_vec());
+    let factory_matchers = Arc::new(factory_matchers.clone());
+    let output_base = Arc::new(output_base.to_path_buf());
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
+    let mut join_set = JoinSet::new();
+
+    for (range_start, range_end, file_path) in files_to_process {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let regular_matchers = regular_matchers.clone();
+        let factory_matchers = factory_matchers.clone();
+        let factory_addresses = factory_addresses.clone();
+        let output_base = output_base.clone();
+
+        join_set.spawn(async move {
+            let _permit = permit; // Hold permit until task completes
+
             tracing::debug!(
-                "Log decoding catchup: skipping range {}-{}, all events already decoded",
+                "Log decoding catchup: processing range {}-{}",
                 range_start,
                 range_end - 1
             );
-            continue;
+
+            // Read raw logs from parquet
+            let logs = read_logs_from_parquet(&file_path)?;
+
+            // Get factory addresses for this range
+            let factory_addrs = factory_addresses
+                .get(&range_start)
+                .cloned()
+                .unwrap_or_default();
+
+            process_logs(
+                &logs,
+                range_start,
+                range_end,
+                &regular_matchers,
+                &factory_matchers,
+                &factory_addrs,
+                &output_base,
+            )
+            .await
+        });
+    }
+
+    // Collect results and propagate errors
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(LogDecodingError::JoinError(e.to_string())),
         }
-
-        tracing::debug!(
-            "Log decoding catchup: processing range {}-{}",
-            range_start,
-            range_end - 1
-        );
-
-        // Read raw logs from parquet
-        let logs = read_logs_from_parquet(&file_path)?;
-
-        // Get factory addresses for this range
-        let factory_addrs = factory_addresses
-            .get(&range_start)
-            .cloned()
-            .unwrap_or_default();
-
-        process_logs(
-            &logs,
-            range_start,
-            range_end,
-            regular_matchers,
-            factory_matchers,
-            &factory_addrs,
-            output_base,
-        )
-        .await?;
     }
 
     Ok(())
