@@ -104,8 +104,15 @@ pub async fn decode_logs(
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
 
     // Build event matchers from contract configs
+    tracing::debug!("Building event matchers for chain {}", chain.name);
     let (regular_matchers, factory_matchers) =
-        build_event_matchers(&chain.contracts, &chain.factory_collections)?;
+        match build_event_matchers(&chain.contracts, &chain.factory_collections) {
+            Ok(matchers) => matchers,
+            Err(e) => {
+                tracing::error!("Failed to build event matchers for chain {}: {}", chain.name, e);
+                return Err(e);
+            }
+        };
 
     if regular_matchers.is_empty() && factory_matchers.is_empty() {
         tracing::info!(
@@ -215,7 +222,18 @@ fn build_event_matchers(
         // Regular contract events
         if let Some(events) = &contract.events {
             for event_config in events {
-                let parsed = ParsedEvent::from_signature(&event_config.signature)?;
+                let parsed = match ParsedEvent::from_signature(&event_config.signature) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to parse event signature for contract {}: '{}' - {}",
+                            contract_name,
+                            event_config.signature,
+                            e
+                        );
+                        return Err(e.into());
+                    }
+                };
                 let event_name = event_config
                     .name
                     .clone()
@@ -304,8 +322,24 @@ async fn catchup_decode_logs(
 
     raw_files.sort_by_key(|(start, _, _)| *start);
 
+    tracing::info!(
+        "Log decoding catchup: found {} raw log files to check",
+        raw_files.len()
+    );
+
     // Load factory addresses from factory parquet files for catchup
     let factory_addresses = load_factory_addresses_for_catchup(chain)?;
+
+    let total_factory_addrs: usize = factory_addresses
+        .values()
+        .flat_map(|m| m.values())
+        .map(|s| s.len())
+        .sum();
+    tracing::info!(
+        "Log decoding catchup: loaded {} factory addresses across {} ranges",
+        total_factory_addrs,
+        factory_addresses.len()
+    );
 
     for (range_start, range_end, file_path) in raw_files {
         // Check if all events for this range are already decoded
@@ -318,8 +352,19 @@ async fn catchup_decode_logs(
         );
 
         if all_decoded {
+            tracing::debug!(
+                "Log decoding catchup: skipping range {}-{}, all events already decoded",
+                range_start,
+                range_end - 1
+            );
             continue;
         }
+
+        tracing::debug!(
+            "Log decoding catchup: processing range {}-{}",
+            range_start,
+            range_end - 1
+        );
 
         // Read raw logs from parquet
         let logs = read_logs_from_parquet(&file_path)?;
@@ -406,7 +451,7 @@ fn load_factory_addresses_for_catchup(
     let mut result: HashMap<u64, HashMap<String, HashSet<[u8; 20]>>> = HashMap::new();
 
     // Look for factory parquet files
-    let factories_dir = PathBuf::from(format!("data/raw/{}/factories", chain.name));
+    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain.name));
     if !factories_dir.exists() {
         return Ok(result);
     }
@@ -481,8 +526,8 @@ fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>,
     for batch_result in reader {
         let batch = batch_result?;
 
-        // Look for "address" column
-        if let Some(col_idx) = batch.schema().index_of("address").ok() {
+        // Look for "factory_address" column (the address of factory-created contracts)
+        if let Some(col_idx) = batch.schema().index_of("factory_address").ok() {
             let col = batch.column(col_idx);
             if let Some(addr_array) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
                 for i in 0..addr_array.len() {
@@ -713,6 +758,16 @@ async fn process_logs(
             }
         }
     }
+
+    let total_decoded: usize = decoded_by_event.values().map(|(v, _)| v.len()).sum();
+    tracing::debug!(
+        "Log decoding range {}-{}: {} logs in file, {} decoded events across {} event types",
+        range_start,
+        range_end - 1,
+        logs.len(),
+        total_decoded,
+        decoded_by_event.len()
+    );
 
     // Write decoded data to parquet files
     for ((contract_name, event_name), (records, parsed_event)) in decoded_by_event {

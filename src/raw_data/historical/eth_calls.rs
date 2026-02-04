@@ -1538,7 +1538,7 @@ fn load_historical_factory_addresses(
         return result;
     }
 
-    let factories_dir = PathBuf::from(format!("data/raw/{}/factories", chain_name));
+    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain_name));
     if !factories_dir.exists() {
         tracing::debug!(
             "No factories directory found at {}, skipping historical factory address loading",
@@ -1628,7 +1628,7 @@ fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>,
             }
         };
 
-        if let Some(col_idx) = batch.schema().index_of("address").ok() {
+        if let Some(col_idx) = batch.schema().index_of("factory_address").ok() {
             let col = batch.column(col_idx);
             if let Some(addr_array) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
                 for i in 0..addr_array.len() {
