@@ -21,7 +21,9 @@ use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
 use crate::types::config::chain::ChainConfig;
-use crate::types::config::contract::{AddressOrAddresses, Contracts};
+use crate::types::config::contract::{
+    resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
+};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 #[derive(Debug, Error)]
@@ -100,7 +102,8 @@ pub async fn decode_logs(
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
 
     // Build event matchers from contract configs
-    let (regular_matchers, factory_matchers) = build_event_matchers(&chain.contracts)?;
+    let (regular_matchers, factory_matchers) =
+        build_event_matchers(&chain.contracts, &chain.factory_collections)?;
 
     if regular_matchers.is_empty() && factory_matchers.is_empty() {
         tracing::info!(
@@ -196,6 +199,7 @@ pub async fn decode_logs(
 /// Build event matchers from contract configurations
 fn build_event_matchers(
     contracts: &Contracts,
+    factory_collections: &FactoryCollections,
 ) -> Result<(Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>), LogDecodingError> {
     let mut regular = Vec::new();
     let mut factory: HashMap<String, Vec<EventMatcher>> = HashMap::new();
@@ -222,21 +226,22 @@ fn build_event_matchers(
         // Factory-created contract events
         if let Some(factories) = &contract.factories {
             for factory_config in factories {
-                if let Some(events) = &factory_config.events {
-                    let matchers: Vec<EventMatcher> = events
-                        .iter()
-                        .filter_map(|e| {
-                            ParsedEvent::from_signature(&e.signature)
-                                .ok()
-                                .map(|parsed| EventMatcher {
-                                    name: factory_config.collection_name.clone(),
+                let resolved = resolve_factory_config(factory_config, factory_collections);
+                if let Some(events) = &resolved.events {
+                    let entry = factory.entry(resolved.collection_name.clone()).or_default();
+                    for event_config in events {
+                        if let Ok(parsed) = ParsedEvent::from_signature(&event_config.signature) {
+                            // Deduplicate by topic0
+                            if !entry.iter().any(|m| m.event.topic0 == parsed.topic0) {
+                                entry.push(EventMatcher {
+                                    name: resolved.collection_name.clone(),
                                     event: parsed,
                                     addresses: HashSet::new(),
                                     is_factory: true,
-                                })
-                        })
-                        .collect();
-                    factory.insert(factory_config.collection_name.clone(), matchers);
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }

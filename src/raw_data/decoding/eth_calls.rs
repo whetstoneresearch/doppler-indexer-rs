@@ -235,25 +235,27 @@ fn build_decode_configs(
         // Factory calls
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                for call in &factory.calls {
-                    let function_name = call
-                        .function
-                        .split('(')
-                        .next()
-                        .unwrap_or(&call.function)
-                        .to_string();
+                if let Some(calls) = &factory.calls {
+                    for call in calls {
+                        let function_name = call
+                            .function
+                            .split('(')
+                            .next()
+                            .unwrap_or(&call.function)
+                            .to_string();
 
-                    let config = CallDecodeConfig {
-                        contract_name: factory.collection_name.clone(),
-                        function_name,
-                        output_type: call.output_type.clone(),
-                        is_once: call.frequency.is_once(),
-                    };
+                        let config = CallDecodeConfig {
+                            contract_name: factory.collection.clone(),
+                            function_name,
+                            output_type: call.output_type.clone(),
+                            is_once: call.frequency.is_once(),
+                        };
 
-                    if call.frequency.is_once() {
-                        once.push(config);
-                    } else {
-                        regular.push(config);
+                        if call.frequency.is_once() {
+                            once.push(config);
+                        } else {
+                            regular.push(config);
+                        }
                     }
                 }
             }

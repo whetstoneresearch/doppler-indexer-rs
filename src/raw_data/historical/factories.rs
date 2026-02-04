@@ -19,7 +19,8 @@ use crate::raw_data::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
-    AddressOrAddresses, Contracts, FactoryParameterLocation,
+    resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
+    FactoryParameterLocation,
 };
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -450,7 +451,7 @@ fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
                         tracing::debug!(
                             "Created factory matcher for {} -> {} (topic0: 0x{})",
                             contract_name,
-                            factory.collection_name,
+                            factory.collection,
                             hex::encode(&event_topic0[..8])
                         );
 
@@ -459,7 +460,7 @@ fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
                             event_topic0,
                             param_location: param_location.clone(),
                             data_types: data_types.clone(),
-                            collection_name: factory.collection_name.clone(),
+                            collection_name: factory.collection.clone(),
                         });
                     }
                 }
@@ -874,6 +875,7 @@ fn load_factory_addresses_from_parquet(
 
 pub fn get_factory_call_configs(
     contracts: &Contracts,
+    factory_collections: &FactoryCollections,
 ) -> HashMap<String, Vec<crate::types::config::eth_call::EthCallConfig>> {
     let mut configs: HashMap<String, Vec<crate::types::config::eth_call::EthCallConfig>> =
         HashMap::new();
@@ -881,8 +883,16 @@ pub fn get_factory_call_configs(
     for (_, contract) in contracts {
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                if !factory.calls.is_empty() {
-                    configs.insert(factory.collection_name.clone(), factory.calls.clone());
+                let resolved = resolve_factory_config(factory, factory_collections);
+                if !resolved.calls.is_empty() {
+                    // Use entry().or_default().extend() to merge calls from multiple contracts
+                    let entry = configs.entry(resolved.collection_name).or_default();
+                    for call in resolved.calls {
+                        // Deduplicate by function signature
+                        if !entry.iter().any(|c| c.function == call.function) {
+                            entry.push(call);
+                        }
+                    }
                 }
             }
         }
@@ -891,16 +901,27 @@ pub fn get_factory_call_configs(
     configs
 }
 
-pub fn get_factory_collection_names(contracts: &Contracts) -> Vec<String> {
+pub fn get_factory_collection_names(
+    contracts: &Contracts,
+    factory_collections: &FactoryCollections,
+) -> Vec<String> {
     let mut names = Vec::new();
 
+    // Include collection names from contracts
     for (_, contract) in contracts {
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                if !names.contains(&factory.collection_name) {
-                    names.push(factory.collection_name.clone());
+                if !names.contains(&factory.collection) {
+                    names.push(factory.collection.clone());
                 }
             }
+        }
+    }
+
+    // Include collection names from factory_collections that aren't already present
+    for name in factory_collections.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
         }
     }
 

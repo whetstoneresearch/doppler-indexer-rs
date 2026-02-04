@@ -168,17 +168,19 @@ pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMa
         // Check factory calls for on_events
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                for call in &factory.calls {
-                    if let Frequency::OnEvents(config) = &call.frequency {
-                        let key = (config.source.clone(), compute_event_signature_hash(&config.event));
-                        if !seen.contains(&key) {
-                            if let Some(matcher) = build_matcher_for_source(
-                                &config.source,
-                                &config.event,
-                                contracts,
-                            ) {
-                                matchers.push(matcher);
-                                seen.insert(key);
+                if let Some(calls) = &factory.calls {
+                    for call in calls {
+                        if let Frequency::OnEvents(config) = &call.frequency {
+                            let key = (config.source.clone(), compute_event_signature_hash(&config.event));
+                            if !seen.contains(&key) {
+                                if let Some(matcher) = build_matcher_for_source(
+                                    &config.source,
+                                    &config.event,
+                                    contracts,
+                                ) {
+                                    matchers.push(matcher);
+                                    seen.insert(key);
+                                }
                             }
                         }
                     }
@@ -221,7 +223,7 @@ fn build_matcher_for_source(
     for (_, contract) in contracts {
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                if factory.collection_name == source {
+                if factory.collection == source {
                     return Some(EventTriggerMatcher {
                         source_name: source.to_string(),
                         addresses: HashSet::new(), // Factory addresses discovered dynamically

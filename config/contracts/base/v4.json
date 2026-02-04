@@ -27,9 +27,6 @@
                         "topics_signature":  "address,address,address",
                         "factory_parameters": "topics[1]"
                     }
-                ],
-                "events": [
-                    { "signature": "Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)" }
                 ]
             }
         ],

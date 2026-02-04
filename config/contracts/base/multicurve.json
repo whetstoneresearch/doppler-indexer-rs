@@ -1,6 +1,18 @@
 {
     "UniswapV4MulticurveInitializer": {
         "address": "0x65de470da664a5be139a5d812be5fda0d76cc951",
+        "factories": [
+            {
+                "collection_name": "DopplerV4Pool",
+                "factory_events": [
+                    {
+                        "name": "Create",
+                        "topics_signature":  "address,address,address",
+                        "factory_parameters": "topics[1]"
+                    }
+                ]
+            }
+        ],
         "events": [
             { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
         ]   
@@ -14,6 +26,18 @@
     },
     "UniswapV4ScheduledMulticurveInitializer": {
         "address": "0xa36715da46ddf4a769f3290f49af58bf8132ed8e",
+        "factories": [
+            {
+                "collection_name": "DopplerV4Pool",
+                "factory_events": [
+                    {
+                        "name": "Create",
+                        "topics_signature":  "address,address,address",
+                        "factory_parameters": "topics[1]"
+                    }
+                ]
+            }
+        ],
         "events": [
             { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
         ]        

@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::raw_data::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
-use crate::raw_data::historical::factories::FactoryAddressData;
+use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers, EventTriggerData, EventTriggerMessage,
     LogData,
@@ -156,7 +156,7 @@ pub async fn collect_eth_calls(
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
 
     let call_configs = build_call_configs(&chain.contracts)?;
-    let factory_call_configs = build_factory_call_configs(&chain.contracts);
+    let factory_call_configs = get_factory_call_configs(&chain.contracts, &chain.factory_collections);
     let event_call_configs = build_event_triggered_call_configs(&chain.contracts);
     let token_call_configs = build_token_call_configs(&chain.tokens, &chain.contracts)?;
 
@@ -880,21 +880,7 @@ pub async fn collect_eth_calls(
     Ok(())
 }
 
-fn build_factory_call_configs(contracts: &Contracts) -> HashMap<String, Vec<EthCallConfig>> {
-    let mut configs: HashMap<String, Vec<EthCallConfig>> = HashMap::new();
-
-    for (_, contract) in contracts {
-        if let Some(factories) = &contract.factories {
-            for factory in factories {
-                if !factory.calls.is_empty() {
-                    configs.insert(factory.collection_name.clone(), factory.calls.clone());
-                }
-            }
-        }
-    }
-
-    configs
-}
+// NOTE: build_factory_call_configs was removed - use get_factory_call_configs from factories.rs instead
 
 /// Build event-triggered call configs from contracts configuration
 /// Returns a map from (source_name, event_signature_hash) -> Vec<EventTriggeredCallConfig>
@@ -942,27 +928,29 @@ fn build_event_triggered_call_configs(
         // Check factory calls for on_events frequency
         if let Some(factories) = &contract.factories {
             for factory in factories {
-                for call in &factory.calls {
-                    if let Frequency::OnEvents(trigger_config) = &call.frequency {
-                        let event_hash = compute_event_signature_hash(&trigger_config.event);
-                        let key = (trigger_config.source.clone(), event_hash);
+                if let Some(calls) = &factory.calls {
+                    for call in calls {
+                        if let Frequency::OnEvents(trigger_config) = &call.frequency {
+                            let event_hash = compute_event_signature_hash(&trigger_config.event);
+                            let key = (trigger_config.source.clone(), event_hash);
 
-                        let selector = compute_function_selector(&call.function);
-                        let function_name = call.function
-                            .split('(')
-                            .next()
-                            .unwrap_or(&call.function)
-                            .to_string();
+                            let selector = compute_function_selector(&call.function);
+                            let function_name = call.function
+                                .split('(')
+                                .next()
+                                .unwrap_or(&call.function)
+                                .to_string();
 
-                        // For factory collections, target address is determined at runtime from event emitter
-                        configs.entry(key.clone()).or_default().push(EventTriggeredCallConfig {
-                            contract_name: factory.collection_name.clone(),
-                            target_address: None, // Will use event emitter address
-                            function_name: function_name.clone(),
-                            function_selector: selector,
-                            params: call.params.clone(),
-                            is_factory: true,
-                        });
+                            // For factory collections, target address is determined at runtime from event emitter
+                            configs.entry(key.clone()).or_default().push(EventTriggeredCallConfig {
+                                contract_name: factory.collection.clone(),
+                                target_address: None, // Will use event emitter address
+                                function_name: function_name.clone(),
+                                function_selector: selector,
+                                params: call.params.clone(),
+                                is_factory: true,
+                            });
+                        }
                     }
                 }
             }

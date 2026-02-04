@@ -21,7 +21,7 @@ Factories are configured within the `factories` array of a contract:
         "address": "0x660eAaEdEBc968f8f3694354FA8EC0b4c5Ba8D12",
         "factories": [
             {
-                "collection_name": "DERC20",
+                "collection": "DERC20",
                 "factory_events": {
                     "name": "Create",
                     "topics_signature": "address",
@@ -41,10 +41,115 @@ Factories are configured within the `factories` array of a contract:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `collection_name` | string | Yes | Identifier for this group of factory-created contracts |
+| `collection` | string | Yes | Identifier for this group of factory-created contracts (alias: `collection_name` for backward compatibility) |
 | `factory_events` | object | Yes | Event signature information for matching |
 | `factory_parameters` | string | Yes | Which parameter contains the created contract address |
-| `calls` | array | No | eth_call configs to execute on factory-created contracts (supports `frequency`) |
+| `calls` | array | No | eth_call configs to execute on factory-created contracts (merged with collection type if defined) |
+| `events` | array | No | Event configs to decode from factory-created contracts (merged with collection type if defined) |
+
+## Factory Collection Types (Shared Configuration)
+
+When multiple contracts create the same type of factory contracts (e.g., multiple initializers creating DERC20 tokens), you can define shared configuration at the chain level to avoid duplication.
+
+### Chain-Level Configuration
+
+Add a `factory_collections` field to your chain config, either inline or as a path to a JSON file:
+
+```json
+{
+    "name": "base",
+    "chain_id": 8453,
+    "factory_collections": "factory_collections/base.json",
+    "contracts": "contracts/"
+}
+```
+
+### Factory Collections File
+
+Define shared calls and events for each collection type:
+
+```json
+{
+    "DERC20": {
+        "calls": [
+            {"function": "name()", "output_type": "string", "frequency": "once"},
+            {"function": "symbol()", "output_type": "string", "frequency": "once"},
+            {"function": "totalSupply()", "output_type": "uint256"}
+        ],
+        "events": [
+            { "signature": "Transfer(address indexed from, address indexed to, uint256 value)" }
+        ]
+    },
+    "UniswapV2Pairs": {
+        "calls": [
+            {"function": "getReserves()", "output_type": "(uint112,uint112,uint32)"}
+        ],
+        "events": [
+            { "signature": "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)" }
+        ]
+    }
+}
+```
+
+### Contract References Collection
+
+Contracts then reference the collection by name, providing only the factory-specific detection config:
+
+```json
+{
+    "Airlock": {
+        "address": "0x660eAaEdEBc968f8f3694354FA8EC0b4c5Ba8D12",
+        "factories": [{
+            "collection": "DERC20",
+            "factory_events": {
+                "name": "Create",
+                "topics_signature": "address",
+                "data_signature": "address,address,address",
+                "factory_parameters": "data[0]"
+            }
+        }]
+    },
+    "AnotherInitializer": {
+        "address": "0x...",
+        "factories": [{
+            "collection": "DERC20",
+            "factory_events": {
+                "name": "TokenDeployed",
+                "topics_signature": "address",
+                "factory_parameters": "topics[1]"
+            }
+        }]
+    }
+}
+```
+
+Both contracts feed into the same `DERC20` collection, sharing the calls and events config.
+
+### Merge Behavior
+
+When a factory config references a collection type:
+
+1. **Calls are merged**: Collection type calls + inline calls (deduplicated by function signature)
+2. **Events are merged**: Collection type events + inline events (deduplicated by topic0)
+3. **Inline overrides**: If you specify calls/events inline, they extend (not replace) the collection type config
+
+```json
+{
+    "collection": "DERC20",
+    "factory_events": {...},
+    "calls": [
+        {"function": "customCall()", "output_type": "uint256"}
+    ]
+}
+```
+
+This would include all DERC20 collection calls PLUS the custom `customCall()`.
+
+### Benefits
+
+- **No duplication**: Define events/calls once, use across multiple contracts
+- **Correct merging**: Multiple contracts contributing to the same collection have their discovered addresses merged correctly
+- **Easy maintenance**: Update shared config in one place
 
 ### Factory Events
 
@@ -231,17 +336,30 @@ The module exports helper functions for working with factory configurations:
 
 ```rust
 // Get eth_call configs for each factory collection
-pub fn get_factory_call_configs(contracts: &Contracts)
-    -> HashMap<String, Vec<EthCallConfig>>
+// Merges collection type config with inline overrides, deduplicates by function signature
+pub fn get_factory_call_configs(
+    contracts: &Contracts,
+    factory_collections: &FactoryCollections,
+) -> HashMap<String, Vec<EthCallConfig>>
 
 // Get list of all factory collection names
-pub fn get_factory_collection_names(contracts: &Contracts)
-    -> Vec<String>
+// Includes names from both contracts and factory_collections
+pub fn get_factory_collection_names(
+    contracts: &Contracts,
+    factory_collections: &FactoryCollections,
+) -> Vec<String>
+
+// Resolve a factory config by merging collection type with inline overrides
+pub fn resolve_factory_config(
+    factory: &FactoryConfig,
+    collection_types: &FactoryCollections,
+) -> ResolvedFactoryConfig
 ```
 
 These are useful for:
 - Building the eth_calls collector configuration
 - Checking which collections exist before processing
+- Getting the resolved (merged) configuration for a factory
 
 ## Example Use Cases
 
@@ -255,13 +373,13 @@ Track all tokens deployed by a token factory:
         "address": "0x...",
         "factories": [
             {
-                "collection_name": "FactoryTokens",
+                "collection": "FactoryTokens",
                 "factory_events": {
                     "name": "TokenCreated",
                     "topics_signature": "",
-                    "data_signature": "address,string,string"
+                    "data_signature": "address,string,string",
+                    "factory_parameters": "data[0]"
                 },
-                "factory_parameters": "data[0]",
                 "calls": [
                     {"function": "totalSupply()", "output_type": "uint256"},
                     {"function": "name()", "output_type": "string", "frequency": "once"},
@@ -286,15 +404,15 @@ Track all pairs created by Uniswap V2 factory:
         "address": "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
         "factories": [
             {
-                "collection_name": "UniswapV2Pairs",
+                "collection": "UniswapV2Pairs",
                 "factory_events": {
                     "name": "PairCreated",
                     "topics_signature": "address,address",
-                    "data_signature": "address,uint256"
+                    "data_signature": "address,uint256",
+                    "factory_parameters": "data[0]"
                 },
-                "factory_parameters": "data[0]",
                 "calls": [
-                    {"function": "getReserves()", "output_type": "uint256"}
+                    {"function": "getReserves()", "output_type": "(uint112,uint112,uint32)"}
                 ]
             }
         ]
@@ -312,19 +430,60 @@ A single contract can have multiple factory configurations:
         "address": "0x...",
         "factories": [
             {
-                "collection_name": "TypeA",
-                "factory_events": {"name": "TypeACreated", ...},
-                "factory_parameters": "data[0]"
+                "collection": "TypeA",
+                "factory_events": {"name": "TypeACreated", "factory_parameters": "data[0]", ...}
             },
             {
-                "collection_name": "TypeB",
-                "factory_events": {"name": "TypeBCreated", ...},
-                "factory_parameters": "topics[1]"
+                "collection": "TypeB",
+                "factory_events": {"name": "TypeBCreated", "factory_parameters": "topics[1]", ...}
             }
         ]
     }
 }
 ```
+
+### Multiple Contracts, Same Collection
+
+Multiple contracts can contribute to the same collection using shared configuration:
+
+```json
+// In factory_collections/base.json
+{
+    "DERC20": {
+        "calls": [
+            {"function": "name()", "output_type": "string", "frequency": "once"},
+            {"function": "symbol()", "output_type": "string", "frequency": "once"}
+        ],
+        "events": [
+            { "signature": "Transfer(address indexed from, address indexed to, uint256 value)" }
+        ]
+    }
+}
+
+// In contracts/airlock.json
+{
+    "Airlock": {
+        "address": "0x...",
+        "factories": [{
+            "collection": "DERC20",
+            "factory_events": {"name": "Create", "factory_parameters": "data[0]", ...}
+        }]
+    }
+}
+
+// In contracts/other_initializer.json
+{
+    "OtherInitializer": {
+        "address": "0x...",
+        "factories": [{
+            "collection": "DERC20",
+            "factory_events": {"name": "TokenDeployed", "factory_parameters": "topics[1]", ...}
+        }]
+    }
+}
+```
+
+Both contracts contribute discovered addresses to the same `DERC20` collection, sharing the calls and events config.
 
 ## Error Handling
 

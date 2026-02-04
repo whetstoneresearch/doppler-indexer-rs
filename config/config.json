@@ -7,7 +7,7 @@
             "start_block": 26602741,
             "contracts": "contracts/base",
             "tokens": "tokens/base.json",
-            "factories": "factories/base.json",
+            "factory_collections": "factory_collections/base.json",
             "block_receipts_method": "eth_getBlockReceipts"
         }
     ],

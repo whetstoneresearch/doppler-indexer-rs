@@ -27,13 +27,80 @@ pub struct ContractConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FactoryConfig {
-    pub collection_name: String,
+    /// Collection name - can use either "collection" or "collection_name" in JSON
+    #[serde(alias = "collection_name")]
+    pub collection: String,
     pub factory_events: FactoryEventConfigOrArray,
+    /// Inline calls - merged with collection type calls if present
     #[serde(default)]
-    pub calls: Vec<EthCallConfig>,
-    /// Events to decode from factory-created contract logs
+    pub calls: Option<Vec<EthCallConfig>>,
+    /// Events to decode from factory-created contract logs - merged with collection type events
     #[serde(default)]
     pub events: Option<Vec<EventConfig>>,
+}
+
+/// Shared configuration for a factory collection type
+/// Defined at the chain level and referenced by collection name
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FactoryCollectionType {
+    #[serde(default)]
+    pub calls: Vec<EthCallConfig>,
+    #[serde(default)]
+    pub events: Option<Vec<EventConfig>>,
+}
+
+/// Map of collection name to shared collection type config
+pub type FactoryCollections = HashMap<String, FactoryCollectionType>;
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FactoryCollectionsOrPath {
+    Inline(FactoryCollections),
+    Path(String),
+}
+
+/// Resolved factory config with collection type merged in
+#[derive(Debug, Clone)]
+pub struct ResolvedFactoryConfig {
+    pub collection_name: String,
+    pub factory_events: Vec<FactoryEventConfig>,
+    pub calls: Vec<EthCallConfig>,
+    pub events: Option<Vec<EventConfig>>,
+}
+
+/// Resolve a factory config by merging collection type config with inline overrides
+pub fn resolve_factory_config(
+    factory: &FactoryConfig,
+    collection_types: &FactoryCollections,
+) -> ResolvedFactoryConfig {
+    let collection_type = collection_types.get(&factory.collection);
+
+    // Start with collection type config or empty defaults
+    let mut calls = collection_type
+        .map(|ct| ct.calls.clone())
+        .unwrap_or_default();
+
+    let mut events = collection_type.and_then(|ct| ct.events.clone());
+
+    // Merge inline calls (extend, don't replace)
+    if let Some(inline_calls) = &factory.calls {
+        calls.extend(inline_calls.iter().cloned());
+    }
+
+    // Merge inline events (extend, don't replace)
+    if let Some(inline_events) = &factory.events {
+        match &mut events {
+            Some(existing) => existing.extend(inline_events.iter().cloned()),
+            None => events = Some(inline_events.clone()),
+        }
+    }
+
+    ResolvedFactoryConfig {
+        collection_name: factory.collection.clone(),
+        factory_events: factory.factory_events.clone().into_vec(),
+        calls,
+        events,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +284,99 @@ fn load_contracts_from_dir(path: &Path) -> anyhow::Result<Contracts> {
             }
             Err(e) => {
                 panic!("Failed to load contracts file at {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    Ok(merged)
+}
+
+/// Load factory collections from a path (file or directory)
+pub fn load_factory_collections_from_path(
+    base_dir: &Path,
+    path: &str,
+) -> anyhow::Result<FactoryCollections> {
+    let full_path = base_dir.join(path);
+
+    if full_path.is_dir() {
+        load_factory_collections_from_dir(&full_path)
+    } else {
+        load_factory_collections_from_file(&full_path)
+    }
+}
+
+fn load_factory_collections_from_file(path: &Path) -> anyhow::Result<FactoryCollections> {
+    let content = std::fs::read_to_string(path);
+    match content {
+        Ok(content) => {
+            let collections: Result<FactoryCollections, _> = serde_json::from_str(&content);
+            match collections {
+                Ok(collections) => Ok(collections),
+                Err(e) => {
+                    panic!(
+                        "Failed to parse factory collections file at {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            panic!(
+                "Failed to load factory collections file at {}: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+}
+
+fn load_factory_collections_from_dir(path: &Path) -> anyhow::Result<FactoryCollections> {
+    let mut merged = FactoryCollections::new();
+
+    let entries = std::fs::read_dir(path);
+    let mut entries: Vec<_> = match entries {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "json")
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(e) => {
+            panic!(
+                "Failed to read factory collections directory at {}: {}",
+                path.display(),
+                e
+            );
+        }
+    };
+
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let collections = load_factory_collections_from_file(&entry.path());
+        match collections {
+            Ok(collections) => {
+                for key in collections.keys() {
+                    if merged.contains_key(key) {
+                        panic!(
+                            "Duplicate factory collection key '{}' found in {}",
+                            key,
+                            path.display()
+                        );
+                    }
+                }
+                merged.extend(collections);
+            }
+            Err(e) => {
+                panic!(
+                    "Failed to load factory collections file at {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }

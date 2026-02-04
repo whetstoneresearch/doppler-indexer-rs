@@ -69,7 +69,11 @@ async fn main() -> anyhow::Result<()> {
         let has_factory_calls = chain.contracts.values().any(|c| {
             c.factories
                 .as_ref()
-                .map(|factories| factories.iter().any(|f| !f.calls.is_empty()))
+                .map(|factories| {
+                    factories
+                        .iter()
+                        .any(|f| f.calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false))
+                })
                 .unwrap_or(false)
         });
 
@@ -77,13 +81,24 @@ async fn main() -> anyhow::Result<()> {
         let has_event_triggered_calls = chain.contracts.values().any(|c| {
             c.calls
                 .as_ref()
-                .map(|calls| calls.iter().any(|call| matches!(call.frequency, Frequency::OnEvents(_))))
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
+                })
                 .unwrap_or(false)
                 || c.factories
                     .as_ref()
                     .map(|factories| {
                         factories.iter().any(|f| {
-                            f.calls.iter().any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
+                            f.calls
+                                .as_ref()
+                                .map(|calls| {
+                                    calls
+                                        .iter()
+                                        .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
+                                })
+                                .unwrap_or(false)
                         })
                     })
                     .unwrap_or(false)
@@ -158,11 +173,18 @@ async fn main() -> anyhow::Result<()> {
         });
 
         let has_calls = chain.contracts.values().any(|c| {
-            c.calls.as_ref().map(|calls| !calls.is_empty()).unwrap_or(false)
-                || c.factories
-                    .as_ref()
-                    .map(|f| f.iter().any(|fc| !fc.calls.is_empty()))
-                    .unwrap_or(false)
+            c.calls
+                .as_ref()
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false)
+                || c.factories.as_ref().map(|f| {
+                    f.iter().any(|fc| {
+                        fc.calls
+                            .as_ref()
+                            .map(|calls| !calls.is_empty())
+                            .unwrap_or(false)
+                    })
+                }).unwrap_or(false)
         });
 
         let decode_logs_enabled = has_events;
