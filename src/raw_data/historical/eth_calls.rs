@@ -235,8 +235,14 @@ pub async fn collect_eth_calls(
                 existing_files.contains(&rel_path)
             });
 
+            // Check if all once call files exist for this range (one file per contract at {contract}/once/)
+            let once_calls_done = !has_once_calls || once_configs.keys().all(|contract_name| {
+                let rel_path = format!("{}/once/{}", contract_name, range.file_name());
+                existing_files.contains(&rel_path)
+            });
+
             // Skip this range only if ALL call types have their files
-            if regular_calls_done && token_calls_done {
+            if regular_calls_done && token_calls_done && once_calls_done {
                 range_regular_done.insert(range.start);
                 continue;
             }
