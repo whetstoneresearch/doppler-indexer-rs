@@ -11,6 +11,7 @@ bench = []
 alloy-primitives = { version = "1.5.2", features = ["serde"] }
 alloy = { version = "1.0", features = ["full", "provider-http", "rpc-types", "dyn-abi", "json-abi"] }
 anyhow = "1.0.100"
+dotenvy = "0.15"
 async-trait = "0.1"
 futures = "0.3"
 hex = "0.4"

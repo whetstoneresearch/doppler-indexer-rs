@@ -32,6 +32,41 @@ async fn main() -> anyhow::Result<()> {
 
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
 
+    let required_env_vars: Vec<&str> = config
+        .chains
+        .iter()
+        .map(|c| c.rpc_url_env_var.as_str())
+        .collect();
+
+    let missing_vars: Vec<&str> = required_env_vars
+        .iter()
+        .filter(|var| env::var(var).is_err())
+        .copied()
+        .collect();
+
+    if !missing_vars.is_empty() {
+        dotenvy::dotenv().map_err(|e| {
+            anyhow::anyhow!(
+                "Missing environment variables {:?} and failed to load .env file: {}",
+                missing_vars,
+                e
+            )
+        })?;
+
+        let still_missing: Vec<&str> = required_env_vars
+            .iter()
+            .filter(|var| env::var(var).is_err())
+            .copied()
+            .collect();
+
+        if !still_missing.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Missing required environment variables after loading .env: {:?}",
+                still_missing
+            ));
+        }
+    }
+
     #[cfg(feature = "bench")]
     {
         std::fs::create_dir_all("data")?;
