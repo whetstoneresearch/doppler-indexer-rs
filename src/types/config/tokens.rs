@@ -4,6 +4,8 @@ use std::path::Path;
 use alloy_primitives::{Address, FixedBytes};
 use serde::Deserialize;
 
+use crate::types::config::eth_call::EthCallConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenConfig {
     pub address: Address,
@@ -31,6 +33,8 @@ pub struct PoolConfig {
     pub pool_type: PoolType,
     pub address: AddressOrPoolId,
     pub quote_token: String,
+    #[serde(default)]
+    pub calls: Option<Vec<EthCallConfig>>,
 }
 
 pub type Tokens = HashMap<String, TokenConfig>;

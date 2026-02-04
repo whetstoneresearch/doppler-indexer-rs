@@ -28,6 +28,7 @@ use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue};
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 
 #[derive(Debug, Error)]
 pub enum EthCallCollectionError {
@@ -157,6 +158,7 @@ pub async fn collect_eth_calls(
     let call_configs = build_call_configs(&chain.contracts)?;
     let factory_call_configs = build_factory_call_configs(&chain.contracts);
     let event_call_configs = build_event_triggered_call_configs(&chain.contracts);
+    let token_call_configs = build_token_call_configs(&chain.tokens, &chain.contracts)?;
 
     let once_configs = build_once_call_configs(&chain.contracts);
     let factory_once_configs = build_factory_once_call_configs(&factory_call_configs);
@@ -166,8 +168,9 @@ pub async fn collect_eth_calls(
     let has_factory_calls = !factory_call_configs.is_empty() && factory_rx.is_some();
     let has_factory_once_calls = !factory_once_configs.is_empty() && factory_rx.is_some();
     let has_event_triggered_calls = !event_call_configs.is_empty() && event_trigger_rx.is_some();
+    let has_token_calls = !token_call_configs.is_empty();
 
-    if !has_regular_calls && !has_once_calls && !has_factory_calls && !has_factory_once_calls && !has_event_triggered_calls {
+    if !has_regular_calls && !has_once_calls && !has_factory_calls && !has_factory_once_calls && !has_event_triggered_calls && !has_token_calls {
         tracing::info!("No eth_calls configured for chain {}", chain.name);
         while block_rx.recv().await.is_some() {}
         return Ok(());
@@ -193,13 +196,14 @@ pub async fn collect_eth_calls(
     };
 
     tracing::info!(
-        "Starting eth_call collection for chain {} with {} regular configs, {} once configs, {} factory collections, {} factory once configs, {} event trigger configs",
+        "Starting eth_call collection for chain {} with {} regular configs, {} once configs, {} factory collections, {} factory once configs, {} event trigger configs, {} token pool configs",
         chain.name,
         call_configs.len(),
         once_configs.len(),
         factory_call_configs.len(),
         factory_once_configs.len(),
-        event_call_configs.len()
+        event_call_configs.len(),
+        token_call_configs.len()
     );
 
     let existing_files = scan_existing_parquet_files(&base_output_dir);
@@ -271,6 +275,20 @@ pub async fn collect_eth_calls(
                     &existing_files,
                     rpc_batch_size,
                     max_params,
+                    &mut frequency_state,
+                )
+                .await?;
+            }
+
+            if has_token_calls {
+                process_token_range(
+                    &range,
+                    blocks.clone(),
+                    client,
+                    &token_call_configs,
+                    &base_output_dir,
+                    &existing_files,
+                    rpc_batch_size,
                     &mut frequency_state,
                 )
                 .await?;
@@ -584,6 +602,20 @@ pub async fn collect_eth_calls(
                                     .await?;
                                 }
 
+                                if has_token_calls {
+                                    process_token_range(
+                                        &range,
+                                        blocks.clone(),
+                                        client,
+                                        &token_call_configs,
+                                        &base_output_dir,
+                                        &existing_files,
+                                        rpc_batch_size,
+                                        &mut frequency_state,
+                                    )
+                                    .await?;
+                                }
+
                                 if has_once_calls {
                                     process_once_calls_regular(
                                         &range,
@@ -774,6 +806,20 @@ pub async fn collect_eth_calls(
                 &existing_files,
                 rpc_batch_size,
                 max_params,
+                &mut frequency_state,
+            )
+            .await?;
+        }
+
+        if has_token_calls && !range_regular_done.contains(&range_start) {
+            process_token_range(
+                &range,
+                blocks.clone(),
+                client,
+                &token_call_configs,
+                &base_output_dir,
+                &existing_files,
+                rpc_batch_size,
                 &mut frequency_state,
             )
             .await?;
@@ -1104,11 +1150,29 @@ fn extract_value_from_32_bytes(
             let encoded = DynSolValue::FixedBytes(b256, 32).abi_encode();
             Ok((DynSolValue::FixedBytes(b256, 32), encoded))
         }
+        EvmType::Uint160 => {
+            let val = U256::from_be_bytes(*bytes);
+            let encoded = DynSolValue::Uint(val, 160).abi_encode();
+            Ok((DynSolValue::Uint(val, 160), encoded))
+        }
+        EvmType::Uint96 => {
+            let val = U256::from_be_bytes(*bytes);
+            let encoded = DynSolValue::Uint(val, 96).abi_encode();
+            Ok((DynSolValue::Uint(val, 96), encoded))
+        }
         EvmType::Bytes | EvmType::String => {
             Err(EthCallCollectionError::EventParamExtraction(format!(
                 "Dynamic types ({:?}) cannot be extracted from event data directly",
                 param_type
             )))
+        }
+        // Named types delegate to inner type
+        EvmType::Named { inner, .. } => extract_value_from_32_bytes(bytes, inner),
+        // NamedTuple not supported for event param extraction
+        EvmType::NamedTuple(_) => {
+            Err(EthCallCollectionError::EventParamExtraction(
+                "NamedTuple cannot be used as a parameter type".to_string(),
+            ))
         }
     }
 }
@@ -2106,6 +2170,119 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
     Ok(configs)
 }
 
+/// Configuration for a token pool call
+#[derive(Debug, Clone)]
+struct TokenCallConfig {
+    /// Token name (used for output directory naming as {token_name}_pool)
+    token_name: String,
+    /// Pool type (v2, v3, v4)
+    pool_type: PoolType,
+    /// Target address for the call (pool address for v2/v3, StateView for v4)
+    target_address: Address,
+    /// Function name (e.g., "slot0")
+    function_name: String,
+    /// Encoded calldata including selector and any params
+    encoded_calldata: Bytes,
+    /// Call frequency
+    frequency: Frequency,
+    /// Output type for decoding
+    output_type: EvmType,
+}
+
+/// Build call configs from token pool configurations
+fn build_token_call_configs(
+    tokens: &Tokens,
+    contracts: &Contracts,
+) -> Result<Vec<TokenCallConfig>, EthCallCollectionError> {
+    let mut configs = Vec::new();
+
+    // Look up UniswapV4StateView address from contracts config
+    let state_view_address = contracts
+        .get("UniswapV4StateView")
+        .and_then(|c| match &c.address {
+            AddressOrAddresses::Single(addr) => Some(*addr),
+            AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
+        });
+
+    for (token_name, token_config) in tokens {
+        if let Some(pool) = &token_config.pool {
+            if let Some(calls) = &pool.calls {
+                for call in calls {
+                    // Skip once and on_events calls for now
+                    if call.frequency.is_once() || call.frequency.is_on_events() {
+                        continue;
+                    }
+
+                    let selector = compute_function_selector(&call.function);
+                    let function_name = call
+                        .function
+                        .split('(')
+                        .next()
+                        .unwrap_or(&call.function)
+                        .to_string();
+
+                    let (target_address, encoded_calldata) = match pool.pool_type {
+                        PoolType::V2 | PoolType::V3 => {
+                            // Target the pool address directly
+                            let addr = match &pool.address {
+                                AddressOrPoolId::Address(a) => *a,
+                                AddressOrPoolId::PoolId(_) => {
+                                    tracing::warn!(
+                                        "V2/V3 pool {} has PoolId instead of Address, skipping",
+                                        token_name
+                                    );
+                                    continue;
+                                }
+                            };
+                            let calldata = Bytes::copy_from_slice(&selector);
+                            (addr, calldata)
+                        }
+                        PoolType::V4 => {
+                            // Target StateView with pool ID as parameter
+                            let state_view = match state_view_address {
+                                Some(addr) => addr,
+                                None => {
+                                    tracing::warn!(
+                                        "No UniswapV4StateView configured, skipping V4 pool calls for {}",
+                                        token_name
+                                    );
+                                    continue;
+                                }
+                            };
+                            let pool_id_bytes = match &pool.address {
+                                AddressOrPoolId::PoolId(id) => *id,
+                                AddressOrPoolId::Address(_) => {
+                                    tracing::warn!(
+                                        "V4 pool {} has Address instead of PoolId, skipping",
+                                        token_name
+                                    );
+                                    continue;
+                                }
+                            };
+                            // Encode call: selector + abi-encoded pool_id (bytes32)
+                            let pool_id_value = DynSolValue::FixedBytes(pool_id_bytes, 32);
+                            let calldata = encode_call_with_params(selector, &[pool_id_value]);
+                            (state_view, calldata)
+                        }
+                    };
+
+                    configs.push(TokenCallConfig {
+                        token_name: token_name.clone(),
+                        pool_type: pool.pool_type.clone(),
+                        target_address,
+                        function_name,
+                        encoded_calldata,
+                        frequency: call.frequency.clone(),
+                        output_type: call.output_type.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(configs)
+}
+
 fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
     let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
 
@@ -2622,6 +2799,153 @@ async fn process_range(
                     (contract_name.clone(), function_name.clone()),
                     last_block.timestamp,
                 );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process token pool calls for a range of blocks
+async fn process_token_range(
+    range: &BlockRange,
+    blocks: Vec<BlockInfo>,
+    client: &UnifiedRpcClient,
+    token_configs: &[TokenCallConfig],
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+    rpc_batch_size: usize,
+    frequency_state: &mut FrequencyState,
+) -> Result<(), EthCallCollectionError> {
+    // Group configs by (token_name, function_name)
+    let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
+    for config in token_configs {
+        grouped_configs
+            .entry((config.token_name.clone(), config.function_name.clone()))
+            .or_default()
+            .push(config);
+    }
+
+    for ((token_name, function_name), configs) in &grouped_configs {
+        let output_name = format!("{}_pool", token_name);
+        let file_name = range.file_name();
+        let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
+
+        if existing_files.contains(&rel_path) {
+            tracing::debug!(
+                "Skipping token calls for {}.{} blocks {}-{} (already exists)",
+                output_name,
+                function_name,
+                range.start,
+                range.end - 1
+            );
+            continue;
+        }
+
+        let frequency = &configs[0].frequency;
+        let state_key = (output_name.clone(), function_name.clone());
+        let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
+        let filtered_blocks = filter_blocks_for_frequency(&blocks, frequency, last_call_ts);
+
+        if filtered_blocks.is_empty() {
+            tracing::debug!(
+                "No blocks match frequency {:?} for {}.{} in range {}-{}",
+                frequency,
+                output_name,
+                function_name,
+                range.start,
+                range.end - 1
+            );
+            continue;
+        }
+
+        tracing::info!(
+            "Fetching token calls for {}.{} blocks {}-{} ({} blocks after frequency filter)",
+            output_name,
+            function_name,
+            range.start,
+            range.end - 1,
+            filtered_blocks.len()
+        );
+
+        let mut all_results: Vec<CallResult> = Vec::new();
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, &BlockInfo, &TokenCallConfig)> =
+            Vec::new();
+
+        for block in &filtered_blocks {
+            for config in configs {
+                let tx = TransactionRequest::default()
+                    .to(config.target_address)
+                    .input(config.encoded_calldata.clone().into());
+                let block_id = BlockId::Number(BlockNumberOrTag::Number(block.block_number));
+                pending_calls.push((tx, block_id, block, config));
+            }
+        }
+
+        for chunk in pending_calls.chunks(rpc_batch_size) {
+            let calls: Vec<(TransactionRequest, BlockId)> = chunk
+                .iter()
+                .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
+                .collect();
+
+            let results = client.call_batch(calls).await?;
+
+            for (i, result) in results.into_iter().enumerate() {
+                let (_, _, block, config) = &chunk[i];
+                match result {
+                    Ok(bytes) => {
+                        all_results.push(CallResult {
+                            block_number: block.block_number,
+                            block_timestamp: block.timestamp,
+                            contract_address: config.target_address.0 .0,
+                            value_bytes: bytes.to_vec(),
+                            param_values: Vec::new(), // Token calls don't have params stored
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Token call failed for {}.{} at block {}: {}",
+                            output_name,
+                            function_name,
+                            block.block_number,
+                            e
+                        );
+                        all_results.push(CallResult {
+                            block_number: block.block_number,
+                            block_timestamp: block.timestamp,
+                            contract_address: config.target_address.0 .0,
+                            value_bytes: Vec::new(),
+                            param_values: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        all_results.sort_by_key(|r| (r.block_number, r.contract_address));
+
+        let result_count = all_results.len();
+        let sub_dir = output_dir.join(&output_name).join(function_name);
+        std::fs::create_dir_all(&sub_dir)?;
+        let output_path = sub_dir.join(&file_name);
+
+        tokio::task::spawn_blocking(move || {
+            write_results_to_parquet(&all_results, &output_path, 0) // No params
+        })
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+
+        tracing::info!(
+            "Wrote {} token call results to {}",
+            result_count,
+            sub_dir.join(&file_name).display()
+        );
+
+        if let Frequency::Duration(_) = frequency {
+            if let Some(last_block) = filtered_blocks.last() {
+                frequency_state
+                    .last_call_times
+                    .insert((output_name.clone(), function_name.clone()), last_block.timestamp);
             }
         }
     }

@@ -124,6 +124,15 @@ Event field references:
 - `topics[1]`, `topics[2]`, `topics[3]` - Indexed parameters
 - `data[0]`, `data[1]`, etc. - Non-indexed parameters (32-byte words)
 
+Supported types for `from_event`:
+- `address` - Ethereum address (20 bytes, right-aligned in 32-byte word)
+- `uint256`, `uint128`, `uint80`, `uint64`, `uint32`, `uint24`, `uint16`, `uint8`
+- `int256`, `int128`, `int64`, `int32`, `int24`, `int16`, `int8`
+- `bool` - Boolean (last byte of 32-byte word)
+- `bytes32` - Fixed 32-byte value
+
+**Note:** Dynamic types (`bytes`, `string`) cannot be extracted from event data directly.
+
 #### 3. Self Address (event emitter)
 ```json
 {"type": "address", "source": "self"}
@@ -165,15 +174,19 @@ Existing Log Parquet Files → [Read Logs] → [Event Trigger Extraction] → ET
 
 On startup, the eth_calls collector runs a catchup phase that:
 
-1. Scans `data/raw/{chain}/logs/` for existing parquet files
-2. For each log file, checks if output already exists in the `on_events/` subdirectory
-3. If output doesn't exist:
+1. **Loads historical factory addresses** from `data/raw/{chain}/factories/` parquet files (for factory collections only)
+2. Scans `data/raw/{chain}/logs/` for existing parquet files
+3. For each log file, checks if output already exists in the `on_events/` subdirectory
+4. If output doesn't exist:
    - Reads logs from the parquet file
    - Extracts event triggers using configured matchers
+   - Filters factory collection triggers by known factory addresses
    - Processes triggers through the same pipeline as live mode
-4. Skips ranges where output already exists to avoid duplicate processing
+5. Skips ranges where output already exists to avoid duplicate processing
 
 This ensures that historical data is processed even if the indexer was started after events occurred.
+
+**Important:** For factory collections, historical factory addresses are loaded before processing any event triggers. This ensures that only events from known factory-created contracts are processed, preventing incorrect calls to unrelated addresses.
 
 ## Output Format
 
@@ -283,10 +296,11 @@ struct EventCallResult {
 
 | File | Changes |
 |------|---------|
-| `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, extended `ParamConfig` with `FromEvent` and `SelfAddress` variants |
-| `src/raw_data/historical/receipts.rs` | Added `EventTriggerData`, `EventTriggerMessage`, `EventTriggerMatcher` types; `build_event_trigger_matchers()`, `extract_event_triggers()` functions; channel sending |
-| `src/raw_data/historical/eth_calls.rs` | Added event processing: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `build_event_call_params()`, `process_event_triggers()`, `write_event_call_results_to_parquet()`; catchup: `get_existing_log_ranges()`, `read_logs_from_parquet()`, `event_output_exists()` |
+| `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, extended `ParamConfig` with `FromEvent` and `SelfAddress` variants; added `Int24`, `Int16`, `Uint24` types |
+| `src/raw_data/historical/receipts.rs` | Added `EventTriggerData`, `EventTriggerMessage`, `EventTriggerMatcher` types; `build_event_trigger_matchers()`, `extract_event_triggers()` functions with deduplication; channel sending |
+| `src/raw_data/historical/eth_calls.rs` | Added event processing: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `extract_value_from_32_bytes()`, `build_event_call_params()`, `process_event_triggers()`, `write_event_call_results_to_parquet()`; catchup: `get_existing_log_ranges()`, `read_logs_from_parquet()`, `event_output_exists()`, `load_historical_factory_addresses()`, `read_factory_addresses_from_parquet()` |
 | `src/raw_data/decoding/types.rs` | Added `EventCallResult` type and `EventCallsReady` variant to `DecoderMessage` |
+| `src/raw_data/decoding/eth_calls.rs` | Added support for `Int24`, `Int16`, `Uint24` types in decoding |
 | `src/raw_data/decoding/mod.rs` | Exported `EventCallResult` |
 | `src/main.rs` | Added channel creation, event matchers building, and wiring |
 
@@ -300,6 +314,11 @@ Event triggers are extracted in the receipts collector (where logs are already a
 
 For factory collections, receipts sends all logs matching the event signature. The eth_calls collector filters by known factory addresses. This avoids complex bidirectional communication between collectors.
 
+**Race Condition Handling:** During live processing, event triggers may arrive before factory addresses are discovered (since factory discovery and event processing happen concurrently). To handle this safely:
+- If no factory addresses are known for a collection, event triggers are skipped (not processed)
+- Skipped triggers will be processed during the next catchup phase when addresses are known
+- This prevents making eth_calls to random addresses that aren't actually factory-created contracts
+
 ### 3. No Call Chaining
 
 Call chaining (output of call A → input of call B) is explicitly out of scope. This keeps the configuration simple and type-safe. Complex call dependencies should be handled in downstream event handlers in the transformation layer, which provides:
@@ -310,7 +329,9 @@ Call chaining (output of call A → input of call B) is explicitly out of scope.
 
 ### 4. One Call Per Event
 
-Each matching event triggers a separate eth_call. There is no deduplication within a block. This ensures data completeness for scenarios where the same call with different parameters might be needed.
+Each matching event triggers a separate eth_call. This ensures data completeness for scenarios where the same call with different parameters might be needed.
+
+**Deduplication:** Duplicate triggers are prevented at the extraction level - if the same log (identified by block number, log index, and source name) would match multiple matchers with the same event signature, only one trigger is created. This prevents redundant calls while still allowing different call configurations to trigger from the same event.
 
 ### 5. Separate Output Directory
 
@@ -322,6 +343,16 @@ The catchup mode checks for existing output files before processing. This ensure
 - Restarting the indexer doesn't cause duplicate processing
 - Partially completed runs can be resumed
 - New event-triggered call configurations are automatically backfilled
+
+## Known Limitations
+
+1. **Dynamic types not supported in `from_event`:** The `bytes` and `string` types cannot be extracted from event data directly because they require complex ABI decoding with offset handling.
+
+2. **Factory collection race window:** During live processing, there may be a brief window where events from newly-created factory contracts are skipped because the factory address hasn't been discovered yet. These events will be processed during the next catchup phase.
+
+3. **Failed calls stored as empty:** If an eth_call fails (e.g., contract reverted), an empty result is stored. Failed calls during catchup are not automatically retried on subsequent runs.
+
+4. **No cross-event parameter passing:** Parameters can only be extracted from the triggering event itself, not from other events in the same block or transaction.
 
 ## Testing
 

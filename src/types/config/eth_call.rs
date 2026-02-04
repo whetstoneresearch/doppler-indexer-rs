@@ -27,6 +27,16 @@ pub enum FrequencyError {
     InvalidDuration(String),
 }
 
+#[derive(Debug, Error)]
+pub enum EvmTypeParseError {
+    #[error("Unknown EVM type: {0}")]
+    UnknownType(String),
+    #[error("Invalid tuple format: {0}")]
+    InvalidTuple(String),
+    #[error("Empty tuple field")]
+    EmptyField,
+}
+
 /// Configuration for event-triggered eth_calls
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct EventTriggerConfig {
@@ -302,9 +312,11 @@ impl ParamValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// EVM type representation for eth_call output types
+/// Supports simple types, named single values, and named tuples
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EvmType {
+    // Simple types (unnamed)
     Int256,
     Int128,
     Int64,
@@ -313,7 +325,9 @@ pub enum EvmType {
     Int16,
     Int8,
     Uint256,
+    Uint160,
     Uint128,
+    Uint96,
     Uint80,
     Uint64,
     Uint32,
@@ -325,6 +339,207 @@ pub enum EvmType {
     Bytes32,
     Bytes,
     String,
+    /// Named single value: "int256 latestAnswer" → column "latestAnswer"
+    Named {
+        name: std::string::String,
+        inner: Box<EvmType>,
+    },
+    /// Named tuple: "(uint160 sqrtPriceX96, int24 tick)" → columns "sqrtPriceX96", "tick"
+    NamedTuple(Vec<(std::string::String, Box<EvmType>)>),
+}
+
+impl EvmType {
+    /// Parse a simple type string (no name) into EvmType
+    fn parse_simple(s: &str) -> Result<EvmType, EvmTypeParseError> {
+        match s.to_lowercase().as_str() {
+            "int256" => Ok(EvmType::Int256),
+            "int128" => Ok(EvmType::Int128),
+            "int64" => Ok(EvmType::Int64),
+            "int32" => Ok(EvmType::Int32),
+            "int24" => Ok(EvmType::Int24),
+            "int16" => Ok(EvmType::Int16),
+            "int8" => Ok(EvmType::Int8),
+            "uint256" => Ok(EvmType::Uint256),
+            "uint160" => Ok(EvmType::Uint160),
+            "uint128" => Ok(EvmType::Uint128),
+            "uint96" => Ok(EvmType::Uint96),
+            "uint80" => Ok(EvmType::Uint80),
+            "uint64" => Ok(EvmType::Uint64),
+            "uint32" => Ok(EvmType::Uint32),
+            "uint24" => Ok(EvmType::Uint24),
+            "uint16" => Ok(EvmType::Uint16),
+            "uint8" => Ok(EvmType::Uint8),
+            "address" => Ok(EvmType::Address),
+            "bool" => Ok(EvmType::Bool),
+            "bytes32" => Ok(EvmType::Bytes32),
+            "bytes" => Ok(EvmType::Bytes),
+            "string" => Ok(EvmType::String),
+            _ => Err(EvmTypeParseError::UnknownType(s.to_string())),
+        }
+    }
+
+    /// Parse an output_type string into EvmType
+    /// Handles: "uint256", "int256 latestAnswer", "(uint160 sqrtPriceX96, int24 tick)"
+    pub fn parse(s: &str) -> Result<EvmType, EvmTypeParseError> {
+        let s = s.trim();
+
+        // Check if it's a tuple
+        if s.starts_with('(') && s.ends_with(')') {
+            return Self::parse_named_tuple(s);
+        }
+
+        // Check if it's a named single value (contains space but not a tuple)
+        if let Some(space_idx) = s.find(' ') {
+            let type_str = &s[..space_idx].trim();
+            let name = &s[space_idx + 1..].trim();
+            if !name.is_empty() {
+                let inner = Self::parse_simple(type_str)?;
+                return Ok(EvmType::Named {
+                    name: name.to_string(),
+                    inner: Box::new(inner),
+                });
+            }
+        }
+
+        // Simple type
+        Self::parse_simple(s)
+    }
+
+    /// Parse a named tuple like "(uint160 sqrtPriceX96, int24 tick)"
+    fn parse_named_tuple(s: &str) -> Result<EvmType, EvmTypeParseError> {
+        // Strip outer parentheses
+        let inner = s
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(|| EvmTypeParseError::InvalidTuple(s.to_string()))?;
+
+        if inner.trim().is_empty() {
+            return Err(EvmTypeParseError::InvalidTuple("empty tuple".to_string()));
+        }
+
+        // Split by comma, respecting nested parentheses
+        let fields = split_tuple_fields(inner)?;
+
+        let mut parsed_fields = Vec::new();
+        for field in fields {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err(EvmTypeParseError::EmptyField);
+            }
+
+            // Each field is "type name"
+            let parts: Vec<&str> = field.splitn(2, ' ').collect();
+            if parts.len() != 2 {
+                return Err(EvmTypeParseError::InvalidTuple(format!(
+                    "field '{}' must have type and name",
+                    field
+                )));
+            }
+
+            let type_str = parts[0].trim();
+            let name = parts[1].trim();
+
+            if name.is_empty() {
+                return Err(EvmTypeParseError::InvalidTuple(format!(
+                    "field '{}' has empty name",
+                    field
+                )));
+            }
+
+            let field_type = Self::parse_simple(type_str)?;
+            parsed_fields.push((name.to_string(), Box::new(field_type)));
+        }
+
+        Ok(EvmType::NamedTuple(parsed_fields))
+    }
+
+    /// Get the column name for named single values
+    pub fn column_name(&self) -> Option<&str> {
+        match self {
+            EvmType::Named { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Get field names for named tuples
+    pub fn field_names(&self) -> Option<Vec<&str>> {
+        match self {
+            EvmType::NamedTuple(fields) => Some(fields.iter().map(|(n, _)| n.as_str()).collect()),
+            _ => None,
+        }
+    }
+
+    /// Get the inner type for Named variant, or self for simple types
+    pub fn inner_type(&self) -> &EvmType {
+        match self {
+            EvmType::Named { inner, .. } => inner,
+            _ => self,
+        }
+    }
+
+    /// Check if this is a named tuple
+    pub fn is_named_tuple(&self) -> bool {
+        matches!(self, EvmType::NamedTuple(_))
+    }
+
+    /// Check if this is a named single value
+    pub fn is_named(&self) -> bool {
+        matches!(self, EvmType::Named { .. })
+    }
+}
+
+/// Split tuple fields by comma, respecting nested parentheses
+fn split_tuple_fields(s: &str) -> Result<Vec<&str>, EvmTypeParseError> {
+    let mut fields = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                fields.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Add the last field
+    if start < s.len() {
+        fields.push(&s[start..]);
+    }
+
+    Ok(fields)
+}
+
+impl<'de> Deserialize<'de> for EvmType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EvmTypeVisitor;
+
+        impl<'de> Visitor<'de> for EvmTypeVisitor {
+            type Value = EvmType;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "an EVM type like \"uint256\", \"int256 latestAnswer\", or \"(uint160 sqrtPriceX96, int24 tick)\"",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<EvmType, E>
+            where
+                E: de::Error,
+            {
+                EvmType::parse(value).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(EvmTypeVisitor)
+    }
 }
 
 impl EvmType {
@@ -434,6 +649,23 @@ impl EvmType {
                 let s = value.as_string()?;
                 Ok(DynSolValue::String(s))
             }
+            EvmType::Uint160 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 160))
+            }
+            EvmType::Uint96 => {
+                let s = value.as_string()?;
+                let val = parse_uint256(&s)?;
+                Ok(DynSolValue::Uint(val, 96))
+            }
+            // Named types delegate to their inner type
+            EvmType::Named { inner, .. } => inner.parse_value(value),
+            // NamedTuple doesn't support parsing from ParamValue
+            EvmType::NamedTuple(_) => Err(ParamError::TypeMismatch {
+                expected: "simple type".to_string(),
+                got: "named tuple".to_string(),
+            }),
         }
     }
 
@@ -447,7 +679,7 @@ impl EvmType {
             EvmType::Int16 => DataType::Int16,
             EvmType::Int8 => DataType::Int8,
             // Large unsigned integers stored as strings to preserve precision
-            EvmType::Uint256 | EvmType::Uint128 | EvmType::Uint80 => DataType::Utf8,
+            EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => DataType::Utf8,
             EvmType::Uint64 => DataType::UInt64,
             EvmType::Uint32 | EvmType::Uint24 => DataType::UInt32,
             EvmType::Uint16 => DataType::UInt16,
@@ -457,6 +689,23 @@ impl EvmType {
             EvmType::Bytes32 => DataType::FixedSizeBinary(32),
             EvmType::Bytes => DataType::Binary,
             EvmType::String => DataType::Utf8,
+            // Named types delegate to their inner type
+            EvmType::Named { inner, .. } => inner.to_arrow_type(),
+            // NamedTuple - should use field_arrow_types() instead
+            EvmType::NamedTuple(_) => DataType::Utf8, // Fallback, shouldn't be used directly
+        }
+    }
+
+    /// Get Arrow types for each field in a named tuple
+    pub fn field_arrow_types(&self) -> Option<Vec<(&str, DataType)>> {
+        match self {
+            EvmType::NamedTuple(fields) => Some(
+                fields
+                    .iter()
+                    .map(|(name, ty)| (name.as_str(), ty.to_arrow_type()))
+                    .collect(),
+            ),
+            _ => None,
         }
     }
 }
@@ -717,5 +966,105 @@ mod tests {
         assert!(config.frequency.is_on_events());
         assert_eq!(config.params.len(), 1);
         assert_eq!(config.params[0].from_event(), Some("topics[2]"));
+    }
+
+    #[test]
+    fn test_evm_type_parse_simple() {
+        assert_eq!(EvmType::parse("uint256").unwrap(), EvmType::Uint256);
+        assert_eq!(EvmType::parse("int24").unwrap(), EvmType::Int24);
+        assert_eq!(EvmType::parse("address").unwrap(), EvmType::Address);
+        assert_eq!(EvmType::parse("bool").unwrap(), EvmType::Bool);
+        assert_eq!(EvmType::parse("uint160").unwrap(), EvmType::Uint160);
+    }
+
+    #[test]
+    fn test_evm_type_parse_named_single() {
+        let result = EvmType::parse("int256 latestAnswer").unwrap();
+        match result {
+            EvmType::Named { name, inner } => {
+                assert_eq!(name, "latestAnswer");
+                assert_eq!(*inner, EvmType::Int256);
+            }
+            _ => panic!("Expected Named variant"),
+        }
+    }
+
+    #[test]
+    fn test_evm_type_parse_named_tuple() {
+        let result = EvmType::parse("(uint160 sqrtPriceX96, int24 tick)").unwrap();
+        match result {
+            EvmType::NamedTuple(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "sqrtPriceX96");
+                assert_eq!(*fields[0].1, EvmType::Uint160);
+                assert_eq!(fields[1].0, "tick");
+                assert_eq!(*fields[1].1, EvmType::Int24);
+            }
+            _ => panic!("Expected NamedTuple variant"),
+        }
+    }
+
+    #[test]
+    fn test_evm_type_parse_complex_tuple() {
+        let result = EvmType::parse(
+            "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)"
+        ).unwrap();
+        match result {
+            EvmType::NamedTuple(fields) => {
+                assert_eq!(fields.len(), 7);
+                assert_eq!(fields[0].0, "sqrtPriceX96");
+                assert_eq!(fields[6].0, "unlocked");
+                assert_eq!(*fields[6].1, EvmType::Bool);
+            }
+            _ => panic!("Expected NamedTuple variant"),
+        }
+    }
+
+    #[test]
+    fn test_evm_type_deserialize_simple() {
+        let json = r#""uint256""#;
+        let result: EvmType = serde_json::from_str(json).unwrap();
+        assert_eq!(result, EvmType::Uint256);
+    }
+
+    #[test]
+    fn test_evm_type_deserialize_named_single() {
+        let json = r#""int256 latestAnswer""#;
+        let result: EvmType = serde_json::from_str(json).unwrap();
+        assert!(result.is_named());
+        assert_eq!(result.column_name(), Some("latestAnswer"));
+    }
+
+    #[test]
+    fn test_evm_type_deserialize_named_tuple() {
+        let json = r#""(uint160 sqrtPriceX96, int24 tick)""#;
+        let result: EvmType = serde_json::from_str(json).unwrap();
+        assert!(result.is_named_tuple());
+        assert_eq!(result.field_names(), Some(vec!["sqrtPriceX96", "tick"]));
+    }
+
+    #[test]
+    fn test_eth_call_config_with_named_output() {
+        let json = r#"{
+            "function": "latestAnswer()",
+            "output_type": "int256 latestAnswer"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.function, "latestAnswer()");
+        assert!(config.output_type.is_named());
+        assert_eq!(config.output_type.column_name(), Some("latestAnswer"));
+    }
+
+    #[test]
+    fn test_eth_call_config_with_tuple_output() {
+        let json = r#"{
+            "function": "slot0()",
+            "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex)"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.function, "slot0()");
+        assert!(config.output_type.is_named_tuple());
+        let names = config.output_type.field_names().unwrap();
+        assert_eq!(names, vec!["sqrtPriceX96", "tick", "observationIndex"]);
     }
 }

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use alloy::dyn_abi::DynSolValue;
+use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{I256, U256};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
@@ -83,6 +83,8 @@ enum DecodedValue {
     Bytes32([u8; 32]),
     Bytes(Vec<u8>),
     String(String),
+    /// Named tuple of (field_name, field_value) pairs
+    NamedTuple(Vec<(std::string::String, DecodedValue)>),
 }
 
 pub async fn decode_eth_calls(
@@ -741,11 +743,9 @@ async fn process_once_calls(
     Ok(())
 }
 
-/// Decode a raw value using the specified type
-fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCallDecodingError> {
-    use alloy::dyn_abi::DynSolType;
-
-    let sol_type = match output_type {
+/// Convert an EvmType to a DynSolType for decoding
+fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
+    match output_type {
         EvmType::Int256 => DynSolType::Int(256),
         EvmType::Int128 => DynSolType::Int(128),
         EvmType::Int64 => DynSolType::Int(64),
@@ -754,7 +754,9 @@ fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCa
         EvmType::Int16 => DynSolType::Int(16),
         EvmType::Int8 => DynSolType::Int(8),
         EvmType::Uint256 => DynSolType::Uint(256),
+        EvmType::Uint160 => DynSolType::Uint(160),
         EvmType::Uint128 => DynSolType::Uint(128),
+        EvmType::Uint96 => DynSolType::Uint(96),
         EvmType::Uint80 => DynSolType::Uint(80),
         EvmType::Uint64 => DynSolType::Uint(64),
         EvmType::Uint32 => DynSolType::Uint(32),
@@ -766,7 +768,20 @@ fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCa
         EvmType::Bytes32 => DynSolType::FixedBytes(32),
         EvmType::Bytes => DynSolType::Bytes,
         EvmType::String => DynSolType::String,
-    };
+        EvmType::Named { inner, .. } => evm_type_to_dyn_sol_type(inner),
+        EvmType::NamedTuple(fields) => {
+            let field_types: Vec<DynSolType> = fields
+                .iter()
+                .map(|(_, ty)| evm_type_to_dyn_sol_type(ty))
+                .collect();
+            DynSolType::Tuple(field_types)
+        }
+    }
+}
+
+/// Decode a raw value using the specified type
+fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCallDecodingError> {
+    let sol_type = evm_type_to_dyn_sol_type(output_type);
 
     let decoded = sol_type
         .abi_decode(raw)
@@ -780,18 +795,47 @@ fn convert_dyn_sol_value(
     value: &DynSolValue,
     output_type: &EvmType,
 ) -> Result<DecodedValue, EthCallDecodingError> {
+    // Handle Named types by delegating to inner type
+    if let EvmType::Named { inner, .. } = output_type {
+        return convert_dyn_sol_value(value, inner);
+    }
+
+    // Handle NamedTuple types
+    if let EvmType::NamedTuple(fields) = output_type {
+        if let DynSolValue::Tuple(values) = value {
+            if values.len() != fields.len() {
+                return Err(EthCallDecodingError::Decode(format!(
+                    "Tuple length mismatch: expected {}, got {}",
+                    fields.len(),
+                    values.len()
+                )));
+            }
+            let mut named_values = Vec::with_capacity(fields.len());
+            for ((name, field_type), val) in fields.iter().zip(values.iter()) {
+                let decoded = convert_dyn_sol_value(val, field_type)?;
+                named_values.push((name.clone(), decoded));
+            }
+            return Ok(DecodedValue::NamedTuple(named_values));
+        } else {
+            return Err(EthCallDecodingError::Decode(format!(
+                "Expected tuple value for NamedTuple type, got {:?}",
+                value
+            )));
+        }
+    }
+
     match value {
         DynSolValue::Address(addr) => Ok(DecodedValue::Address(addr.0 .0)),
         DynSolValue::Uint(val, _) => match output_type {
             EvmType::Uint8 => Ok(DecodedValue::Uint8((*val).try_into().unwrap_or(u8::MAX))),
-            EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint16 => {
+            EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
                 Ok(DecodedValue::Uint64((*val).try_into().unwrap_or(u64::MAX)))
             }
             _ => Ok(DecodedValue::Uint256(*val)),
         },
         DynSolValue::Int(val, _) => match output_type {
             EvmType::Int8 => Ok(DecodedValue::Int8((*val).try_into().unwrap_or(i8::MAX))),
-            EvmType::Int64 | EvmType::Int32 => {
+            EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
                 Ok(DecodedValue::Int64((*val).try_into().unwrap_or(i64::MAX)))
             }
             _ => Ok(DecodedValue::Int256(*val)),
@@ -818,14 +862,30 @@ fn write_decoded_calls_to_parquet(
     output_type: &EvmType,
     output_path: &Path,
 ) -> Result<(), EthCallDecodingError> {
-    let value_type = output_type.to_arrow_type();
-
-    let fields = vec![
+    // Build schema based on output type
+    let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
         Field::new("contract_address", DataType::FixedSizeBinary(20), false),
-        Field::new("decoded_value", value_type, true),
     ];
+
+    // Add value fields based on output type
+    match output_type {
+        EvmType::Named { name, inner } => {
+            // Named single value: use the name as column name
+            fields.push(Field::new(name, inner.to_arrow_type(), true));
+        }
+        EvmType::NamedTuple(tuple_fields) => {
+            // Named tuple: create a column for each field
+            for (field_name, field_type) in tuple_fields {
+                fields.push(Field::new(field_name, field_type.to_arrow_type(), true));
+            }
+        }
+        _ => {
+            // Simple type: use "decoded_value"
+            fields.push(Field::new("decoded_value", output_type.to_arrow_type(), true));
+        }
+    }
 
     let schema = Arc::new(Schema::new(fields));
     let mut arrays: Vec<ArrayRef> = Vec::new();
@@ -848,9 +908,26 @@ fn write_decoded_calls_to_parquet(
         arrays.push(Arc::new(arr));
     }
 
-    // decoded_value
-    let value_array = build_value_array(records, output_type)?;
-    arrays.push(value_array);
+    // Add value arrays based on output type
+    match output_type {
+        EvmType::Named { inner, .. } => {
+            // Named single value: build array using inner type
+            let value_array = build_value_array(records, inner)?;
+            arrays.push(value_array);
+        }
+        EvmType::NamedTuple(tuple_fields) => {
+            // Named tuple: build array for each field
+            for (idx, (_, field_type)) in tuple_fields.iter().enumerate() {
+                let arr = build_tuple_field_array(records, idx, field_type)?;
+                arrays.push(arr);
+            }
+        }
+        _ => {
+            // Simple type
+            let value_array = build_value_array(records, output_type)?;
+            arrays.push(value_array);
+        }
+    }
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
@@ -865,6 +942,220 @@ fn write_decoded_calls_to_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+/// Build an Arrow array for a specific field of a named tuple
+fn build_tuple_field_array(
+    records: &[DecodedCallRecord],
+    field_idx: usize,
+    field_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    // Extract the field value from each record's NamedTuple
+    // For each record, find the tuple field at the given index
+    match field_type {
+        EvmType::Address => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    match &r.decoded_value {
+                        DecodedValue::NamedTuple(fields) => {
+                            if let Some((_, DecodedValue::Address(addr))) = fields.get(field_idx) {
+                                addr.as_slice()
+                            } else {
+                                &[0u8; 20][..]
+                            }
+                        }
+                        _ => &[0u8; 20][..],
+                    }
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = records
+                .iter()
+                .map(|r| extract_tuple_uint8(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
+            let arr: UInt64Array = records
+                .iter()
+                .map(|r| extract_tuple_uint64(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_tuple_uint256_string(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = records
+                .iter()
+                .map(|r| extract_tuple_int8(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
+            let arr: Int64Array = records
+                .iter()
+                .map(|r| extract_tuple_int64(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_tuple_int256_string(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = records
+                .iter()
+                .map(|r| extract_tuple_bool(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    match &r.decoded_value {
+                        DecodedValue::NamedTuple(fields) => {
+                            if let Some((_, DecodedValue::Bytes32(b))) = fields.get(field_idx) {
+                                b.as_slice()
+                            } else {
+                                &[0u8; 32][..]
+                            }
+                        }
+                        _ => &[0u8; 32][..],
+                    }
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::String => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_tuple_string(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = records
+                .iter()
+                .map(|r| extract_tuple_bytes(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => build_tuple_field_array(records, field_idx, inner),
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "Nested NamedTuple not supported".to_string(),
+        )),
+    }
+}
+
+// Helper functions for extracting tuple field values
+
+fn extract_tuple_uint8(r: &DecodedCallRecord, idx: usize) -> Option<u8> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint8(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_uint64(r: &DecodedCallRecord, idx: usize) -> Option<u64> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => Some(*val),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_uint256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint256(val) => Some(val.to_string()),
+            DecodedValue::Uint64(val) => Some(val.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_int8(r: &DecodedCallRecord, idx: usize) -> Option<i8> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int8(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_int64(r: &DecodedCallRecord, idx: usize) -> Option<i64> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => Some(*val),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_int256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int256(val) => Some(val.to_string()),
+            DecodedValue::Int64(val) => Some(val.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_bool(r: &DecodedCallRecord, idx: usize) -> Option<bool> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Bool(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_string(r: &DecodedCallRecord, idx: usize) -> Option<&str> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_bytes(r: &DecodedCallRecord, idx: usize) -> Option<&[u8]> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Bytes(b) => Some(b.as_slice()),
+            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 /// Write decoded "once" calls to parquet
@@ -971,7 +1262,7 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint128 | EvmType::Uint80 => {
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| match &r.decoded_value {
@@ -1058,6 +1349,12 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
+        // Named types delegate to their inner type
+        EvmType::Named { inner, .. } => build_value_array(records, inner),
+        // NamedTuple should not use this function directly - use build_named_tuple_arrays
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "NamedTuple should use build_named_tuple_arrays".to_string(),
+        )),
     }
 }
 
@@ -1102,7 +1399,7 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint128 | EvmType::Uint80 => {
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| match r.decoded_values.get(function_name) {
@@ -1189,5 +1486,11 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
+        // Named types delegate to their inner type
+        EvmType::Named { inner, .. } => build_once_value_array(records, function_name, inner),
+        // NamedTuple not yet supported for once calls
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "NamedTuple not yet supported for once calls".to_string(),
+        )),
     }
 }

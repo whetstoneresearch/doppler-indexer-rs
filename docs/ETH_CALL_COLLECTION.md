@@ -53,13 +53,37 @@ The `output_type` field (and parameter types) support the following EVM types:
 
 | Type | Description |
 |------|-------------|
-| `uint8`, `uint16`, `uint32`, `uint64`, `uint80`, `uint128`, `uint256` | Unsigned integers of various sizes |
-| `int8`, `int32`, `int64`, `int128`, `int256` | Signed integers of various sizes |
+| `uint8`, `uint16`, `uint24`, `uint32`, `uint64`, `uint80`, `uint96`, `uint128`, `uint160`, `uint256` | Unsigned integers of various sizes |
+| `int8`, `int16`, `int24`, `int32`, `int64`, `int128`, `int256` | Signed integers of various sizes |
 | `address` | 20-byte Ethereum address |
 | `bool` | Boolean value |
 | `bytes32` | Fixed 32-byte value |
 | `bytes` | Dynamic byte array |
 | `string` | Dynamic string |
+
+### Named Output Types
+
+Output types can include names to create descriptive column names in the decoded parquet output:
+
+**Named Single Value:**
+```json
+{
+  "function": "latestAnswer()",
+  "output_type": "int256 latestAnswer"
+}
+```
+This creates a column named `latestAnswer` instead of the default `decoded_value`.
+
+**Named Tuple (for functions returning multiple values):**
+```json
+{
+  "function": "slot0()",
+  "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)"
+}
+```
+This creates separate columns: `sqrtPriceX96`, `tick`, `observationIndex`, `observationCardinality`, `observationCardinalityNext`, `feeProtocol`, `unlocked`.
+
+The format is `type name` for each field, with tuples enclosed in parentheses and fields separated by commas.
 
 ## Parameters
 
@@ -438,6 +462,89 @@ For frequently-used factories (e.g., token deployers), this can generate many ca
 - Monitoring RPC compute unit usage
 
 See [Factory Collection](./FACTORY_COLLECTION.md) for details on how factory addresses are discovered.
+
+## Token Pool Calls
+
+The eth_call collector also supports making calls on token pool contracts. This is configured in the token configuration file (`config/tokens/{chain}.json`) rather than the contracts configuration.
+
+### Configuration
+
+Token pool calls are defined within the `pool` configuration of a token:
+
+```json
+{
+  "Fxh": {
+    "address": "0x5fc2843838e65eb0b5d33654628f446d54602791",
+    "pool": {
+      "type": "v3",
+      "address": "0xC3e7433ae4d929092F8dFf62F7E2f15f23bC3E63",
+      "quote_token": "Weth",
+      "calls": [
+        {
+          "function": "slot0()",
+          "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)"
+        }
+      ]
+    }
+  }
+}
+```
+
+### Pool Types and Target Addresses
+
+The target address for eth_calls depends on the pool type:
+
+| Pool Type | Target Address | Notes |
+|-----------|----------------|-------|
+| `v2` | Pool address (from `pool.address`) | Direct call to the pool contract |
+| `v3` | Pool address (from `pool.address`) | Direct call to the pool contract |
+| `v4` | `UniswapV4StateView` contract | Pool ID (bytes32) passed as first parameter |
+
+For v4 pools, the `pool.address` field should contain the pool ID (bytes32), and the system automatically looks up the `UniswapV4StateView` contract address from the contracts configuration and passes the pool ID as a parameter.
+
+**V4 Pool Example:**
+```json
+{
+  "Eurc": {
+    "address": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+    "pool": {
+      "type": "v4",
+      "address": "0xb18fad93e3c5a5f932d901f0c22c5639a832d6f29a4392fff3393fb734dd0720",
+      "quote_token": "Usdc",
+      "calls": [
+        {
+          "function": "getSlot0(bytes32)",
+          "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)"
+        }
+      ]
+    }
+  }
+}
+```
+
+### Output Files
+
+Token pool eth_call results are written to:
+
+```
+data/raw/{chain}/eth_calls/{token_name}_pool/{function_name}/{start}-{end}.parquet
+```
+
+Example: `data/raw/base/eth_calls/Fxh_pool/slot0/0-9999.parquet`
+
+### Decoded Output Schema
+
+When using named tuple output types, the decoded parquet files will have named columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_number` | UInt64 | Block height |
+| `block_timestamp` | UInt64 | Unix timestamp |
+| `contract_address` | FixedSizeBinary(20) | Target contract address |
+| `sqrtPriceX96` | Utf8 | First tuple field (stored as string for large integers) |
+| `tick` | Int32 | Second tuple field |
+| `observationIndex` | UInt32 | Third tuple field |
+| ... | ... | Additional fields from the tuple |
 
 ## Resumability
 
