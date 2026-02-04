@@ -11,7 +11,7 @@ use alloy::rpc::types::{
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::rpc::rpc::{with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError};
+use crate::rpc::rpc::{error_chain, with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputeUnitCost(pub u32);
@@ -247,7 +247,7 @@ impl AlchemyClient {
                 .provider()
                 .get_block_number()
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -270,11 +270,11 @@ impl AlchemyClient {
                 builder
                     .full()
                     .await
-                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
             } else {
                 builder
                     .await
-                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
             }
         })
         .await
@@ -298,7 +298,7 @@ impl AlchemyClient {
                 .provider()
                 .get_transaction_by_hash(hash)
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -315,7 +315,7 @@ impl AlchemyClient {
                 .provider()
                 .get_transaction_receipt(hash)
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -390,7 +390,7 @@ impl AlchemyClient {
                 .provider()
                 .get_logs(&filter)
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -409,7 +409,7 @@ impl AlchemyClient {
                 .get_balance(address)
                 .block_id(block.unwrap_or(BlockId::latest()))
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -427,7 +427,7 @@ impl AlchemyClient {
                 .get_code_at(address)
                 .block_id(block.unwrap_or(BlockId::latest()))
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -446,7 +446,7 @@ impl AlchemyClient {
                 .call(tx.clone())
                 .block(block.unwrap_or(BlockId::latest()))
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -501,7 +501,7 @@ impl AlchemyClient {
                     let mut chunk_results = Vec::with_capacity(results.len());
                     for result in results {
                         chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
+                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
                     }
                     Ok(chunk_results)
                 },
@@ -596,7 +596,7 @@ impl AlchemyClient {
                     let mut chunk_results = Vec::with_capacity(results.len());
                     for result in results {
                         chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
+                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
                     }
                     Ok(chunk_results)
                 },
@@ -652,7 +652,7 @@ impl AlchemyClient {
 
                     Ok(results
                         .into_iter()
-                        .map(|r| r.map_err(|e| RpcError::ProviderError(e.to_string())))
+                        .map(|r| r.map_err(|e| RpcError::ProviderError(error_chain(&e))))
                         .collect())
                 },
             )

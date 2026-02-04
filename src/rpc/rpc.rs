@@ -16,6 +16,19 @@ use governor::{Jitter, Quota, RateLimiter};
 use thiserror::Error;
 use url::Url;
 
+/// Extracts the full error chain from an error, including all source errors.
+/// This is useful for debugging because alloy errors like "error decoding response body"
+/// often have underlying serde errors that explain exactly what field failed.
+pub fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(s) = source {
+        chain.push(s.to_string());
+        source = s.source();
+    }
+    chain.join(": ")
+}
+
 #[derive(Debug, Error)]
 pub enum RpcError {
     #[error("RPC transport error: {0}")]
@@ -330,7 +343,7 @@ impl RpcClient {
             self.provider
                 .get_block_number()
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -348,11 +361,11 @@ impl RpcClient {
                 builder
                     .full()
                     .await
-                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
             } else {
                 builder
                     .await
-                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
             }
         })
         .await
@@ -374,7 +387,7 @@ impl RpcClient {
             self.provider
                 .get_transaction_by_hash(hash)
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -389,7 +402,7 @@ impl RpcClient {
             self.provider
                 .get_transaction_receipt(hash)
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -418,7 +431,7 @@ impl RpcClient {
                     .client()
                     .request(method.clone(), (block_param.clone(),))
                     .await
-                    .map_err(|e| RpcError::ProviderError(e.to_string()))
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
             },
         )
         .await?;
@@ -502,7 +515,7 @@ impl RpcClient {
             self.provider
                 .get_logs(&filter)
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -519,7 +532,7 @@ impl RpcClient {
                 .get_balance(address)
                 .block_id(block.unwrap_or(BlockId::latest()))
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -536,7 +549,7 @@ impl RpcClient {
                 .get_code_at(address)
                 .block_id(block.unwrap_or(BlockId::latest()))
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -554,7 +567,7 @@ impl RpcClient {
                 .call(tx.clone())
                 .block(block.unwrap_or(BlockId::latest()))
                 .await
-                .map_err(|e| RpcError::ProviderError(e.to_string()))
+                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
         .await
     }
@@ -607,7 +620,7 @@ impl RpcClient {
                     let mut chunk_results = Vec::with_capacity(results.len());
                     for result in results {
                         chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
+                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
                     }
                     Ok(chunk_results)
                 },
@@ -698,7 +711,7 @@ impl RpcClient {
                     let mut chunk_results = Vec::with_capacity(results.len());
                     for result in results {
                         chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(e.to_string()))?);
+                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
                     }
                     Ok(chunk_results)
                 },
@@ -752,7 +765,7 @@ impl RpcClient {
 
                     Ok(results
                         .into_iter()
-                        .map(|r| r.map_err(|e| RpcError::ProviderError(e.to_string())))
+                        .map(|r| r.map_err(|e| RpcError::ProviderError(error_chain(&e))))
                         .collect())
                 },
             )
