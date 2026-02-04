@@ -4,7 +4,7 @@
         "events": [
             { "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)" },
             { "signature": "Donate(bytes32 indexed id, address indexed sender, uint256 amount0, uint256 amount1)"},
-            { "signature": "Initialize(PoolId indexed id, Currency indexed currency0, Currency indexed currency1, uint24 fee, int24 tickSpacing, IHooks hooks, uint160 sqrtPriceX96, int24 tick)"}
+            { "signature": "Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, IHooks hooks, uint160 sqrtPriceX96, int24 tick)"}
         ]
     },
     "UniswapV4StateView": {
