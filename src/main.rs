@@ -1,15 +1,19 @@
 #[cfg(feature = "bench")]
 mod bench;
+mod db;
 mod raw_data;
 mod rpc;
+mod transformations;
 mod types;
 
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+use db::DbPool;
 use raw_data::decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
@@ -19,6 +23,10 @@ use raw_data::historical::receipts::{
     build_event_trigger_matchers, collect_receipts, EventTriggerMessage, LogMessage,
 };
 use rpc::UnifiedRpcClient;
+use transformations::{
+    build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
+    RangeCompleteMessage, TransformationEngine,
+};
 use types::config::eth_call::Frequency;
 use types::config::indexer::IndexerConfig;
 
@@ -247,6 +255,53 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
+        let registry = build_registry();
+        let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
+
+        let (transform_events_tx, transform_events_rx) = if transformations_enabled {
+            let (tx, rx) = mpsc::channel::<DecodedEventsMessage>(channel_capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (transform_calls_tx, transform_calls_rx) = if transformations_enabled {
+            let (tx, rx) = mpsc::channel::<DecodedCallsMessage>(channel_capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (transform_complete_tx, transform_complete_rx) = if transformations_enabled {
+            let (tx, rx) = mpsc::channel::<RangeCompleteMessage>(channel_capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let db_pool = if transformations_enabled {
+            let transform_config = config.transformations.as_ref().unwrap();
+            let database_url = env::var(&transform_config.database_url_env_var).map_err(|_| {
+                anyhow::anyhow!(
+                    "Environment variable {} not set for transformations",
+                    transform_config.database_url_env_var
+                )
+            })?;
+
+            let pool = DbPool::new(&database_url).await.map_err(|e| {
+                anyhow::anyhow!("Failed to create database pool: {}", e)
+            })?;
+
+            pool.run_migrations().await.map_err(|e| {
+                anyhow::anyhow!("Failed to run database migrations: {}", e)
+            })?;
+
+            tracing::info!("Database pool initialized and migrations complete");
+            Some(Arc::new(pool))
+        } else {
+            None
+        };
+
         let raw_data_config = config.raw_data_collection.clone();
         let raw_data_config2 = config.raw_data_collection.clone();
         let raw_data_config3 = config.raw_data_collection.clone();
@@ -262,7 +317,6 @@ async fn main() -> anyhow::Result<()> {
         let chain_clone6 = chain.clone();
         let chain_clone7 = chain.clone();
 
-        // Clone decoder senders for factories (needs both)
         let log_decoder_tx_for_factories = log_decoder_tx.clone();
         let call_decoder_tx_for_factories = call_decoder_tx.clone();
         
@@ -329,13 +383,14 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        // Spawn decoder tasks
         let log_decoder_handle = if decode_logs_enabled {
+            let transform_events_tx = transform_events_tx.clone();
             Some(tokio::spawn(async move {
                 decode_logs(
                     &chain_clone6,
                     &raw_data_config6,
                     log_decoder_rx.unwrap(),
+                    transform_events_tx,
                 )
                 .await
             }))
@@ -344,11 +399,13 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let call_decoder_handle = if decode_calls_enabled {
+            let transform_calls_tx = transform_calls_tx.clone();
             Some(tokio::spawn(async move {
                 decode_eth_calls(
                     &chain_clone7,
                     &raw_data_config7,
                     call_decoder_rx.unwrap(),
+                    transform_calls_tx,
                 )
                 .await
             }))
@@ -356,7 +413,55 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        let (blocks_result, receipts_result, logs_result, eth_calls_result, factories_result, log_decoder_result, call_decoder_result) =
+        let transformation_handle = if transformations_enabled {
+            let rpc_url = env::var(&chain.rpc_url_env_var).unwrap();
+            let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url).unwrap());
+            let transform_config = config.transformations.as_ref().unwrap();
+            let mode = if transform_config.mode.batch_for_catchup {
+                ExecutionMode::Batch {
+                    batch_size: transform_config.mode.catchup_batch_size,
+                }
+            } else {
+                ExecutionMode::Streaming
+            };
+
+            let handler_count = registry.handler_count();
+            let engine = TransformationEngine::new(
+                Arc::new(registry),
+                db_pool.clone().unwrap(),
+                rpc_client,
+                chain.name.clone(),
+                chain.chain_id,
+                mode,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create transformation engine: {}", e))?;
+
+            engine.initialize().await.map_err(|e| {
+                anyhow::anyhow!("Failed to initialize transformation handlers: {}", e)
+            })?;
+
+            tracing::info!(
+                "Transformation engine initialized for chain {} with {} handlers",
+                chain.name,
+                handler_count
+            );
+
+            Some(tokio::spawn(async move {
+                engine
+                    .run(
+                        transform_events_rx.unwrap(),
+                        transform_calls_rx.unwrap(),
+                        transform_complete_rx.unwrap(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Transformation engine error: {}", e))
+            }))
+        } else {
+            None
+        };
+
+        let (blocks_result, receipts_result, logs_result, eth_calls_result, factories_result, log_decoder_result, call_decoder_result, transformation_result) =
             tokio::try_join!(
                 blocks_handle,
                 receipts_handle,
@@ -379,6 +484,12 @@ async fn main() -> anyhow::Result<()> {
                         Some(handle) => handle.await,
                         None => Ok(Ok(())),
                     }
+                },
+                async {
+                    match transformation_handle {
+                        Some(handle) => handle.await,
+                        None => Ok(Ok(())),
+                    }
                 }
             )?;
 
@@ -389,6 +500,7 @@ async fn main() -> anyhow::Result<()> {
         factories_result?;
         log_decoder_result?;
         call_decoder_result?;
+        transformation_result?;
 
         tracing::info!("Completed collection for chain {}", chain.name);
     }

@@ -12,7 +12,7 @@ pub enum UnifiedRpcClient {
 impl UnifiedRpcClient {    
     pub fn from_url(url: &str) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
-            Ok(Self::Alchemy(AlchemyClient::from_url(url, 9500)?))
+            Ok(Self::Alchemy(AlchemyClient::from_url(url, 8500)?))
         } else {
             Ok(Self::Standard(RpcClient::from_url(url)?))
         }
@@ -93,6 +93,25 @@ impl UnifiedRpcClient {
             Self::Standard(client) => client.call_batch(calls).await,
             Self::Alchemy(client) => client.call_batch(calls).await,
         }
+    }
+
+    /// Execute a single eth_call at a specific block.
+    pub async fn eth_call(
+        &self,
+        to: alloy::primitives::Address,
+        data: Bytes,
+        block_number: u64,
+    ) -> Result<Bytes, RpcError> {
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(to)
+            .input(alloy::rpc::types::TransactionInput::new(data));
+        let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
+
+        let results = self.call_batch(vec![(tx, block_id)]).await?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| RpcError::BatchError("Empty batch result".to_string()))?
     }
 }
 

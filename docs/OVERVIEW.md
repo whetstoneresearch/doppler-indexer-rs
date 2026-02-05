@@ -1,6 +1,6 @@
 # Doppler Indexer
 
-Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rust. It collects raw blockchain data, tracks dynamically created contracts, reads on-chain state, and decodes events and call results into typed Parquet files for efficient analysis.
+Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rust. It collects raw blockchain data, tracks dynamically created contracts, reads on-chain state, decodes events and call results into typed Parquet files, and supports custom transformations that write to PostgreSQL.
 
 ## Features
 
@@ -8,9 +8,10 @@ Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rus
 - **Factory Contract Tracking** - Automatically discovers and indexes dynamically created contracts (e.g., Uniswap pairs, token deployments)
 - **Historical State Reading** - Makes `eth_call` requests at historical block heights to track on-chain state over time
 - **Event Decoding** - Parses raw log data into typed columns using Solidity event signatures
+- **Transformations** - Custom Rust handlers process decoded data and write to PostgreSQL with per-block atomicity
 - **Parallel Processing** - Async task-based architecture with configurable concurrency for maximum throughput
 - **Resumable** - Automatic catchup on restart, skipping already-collected ranges
-- **Flexible Output** - All data stored in Parquet format for efficient querying with tools like DuckDB
+- **Flexible Output** - Parquet files for analytics, PostgreSQL for application data
 
 ## Architecture
 
@@ -18,19 +19,19 @@ The indexer runs as multiple concurrent async tasks connected by channels:
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
-│   Blocks    │────►│    Receipts      │────►│    Logs     │────► Log Decoder
-└──────┬──────┘     └────────┬─────────┘     └─────────────┘
-       │                     │
-       │                     └────────────────►┌─────────────┐
-       │                                       │  Factories  │────► Decoder
-       │                                       └─────────────┘
-       │
-       └─────────────────────────────────────►┌─────────────┐
-                                              │  ETH Calls  │────► Call Decoder
-                                              └─────────────┘
+│   Blocks    │────►│    Receipts      │────►│    Logs     │────► Log Decoder ────┐
+└──────┬──────┘     └────────┬─────────┘     └─────────────┘                      │
+       │                     │                                                     │
+       │                     └────────────────►┌─────────────┐                     │
+       │                                       │  Factories  │────► Decoder        │
+       │                                       └─────────────┘                     │
+       │                                                                           ▼
+       └─────────────────────────────────────►┌─────────────┐              ┌──────────────┐
+                                              │  ETH Calls  │────► Decoder─►│Transformations│──► PostgreSQL
+                                              └─────────────┘              └──────────────┘
 ```
 
-Each collector runs independently, maximizing throughput while respecting RPC rate limits.
+Each collector runs independently, maximizing throughput while respecting RPC rate limits. The optional transformation layer processes decoded data and writes to PostgreSQL.
 
 ## Output Structure
 
@@ -54,7 +55,13 @@ data/
         │   └── {contract}/{event}/
         └── eth_calls/    # Decoded call results
             └── {contract}/{function}/
+
+migrations/               # SQL migration files (when transformations enabled)
+├── 001_initial_schema.sql
+└── ...
 ```
+
+When transformations are enabled, data is also written to PostgreSQL tables defined in your migrations.
 
 ## Quick Start
 
@@ -78,6 +85,7 @@ cargo run --release -- --config config/config.json
 | [ETH Call Collection](./ETH_CALL_COLLECTION.md) | Historical state reading |
 | [On-Event Calls](./ON_EVENT_CALLS.md) | Event-triggered eth_calls |
 | [Decoding](./DECODING.md) | ABI-based event and call decoding |
+| [Transformations](./TRANSFORMATIONS.md) | Custom handlers, PostgreSQL output, historical queries |
 | [Parallelism](./PARALLELISM.md) | Task architecture and data flow |
 | [RPC](./RPC.md) | RPC client, rate limiting, and retries |
 
@@ -104,6 +112,9 @@ cargo run --release -- --config config/config.json
       "receipt_fields": ["block_number", "timestamp", "transaction_hash", "from", "to"],
       "log_fields": ["block_number", "timestamp", "transaction_hash", "log_index", "address", "topics", "data"]
     }
+  },
+  "transformations": {
+    "database_url_env_var": "DATABASE_URL"
   }
 }
 ```
@@ -114,6 +125,7 @@ cargo run --release -- --config config/config.json
 - **Token Tracking** - Monitor token deployments, transfers, and balances
 - **Protocol Indexing** - Index any smart contract's events and state
 - **Historical Analysis** - Query on-chain data with SQL using DuckDB or similar tools
+- **Application Backends** - Use transformations to power real-time APIs with PostgreSQL
 
 ## Querying Data
 

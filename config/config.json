@@ -42,5 +42,14 @@
             ]
         },
         "contract_logs_only": false        
+    },
+    "transformations": {
+        "database_url_env_var": "DATABASE_URL",
+        "mode": {
+            "batch_for_catchup": true,
+            "catchup_batch_size": 10000
+        },
+        "handler_concurrency": 4,
+        "max_batch_size": 1000
     }
 }

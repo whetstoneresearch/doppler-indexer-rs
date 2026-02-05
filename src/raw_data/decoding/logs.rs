@@ -15,13 +15,17 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
+use crate::transformations::{
+    DecodedEvent as TransformDecodedEvent, DecodedEventsMessage,
+    DecodedValue as TransformDecodedValue,
+};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
@@ -99,6 +103,7 @@ pub async fn decode_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     mut decoder_rx: Receiver<DecoderMessage>,
+    transform_tx: Option<Sender<DecodedEventsMessage>>,
 ) -> Result<(), LogDecodingError> {
     let output_base = PathBuf::from(format!("data/derived/{}/decoded/logs", chain.name));
     std::fs::create_dir_all(&output_base)?;
@@ -149,6 +154,7 @@ pub async fn decode_logs(
             &factory_matchers,
             chain,
             raw_data_config,
+            transform_tx.as_ref(),
         )
         .await?;
     }
@@ -176,6 +182,7 @@ pub async fn decode_logs(
                     &factory_matchers,
                     &factory_addrs,
                     &output_base,
+                    transform_tx.as_ref(),
                 )
                 .await?;
             }
@@ -292,6 +299,7 @@ async fn catchup_decode_logs(
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
+    transform_tx: Option<&Sender<DecodedEventsMessage>>,
 ) -> Result<(), LogDecodingError> {
     let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
 
@@ -370,6 +378,7 @@ async fn catchup_decode_logs(
         .collect();
 
     if files_to_process.is_empty() {
+        tracing::info!("Log decoding catchup complete for chain {}", chain.name);
         return Ok(());
     }
 
@@ -384,6 +393,7 @@ async fn catchup_decode_logs(
     let factory_matchers = Arc::new(factory_matchers.clone());
     let output_base = Arc::new(output_base.to_path_buf());
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    let transform_tx = transform_tx.cloned();
 
     let mut join_set = JoinSet::new();
 
@@ -393,6 +403,7 @@ async fn catchup_decode_logs(
         let factory_matchers = factory_matchers.clone();
         let factory_addresses = factory_addresses.clone();
         let output_base = output_base.clone();
+        let transform_tx = transform_tx.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -420,6 +431,7 @@ async fn catchup_decode_logs(
                 &factory_matchers,
                 &factory_addrs,
                 &output_base,
+                transform_tx.as_ref(),
             )
             .await
         });
@@ -747,6 +759,7 @@ async fn process_logs(
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     output_base: &Path,
+    transform_tx: Option<&Sender<DecodedEventsMessage>>,
 ) -> Result<(), LogDecodingError> {
     // Group decoded logs by (contract_name, event_name)
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
@@ -855,6 +868,88 @@ async fn process_logs(
             if !output_path.exists() {
                 std::fs::create_dir_all(&output_dir)?;
                 write_decoded_logs_to_parquet(&[], &matcher.event, &output_path)?;
+            }
+        }
+    }
+
+    // Send to transformation channel if enabled
+    if let Some(tx) = transform_tx {
+        // Re-decode and send to transformation engine (we need to iterate again to build the transform messages)
+        // Group decoded logs by (contract_name, event_name) for sending
+        let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
+            HashMap::new();
+
+        for log in logs {
+            if log.topics.is_empty() {
+                continue;
+            }
+            let topic0 = log.topics[0];
+
+            // Try regular matchers
+            for matcher in regular_matchers {
+                if !matcher.addresses.contains(&log.address) {
+                    continue;
+                }
+                if topic0 != matcher.event.topic0 {
+                    continue;
+                }
+
+                if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    let transform_event = convert_to_transform_event(
+                        &decoded,
+                        &matcher.event,
+                        &matcher.name,
+                        &matcher.event_name,
+                    );
+                    let key = (matcher.name.clone(), matcher.event_name.clone());
+                    transform_events_by_type.entry(key).or_default().push(transform_event);
+                }
+            }
+
+            // Try factory matchers
+            for (collection_name, matchers) in factory_matchers {
+                let addrs = match factory_addresses.get(collection_name) {
+                    Some(addrs) => addrs,
+                    None => continue,
+                };
+
+                if !addrs.contains(&log.address) {
+                    continue;
+                }
+
+                for matcher in matchers {
+                    if topic0 != matcher.event.topic0 {
+                        continue;
+                    }
+
+                    if let Some(decoded) = decode_log(log, &matcher.event)? {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            collection_name,
+                            &matcher.event_name,
+                        );
+                        let key = (collection_name.clone(), matcher.event_name.clone());
+                        transform_events_by_type.entry(key).or_default().push(transform_event);
+                    }
+                }
+            }
+        }
+
+        // Send each event type as a message
+        for ((source_name, event_name), events) in transform_events_by_type {
+            if events.is_empty() {
+                continue;
+            }
+            let msg = DecodedEventsMessage {
+                range_start,
+                range_end,
+                source_name,
+                event_name,
+                events,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!("Failed to send decoded events to transformation channel: {}", e);
             }
         }
     }
@@ -1311,5 +1406,57 @@ fn build_flattened_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
+    }
+}
+
+/// Convert internal DecodedValue to transformation DecodedValue
+fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
+    match value {
+        DecodedValue::Address(a) => TransformDecodedValue::Address(*a),
+        DecodedValue::Uint256(v) => TransformDecodedValue::Uint256(*v),
+        DecodedValue::Int256(v) => TransformDecodedValue::Int256(*v),
+        DecodedValue::Uint64(v) => TransformDecodedValue::Uint64(*v),
+        DecodedValue::Int64(v) => TransformDecodedValue::Int64(*v),
+        DecodedValue::Uint8(v) => TransformDecodedValue::Uint8(*v),
+        DecodedValue::Int8(v) => TransformDecodedValue::Int8(*v),
+        DecodedValue::Bool(v) => TransformDecodedValue::Bool(*v),
+        DecodedValue::Bytes32(b) => TransformDecodedValue::Bytes32(*b),
+        DecodedValue::Bytes(b) => TransformDecodedValue::Bytes(b.clone()),
+        DecodedValue::String(s) => TransformDecodedValue::String(s.clone()),
+        DecodedValue::NamedTuple(fields) => {
+            let converted: Vec<(String, TransformDecodedValue)> = fields
+                .iter()
+                .map(|(name, val)| (name.clone(), convert_decoded_value(val)))
+                .collect();
+            TransformDecodedValue::NamedTuple(converted)
+        }
+    }
+}
+
+/// Convert a DecodedLogRecord to a TransformDecodedEvent
+fn convert_to_transform_event(
+    record: &DecodedLogRecord,
+    parsed_event: &ParsedEvent,
+    source_name: &str,
+    event_name: &str,
+) -> TransformDecodedEvent {
+    // Build params HashMap from flattened values
+    let mut params = HashMap::new();
+    for (idx, flattened) in parsed_event.flattened_fields.iter().enumerate() {
+        if let Some(value) = record.decoded_values.get(idx) {
+            params.insert(flattened.full_name.clone(), convert_decoded_value(value));
+        }
+    }
+
+    TransformDecodedEvent {
+        block_number: record.block_number,
+        block_timestamp: record.block_timestamp,
+        transaction_hash: record.transaction_hash,
+        log_index: record.log_index,
+        contract_address: record.contract_address,
+        source_name: source_name.to_string(),
+        event_name: event_name.to_string(),
+        event_signature: parsed_event.signature.clone(),
+        params,
     }
 }

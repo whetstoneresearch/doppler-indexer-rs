@@ -15,11 +15,15 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::types::{DecoderMessage, EthCallResult, OnceCallResult};
+use crate::transformations::{
+    DecodedCall as TransformDecodedCall, DecodedCallsMessage,
+    DecodedValue as TransformDecodedValue,
+};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::Contracts;
 use crate::types::config::eth_call::EvmType;
@@ -93,6 +97,7 @@ pub async fn decode_eth_calls(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     mut decoder_rx: Receiver<DecoderMessage>,
+    transform_tx: Option<Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
     let output_base = PathBuf::from(format!("data/derived/{}/decoded/eth_calls", chain.name));
     std::fs::create_dir_all(&output_base)?;
@@ -128,6 +133,7 @@ pub async fn decode_eth_calls(
             &regular_configs,
             &once_configs,
             raw_data_config,
+            transform_tx.as_ref(),
         )
         .await?;
     }
@@ -161,6 +167,7 @@ pub async fn decode_eth_calls(
                         range_end,
                         config,
                         &output_base,
+                        transform_tx.as_ref(),
                     )
                     .await?;
                 }
@@ -185,6 +192,7 @@ pub async fn decode_eth_calls(
                         &contract_name,
                         &configs,
                         &output_base,
+                        transform_tx.as_ref(),
                     )
                     .await?;
                 }
@@ -292,6 +300,7 @@ async fn catchup_decode_eth_calls(
     regular_configs: &[CallDecodeConfig],
     once_configs: &[CallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
+    transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
     let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
 
@@ -458,11 +467,13 @@ async fn catchup_decode_eth_calls(
     // Process work items concurrently
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let output_base = Arc::new(output_base.to_path_buf());
+    let transform_tx = transform_tx.cloned();
     let mut join_set = JoinSet::new();
 
     for item in work_items {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let output_base = output_base.clone();
+        let transform_tx = transform_tx.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -475,7 +486,7 @@ async fn catchup_decode_eth_calls(
                     config,
                 } => {
                     let results = read_regular_calls_from_parquet(&file_path)?;
-                    process_regular_calls(&results, range_start, range_end, &config, &output_base)
+                    process_regular_calls(&results, range_start, range_end, &config, &output_base, transform_tx.as_ref())
                         .await
                 }
                 CatchupWorkItem::Once {
@@ -494,6 +505,7 @@ async fn catchup_decode_eth_calls(
                         &contract_name,
                         &config_refs,
                         &output_base,
+                        transform_tx.as_ref(),
                     )
                     .await
                 }
@@ -714,6 +726,7 @@ async fn process_regular_calls(
     range_end: u64,
     config: &CallDecodeConfig,
     output_base: &Path,
+    transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
     let mut decoded_records = Vec::new();
 
@@ -762,6 +775,27 @@ async fn process_regular_calls(
         output_path.display()
     );
 
+    // Send to transformation channel if enabled
+    if let Some(tx) = transform_tx {
+        let transform_calls: Vec<TransformDecodedCall> = decoded_records
+            .iter()
+            .map(|r| convert_to_transform_call(r, &config.contract_name, &config.function_name, &config.output_type))
+            .collect();
+
+        if !transform_calls.is_empty() {
+            let msg = DecodedCallsMessage {
+                range_start,
+                range_end,
+                source_name: config.contract_name.clone(),
+                function_name: config.function_name.clone(),
+                calls: transform_calls,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!("Failed to send decoded calls to transformation channel: {}", e);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -773,6 +807,7 @@ async fn process_once_calls(
     contract_name: &str,
     configs: &[&CallDecodeConfig],
     output_base: &Path,
+    transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
     let mut decoded_records = Vec::new();
 
@@ -823,6 +858,40 @@ async fn process_once_calls(
         contract_name,
         output_path.display()
     );
+
+    // Send to transformation channel if enabled
+    if let Some(tx) = transform_tx {
+        // For "once" calls, we send each function as a separate message
+        for config in configs {
+            let transform_calls: Vec<TransformDecodedCall> = decoded_records
+                .iter()
+                .filter_map(|r| {
+                    r.decoded_values.get(&config.function_name).map(|decoded| {
+                        convert_once_to_transform_call(
+                            r,
+                            contract_name,
+                            &config.function_name,
+                            decoded,
+                            &config.output_type,
+                        )
+                    })
+                })
+                .collect();
+
+            if !transform_calls.is_empty() {
+                let msg = DecodedCallsMessage {
+                    range_start,
+                    range_end,
+                    source_name: contract_name.to_string(),
+                    function_name: config.function_name.clone(),
+                    calls: transform_calls,
+                };
+                if let Err(e) = tx.send(msg).await {
+                    tracing::warn!("Failed to send decoded calls to transformation channel: {}", e);
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1851,5 +1920,94 @@ fn extract_once_tuple_bytes<'a>(
             _ => None,
         }),
         _ => None,
+    }
+}
+
+/// Convert internal DecodedValue to transformation DecodedValue
+fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
+    match value {
+        DecodedValue::Address(a) => TransformDecodedValue::Address(*a),
+        DecodedValue::Uint256(v) => TransformDecodedValue::Uint256(*v),
+        DecodedValue::Int256(v) => TransformDecodedValue::Int256(*v),
+        DecodedValue::Uint64(v) => TransformDecodedValue::Uint64(*v),
+        DecodedValue::Int64(v) => TransformDecodedValue::Int64(*v),
+        DecodedValue::Uint8(v) => TransformDecodedValue::Uint8(*v),
+        DecodedValue::Int8(v) => TransformDecodedValue::Int8(*v),
+        DecodedValue::Bool(v) => TransformDecodedValue::Bool(*v),
+        DecodedValue::Bytes32(b) => TransformDecodedValue::Bytes32(*b),
+        DecodedValue::Bytes(b) => TransformDecodedValue::Bytes(b.clone()),
+        DecodedValue::String(s) => TransformDecodedValue::String(s.clone()),
+        DecodedValue::NamedTuple(fields) => {
+            let converted: Vec<(String, TransformDecodedValue)> = fields
+                .iter()
+                .map(|(name, val)| (name.clone(), convert_decoded_value(val)))
+                .collect();
+            TransformDecodedValue::NamedTuple(converted)
+        }
+    }
+}
+
+/// Build result HashMap based on output type
+fn build_result_map(
+    value: &DecodedValue,
+    output_type: &EvmType,
+    function_name: &str,
+) -> HashMap<String, TransformDecodedValue> {
+    let mut result = HashMap::new();
+    match output_type {
+        EvmType::Named { name, inner } => {
+            // Named single value
+            result.insert(name.clone(), convert_decoded_value(value));
+        }
+        EvmType::NamedTuple(fields) => {
+            // Named tuple: extract each field
+            if let DecodedValue::NamedTuple(named_values) = value {
+                for ((field_name, _), (_, val)) in fields.iter().zip(named_values.iter()) {
+                    result.insert(field_name.clone(), convert_decoded_value(val));
+                }
+            }
+        }
+        _ => {
+            // Simple type: use function name or "result"
+            result.insert(function_name.to_string(), convert_decoded_value(value));
+        }
+    }
+    result
+}
+
+/// Convert a DecodedCallRecord to a TransformDecodedCall
+fn convert_to_transform_call(
+    record: &DecodedCallRecord,
+    source_name: &str,
+    function_name: &str,
+    output_type: &EvmType,
+) -> TransformDecodedCall {
+    TransformDecodedCall {
+        block_number: record.block_number,
+        block_timestamp: record.block_timestamp,
+        contract_address: record.contract_address,
+        source_name: source_name.to_string(),
+        function_name: function_name.to_string(),
+        trigger_log_index: None,
+        result: build_result_map(&record.decoded_value, output_type, function_name),
+    }
+}
+
+/// Convert a DecodedOnceRecord entry to a TransformDecodedCall
+fn convert_once_to_transform_call(
+    record: &DecodedOnceRecord,
+    source_name: &str,
+    function_name: &str,
+    decoded_value: &DecodedValue,
+    output_type: &EvmType,
+) -> TransformDecodedCall {
+    TransformDecodedCall {
+        block_number: record.block_number,
+        block_timestamp: record.block_timestamp,
+        contract_address: record.contract_address,
+        source_name: source_name.to_string(),
+        function_name: function_name.to_string(),
+        trigger_log_index: None,
+        result: build_result_map(decoded_value, output_type, function_name),
     }
 }

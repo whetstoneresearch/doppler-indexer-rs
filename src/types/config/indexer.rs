@@ -4,17 +4,21 @@ use serde::Deserialize;
 
 use crate::types::config::chain::{ChainConfig, ChainConfigRaw, resolve_chain_config};
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::config::transformations::TransformationConfig;
 
 #[derive(Debug, Deserialize)]
 pub struct IndexerConfigRaw {
     pub chains: Vec<ChainConfigRaw>,
     pub raw_data_collection: RawDataCollectionConfig,
+    #[serde(default)]
+    pub transformations: Option<TransformationConfig>,
 }
 
 #[derive(Debug)]
 pub struct IndexerConfig {
     pub chains: Vec<ChainConfig>,
     pub raw_data_collection: RawDataCollectionConfig,
+    pub transformations: Option<TransformationConfig>,
 }
 
 impl IndexerConfig {
@@ -40,6 +44,7 @@ impl IndexerConfig {
                         Ok(IndexerConfig {
                             chains,
                             raw_data_collection: raw_config.raw_data_collection,
+                            transformations: raw_config.transformations,
                         })
                     }
                     Err(e) => {
