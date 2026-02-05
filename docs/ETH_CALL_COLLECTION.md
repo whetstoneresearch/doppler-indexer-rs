@@ -85,6 +85,8 @@ This creates separate columns: `sqrtPriceX96`, `tick`, `observationIndex`, `obse
 
 The format is `type name` for each field, with tuples enclosed in parentheses and fields separated by commas.
 
+**Named tuples work with all frequency settings**, including `"once"`. For once calls, the column naming pattern is `{function}_decoded.{field_name}` (e.g., `slot0_decoded.sqrtPriceX96`).
+
 ## Parameters
 
 Functions with arguments are supported via the `params` configuration. Each parameter specifies a type and a list of values. The collector generates all combinations of parameter values (cartesian product).

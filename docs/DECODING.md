@@ -227,7 +227,22 @@ Regular eth_calls are made at a configured frequency (every N blocks). Each call
 | `block_number` | UInt64 | Block at which call was made |
 | `block_timestamp` | UInt64 | Block timestamp |
 | `address` | FixedSizeBinary(20) | Contract address |
-| `{function}_decoded` | varies | One column per function result |
+| `{function}_decoded` | varies | One column per function result (simple types) |
+| `{function}_decoded.{field}` | varies | One column per tuple field (named tuples) |
+
+**Named Tuple Support for Once Calls:**
+
+When a "once" call returns a named tuple, each field is stored as a separate column using dot-notation:
+
+```json
+{
+  "function": "slot0()",
+  "output_type": "(uint160 sqrtPriceX96, int24 tick, uint8 feeProtocol)",
+  "frequency": "once"
+}
+```
+
+Output columns: `slot0_decoded.sqrtPriceX96`, `slot0_decoded.tick`, `slot0_decoded.feeProtocol`
 
 ### Output Location
 
