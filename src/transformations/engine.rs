@@ -1,8 +1,8 @@
 //! Transformation engine that orchestrates handler execution.
 //!
 //! The engine receives decoded events and calls, invokes registered handlers,
-//! and writes results to PostgreSQL. It tracks its own progress and performs
-//! catchup from decoded parquet files on startup.
+//! and writes results to PostgreSQL. It tracks progress per handler and performs
+//! per-handler catchup from decoded parquet files on startup.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -13,8 +13,8 @@ use tokio::sync::mpsc::Receiver;
 use super::context::{DecodedCall, DecodedEvent, TransformationContext};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
-use super::registry::TransformationRegistry;
-use crate::db::{DbOperation, DbPool, DbValue};
+use super::registry::{extract_event_name, TransformationRegistry};
+use crate::db::{DbPool, DbValue, DbOperation};
 use crate::rpc::UnifiedRpcClient;
 
 /// Message containing decoded events for a block range.
@@ -60,6 +60,9 @@ impl Default for ExecutionMode {
 }
 
 /// The transformation engine processes decoded data and invokes handlers.
+///
+/// Progress is tracked per handler (keyed by `handler_key()`) in the
+/// `_handler_progress` table, enabling independent catchup and versioning.
 pub struct TransformationEngine {
     registry: Arc<TransformationRegistry>,
     db_pool: Arc<DbPool>,
@@ -69,6 +72,7 @@ pub struct TransformationEngine {
     chain_id: u64,
     mode: ExecutionMode,
     decoded_logs_dir: PathBuf,
+    decoded_calls_dir: PathBuf,
 }
 
 impl TransformationEngine {
@@ -83,6 +87,8 @@ impl TransformationEngine {
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
         let decoded_logs_dir = PathBuf::from(format!("data/derived/{}/decoded/logs", chain_name));
+        let decoded_calls_dir =
+            PathBuf::from(format!("data/derived/{}/decoded/eth_calls", chain_name));
 
         Ok(Self {
             registry,
@@ -93,25 +99,148 @@ impl TransformationEngine {
             chain_id,
             mode,
             decoded_logs_dir,
+            decoded_calls_dir,
         })
     }
 
-    /// Initialize all handlers.
+    /// Initialize the engine: run handler migrations, then initialize handlers.
     pub async fn initialize(&self) -> Result<(), TransformationError> {
+        // Run handler-specified migrations first
+        self.run_handler_migrations().await?;
+
+        // Then run handler initialization
         for handler in self.registry.all_handlers() {
-            tracing::debug!("Initializing handler: {}", handler.name());
+            tracing::debug!(
+                "Initializing handler: {} ({})",
+                handler.name(),
+                handler.handler_key()
+            );
             handler.initialize(&self.db_pool).await?;
         }
         Ok(())
     }
 
-    /// Get completed ranges from the database.
-    async fn get_completed_ranges(&self) -> Result<HashSet<u64>, TransformationError> {
+    // ─── Handler Migrations ──────────────────────────────────────────
+
+    /// Run handler migration files by scanning each handler's `migration_folder()/v{version}/`.
+    /// All `.sql` files in the version subfolder are run in alphabetical order.
+    /// Each migration is tracked in the `_migrations` table with a `handlers/` prefix.
+    async fn run_handler_migrations(&self) -> Result<(), TransformationError> {
+        // Collect migration directories from all handlers (deduplicate by resolved path)
+        let mut migration_dirs: Vec<(PathBuf, String)> = Vec::new();
+        let mut seen_dirs = HashSet::new();
+
+        for handler in self.registry.all_handlers() {
+            if let Some(folder) = handler.migration_folder() {
+                let version_dir =
+                    PathBuf::from(format!("{}/v{}", folder, handler.version()));
+                if seen_dirs.insert(version_dir.clone()) {
+                    migration_dirs.push((version_dir, handler.handler_key()));
+                }
+            }
+        }
+
+        if migration_dirs.is_empty() {
+            return Ok(());
+        }
+
+        // Check which migrations have already been applied
+        let pool = self.db_pool.inner();
+        let applied: HashSet<String> = {
+            let client = pool.get().await.map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
+            })?;
+            let rows = client
+                .query("SELECT name FROM _migrations", &[])
+                .await
+                .map_err(|e| {
+                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+                })?;
+            rows.iter().map(|r| r.get(0)).collect()
+        };
+
+        for (version_dir, handler_key) in &migration_dirs {
+            if !version_dir.exists() {
+                tracing::warn!(
+                    "Handler {} migration directory does not exist: {}",
+                    handler_key,
+                    version_dir.display()
+                );
+                continue;
+            }
+
+            // Collect and sort .sql files in the version directory
+            let mut sql_files: Vec<_> = std::fs::read_dir(version_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x == "sql")
+                        .unwrap_or(false)
+                })
+                .collect();
+            sql_files.sort_by_key(|e| e.file_name());
+
+            for entry in sql_files {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                // Track as "handlers/{version_dir_relative}/{filename}"
+                let migration_name =
+                    format!("handlers/{}", version_dir.join(&file_name).display());
+
+                if applied.contains(&migration_name) {
+                    continue;
+                }
+
+                let sql = std::fs::read_to_string(entry.path())?;
+
+                let mut client = pool.get().await.map_err(|e| {
+                    TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
+                })?;
+                let tx = client.transaction().await.map_err(|e| {
+                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+                })?;
+
+                tx.batch_execute(&sql).await.map_err(|e| {
+                    TransformationError::DatabaseError(crate::db::DbError::MigrationError(
+                        format!(
+                            "Handler migration {} failed: {}",
+                            migration_name, e
+                        ),
+                    ))
+                })?;
+
+                tx.execute(
+                    "INSERT INTO _migrations (name) VALUES ($1)",
+                    &[&migration_name],
+                )
+                .await
+                .map_err(|e| {
+                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+                })?;
+
+                tx.commit().await.map_err(|e| {
+                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+                })?;
+
+                tracing::info!("Applied handler migration: {}", migration_name);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ─── Per-Handler Progress Tracking ───────────────────────────────
+
+    /// Get completed ranges for a specific handler from the database.
+    async fn get_completed_ranges_for_handler(
+        &self,
+        handler_key: &str,
+    ) -> Result<HashSet<u64>, TransformationError> {
         let rows = self
             .db_pool
             .query(
-                "SELECT range_start FROM _transformation_progress WHERE chain_id = $1",
-                &[&(self.chain_id as i64)],
+                "SELECT range_start FROM _handler_progress WHERE chain_id = $1 AND handler_key = $2",
+                &[&(self.chain_id as i64), &handler_key.to_string()],
             )
             .await?;
 
@@ -124,26 +253,33 @@ impl TransformationEngine {
         Ok(completed)
     }
 
-    /// Record a completed range in the database.
-    async fn record_completed_range(
+    /// Record a completed range for a specific handler.
+    async fn record_completed_range_for_handler(
         &self,
+        handler_key: &str,
         range_start: u64,
         range_end: u64,
     ) -> Result<(), TransformationError> {
         self.db_pool
             .execute_transaction(vec![DbOperation::Upsert {
-                table: "_transformation_progress".to_string(),
+                table: "_handler_progress".to_string(),
                 columns: vec![
                     "chain_id".to_string(),
+                    "handler_key".to_string(),
                     "range_start".to_string(),
                     "range_end".to_string(),
                 ],
                 values: vec![
                     DbValue::Int64(self.chain_id as i64),
+                    DbValue::Text(handler_key.to_string()),
                     DbValue::Int64(range_start as i64),
                     DbValue::Int64(range_end as i64),
                 ],
-                conflict_columns: vec!["chain_id".to_string(), "range_start".to_string()],
+                conflict_columns: vec![
+                    "chain_id".to_string(),
+                    "handler_key".to_string(),
+                    "range_start".to_string(),
+                ],
                 update_columns: vec!["range_end".to_string()],
             }])
             .await?;
@@ -151,12 +287,13 @@ impl TransformationEngine {
         Ok(())
     }
 
+    // ─── Range Scanning ──────────────────────────────────────────────
+
     /// Scan decoded parquet files to find available ranges.
-    fn scan_available_ranges(&self) -> Result<Vec<(u64, u64)>, TransformationError> {
+    fn scan_available_ranges(&self, base_dir: &PathBuf) -> Result<Vec<(u64, u64)>, TransformationError> {
         let mut ranges = HashSet::new();
 
-        // Scan all subdirectories for parquet files
-        if !self.decoded_logs_dir.exists() {
+        if !base_dir.exists() {
             return Ok(Vec::new());
         }
 
@@ -183,7 +320,7 @@ impl TransformationEngine {
             }
         }
 
-        scan_recursive(&self.decoded_logs_dir, &mut ranges);
+        scan_recursive(base_dir, &mut ranges);
 
         let mut sorted: Vec<_> = ranges.into_iter().collect();
         sorted.sort_by_key(|(start, _)| *start);
@@ -191,124 +328,266 @@ impl TransformationEngine {
         Ok(sorted)
     }
 
-    /// Run catchup phase: process decoded parquet files that haven't been transformed yet.
+    // ─── Per-Handler Catchup ─────────────────────────────────────────
+
+    /// Run catchup phase: process decoded parquet files per handler.
+    /// Each handler catches up independently based on its own progress.
     pub async fn run_catchup(&self) -> Result<(), TransformationError> {
-        let completed = self.get_completed_ranges().await?;
-        let available = self.scan_available_ranges()?;
+        // Catch up event handlers
+        self.run_event_handler_catchup().await?;
 
-        let to_process: Vec<_> = available
-            .into_iter()
-            .filter(|(start, _)| !completed.contains(start))
-            .collect();
+        // Catch up call handlers
+        self.run_call_handler_catchup().await?;
 
-        if to_process.is_empty() {
+        Ok(())
+    }
+
+    /// Run catchup for all event handlers.
+    async fn run_event_handler_catchup(&self) -> Result<(), TransformationError> {
+        let available = self.scan_available_ranges(&self.decoded_logs_dir)?;
+
+        if available.is_empty() {
             tracing::info!(
-                "Transformation catchup: no new ranges to process for chain {}",
+                "Event handler catchup: no parquet ranges found for chain {}",
                 self.chain_name
             );
             return Ok(());
         }
 
-        let event_triggers = self.registry.all_event_triggers();
-        tracing::info!(
-            "Transformation catchup: processing {} ranges for chain {} (looking for {} event types: {:?})",
-            to_process.len(),
-            self.chain_name,
-            event_triggers.len(),
-            event_triggers
-        );
+        for handler_info in self.registry.unique_event_handlers() {
+            let handler = &handler_info.handler;
+            let handler_key = handler.handler_key();
+            let event_triggers: Vec<(String, String)> = handler_info
+                .triggers
+                .iter()
+                .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
+                .collect();
 
-        let total = to_process.len();
-        let mut processed = 0;
-        let mut with_events = 0;
-        let mut total_events = 0;
+            let completed = self.get_completed_ranges_for_handler(&handler_key).await?;
 
-        for (range_start, range_end) in to_process {
-            // Read decoded events from parquet files for this range
-            let events = self.read_decoded_events_for_range(range_start, range_end)?;
+            let to_process: Vec<_> = available
+                .iter()
+                .filter(|(start, _)| !completed.contains(start))
+                .cloned()
+                .collect();
 
-            processed += 1;
-
-            if events.is_empty() {
-                // No events for handlers we care about, but still mark as complete
-                self.record_completed_range(range_start, range_end).await?;
-            } else {
-                with_events += 1;
-                total_events += events.len();
-
-                tracing::info!(
-                    "Transformation catchup: processing range {}-{} with {} events ({}/{})",
-                    range_start,
-                    range_end - 1,
-                    events.len(),
-                    processed,
-                    total
-                );
-
-                // Process the range
-                self.process_range(range_start, range_end, events, Vec::new())
-                    .await?;
-
-                // Record completion
-                self.record_completed_range(range_start, range_end).await?;
+            if to_process.is_empty() {
+                tracing::info!("Handler {} catchup: already up to date", handler_key);
+                continue;
             }
 
-            // Log progress every 50 ranges
-            if processed % 50 == 0 {
+            tracing::info!(
+                "Handler {} catchup: processing {} ranges (triggers: {:?})",
+                handler_key,
+                to_process.len(),
+                event_triggers
+            );
+
+            let total = to_process.len();
+            let mut processed = 0;
+            let mut errored = false;
+
+            for (range_start, range_end) in &to_process {
+                let events = self.read_decoded_events_for_triggers(
+                    *range_start,
+                    *range_end,
+                    &event_triggers,
+                )?;
+
+                processed += 1;
+
+                if !events.is_empty() {
+                    let ctx = TransformationContext::new(
+                        &self.chain_name,
+                        self.chain_id,
+                        *range_start,
+                        *range_end,
+                        &events,
+                        &[],
+                        self.historical_reader.clone(),
+                        self.rpc_client.clone(),
+                    );
+
+                    match handler.handle(&ctx).await {
+                        Ok(ops) => {
+                            if !ops.is_empty() {
+                                self.db_pool.execute_transaction(ops).await?;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Handler {} failed on range {}-{}: {}. Stopping catchup for this handler.",
+                                handler_key, range_start, range_end, e
+                            );
+                            errored = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Record progress for this handler
+                self.record_completed_range_for_handler(&handler_key, *range_start, *range_end)
+                    .await?;
+
+                if processed % 50 == 0 {
+                    tracing::info!(
+                        "Handler {} catchup progress: {}/{}",
+                        handler_key,
+                        processed,
+                        total
+                    );
+                }
+            }
+
+            if !errored {
                 tracing::info!(
-                    "Transformation catchup progress: {}/{} ranges processed ({} with events, {} total events)",
-                    processed,
-                    total,
-                    with_events,
-                    total_events
+                    "Handler {} catchup complete: processed {} ranges",
+                    handler_key,
+                    processed
                 );
             }
         }
 
-        tracing::info!(
-            "Transformation catchup complete for chain {}: processed {} ranges, {} had events ({} total events)",
-            self.chain_name,
-            processed,
-            with_events,
-            total_events
-        );
+        Ok(())
+    }
+
+    /// Run catchup for all call handlers.
+    async fn run_call_handler_catchup(&self) -> Result<(), TransformationError> {
+        let available = self.scan_available_ranges(&self.decoded_calls_dir)?;
+
+        if available.is_empty() {
+            tracing::info!(
+                "Call handler catchup: no parquet ranges found for chain {}",
+                self.chain_name
+            );
+            return Ok(());
+        }
+
+        for handler_info in self.registry.unique_call_handlers() {
+            let handler = &handler_info.handler;
+            let handler_key = handler.handler_key();
+            let call_triggers: Vec<(String, String)> = handler_info
+                .triggers
+                .iter()
+                .map(|t| (t.source.clone(), t.function_name.clone()))
+                .collect();
+
+            let completed = self.get_completed_ranges_for_handler(&handler_key).await?;
+
+            let to_process: Vec<_> = available
+                .iter()
+                .filter(|(start, _)| !completed.contains(start))
+                .cloned()
+                .collect();
+
+            if to_process.is_empty() {
+                tracing::info!("Handler {} catchup: already up to date", handler_key);
+                continue;
+            }
+
+            tracing::info!(
+                "Handler {} catchup: processing {} ranges (triggers: {:?})",
+                handler_key,
+                to_process.len(),
+                call_triggers
+            );
+
+            let total = to_process.len();
+            let mut processed = 0;
+            let mut errored = false;
+
+            for (range_start, range_end) in &to_process {
+                let calls = self.read_decoded_calls_for_triggers(
+                    *range_start,
+                    *range_end,
+                    &call_triggers,
+                )?;
+
+                processed += 1;
+
+                if !calls.is_empty() {
+                    let ctx = TransformationContext::new(
+                        &self.chain_name,
+                        self.chain_id,
+                        *range_start,
+                        *range_end,
+                        &[],
+                        &calls,
+                        self.historical_reader.clone(),
+                        self.rpc_client.clone(),
+                    );
+
+                    match handler.handle(&ctx).await {
+                        Ok(ops) => {
+                            if !ops.is_empty() {
+                                self.db_pool.execute_transaction(ops).await?;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Handler {} failed on range {}-{}: {}. Stopping catchup for this handler.",
+                                handler_key, range_start, range_end, e
+                            );
+                            errored = true;
+                            break;
+                        }
+                    }
+                }
+
+                self.record_completed_range_for_handler(&handler_key, *range_start, *range_end)
+                    .await?;
+
+                if processed % 50 == 0 {
+                    tracing::info!(
+                        "Handler {} catchup progress: {}/{}",
+                        handler_key,
+                        processed,
+                        total
+                    );
+                }
+            }
+
+            if !errored {
+                tracing::info!(
+                    "Handler {} catchup complete: processed {} ranges",
+                    handler_key,
+                    processed
+                );
+            }
+        }
 
         Ok(())
     }
 
-    /// Read decoded events from parquet files for a specific range.
-    fn read_decoded_events_for_range(
+    // ─── Parquet Reading ─────────────────────────────────────────────
+
+    /// Read decoded events from parquet files for specific triggers only.
+    fn read_decoded_events_for_triggers(
         &self,
         range_start: u64,
         range_end: u64,
+        event_triggers: &[(String, String)],
     ) -> Result<Vec<DecodedEvent>, TransformationError> {
         let mut all_events = Vec::new();
         let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
 
-        // Get event triggers we care about from the registry
-        let event_triggers = self.registry.all_event_triggers();
-
         for (source_name, event_name) in event_triggers {
             let file_path = self
                 .decoded_logs_dir
-                .join(&source_name)
-                .join(&event_name)
+                .join(source_name)
+                .join(event_name)
                 .join(&file_name);
 
             if !file_path.exists() {
                 continue;
             }
 
-            tracing::debug!(
-                "Reading decoded events from {}",
-                file_path.display()
-            );
+            tracing::debug!("Reading decoded events from {}", file_path.display());
 
-            match self.historical_reader.read_events_from_file(
-                &file_path,
-                &source_name,
-                &event_name,
-            ) {
+            match self
+                .historical_reader
+                .read_events_from_file(&file_path, source_name, event_name)
+            {
                 Ok(events) => {
                     tracing::debug!(
                         "Read {} events from {}",
@@ -329,6 +608,56 @@ impl TransformationEngine {
 
         Ok(all_events)
     }
+
+    /// Read decoded calls from parquet files for specific triggers only.
+    fn read_decoded_calls_for_triggers(
+        &self,
+        range_start: u64,
+        range_end: u64,
+        call_triggers: &[(String, String)],
+    ) -> Result<Vec<DecodedCall>, TransformationError> {
+        let mut all_calls = Vec::new();
+        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+
+        for (source_name, function_name) in call_triggers {
+            let file_path = self
+                .decoded_calls_dir
+                .join(source_name)
+                .join(function_name)
+                .join(&file_name);
+
+            if !file_path.exists() {
+                continue;
+            }
+
+            tracing::debug!("Reading decoded calls from {}", file_path.display());
+
+            match self
+                .historical_reader
+                .read_calls_from_file(&file_path, source_name, function_name)
+            {
+                Ok(calls) => {
+                    tracing::debug!(
+                        "Read {} calls from {}",
+                        calls.len(),
+                        file_path.display()
+                    );
+                    all_calls.extend(calls);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read decoded calls from {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(all_calls)
+    }
+
+    // ─── Live Processing ─────────────────────────────────────────────
 
     /// Run the transformation engine, processing messages from channels.
     ///
@@ -367,16 +696,13 @@ impl TransformationEngine {
                         msg.range_end
                     );
 
-                    // Process events immediately
+                    // Process events with per-handler transactions and progress
                     self.process_range(
                         msg.range_start,
                         msg.range_end,
                         msg.events,
                         Vec::new(),
                     ).await?;
-
-                    // Record completion for live data
-                    self.record_completed_range(msg.range_start, msg.range_end).await?;
                 }
 
                 Some(msg) = calls_rx.recv() => {
@@ -393,16 +719,13 @@ impl TransformationEngine {
                         msg.range_end
                     );
 
-                    // Process calls immediately
+                    // Process calls with per-handler transactions and progress
                     self.process_range(
                         msg.range_start,
                         msg.range_end,
                         Vec::new(),
                         msg.calls,
                     ).await?;
-
-                    // Record completion for live data
-                    self.record_completed_range(msg.range_start, msg.range_end).await?;
                 }
 
                 else => {
@@ -420,7 +743,9 @@ impl TransformationEngine {
         Ok(())
     }
 
-    /// Process a block range when all data is ready.
+    /// Process a block range with per-handler transactions.
+    /// Each handler's operations execute in their own transaction and
+    /// progress is recorded independently.
     async fn process_range(
         &self,
         range_start: u64,
@@ -448,47 +773,65 @@ impl TransformationEngine {
             self.rpc_client.clone(),
         );
 
-        // Collect all database operations from all handlers
-        let mut all_ops = Vec::new();
-
         // Get unique triggers from events
         let event_triggers: HashSet<_> = events
             .iter()
             .map(|e| (e.source_name.clone(), e.event_name.clone()))
             .collect();
 
-        // Invoke event handlers
-        for (source, event_name) in event_triggers {
-            for handler in self.registry.handlers_for_event(&source, &event_name) {
+        // Invoke each event handler independently with its own transaction
+        for (source, event_name) in &event_triggers {
+            for handler in self.registry.handlers_for_event(source, event_name) {
+                let handler_key = handler.handler_key();
+
                 tracing::debug!(
                     "Invoking handler {} for event {}/{}",
-                    handler.name(),
+                    handler_key,
                     source,
                     event_name
                 );
 
                 match handler.handle(&ctx).await {
                     Ok(ops) => {
-                        tracing::debug!(
-                            "Handler {} produced {} operations",
-                            handler.name(),
-                            ops.len()
-                        );
-                        all_ops.extend(ops);
+                        if !ops.is_empty() {
+                            tracing::debug!(
+                                "Handler {} produced {} operations",
+                                handler_key,
+                                ops.len()
+                            );
+
+                            // Per-handler transaction
+                            if let Err(e) = self.db_pool.execute_transaction(ops).await {
+                                tracing::error!(
+                                    "Handler {} transaction failed for range {}-{}: {:?}",
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                    e
+                                );
+                                // Continue with other handlers
+                                continue;
+                            }
+                        }
+
+                        // Record per-handler progress
+                        self.record_completed_range_for_handler(
+                            &handler_key,
+                            range_start,
+                            range_end,
+                        )
+                        .await?;
                     }
                     Err(e) => {
-                        // Halt on error as per requirements
                         tracing::error!(
                             "Handler {} failed for event {}/{}: {}",
-                            handler.name(),
+                            handler_key,
                             source,
                             event_name,
                             e
                         );
-                        return Err(TransformationError::HandlerError {
-                            handler_name: handler.name().to_string(),
-                            message: e.to_string(),
-                        });
+                        // Continue with other handlers
+                        continue;
                     }
                 }
             }
@@ -500,51 +843,56 @@ impl TransformationEngine {
             .map(|c| (c.source_name.clone(), c.function_name.clone()))
             .collect();
 
-        // Invoke call handlers
-        for (source, function_name) in call_triggers {
-            for handler in self.registry.handlers_for_call(&source, &function_name) {
+        // Invoke each call handler independently with its own transaction
+        for (source, function_name) in &call_triggers {
+            for handler in self.registry.handlers_for_call(source, function_name) {
+                let handler_key = handler.handler_key();
+
                 tracing::trace!(
                     "Invoking handler {} for call {}/{}",
-                    handler.name(),
+                    handler_key,
                     source,
                     function_name
                 );
 
                 match handler.handle(&ctx).await {
                     Ok(ops) => {
-                        tracing::trace!(
-                            "Handler {} produced {} operations",
-                            handler.name(),
-                            ops.len()
-                        );
-                        all_ops.extend(ops);
+                        if !ops.is_empty() {
+                            tracing::trace!(
+                                "Handler {} produced {} operations",
+                                handler_key,
+                                ops.len()
+                            );
+
+                            if let Err(e) = self.db_pool.execute_transaction(ops).await {
+                                tracing::error!(
+                                    "Handler {} transaction failed for range {}-{}: {:?}",
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+
+                        self.record_completed_range_for_handler(
+                            &handler_key,
+                            range_start,
+                            range_end,
+                        )
+                        .await?;
                     }
                     Err(e) => {
-                        return Err(TransformationError::HandlerError {
-                            handler_name: handler.name().to_string(),
-                            message: e.to_string(),
-                        });
+                        tracing::error!(
+                            "Handler {} failed for call {}/{}: {}",
+                            handler_key,
+                            source,
+                            function_name,
+                            e
+                        );
+                        continue;
                     }
-                }
-            }
-        }
-
-        // Execute all operations in a single transaction (per-block atomicity)
-        if !all_ops.is_empty() {
-            tracing::info!(
-                "Executing {} database operations for range {}-{}",
-                all_ops.len(),
-                range_start,
-                range_end
-            );
-
-            match self.db_pool.execute_transaction(all_ops).await {
-                Ok(()) => {
-                    tracing::debug!("Database transaction committed for range {}-{}", range_start, range_end);
-                }
-                Err(e) => {
-                    tracing::error!("Database transaction failed for range {}-{}: {:?}", range_start, range_end, e);
-                    return Err(e.into());
                 }
             }
         }

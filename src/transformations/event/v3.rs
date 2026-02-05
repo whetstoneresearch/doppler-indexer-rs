@@ -24,6 +24,14 @@ impl TransformationHandler for V3CreateHandler {
         "V3CreateHandler"
     }
 
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_folder(&self) -> Option<&'static str> {
+        Some("migrations/handlers/v3_pools")
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext<'_>,
@@ -49,7 +57,7 @@ impl TransformationHandler for V3CreateHandler {
 
             // Build upsert operation
             ops.push(DbOperation::Upsert {
-                table: "v3_pools".to_string(),
+                table: "v3_pools_v1".to_string(),
                 columns: vec![
                     "pool_address".to_string(),
                     "asset".to_string(),

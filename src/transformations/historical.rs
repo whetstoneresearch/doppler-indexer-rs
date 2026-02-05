@@ -228,6 +228,29 @@ impl HistoricalDataReader {
         Ok(events)
     }
 
+    /// Read all calls from a specific parquet file (no filtering).
+    /// Used by the transformation engine for call handler catchup.
+    pub fn read_calls_from_file(
+        &self,
+        file_path: &Path,
+        source_name: &str,
+        function_name: &str,
+    ) -> Result<Vec<DecodedCall>, TransformationError> {
+        let file = std::fs::File::open(file_path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let reader = builder.build()?;
+
+        let mut calls = Vec::new();
+
+        for batch_result in reader {
+            let batch = batch_result?;
+            let batch_calls = batch_to_calls(batch, source_name, function_name)?;
+            calls.extend(batch_calls);
+        }
+
+        Ok(calls)
+    }
+
     /// Find files that overlap with the requested block range.
     fn find_files_for_range(
         &self,

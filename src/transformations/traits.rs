@@ -14,10 +14,36 @@ use super::error::TransformationError;
 ///
 /// Handlers are registered at compile-time and invoked when their
 /// registered triggers (events or calls) are decoded.
+///
+/// Each handler declares a `version()` and a `handler_key()` used for
+/// per-handler progress tracking. Bumping the version causes the handler
+/// to reprocess all data into a new versioned output table.
 #[async_trait]
 pub trait TransformationHandler: Send + Sync + 'static {
-    /// Unique name for this handler (used in logging and error messages).
+    /// Unique name for this handler (used in logging and progress tracking).
     fn name(&self) -> &'static str;
+
+    /// Version of this handler. Bump when the handler logic changes and you
+    /// want to reprocess all data into a new versioned output table.
+    fn version(&self) -> u32 {
+        1
+    }
+
+    /// Computed identity key: `"{name}_v{version}"`.
+    /// Used for progress tracking in the `_handler_progress` table.
+    fn handler_key(&self) -> String {
+        format!("{}_v{}", self.name(), self.version())
+    }
+
+    /// Base folder for this handler's migration SQL files, relative to the project root.
+    /// The engine will run all `.sql` files found in `{folder}/v{version}/`
+    /// in alphabetical order at startup (tracked via the `_migrations` table).
+    ///
+    /// Example: returning `Some("migrations/handlers/v3_pools")` with `version() == 1`
+    /// will run all `.sql` files in `migrations/handlers/v3_pools/v1/`.
+    fn migration_folder(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Process decoded data for a block range.
     ///

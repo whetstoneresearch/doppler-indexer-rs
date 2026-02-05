@@ -24,6 +24,14 @@ impl TransformationHandler for V4SwapHandler {
         "V4SwapHandler"
     }
 
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_folder(&self) -> Option<&'static str> {
+        Some("migrations/handlers/v4_swaps")
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext<'_>,
@@ -77,7 +85,7 @@ impl TransformationHandler for V4SwapHandler {
 
             // Build upsert operation
             ops.push(DbOperation::Upsert {
-                table: "v4_swaps".to_string(),
+                table: "v4_swaps_v1".to_string(),
                 columns: vec![
                     "pool_id".to_string(),
                     "block_number".to_string(),

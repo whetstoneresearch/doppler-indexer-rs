@@ -5,7 +5,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::traits::{EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler};
+use super::traits::{
+    EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler,
+};
+
+/// An event handler with its associated trigger information.
+pub struct EventHandlerInfo {
+    pub handler: Arc<dyn EventHandler>,
+    pub triggers: Vec<EventTrigger>,
+}
+
+/// A call handler with its associated trigger information.
+pub struct CallHandlerInfo {
+    pub handler: Arc<dyn EthCallHandler>,
+    pub triggers: Vec<EthCallTrigger>,
+}
 
 /// Registry of all transformation handlers, built at startup.
 pub struct TransformationRegistry {
@@ -107,6 +121,38 @@ impl TransformationRegistry {
     pub fn handler_count(&self) -> usize {
         self.all_handlers.len()
     }
+
+    /// Get all unique event handlers with their triggers grouped.
+    /// Each handler appears exactly once, deduplicated by `handler_key()`.
+    pub fn unique_event_handlers(&self) -> Vec<EventHandlerInfo> {
+        let mut seen: HashMap<String, EventHandlerInfo> = HashMap::new();
+        for handlers in self.event_handlers.values() {
+            for handler in handlers {
+                let key = handler.handler_key();
+                seen.entry(key).or_insert_with(|| EventHandlerInfo {
+                    handler: handler.clone(),
+                    triggers: handler.triggers(),
+                });
+            }
+        }
+        seen.into_values().collect()
+    }
+
+    /// Get all unique call handlers with their triggers grouped.
+    /// Each handler appears exactly once, deduplicated by `handler_key()`.
+    pub fn unique_call_handlers(&self) -> Vec<CallHandlerInfo> {
+        let mut seen: HashMap<String, CallHandlerInfo> = HashMap::new();
+        for handlers in self.call_handlers.values() {
+            for handler in handlers {
+                let key = handler.handler_key();
+                seen.entry(key).or_insert_with(|| CallHandlerInfo {
+                    handler: handler.clone(),
+                    triggers: handler.triggers(),
+                });
+            }
+        }
+        seen.into_values().collect()
+    }
 }
 
 impl Default for TransformationRegistry {
@@ -117,7 +163,7 @@ impl Default for TransformationRegistry {
 
 /// Extract event name from signature.
 /// e.g., "Swap(bytes32,address,int128)" -> "Swap"
-fn extract_event_name(signature: &str) -> String {
+pub fn extract_event_name(signature: &str) -> String {
     signature
         .split('(')
         .next()
