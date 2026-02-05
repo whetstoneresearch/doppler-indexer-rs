@@ -1256,12 +1256,27 @@ fn write_decoded_once_calls_to_parquet(
 
     // Add a field for each function result
     for config in configs {
-        let value_type = config.output_type.to_arrow_type();
-        fields.push(Field::new(
-            &format!("{}_decoded", config.function_name),
-            value_type,
-            true,
-        ));
+        match &config.output_type {
+            EvmType::NamedTuple(tuple_fields) => {
+                // Named tuple: create a column for each field with {function}_decoded.{field_name}
+                for (field_name, field_type) in tuple_fields {
+                    fields.push(Field::new(
+                        &format!("{}_decoded.{}", config.function_name, field_name),
+                        field_type.to_arrow_type(),
+                        true,
+                    ));
+                }
+            }
+            _ => {
+                // Simple type or named single value
+                let value_type = config.output_type.to_arrow_type();
+                fields.push(Field::new(
+                    &format!("{}_decoded", config.function_name),
+                    value_type,
+                    true,
+                ));
+            }
+        }
     }
 
     let schema = Arc::new(Schema::new(fields));
@@ -1287,8 +1302,21 @@ fn write_decoded_once_calls_to_parquet(
 
     // Function result columns
     for config in configs {
-        let arr = build_once_value_array(records, &config.function_name, &config.output_type)?;
-        arrays.push(arr);
+        match &config.output_type {
+            EvmType::NamedTuple(tuple_fields) => {
+                // Named tuple: build an array for each field
+                for (idx, (_, field_type)) in tuple_fields.iter().enumerate() {
+                    let arr =
+                        build_once_tuple_field_array(records, &config.function_name, idx, field_type)?;
+                    arrays.push(arr);
+                }
+            }
+            _ => {
+                let arr =
+                    build_once_value_array(records, &config.function_name, &config.output_type)?;
+                arrays.push(arr);
+            }
+        }
     }
 
     // Write to parquet
@@ -1572,9 +1600,256 @@ fn build_once_value_array(
         }
         // Named types delegate to their inner type
         EvmType::Named { inner, .. } => build_once_value_array(records, function_name, inner),
-        // NamedTuple not yet supported for once calls
+        // NamedTuple should use build_once_tuple_field_array instead
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
-            "NamedTuple not yet supported for once calls".to_string(),
+            "NamedTuple should use build_once_tuple_field_array".to_string(),
         )),
+    }
+}
+
+/// Build an Arrow array for a specific field of a named tuple from "once" calls
+fn build_once_tuple_field_array(
+    records: &[DecodedOnceRecord],
+    function_name: &str,
+    field_idx: usize,
+    field_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    match field_type {
+        EvmType::Address => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    extract_once_tuple_address(r, function_name, field_idx)
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = records
+                .iter()
+                .map(|r| extract_once_tuple_uint8(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
+            let arr: UInt64Array = records
+                .iter()
+                .map(|r| extract_once_tuple_uint64(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_once_tuple_uint256_string(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = records
+                .iter()
+                .map(|r| extract_once_tuple_int8(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
+            let arr: Int64Array = records
+                .iter()
+                .map(|r| extract_once_tuple_int64(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_once_tuple_int256_string(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = records
+                .iter()
+                .map(|r| extract_once_tuple_bool(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    extract_once_tuple_bytes32(r, function_name, field_idx)
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::String => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_once_tuple_string(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = records
+                .iter()
+                .map(|r| extract_once_tuple_bytes(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => {
+            build_once_tuple_field_array(records, function_name, field_idx, inner)
+        }
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "Nested NamedTuple not supported".to_string(),
+        )),
+    }
+}
+
+// Helper functions for extracting tuple field values from "once" records
+
+fn extract_once_tuple_address<'a>(
+    r: &'a DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> &'a [u8] {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => {
+            if let Some((_, DecodedValue::Address(addr))) = fields.get(idx) {
+                addr.as_slice()
+            } else {
+                &[0u8; 20][..]
+            }
+        }
+        _ => &[0u8; 20][..],
+    }
+}
+
+fn extract_once_tuple_uint8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u8> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint8(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_uint64(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u64> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => Some(*val),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_uint256_string(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<String> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint256(val) => Some(val.to_string()),
+            DecodedValue::Uint64(val) => Some(val.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_int8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i8> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int8(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i64> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => Some(*val),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_int256_string(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<String> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int256(val) => Some(val.to_string()),
+            DecodedValue::Int64(val) => Some(val.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_bool(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<bool> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Bool(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_bytes32<'a>(
+    r: &'a DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> &'a [u8] {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => {
+            if let Some((_, DecodedValue::Bytes32(b))) = fields.get(idx) {
+                b.as_slice()
+            } else {
+                &[0u8; 32][..]
+            }
+        }
+        _ => &[0u8; 32][..],
+    }
+}
+
+fn extract_once_tuple_string<'a>(
+    r: &'a DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<&'a str> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_bytes<'a>(
+    r: &'a DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<&'a [u8]> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Bytes(b) => Some(b.as_slice()),
+            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+            _ => None,
+        }),
+        _ => None,
     }
 }
