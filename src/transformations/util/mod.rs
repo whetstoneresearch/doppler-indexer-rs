@@ -3,6 +3,7 @@
 //! Common helpers for working with decoded values, addresses, hashes, etc.
 
 pub mod constants;
+pub mod market;
 pub mod price;
 
 use alloy::primitives::{Address, B256};
