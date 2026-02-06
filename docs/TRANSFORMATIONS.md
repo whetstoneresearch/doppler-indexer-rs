@@ -519,8 +519,13 @@ src/transformations/
 │   └── v4.rs        # Example V4 handlers
 ├── eth_call/        # Call handlers
 │   └── mod.rs
-└── util/            # Shared utilities
-    └── mod.rs
+└── util/            # Shared utilities (see [TRANSFORMATION_UTILS.md](TRANSFORMATION_UTILS.md))
+    ├── mod.rs           # Byte/address/hex conversions
+    ├── constants.rs     # Q192, WAD, time intervals
+    ├── price.rs         # sqrtPriceX96 and reserve price computation
+    ├── market.rs        # Market cap, liquidity, volume calculations
+    ├── price_fetch.rs   # PriceFetcher — reads prices from parquet files
+    └── quote_info.rs    # QuoteResolver — quote token identification & USD pricing
 ```
 
 ## Performance Considerations

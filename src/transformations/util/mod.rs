@@ -6,6 +6,7 @@ pub mod constants;
 pub mod market;
 pub mod price;
 pub mod price_fetch;
+pub mod quote_info;
 
 use alloy::primitives::{Address, B256};
 
