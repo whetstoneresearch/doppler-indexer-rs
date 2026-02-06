@@ -10,7 +10,9 @@ use std::env;
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
@@ -27,8 +29,25 @@ use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
     RangeCompleteMessage, TransformationEngine,
 };
+use types::config::chain::ChainConfig;
 use types::config::eth_call::Frequency;
 use types::config::indexer::IndexerConfig;
+
+fn has_items<T>(opt: &Option<Vec<T>>) -> bool {
+    opt.as_ref().is_some_and(|v| !v.is_empty())
+}
+
+fn optional_channel<T>(
+    enabled: bool,
+    capacity: usize,
+) -> (Option<mpsc::Sender<T>>, Option<mpsc::Receiver<T>>) {
+    if enabled {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,41 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
-
-    let required_env_vars: Vec<&str> = config
-        .chains
-        .iter()
-        .map(|c| c.rpc_url_env_var.as_str())
-        .collect();
-
-    let missing_vars: Vec<&str> = required_env_vars
-        .iter()
-        .filter(|var| env::var(var).is_err())
-        .copied()
-        .collect();
-
-    if !missing_vars.is_empty() {
-        dotenvy::dotenv().map_err(|e| {
-            anyhow::anyhow!(
-                "Missing environment variables {:?} and failed to load .env file: {}",
-                missing_vars,
-                e
-            )
-        })?;
-
-        let still_missing: Vec<&str> = required_env_vars
-            .iter()
-            .filter(|var| env::var(var).is_err())
-            .copied()
-            .collect();
-
-        if !still_missing.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Missing required environment variables after loading .env: {:?}",
-                still_missing
-            ));
-        }
-    }
+    load_required_env_vars(&config)?;
 
     #[cfg(feature = "bench")]
     {
@@ -85,259 +70,222 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
     for chain in &config.chains {
-        tracing::info!("Processing chain: {}", chain.name);
+        process_chain(&config, chain).await?;
+    }
 
-        let rpc_url = env::var(&chain.rpc_url_env_var).map_err(|_| {
-            anyhow::anyhow!(
-                "Environment variable {} not set for chain {}",
-                chain.rpc_url_env_var,
-                chain.name
-            )
-        })?;
+    tracing::info!("All chains processed successfully");
+    Ok(())
+}
 
-        let client = UnifiedRpcClient::from_url(&rpc_url)?;
-        tracing::info!("Connected to RPC for chain {}", chain.name);
+/// Ensures all required RPC URL env vars are set, loading .env if needed.
+fn load_required_env_vars(config: &IndexerConfig) -> anyhow::Result<()> {
+    let required: Vec<&str> = config
+        .chains
+        .iter()
+        .map(|c| c.rpc_url_env_var.as_str())
+        .collect();
 
-        let has_factories = chain
-            .contracts
-            .values()
-            .any(|c| c.factories.as_ref().map(|f| !f.is_empty()).unwrap_or(false));
+    let missing: Vec<&&str> = required
+        .iter()
+        .filter(|var| env::var(var).is_err())
+        .collect();
 
-        let contract_logs_only = config
-            .raw_data_collection
-            .contract_logs_only
-            .unwrap_or(false);
-        let needs_factory_filtering = has_factories && contract_logs_only;
+    if missing.is_empty() {
+        return Ok(());
+    }
 
-        let has_factory_calls = chain.contracts.values().any(|c| {
-            c.factories
-                .as_ref()
-                .map(|factories| {
-                    factories
-                        .iter()
-                        .any(|f| f.calls.as_ref().map(|c| !c.is_empty()).unwrap_or(false))
-                })
-                .unwrap_or(false)
-        });
+    dotenvy::dotenv().with_context(|| {
+        format!(
+            "Missing env vars {:?} and failed to load .env file",
+            missing
+        )
+    })?;
 
-        // Check if any calls use on_events frequency
-        let has_event_triggered_calls = chain.contracts.values().any(|c| {
-            c.calls
-                .as_ref()
-                .map(|calls| {
+    let still_missing: Vec<&str> = required
+        .iter()
+        .filter(|var| env::var(var).is_err())
+        .copied()
+        .collect();
+
+    anyhow::ensure!(
+        still_missing.is_empty(),
+        "Missing required env vars after loading .env: {:?}",
+        still_missing
+    );
+
+    Ok(())
+}
+
+async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::Result<()> {
+    tracing::info!("Processing chain: {}", chain.name);
+
+    let rpc_url = env::var(&chain.rpc_url_env_var).with_context(|| {
+        format!(
+            "env var {} not set for chain {}",
+            chain.rpc_url_env_var, chain.name
+        )
+    })?;
+
+    // Feature detection
+    let has_factories = chain
+        .contracts
+        .values()
+        .any(|c| has_items(&c.factories));
+
+    let contract_logs_only = config
+        .raw_data_collection
+        .contract_logs_only
+        .unwrap_or(false);
+
+    let needs_factory_filtering = has_factories && contract_logs_only;
+
+    let has_factory_calls = chain.contracts.values().any(|c| {
+        c.factories.as_ref().is_some_and(|factories| {
+            factories.iter().any(|f| has_items(&f.calls))
+        })
+    });
+
+    let has_event_triggered_calls = chain.contracts.values().any(|c| {
+        c.calls.as_ref().is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
+        }) || c.factories.as_ref().is_some_and(|factories| {
+            factories.iter().any(|f| {
+                f.calls.as_ref().is_some_and(|calls| {
                     calls
                         .iter()
                         .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
                 })
-                .unwrap_or(false)
-                || c.factories
-                    .as_ref()
-                    .map(|factories| {
-                        factories.iter().any(|f| {
-                            f.calls
-                                .as_ref()
-                                .map(|calls| {
-                                    calls
-                                        .iter()
-                                        .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-        });
+            })
+        })
+    });
 
-        tracing::info!(
-            "Chain {} - has_factories: {}, contract_logs_only: {}, has_factory_calls: {}, has_event_triggered_calls: {}",
-            chain.name,
-            has_factories,
-            contract_logs_only,
-            has_factory_calls,
-            has_event_triggered_calls
-        );
-
-        // Channel capacities from config, with sensible defaults
-        let channel_capacity = config.raw_data_collection.channel_capacity.unwrap_or(1000);
-        let factory_channel_capacity = config
-            .raw_data_collection
-            .factory_channel_capacity
-            .unwrap_or(1000);
-
-        let (block_tx, block_rx) = mpsc::channel(channel_capacity);
-        let (log_tx, log_rx) = mpsc::channel::<LogMessage>(channel_capacity);
-        let (eth_call_tx, eth_call_rx) = mpsc::channel(channel_capacity);
-
-        let (factory_log_tx, factory_log_rx) = if has_factories {
-            let (tx, rx) = mpsc::channel::<LogMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        let (logs_factory_tx, logs_factory_rx) = if needs_factory_filtering {
-            let (tx, rx) = mpsc::channel(factory_channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        let (eth_calls_factory_tx, eth_calls_factory_rx) = if has_factory_calls {
-            let (tx, rx) = mpsc::channel(factory_channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        // Create event trigger channel for on_events frequency calls
-        let (event_trigger_tx, event_trigger_rx) = if has_event_triggered_calls {
-            let (tx, rx) = mpsc::channel::<EventTriggerMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        // Build event trigger matchers from contracts config
-        let event_matchers = if has_event_triggered_calls {
-            build_event_trigger_matchers(&chain.contracts)
-        } else {
-            Vec::new()
-        };
-
-        // Check if decoding is needed
-        let has_events = chain.contracts.values().any(|c| {
-            c.events.as_ref().map(|e| !e.is_empty()).unwrap_or(false)
-                || c.factories
-                    .as_ref()
-                    .map(|f| {
-                        f.iter()
-                            .any(|fc| fc.events.as_ref().map(|e| !e.is_empty()).unwrap_or(false))
-                    })
-                    .unwrap_or(false)
-        });
-
-        let has_calls = chain.contracts.values().any(|c| {
-            c.calls
+    let has_events = chain.contracts.values().any(|c| {
+        has_items(&c.events)
+            || c.factories
                 .as_ref()
-                .map(|calls| !calls.is_empty())
-                .unwrap_or(false)
-                || c.factories.as_ref().map(|f| {
-                    f.iter().any(|fc| {
-                        fc.calls
-                            .as_ref()
-                            .map(|calls| !calls.is_empty())
-                            .unwrap_or(false)
-                    })
-                }).unwrap_or(false)
-        });
+                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.events)))
+    });
 
-        let decode_logs_enabled = has_events;
-        let decode_calls_enabled = has_calls;
+    let has_calls = chain.contracts.values().any(|c| {
+        has_items(&c.calls)
+            || c.factories
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.calls)))
+    });
 
-        tracing::info!(
-            "Chain {} - decode_logs: {}, decode_calls: {}",
-            chain.name,
-            decode_logs_enabled,
-            decode_calls_enabled
-        );
+    tracing::info!(
+        "Chain {} - has_factories: {}, contract_logs_only: {}, has_factory_calls: {}, has_event_triggered_calls: {}",
+        chain.name, has_factories, contract_logs_only, has_factory_calls, has_event_triggered_calls
+    );
+    tracing::info!(
+        "Chain {} - decode_logs: {}, decode_calls: {}",
+        chain.name, has_events, has_calls
+    );
 
-        // Create decoder channels
-        let (log_decoder_tx, log_decoder_rx) = if decode_logs_enabled {
-            let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    // Channel setup
+    let channel_cap = config.raw_data_collection.channel_capacity.unwrap_or(1000);
+    let factory_cap = config
+        .raw_data_collection
+        .factory_channel_capacity
+        .unwrap_or(1000);
 
-        let (call_decoder_tx, call_decoder_rx) = if decode_calls_enabled {
-            let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    let (block_tx, block_rx) = mpsc::channel(channel_cap);
+    let (log_tx, log_rx) = mpsc::channel::<LogMessage>(channel_cap);
+    let (eth_call_tx, eth_call_rx) = mpsc::channel(channel_cap);
 
-        let registry = build_registry();
-        let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
+    let (factory_log_tx, factory_log_rx) =
+        optional_channel::<LogMessage>(has_factories, channel_cap);
+    let (logs_factory_tx, logs_factory_rx) =
+        optional_channel(needs_factory_filtering, factory_cap);
+    let (eth_calls_factory_tx, eth_calls_factory_rx) =
+        optional_channel(has_factory_calls, factory_cap);
+    let (event_trigger_tx, event_trigger_rx) =
+        optional_channel::<EventTriggerMessage>(has_event_triggered_calls, channel_cap);
+    let (log_decoder_tx, log_decoder_rx) =
+        optional_channel::<DecoderMessage>(has_events, channel_cap);
+    let (call_decoder_tx, call_decoder_rx) =
+        optional_channel::<DecoderMessage>(has_calls, channel_cap);
 
-        let (transform_events_tx, transform_events_rx) = if transformations_enabled {
-            let (tx, rx) = mpsc::channel::<DecodedEventsMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    let event_matchers = if has_event_triggered_calls {
+        build_event_trigger_matchers(&chain.contracts)
+    } else {
+        Vec::new()
+    };
 
-        let (transform_calls_tx, transform_calls_rx) = if transformations_enabled {
-            let (tx, rx) = mpsc::channel::<DecodedCallsMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    // Transformation setup
+    let registry = build_registry();
+    let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
-        let (transform_complete_tx, transform_complete_rx) = if transformations_enabled {
-            let (tx, rx) = mpsc::channel::<RangeCompleteMessage>(channel_capacity);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    let (transform_events_tx, transform_events_rx) =
+        optional_channel::<DecodedEventsMessage>(transformations_enabled, channel_cap);
+    let (transform_calls_tx, transform_calls_rx) =
+        optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
+    let (_transform_complete_tx, transform_complete_rx) =
+        optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
 
-        let db_pool = if transformations_enabled {
-            let transform_config = config.transformations.as_ref().unwrap();
-            let database_url = env::var(&transform_config.database_url_env_var).map_err(|_| {
-                anyhow::anyhow!(
-                    "Environment variable {} not set for transformations",
-                    transform_config.database_url_env_var
-                )
-            })?;
-
-            let pool = DbPool::new(&database_url).await.map_err(|e| {
-                anyhow::anyhow!("Failed to create database pool: {}", e)
-            })?;
-
-            pool.run_migrations().await.map_err(|e| {
-                anyhow::anyhow!("Failed to run database migrations: {}", e)
-            })?;
-
-            tracing::info!("Database pool initialized and migrations complete");
-            Some(Arc::new(pool))
-        } else {
-            None
-        };
-
-        let raw_data_config = config.raw_data_collection.clone();
-        let raw_data_config2 = config.raw_data_collection.clone();
-        let raw_data_config3 = config.raw_data_collection.clone();
-        let raw_data_config4 = config.raw_data_collection.clone();
-        let raw_data_config5 = config.raw_data_collection.clone();
-        let raw_data_config6 = config.raw_data_collection.clone();
-        let raw_data_config7 = config.raw_data_collection.clone();
-        let chain_clone = chain.clone();
-        let chain_clone2 = chain.clone();
-        let chain_clone3 = chain.clone();
-        let chain_clone4 = chain.clone();
-        let chain_clone5 = chain.clone();
-        let chain_clone6 = chain.clone();
-        let chain_clone7 = chain.clone();
-
-        let log_decoder_tx_for_factories = log_decoder_tx.clone();
-        let call_decoder_tx_for_factories = call_decoder_tx.clone();
-        
-        let blocks_handle = tokio::spawn(async move {
-            collect_blocks(
-                &chain_clone,
-                &client,
-                &raw_data_config,
-                Some(block_tx),
-                Some(eth_call_tx),
+    let db_pool = if transformations_enabled {
+        let tc = config.transformations.as_ref().unwrap();
+        let database_url = env::var(&tc.database_url_env_var).with_context(|| {
+            format!(
+                "env var {} not set for transformations",
+                tc.database_url_env_var
             )
-            .await
-        });
+        })?;
 
-        let receipts_handle = tokio::spawn(async move {
-            let rpc_url = env::var(&chain_clone2.rpc_url_env_var).unwrap();
-            let client = UnifiedRpcClient::from_url(&rpc_url).unwrap();
+        let pool = DbPool::new(&database_url)
+            .await
+            .context("failed to create database pool")?;
+        pool.run_migrations()
+            .await
+            .context("failed to run database migrations")?;
+
+        tracing::info!("Database pool initialized and migrations complete");
+        Some(Arc::new(pool))
+    } else {
+        None
+    };
+
+    // Shared state for spawned tasks
+    let chain = Arc::new(chain.clone());
+    let raw_config = Arc::new(config.raw_data_collection.clone());
+
+    // Pre-create RPC clients to avoid unwrap() inside spawned tasks
+    let blocks_client = UnifiedRpcClient::from_url(&rpc_url)?;
+    let receipts_client = UnifiedRpcClient::from_url(&rpc_url)?;
+    let eth_calls_client = UnifiedRpcClient::from_url(&rpc_url)?;
+
+    // Clone decoder senders for factories before the originals are moved
+    let log_decoder_tx_for_factories = if has_factories {
+        log_decoder_tx.clone()
+    } else {
+        None
+    };
+    let call_decoder_tx_for_factories = if has_factories {
+        call_decoder_tx.clone()
+    } else {
+        None
+    };
+
+    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+
+    tasks.spawn({
+        let (chain, cfg) = (chain.clone(), raw_config.clone());
+        async move {
+            collect_blocks(&chain, &blocks_client, &cfg, Some(block_tx), Some(eth_call_tx))
+                .await
+                .context("block collection failed")
+        }
+    });
+
+    tasks.spawn({
+        let (chain, cfg) = (chain.clone(), raw_config.clone());
+        async move {
             collect_receipts(
-                &chain_clone2,
-                &client,
-                &raw_data_config2,
+                &chain,
+                &receipts_client,
+                &cfg,
                 block_rx,
                 Some(log_tx),
                 factory_log_tx,
@@ -345,32 +293,43 @@ async fn main() -> anyhow::Result<()> {
                 event_matchers,
             )
             .await
-        });
+            .context("receipt collection failed")
+        }
+    });
 
-        let logs_handle = tokio::spawn(async move {
-            collect_logs(&chain_clone3, &raw_data_config3, log_rx, logs_factory_rx, log_decoder_tx).await
-        });
+    tasks.spawn({
+        let (chain, cfg) = (chain.clone(), raw_config.clone());
+        async move {
+            collect_logs(&chain, &cfg, log_rx, logs_factory_rx, log_decoder_tx)
+                .await
+                .context("log collection failed")
+        }
+    });
 
-        let eth_calls_handle = tokio::spawn(async move {
-            let rpc_url = env::var(&chain_clone4.rpc_url_env_var).unwrap();
-            let client = UnifiedRpcClient::from_url(&rpc_url).unwrap();
+    tasks.spawn({
+        let (chain, cfg) = (chain.clone(), raw_config.clone());
+        async move {
             collect_eth_calls(
-                &chain_clone4,
-                &client,
-                &raw_data_config4,
+                &chain,
+                &eth_calls_client,
+                &cfg,
                 eth_call_rx,
                 eth_calls_factory_rx,
                 event_trigger_rx,
                 call_decoder_tx,
             )
             .await
-        });
+            .context("eth call collection failed")
+        }
+    });
 
-        let factories_handle = if has_factories {
-            Some(tokio::spawn(async move {
+    if has_factories {
+        tasks.spawn({
+            let (chain, cfg) = (chain.clone(), raw_config.clone());
+            async move {
                 collect_factories(
-                    &chain_clone5,
-                    &raw_data_config5,
+                    &chain,
+                    &cfg,
                     factory_log_rx.unwrap(),
                     logs_factory_tx,
                     eth_calls_factory_tx,
@@ -378,133 +337,85 @@ async fn main() -> anyhow::Result<()> {
                     call_decoder_tx_for_factories,
                 )
                 .await
-            }))
-        } else {
-            None
-        };
-
-        let log_decoder_handle = if decode_logs_enabled {
-            let transform_events_tx = transform_events_tx.clone();
-            Some(tokio::spawn(async move {
-                decode_logs(
-                    &chain_clone6,
-                    &raw_data_config6,
-                    log_decoder_rx.unwrap(),
-                    transform_events_tx,
-                )
-                .await
-            }))
-        } else {
-            None
-        };
-
-        let call_decoder_handle = if decode_calls_enabled {
-            let transform_calls_tx = transform_calls_tx.clone();
-            Some(tokio::spawn(async move {
-                decode_eth_calls(
-                    &chain_clone7,
-                    &raw_data_config7,
-                    call_decoder_rx.unwrap(),
-                    transform_calls_tx,
-                )
-                .await
-            }))
-        } else {
-            None
-        };
-
-        let transformation_handle = if transformations_enabled {
-            let rpc_url = env::var(&chain.rpc_url_env_var).unwrap();
-            let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url).unwrap());
-            let transform_config = config.transformations.as_ref().unwrap();
-            let mode = if transform_config.mode.batch_for_catchup {
-                ExecutionMode::Batch {
-                    batch_size: transform_config.mode.catchup_batch_size,
-                }
-            } else {
-                ExecutionMode::Streaming
-            };
-
-            let handler_count = registry.handler_count();
-            let engine = TransformationEngine::new(
-                Arc::new(registry),
-                db_pool.clone().unwrap(),
-                rpc_client,
-                chain.name.clone(),
-                chain.chain_id,
-                mode,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create transformation engine: {}", e))?;
-
-            engine.initialize().await.map_err(|e| {
-                anyhow::anyhow!("Failed to initialize transformation handlers: {}", e)
-            })?;
-
-            tracing::info!(
-                "Transformation engine initialized for chain {} with {} handlers",
-                chain.name,
-                handler_count
-            );
-
-            Some(tokio::spawn(async move {
-                engine
-                    .run(
-                        transform_events_rx.unwrap(),
-                        transform_calls_rx.unwrap(),
-                        transform_complete_rx.unwrap(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Transformation engine error: {}", e))
-            }))
-        } else {
-            None
-        };
-
-        let (blocks_result, receipts_result, logs_result, eth_calls_result, factories_result, log_decoder_result, call_decoder_result, transformation_result) =
-            tokio::try_join!(
-                blocks_handle,
-                receipts_handle,
-                logs_handle,
-                eth_calls_handle,
-                async {
-                    match factories_handle {
-                        Some(handle) => handle.await,
-                        None => Ok(Ok(())),
-                    }
-                },
-                async {
-                    match log_decoder_handle {
-                        Some(handle) => handle.await,
-                        None => Ok(Ok(())),
-                    }
-                },
-                async {
-                    match call_decoder_handle {
-                        Some(handle) => handle.await,
-                        None => Ok(Ok(())),
-                    }
-                },
-                async {
-                    match transformation_handle {
-                        Some(handle) => handle.await,
-                        None => Ok(Ok(())),
-                    }
-                }
-            )?;
-
-        blocks_result?;
-        receipts_result?;
-        logs_result?;
-        eth_calls_result?;
-        factories_result?;
-        log_decoder_result?;
-        call_decoder_result?;
-        transformation_result?;
-
-        tracing::info!("Completed collection for chain {}", chain.name);
+                .context("factory collection failed")
+            }
+        });
     }
 
-    tracing::info!("All chains processed successfully");
+    if has_events {
+        let transform_events_tx = transform_events_tx.clone();
+        tasks.spawn({
+            let (chain, cfg) = (chain.clone(), raw_config.clone());
+            async move {
+                decode_logs(&chain, &cfg, log_decoder_rx.unwrap(), transform_events_tx)
+                    .await
+                    .context("log decoding failed")
+            }
+        });
+    }
+
+    if has_calls {
+        let transform_calls_tx = transform_calls_tx.clone();
+        tasks.spawn({
+            let (chain, cfg) = (chain.clone(), raw_config.clone());
+            async move {
+                decode_eth_calls(&chain, &cfg, call_decoder_rx.unwrap(), transform_calls_tx)
+                    .await
+                    .context("eth call decoding failed")
+            }
+        });
+    }
+
+    if transformations_enabled {
+        let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
+        let tc = config.transformations.as_ref().unwrap();
+        let mode = if tc.mode.batch_for_catchup {
+            ExecutionMode::Batch {
+                batch_size: tc.mode.catchup_batch_size,
+            }
+        } else {
+            ExecutionMode::Streaming
+        };
+
+        let handler_count = registry.handler_count();
+        let engine = TransformationEngine::new(
+            Arc::new(registry),
+            db_pool.unwrap(),
+            rpc_client,
+            chain.name.clone(),
+            chain.chain_id,
+            mode,
+        )
+        .await
+        .context("failed to create transformation engine")?;
+
+        engine
+            .initialize()
+            .await
+            .context("failed to initialize transformation handlers")?;
+
+        tracing::info!(
+            "Transformation engine initialized for chain {} with {} handlers",
+            chain.name,
+            handler_count
+        );
+
+        tasks.spawn(async move {
+            engine
+                .run(
+                    transform_events_rx.unwrap(),
+                    transform_calls_rx.unwrap(),
+                    transform_complete_rx.unwrap(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.context("pipeline task panicked")??;
+    }
+
+    tracing::info!("Completed collection for chain {}", chain.name);
     Ok(())
 }
