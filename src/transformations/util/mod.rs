@@ -7,6 +7,7 @@ pub mod market;
 pub mod price;
 pub mod price_fetch;
 pub mod quote_info;
+pub mod sanitize;
 
 use alloy::primitives::{Address, B256};
 
