@@ -35,14 +35,20 @@ pub trait TransformationHandler: Send + Sync + 'static {
         format!("{}_v{}", self.name(), self.version())
     }
 
-    /// Base folder for this handler's migration SQL files, relative to the project root.
-    /// The engine will run all `.sql` files found in `{folder}/v{version}/`
-    /// in alphabetical order at startup (tracked via the `_migrations` table).
+    /// Migration paths for this handler's SQL files, relative to the project root.
+    /// Each path can be either:
+    /// - A directory: all `.sql` files in it are run in alphabetical order
+    /// - A single `.sql` file: run directly
     ///
-    /// Example: returning `Some("migrations/handlers/v3_pools")` with `version() == 1`
-    /// will run all `.sql` files in `migrations/handlers/v3_pools/v1/`.
-    fn migration_folder(&self) -> Option<&'static str> {
-        None
+    /// Multiple paths are supported for handlers that write to multiple tables.
+    /// Directories are scanned flat (no subdirectories).
+    ///
+    /// Examples:
+    /// - `vec!["migrations/handlers/pools"]` — run all SQL in the `pools/` dir
+    /// - `vec!["migrations/handlers/pools/create_table.sql"]` — run one file
+    /// - `vec!["migrations/handlers/pools", "migrations/handlers/swaps"]` — multiple dirs
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![]
     }
 
     /// Process decoded data for a block range.

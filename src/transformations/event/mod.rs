@@ -3,7 +3,6 @@
 //! Add new event handler modules here and register them in `register_handlers`.
 
 pub mod v3;
-pub mod v4;
 
 use super::registry::TransformationRegistry;
 

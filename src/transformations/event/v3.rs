@@ -28,8 +28,8 @@ impl TransformationHandler for V3CreateHandler {
         1
     }
 
-    fn migration_folder(&self) -> Option<&'static str> {
-        Some("migrations/handlers/v3_pools")
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec!["migrations/tables/pools.sql"]
     }
 
     async fn handle(
@@ -57,7 +57,7 @@ impl TransformationHandler for V3CreateHandler {
 
             // Build upsert operation
             ops.push(DbOperation::Upsert {
-                table: "v3_pools_v1".to_string(),
+                table: "pools".to_string(),
                 columns: vec![
                     "pool_address".to_string(),
                     "asset".to_string(),

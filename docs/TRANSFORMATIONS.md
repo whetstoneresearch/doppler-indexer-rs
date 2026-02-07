@@ -16,15 +16,15 @@ Transformations extend the indexer's capabilities beyond Parquet file storage:
 
 ```
 Decoded Events/Calls ──► TransformationEngine ──► Handlers ──► DbOperations ──► PostgreSQL
-                               │
-                               └─► TransformationContext
+                               │                                    │
+                               └─► TransformationContext            └─► inject source/source_version
                                     ├─ Chain info (name, id, block range)
                                     ├─ Decoded data (events, calls)
                                     ├─ Historical queries (parquet)
                                     └─ Ad-hoc RPC calls
 ```
 
-The transformation engine receives decoded data via channels from the decoders, invokes registered handlers, collects database operations, and executes them transactionally.
+The transformation engine receives decoded data via channels from the decoders, invokes registered handlers, collects database operations, injects `source`/`source_version` columns automatically, and executes them transactionally.
 
 ## Configuration
 
@@ -62,38 +62,42 @@ SQL migrations are stored in the `migrations/` directory and run automatically o
 
 ```
 migrations/
-├── 001_initial_schema.sql
-├── 002_add_indexes.sql
-└── ...
+├── 000_handler_progress.sql
+├── 001_active_versions.sql
+└── handlers/
+    ├── pools/
+    │   └── create_table.sql
+    └── swaps/
+        └── create_table.sql
 ```
 
-Migrations are executed in alphabetical order. Each migration runs once and is tracked in a `_migrations` table.
+Global migrations in `migrations/` are executed in alphabetical order. Each migration runs once and is tracked in a `_migrations` table.
 
-**Example migration:**
+Handler migration folders are specified by each handler via `migration_folders()`. Folders are scanned flat (no version subdirectories) and `.sql` files are run in alphabetical order.
+
+## Active Versions
+
+The `active_versions` table tracks which version of each source (handler) is currently active:
 
 ```sql
--- migrations/001_v4_swaps.sql
-
-CREATE TABLE IF NOT EXISTS v4_swaps (
-    id BIGSERIAL PRIMARY KEY,
-    pool_id BYTEA NOT NULL,
-    block_number BIGINT NOT NULL,
-    log_index INT NOT NULL,
-    tx_hash BYTEA NOT NULL,
-    sender BYTEA NOT NULL,
-    amount0 NUMERIC NOT NULL,
-    amount1 NUMERIC NOT NULL,
-    sqrt_price_x96 NUMERIC NOT NULL,
-    liquidity NUMERIC NOT NULL,
-    tick INT NOT NULL,
-    fee INT NOT NULL,
-    timestamp BIGINT NOT NULL,
-    chain_id BIGINT NOT NULL,
-    UNIQUE (pool_id, block_number, log_index)
+CREATE TABLE active_versions (
+    source VARCHAR(255) PRIMARY KEY,
+    active_version INT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+```
 
-CREATE INDEX idx_v4_swaps_pool_block ON v4_swaps (pool_id, block_number DESC);
-CREATE INDEX idx_v4_swaps_timestamp ON v4_swaps (timestamp DESC);
+When a handler starts for the first time, the engine automatically inserts a row with its current version. If the handler version changes (e.g., bumped from 1 to 2), the engine logs a warning but does **not** auto-upgrade — activation is manual:
+
+```sql
+UPDATE active_versions SET active_version = 2, updated_at = NOW() WHERE source = 'V4SwapHandler';
+```
+
+This allows multiple versions to coexist in the same table. Downstream queries and views should filter by `active_version`:
+
+```sql
+SELECT * FROM swaps s
+JOIN active_versions av ON av.source = s.source AND av.active_version = s.source_version;
 ```
 
 ## Writing Handlers
@@ -108,7 +112,15 @@ pub trait TransformationHandler: Send + Sync + 'static {
     /// Unique name for logging and error messages
     fn name(&self) -> &'static str;
 
-    /// Process decoded data and return database operations
+    /// Version of this handler. Bump when handler logic changes.
+    fn version(&self) -> u32 { 1 }
+
+    /// Migration folders for this handler's SQL files (flat, no version subdirs).
+    /// Multiple folders supported for handlers that write to multiple tables.
+    fn migration_folders(&self) -> Vec<&'static str> { vec![] }
+
+    /// Process decoded data and return database operations.
+    /// Do NOT include `source` or `source_version` columns — the engine injects them.
     async fn handle(
         &self,
         ctx: &TransformationContext<'_>,
@@ -137,6 +149,20 @@ pub trait EthCallHandler: TransformationHandler {
 }
 ```
 
+### Source/Version Injection
+
+The engine automatically injects `source` (handler name) and `source_version` (handler version) into every `DbOperation` returned by handlers:
+
+| Operation | Injection |
+|-----------|-----------|
+| `Upsert` | Appends to `columns`, `values`, and `conflict_columns` |
+| `Insert` | Appends to `columns` and `values` |
+| `Update` | Merges into `where_clause` |
+| `Delete` | Merges into `where_clause` |
+| `RawSql` | Skipped (handler must manage manually) |
+
+Handlers should **not** include `source` or `source_version` in their operations — the engine handles this.
+
 ### Example: V4 Swap Handler
 
 ```rust
@@ -157,15 +183,17 @@ impl TransformationHandler for V4SwapHandler {
         "V4SwapHandler"
     }
 
+    fn migration_folders(&self) -> Vec<&'static str> {
+        vec!["migrations/handlers/swaps"]
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext<'_>,
     ) -> Result<Vec<DbOperation>, TransformationError> {
         let mut ops = Vec::new();
 
-        // Iterate over all matching events in the current block range
         for event in ctx.events_of_type("UniswapV4PoolManager", "Swap") {
-            // Extract decoded parameters by name
             let pool_id = event.get("id")?.as_bytes32()
                 .ok_or_else(|| TransformationError::TypeConversion("id".into()))?;
             let sender = event.get("sender")?.as_address()
@@ -175,9 +203,9 @@ impl TransformationHandler for V4SwapHandler {
             let tick = event.get("tick")?.as_i32()
                 .ok_or_else(|| TransformationError::TypeConversion("tick".into()))?;
 
-            // Build database operation
+            // Note: source and source_version are injected by the engine
             ops.push(DbOperation::Upsert {
-                table: "v4_swaps".to_string(),
+                table: "swaps".to_string(),
                 columns: vec![
                     "pool_id".into(), "block_number".into(), "log_index".into(),
                     "tx_hash".into(), "sender".into(), "amount0".into(),
@@ -383,7 +411,7 @@ value.get_field("name") // Option<&DecodedValue> (for tuples)
 
 ## Database Operations
 
-Handlers return `Vec<DbOperation>` which are executed transactionally:
+Handlers return `Vec<DbOperation>` which are executed transactionally. The engine automatically injects `source` and `source_version` into each operation — handlers should not include these columns.
 
 ### Upsert
 
@@ -395,8 +423,9 @@ DbOperation::Upsert {
     conflict_columns: vec!["id".into()],
     update_columns: vec!["amount".into()],
 }
-// Generates: INSERT INTO swaps (id, amount) VALUES ($1, $2)
-//            ON CONFLICT (id) DO UPDATE SET amount = EXCLUDED.amount
+// Engine injects source/source_version into columns, values, and conflict_columns
+// Generates: INSERT INTO swaps (id, amount, source, source_version) VALUES ($1, $2, $3, $4)
+//            ON CONFLICT (id, source, source_version) DO UPDATE SET amount = EXCLUDED.amount
 ```
 
 ### Insert
@@ -417,6 +446,7 @@ DbOperation::Update {
     set_columns: vec![("liquidity".into(), DbValue::Numeric(liq))],
     where_clause: WhereClause::Eq("id".into(), DbValue::Bytes32(pool_id)),
 }
+// Engine injects source/source_version into the where_clause
 ```
 
 ### Delete
@@ -435,9 +465,10 @@ DbOperation::Delete {
 
 ```rust
 DbOperation::RawSql {
-    query: "UPDATE pools SET total = total + $1 WHERE id = $2".into(),
-    params: vec![DbValue::Numeric(amount), DbValue::Bytes32(id)],
+    query: "UPDATE pools SET total = total + $1 WHERE id = $2 AND source = $3 AND source_version = $4".into(),
+    params: vec![DbValue::Numeric(amount), DbValue::Bytes32(id), DbValue::Text(source), DbValue::Int32(version)],
 }
+// Note: RawSql is NOT auto-injected — handler must include source/source_version manually
 ```
 
 ## DbValue Types
@@ -516,7 +547,8 @@ src/transformations/
 ├── error.rs         # TransformationError
 ├── event/           # Event handlers
 │   ├── mod.rs
-│   └── v4.rs        # Example V4 handlers
+│   ├── v3.rs        # V3 pool creation handler
+│   └── v4.rs        # V4 swap handler
 ├── eth_call/        # Call handlers
 │   └── mod.rs
 └── util/            # Shared utilities (see [TRANSFORMATION_UTILS.md](TRANSFORMATION_UTILS.md))
@@ -526,6 +558,15 @@ src/transformations/
     ├── market.rs        # Market cap, liquidity, volume calculations
     ├── price_fetch.rs   # PriceFetcher — reads prices from parquet files
     └── quote_info.rs    # QuoteResolver — quote token identification & USD pricing
+
+migrations/
+├── 000_handler_progress.sql
+├── 001_active_versions.sql
+└── handlers/
+    ├── pools/
+    │   └── create_table.sql
+    └── swaps/
+        └── create_table.sql
 ```
 
 ## Performance Considerations
@@ -544,3 +585,5 @@ src/transformations/
 4. **Validate data** - Return errors for unexpected data rather than silently skipping
 5. **Log context** - Include relevant identifiers in error messages
 6. **Test locally** - Use a local PostgreSQL for development
+7. **Don't include source/source_version** - The engine injects these automatically into all operations (except `RawSql`)
+8. **Use entity table names** - Use `pools`, `swaps` etc. instead of versioned names like `v3_pools_v1`

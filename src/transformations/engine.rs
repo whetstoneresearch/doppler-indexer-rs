@@ -14,7 +14,7 @@ use super::context::{DecodedCall, DecodedEvent, TransformationContext};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use super::registry::{extract_event_name, TransformationRegistry};
-use crate::db::{DbPool, DbValue, DbOperation};
+use crate::db::{DbPool, DbValue, DbOperation, WhereClause};
 use crate::rpc::UnifiedRpcClient;
 
 /// Message containing decoded events for a block range.
@@ -103,10 +103,13 @@ impl TransformationEngine {
         })
     }
 
-    /// Initialize the engine: run handler migrations, then initialize handlers.
+    /// Initialize the engine: run handler migrations, register sources, then initialize handlers.
     pub async fn initialize(&self) -> Result<(), TransformationError> {
         // Run handler-specified migrations first
         self.run_handler_migrations().await?;
+
+        // Register handler sources in active_versions table
+        self.register_handler_sources().await?;
 
         // Then run handler initialization
         for handler in self.registry.all_handlers() {
@@ -122,25 +125,24 @@ impl TransformationEngine {
 
     // ─── Handler Migrations ──────────────────────────────────────────
 
-    /// Run handler migration files by scanning each handler's `migration_folder()/v{version}/`.
-    /// All `.sql` files in the version subfolder are run in alphabetical order.
-    /// Each migration is tracked in the `_migrations` table with a `handlers/` prefix.
+    /// Run handler migration files from each handler's `migration_paths()`.
+    /// Each path can be a directory (all `.sql` files run in alphabetical order)
+    /// or a single `.sql` file. Tracked in the `_migrations` table with a `handlers/` prefix.
     async fn run_handler_migrations(&self) -> Result<(), TransformationError> {
-        // Collect migration directories from all handlers (deduplicate by resolved path)
-        let mut migration_dirs: Vec<(PathBuf, String)> = Vec::new();
-        let mut seen_dirs = HashSet::new();
+        // Collect migration paths from all handlers (deduplicate)
+        let mut migration_paths: Vec<PathBuf> = Vec::new();
+        let mut seen = HashSet::new();
 
         for handler in self.registry.all_handlers() {
-            if let Some(folder) = handler.migration_folder() {
-                let version_dir =
-                    PathBuf::from(format!("{}/v{}", folder, handler.version()));
-                if seen_dirs.insert(version_dir.clone()) {
-                    migration_dirs.push((version_dir, handler.handler_key()));
+            for path_str in handler.migration_paths() {
+                let path = PathBuf::from(path_str);
+                if seen.insert(path.clone()) {
+                    migration_paths.push(path);
                 }
             }
         }
 
-        if migration_dirs.is_empty() {
+        if migration_paths.is_empty() {
             return Ok(());
         }
 
@@ -159,74 +161,247 @@ impl TransformationEngine {
             rows.iter().map(|r| r.get(0)).collect()
         };
 
-        for (version_dir, handler_key) in &migration_dirs {
-            if !version_dir.exists() {
+        // Resolve each path into (file_path, migration_name) pairs
+        let mut sql_entries: Vec<(PathBuf, String)> = Vec::new();
+
+        for path in &migration_paths {
+            if !path.exists() {
                 tracing::warn!(
-                    "Handler {} migration directory does not exist: {}",
-                    handler_key,
-                    version_dir.display()
+                    "Handler migration path does not exist: {}",
+                    path.display()
                 );
                 continue;
             }
 
-            // Collect and sort .sql files in the version directory
-            let mut sql_files: Vec<_> = std::fs::read_dir(version_dir)?
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|x| x == "sql")
-                        .unwrap_or(false)
-                })
-                .collect();
-            sql_files.sort_by_key(|e| e.file_name());
+            if path.is_file() {
+                // Single file: track as "handlers/{path}"
+                let migration_name = format!("handlers/{}", path.display());
+                sql_entries.push((path.clone(), migration_name));
+            } else if path.is_dir() {
+                // Directory: collect and sort .sql files (flat scan)
+                let mut dir_files: Vec<_> = std::fs::read_dir(path)?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map(|x| x == "sql")
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                dir_files.sort_by_key(|e| e.file_name());
 
-            for entry in sql_files {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                // Track as "handlers/{version_dir_relative}/{filename}"
-                let migration_name =
-                    format!("handlers/{}", version_dir.join(&file_name).display());
-
-                if applied.contains(&migration_name) {
-                    continue;
+                for entry in dir_files {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    let migration_name =
+                        format!("handlers/{}", path.join(&file_name).display());
+                    sql_entries.push((entry.path(), migration_name));
                 }
+            }
+        }
 
-                let sql = std::fs::read_to_string(entry.path())?;
+        // Apply each migration
+        for (file_path, migration_name) in &sql_entries {
+            if applied.contains(migration_name) {
+                continue;
+            }
 
-                let mut client = pool.get().await.map_err(|e| {
-                    TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
-                })?;
-                let tx = client.transaction().await.map_err(|e| {
-                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-                })?;
+            let sql = std::fs::read_to_string(file_path)?;
 
-                tx.batch_execute(&sql).await.map_err(|e| {
-                    TransformationError::DatabaseError(crate::db::DbError::MigrationError(
-                        format!(
-                            "Handler migration {} failed: {}",
-                            migration_name, e
-                        ),
-                    ))
-                })?;
+            let mut client = pool.get().await.map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
+            })?;
+            let tx = client.transaction().await.map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+            })?;
 
-                tx.execute(
-                    "INSERT INTO _migrations (name) VALUES ($1)",
-                    &[&migration_name],
+            tx.batch_execute(&sql).await.map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::MigrationError(
+                    format!(
+                        "Handler migration {} failed: {}",
+                        migration_name, e
+                    ),
+                ))
+            })?;
+
+            tx.execute(
+                "INSERT INTO _migrations (name) VALUES ($1)",
+                &[&migration_name],
+            )
+            .await
+            .map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+            })?;
+
+            tx.commit().await.map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+            })?;
+
+            tracing::info!("Applied handler migration: {}", migration_name);
+        }
+
+        Ok(())
+    }
+
+    // ─── Source Registration ────────────────────────────────────────
+
+    /// Register handler sources in the `active_versions` table.
+    /// For new sources, inserts with the handler's current version.
+    /// For existing sources with a different version, logs a warning.
+    async fn register_handler_sources(&self) -> Result<(), TransformationError> {
+        let pool = self.db_pool.inner();
+        let client = pool.get().await.map_err(|e| {
+            TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
+        })?;
+
+        for handler in self.registry.all_handlers() {
+            let source = handler.name().to_string();
+            let version = handler.version() as i32;
+
+            let rows = client
+                .query(
+                    "SELECT active_version FROM active_versions WHERE source = $1",
+                    &[&source],
                 )
                 .await
                 .map_err(|e| {
                     TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
                 })?;
 
-                tx.commit().await.map_err(|e| {
-                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-                })?;
-
-                tracing::info!("Applied handler migration: {}", migration_name);
+            if rows.is_empty() {
+                // New source — insert with current version
+                client
+                    .execute(
+                        "INSERT INTO active_versions (source, active_version) VALUES ($1, $2)",
+                        &[&source, &version],
+                    )
+                    .await
+                    .map_err(|e| {
+                        TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
+                    })?;
+                tracing::info!(
+                    "Registered new source: {} with active_version={}",
+                    source,
+                    version
+                );
+            } else {
+                let existing_version: i32 = rows[0].get(0);
+                if existing_version != version {
+                    tracing::warn!(
+                        "Source '{}' has active_version={} but handler is at version={}. \
+                         To activate the new version, run: \
+                         UPDATE active_versions SET active_version = {}, updated_at = NOW() WHERE source = '{}';",
+                        source,
+                        existing_version,
+                        version,
+                        version,
+                        source
+                    );
+                }
             }
         }
 
         Ok(())
+    }
+
+    // ─── Source/Version Injection ────────────────────────────────────
+
+    /// Inject `source` and `source_version` into each DbOperation.
+    /// Called after handler.handle() returns ops, before execute_transaction().
+    fn inject_source_version(ops: Vec<DbOperation>, source: &str, version: u32) -> Vec<DbOperation> {
+        ops.into_iter()
+            .map(|op| match op {
+                DbOperation::Upsert {
+                    table,
+                    mut columns,
+                    mut values,
+                    mut conflict_columns,
+                    update_columns,
+                } => {
+                    columns.push("source".to_string());
+                    columns.push("source_version".to_string());
+                    values.push(DbValue::Text(source.to_string()));
+                    values.push(DbValue::Int32(version as i32));
+                    conflict_columns.push("source".to_string());
+                    conflict_columns.push("source_version".to_string());
+                    DbOperation::Upsert {
+                        table,
+                        columns,
+                        values,
+                        conflict_columns,
+                        update_columns,
+                    }
+                }
+                DbOperation::Insert {
+                    table,
+                    mut columns,
+                    mut values,
+                } => {
+                    columns.push("source".to_string());
+                    columns.push("source_version".to_string());
+                    values.push(DbValue::Text(source.to_string()));
+                    values.push(DbValue::Int32(version as i32));
+                    DbOperation::Insert {
+                        table,
+                        columns,
+                        values,
+                    }
+                }
+                DbOperation::Update {
+                    table,
+                    set_columns,
+                    where_clause,
+                } => {
+                    let where_clause = Self::inject_where_clause(where_clause, source, version);
+                    DbOperation::Update {
+                        table,
+                        set_columns,
+                        where_clause,
+                    }
+                }
+                DbOperation::Delete {
+                    table,
+                    where_clause,
+                } => {
+                    let where_clause = Self::inject_where_clause(where_clause, source, version);
+                    DbOperation::Delete {
+                        table,
+                        where_clause,
+                    }
+                }
+                DbOperation::RawSql { query, params } => {
+                    tracing::warn!(
+                        "RawSql operation skipped for source/version injection — handler must manage source/source_version manually"
+                    );
+                    DbOperation::RawSql { query, params }
+                }
+            })
+            .collect()
+    }
+
+    /// Inject source/source_version conditions into a WhereClause.
+    fn inject_where_clause(clause: WhereClause, source: &str, version: u32) -> WhereClause {
+        let source_conditions = vec![
+            ("source".to_string(), DbValue::Text(source.to_string())),
+            ("source_version".to_string(), DbValue::Int32(version as i32)),
+        ];
+
+        match clause {
+            WhereClause::Eq(col, val) => {
+                let mut conditions = vec![(col, val)];
+                conditions.extend(source_conditions);
+                WhereClause::And(conditions)
+            }
+            WhereClause::And(mut conditions) => {
+                conditions.extend(source_conditions);
+                WhereClause::And(conditions)
+            }
+            WhereClause::Raw { condition, params } => {
+                tracing::warn!(
+                    "WhereClause::Raw skipped for source/version injection — handler must manage manually"
+                );
+                WhereClause::Raw { condition, params }
+            }
+        }
     }
 
     // ─── Per-Handler Progress Tracking ───────────────────────────────
@@ -411,6 +586,7 @@ impl TransformationEngine {
                     match handler.handle(&ctx).await {
                         Ok(ops) => {
                             if !ops.is_empty() {
+                                let ops = Self::inject_source_version(ops, handler.name(), handler.version());
                                 self.db_pool.execute_transaction(ops).await?;
                             }
                         }
@@ -520,6 +696,7 @@ impl TransformationEngine {
                     match handler.handle(&ctx).await {
                         Ok(ops) => {
                             if !ops.is_empty() {
+                                let ops = Self::inject_source_version(ops, handler.name(), handler.version());
                                 self.db_pool.execute_transaction(ops).await?;
                             }
                         }
@@ -800,6 +977,8 @@ impl TransformationEngine {
                                 ops.len()
                             );
 
+                            let ops = Self::inject_source_version(ops, handler.name(), handler.version());
+
                             // Per-handler transaction
                             if let Err(e) = self.db_pool.execute_transaction(ops).await {
                                 tracing::error!(
@@ -863,6 +1042,8 @@ impl TransformationEngine {
                                 handler_key,
                                 ops.len()
                             );
+
+                            let ops = Self::inject_source_version(ops, handler.name(), handler.version());
 
                             if let Err(e) = self.db_pool.execute_transaction(ops).await {
                                 tracing::error!(
