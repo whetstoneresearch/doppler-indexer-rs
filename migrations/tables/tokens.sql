@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS tokens (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    creator_address BYTEA NOT NULL,
+    integrator BYTEA NOT NULL,
+    address BYTEA NOT NULL,
+    pool BYTEA NOT NULL,
+    name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    decimals SMALLINT NOT NULL,
+    total_supply NUMERIC NOT NULL,
+    token_uri TEXT NOT NULL,
+    is_derc20 BOOLEAN NOT NULL,
+    is_creator_coin BOOLEAN NOT NULL,
+    is_content_coin BOOLEAN NOT NULL,
+    creator_coin_pool BYTEA,
+    governance BYTEA NOT NULL,
+    source VARCHAR(255) NOT NULL,
+    source_version INT NOT NULL,
+    UNIQUE (chain_id, address, source, source_version)
+)

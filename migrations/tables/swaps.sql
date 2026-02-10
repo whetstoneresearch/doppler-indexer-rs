@@ -1,0 +1,25 @@
+CREATE TABLE IF NOT EXISTS swaps (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id BIGINT NOT NULL,
+    tx_hash BYTEA NOT NULL,
+    block_number BIGINT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    pool BYTEA NOT NULL,
+    asset BYTEA NOT NULL,
+    amountIn BIGINT NOT NULL,
+    amountOut BIGINT NOT NULL,
+    is_buy BOOLEAN NOT NULL,
+    current_tick INTEGER,
+    graduation_tick INTEGER,
+    fee0_delta BIGINT NOT NULL,
+    fee1_delta BIGINT NOT NULL,
+    tokens_sold_delta BIGINT NOT NULL,
+    graduation_balance_delta BIGINT NOT NULL,
+    max_threshold_delta BIGINT NOT NULL
+    market_cap_usd_delta BIGINT NOT NULL,
+    liquidity_usd_delta BIGINT NOT NULL,
+    value_usd BIGINT NOT NULL,
+    source VARCHAR(255) NOT NULL,
+    source_version INT NOT NULL,
+    UNIQUE (chain_id, tx_hash, source, source_version)
+);
