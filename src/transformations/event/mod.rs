@@ -9,7 +9,6 @@ use super::registry::TransformationRegistry;
 /// Register all event handlers with the registry.
 pub fn register_handlers(registry: &mut TransformationRegistry) {
     v3::register_handlers(registry);
-    v4::register_handlers(registry);
     // Add more handler registrations here as they are implemented:
     // transfers::register_handlers(registry);
 }

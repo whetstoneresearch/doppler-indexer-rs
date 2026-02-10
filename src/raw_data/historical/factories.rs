@@ -476,14 +476,38 @@ fn parse_data_signature(sig: &str) -> Vec<DynSolType> {
         return Vec::new();
     }
 
-    sig.split(',')
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return None;
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+
+    for ch in sig.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
             }
-            trimmed.parse::<DynSolType>().ok()
-        })
+            ')' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+
+    parts
+        .iter()
+        .filter_map(|s| s.parse::<DynSolType>().ok())
         .collect()
 }
 
@@ -520,7 +544,21 @@ async fn process_range(
                     }
                 }
                 FactoryParameterLocation::Data(indices) => {
-                    decode_address_from_data(&log.data, &matcher.data_types, indices)
+                    match decode_address_from_data(&log.data, &matcher.data_types, indices) {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            tracing::warn!(
+                                block_number = log.block_number,
+                                contract = %Address::from(log.address),
+                                topic0 = %hex::encode(&log.topics.first().map(|t| t.as_slice()).unwrap_or(&[])),
+                                collection = %matcher.collection_name,
+                                data_len = log.data.len(),
+                                "Failed to decode factory event data: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
             };
 
@@ -645,20 +683,17 @@ fn extract_address_recursive(values: &[DynSolValue], indices: &[usize]) -> Optio
     }
 }
 
-fn decode_address_from_data(data: &[u8], types: &[DynSolType], indices: &[usize]) -> Option<[u8; 20]> {
+fn decode_address_from_data(data: &[u8], types: &[DynSolType], indices: &[usize]) -> Result<Option<[u8; 20]>, alloy::dyn_abi::Error> {
     if types.is_empty() || indices.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let tuple_type = DynSolType::Tuple(types.to_vec());
 
-    match tuple_type.abi_decode(data) {
-        Ok(DynSolValue::Tuple(values)) => extract_address_recursive(&values, indices),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("Failed to decode factory event data: {}", e);
-            None
-        }
+    match tuple_type.abi_decode_params(data) {
+        Ok(DynSolValue::Tuple(values)) => Ok(extract_address_recursive(&values, indices)),
+        Ok(_) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
