@@ -18,6 +18,10 @@ pub struct RawDataCollectionConfig {
     /// Higher values improve throughput during catchup but use more memory.
     /// Default: 4
     pub decoding_concurrency: Option<usize>,
+    /// Number of concurrent tasks for factory collection catchup from existing log files.
+    /// Higher values improve throughput during catchup but use more memory.
+    /// Default: 4
+    pub factory_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

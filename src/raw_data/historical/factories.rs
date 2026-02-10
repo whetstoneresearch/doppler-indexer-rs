@@ -10,10 +10,12 @@ use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSize
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::raw_data::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
@@ -213,106 +215,126 @@ pub async fn collect_factories(
     let log_ranges = get_existing_log_ranges(&chain.name);
     let mut catchup_count = 0;
 
-    for log_range in &log_ranges {
-        // Check if all factory files exist for this range
-        let all_factory_files_exist = factory_collection_names.iter().all(|collection| {
-            let rel_path = format!("{}/{}-{}.parquet", collection, log_range.start, log_range.end - 1);
-            existing_files.contains(&rel_path)
-        });
+    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(4);
+    let matchers = Arc::new(matchers);
+    let existing_files = Arc::new(existing_files);
+    let output_dir = Arc::new(output_dir);
 
-        if all_factory_files_exist {
-            continue;
-        }
+    {
+        let semaphore = Arc::new(Semaphore::new(factory_concurrency));
+        let mut join_set: JoinSet<Result<FactoryAddressData, FactoryCollectionError>> =
+            JoinSet::new();
 
-        // Read logs from existing parquet file
-        let logs = match read_logs_from_parquet(&log_range.file_path) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read logs from {}: {}",
-                    log_range.file_path.display(),
-                    e
-                );
-                continue;
-            }
-        };
-
-        tracing::info!(
-            "Catchup: processing factories for blocks {}-{} from existing logs file ({} logs)",
-            log_range.start,
-            log_range.end - 1,
-            logs.len()
-        );
-
-        // Process the range
-        let factory_data = match process_range(
-            log_range.start,
-            log_range.end,
-            logs,
-            &matchers,
-            &output_dir,
-            &existing_files,
-        )
-        .await
-        {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!(
-                    "Factory processing failed for range {}-{}: {:?}",
+        for log_range in &log_ranges {
+            let all_factory_files_exist = factory_collection_names.iter().all(|collection| {
+                let rel_path = format!(
+                    "{}/{}-{}.parquet",
+                    collection,
                     log_range.start,
-                    log_range.end,
-                    e
+                    log_range.end - 1
                 );
-                return Err(e);
-            }
-        };
-
-        // Send factory data to downstream consumers
-        if let Some(ref tx) = logs_factory_tx {
-            if tx.send(factory_data.clone()).await.is_err() {
-                tracing::error!(
-                    "Failed to send catchup factory data for range {}-{} to logs_factory_tx - receiver dropped",
-                    factory_data.range_start,
-                    factory_data.range_end
-                );
-                return Err(FactoryCollectionError::ChannelSend(format!(
-                    "logs_factory_tx (catchup {}-{}) - receiver dropped",
-                    factory_data.range_start, factory_data.range_end
-                )));
-            }
-        }
-
-        if let Some(ref tx) = eth_calls_factory_tx {
-            let _ = tx.send(factory_data.clone()).await;
-        }
-
-        // Send to decoders
-        let addresses: HashMap<String, Vec<Address>> = factory_data
-            .addresses_by_block
-            .values()
-            .flatten()
-            .fold(HashMap::new(), |mut acc, (_, addr, collection)| {
-                acc.entry(collection.clone()).or_default().push(*addr);
-                acc
+                existing_files.contains(&rel_path)
             });
 
-        if let Some(ref tx) = log_decoder_tx {
-            let _ = tx.send(DecoderMessage::FactoryAddresses {
-                range_start: factory_data.range_start,
-                range_end: factory_data.range_end,
-                addresses: addresses.clone(),
-            }).await;
+            if all_factory_files_exist {
+                continue;
+            }
+
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let matchers = matchers.clone();
+            let existing_files = existing_files.clone();
+            let output_dir = output_dir.clone();
+            let file_path = log_range.file_path.clone();
+            let start = log_range.start;
+            let end = log_range.end;
+
+            join_set.spawn(async move {
+                let _permit = permit;
+
+                let batches = tokio::task::spawn_blocking(move || {
+                    read_log_batches_from_parquet(&file_path)
+                })
+                .await
+                .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+
+                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                tracing::info!(
+                    "Catchup: processing factories for blocks {}-{} from existing logs file ({} rows)",
+                    start,
+                    end - 1,
+                    total_rows
+                );
+
+                process_range_batches(start, end, batches, &matchers, &output_dir, &existing_files)
+                    .await
+            });
         }
 
-        if let Some(ref tx) = call_decoder_tx {
-            let _ = tx.send(DecoderMessage::FactoryAddresses {
-                range_start: factory_data.range_start,
-                range_end: factory_data.range_end,
-                addresses,
-            }).await;
+        let mut catchup_results: Vec<FactoryAddressData> = Vec::new();
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(data)) => catchup_results.push(data),
+                Ok(Err(e)) => {
+                    tracing::error!("Factory catchup task failed: {:?}", e);
+                    return Err(e);
+                }
+                Err(e) => return Err(FactoryCollectionError::JoinError(e.to_string())),
+            }
         }
 
-        catchup_count += 1;
+        catchup_results.sort_by_key(|d| d.range_start);
+
+        for factory_data in catchup_results {
+            if let Some(ref tx) = logs_factory_tx {
+                if tx.send(factory_data.clone()).await.is_err() {
+                    tracing::error!(
+                        "Failed to send catchup factory data for range {}-{} to logs_factory_tx - receiver dropped",
+                        factory_data.range_start,
+                        factory_data.range_end
+                    );
+                    return Err(FactoryCollectionError::ChannelSend(format!(
+                        "logs_factory_tx (catchup {}-{}) - receiver dropped",
+                        factory_data.range_start, factory_data.range_end
+                    )));
+                }
+            }
+
+            if let Some(ref tx) = eth_calls_factory_tx {
+                let _ = tx.send(factory_data.clone()).await;
+            }
+
+            let addresses: HashMap<String, Vec<Address>> = factory_data
+                .addresses_by_block
+                .values()
+                .flatten()
+                .fold(HashMap::new(), |mut acc, (_, addr, collection)| {
+                    acc.entry(collection.clone()).or_default().push(*addr);
+                    acc
+                });
+
+            if let Some(ref tx) = log_decoder_tx {
+                let _ = tx
+                    .send(DecoderMessage::FactoryAddresses {
+                        range_start: factory_data.range_start,
+                        range_end: factory_data.range_end,
+                        addresses: addresses.clone(),
+                    })
+                    .await;
+            }
+
+            if let Some(ref tx) = call_decoder_tx {
+                let _ = tx
+                    .send(DecoderMessage::FactoryAddresses {
+                        range_start: factory_data.range_start,
+                        range_end: factory_data.range_end,
+                        addresses,
+                    })
+                    .await;
+            }
+
+            catchup_count += 1;
+        }
     }
 
     if catchup_count > 0 {
@@ -582,6 +604,197 @@ async fn process_range(
         }
     }
 
+    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files).await?;
+
+    Ok(FactoryAddressData {
+        range_start,
+        range_end,
+        addresses_by_block,
+    })
+}
+
+/// Read log batches from a parquet file with column projection.
+/// Only reads block_number, block_timestamp, address, topics, data — skips transaction_hash and log_index.
+fn read_log_batches_from_parquet(file_path: &Path) -> Result<Vec<RecordBatch>, FactoryCollectionError> {
+    let file = File::open(file_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let arrow_schema = builder.schema().clone();
+
+    let needed = ["block_number", "block_timestamp", "address", "topics", "data"];
+    let root_indices: Vec<usize> = needed
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+    let reader = builder.with_projection(mask).build()?;
+
+    let mut batches = Vec::new();
+    for batch_result in reader {
+        batches.push(batch_result?);
+    }
+
+    Ok(batches)
+}
+
+/// Process log record batches using Arrow-native column access.
+/// Works directly on Arrow arrays instead of materializing LogData structs.
+async fn process_range_batches(
+    range_start: u64,
+    range_end: u64,
+    batches: Vec<RecordBatch>,
+    matchers: &[FactoryMatcher],
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<FactoryAddressData, FactoryCollectionError> {
+    let mut records: Vec<FactoryRecord> = Vec::new();
+    let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
+
+    for batch in &batches {
+        let block_nums = match batch
+            .column_by_name("block_number")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+        let timestamps = match batch
+            .column_by_name("block_timestamp")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+        let addrs = match batch
+            .column_by_name("address")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        let topics_list = batch
+            .column_by_name("topics")
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>());
+
+        // Pre-extract inner topics array and offsets for zero-copy access
+        let topics_inner = topics_list
+            .and_then(|l| l.values().as_any().downcast_ref::<FixedSizeBinaryArray>());
+        let topics_offsets = topics_list.map(|l| l.offsets());
+
+        let data_col = batch
+            .column_by_name("data")
+            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>());
+
+        for i in 0..batch.num_rows() {
+            let addr_bytes = addrs.value(i);
+            if addr_bytes.len() != 20 {
+                continue;
+            }
+
+            for matcher in matchers {
+                if addr_bytes != matcher.factory_contract_address.as_slice() {
+                    continue;
+                }
+
+                // Check topic0 match using pre-extracted inner array and offsets
+                let topic0_match = match (topics_offsets, topics_inner) {
+                    (Some(offsets), Some(inner)) => {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        end > start && inner.value(start) == matcher.event_topic0.as_slice()
+                    }
+                    _ => false,
+                };
+
+                if !topic0_match {
+                    continue;
+                }
+
+                let block_number = block_nums.value(i);
+                let block_timestamp = timestamps.value(i);
+
+                let extracted_address = match &matcher.param_location {
+                    FactoryParameterLocation::Topic(idx) => {
+                        match (topics_offsets, topics_inner) {
+                            (Some(offsets), Some(inner)) => {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                let num_topics = end - start;
+                                if *idx < num_topics {
+                                    let topic = inner.value(start + *idx);
+                                    if topic.len() == 32 {
+                                        let mut addr = [0u8; 20];
+                                        addr.copy_from_slice(&topic[12..32]);
+                                        Some(addr)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    FactoryParameterLocation::Data(indices) => {
+                        let data = data_col.map(|arr| arr.value(i)).unwrap_or(&[]);
+                        match decode_address_from_data(data, &matcher.data_types, indices) {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                tracing::warn!(
+                                    block_number,
+                                    contract = %Address::from_slice(addr_bytes),
+                                    collection = %matcher.collection_name,
+                                    "Failed to decode factory event data: {}",
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    }
+                };
+
+                if let Some(addr) = extracted_address {
+                    records.push(FactoryRecord {
+                        block_number,
+                        block_timestamp,
+                        factory_address: addr,
+                        collection_name: matcher.collection_name.clone(),
+                    });
+
+                    addresses_by_block
+                        .entry(block_number)
+                        .or_default()
+                        .push((
+                            block_timestamp,
+                            Address::from(addr),
+                            matcher.collection_name.clone(),
+                        ));
+                }
+            }
+        }
+    }
+
+    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files).await?;
+
+    Ok(FactoryAddressData {
+        range_start,
+        range_end,
+        addresses_by_block,
+    })
+}
+
+/// Write factory records to parquet files, grouped by collection.
+/// Writes empty parquet files for collections with no matching events.
+async fn write_factory_parquet_files(
+    range_start: u64,
+    range_end: u64,
+    records: Vec<FactoryRecord>,
+    matchers: &[FactoryMatcher],
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<(), FactoryCollectionError> {
     let mut by_collection: HashMap<String, Vec<FactoryRecord>> = HashMap::new();
     for record in records {
         by_collection
@@ -648,11 +861,7 @@ async fn process_range(
         }
     }
 
-    Ok(FactoryAddressData {
-        range_start,
-        range_end,
-        addresses_by_block,
-    })
+    Ok(())
 }
 
 fn extract_address_recursive(values: &[DynSolValue], indices: &[usize]) -> Option<[u8; 20]> {
