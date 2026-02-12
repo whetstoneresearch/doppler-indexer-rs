@@ -47,55 +47,39 @@ impl DbPool {
         let transaction = client.transaction().await?;
 
         for op in operations {
-            match op {
+            let (sql, params) = match op {
                 DbOperation::Upsert {
                     table,
                     columns,
                     values,
                     conflict_columns,
                     update_columns,
-                } => {
-                    let (sql, params) =
-                        build_upsert_sql(&table, &columns, &values, &conflict_columns, &update_columns);
-                    let params_refs: Vec<&(dyn ToSql + Sync)> =
-                        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
-                        tracing::error!("SQL execution failed: {}\nSQL: {}\nError: {:?}", e, sql, e);
-                        return Err(e.into());
-                    }
-                }
+                } => build_upsert_sql(&table, &columns, &values, &conflict_columns, &update_columns),
                 DbOperation::Insert {
                     table,
                     columns,
                     values,
-                } => {
-                    let (sql, params) = build_insert_sql(&table, &columns, &values);
-                    let params_refs: Vec<&(dyn ToSql + Sync)> =
-                        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    transaction.execute(&sql, &params_refs[..]).await?;
-                }
+                } => build_insert_sql(&table, &columns, &values),
                 DbOperation::Update {
                     table,
                     set_columns,
                     where_clause,
-                } => {
-                    let (sql, params) = build_update_sql(&table, &set_columns, &where_clause);
-                    let params_refs: Vec<&(dyn ToSql + Sync)> =
-                        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    transaction.execute(&sql, &params_refs[..]).await?;
-                }
+                } => build_update_sql(&table, &set_columns, &where_clause),
                 DbOperation::Delete { table, where_clause } => {
-                    let (sql, params) = build_delete_sql(&table, &where_clause);
-                    let params_refs: Vec<&(dyn ToSql + Sync)> =
-                        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    transaction.execute(&sql, &params_refs[..]).await?;
+                    build_delete_sql(&table, &where_clause)
                 }
                 DbOperation::RawSql { query, params } => {
-                    let converted = convert_values_to_params(&params);
-                    let params_refs: Vec<&(dyn ToSql + Sync)> =
-                        converted.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-                    transaction.execute(&query, &params_refs[..]).await?;
+                    (query, convert_values_to_params(&params))
                 }
+            };
+
+            let params_refs: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+
+            if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
+                let db_err: DbError = e.into();
+                tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                return Err(db_err);
             }
         }
 
@@ -124,6 +108,7 @@ enum SqlParam {
     Bool(bool),
     Int64(i64),
     Int32(i32),
+    Float64(f64),
     Text(String),
     Bytes(Vec<u8>),
     Json(serde_json::Value),
@@ -140,6 +125,7 @@ impl ToSql for SqlParam {
             SqlParam::Bool(v) => v.to_sql(ty, out),
             SqlParam::Int64(v) => v.to_sql(ty, out),
             SqlParam::Int32(v) => v.to_sql(ty, out),
+            SqlParam::Float64(v) => v.to_sql(ty, out),
             SqlParam::Text(v) => v.to_sql(ty, out),
             SqlParam::Bytes(v) => v.to_sql(ty, out),
             SqlParam::Json(v) => v.to_sql(ty, out),
@@ -150,6 +136,7 @@ impl ToSql for SqlParam {
         <bool as ToSql>::accepts(ty)
             || <i64 as ToSql>::accepts(ty)
             || <i32 as ToSql>::accepts(ty)
+            || <f64 as ToSql>::accepts(ty)
             || <String as ToSql>::accepts(ty)
             || <Vec<u8> as ToSql>::accepts(ty)
             || <serde_json::Value as ToSql>::accepts(ty)
@@ -169,8 +156,8 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::Bytes(v) => SqlParam::Bytes(v.clone()),
         DbValue::Address(v) => SqlParam::Bytes(v.to_vec()),
         DbValue::Bytes32(v) => SqlParam::Bytes(v.to_vec()),
-        DbValue::Numeric(v) => SqlParam::Text(v.clone()), // NUMERIC accepts text
-        DbValue::Timestamp(v) => SqlParam::Int64(*v),
+        DbValue::Numeric(v) => SqlParam::Text(v.clone()),
+        DbValue::Timestamp(v) => SqlParam::Float64(*v as f64),
         DbValue::Json(v) => SqlParam::Json(v.clone()),
     }
 }
@@ -179,9 +166,34 @@ fn convert_values_to_params(values: &[DbValue]) -> Vec<SqlParam> {
     values.iter().map(convert_db_value).collect()
 }
 
+/// Generate the SQL placeholder for a value at the given parameter index.
+/// Uses casts for types that need special handling:
+/// - Timestamp → `to_timestamp($N)`
+/// - Numeric → `$N::numeric` (sent as text, cast by PostgreSQL)
+fn placeholder_for(value: &DbValue, param_idx: usize) -> String {
+    match value {
+        DbValue::Timestamp(_) => format!("to_timestamp(${})", param_idx),
+        DbValue::Numeric(_) => format!("${}::text::numeric", param_idx),
+        _ => format!("${}", param_idx),
+    }
+}
+
+/// Wrap a column name in double quotes to handle reserved keywords.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name)
+}
+
+fn quote_cols(columns: &[String]) -> String {
+    columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ")
+}
+
 fn build_insert_sql(table: &str, columns: &[String], values: &[DbValue]) -> (String, Vec<SqlParam>) {
-    let cols = columns.join(", ");
-    let placeholders: Vec<String> = (1..=values.len()).map(|i| format!("${}", i)).collect();
+    let cols = quote_cols(columns);
+    let placeholders: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| placeholder_for(v, i + 1))
+        .collect();
     let placeholders_str = placeholders.join(", ");
 
     let sql = format!("INSERT INTO {} ({}) VALUES ({})", table, cols, placeholders_str);
@@ -197,14 +209,18 @@ fn build_upsert_sql(
     conflict_columns: &[String],
     update_columns: &[String],
 ) -> (String, Vec<SqlParam>) {
-    let cols = columns.join(", ");
-    let placeholders: Vec<String> = (1..=values.len()).map(|i| format!("${}", i)).collect();
+    let cols = quote_cols(columns);
+    let placeholders: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| placeholder_for(v, i + 1))
+        .collect();
     let placeholders_str = placeholders.join(", ");
 
-    let conflict_cols = conflict_columns.join(", ");
+    let conflict_cols = quote_cols(conflict_columns);
     let updates: Vec<String> = update_columns
         .iter()
-        .map(|c| format!("{} = EXCLUDED.{}", c, c))
+        .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
         .collect();
     let updates_str = updates.join(", ");
 
@@ -235,39 +251,16 @@ fn build_update_sql(
     let sets: Vec<String> = set_columns
         .iter()
         .map(|(col, val)| {
+            let ph = placeholder_for(val, param_idx);
             params.push(convert_db_value(val));
-            let s = format!("{} = ${}", col, param_idx);
+            let s = format!("{} = {}", quote_ident(col), ph);
             param_idx += 1;
             s
         })
         .collect();
     let sets_str = sets.join(", ");
 
-    let where_str = match where_clause {
-        WhereClause::Eq(col, val) => {
-            params.push(convert_db_value(val));
-            let s = format!("{} = ${}", col, param_idx);
-            s
-        }
-        WhereClause::And(conditions) => {
-            let parts: Vec<String> = conditions
-                .iter()
-                .map(|(col, val)| {
-                    params.push(convert_db_value(val));
-                    let s = format!("{} = ${}", col, param_idx);
-                    param_idx += 1;
-                    s
-                })
-                .collect();
-            parts.join(" AND ")
-        }
-        WhereClause::Raw { condition, params: raw_params } => {
-            for p in raw_params {
-                params.push(convert_db_value(p));
-            }
-            condition.clone()
-        }
-    };
+    let where_str = build_where_sql(where_clause, &mut params, &mut param_idx);
 
     let sql = format!("UPDATE {} SET {} WHERE {}", table, sets_str, where_str);
     (sql, params)
@@ -277,18 +270,32 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
     let mut params = Vec::new();
     let mut param_idx = 1;
 
-    let where_str = match where_clause {
+    let where_str = build_where_sql(where_clause, &mut params, &mut param_idx);
+
+    let sql = format!("DELETE FROM {} WHERE {}", table, where_str);
+    (sql, params)
+}
+
+fn build_where_sql(
+    where_clause: &WhereClause,
+    params: &mut Vec<SqlParam>,
+    param_idx: &mut usize,
+) -> String {
+    match where_clause {
         WhereClause::Eq(col, val) => {
+            let ph = placeholder_for(val, *param_idx);
             params.push(convert_db_value(val));
-            format!("{} = ${}", col, param_idx)
+            *param_idx += 1;
+            format!("{} = {}", quote_ident(col), ph)
         }
         WhereClause::And(conditions) => {
             let parts: Vec<String> = conditions
                 .iter()
                 .map(|(col, val)| {
+                    let ph = placeholder_for(val, *param_idx);
                     params.push(convert_db_value(val));
-                    let s = format!("{} = ${}", col, param_idx);
-                    param_idx += 1;
+                    let s = format!("{} = {}", quote_ident(col), ph);
+                    *param_idx += 1;
                     s
                 })
                 .collect();
@@ -300,8 +307,5 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
             }
             condition.clone()
         }
-    };
-
-    let sql = format!("DELETE FROM {} WHERE {}", table, where_str);
-    (sql, params)
+    }
 }
