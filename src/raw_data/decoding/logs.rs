@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 
 use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
+use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage,
@@ -104,6 +105,7 @@ pub async fn decode_logs(
     raw_data_config: &RawDataCollectionConfig,
     mut decoder_rx: Receiver<DecoderMessage>,
     transform_tx: Option<Sender<DecodedEventsMessage>>,
+    recollect_tx: Option<Sender<RecollectRequest>>,
 ) -> Result<(), LogDecodingError> {
     let output_base = PathBuf::from(format!("data/derived/{}/decoded/logs", chain.name));
     std::fs::create_dir_all(&output_base)?;
@@ -155,6 +157,7 @@ pub async fn decode_logs(
             chain,
             raw_data_config,
             transform_tx.as_ref(),
+            recollect_tx.as_ref(),
         )
         .await?;
     }
@@ -300,6 +303,7 @@ async fn catchup_decode_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedEventsMessage>>,
+    recollect_tx: Option<&Sender<RecollectRequest>>,
 ) -> Result<(), LogDecodingError> {
     let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
 
@@ -397,6 +401,8 @@ async fn catchup_decode_logs(
 
     let mut join_set = JoinSet::new();
 
+    let recollect_tx = recollect_tx.cloned();
+
     for (range_start, range_end, file_path) in files_to_process {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let regular_matchers = regular_matchers.clone();
@@ -404,6 +410,7 @@ async fn catchup_decode_logs(
         let factory_addresses = factory_addresses.clone();
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
+        let recollect_tx = recollect_tx.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -415,7 +422,49 @@ async fn catchup_decode_logs(
             );
 
             // Read raw logs from parquet
-            let logs = read_logs_from_parquet(&file_path)?;
+            let file_path_for_read = file_path.clone();
+            let logs = match read_logs_from_parquet(&file_path_for_read) {
+                Ok(logs) => logs,
+                Err(e) => {
+                    tracing::warn!(
+                        "Corrupted log file {}: {} - deleting and requesting recollection for range {}-{}",
+                        file_path.display(),
+                        e,
+                        range_start,
+                        range_end - 1
+                    );
+
+                    // Delete the corrupted file
+                    if let Err(del_err) = std::fs::remove_file(&file_path) {
+                        tracing::error!(
+                            "Failed to delete corrupted log file {}: {}",
+                            file_path.display(),
+                            del_err
+                        );
+                    } else {
+                        tracing::info!("Deleted corrupted log file: {}", file_path.display());
+                    }
+
+                    // Send recollect request
+                    if let Some(tx) = recollect_tx {
+                        let request = RecollectRequest {
+                            range_start,
+                            range_end,
+                            file_path: file_path.clone(),
+                        };
+                        if let Err(send_err) = tx.send(request).await {
+                            tracing::error!(
+                                "Failed to send recollect request for range {}-{}: {}",
+                                range_start,
+                                range_end - 1,
+                                send_err
+                            );
+                        }
+                    }
+
+                    return Ok(());
+                }
+            };
 
             // Get factory addresses for this range
             let factory_addrs = factory_addresses

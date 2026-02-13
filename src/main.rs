@@ -207,8 +207,10 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         optional_channel::<DecoderMessage>(has_events, channel_cap);
     let (call_decoder_tx, call_decoder_rx) =
         optional_channel::<DecoderMessage>(has_calls, channel_cap);
+    // Recollect channel is needed by both factory collector and log decoder
+    let needs_recollect = has_factories || has_events;
     let (recollect_tx, recollect_rx) =
-        optional_channel::<RecollectRequest>(has_factories, channel_cap);
+        optional_channel::<RecollectRequest>(needs_recollect, channel_cap);
 
     let event_matchers = if has_event_triggered_calls {
         build_event_trigger_matchers(&chain.contracts)
@@ -266,6 +268,17 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     };
     let call_decoder_tx_for_factories = if has_factories {
         call_decoder_tx.clone()
+    } else {
+        None
+    };
+    // Clone recollect_tx for both factory collector and log decoder
+    let recollect_tx_for_factories = if has_factories {
+        recollect_tx.clone()
+    } else {
+        None
+    };
+    let recollect_tx_for_log_decoder = if has_events {
+        recollect_tx.clone()
     } else {
         None
     };
@@ -338,7 +351,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
                     eth_calls_factory_tx,
                     log_decoder_tx_for_factories,
                     call_decoder_tx_for_factories,
-                    recollect_tx,
+                    recollect_tx_for_factories,
                 )
                 .await
                 .context("factory collection failed")
@@ -351,7 +364,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
-                decode_logs(&chain, &cfg, log_decoder_rx.unwrap(), transform_events_tx)
+                decode_logs(&chain, &cfg, log_decoder_rx.unwrap(), transform_events_tx, recollect_tx_for_log_decoder)
                     .await
                     .context("log decoding failed")
             }

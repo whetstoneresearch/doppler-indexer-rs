@@ -250,7 +250,9 @@ async fn process_completed_range(
         end: range_end,
     };
 
-    if existing_files.contains(&range.file_name()) {
+    // Check filesystem directly instead of cache to handle files deleted during recollection
+    let output_path = output_dir.join(range.file_name());
+    if output_path.exists() {
         tracing::debug!(
             "Skipping logs for blocks {}-{} (already exists)",
             range.start,
