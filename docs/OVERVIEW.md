@@ -23,8 +23,8 @@ The indexer runs as multiple concurrent async tasks connected by channels:
 └──────┬──────┘     └────────┬─────────┘     └─────────────┘                      │
        │                     │                                                     │
        │                     └────────────────►┌─────────────┐                     │
-       │                                       │  Factories  │────► Decoder        │
-       │                                       └─────────────┘                     │
+       │                           ◄───────────│  Factories  │────► Decoder        │
+       │                        (recollect)    └─────────────┘                     │
        │                                                                           ▼
        └─────────────────────────────────────►┌─────────────┐              ┌──────────────┐
                                               │  ETH Calls  │────► Decoder─►│Transformations│──► PostgreSQL
@@ -32,6 +32,8 @@ The indexer runs as multiple concurrent async tasks connected by channels:
 ```
 
 Each collector runs independently, maximizing throughput while respecting RPC rate limits. The optional transformation layer processes decoded data and writes to PostgreSQL.
+
+**Recollection Channel**: When the factory collector encounters a corrupted log file during catchup, it deletes the file and sends a recollection request back to the receipt collector. The receipt collector then re-fetches the data and sends it through the normal channels, ensuring data integrity without manual intervention.
 
 ## Output Structure
 

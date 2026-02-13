@@ -218,6 +218,7 @@ pub async fn collect_factories(
     eth_calls_factory_tx: Option<Sender<FactoryAddressData>>,
     log_decoder_tx: Option<Sender<DecoderMessage>>,
     call_decoder_tx: Option<Sender<DecoderMessage>>,
+    recollect_tx: Option<Sender<RecollectRequest>>,
 ) -> Result<(), FactoryCollectionError>
 ```
 
@@ -232,6 +233,7 @@ pub async fn collect_factories(
 | `eth_calls_factory_tx` | `Option<Sender<FactoryAddressData>>` | Channel to send addresses to eth_calls collector |
 | `log_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to log decoder |
 | `call_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to call decoder |
+| `recollect_tx` | `Option<Sender<RecollectRequest>>` | Channel to request recollection of corrupted log files |
 
 ### LogMessage Protocol
 
@@ -551,6 +553,59 @@ This is particularly useful when:
 - Factory collection was interrupted mid-run
 - New factory configurations are added to existing contracts
 - Factory files were manually deleted for re-processing
+
+### Corrupted File Recovery
+
+During catchup, if a log parquet file is corrupted (fails to parse), the factory collector automatically handles recovery:
+
+1. **Detection**: When `read_log_batches_from_parquet` fails with a parse error
+2. **Deletion**: The corrupted file is deleted from `data/raw/{chain}/logs/`
+3. **Recollection Request**: A `RecollectRequest` is sent via the `recollect_tx` channel to the receipt collector
+4. **Re-fetching**: The receipt collector reads block info from the corresponding block file, re-fetches receipts via RPC, and sends logs through the normal `factory_log_tx` channel
+5. **Processing**: The factory collector receives the re-fetched logs through its normal channel and processes them
+
+#### RecollectRequest Structure
+
+```rust
+pub struct RecollectRequest {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub file_path: PathBuf,
+}
+```
+
+#### Data Flow for Corrupted File Recovery
+
+```
+Factory Catchup                           Receipt Collector
+     │                                           │
+     │ (attempts to read corrupted file)         │
+     │                                           │
+     ▼                                           │
+  Parse error detected                           │
+     │                                           │
+     ▼                                           │
+  Delete corrupted file                          │
+  (data/raw/{chain}/logs/logs_X-Y.parquet)       │
+     │                                           │
+     │─────── RecollectRequest ─────────────────►│
+     │        {range_start, range_end}           │
+     │                                           ▼
+     │                                  Read block info from
+     │                                  blocks_X-Y.parquet
+     │                                           │
+     │                                           ▼
+     │                                  Fetch receipts via RPC
+     │                                           │
+     │◄──────────── LogMessage ──────────────────│
+     │          (via factory_log_tx)             │
+     │                                           │
+     ▼                                           │
+  Process logs normally                          │
+  Write factory parquet                          │
+```
+
+This automatic recovery ensures data integrity without manual intervention, even when parquet files become corrupted due to crashes, disk errors, or other issues.
 
 ### Empty Range Handling
 

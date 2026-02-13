@@ -6,6 +6,7 @@ The receipt collection module fetches transaction receipts via RPC and writes th
 
 ```rust
 use doppler_indexer_rs::raw_data::historical::receipts::{collect_receipts, LogMessage};
+use doppler_indexer_rs::raw_data::historical::factories::RecollectRequest;
 use doppler_indexer_rs::rpc::UnifiedRpcClient;
 use tokio::sync::mpsc;
 
@@ -17,6 +18,8 @@ let (block_tx, block_rx) = mpsc::channel(1000);
 let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
 // Channel to factory collector (optional)
 let (factory_log_tx, factory_log_rx) = mpsc::channel::<LogMessage>(1000);
+// Channel for recollection requests from factory collector (optional)
+let (recollect_tx, recollect_rx) = mpsc::channel::<RecollectRequest>(100);
 
 collect_receipts(
     &chain_config,
@@ -25,6 +28,9 @@ collect_receipts(
     block_rx,
     Some(log_tx),
     Some(factory_log_tx),
+    None,  // event_trigger_tx
+    vec![], // event_matchers
+    Some(recollect_rx),
 ).await?;
 ```
 
@@ -38,6 +44,9 @@ pub async fn collect_receipts(
     block_rx: Receiver<(u64, u64, Vec<B256>)>,
     log_tx: Option<Sender<LogMessage>>,
     factory_log_tx: Option<Sender<LogMessage>>,
+    event_trigger_tx: Option<Sender<EventTriggerMessage>>,
+    event_matchers: Vec<EventTriggerMatcher>,
+    recollect_rx: Option<Receiver<RecollectRequest>>,
 ) -> Result<(), ReceiptCollectionError>
 ```
 
@@ -51,6 +60,9 @@ pub async fn collect_receipts(
 | `block_rx` | `Receiver<(u64, u64, Vec<B256>)>` | Channel receiving block info from block collector |
 | `log_tx` | `Option<Sender<LogMessage>>` | Optional channel for forwarding logs to log collector |
 | `factory_log_tx` | `Option<Sender<LogMessage>>` | Optional channel for forwarding logs to factory collector |
+| `event_trigger_tx` | `Option<Sender<EventTriggerMessage>>` | Optional channel for event-triggered eth_calls |
+| `event_matchers` | `Vec<EventTriggerMatcher>` | Matchers for detecting events that trigger eth_calls |
+| `recollect_rx` | `Option<Receiver<RecollectRequest>>` | Optional channel for receiving recollection requests from factory collector |
 
 ### Input Channel Message Format
 
@@ -176,6 +188,62 @@ If a block range contains no transactions, the collector writes an empty parquet
 ### Manual Re-collection
 
 To re-collect a range, delete the corresponding file from `data/raw/{chain}/receipts/`. Note that you may also need to delete the corresponding logs and factory files if you want those to be regenerated.
+
+## Automatic Recollection (Corrupted File Recovery)
+
+The receipt collector supports automatic recollection of ranges when downstream collectors detect corrupted files. This is primarily used by the factory collector during its catchup phase.
+
+### How It Works
+
+1. **Detection**: During catchup, the factory collector reads existing log parquet files. If a file is corrupted (fails to parse), the factory collector:
+   - Deletes the corrupted file
+   - Sends a `RecollectRequest` through the `recollect_tx` channel
+
+2. **Re-processing**: The receipt collector listens on `recollect_rx` using `tokio::select!`:
+   - Reads block info from the corresponding block parquet file
+   - Re-fetches receipts via RPC for that range
+   - Sends logs through the normal `factory_log_tx` channel
+
+3. **Normal Processing**: The factory collector receives the re-fetched logs through its normal `log_rx` channel and processes them as usual
+
+### RecollectRequest Structure
+
+```rust
+pub struct RecollectRequest {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub file_path: PathBuf,
+}
+```
+
+### Data Flow
+
+```
+Factory Catchup                    Receipt Collector
+     │                                    │
+     │ (reads corrupted log file)         │
+     │                                    │
+     ▼                                    │
+  Delete file                             │
+     │                                    │
+     │──── RecollectRequest ─────────────►│
+     │                                    │
+     │                                    ▼
+     │                          Read block info
+     │                          Fetch receipts (RPC)
+     │                                    │
+     │◄─────── LogMessage ────────────────│
+     │      (via factory_log_tx)          │
+     ▼                                    │
+  Process normally                        │
+```
+
+### Benefits
+
+- **Automatic recovery**: No manual intervention required for corrupted files
+- **Data integrity**: Ensures all ranges are properly processed
+- **Efficient**: Only re-fetches the specific corrupted range, not the entire dataset
+- **Non-blocking**: Uses `tokio::select!` to handle recollection requests alongside normal block processing
 
 ## Field Configuration
 

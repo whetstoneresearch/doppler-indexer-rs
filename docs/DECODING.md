@@ -300,6 +300,53 @@ For factory events during catchup, the decoder loads factory addresses from `dat
 - Empty files are written for ranges with no matching events (to mark as processed)
 - Channel disconnection triggers graceful shutdown
 
+### Corrupted File Recovery
+
+During the catchup phase, if the log decoder encounters a corrupted raw log file, it automatically handles recovery:
+
+1. **Detection**: When reading a raw log parquet file fails with a parse error
+2. **Deletion**: The corrupted file is deleted from `data/raw/{chain}/logs/`
+3. **Recollection Request**: A `RecollectRequest` is sent to the receipt collector
+4. **Re-fetching**: The receipt collector re-fetches receipts from RPC and sends logs through the normal channel flow
+5. **Processing**: The logs collector writes a new parquet file, and the log decoder processes it during the live phase
+
+#### Data Flow for Corrupted File Recovery
+
+```
+Log Decoder Catchup                          Receipt Collector
+     │                                              │
+     │ (attempts to read raw log file)              │
+     │                                              │
+     ▼                                              │
+  Parse error detected                              │
+     │                                              │
+     ▼                                              │
+  Delete corrupted file                             │
+  (data/raw/{chain}/logs/logs_X-Y.parquet)          │
+     │                                              │
+     │───────── RecollectRequest ──────────────────►│
+     │          {range_start, range_end}            │
+     │                                              ▼
+     │                                    Read block info
+     │                                    Fetch receipts via RPC
+     │                                              │
+     │                              ┌───────────────┴───────────────┐
+     │                              │                               │
+     │                              ▼                               ▼
+     │                       Logs Collector               Factory Collector
+     │                       (writes new file)            (processes factories)
+     │                              │
+     │                              │ decoder_tx
+     │                              ▼
+     │◄─────────── DecoderMessage (LogsReady) ──────
+     │              (via normal channel)
+     ▼
+  Process logs in live phase
+  Write decoded parquet
+```
+
+This automatic recovery ensures data integrity without manual intervention, even when raw log files become corrupted.
+
 ## Performance Considerations
 
 - Decoding runs concurrently with data collection

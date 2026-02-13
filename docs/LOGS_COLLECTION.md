@@ -191,6 +191,18 @@ Parquet files are written even for ranges with no logs (either because no events
 
 To re-collect logs for a range, delete the corresponding file from `data/raw/{chain}/logs/`. You may also need to delete the corresponding receipts file to trigger the receipt collector's catchup logic.
 
+### Automatic Recollection (Corrupted Files)
+
+Log files can also be automatically recollected when the factory collector detects corruption during its catchup phase:
+
+1. **Detection**: Factory collector attempts to read a log file and encounters a parse error
+2. **Deletion**: The corrupted log file is automatically deleted
+3. **Recollection**: Factory collector sends a `RecollectRequest` to the receipt collector
+4. **Re-fetching**: Receipt collector re-fetches receipts from RPC and sends logs through channels
+5. **Writing**: The logs collector receives the data through its normal channel and writes a new parquet file
+
+This automatic recovery ensures data integrity without manual intervention. See [Factory Collection](./FACTORY_COLLECTION.md#corrupted-file-recovery) and [Receipt Collection](./RECEIPTS_COLLECTION.md#automatic-recollection-corrupted-file-recovery) for more details.
+
 ## Field Configuration
 
 ### Minimal Schema (when `log_fields` is specified)
@@ -381,7 +393,17 @@ let mut tasks = JoinSet::new();
 
 // Spawn collectors
 tasks.spawn(collect_blocks(chain.clone(), client.clone(), config.clone(), Some(block_tx)));
-tasks.spawn(collect_receipts(chain.clone(), client.clone(), config.clone(), block_rx, Some(log_tx), None));
+tasks.spawn(collect_receipts(
+    chain.clone(),
+    client.clone(),
+    config.clone(),
+    block_rx,
+    Some(log_tx),
+    None,  // factory_log_tx
+    None,  // event_trigger_tx
+    vec![], // event_matchers
+    None,  // recollect_rx
+));
 tasks.spawn(collect_logs(chain.clone(), config.clone(), log_rx, None, None));
 
 // Wait for all to complete
