@@ -4,6 +4,7 @@
 //! they need: decoded events/calls, chain info, historical queries, and RPC access.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
@@ -62,6 +63,7 @@ impl DecodedValue {
             DecodedValue::Uint64(v) => Some(U256::from(*v)),
             DecodedValue::Uint32(v) => Some(U256::from(*v)),
             DecodedValue::Uint8(v) => Some(U256::from(*v)),
+            DecodedValue::String(s) => U256::from_str(s.trim()).ok(),
             _ => None,
         }
     }
@@ -74,6 +76,7 @@ impl DecodedValue {
             DecodedValue::Int64(v) => Some(I256::try_from(*v).unwrap_or_default()),
             DecodedValue::Int32(v) => Some(I256::try_from(*v).unwrap_or_default()),
             DecodedValue::Int8(v) => Some(I256::try_from(*v).unwrap_or_default()),
+            DecodedValue::String(s) => I256::from_str(s.trim()).ok(),
             _ => None,
         }
     }
@@ -159,6 +162,13 @@ impl DecodedValue {
             DecodedValue::Int32(v) => Some(v.to_string()),
             DecodedValue::Uint8(v) => Some(v.to_string()),
             DecodedValue::Int8(v) => Some(v.to_string()),
+            DecodedValue::String(s) => {
+                if U256::from_str(s.trim()).is_ok() || I256::from_str(s.trim()).is_ok() {
+                    Some(s.trim().to_string())
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
