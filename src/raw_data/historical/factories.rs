@@ -78,6 +78,7 @@ pub async fn collect_factories(
     eth_calls_factory_tx: Option<Sender<FactoryAddressData>>,
     log_decoder_tx: Option<Sender<DecoderMessage>>,
     call_decoder_tx: Option<Sender<DecoderMessage>>,
+    recollect_tx: Option<Sender<RecollectRequest>>,
 ) -> Result<(), FactoryCollectionError> {
     let output_dir = PathBuf::from(format!("data/derived/{}/factories", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -222,8 +223,9 @@ pub async fn collect_factories(
 
     {
         let semaphore = Arc::new(Semaphore::new(factory_concurrency));
-        let mut join_set: JoinSet<Result<FactoryAddressData, FactoryCollectionError>> =
-            JoinSet::new();
+        let mut join_set: JoinSet<
+            Result<Option<FactoryAddressData>, FactoryCollectionError>,
+        > = JoinSet::new();
 
         for log_range in &log_ranges {
             let all_factory_files_exist = factory_collection_names.iter().all(|collection| {
@@ -248,14 +250,61 @@ pub async fn collect_factories(
             let start = log_range.start;
             let end = log_range.end;
 
+            let recollect_tx = recollect_tx.clone();
             join_set.spawn(async move {
                 let _permit = permit;
 
-                let batches = tokio::task::spawn_blocking(move || {
-                    read_log_batches_from_parquet(&file_path)
+                let file_path_for_read = file_path.clone();
+                let file_path_display = file_path.display().to_string();
+                let batches = match tokio::task::spawn_blocking(move || {
+                    read_log_batches_from_parquet(&file_path_for_read)
                 })
                 .await
-                .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+                {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Corrupted log file {}: {} - deleting and requesting recollection for range {}-{}",
+                            file_path_display,
+                            e,
+                            start,
+                            end - 1
+                        );
+
+                        // Delete the corrupted file
+                        if let Err(del_err) = std::fs::remove_file(&file_path) {
+                            tracing::error!(
+                                "Failed to delete corrupted log file {}: {}",
+                                file_path.display(),
+                                del_err
+                            );
+                        } else {
+                            tracing::info!("Deleted corrupted log file: {}", file_path.display());
+                        }
+
+                        // Send recollect request
+                        if let Some(tx) = recollect_tx {
+                            let request = RecollectRequest {
+                                range_start: start,
+                                range_end: end,
+                                file_path: file_path.clone(),
+                            };
+                            if let Err(send_err) = tx.send(request).await {
+                                tracing::error!(
+                                    "Failed to send recollect request for range {}-{}: {}",
+                                    start,
+                                    end - 1,
+                                    send_err
+                                );
+                            }
+                        }
+
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(FactoryCollectionError::JoinError(e.to_string()));
+                    }
+                };
 
                 let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 tracing::info!(
@@ -267,6 +316,7 @@ pub async fn collect_factories(
 
                 process_range_batches(start, end, batches, &matchers, &output_dir, &existing_files)
                     .await
+                    .map(Some)
             });
         }
 
@@ -274,7 +324,8 @@ pub async fn collect_factories(
 
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(data)) => catchup_results.push(data),
+                Ok(Ok(Some(data))) => catchup_results.push(data),
+                Ok(Ok(None)) => {} // Skipped (corrupt/unreadable file)
                 Ok(Err(e)) => {
                     tracing::error!("Factory catchup task failed: {:?}", e);
                     return Err(e);
@@ -1211,6 +1262,14 @@ fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollecti
 pub struct ExistingLogRange {
     pub start: u64,
     pub end: u64,
+    pub file_path: PathBuf,
+}
+
+/// Request to recollect a corrupted log file range
+#[derive(Debug, Clone)]
+pub struct RecollectRequest {
+    pub range_start: u64,
+    pub range_end: u64,
     pub file_path: PathBuf,
 }
 

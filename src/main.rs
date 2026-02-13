@@ -19,7 +19,7 @@ use db::DbPool;
 use raw_data::decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
-use raw_data::historical::factories::collect_factories;
+use raw_data::historical::factories::{collect_factories, RecollectRequest};
 use raw_data::historical::logs::collect_logs;
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, collect_receipts, EventTriggerMessage, LogMessage,
@@ -207,6 +207,8 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         optional_channel::<DecoderMessage>(has_events, channel_cap);
     let (call_decoder_tx, call_decoder_rx) =
         optional_channel::<DecoderMessage>(has_calls, channel_cap);
+    let (recollect_tx, recollect_rx) =
+        optional_channel::<RecollectRequest>(has_factories, channel_cap);
 
     let event_matchers = if has_event_triggered_calls {
         build_event_trigger_matchers(&chain.contracts)
@@ -291,6 +293,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
                 factory_log_tx,
                 event_trigger_tx,
                 event_matchers,
+                recollect_rx,
             )
             .await
             .context("receipt collection failed")
@@ -335,6 +338,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
                     eth_calls_factory_tx,
                     log_decoder_tx_for_factories,
                     call_decoder_tx_for_factories,
+                    recollect_tx,
                 )
                 .await
                 .context("factory collection failed")

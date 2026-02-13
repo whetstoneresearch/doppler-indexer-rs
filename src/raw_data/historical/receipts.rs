@@ -14,6 +14,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
+use crate::raw_data::historical::factories::RecollectRequest;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
@@ -365,6 +366,7 @@ pub async fn collect_receipts(
     factory_log_tx: Option<Sender<LogMessage>>,
     event_trigger_tx: Option<Sender<EventTriggerMessage>>,
     event_matchers: Vec<EventTriggerMatcher>,
+    mut recollect_rx: Option<Receiver<RecollectRequest>>,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/raw/{}/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -503,69 +505,186 @@ pub async fn collect_receipts(
     }
 
     // =========================================================================
-    // Normal phase: Process new blocks from the channel
+    // Normal phase: Process new blocks from the channel and handle recollect requests
     // =========================================================================
-    while let Some((block_number, timestamp, tx_hashes)) = block_rx.recv().await {
-        let range_start = (block_number / range_size) * range_size;
+    let mut block_rx_closed = false;
 
-        range_data
-            .entry(range_start)
-            .or_default()
-            .push(BlockInfo {
-                block_number,
-                timestamp,
-                tx_hashes,
-            });
+    loop {
+        tokio::select! {
+            block_result = block_rx.recv(), if !block_rx_closed => {
+                match block_result {
+                    Some((block_number, timestamp, tx_hashes)) => {
+                        let range_start = (block_number / range_size) * range_size;
 
-        if let Some(blocks) = range_data.get(&range_start) {
-            let expected_blocks: HashSet<u64> =
-                (range_start..range_start + range_size).collect();
-            let received_blocks: HashSet<u64> =
-                blocks.iter().map(|b| b.block_number).collect();
+                        range_data
+                            .entry(range_start)
+                            .or_default()
+                            .push(BlockInfo {
+                                block_number,
+                                timestamp,
+                                tx_hashes,
+                            });
 
-            if expected_blocks.is_subset(&received_blocks) {
-                let range = BlockRange {
-                    start: range_start,
-                    end: range_start + range_size,
-                };
+                        if let Some(blocks) = range_data.get(&range_start) {
+                            let expected_blocks: HashSet<u64> =
+                                (range_start..range_start + range_size).collect();
+                            let received_blocks: HashSet<u64> =
+                                blocks.iter().map(|b| b.block_number).collect();
 
-                if existing_files.contains(&range.file_name()) {
-                    tracing::info!(
-                        "Skipping receipts for blocks {}-{} (already exists)",
-                        range.start,
-                        range.end - 1
-                    );
-                    range_data.remove(&range_start);
+                            if expected_blocks.is_subset(&received_blocks) {
+                                let range = BlockRange {
+                                    start: range_start,
+                                    end: range_start + range_size,
+                                };
 
-                    // Still need to signal range complete for skipped ranges
-                    send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
-                    continue;
+                                if existing_files.contains(&range.file_name()) {
+                                    tracing::info!(
+                                        "Skipping receipts for blocks {}-{} (already exists)",
+                                        range.start,
+                                        range.end - 1
+                                    );
+                                    range_data.remove(&range_start);
+
+                                    // Still need to signal range complete for skipped ranges
+                                    send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                                    continue;
+                                }
+
+                                let blocks = range_data.remove(&range_start).unwrap();
+                                process_range(
+                                    &range,
+                                    blocks,
+                                    client,
+                                    receipt_fields,
+                                    &schema,
+                                    &output_dir,
+                                    &log_tx,
+                                    &factory_log_tx,
+                                    &event_trigger_tx,
+                                    &event_matchers,
+                                    rpc_batch_size,
+                                    &mut log_tx_metrics,
+                                    &mut factory_log_tx_metrics,
+                                    log_tx_capacity,
+                                    factory_log_tx_capacity,
+                                    chain.block_receipts_method.as_deref(),
+                                    block_receipt_concurrency,
+                                )
+                                .await?;
+
+                                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                            }
+                        }
+                    }
+                    None => {
+                        block_rx_closed = true;
+                    }
                 }
-
-                let blocks = range_data.remove(&range_start).unwrap();
-                process_range(
-                    &range,
-                    blocks,
-                    client,
-                    receipt_fields,
-                    &schema,
-                    &output_dir,
-                    &log_tx,
-                    &factory_log_tx,
-                    &event_trigger_tx,
-                    &event_matchers,
-                    rpc_batch_size,
-                    &mut log_tx_metrics,
-                    &mut factory_log_tx_metrics,
-                    log_tx_capacity,
-                    factory_log_tx_capacity,
-                    chain.block_receipts_method.as_deref(),
-                    block_receipt_concurrency,
-                )
-                .await?;
-
-                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
             }
+
+            recollect_result = async {
+                match &mut recollect_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(request) = recollect_result {
+                    tracing::info!(
+                        "Recollecting range {}-{} (corrupted file was deleted)",
+                        request.range_start,
+                        request.range_end - 1
+                    );
+
+                    // Find the corresponding block file and read block info
+                    let block_file_path = PathBuf::from(format!(
+                        "data/raw/{}/blocks/blocks_{}-{}.parquet",
+                        chain.name,
+                        request.range_start,
+                        request.range_end - 1
+                    ));
+
+                    let block_infos = match read_block_info_from_parquet(&block_file_path) {
+                        Ok(infos) => infos,
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to read block info for recollection {}-{}: {}",
+                                request.range_start,
+                                request.range_end - 1,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+
+                    if block_infos.is_empty() {
+                        tracing::warn!(
+                            "No block info found for recollection range {}-{}",
+                            request.range_start,
+                            request.range_end - 1
+                        );
+                        continue;
+                    }
+
+                    let range = BlockRange {
+                        start: request.range_start,
+                        end: request.range_end,
+                    };
+
+                    let blocks: Vec<BlockInfo> = block_infos
+                        .into_iter()
+                        .map(|info| BlockInfo {
+                            block_number: info.block_number,
+                            timestamp: info.timestamp,
+                            tx_hashes: info.tx_hashes,
+                        })
+                        .collect();
+
+                    process_range(
+                        &range,
+                        blocks,
+                        client,
+                        receipt_fields,
+                        &schema,
+                        &output_dir,
+                        &log_tx,
+                        &factory_log_tx,
+                        &event_trigger_tx,
+                        &event_matchers,
+                        rpc_batch_size,
+                        &mut log_tx_metrics,
+                        &mut factory_log_tx_metrics,
+                        log_tx_capacity,
+                        factory_log_tx_capacity,
+                        chain.block_receipts_method.as_deref(),
+                        block_receipt_concurrency,
+                    )
+                    .await?;
+
+                    send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+
+                    tracing::info!(
+                        "Recollection complete for range {}-{}",
+                        request.range_start,
+                        request.range_end - 1
+                    );
+                } else {
+                    // recollect_rx closed
+                    recollect_rx = None;
+                }
+            }
+        }
+
+        // Exit loop when block_rx is closed and no more recollect requests are expected
+        if block_rx_closed && recollect_rx.is_none() {
+            break;
+        }
+
+        // If block_rx is closed but we might still get recollect requests, continue
+        // (recollect_rx will be set to None when it closes)
+        if block_rx_closed && recollect_rx.is_some() {
+            // Keep waiting for recollect requests with a timeout
+            // to avoid indefinite waiting if no more requests come
+            continue;
         }
     }
 
