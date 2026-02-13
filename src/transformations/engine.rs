@@ -175,7 +175,7 @@ impl TransformationEngine {
 
             if path.is_file() {
                 // Single file: track as "handlers/{path}"
-                let migration_name = format!("handlers/{}", path.display());
+                let migration_name = format!("{}", path.display());
                 sql_entries.push((path.clone(), migration_name));
             } else if path.is_dir() {
                 // Directory: collect and sort .sql files (flat scan)
@@ -193,7 +193,7 @@ impl TransformationEngine {
                 for entry in dir_files {
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     let migration_name =
-                        format!("handlers/{}", path.join(&file_name).display());
+                        format!("{}", path.join(&file_name).display());
                     sql_entries.push((entry.path(), migration_name));
                 }
             }
