@@ -7,4 +7,4 @@ CREATE TABLE IF NOT EXISTS users (
     source VARCHAR(255) NOT NULL,
     source_version INT NOT NULL,
     UNIQUE (chain_id, address, source, source_version)
-)
+);
