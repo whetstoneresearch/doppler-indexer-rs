@@ -222,6 +222,13 @@ pub struct EthCallConfig {
     pub frequency: Frequency,
 }
 
+impl EthCallConfig {
+    /// Check if any parameter uses self-address (source: "self")
+    pub fn has_self_address_param(&self) -> bool {
+        self.params.iter().any(|p| p.is_self_address())
+    }
+}
+
 /// Parameter configuration for eth_calls
 /// Supports static values, event data binding, and self-address for factory collections
 #[derive(Debug, Clone, Deserialize)]
@@ -1066,5 +1073,36 @@ mod tests {
         assert!(config.output_type.is_named_tuple());
         let names = config.output_type.field_names().unwrap();
         assert_eq!(names, vec!["sqrtPriceX96", "tick", "observationIndex"]);
+    }
+
+    #[test]
+    fn test_eth_call_config_has_self_address_param() {
+        // Config with self-address param
+        let json = r#"{
+            "function": "getAssetData(address)",
+            "output_type": "uint256",
+            "frequency": "once",
+            "params": [{"type": "address", "source": "self"}]
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert!(config.has_self_address_param());
+
+        // Config without self-address param
+        let json_no_self = r#"{
+            "function": "name()",
+            "output_type": "string",
+            "frequency": "once"
+        }"#;
+        let config_no_self: EthCallConfig = serde_json::from_str(json_no_self).unwrap();
+        assert!(!config_no_self.has_self_address_param());
+
+        // Config with static param only
+        let json_static = r#"{
+            "function": "balanceOf(address)",
+            "output_type": "uint256",
+            "params": [{"type": "address", "values": ["0x1234567890abcdef1234567890abcdef12345678"]}]
+        }"#;
+        let config_static: EthCallConfig = serde_json::from_str(json_static).unwrap();
+        assert!(!config_static.has_self_address_param());
     }
 }

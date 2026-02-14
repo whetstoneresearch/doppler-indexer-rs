@@ -85,7 +85,11 @@ struct CallConfig {
 #[derive(Debug, Clone)]
 struct OnceCallConfig {
     function_name: String,
-    encoded_calldata: Bytes,
+    function_selector: [u8; 4],
+    /// Pre-encoded calldata if no self-address params
+    preencoded_calldata: Option<Bytes>,
+    /// Param configs needed when preencoded_calldata is None
+    params: Vec<ParamConfig>,
 }
 
 #[derive(Debug)]
@@ -1239,6 +1243,56 @@ fn extract_value_from_32_bytes(
 }
 
 /// Build parameters for an event-triggered call
+/// Encode calldata for "once" calls that have self-address params
+fn encode_once_call_params(
+    function_selector: [u8; 4],
+    param_configs: &[ParamConfig],
+    self_address: Address,
+) -> Result<Bytes, EthCallCollectionError> {
+    let mut params = Vec::with_capacity(param_configs.len());
+
+    for param in param_configs {
+        match param {
+            ParamConfig::Static { param_type, values } => {
+                if let Some(value) = values.first() {
+                    let dyn_val = param_type.parse_value(value)?;
+                    params.push(dyn_val);
+                } else {
+                    return Err(EthCallCollectionError::EventParamExtraction(
+                        "Static param has no values".to_string(),
+                    ));
+                }
+            }
+            ParamConfig::SelfAddress { param_type, source } => {
+                if source == "self" {
+                    let dyn_val = match param_type {
+                        EvmType::Address => DynSolValue::Address(self_address),
+                        _ => {
+                            return Err(EthCallCollectionError::EventParamExtraction(format!(
+                                "source: \"self\" can only be used with address type, got {:?}",
+                                param_type
+                            )));
+                        }
+                    };
+                    params.push(dyn_val);
+                } else {
+                    return Err(EthCallCollectionError::EventParamExtraction(format!(
+                        "Unknown source: {} (expected \"self\")",
+                        source
+                    )));
+                }
+            }
+            ParamConfig::FromEvent { .. } => {
+                return Err(EthCallCollectionError::EventParamExtraction(
+                    "from_event params are not supported for 'once' frequency calls".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(encode_call_with_params(function_selector, &params))
+}
+
 fn build_event_call_params(
     trigger: &EventTriggerData,
     param_configs: &[ParamConfig],
@@ -2358,12 +2412,52 @@ fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCal
                         .unwrap_or(&call.function)
                         .to_string();
 
-                    // For "once" calls, we don't support params (they're typically view functions)
-                    let encoded_calldata = Bytes::copy_from_slice(&selector);
+                    // Check if call has self-address params (requires dynamic encoding per address)
+                    let (preencoded_calldata, params) = if call.has_self_address_param() {
+                        // Need to encode dynamically per address
+                        (None, call.params.clone())
+                    } else if call.params.is_empty() {
+                        // No params - just the selector
+                        (Some(Bytes::copy_from_slice(&selector)), vec![])
+                    } else {
+                        // Static params only - pre-encode now
+                        // Note: This uses first value from each static param
+                        let mut dyn_values = Vec::new();
+                        let mut all_static = true;
+                        for param in &call.params {
+                            match param {
+                                ParamConfig::Static { param_type, values } => {
+                                    if let Some(value) = values.first() {
+                                        if let Ok(dyn_val) = param_type.parse_value(value) {
+                                            dyn_values.push(dyn_val);
+                                        } else {
+                                            all_static = false;
+                                            break;
+                                        }
+                                    } else {
+                                        all_static = false;
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    all_static = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_static {
+                            (Some(encode_call_with_params(selector, &dyn_values)), vec![])
+                        } else {
+                            // Fallback: store params for dynamic encoding
+                            (None, call.params.clone())
+                        }
+                    };
 
                     configs.entry(contract_name.clone()).or_default().push(OnceCallConfig {
                         function_name,
-                        encoded_calldata,
+                        function_selector: selector,
+                        preencoded_calldata,
+                        params,
                     });
                 }
             }
@@ -2386,11 +2480,51 @@ fn build_factory_once_call_configs(factory_call_configs: &HashMap<String, Vec<Et
                     .unwrap_or(&call.function)
                     .to_string();
 
-                let encoded_calldata = Bytes::copy_from_slice(&selector);
+                // Check if call has self-address params (requires dynamic encoding per address)
+                let (preencoded_calldata, params) = if call.has_self_address_param() {
+                    // Need to encode dynamically per address
+                    (None, call.params.clone())
+                } else if call.params.is_empty() {
+                    // No params - just the selector
+                    (Some(Bytes::copy_from_slice(&selector)), vec![])
+                } else {
+                    // Static params only - pre-encode now
+                    let mut dyn_values = Vec::new();
+                    let mut all_static = true;
+                    for param in &call.params {
+                        match param {
+                            ParamConfig::Static { param_type, values } => {
+                                if let Some(value) = values.first() {
+                                    if let Ok(dyn_val) = param_type.parse_value(value) {
+                                        dyn_values.push(dyn_val);
+                                    } else {
+                                        all_static = false;
+                                        break;
+                                    }
+                                } else {
+                                    all_static = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                all_static = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_static {
+                        (Some(encode_call_with_params(selector, &dyn_values)), vec![])
+                    } else {
+                        // Fallback: store params for dynamic encoding
+                        (None, call.params.clone())
+                    }
+                };
 
                 configs.entry(collection_name.clone()).or_default().push(OnceCallConfig {
                     function_name,
-                    encoded_calldata,
+                    function_selector: selector,
+                    preencoded_calldata,
+                    params,
                 });
             }
         }
@@ -2470,9 +2604,19 @@ async fn process_once_calls_regular(
 
         for address in &addresses {
             for call_config in call_configs {
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    // Encode dynamically with self-address
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
                 let tx = TransactionRequest::default()
                     .to(*address)
-                    .input(call_config.encoded_calldata.clone().into());
+                    .input(calldata.into());
                 pending_calls.push((tx, block_id, *address, call_config.function_name.clone()));
             }
         }
@@ -2593,9 +2737,19 @@ async fn process_factory_once_calls(
             let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
 
             for call_config in call_configs {
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    // Encode dynamically with self-address
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
                 let tx = TransactionRequest::default()
                     .to(*address)
-                    .input(call_config.encoded_calldata.clone().into());
+                    .input(calldata.into());
                 pending_calls.push((
                     tx,
                     block_id,

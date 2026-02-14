@@ -227,8 +227,8 @@ Regular eth_calls are made at a configured frequency (every N blocks). Each call
 | `block_number` | UInt64 | Block at which call was made |
 | `block_timestamp` | UInt64 | Block timestamp |
 | `address` | FixedSizeBinary(20) | Contract address |
-| `{function}_decoded` | varies | One column per function result (simple types) |
-| `{function}_decoded.{field}` | varies | One column per tuple field (named tuples) |
+| `{function}` | varies | One column per function result (simple types) |
+| `{function}.{field}` | varies | One column per tuple field (named tuples) |
 
 **Named Tuple Support for Once Calls:**
 
@@ -242,7 +242,22 @@ When a "once" call returns a named tuple, each field is stored as a separate col
 }
 ```
 
-Output columns: `slot0_decoded.sqrtPriceX96`, `slot0_decoded.tick`, `slot0_decoded.feeProtocol`
+Output columns: `slot0.sqrtPriceX96`, `slot0.tick`, `slot0.feeProtocol`
+
+**Self-Address Parameters:**
+
+"Once" calls support `source: "self"` parameters, which use the contract's own address:
+
+```json
+{
+  "function": "getAssetData(address)",
+  "output_type": "(address numeraire, uint256 amount)",
+  "frequency": "once",
+  "params": [{"type": "address", "source": "self"}]
+}
+```
+
+This encodes the call with the target contract address as the parameter, useful for functions that query data about the calling contract itself.
 
 ### Output Location
 

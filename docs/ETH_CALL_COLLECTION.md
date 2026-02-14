@@ -85,7 +85,7 @@ This creates separate columns: `sqrtPriceX96`, `tick`, `observationIndex`, `obse
 
 The format is `type name` for each field, with tuples enclosed in parentheses and fields separated by commas.
 
-**Named tuples work with all frequency settings**, including `"once"`. For once calls, the column naming pattern is `{function}_decoded.{field_name}` (e.g., `slot0_decoded.sqrtPriceX96`).
+**Named tuples work with all frequency settings**, including `"once"`. For once calls, the decoded column naming pattern is `{function}.{field_name}` (e.g., `slot0.sqrtPriceX96`).
 
 ## Parameters
 
@@ -148,7 +148,24 @@ This generates 4 calls: `(Owner1, Spender1)`, `(Owner1, Spender2)`, `(Owner2, Sp
 | `bytes` | `"0x..."` (hex with 0x prefix) |
 | `string` | `"any string value"` |
 
-**Note:** Functions with `frequency: "once"` do not support parameters.
+### Self-Address Parameters
+
+For `frequency: "once"` calls, you can use `source: "self"` to pass the contract's own address as a parameter. This is useful when calling functions that need to know which contract to query:
+
+```json
+{
+  "function": "getAssetData(address)",
+  "output_type": "(address numeraire, uint256 amount)",
+  "frequency": "once",
+  "params": [
+    {"type": "address", "source": "self"}
+  ]
+}
+```
+
+The `source: "self"` parameter will be replaced with the contract address being called. This works for both regular contracts and factory-discovered contracts.
+
+**Note:** Static parameter values (via `values`) are also supported for "once" calls, but `from_event` parameters are not supported since "once" calls are not triggered by events.
 
 ## Frequency
 
@@ -573,4 +590,4 @@ To re-collect eth_calls for a range, delete the corresponding file from `data/ra
 - No state override support (calls use the actual on-chain state)
 - Results are stored as raw bytes; decoding is left to the consumer
 - Factory calls require the factory collector to discover addresses first
-- Functions with `frequency: "once"` do not support parameters (use parameterless view functions like `name()`, `symbol()`, `decimals()`)
+- Functions with `frequency: "once"` support `source: "self"` and static `values` parameters, but not `from_event` parameters
