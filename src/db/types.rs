@@ -11,6 +11,8 @@ pub enum DbValue {
     Int64(i64),
     /// Signed 32-bit integer
     Int32(i32),
+    /// Unsigned 8-bit integer (stored as SMALLINT/INT2)
+    Int2(u8),
     /// Unsigned 64-bit integer (stored as BIGINT)
     Uint64(u64),
     /// Text/varchar

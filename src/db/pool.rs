@@ -108,6 +108,7 @@ enum SqlParam {
     Bool(bool),
     Int64(i64),
     Int32(i32),
+    Int16(i16),
     Float64(f64),
     Text(String),
     Bytes(Vec<u8>),
@@ -125,6 +126,7 @@ impl ToSql for SqlParam {
             SqlParam::Bool(v) => v.to_sql(ty, out),
             SqlParam::Int64(v) => v.to_sql(ty, out),
             SqlParam::Int32(v) => v.to_sql(ty, out),
+            SqlParam::Int16(v) => v.to_sql(ty, out),
             SqlParam::Float64(v) => v.to_sql(ty, out),
             SqlParam::Text(v) => v.to_sql(ty, out),
             SqlParam::Bytes(v) => v.to_sql(ty, out),
@@ -136,6 +138,7 @@ impl ToSql for SqlParam {
         <bool as ToSql>::accepts(ty)
             || <i64 as ToSql>::accepts(ty)
             || <i32 as ToSql>::accepts(ty)
+            || <i16 as ToSql>::accepts(ty)
             || <f64 as ToSql>::accepts(ty)
             || <String as ToSql>::accepts(ty)
             || <Vec<u8> as ToSql>::accepts(ty)
@@ -151,6 +154,7 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::Bool(v) => SqlParam::Bool(*v),
         DbValue::Int64(v) => SqlParam::Int64(*v),
         DbValue::Int32(v) => SqlParam::Int32(*v),
+        DbValue::Int2(v) => SqlParam::Int16(*v as i16),
         DbValue::Uint64(v) => SqlParam::Int64(*v as i64),
         DbValue::Text(v) => SqlParam::Text(v.clone()),
         DbValue::Bytes(v) => SqlParam::Bytes(v.clone()),
