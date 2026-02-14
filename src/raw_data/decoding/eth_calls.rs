@@ -1330,7 +1330,7 @@ fn write_decoded_once_calls_to_parquet(
                 // Named tuple: create a column for each field with {function}_decoded.{field_name}
                 for (field_name, field_type) in tuple_fields {
                     fields.push(Field::new(
-                        &format!("{}_decoded.{}", config.function_name, field_name),
+                        &format!("{}.{}", config.function_name, field_name),
                         field_type.to_arrow_type(),
                         true,
                     ));
@@ -1340,7 +1340,7 @@ fn write_decoded_once_calls_to_parquet(
                 // Simple type or named single value
                 let value_type = config.output_type.to_arrow_type();
                 fields.push(Field::new(
-                    &format!("{}_decoded", config.function_name),
+                    &format!("{}", config.function_name),
                     value_type,
                     true,
                 ));
