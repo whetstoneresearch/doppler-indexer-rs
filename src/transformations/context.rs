@@ -113,6 +113,18 @@ impl DecodedValue {
         }
     }
 
+    /// Try to get as u8.
+    pub fn as_u8(&self) -> Option<u8> {
+        match self {
+            DecodedValue::Uint8(v) => Some(*v),
+            DecodedValue::Uint64(v) => (*v).try_into().ok(),
+            DecodedValue::Uint32(v) => (*v).try_into().ok(),
+            DecodedValue::Uint256(v) => v.try_into().ok(),
+            DecodedValue::Uint128(v) => (*v).try_into().ok(),
+            _ => None,
+        }
+    }
+
     /// Try to get as bool.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
