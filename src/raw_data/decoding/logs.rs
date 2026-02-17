@@ -359,25 +359,34 @@ async fn catchup_decode_logs(
         factory_addresses.len()
     );
 
-    // Filter files that need processing
-    let files_to_process: Vec<_> = raw_files
+    // Filter files that need processing and compute per-range missing matchers
+    let files_to_process: Vec<(u64, u64, PathBuf, Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>)> = raw_files
         .into_iter()
-        .filter(|(range_start, range_end, _)| {
-            let all_decoded = check_all_decoded(
-                *range_start,
-                *range_end,
+        .filter_map(|(range_start, range_end, path)| {
+            let (missing_regular, missing_factory) = get_missing_matchers(
+                range_start,
+                range_end,
                 regular_matchers,
                 factory_matchers,
                 &existing_decoded,
             );
-            if all_decoded {
+            if missing_regular.is_empty() && missing_factory.is_empty() {
                 tracing::debug!(
                     "Log decoding catchup: skipping range {}-{}, all events already decoded",
                     range_start,
                     range_end - 1
                 );
+                None
+            } else {
+                tracing::debug!(
+                    "Log decoding catchup: range {}-{} has {} regular and {} factory matchers to decode",
+                    range_start,
+                    range_end - 1,
+                    missing_regular.len(),
+                    missing_factory.len()
+                );
+                Some((range_start, range_end, path, missing_regular, missing_factory))
             }
-            !all_decoded
         })
         .collect();
 
@@ -392,9 +401,6 @@ async fn catchup_decode_logs(
         concurrency
     );
 
-    // Wrap shared data in Arc for concurrent access
-    let regular_matchers = Arc::new(regular_matchers.to_vec());
-    let factory_matchers = Arc::new(factory_matchers.clone());
     let output_base = Arc::new(output_base.to_path_buf());
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let transform_tx = transform_tx.cloned();
@@ -403,10 +409,8 @@ async fn catchup_decode_logs(
 
     let recollect_tx = recollect_tx.cloned();
 
-    for (range_start, range_end, file_path) in files_to_process {
+    for (range_start, range_end, file_path, missing_regular, missing_factory) in files_to_process {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let regular_matchers = regular_matchers.clone();
-        let factory_matchers = factory_matchers.clone();
         let factory_addresses = factory_addresses.clone();
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
@@ -476,8 +480,8 @@ async fn catchup_decode_logs(
                 &logs,
                 range_start,
                 range_end,
-                &regular_matchers,
-                &factory_matchers,
+                &missing_regular,
+                &missing_factory,
                 &factory_addrs,
                 &output_base,
                 transform_tx.as_ref(),
@@ -498,35 +502,47 @@ async fn catchup_decode_logs(
     Ok(())
 }
 
-/// Check if all event files for a range are already decoded
-fn check_all_decoded(
+/// Get matchers whose decoded output files don't exist yet for a given range.
+/// Returns only the matchers that still need decoding.
+fn get_missing_matchers(
     range_start: u64,
     range_end: u64,
     regular_matchers: &[EventMatcher],
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     existing: &HashSet<String>,
-) -> bool {
+) -> (Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>) {
     let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
 
-    // Check regular matchers
-    for matcher in regular_matchers {
-        let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
-        if !existing.contains(&rel_path) {
-            return false;
-        }
-    }
-
-    // Check factory matchers
-    for (_, matchers) in factory_matchers {
-        for matcher in matchers {
+    let missing_regular: Vec<EventMatcher> = regular_matchers
+        .iter()
+        .filter(|matcher| {
             let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
-            if !existing.contains(&rel_path) {
-                return false;
-            }
-        }
-    }
+            !existing.contains(&rel_path)
+        })
+        .cloned()
+        .collect();
 
-    true
+    let missing_factory: HashMap<String, Vec<EventMatcher>> = factory_matchers
+        .iter()
+        .filter_map(|(collection, matchers)| {
+            let missing: Vec<EventMatcher> = matchers
+                .iter()
+                .filter(|matcher| {
+                    let rel_path =
+                        format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
+                    !existing.contains(&rel_path)
+                })
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                None
+            } else {
+                Some((collection.clone(), missing))
+            }
+        })
+        .collect();
+
+    (missing_regular, missing_factory)
 }
 
 /// Scan existing decoded files
