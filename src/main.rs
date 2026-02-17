@@ -57,8 +57,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let args: Vec<String> = env::args().collect();
+    let decode_only = args.iter().any(|a| a == "--decode-only");
+
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
-    load_required_env_vars(&config)?;
+    if !decode_only {
+        load_required_env_vars(&config)?;
+    }
 
     #[cfg(feature = "bench")]
     {
@@ -67,10 +72,20 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Benchmarking enabled, writing to data/bench.csv");
     }
 
+    if decode_only {
+        tracing::info!(
+            "Running in decode-only mode (no collection, no transformations)"
+        );
+    }
+
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
     for chain in &config.chains {
-        process_chain(&config, chain).await?;
+        if decode_only {
+            decode_only_chain(&config, chain).await?;
+        } else {
+            process_chain(&config, chain).await?;
+        }
     }
 
     tracing::info!("All chains processed successfully");
@@ -113,6 +128,70 @@ fn load_required_env_vars(config: &IndexerConfig) -> anyhow::Result<()> {
         still_missing
     );
 
+    Ok(())
+}
+
+/// Decode-only mode: runs decoders on existing raw parquet files without
+/// collection or transformations. Useful for profiling the decoding pipeline.
+async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::Result<()> {
+    tracing::info!("Decode-only processing for chain: {}", chain.name);
+
+    let raw_config = Arc::new(config.raw_data_collection.clone());
+    let chain = Arc::new(chain.clone());
+
+    let has_events = chain.contracts.values().any(|c| {
+        has_items(&c.events)
+            || c.factories
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.events)))
+    });
+
+    let has_calls = chain.contracts.values().any(|c| {
+        has_items(&c.calls)
+            || c.factories
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.calls)))
+    });
+
+    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+
+    if has_events {
+        tasks.spawn({
+            let (chain, cfg) = (chain.clone(), raw_config.clone());
+            async move {
+                // Create a channel and immediately drop the sender so the decoder
+                // runs catchup then exits the live phase immediately.
+                let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
+                drop(_tx);
+                decode_logs(&chain, &cfg, rx, None, None)
+                    .await
+                    .context("log decoding failed")
+            }
+        });
+    }
+
+    if has_calls {
+        tasks.spawn({
+            let (chain, cfg) = (chain.clone(), raw_config.clone());
+            async move {
+                let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
+                drop(_tx);
+                decode_eth_calls(&chain, &cfg, rx, None)
+                    .await
+                    .context("eth call decoding failed")
+            }
+        });
+    }
+
+    if !has_events && !has_calls {
+        tracing::warn!("No events or calls configured for chain {}", chain.name);
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.context("decode task panicked")??;
+    }
+
+    tracing::info!("Decode-only processing complete for chain {}", chain.name);
     Ok(())
 }
 
