@@ -253,10 +253,21 @@ pub async fn collect_eth_calls(
                 existing_files.contains(&rel_path)
             });
 
-            // Check if all once call files exist for this range (one file per contract at {contract}/once/)
-            let once_calls_done = !has_once_calls || once_configs.keys().all(|contract_name| {
+            // Check if all once call files exist AND have all expected columns for this range
+            let once_calls_done = !has_once_calls || once_configs.iter().all(|(contract_name, configs)| {
                 let rel_path = format!("{}/once/{}", contract_name, range.file_name());
-                existing_files.contains(&rel_path)
+                if !existing_files.contains(&rel_path) {
+                    return false;
+                }
+                let expected: HashSet<&str> = configs
+                    .iter()
+                    .map(|c| c.function_name.as_str())
+                    .collect();
+                let index = read_once_column_index(&base_output_dir.join(contract_name).join("once"));
+                match index.get(&range.file_name()) {
+                    Some(cols) => expected.iter().all(|f| cols.contains(&f.to_string())),
+                    None => false, // index missing = needs recheck
+                }
             });
 
             // Skip this range only if ALL call types have their files
@@ -2578,16 +2589,55 @@ async fn process_once_calls_regular(
 
         let file_name = range.file_name();
         let rel_path = format!("{}/once/{}", contract_name, file_name);
+        let sub_dir = output_dir.join(contract_name).join("once");
+        let output_path = sub_dir.join(&file_name);
 
-        if existing_files.contains(&rel_path) {
-            tracing::debug!(
-                "Skipping once eth_calls for {} blocks {}-{} (already exists)",
+        // Determine which function calls are missing from the existing file
+        let all_fn_names: Vec<String> = call_configs
+            .iter()
+            .map(|c| c.function_name.clone())
+            .collect();
+
+        let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
+            let index = read_once_column_index(&sub_dir);
+            let existing_cols: HashSet<String> = index
+                .get(&file_name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let missing: Vec<String> = all_fn_names
+                .iter()
+                .filter(|f| !existing_cols.contains(*f))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                tracing::debug!(
+                    "Skipping once eth_calls for {} blocks {}-{} (all columns present)",
+                    contract_name,
+                    range.start,
+                    range.end - 1
+                );
+                continue;
+            }
+            tracing::info!(
+                "Found {} missing once columns for {} blocks {}-{}: {:?}",
+                missing.len(),
                 contract_name,
                 range.start,
-                range.end - 1
+                range.end - 1,
+                missing
             );
-            continue;
-        }
+            (missing, true)
+        } else {
+            (all_fn_names.clone(), false)
+        };
+
+        // Filter call configs to only missing functions
+        let configs_to_call: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
 
         let contract = match contracts.get(contract_name) {
             Some(c) => c,
@@ -2603,11 +2653,10 @@ async fn process_once_calls_regular(
         let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, String)> = Vec::new();
 
         for address in &addresses {
-            for call_config in call_configs {
+            for call_config in &configs_to_call {
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
-                    // Encode dynamically with self-address
                     encode_once_call_params(
                         call_config.function_selector,
                         &call_config.params,
@@ -2656,36 +2705,65 @@ async fn process_once_calls_regular(
             }
         }
 
-        let results: Vec<OnceCallResult> = addresses
-            .iter()
-            .filter_map(|addr| {
-                results_by_address.remove(addr).map(|function_results| OnceCallResult {
-                    block_number: first_block.block_number,
-                    block_timestamp: first_block.timestamp,
-                    contract_address: addr.0.0,
-                    function_results,
-                })
-            })
-            .collect();
+        std::fs::create_dir_all(&sub_dir)?;
 
-        if !results.is_empty() {
-            let function_names: Vec<String> = call_configs
-                .iter()
-                .map(|c| c.function_name.clone())
+        if has_existing_file {
+            // Merge new columns into existing parquet
+            let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
+                .into_iter()
+                .map(|(addr, fns)| (addr.0.0, fns))
                 .collect();
 
-            let sub_dir = output_dir.join(contract_name).join("once");
-            std::fs::create_dir_all(&sub_dir)?;
-            let output_path = sub_dir.join(&file_name);
+            let existing_batches = read_existing_once_parquet(&output_path)?;
+            if !existing_batches.is_empty() {
+                let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
 
-            tracing::info!(
-                "Writing {} once eth_call results to {}",
-                results.len(),
-                output_path.display()
-            );
+                let file = File::create(&output_path)?;
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::SNAPPY)
+                    .build();
+                let mut writer = ArrowWriter::try_new(file, merged.schema(), Some(props))?;
+                writer.write(&merged)?;
+                writer.close()?;
 
-            write_once_results_to_parquet(&results, &output_path, &function_names)?;
+                tracing::info!(
+                    "Merged {} new once columns into {} for {}",
+                    missing_fn_names.len(),
+                    output_path.display(),
+                    contract_name
+                );
+            }
+        } else {
+            // Write new file with all results
+            let results: Vec<OnceCallResult> = addresses
+                .iter()
+                .filter_map(|addr| {
+                    results_by_address.remove(addr).map(|function_results| OnceCallResult {
+                        block_number: first_block.block_number,
+                        block_timestamp: first_block.timestamp,
+                        contract_address: addr.0.0,
+                        function_results,
+                    })
+                })
+                .collect();
+
+            if !results.is_empty() {
+                let output_path = sub_dir.join(&file_name);
+
+                tracing::info!(
+                    "Writing {} once eth_call results to {}",
+                    results.len(),
+                    output_path.display()
+                );
+
+                write_once_results_to_parquet(&results, &output_path, &all_fn_names)?;
+            }
         }
+
+        // Update the column index with the complete list of function names now in the file
+        let mut index = read_once_column_index(&sub_dir);
+        index.insert(file_name.clone(), all_fn_names.clone());
+        write_once_column_index(&sub_dir, &index)?;
     }
 
     Ok(())
@@ -2706,18 +2784,55 @@ async fn process_factory_once_calls(
 
         let file_name = range.file_name();
         let rel_path = format!("{}/once/{}", collection_name, file_name);
+        let sub_dir = output_dir.join(collection_name).join("once");
+        let output_path = sub_dir.join(&file_name);
 
-        if existing_files.contains(&rel_path) {
-            tracing::debug!(
-                "Skipping factory once eth_calls for {} blocks {}-{} (already exists)",
+        let all_fn_names: Vec<String> = call_configs
+            .iter()
+            .map(|c| c.function_name.clone())
+            .collect();
+
+        let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
+            let index = read_once_column_index(&sub_dir);
+            let existing_cols: HashSet<String> = index
+                .get(&file_name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let missing: Vec<String> = all_fn_names
+                .iter()
+                .filter(|f| !existing_cols.contains(*f))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                tracing::debug!(
+                    "Skipping factory once eth_calls for {} blocks {}-{} (all columns present)",
+                    collection_name,
+                    range.start,
+                    range.end - 1
+                );
+                continue;
+            }
+            tracing::info!(
+                "Found {} missing factory once columns for {} blocks {}-{}: {:?}",
+                missing.len(),
                 collection_name,
                 range.start,
-                range.end - 1
+                range.end - 1,
+                missing
             );
-            continue;
-        }
+            (missing, true)
+        } else {
+            (all_fn_names.clone(), false)
+        };
 
-        let mut address_discovery: HashMap<Address, (u64, u64)> = HashMap::new(); // addr -> (block, timestamp)
+        let configs_to_call: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        let mut address_discovery: HashMap<Address, (u64, u64)> = HashMap::new();
 
         for (block_num, addrs) in &factory_data.addresses_by_block {
             for (timestamp, addr, coll_name) in addrs {
@@ -2736,11 +2851,10 @@ async fn process_factory_once_calls(
         for (address, (block_number, timestamp)) in &address_discovery {
             let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
 
-            for call_config in call_configs {
+            for call_config in &configs_to_call {
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
-                    // Encode dynamically with self-address
                     encode_once_call_params(
                         call_config.function_selector,
                         &call_config.params,
@@ -2798,34 +2912,60 @@ async fn process_factory_once_calls(
             }
         }
 
-        let results: Vec<OnceCallResult> = results_by_address
-            .into_iter()
-            .map(|(address, (block_number, timestamp, function_results))| OnceCallResult {
-                block_number,
-                block_timestamp: timestamp,
-                contract_address: address.0.0,
-                function_results,
-            })
-            .collect();
+        std::fs::create_dir_all(&sub_dir)?;
 
-        if !results.is_empty() {
-            let function_names: Vec<String> = call_configs
-                .iter()
-                .map(|c| c.function_name.clone())
+        if has_existing_file {
+            // Merge new columns into existing parquet
+            let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
+                .into_iter()
+                .map(|(addr, (_, _, fns))| (addr.0.0, fns))
                 .collect();
 
-            let sub_dir = output_dir.join(collection_name).join("once");
-            std::fs::create_dir_all(&sub_dir)?;
-            let output_path = sub_dir.join(&file_name);
+            let existing_batches = read_existing_once_parquet(&output_path)?;
+            if !existing_batches.is_empty() {
+                let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
 
-            tracing::info!(
-                "Writing {} factory once eth_call results to {}",
-                results.len(),
-                output_path.display()
-            );
+                let file = File::create(&output_path)?;
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::SNAPPY)
+                    .build();
+                let mut writer = ArrowWriter::try_new(file, merged.schema(), Some(props))?;
+                writer.write(&merged)?;
+                writer.close()?;
 
-            write_once_results_to_parquet(&results, &output_path, &function_names)?;
+                tracing::info!(
+                    "Merged {} new factory once columns into {} for {}",
+                    missing_fn_names.len(),
+                    output_path.display(),
+                    collection_name
+                );
+            }
+        } else {
+            let results: Vec<OnceCallResult> = results_by_address
+                .into_iter()
+                .map(|(address, (block_number, timestamp, function_results))| OnceCallResult {
+                    block_number,
+                    block_timestamp: timestamp,
+                    contract_address: address.0.0,
+                    function_results,
+                })
+                .collect();
+
+            if !results.is_empty() {
+                tracing::info!(
+                    "Writing {} factory once eth_call results to {}",
+                    results.len(),
+                    output_path.display()
+                );
+
+                write_once_results_to_parquet(&results, &output_path, &all_fn_names)?;
+            }
         }
+
+        // Update the column index
+        let mut index = read_once_column_index(&sub_dir);
+        index.insert(file_name.clone(), all_fn_names.clone());
+        write_once_column_index(&sub_dir, &index)?;
     }
 
     Ok(())
@@ -3658,6 +3798,100 @@ fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
     }
 
     Arc::new(Schema::new(fields))
+}
+
+/// Read the column index sidecar file from a `once/` directory.
+/// Returns a map of filename -> list of function names whose `{name}_result` columns are present.
+fn read_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
+    let index_path = once_dir.join("column_index.json");
+    match std::fs::read_to_string(&index_path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Write the column index sidecar file to a `once/` directory.
+fn write_once_column_index(
+    once_dir: &Path,
+    index: &HashMap<String, Vec<String>>,
+) -> Result<(), EthCallCollectionError> {
+    let index_path = once_dir.join("column_index.json");
+    let content = serde_json::to_string_pretty(index).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialize error: {}", e))
+    })?;
+    std::fs::write(&index_path, content)?;
+    Ok(())
+}
+
+/// Read an existing once-call parquet file and return all record batches.
+fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+        .build()?;
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+    Ok(batches)
+}
+
+/// Merge new function result columns into existing once-call record batches.
+/// Matches rows by the `address` column (FixedSizeBinary(20)).
+/// Returns a single merged RecordBatch.
+fn merge_once_columns(
+    existing_batches: &[RecordBatch],
+    new_results: &HashMap<[u8; 20], HashMap<String, Vec<u8>>>,
+    new_fn_names: &[String],
+) -> Result<RecordBatch, EthCallCollectionError> {
+    // Concatenate existing batches into one
+    let existing = arrow::compute::concat_batches(
+        &existing_batches[0].schema(),
+        existing_batches,
+    )?;
+
+    let num_rows = existing.num_rows();
+    let address_col = existing
+        .column_by_name("address")
+        .expect("existing once parquet must have address column");
+    let address_arr = address_col
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("address column must be FixedSizeBinary(20)");
+
+    // Build new columns by matching on address
+    let mut new_columns: Vec<ArrayRef> = Vec::new();
+    for fn_name in new_fn_names {
+        let arr: BinaryArray = (0..num_rows)
+            .map(|i| {
+                let addr_bytes: [u8; 20] = address_arr.value(i).try_into().unwrap();
+                new_results
+                    .get(&addr_bytes)
+                    .and_then(|m| m.get(fn_name))
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.as_slice())
+            })
+            .collect();
+        new_columns.push(Arc::new(arr));
+    }
+
+    // Build merged schema: existing fields + new result fields
+    let existing_schema = existing.schema();
+    let mut fields: Vec<Field> = existing_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    for fn_name in new_fn_names {
+        fields.push(Field::new(
+            &format!("{}_result", fn_name),
+            DataType::Binary,
+            true,
+        ));
+    }
+    let merged_schema = Arc::new(Schema::new(fields));
+
+    // Combine columns
+    let mut columns: Vec<ArrayRef> = (0..existing.num_columns())
+        .map(|i| existing.column(i).clone())
+        .collect();
+    columns.extend(new_columns);
+
+    let merged = RecordBatch::try_new(merged_schema, columns)?;
+    Ok(merged)
 }
 
 fn write_once_results_to_parquet(
