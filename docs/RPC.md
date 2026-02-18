@@ -268,20 +268,126 @@ let client = UnifiedRpcClient::from_url_with_alchemy_cu(
 )?;
 ```
 
+### With Shared Rate Limiter and Custom Concurrency
+
+```rust
+use std::sync::Arc;
+use doppler_indexer_rs::rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
+
+// Create shared rate limiter for account-level limiting
+let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(7500));
+
+// Create clients with shared limiter and custom concurrency
+let client = UnifiedRpcClient::from_url_with_options(
+    "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY",
+    7500,  // CU per second
+    500,   // Max concurrent requests
+    Some(shared_limiter.clone()),  // Shared limiter
+)?;
+```
+
 ### Available Methods
 
 `UnifiedRpcClient` exposes a subset of methods available on both clients:
 
 - `get_block_number()`
 - `get_blocks_batch(block_numbers, full_transactions)`
+- `get_blocks_streaming(block_numbers, full_transactions, result_tx)` - Streaming version
 - `get_transaction_receipts_batch(hashes)`
 - `get_block_receipts(method_name, block_number)`
 - `get_block_receipts_concurrent(method_name, block_numbers, concurrency)`
 - `call_batch(calls)`
+- `eth_call(to, data, block_number)` - Single eth_call convenience method
 
 ## Alchemy Client
 
 The `AlchemyClient` wraps `RpcClient` and adds compute unit (CU) based rate limiting, which is how Alchemy tracks API usage.
+
+### Environment Variables
+
+The Alchemy client behavior can be configured via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALCHEMY_CU_PER_SECOND` | 7500 | Compute units per second (match your Alchemy plan) |
+| `RPC_CONCURRENCY` | 100 | Max concurrent in-flight RPC requests |
+| `RPC_BATCH_SIZE` | from config | Override config's `rpc_batch_size` |
+
+Example:
+```bash
+ALCHEMY_CU_PER_SECOND=7500 RPC_CONCURRENCY=500 cargo run
+```
+
+### Sliding Window Rate Limiter
+
+The Alchemy client uses a **sliding window rate limiter** that accurately models Alchemy's rate limiting behavior:
+
+- Alchemy measures usage over **10-second sliding windows** at 10x the per-second rate
+- Unlike token bucket algorithms, you cannot "save up" compute units by being idle
+- The limiter tracks exact timestamps of CU consumption and calculates available capacity
+
+```rust
+// Internal implementation
+pub struct SlidingWindowRateLimiter {
+    max_in_window: u32,        // CU limit for 10-second window (cu_per_second * 10)
+    window: Duration,          // 10 seconds
+    history: VecDeque<(Instant, u32)>,  // (timestamp, units) consumption history
+}
+```
+
+### Shared Rate Limiter
+
+When running multiple collectors (blocks, receipts, eth_calls), you can share a single rate limiter to enforce **account-level** rate limiting across all clients:
+
+```rust
+use std::sync::Arc;
+use doppler_indexer_rs::rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
+
+// Create shared limiter
+let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(7500));
+
+// All clients share the same limiter
+let blocks_client = UnifiedRpcClient::from_url_with_options(
+    &rpc_url, 7500, 100, Some(shared_limiter.clone())
+)?;
+let receipts_client = UnifiedRpcClient::from_url_with_options(
+    &rpc_url, 7500, 100, Some(shared_limiter.clone())
+)?;
+```
+
+This ensures combined CU usage across all collectors stays within your Alchemy plan limits.
+
+### Concurrent Execution with Semaphore
+
+Batch operations use **semaphore-bounded concurrency** for maximum throughput:
+
+1. Each request acquires a semaphore permit (limits concurrent in-flight requests)
+2. Each request acquires CUs from the rate limiter individually
+3. Requests execute immediately as permits become available
+4. No waiting for batch completion before starting new requests
+
+This approach provides:
+- **Continuous rate limit acquisition** instead of chunk-based batching
+- **Better throughput** by keeping the RPC pipeline full
+- **Configurable concurrency** via `RPC_CONCURRENCY` environment variable
+
+### Streaming Execution
+
+For pipelined collection, streaming methods send results via channels as they complete:
+
+```rust
+// Start streaming block fetch (returns immediately)
+let (tx, mut rx) = mpsc::channel(256);
+let handle = client.get_blocks_streaming(block_numbers, false, tx);
+
+// Process blocks as they arrive
+while let Some((block_num, result)) = rx.recv().await {
+    // Forward to downstream immediately
+    process_block(result?);
+}
+
+handle.await?;
+```
 
 ### Compute Unit Costs
 
@@ -344,11 +450,12 @@ AlchemyConfig {
     compute_units_per_second: NonZeroU32::new(330).unwrap(),  // Free tier
     max_batch_size: 100,
     batching_enabled: true,
-    jitter_min_ms: 1,
-    jitter_max_ms: 10,
     retry: RetryConfig::default(),
+    rpc_concurrency: 100,  // Max concurrent in-flight requests
 }
 ```
+
+Note: When using `UnifiedRpcClient::from_url()`, the default is 7500 CU/s (Growth tier). Use `ALCHEMY_CU_PER_SECOND` env var to override.
 
 ### Alchemy Tier Limits
 

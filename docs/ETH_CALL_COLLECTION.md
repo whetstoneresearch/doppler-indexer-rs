@@ -46,6 +46,7 @@ eth_calls are configured per-contract in your chain config:
 | `output_type` | string | Yes | - | The return type. Used by consumers to decode the binary result. |
 | `params` | array | No | `[]` | Parameters to pass to the function (see Parameters section below). |
 | `frequency` | string/number | No | every block | How often to make the call (see Frequency section below). |
+| `target` | string | No | *(contract address)* | Override the target address for this call (see Target Override section below). |
 
 ### Supported Types
 
@@ -166,6 +167,76 @@ For `frequency: "once"` calls, you can use `source: "self"` to pass the contract
 The `source: "self"` parameter will be replaced with the contract address being called. This works for both regular contracts and factory-discovered contracts.
 
 **Note:** Static parameter values (via `values`) are also supported for "once" calls, but `from_event` parameters are not supported since "once" calls are not triggered by events.
+
+## Target Override
+
+By default, eth_calls are made to the contract they are configured under. The `target` field allows you to override this, directing the call to a different address instead.
+
+### Usage
+
+The `target` field accepts either:
+
+- **A hex address** — call this address directly
+- **A contract name** — look up the address from the chain's contract configuration
+
+```json
+{
+  "MyProtocol": {
+    "address": "0xAAA...",
+    "calls": [
+      {
+        "function": "latestAnswer()",
+        "output_type": "int256",
+        "target": "0xBBB..."
+      },
+      {
+        "function": "getPrice()",
+        "output_type": "uint256",
+        "target": "ChainlinkEthOracle"
+      }
+    ]
+  }
+}
+```
+
+In this example:
+- `latestAnswer()` is called on `0xBBB...` instead of `0xAAA...`
+- `getPrice()` is called on whatever address is configured for `ChainlinkEthOracle` in the same chain's contracts
+
+### Name Resolution
+
+When `target` is a contract name, the address is resolved from the chain's contracts configuration at startup. If the contract has multiple addresses, all of them are used. If the name cannot be found, a warning is logged and the call is skipped.
+
+### Compatibility
+
+The `target` field works with all frequency settings (`"once"`, every-N-blocks, duration-based, and `on_events`) and with both regular contracts and factory collections.
+
+**Factory calls with target:**
+- For factory event-triggered calls, the resolved target overrides the default behavior of using the event emitter address
+- For factory `"once"` calls, the target address is called once per discovered factory instance (at the block where each instance was discovered). The `source: "self"` parameter still refers to the discovered factory address, allowing you to query a central contract about each discovered instance.
+
+**Example:** Call a registry contract to get metadata about each discovered factory instance:
+```json
+{
+    "Airlock": {
+        "address": "0x...",
+        "factories": [{
+            "collection_name": "DERC20",
+            "factory_events": { ... },
+            "calls": [{
+                "function": "getAssetData(address)",
+                "output_type": "(address numeraire, uint256 supply)",
+                "frequency": "once",
+                "target": "Airlock",
+                "params": [{"type": "address", "source": "self"}]
+            }]
+        }]
+    }
+}
+```
+This calls `Airlock.getAssetData(factoryAddress)` for each discovered DERC20, storing results keyed by the factory instance.
+
+Results are still written under the original contract/collection name in the output directory, regardless of which address was actually called.
 
 ## Frequency
 
@@ -298,6 +369,30 @@ data/raw/base/eth_calls/DERC20/once/0-9999.parquet
   - symbol_result
   - decimals_result
 ```
+
+### Column Index Sidecar
+
+Each `once/` directory contains a `column_index.json` sidecar file that tracks which function result columns exist in each parquet file:
+
+**Path:** `data/raw/{chain}/eth_calls/{contract}/once/column_index.json`
+
+**Format:**
+```json
+{
+  "0-9999.parquet": ["name", "symbol", "decimals"],
+  "10000-19999.parquet": ["name", "symbol", "decimals"]
+}
+```
+
+This index enables **incremental column addition**: when you add a new `frequency: "once"` call to an existing contract configuration, the collector detects which parquet files are missing the new column and:
+
+1. Executes only the newly added call(s)
+2. Reads the existing parquet file
+3. Merges the new result column(s) into the existing data
+4. Rewrites the parquet file with all columns
+5. Updates the column index
+
+This avoids re-executing calls that were already collected, significantly reducing RPC usage when adding new "once" calls to an existing configuration.
 
 ## Data Flow
 
@@ -567,7 +662,7 @@ When using named tuple output types, the decoded parquet files will have named c
 
 ## Resumability
 
-Collection is fully resumable with catchup logic for regular eth_calls:
+Collection is fully resumable with catchup logic for all eth_call types:
 
 ### Catchup Phase (Regular Calls)
 
@@ -577,13 +672,93 @@ On startup, the eth_call collector performs a catchup phase for regular (non-fac
 2. **Checks existing eth_call files** - For each block range, checks if eth_call parquet files exist for all configured contract/function pairs
 3. **Re-processes missing ranges** - If any eth_call files are missing, reads block info from the existing block parquet file and executes the calls
 
+### "Once" Call Catchup
+
+For `frequency: "once"` calls, the catchup logic is column-aware:
+
+1. **Checks the column index** - Reads `column_index.json` from each `once/` directory
+2. **Detects missing columns** - Compares configured function names against the index to find newly added calls
+3. **Executes only missing calls** - If the parquet file exists but is missing columns for new functions, only those new calls are executed
+4. **Merges columns** - New result columns are merged into existing parquet files by matching on the `address` column
+5. **Updates the index** - The column index is updated after each write
+
+This means you can add new `frequency: "once"` calls to an existing configuration without re-running all historical calls — only the new calls are executed and merged into existing files.
+
 ### Factory Calls
 
 Factory eth_calls are handled during the normal processing phase (not during catchup). When the factory collector sends addresses, those calls are executed regardless of what catchup has processed. This is because factory addresses may not be known until the factory collector processes the corresponding log data.
 
 ### Manual Re-collection
 
-To re-collect eth_calls for a range, delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/`.
+**Regular calls:** Delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/`.
+
+**Once calls:** Remove the function name from the `column_index.json` for that file, or delete the entire parquet file to recollect all columns.
+
+### Column Merging
+
+When new "once" columns are added to the configuration:
+
+1. The collector detects missing columns by comparing configured functions against the column index
+2. Only the missing columns are collected via RPC calls
+3. New columns are merged into existing parquet files
+4. If a column name already exists in the parquet (but was removed from the index), it is **replaced** with fresh data
+5. The column index is updated to reflect the actual parquet schema after the merge
+
+For "once" calls, you can either:
+- Delete the parquet file to re-collect all "once" calls for that range
+- Edit `column_index.json` to remove specific function names, then restart — only those functions will be re-collected and merged
+
+## Column Index Tracking
+
+For `frequency: "once"` calls, the collector maintains a `column_index.json` sidecar file in each `once/` directory. This tracks which function result columns exist in each parquet file.
+
+### Index File Location
+
+```
+data/raw/{chain}/eth_calls/{contract_or_collection}/once/column_index.json
+```
+
+### Index Format
+
+```json
+{
+  "0-9999.parquet": ["name", "symbol", "decimals"],
+  "10000-19999.parquet": ["name", "symbol", "decimals", "getAssetData"]
+}
+```
+
+### Index Behavior
+
+**On startup (catchup phase):**
+- If `column_index.json` exists, it is loaded
+- If not, the collector scans all parquet files in the directory and builds the index from their schemas
+- The rebuilt index is saved to disk
+
+**During collection:**
+- When a file is written or merged, the index is updated based on the actual columns in the parquet file (not the configured functions)
+- This ensures the index always reflects reality, even if some calls failed
+
+**For incremental collection:**
+- The index determines which columns are missing from each file
+- Missing columns are collected and merged into existing files
+- Existing columns with the same name are replaced (not duplicated)
+
+**Raw vs Decoded Index Updates:**
+- **Raw data collection** processes "once" calls sequentially, so indexes are updated immediately after each file is written
+- **Decoded data catchup** processes files in parallel via JoinSet, so decoded column indexes are **batch-updated** after all concurrent tasks complete to avoid race conditions (see [Decoding](./DECODING.md#column-index-batch-updates))
+
+### Recollecting a Column
+
+To force recollection of a specific column (e.g., after fixing a bug):
+
+1. Remove the column from `column_index.json` for the affected files
+2. Re-run the collector - it will detect the "missing" column and recollect it
+3. The new data will replace the old column in the parquet file
+
+Alternatively, use the helper script:
+```bash
+python scripts/remove_parquet_column.py data/raw/base/eth_calls/DERC20/once getAssetData_result
+```
 
 ## Limitations
 

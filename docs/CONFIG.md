@@ -219,6 +219,7 @@ Contracts can include `calls` to read on-chain state:
 | `output_type` | string | Yes | - | Return type for decoding |
 | `params` | array | No | - | Parameters to pass to the function call |
 | `frequency` | string/number | No | every block | How often to make the call |
+| `target` | string | No | *(contract address)* | Override target: a hex address or a contract name to look up |
 
 **Parameterized Calls:**
 

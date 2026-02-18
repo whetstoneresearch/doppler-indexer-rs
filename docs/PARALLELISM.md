@@ -158,7 +158,60 @@ Channel capacity is configurable in `raw_data_collection`:
 
 Larger channel capacities allow more buffering between collectors, which can improve throughput when downstream collectors are temporarily slower than upstream.
 
+## Streaming Collection
+
+The block collector uses a **streaming approach** for maximum throughput:
+
+1. All block requests for a range are dispatched concurrently (rate-limited by semaphore + CU limiter)
+2. Each block is processed **immediately as it arrives** from the RPC
+3. Block data is forwarded to downstream collectors (receipts, eth_calls) **instantly**
+4. Records are buffered in a BTreeMap for ordered parquet output
+
+### Benefits
+
+- **Immediate downstream forwarding**: Receipts collector starts receiving blocks as soon as they're fetched, not after the whole batch completes
+- **Better rate limit utilization**: Requests continuously flow to the RPC, limited only by semaphore and CU budget
+- **Pipelining**: While blocks are still being fetched, downstream collectors are already processing
+
+### Architecture
+
+```
+                     ┌─────────────────────────────────────────────────────────────┐
+                     │                    RPC Layer                                 │
+                     │  ┌─────────┐    ┌─────────────────────┐    ┌─────────────┐  │
+                     │  │Semaphore│───▶│Sliding Window Limiter│───▶│   Execute   │  │
+                     │  │(100-500)│    │   (7500 CU/sec)      │    │   Request   │  │
+                     │  └─────────┘    └─────────────────────┘    └──────┬──────┘  │
+                     └───────────────────────────────────────────────────┼─────────┘
+                                                                         │
+                                              Stream results via channel │
+                                                                         ▼
+┌──────────────┐              ┌──────────────────────────────────────────────────────┐
+│    Blocks    │◀─────────────│           Block Collector (Streaming)                 │
+│   Parquet    │              │  ┌──────────────┐   ┌──────────────────────────────┐  │
+│   (ordered)  │◀─────────────│  │ BTreeMap     │   │  Forward to downstream       │  │
+└──────────────┘              │  │ (buffered)   │   │  immediately as received     │──┼──▶ Receipts
+                              │  └──────────────┘   └──────────────────────────────┘  │
+                              └───────────────────────────────────────────────────────┘
+                                                                                       │
+                                                                                       ▼
+                                                                                   Eth Calls
+```
+
 ## Concurrency Settings
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RPC_CONCURRENCY` | 100 | Max concurrent in-flight RPC requests across all collectors |
+| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second (match your plan) |
+| `RPC_BATCH_SIZE` | from config | Override for batch size (larger = more concurrent requests) |
+
+**Recommended settings for high throughput:**
+```bash
+RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
+```
 
 ### Block Receipt Concurrency
 

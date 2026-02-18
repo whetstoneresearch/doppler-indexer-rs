@@ -305,9 +305,20 @@ On startup, the decoder:
 1. Scans `data/derived/{chain}/decoded/` for existing decoded files
 2. Scans `data/raw/{chain}/logs/` and `data/raw/{chain}/eth_calls/` for raw files
 3. Skips ranges that are already fully decoded
-4. Processes any missing ranges **concurrently** (configurable parallelism)
+4. For partially decoded ranges, **only decodes missing events** (incremental catchup)
+5. Processes any missing ranges **concurrently** (configurable parallelism)
 
 For factory events during catchup, the decoder loads factory addresses from `data/derived/{chain}/factories/` parquet files.
+
+### Incremental Decoding
+
+When a new event is added to the configuration, the catchup phase efficiently processes only what's needed:
+
+- For each block range, the decoder checks which event types have existing decoded output files
+- Only events **without** existing decoded files are processed for that range
+- Events that were previously decoded are skipped entirely (no re-reading, re-decoding, or re-writing)
+
+This means adding a new event to the config doesn't require re-processing all historical data for existing events—only the new event is decoded across all ranges.
 
 ## Error Handling
 
@@ -369,6 +380,18 @@ This automatic recovery ensures data integrity without manual intervention, even
 - Uses Snappy compression for output parquet files
 - Processes data in block ranges matching the configured `parquet_block_range`
 - Factory addresses are cached per range to avoid repeated lookups
+
+### Column Index Batch Updates
+
+For "once" call decoding, column indexes (which track decoded function columns per file) are updated in a **batch** after all concurrent decoding tasks complete. This prevents race conditions where multiple tasks might simultaneously read, modify, and overwrite the same index file.
+
+The flow during catchup:
+1. All "once" call files are processed concurrently via JoinSet
+2. Each task returns its column index info (contract name, file name, decoded columns)
+3. After all tasks complete, indexes are grouped by contract and batch-written sequentially
+4. A single log message confirms the final index state for each contract
+
+This design ensures data integrity without sacrificing parallelism during the catchup phase.
 
 ### Concurrency Configuration
 

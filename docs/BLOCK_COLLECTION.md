@@ -136,14 +136,43 @@ When no fields are specified, all block header fields are stored:
 | `uncle_count` | UInt32 | No |
 | `size` | UInt64 | Yes |
 
+## Streaming Collection
+
+Block collection uses a **streaming approach** for maximum throughput:
+
+1. **Concurrent dispatch**: All block requests for a range are dispatched at once
+2. **Rate limiting**: Semaphore limits concurrent in-flight requests (`RPC_CONCURRENCY`)
+3. **Per-request CU tracking**: Each request acquires compute units individually from the sliding window limiter
+4. **Immediate forwarding**: As each block arrives, it's immediately forwarded to downstream collectors
+5. **Ordered output**: Records are buffered in a BTreeMap for sorted parquet output
+
+### Benefits
+
+- **No batch waiting**: Downstream collectors (receipts, eth_calls) receive data as soon as blocks arrive
+- **Pipeline parallelism**: While blocks are being fetched, downstream is already processing
+- **Better rate limit utilization**: Continuous request flow instead of batch-wait-batch pattern
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RPC_CONCURRENCY` | 100 | Max concurrent in-flight block requests |
+| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second |
+| `RPC_BATCH_SIZE` | from config | Override for batch size |
+
+**Example for high throughput:**
+```bash
+RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
+```
+
 ## RPC Client Selection
 
 The `UnifiedRpcClient` automatically selects the appropriate rate limiting strategy:
 
-- **Alchemy URLs** (containing "alchemy"): Uses compute unit rate limiting (330 CU/s default)
+- **Alchemy URLs** (containing "alchemy"): Uses compute unit rate limiting with sliding window
 - **Other URLs**: Uses request-based rate limiting
 
-Both clients share the same interface, allowing rate limits to be shared across block, receipt, and log collection on the same chain.
+All clients can share a rate limiter for account-level rate limiting across block, receipt, and eth_call collection.
 
 ## Error Handling
 
