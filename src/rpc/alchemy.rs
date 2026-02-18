@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +9,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
 use crate::rpc::rpc::{error_chain, with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError};
@@ -144,6 +145,8 @@ pub struct AlchemyConfig {
     pub max_batch_size: usize,
     pub batching_enabled: bool,
     pub retry: RetryConfig,
+    /// Max concurrent in-flight RPC requests. Configurable via RPC_CONCURRENCY env var.
+    pub rpc_concurrency: usize,
 }
 
 impl AlchemyConfig {
@@ -155,6 +158,7 @@ impl AlchemyConfig {
             max_batch_size: 100,
             batching_enabled: true,
             retry: RetryConfig::default(),
+            rpc_concurrency: 100,
         }
     }
 
@@ -172,6 +176,11 @@ impl AlchemyConfig {
         self.retry = config;
         self
     }
+
+    pub fn with_rpc_concurrency(mut self, concurrency: usize) -> Self {
+        self.rpc_concurrency = concurrency;
+        self
+    }
 }
 
 impl Default for AlchemyConfig {
@@ -182,27 +191,39 @@ impl Default for AlchemyConfig {
             max_batch_size: 100,
             batching_enabled: true,
             retry: RetryConfig::default(),
+            rpc_concurrency: 100,
         }
     }
 }
 
 pub struct AlchemyClient {
-    inner: RpcClient,
+    inner: Arc<RpcClient>,
     rate_limiter: Arc<SlidingWindowRateLimiter>,
     config: AlchemyConfig,
 }
 
 impl AlchemyClient {
     pub fn new(config: AlchemyConfig) -> Result<Self, RpcError> {
+        Self::new_with_limiter(config, None)
+    }
+
+    /// Create a new client, optionally sharing a rate limiter with other clients.
+    /// If `shared_limiter` is None, creates a new rate limiter.
+    pub fn new_with_limiter(
+        config: AlchemyConfig,
+        shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    ) -> Result<Self, RpcError> {
         let rpc_config = RpcClientConfig::new(config.url.clone())
             .with_batch_size(config.max_batch_size)
             .with_batching(config.batching_enabled);
 
-        let inner = RpcClient::new(rpc_config)?;
+        let inner = Arc::new(RpcClient::new(rpc_config)?);
 
-        let rate_limiter = Arc::new(SlidingWindowRateLimiter::new(
-            config.compute_units_per_second.get(),
-        ));
+        let rate_limiter = shared_limiter.unwrap_or_else(|| {
+            Arc::new(SlidingWindowRateLimiter::new(
+                config.compute_units_per_second.get(),
+            ))
+        });
 
         Ok(Self {
             inner,
@@ -214,6 +235,19 @@ impl AlchemyClient {
     pub fn from_url(url: &str, compute_units_per_second: u32) -> Result<Self, RpcError> {
         let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
         Self::new(AlchemyConfig::new(url, compute_units_per_second))
+    }
+
+    /// Create client with custom options for concurrency and optional shared rate limiter.
+    pub fn from_url_with_options(
+        url: &str,
+        compute_units_per_second: u32,
+        rpc_concurrency: usize,
+        shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    ) -> Result<Self, RpcError> {
+        let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
+        let config = AlchemyConfig::new(url, compute_units_per_second)
+            .with_rpc_concurrency(rpc_concurrency);
+        Self::new_with_limiter(config, shared_limiter)
     }
 
     pub fn config(&self) -> &AlchemyConfig {
@@ -237,6 +271,123 @@ impl AlchemyClient {
     /// Consume a raw number of compute units, waiting if necessary.
     async fn consume_compute_units_raw(&self, units: u32) {
         self.rate_limiter.acquire(units).await;
+    }
+
+    /// Execute requests concurrently with semaphore-bounded parallelism and per-request rate limiting.
+    /// Returns results in the same order as the input requests.
+    ///
+    /// Each request:
+    /// 1. Acquires a semaphore permit (limits concurrent in-flight requests)
+    /// 2. Acquires CUs from the rate limiter
+    /// 3. Executes the request
+    /// 4. Stores result at its original index
+    async fn execute_concurrent_ordered<T, Req, F, Fut>(
+        &self,
+        requests: Vec<Req>,
+        cost_per_request: u32,
+        make_request: F,
+    ) -> Vec<T>
+    where
+        T: Send + 'static,
+        Req: Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = T> + Send,
+    {
+        use tokio::task::JoinSet;
+
+        if requests.is_empty() {
+            return vec![];
+        }
+
+        let num_requests = requests.len();
+        let semaphore = Arc::new(Semaphore::new(self.config.rpc_concurrency));
+        let rate_limiter = self.rate_limiter.clone();
+        let make_request = Arc::new(make_request);
+
+        let mut join_set = JoinSet::new();
+
+        for (idx, request) in requests.into_iter().enumerate() {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let rate_limiter = rate_limiter.clone();
+            let make_request = make_request.clone();
+
+            join_set.spawn(async move {
+                // Acquire CUs before making request
+                rate_limiter.acquire(cost_per_request).await;
+                let result = make_request(request).await;
+                drop(permit); // Release semaphore permit
+                (idx, result)
+            });
+        }
+
+        // Collect results and sort by index to preserve order
+        let mut indexed_results: Vec<(usize, T)> = Vec::with_capacity(num_requests);
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((idx, value)) => indexed_results.push((idx, value)),
+                Err(e) => {
+                    // Task panicked - this shouldn't happen in normal operation
+                    tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
+                }
+            }
+        }
+
+        // Sort by index and extract values
+        indexed_results.sort_by_key(|(idx, _)| *idx);
+        indexed_results.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Execute requests concurrently, streaming results to a channel as they complete.
+    /// Results are sent in completion order (not input order) for maximum throughput.
+    ///
+    /// Returns a JoinHandle that resolves when all requests are complete.
+    /// The caller should process results from the receiver concurrently.
+    pub fn execute_streaming<T, Req, F, Fut>(
+        &self,
+        requests: Vec<Req>,
+        cost_per_request: u32,
+        result_tx: tokio::sync::mpsc::Sender<T>,
+        make_request: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        T: Send + 'static,
+        Req: Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = T> + Send,
+    {
+        use tokio::task::JoinSet;
+
+        let semaphore = Arc::new(Semaphore::new(self.config.rpc_concurrency));
+        let rate_limiter = self.rate_limiter.clone();
+        let make_request = Arc::new(make_request);
+
+        tokio::spawn(async move {
+            if requests.is_empty() {
+                return;
+            }
+
+            let mut join_set = JoinSet::new();
+
+            for request in requests {
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let rate_limiter = rate_limiter.clone();
+                let make_request = make_request.clone();
+                let result_tx = result_tx.clone();
+
+                join_set.spawn(async move {
+                    // Acquire CUs before making request
+                    rate_limiter.acquire(cost_per_request).await;
+                    let result = make_request(request).await;
+                    drop(permit); // Release semaphore permit
+
+                    // Send result immediately - ignore error if receiver dropped
+                    let _ = result_tx.send(result).await;
+                });
+            }
+
+            // Wait for all tasks to complete
+            while join_set.join_next().await.is_some() {}
+        })
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
@@ -335,46 +486,39 @@ impl AlchemyClient {
         &self,
         method_name: &str,
         block_numbers: Vec<BlockNumberOrTag>,
-        concurrency: usize,
+        _concurrency: usize, // Deprecated: now uses rpc_concurrency from config
     ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
         if block_numbers.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut all_results = Vec::with_capacity(block_numbers.len());
+        let inner = self.inner.clone();
+        let method_name = method_name.to_string();
         let cost_per_block = ComputeUnitCost::GET_BLOCK_RECEIPTS.cost();
 
-        for chunk in block_numbers.chunks(concurrency) {
-            let total_cost = chunk.len() as u32 * cost_per_block;
-            self.consume_compute_units_raw(total_cost).await;
+        let results = self
+            .execute_concurrent_ordered(block_numbers, cost_per_block, move |block_number| {
+                let inner = inner.clone();
+                let method_name = method_name.clone();
+                async move {
+                    // inner.get_block_receipts already has retry logic
+                    inner.get_block_receipts(&method_name, block_number).await
+                }
+            })
+            .await;
 
-            let chunk_block_numbers: Vec<_> = chunk.to_vec();
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|&block_number| {
-                    self.inner.get_block_receipts(method_name, block_number)
-                })
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-
-            for (i, result) in results.into_iter().enumerate() {
-                match result {
-                    Ok(receipts) => all_results.push(receipts),
-                    Err(e) => {
-                        let failed_block = chunk_block_numbers.get(i);
-                        tracing::error!(
-                            "get_block_receipts failed for block {:?}: {}",
-                            failed_block,
-                            e
-                        );
-                        return Err(e);
-                    }
+        // Collect results, failing on first error
+        let mut receipts = Vec::with_capacity(results.len());
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(r) => receipts.push(r),
+                Err(e) => {
+                    tracing::error!("get_block_receipts failed for block index {}: {}", i, e);
+                    return Err(e);
                 }
             }
         }
-
-        Ok(all_results)
+        Ok(receipts)
     }
 
     pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {
@@ -464,54 +608,86 @@ impl AlchemyClient {
             return Ok(results);
         }
 
-        let mut all_results = Vec::with_capacity(block_numbers.len());
-        let cost_per_block = ComputeUnitCost::GET_BLOCK_BY_NUMBER.cost();
-
-        for (chunk_idx, chunk) in block_numbers.chunks(self.config.max_batch_size).enumerate() {
-            let chunk_vec: Vec<BlockNumberOrTag> = chunk.to_vec();
-            let total_cost = chunk_vec.len() as u32 * cost_per_block;
-            let first_block = chunk_vec.first().map(|b| format!("{:?}", b)).unwrap_or_default();
-            let last_block = chunk_vec.last().map(|b| format!("{:?}", b)).unwrap_or_default();
-            let op_name = format!(
-                "eth_getBlockByNumber[batch {}] blocks {}-{}",
-                chunk_idx, first_block, last_block
-            );
-
-            self.consume_compute_units_raw(total_cost).await;
-            let chunk_results: Vec<Option<Block>> = with_retry(
-                &self.config.retry,
-                &op_name,
-                || async {
-                    let futures: Vec<_> = chunk_vec
-                        .iter()
-                        .map(|&number| {
-                            let builder = self.inner.provider().get_block(BlockId::Number(number));
-                            async move {
-                                if full_transactions {
-                                    builder.full().await
-                                } else {
-                                    builder.await
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let results = futures::future::join_all(futures).await;
-
-                    let mut chunk_results = Vec::with_capacity(results.len());
-                    for result in results {
-                        chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                    }
-                    Ok(chunk_results)
-                },
-            )
-            .await?;
-
-            all_results.extend(chunk_results);
+        if block_numbers.is_empty() {
+            return Ok(vec![]);
         }
 
-        Ok(all_results)
+        let provider = self.inner.provider().clone();
+        let retry_config = self.config.retry.clone();
+        let cost_per_block = ComputeUnitCost::GET_BLOCK_BY_NUMBER.cost();
+
+        let results = self
+            .execute_concurrent_ordered(block_numbers, cost_per_block, move |number| {
+                let provider = provider.clone();
+                let retry_config = retry_config.clone();
+                async move {
+                    let op_name = format!("eth_getBlockByNumber({:?})", number);
+                    with_retry(&retry_config, &op_name, || async {
+                        let builder = provider.get_block(BlockId::Number(number));
+                        if full_transactions {
+                            builder
+                                .full()
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        } else {
+                            builder
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        }
+                    })
+                    .await
+                }
+            })
+            .await;
+
+        // Collect results, failing on first error
+        let mut blocks = Vec::with_capacity(results.len());
+        for result in results {
+            blocks.push(result?);
+        }
+        Ok(blocks)
+    }
+
+    /// Stream blocks as they are fetched, sending each to the provided channel.
+    /// Returns a JoinHandle that completes when all blocks are fetched.
+    /// Results include the block number for ordering/identification.
+    pub fn get_blocks_streaming(
+        &self,
+        block_numbers: Vec<BlockNumberOrTag>,
+        full_transactions: bool,
+        result_tx: tokio::sync::mpsc::Sender<(BlockNumberOrTag, Result<Option<Block>, RpcError>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        let provider = self.inner.provider().clone();
+        let retry_config = self.config.retry.clone();
+        let cost_per_block = ComputeUnitCost::GET_BLOCK_BY_NUMBER.cost();
+
+        self.execute_streaming(
+            block_numbers,
+            cost_per_block,
+            result_tx,
+            move |number| {
+                let provider = provider.clone();
+                let retry_config = retry_config.clone();
+                async move {
+                    let op_name = format!("eth_getBlockByNumber({:?})", number);
+                    let result = with_retry(&retry_config, &op_name, || async {
+                        let builder = provider.get_block(BlockId::Number(number));
+                        if full_transactions {
+                            builder
+                                .full()
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        } else {
+                            builder
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        }
+                    })
+                    .await;
+                    (number, result)
+                }
+            },
+        )
     }
 
     pub async fn get_transaction_receipts_batch(
@@ -523,7 +699,7 @@ impl AlchemyClient {
             for hash in hashes {
                 match self.get_transaction_receipt(hash).await {
                     Ok(receipt) => results.push(receipt),
-                    Err(e) => {            
+                    Err(e) => {
                         tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
                         results.push(None);
                     }
@@ -532,32 +708,29 @@ impl AlchemyClient {
             return Ok(results);
         }
 
-        let mut all_results = Vec::with_capacity(hashes.len());
-        let cost_per_receipt = ComputeUnitCost::GET_TRANSACTION_RECEIPT.cost();
-
-        for chunk in hashes.chunks(self.config.max_batch_size) {
-            let total_cost = chunk.len() as u32 * cost_per_receipt;
-            self.consume_compute_units_raw(total_cost).await;
-
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|&hash| self.inner.provider().get_transaction_receipt(hash))
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-
-            for (i, result) in results.into_iter().enumerate() {
-                match result {
-                    Ok(receipt) => all_results.push(receipt),
-                    Err(e) => {
-                        tracing::debug!("Skipping receipt for tx {:?}: {}", chunk[i], e);
-                        all_results.push(None);
-                    }
-                }
-            }
+        if hashes.is_empty() {
+            return Ok(vec![]);
         }
 
-        Ok(all_results)
+        let provider = self.inner.provider().clone();
+        let cost_per_receipt = ComputeUnitCost::GET_TRANSACTION_RECEIPT.cost();
+
+        let results = self
+            .execute_concurrent_ordered(hashes, cost_per_receipt, move |hash| {
+                let provider = provider.clone();
+                async move {
+                    match provider.get_transaction_receipt(hash).await {
+                        Ok(receipt) => receipt,
+                        Err(e) => {
+                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            None
+                        }
+                    }
+                }
+            })
+            .await;
+
+        Ok(results)
     }
 
     pub async fn get_logs_batch(&self, filters: Vec<Filter>) -> Result<Vec<Vec<Log>>, RpcError> {
@@ -569,44 +742,41 @@ impl AlchemyClient {
             return Ok(results);
         }
 
-        let mut all_results = Vec::with_capacity(filters.len());
-        let cost_per_logs = ComputeUnitCost::GET_LOGS.cost();
-
-        for (chunk_idx, chunk) in filters.chunks(self.config.max_batch_size).enumerate() {
-            let chunk_vec: Vec<Filter> = chunk.to_vec();
-            let total_cost = chunk_vec.len() as u32 * cost_per_logs;
-            let op_name = format!(
-                "eth_getLogs[batch {}] ({} filters)",
-                chunk_idx,
-                chunk_vec.len()
-            );
-
-            self.consume_compute_units_raw(total_cost).await;
-            let chunk_results: Vec<Vec<Log>> = with_retry(
-                &self.config.retry,
-                &op_name,
-                || async {
-                    let futures: Vec<_> = chunk_vec
-                        .iter()
-                        .map(|filter| self.inner.provider().get_logs(filter))
-                        .collect();
-
-                    let results = futures::future::join_all(futures).await;
-
-                    let mut chunk_results = Vec::with_capacity(results.len());
-                    for result in results {
-                        chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                    }
-                    Ok(chunk_results)
-                },
-            )
-            .await?;
-
-            all_results.extend(chunk_results);
+        if filters.is_empty() {
+            return Ok(vec![]);
         }
 
-        Ok(all_results)
+        let provider = self.inner.provider().clone();
+        let retry_config = self.config.retry.clone();
+        let cost_per_logs = ComputeUnitCost::GET_LOGS.cost();
+
+        let results = self
+            .execute_concurrent_ordered(filters, cost_per_logs, move |filter| {
+                let provider = provider.clone();
+                let retry_config = retry_config.clone();
+                async move {
+                    let op_name = format!(
+                        "eth_getLogs(blocks {:?}-{:?})",
+                        filter.get_from_block(),
+                        filter.get_to_block()
+                    );
+                    with_retry(&retry_config, &op_name, || async {
+                        provider
+                            .get_logs(&filter)
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    })
+                    .await
+                }
+            })
+            .await;
+
+        // Collect results, failing on first error
+        let mut logs = Vec::with_capacity(results.len());
+        for result in results {
+            logs.push(result?);
+        }
+        Ok(logs)
     }
 
     pub async fn call_batch(
@@ -621,47 +791,33 @@ impl AlchemyClient {
             return Ok(results);
         }
 
-        let mut all_results = Vec::with_capacity(calls.len());
-        let cost_per_call = ComputeUnitCost::ETH_CALL.cost();
-
-        for (chunk_idx, chunk) in calls.chunks(self.config.max_batch_size).enumerate() {
-            let chunk_vec: Vec<(alloy::rpc::types::TransactionRequest, BlockId)> =
-                chunk.to_vec();
-            let total_cost = chunk_vec.len() as u32 * cost_per_call;
-            let first_block = chunk_vec.first().map(|(_, b)| format!("{:?}", b)).unwrap_or_default();
-            let last_block = chunk_vec.last().map(|(_, b)| format!("{:?}", b)).unwrap_or_default();
-            let to_addr = chunk_vec.first().and_then(|(tx, _)| tx.to).map(|a| format!("{:?}", a)).unwrap_or_else(|| "unknown".to_string());
-            let op_name = format!(
-                "eth_call[batch {}] to={} blocks {}-{} ({} calls)",
-                chunk_idx, to_addr, first_block, last_block, chunk_vec.len()
-            );
-
-            self.consume_compute_units_raw(total_cost).await;
-            let chunk_results: Vec<Result<Bytes, RpcError>> = with_retry(
-                &self.config.retry,
-                &op_name,
-                || async {
-                    let futures: Vec<_> = chunk_vec
-                        .iter()
-                        .map(|(tx, block)| async move {
-                            self.inner.provider().call(tx.clone()).block(*block).await
-                        })
-                        .collect();
-
-                    let results = futures::future::join_all(futures).await;
-
-                    Ok(results
-                        .into_iter()
-                        .map(|r| r.map_err(|e| RpcError::ProviderError(error_chain(&e))))
-                        .collect())
-                },
-            )
-            .await?;
-
-            all_results.extend(chunk_results);
+        if calls.is_empty() {
+            return Ok(vec![]);
         }
 
-        Ok(all_results)
+        let provider = self.inner.provider().clone();
+        let retry_config = self.config.retry.clone();
+        let cost_per_call = ComputeUnitCost::ETH_CALL.cost();
+
+        let results = self
+            .execute_concurrent_ordered(calls, cost_per_call, move |(tx, block)| {
+                let provider = provider.clone();
+                let retry_config = retry_config.clone();
+                async move {
+                    let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
+                    with_retry(&retry_config, &op_name, || async {
+                        provider
+                            .call(tx.clone())
+                            .block(block)
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    })
+                    .await
+                }
+            })
+            .await;
+
+        Ok(results)
     }
 }
 

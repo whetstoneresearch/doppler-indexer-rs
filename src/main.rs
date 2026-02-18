@@ -24,7 +24,7 @@ use raw_data::historical::logs::collect_logs;
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, collect_receipts, EventTriggerMessage, LogMessage,
 };
-use rpc::UnifiedRpcClient;
+use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
     RangeCompleteMessage, TransformationEngine,
@@ -332,12 +332,59 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
 
     // Shared state for spawned tasks
     let chain = Arc::new(chain.clone());
-    let raw_config = Arc::new(config.raw_data_collection.clone());
 
-    // Pre-create RPC clients to avoid unwrap() inside spawned tasks
-    let blocks_client = UnifiedRpcClient::from_url(&rpc_url)?;
-    let receipts_client = UnifiedRpcClient::from_url(&rpc_url)?;
-    let eth_calls_client = UnifiedRpcClient::from_url(&rpc_url)?;
+    // RPC configuration from environment variables
+    let rpc_concurrency: usize = env::var("RPC_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let alchemy_cu_per_second: u32 = env::var("ALCHEMY_CU_PER_SECOND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7500);
+
+    // Allow overriding batch size via env var for larger concurrent fetches
+    let rpc_batch_size: Option<u32> = env::var("RPC_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
+    // Apply env var overrides to raw_config
+    let mut raw_config = config.raw_data_collection.clone();
+    if let Some(batch_size) = rpc_batch_size {
+        raw_config.rpc_batch_size = Some(batch_size);
+    }
+    let raw_config = Arc::new(raw_config);
+
+    tracing::info!(
+        "RPC config: concurrency={}, alchemy_cu_per_second={}, batch_size={}",
+        rpc_concurrency,
+        alchemy_cu_per_second,
+        raw_config.rpc_batch_size.unwrap_or(100)
+    );
+
+    // Create shared rate limiter for account-level rate limiting across all clients
+    let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(alchemy_cu_per_second));
+
+    // Pre-create RPC clients with shared rate limiter
+    let blocks_client = UnifiedRpcClient::from_url_with_options(
+        &rpc_url,
+        alchemy_cu_per_second,
+        rpc_concurrency,
+        Some(shared_limiter.clone()),
+    )?;
+    let receipts_client = UnifiedRpcClient::from_url_with_options(
+        &rpc_url,
+        alchemy_cu_per_second,
+        rpc_concurrency,
+        Some(shared_limiter.clone()),
+    )?;
+    let eth_calls_client = UnifiedRpcClient::from_url_with_options(
+        &rpc_url,
+        alchemy_cu_per_second,
+        rpc_concurrency,
+        Some(shared_limiter.clone()),
+    )?;
 
     // Clone decoder senders for factories before the originals are moved
     let log_decoder_tx_for_factories = if has_factories {

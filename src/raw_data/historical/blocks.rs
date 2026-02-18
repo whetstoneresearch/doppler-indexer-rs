@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
@@ -139,182 +139,20 @@ pub async fn collect_blocks(
 
     let block_fields = &raw_data_config.fields.block_fields;
     let schema = build_block_schema(block_fields);
-    let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as u64;
 
     for range in ranges {
         tracing::info!("Fetching blocks {}-{}", range.start, range.end - 1);
 
-        #[cfg(feature = "bench")]
-        let mut rpc_time = std::time::Duration::ZERO;
-        #[cfg(feature = "bench")]
-        let mut process_time = std::time::Duration::ZERO;
-
-        let record_count = match block_fields {
-            Some(fields) => {
-                let mut all_records = Vec::with_capacity((range.end - range.start) as usize);
-
-                for batch_start in (range.start..range.end).step_by(rpc_batch_size as usize) {
-                    let batch_end = std::cmp::min(batch_start + rpc_batch_size, range.end);
-                    let block_numbers: Vec<BlockNumberOrTag> = (batch_start..batch_end)
-                        .map(BlockNumberOrTag::Number)
-                        .collect();
-
-                    #[cfg(feature = "bench")]
-                    let rpc_start = Instant::now();
-                    let blocks = client.get_blocks_batch(block_numbers, false).await?;
-                    #[cfg(feature = "bench")]
-                    {
-                        rpc_time += rpc_start.elapsed();
-                    }
-
-                    #[cfg(feature = "bench")]
-                    let process_start = Instant::now();
-                    let (records, tx_data) =
-                        process_blocks_minimal(&blocks, batch_start, fields.clone())?;
-
-                    if let Some(sender) = &tx_sender {
-                        for (block_number, timestamp, tx_hashes) in &tx_data {
-                            sender
-                                .send((*block_number, *timestamp, tx_hashes.clone()))
-                                .await
-                                .map_err(|_| {
-                                    tracing::error!(
-                                        "Failed to send block {} to receipts channel - receiver dropped",
-                                        block_number
-                                    );
-                                    BlockCollectionError::ChannelSend(format!(
-                                        "block_tx (block {}) - receiver dropped",
-                                        block_number
-                                    ))
-                                })?;
-                        }
-                    }
-
-                    if let Some(sender) = &eth_call_sender {
-                        for (block_number, timestamp, _) in &tx_data {
-                            sender
-                                .send((*block_number, *timestamp))
-                                .await
-                                .map_err(|_| {
-                                    tracing::error!(
-                                        "Failed to send block {} to eth_call channel - receiver dropped",
-                                        block_number
-                                    );
-                                    BlockCollectionError::ChannelSend(format!(
-                                        "eth_call_tx (block {}) - receiver dropped",
-                                        block_number
-                                    ))
-                                })?;
-                        }
-                    }
-
-                    all_records.extend(records);
-                    #[cfg(feature = "bench")]
-                    {
-                        process_time += process_start.elapsed();
-                    }
-                }
-
-                let count = all_records.len();
-                let schema_clone = schema.clone();
-                let fields_vec = fields.to_vec();
-                let output_path = output_dir.join(range.file_name());
-                #[cfg(feature = "bench")]
-                let write_start = Instant::now();
-                tokio::task::spawn_blocking(move || {
-                    write_minimal_blocks_to_parquet(&all_records, &schema_clone, &fields_vec, &output_path)
-                })
-                .await
-                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
-                #[cfg(feature = "bench")]
-                {
-                    let write_time = write_start.elapsed();
-                    crate::bench::record("blocks", range.start, range.end, count, rpc_time, process_time, write_time);
-                }
-                count
-            }
-            None => {
-                let mut all_records = Vec::with_capacity((range.end - range.start) as usize);
-
-                for batch_start in (range.start..range.end).step_by(rpc_batch_size as usize) {
-                    let batch_end = std::cmp::min(batch_start + rpc_batch_size, range.end);
-                    let block_numbers: Vec<BlockNumberOrTag> = (batch_start..batch_end)
-                        .map(BlockNumberOrTag::Number)
-                        .collect();
-
-                    #[cfg(feature = "bench")]
-                    let rpc_start = Instant::now();
-                    let blocks = client.get_blocks_batch(block_numbers, false).await?;
-                    #[cfg(feature = "bench")]
-                    {
-                        rpc_time += rpc_start.elapsed();
-                    }
-
-                    #[cfg(feature = "bench")]
-                    let process_start = Instant::now();
-                    let (records, tx_data) = process_blocks_full(&blocks, batch_start)?;
-
-                    if let Some(sender) = &tx_sender {
-                        for (block_number, timestamp, tx_hashes) in &tx_data {
-                            sender
-                                .send((*block_number, *timestamp, tx_hashes.clone()))
-                                .await
-                                .map_err(|_| {
-                                    tracing::error!(
-                                        "Failed to send block {} to receipts channel - receiver dropped",
-                                        block_number
-                                    );
-                                    BlockCollectionError::ChannelSend(format!(
-                                        "block_tx (block {}) - receiver dropped",
-                                        block_number
-                                    ))
-                                })?;
-                        }
-                    }
-
-                    if let Some(sender) = &eth_call_sender {
-                        for (block_number, timestamp, _) in &tx_data {
-                            sender
-                                .send((*block_number, *timestamp))
-                                .await
-                                .map_err(|_| {
-                                    tracing::error!(
-                                        "Failed to send block {} to eth_call channel - receiver dropped",
-                                        block_number
-                                    );
-                                    BlockCollectionError::ChannelSend(format!(
-                                        "eth_call_tx (block {}) - receiver dropped",
-                                        block_number
-                                    ))
-                                })?;
-                        }
-                    }
-
-                    all_records.extend(records);
-                    #[cfg(feature = "bench")]
-                    {
-                        process_time += process_start.elapsed();
-                    }
-                }
-
-                let count = all_records.len();
-                let schema_clone = schema.clone();
-                let output_path = output_dir.join(range.file_name());
-                #[cfg(feature = "bench")]
-                let write_start = Instant::now();
-                tokio::task::spawn_blocking(move || {
-                    write_full_blocks_to_parquet(&all_records, &schema_clone, &output_path)
-                })
-                .await
-                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
-                #[cfg(feature = "bench")]
-                {
-                    let write_time = write_start.elapsed();
-                    crate::bench::record("blocks", range.start, range.end, count, rpc_time, process_time, write_time);
-                }
-                count
-            }
-        };
+        let record_count = collect_blocks_streaming(
+            client,
+            &range,
+            block_fields,
+            &schema,
+            &output_dir,
+            &tx_sender,
+            &eth_call_sender,
+        )
+        .await?;
 
         tracing::info!(
             "Wrote {} blocks to {}",
@@ -324,6 +162,223 @@ pub async fn collect_blocks(
     }
 
     Ok(())
+}
+
+/// Streaming block collection: fetches blocks concurrently and forwards to downstream
+/// collectors immediately as each block arrives. Buffers records for ordered parquet writing.
+async fn collect_blocks_streaming(
+    client: &UnifiedRpcClient,
+    range: &BlockRange,
+    block_fields: &Option<Vec<BlockField>>,
+    schema: &Arc<Schema>,
+    output_dir: &Path,
+    tx_sender: &Option<Sender<(u64, u64, Vec<B256>)>>,
+    eth_call_sender: &Option<Sender<(u64, u64)>>,
+) -> Result<usize, BlockCollectionError> {
+    let block_numbers: Vec<BlockNumberOrTag> = (range.start..range.end)
+        .map(BlockNumberOrTag::Number)
+        .collect();
+    let expected_count = block_numbers.len();
+
+    // Channel for streaming block results
+    let (result_tx, mut result_rx) = mpsc::channel(256);
+
+    // Start streaming fetch
+    let fetch_handle = client.get_blocks_streaming(block_numbers, false, result_tx);
+
+    // Process blocks as they arrive, using BTreeMap for ordered parquet output
+    let mut received_count = 0usize;
+    let mut errors: Vec<(u64, RpcError)> = Vec::new();
+
+    match block_fields {
+        Some(fields) => {
+            let mut records_map: BTreeMap<u64, MinimalBlockRecord> = BTreeMap::new();
+
+            while let Some((block_num_tag, result)) = result_rx.recv().await {
+                let block_number = match block_num_tag {
+                    BlockNumberOrTag::Number(n) => n,
+                    _ => continue,
+                };
+
+                received_count += 1;
+
+                match result {
+                    Ok(Some(block)) => {
+                        let tx_hashes: Vec<B256> = block.transactions.hashes().collect();
+                        let timestamp = block.header.timestamp;
+
+                        // Immediately forward to downstream collectors
+                        if let Some(sender) = tx_sender {
+                            if sender.send((block_number, timestamp, tx_hashes.clone())).await.is_err() {
+                                tracing::warn!("Receipts channel closed, continuing block collection");
+                            }
+                        }
+
+                        if let Some(sender) = eth_call_sender {
+                            if sender.send((block_number, timestamp)).await.is_err() {
+                                tracing::warn!("Eth_call channel closed, continuing block collection");
+                            }
+                        }
+
+                        // Buffer record for parquet (ordered by block number)
+                        records_map.insert(block_number, MinimalBlockRecord {
+                            number: block_number,
+                            timestamp,
+                            transaction_count: tx_hashes.len() as u32,
+                            transaction_hashes: tx_hashes.iter().map(|h| format!("{:?}", h)).collect(),
+                            uncle_count: block.uncles.len() as u32,
+                        });
+                    }
+                    Ok(None) => {
+                        return Err(BlockCollectionError::BlockNotFound(block_number));
+                    }
+                    Err(e) => {
+                        errors.push((block_number, e));
+                    }
+                }
+            }
+
+            // Wait for fetch task to complete
+            fetch_handle.await.map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
+
+            // Check for errors
+            if !errors.is_empty() {
+                let (block_num, err) = errors.remove(0);
+                tracing::error!("Block {} fetch failed: {}", block_num, err);
+                return Err(BlockCollectionError::Rpc(err));
+            }
+
+            // Convert to ordered vec for parquet
+            let all_records: Vec<MinimalBlockRecord> = records_map.into_values().collect();
+            let count = all_records.len();
+
+            if count != expected_count {
+                tracing::warn!(
+                    "Expected {} blocks but received {}, some may be missing",
+                    expected_count,
+                    count
+                );
+            }
+
+            // Write to parquet
+            let schema_clone = schema.clone();
+            let fields_vec = fields.to_vec();
+            let output_path = output_dir.join(range.file_name());
+            tokio::task::spawn_blocking(move || {
+                write_minimal_blocks_to_parquet(&all_records, &schema_clone, &fields_vec, &output_path)
+            })
+            .await
+            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+
+            Ok(count)
+        }
+        None => {
+            let mut records_map: BTreeMap<u64, FullBlockRecord> = BTreeMap::new();
+
+            while let Some((block_num_tag, result)) = result_rx.recv().await {
+                let block_number = match block_num_tag {
+                    BlockNumberOrTag::Number(n) => n,
+                    _ => continue,
+                };
+
+                received_count += 1;
+
+                match result {
+                    Ok(Some(block)) => {
+                        let tx_hashes: Vec<B256> = block.transactions.hashes().collect();
+                        let timestamp = block.header.timestamp;
+
+                        // Immediately forward to downstream collectors
+                        if let Some(sender) = tx_sender {
+                            if sender.send((block_number, timestamp, tx_hashes.clone())).await.is_err() {
+                                tracing::warn!("Receipts channel closed, continuing block collection");
+                            }
+                        }
+
+                        if let Some(sender) = eth_call_sender {
+                            if sender.send((block_number, timestamp)).await.is_err() {
+                                tracing::warn!("Eth_call channel closed, continuing block collection");
+                            }
+                        }
+
+                        // Buffer full record for parquet
+                        records_map.insert(block_number, process_single_block_full(&block, block_number)?);
+                    }
+                    Ok(None) => {
+                        return Err(BlockCollectionError::BlockNotFound(block_number));
+                    }
+                    Err(e) => {
+                        errors.push((block_number, e));
+                    }
+                }
+            }
+
+            // Wait for fetch task to complete
+            fetch_handle.await.map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
+
+            // Check for errors
+            if !errors.is_empty() {
+                let (block_num, err) = errors.remove(0);
+                tracing::error!("Block {} fetch failed: {}", block_num, err);
+                return Err(BlockCollectionError::Rpc(err));
+            }
+
+            // Convert to ordered vec for parquet
+            let all_records: Vec<FullBlockRecord> = records_map.into_values().collect();
+            let count = all_records.len();
+
+            // Write to parquet
+            let schema_clone = schema.clone();
+            let output_path = output_dir.join(range.file_name());
+            tokio::task::spawn_blocking(move || {
+                write_full_blocks_to_parquet(&all_records, &schema_clone, &output_path)
+            })
+            .await
+            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+
+            Ok(count)
+        }
+    }
+}
+
+/// Process a single block into a FullBlockRecord
+fn process_single_block_full(block: &Block, block_number: u64) -> Result<FullBlockRecord, BlockCollectionError> {
+    let header = &block.header;
+    let inner = &header.inner;
+    let tx_hashes: Vec<String> = block
+        .transactions
+        .hashes()
+        .map(|h| format!("{h:?}"))
+        .collect();
+
+    Ok(FullBlockRecord {
+        number: block_number,
+        hash: header.hash.0,
+        parent_hash: inner.parent_hash.0,
+        nonce: inner.nonce.0,
+        ommers_hash: inner.ommers_hash.0,
+        logs_bloom: inner.logs_bloom.0.to_vec(),
+        transactions_root: inner.transactions_root.0,
+        state_root: inner.state_root.0,
+        receipts_root: inner.receipts_root.0,
+        miner: inner.beneficiary.0 .0,
+        difficulty: inner.difficulty.to_string(),
+        total_difficulty: header.total_difficulty.map(|d| d.to_string()),
+        extra_data: inner.extra_data.to_vec(),
+        gas_limit: inner.gas_limit,
+        gas_used: inner.gas_used,
+        timestamp: inner.timestamp,
+        mix_hash: inner.mix_hash.0,
+        base_fee_per_gas: inner.base_fee_per_gas,
+        withdrawals_root: inner.withdrawals_root.map(|h| h.0),
+        blob_gas_used: inner.blob_gas_used,
+        excess_blob_gas: inner.excess_blob_gas,
+        parent_beacon_block_root: inner.parent_beacon_block_root.map(|h| h.0),
+        transaction_count: tx_hashes.len() as u32,
+        transaction_hashes: tx_hashes,
+        uncle_count: block.uncles.len() as u32,
+        size: header.size.map(|s| s.to::<u64>()),
+    })
 }
 
 fn process_blocks_minimal(
