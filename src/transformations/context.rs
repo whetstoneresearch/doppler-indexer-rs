@@ -113,6 +113,18 @@ impl DecodedValue {
         }
     }
 
+    /// Try to get as u32 (for fee values).
+    pub fn as_u32(&self) -> Option<u32> {
+        match self {
+            DecodedValue::Uint32(v) => Some(*v),
+            DecodedValue::Uint8(v) => Some(*v as u32),
+            DecodedValue::Uint64(v) => (*v).try_into().ok(),
+            DecodedValue::Uint256(v) => v.try_into().ok(),
+            DecodedValue::Uint128(v) => (*v).try_into().ok(),
+            _ => None,
+        }
+    }
+
     /// Try to get as u8.
     pub fn as_u8(&self) -> Option<u8> {
         match self {
