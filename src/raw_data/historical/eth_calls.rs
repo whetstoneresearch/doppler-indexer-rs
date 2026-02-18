@@ -1128,7 +1128,8 @@ fn build_event_triggered_call_configs(
         // Check contract-level calls for on_events frequency
         if let Some(calls) = &contract.calls {
             for call in calls {
-                if let Frequency::OnEvents(trigger_config) = &call.frequency {
+                // Iterate over all event trigger configs (supports single or multiple events)
+                for trigger_config in call.frequency.event_configs() {
                     let event_hash = compute_event_signature_hash(&trigger_config.event);
                     let key = (trigger_config.source.clone(), event_hash);
 
@@ -1175,7 +1176,8 @@ fn build_event_triggered_call_configs(
             for factory in factories {
                 if let Some(calls) = &factory.calls {
                     for call in calls {
-                        if let Frequency::OnEvents(trigger_config) = &call.frequency {
+                        // Iterate over all event trigger configs (supports single or multiple events)
+                        for trigger_config in call.frequency.event_configs() {
                             let event_hash = compute_event_signature_hash(&trigger_config.event);
                             let key = (trigger_config.source.clone(), event_hash);
 
@@ -1229,6 +1231,20 @@ fn extract_param_from_event(
     param_type: &EvmType,
 ) -> Result<(DynSolValue, Vec<u8>), EthCallCollectionError> {
     let from_event = from_event.trim();
+
+    // Handle "address" - extract the event emitter address
+    if from_event == "address" {
+        // Validate that the expected type is Address
+        if !matches!(param_type, EvmType::Address) {
+            return Err(EthCallCollectionError::EventParamExtraction(format!(
+                "from_event: \"address\" requires param type to be address, got {:?}",
+                param_type
+            )));
+        }
+        let addr = Address::from(trigger.emitter_address);
+        let encoded = DynSolValue::Address(addr).abi_encode();
+        return Ok((DynSolValue::Address(addr), encoded));
+    }
 
     if let Some(rest) = from_event.strip_prefix("topics[") {
         // Extract topic index
@@ -1287,7 +1303,7 @@ fn extract_param_from_event(
         extract_value_from_32_bytes(&word, param_type)
     } else {
         Err(EthCallCollectionError::EventParamExtraction(format!(
-            "Unknown from_event format: {} (expected topics[N] or data[N])",
+            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", or \"data[N]\")",
             from_event
         )))
     }

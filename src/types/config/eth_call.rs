@@ -46,6 +46,89 @@ pub struct EventTriggerConfig {
     pub event: String,
 }
 
+/// Wrapper for event trigger configurations supporting single or multiple events
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventTriggerConfigs {
+    Single(EventTriggerConfig),
+    Multiple(Vec<EventTriggerConfig>),
+}
+
+impl EventTriggerConfigs {
+    /// Iterate over all event trigger configurations
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &EventTriggerConfig> + '_> {
+        match self {
+            EventTriggerConfigs::Single(config) => Box::new(std::iter::once(config)),
+            EventTriggerConfigs::Multiple(configs) => Box::new(configs.iter()),
+        }
+    }
+
+    /// Get all configurations as a slice-like iterator
+    pub fn configs(&self) -> Vec<&EventTriggerConfig> {
+        match self {
+            EventTriggerConfigs::Single(config) => vec![config],
+            EventTriggerConfigs::Multiple(configs) => configs.iter().collect(),
+        }
+    }
+
+    /// Get the number of event configurations
+    pub fn len(&self) -> usize {
+        match self {
+            EventTriggerConfigs::Single(_) => 1,
+            EventTriggerConfigs::Multiple(configs) => configs.len(),
+        }
+    }
+
+    /// Check if empty (only possible for Multiple with empty vec, which we prevent)
+    pub fn is_empty(&self) -> bool {
+        match self {
+            EventTriggerConfigs::Single(_) => false,
+            EventTriggerConfigs::Multiple(configs) => configs.is_empty(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EventTriggerConfigs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EventTriggerConfigsVisitor;
+
+        impl<'de> Visitor<'de> for EventTriggerConfigsVisitor {
+            type Value = EventTriggerConfigs;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a single event trigger config object or an array of event trigger configs")
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<EventTriggerConfigs, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                // Deserialize as a single EventTriggerConfig
+                let config = EventTriggerConfig::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(EventTriggerConfigs::Single(config))
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<EventTriggerConfigs, S::Error>
+            where
+                S: de::SeqAccess<'de>,
+            {
+                let mut configs = Vec::new();
+                while let Some(config) = seq.next_element::<EventTriggerConfig>()? {
+                    configs.push(config);
+                }
+                if configs.is_empty() {
+                    return Err(de::Error::custom("on_events array cannot be empty"));
+                }
+                Ok(EventTriggerConfigs::Multiple(configs))
+            }
+        }
+
+        deserializer.deserialize_any(EventTriggerConfigsVisitor)
+    }
+}
+
 /// Frequency at which to make eth_calls
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frequency {
@@ -57,8 +140,8 @@ pub enum Frequency {
     EveryNBlocks(u64),
     /// Call at time intervals (stored as seconds)
     Duration(u64),
-    /// Call when specific events are emitted
-    OnEvents(EventTriggerConfig),
+    /// Call when specific events are emitted (supports single or multiple events)
+    OnEvents(EventTriggerConfigs),
 }
 
 impl Default for Frequency {
@@ -76,10 +159,18 @@ impl Frequency {
         matches!(self, Frequency::OnEvents(_))
     }
 
-    pub fn as_on_events(&self) -> Option<&EventTriggerConfig> {
+    pub fn as_on_events(&self) -> Option<&EventTriggerConfigs> {
         match self {
-            Frequency::OnEvents(config) => Some(config),
+            Frequency::OnEvents(configs) => Some(configs),
             _ => None,
+        }
+    }
+
+    /// Get all event trigger configurations (convenience method)
+    pub fn event_configs(&self) -> Vec<&EventTriggerConfig> {
+        match self {
+            Frequency::OnEvents(configs) => configs.configs(),
+            _ => Vec::new(),
         }
     }
 
@@ -185,7 +276,7 @@ impl<'de> Deserialize<'de> for Frequency {
             where
                 M: de::MapAccess<'de>,
             {
-                let mut on_events: Option<EventTriggerConfig> = None;
+                let mut on_events: Option<EventTriggerConfigs> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -202,7 +293,7 @@ impl<'de> Deserialize<'de> for Frequency {
                 }
 
                 match on_events {
-                    Some(config) => Ok(Frequency::OnEvents(config)),
+                    Some(configs) => Ok(Frequency::OnEvents(configs)),
                     None => Err(de::Error::missing_field("on_events")),
                 }
             }
@@ -938,20 +1029,22 @@ mod tests {
         let json = r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
         let freq: Frequency = serde_json::from_str(json).unwrap();
         assert!(freq.is_on_events());
-        let config = freq.as_on_events().unwrap();
-        assert_eq!(config.source, "Token");
-        assert_eq!(config.event, "Transfer(address,address,uint256)");
+        let configs = freq.event_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].source, "Token");
+        assert_eq!(configs[0].event, "Transfer(address,address,uint256)");
     }
 
     #[test]
     fn test_frequency_on_events_helpers() {
-        let freq = Frequency::OnEvents(EventTriggerConfig {
+        let freq = Frequency::OnEvents(EventTriggerConfigs::Single(EventTriggerConfig {
             source: "Pool".to_string(),
             event: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_string(),
-        });
+        }));
         assert!(freq.is_on_events());
         assert!(!freq.is_once());
         assert!(freq.as_on_events().is_some());
+        assert_eq!(freq.event_configs().len(), 1);
     }
 
     #[test]
@@ -969,8 +1062,9 @@ mod tests {
         let config: EthCallConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.function, "slot0()");
         assert!(config.frequency.is_on_events());
-        let trigger = config.frequency.as_on_events().unwrap();
-        assert_eq!(trigger.source, "V3Pool");
+        let configs = config.frequency.event_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].source, "V3Pool");
     }
 
     #[test]
@@ -1217,5 +1311,124 @@ mod tests {
         }"#;
         let config: EthCallConfig = serde_json::from_str(json).unwrap();
         assert!(config.target.is_none());
+    }
+
+    #[test]
+    fn test_frequency_deserialize_on_events_array() {
+        let json = r#"{"on_events": [
+            {"source": "V3Pool", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"},
+            {"source": "V3Pool", "event": "Mint(address,int24,int24,uint128,uint256,uint256)"},
+            {"source": "V3Pool", "event": "Burn(address,int24,int24,uint128,uint256,uint256)"}
+        ]}"#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert!(freq.is_on_events());
+        let configs = freq.event_configs();
+        assert_eq!(configs.len(), 3);
+        assert_eq!(configs[0].source, "V3Pool");
+        assert_eq!(configs[0].event, "Swap(address,address,int256,int256,uint160,uint128,int24)");
+        assert_eq!(configs[1].event, "Mint(address,int24,int24,uint128,uint256,uint256)");
+        assert_eq!(configs[2].event, "Burn(address,int24,int24,uint128,uint256,uint256)");
+    }
+
+    #[test]
+    fn test_frequency_deserialize_on_events_single_still_works() {
+        // Backward compatibility - single object syntax still works
+        let json = r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
+        let freq: Frequency = serde_json::from_str(json).unwrap();
+        assert!(freq.is_on_events());
+        let configs = freq.event_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].source, "Token");
+    }
+
+    #[test]
+    fn test_frequency_deserialize_on_events_empty_array_fails() {
+        let json = r#"{"on_events": []}"#;
+        let result: Result<Frequency, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty"), "Expected error about empty array, got: {}", err);
+    }
+
+    #[test]
+    fn test_eth_call_config_with_multiple_events() {
+        let json = r#"{
+            "function": "slot0()",
+            "output_type": "(uint160 sqrtPriceX96, int24 tick)",
+            "frequency": {
+                "on_events": [
+                    {"source": "V3Pool", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"},
+                    {"source": "V3Pool", "event": "Mint(address,int24,int24,uint128,uint256,uint256)"}
+                ]
+            }
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.function, "slot0()");
+        assert!(config.frequency.is_on_events());
+        let trigger_configs = config.frequency.event_configs();
+        assert_eq!(trigger_configs.len(), 2);
+        assert!(trigger_configs[0].event.contains("Swap"));
+        assert!(trigger_configs[1].event.contains("Mint"));
+    }
+
+    #[test]
+    fn test_event_trigger_configs_iter() {
+        // Test Single variant
+        let single = EventTriggerConfigs::Single(EventTriggerConfig {
+            source: "Token".to_string(),
+            event: "Transfer(address,address,uint256)".to_string(),
+        });
+        let configs: Vec<_> = single.iter().collect();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].source, "Token");
+
+        // Test Multiple variant
+        let multiple = EventTriggerConfigs::Multiple(vec![
+            EventTriggerConfig {
+                source: "Pool".to_string(),
+                event: "Swap(...)".to_string(),
+            },
+            EventTriggerConfig {
+                source: "Pool".to_string(),
+                event: "Mint(...)".to_string(),
+            },
+        ]);
+        let configs: Vec<_> = multiple.iter().collect();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].event, "Swap(...)");
+        assert_eq!(configs[1].event, "Mint(...)");
+    }
+
+    #[test]
+    fn test_event_trigger_configs_len_and_is_empty() {
+        let single = EventTriggerConfigs::Single(EventTriggerConfig {
+            source: "Token".to_string(),
+            event: "Transfer(...)".to_string(),
+        });
+        assert_eq!(single.len(), 1);
+        assert!(!single.is_empty());
+
+        let multiple = EventTriggerConfigs::Multiple(vec![
+            EventTriggerConfig {
+                source: "Pool".to_string(),
+                event: "Swap(...)".to_string(),
+            },
+            EventTriggerConfig {
+                source: "Pool".to_string(),
+                event: "Mint(...)".to_string(),
+            },
+        ]);
+        assert_eq!(multiple.len(), 2);
+        assert!(!multiple.is_empty());
+    }
+
+    #[test]
+    fn test_param_config_from_event_address() {
+        // Test that from_event: "address" is parsed correctly
+        let json = r#"{"type": "address", "from_event": "address"}"#;
+        let param: ParamConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(*param.param_type(), EvmType::Address);
+        assert_eq!(param.from_event(), Some("address"));
+        assert!(!param.is_self_address());
     }
 }

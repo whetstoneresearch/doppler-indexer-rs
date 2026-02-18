@@ -18,7 +18,6 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::Frequency;
 use crate::types::config::raw_data::{RawDataCollectionConfig, ReceiptField};
 
 #[derive(Debug, Error)]
@@ -146,11 +145,12 @@ pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMa
     let mut matchers = Vec::new();
     let mut seen: HashSet<(String, [u8; 32])> = HashSet::new();
 
-    for (contract_name, contract) in contracts {
+    for (_contract_name, contract) in contracts {
         // Check contract-level calls for on_events
         if let Some(calls) = &contract.calls {
             for call in calls {
-                if let Frequency::OnEvents(config) = &call.frequency {
+                // Iterate over all event configs (supports single or multiple events)
+                for config in call.frequency.event_configs() {
                     let key = (config.source.clone(), compute_event_signature_hash(&config.event));
                     if !seen.contains(&key) {
                         if let Some(matcher) = build_matcher_for_source(
@@ -171,7 +171,8 @@ pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMa
             for factory in factories {
                 if let Some(calls) = &factory.calls {
                     for call in calls {
-                        if let Frequency::OnEvents(config) = &call.frequency {
+                        // Iterate over all event configs (supports single or multiple events)
+                        for config in call.frequency.event_configs() {
                             let key = (config.source.clone(), compute_event_signature_hash(&config.event));
                             if !seen.contains(&key) {
                                 if let Some(matcher) = build_matcher_for_source(
