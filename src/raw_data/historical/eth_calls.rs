@@ -1496,11 +1496,14 @@ async fn process_event_triggers(
                         });
                     }
                     Err(e) => {
+                        let params_hex: Vec<String> = encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
                         tracing::warn!(
-                            "Event-triggered eth_call failed for {}.{} at block {}: {}",
+                            "Event-triggered eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
                             contract_name,
                             function_name,
                             trigger.block_number,
+                            target_address,
+                            params_hex,
                             e
                         );
                         // Store empty result to maintain consistency
@@ -2132,11 +2135,14 @@ async fn process_factory_range(
                             });
                         }
                         Err(e) => {
+                            let params_hex: Vec<String> = config.param_values.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
                             tracing::warn!(
-                                "Factory eth_call failed for {}.{} at block {}: {}",
+                                "Factory eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
                                 collection_name,
                                 function_name,
                                 block.block_number,
+                                config.address,
+                                params_hex,
                                 e
                             );
                             all_results.push(CallResult {
@@ -2684,7 +2690,7 @@ async fn process_once_calls_regular(
         let mut results_by_address: HashMap<Address, HashMap<String, Vec<u8>>> = HashMap::new();
 
         for (i, result) in batch_results.into_iter().enumerate() {
-            let (_, _, address, function_name) = &pending_calls[i];
+            let (tx, _, address, function_name) = &pending_calls[i];
 
             let function_results = results_by_address.entry(*address).or_default();
 
@@ -2693,11 +2699,14 @@ async fn process_once_calls_regular(
                     function_results.insert(function_name.clone(), bytes.to_vec());
                 }
                 Err(e) => {
+                    let calldata = tx.input.input.as_ref().map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default();
                     tracing::warn!(
-                        "once eth_call failed for {}.{} at block {}: {}",
+                        "once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
                         contract_name,
                         function_name,
                         first_block.block_number,
+                        address,
+                        calldata,
                         e
                     );
                     function_results.insert(function_name.clone(), Vec::new());
@@ -2889,7 +2898,7 @@ async fn process_factory_once_calls(
         let mut results_by_address: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> = HashMap::new();
 
         for (i, result) in batch_results.into_iter().enumerate() {
-            let (_, _, address, block_number, timestamp, function_name) = &pending_calls[i];
+            let (tx, _, address, block_number, timestamp, function_name) = &pending_calls[i];
 
             let entry = results_by_address
                 .entry(*address)
@@ -2900,11 +2909,14 @@ async fn process_factory_once_calls(
                     entry.2.insert(function_name.clone(), bytes.to_vec());
                 }
                 Err(e) => {
+                    let calldata = tx.input.input.as_ref().map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default();
                     tracing::warn!(
-                        "factory once eth_call failed for {}.{} at block {}: {}",
+                        "factory once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
                         collection_name,
                         function_name,
                         block_number,
+                        address,
+                        calldata,
                         e
                     );
                     entry.2.insert(function_name.clone(), Vec::new());
@@ -3092,11 +3104,14 @@ async fn process_range(
                         });
                     }
                     Err(e) => {
+                        let params_hex: Vec<String> = config.param_values.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
                         tracing::warn!(
-                            "eth_call failed for {}.{} at block {}: {}",
+                            "eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
                             contract_name,
                             function_name,
                             block.block_number,
+                            config.address,
+                            params_hex,
                             e
                         );
                         all_results.push(CallResult {
