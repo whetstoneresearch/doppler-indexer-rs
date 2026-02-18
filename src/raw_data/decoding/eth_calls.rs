@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
@@ -193,6 +194,7 @@ pub async fn decode_eth_calls(
                         &configs,
                         &output_base,
                         transform_tx.as_ref(),
+                        false, // Live mode: update index directly (no concurrent tasks)
                     )
                     .await?;
                 }
@@ -276,7 +278,7 @@ fn build_decode_configs(
     (regular, once)
 }
 
-///// Work item for concurrent catchup processing
+/// Work item for concurrent catchup processing
 enum CatchupWorkItem {
     Regular {
         file_path: PathBuf,
@@ -293,6 +295,14 @@ enum CatchupWorkItem {
     },
 }
 
+/// Result of processing once calls, used to batch update column indexes after all tasks complete.
+/// This avoids race conditions when multiple concurrent tasks try to read/modify/write the same index.
+struct OnceCallsResult {
+    contract_name: String,
+    file_name: String,
+    columns: Vec<String>,
+}
+
 /// Catchup phase: decode existing raw eth_call files
 async fn catchup_decode_eth_calls(
     raw_calls_dir: &Path,
@@ -306,6 +316,47 @@ async fn catchup_decode_eth_calls(
 
     // Scan existing decoded files
     let existing_decoded = scan_existing_decoded_files(output_base);
+
+    // Build set of unique contract names with once configs
+    let once_contract_names: HashSet<String> = once_configs
+        .iter()
+        .map(|c| c.contract_name.clone())
+        .collect();
+
+    // Pre-load column indexes for all once directories
+    let mut raw_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    let mut decoded_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
+    for contract_name in &once_contract_names {
+        let raw_once_dir = raw_calls_dir.join(contract_name).join("once");
+        let raw_index = if raw_once_dir.exists() {
+            let mut idx = read_raw_column_index(&raw_once_dir);
+            // If index is empty, try to build from parquet schemas
+            if idx.is_empty() {
+                if let Ok(entries) = std::fs::read_dir(&raw_once_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+                            let cols: Vec<String> =
+                                read_raw_parquet_function_names(&path).into_iter().collect();
+                            if !cols.is_empty() {
+                                idx.insert(file_name, cols);
+                            }
+                        }
+                    }
+                }
+            }
+            idx
+        } else {
+            HashMap::new()
+        };
+        raw_column_indexes.insert(contract_name.clone(), raw_index);
+
+        let decoded_once_dir = output_base.join(contract_name).join("once");
+        let decoded_index = load_or_build_decoded_column_index(&decoded_once_dir);
+        decoded_column_indexes.insert(contract_name.clone(), decoded_index);
+    }
 
     // Collect all work items
     let mut work_items = Vec::new();
@@ -346,6 +397,10 @@ async fn catchup_decode_eth_calls(
                             continue;
                         }
 
+                        // Get pre-loaded column indexes
+                        let raw_index = raw_column_indexes.get(&contract_name);
+                        let decoded_index = decoded_column_indexes.get(&contract_name);
+
                         // Collect once call files
                         if let Ok(file_entries) = std::fs::read_dir(&function_path) {
                             for file_entry in file_entries.flatten() {
@@ -361,11 +416,42 @@ async fn catchup_decode_eth_calls(
                                 let file_name =
                                     file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
-                                // Check if already decoded
-                                let rel_path = format!("{}/once/{}", contract_name, file_name);
-                                if existing_decoded.contains(&rel_path) {
-                                    continue;
+                                // Get raw columns for this file (from index or by reading parquet)
+                                let raw_cols: HashSet<String> = raw_index
+                                    .and_then(|idx| idx.get(file_name))
+                                    .map(|cols| cols.iter().cloned().collect())
+                                    .unwrap_or_else(|| read_raw_parquet_function_names(&file_path));
+
+                                // Get decoded columns for this file
+                                let decoded_cols: HashSet<String> = decoded_index
+                                    .and_then(|idx| idx.get(file_name))
+                                    .map(|cols| cols.iter().cloned().collect())
+                                    .unwrap_or_default();
+
+                                // Find functions that exist in raw but need decoding
+                                // Filter configs to only those whose function is in raw and not in decoded
+                                let missing_configs: Vec<CallDecodeConfig> = configs
+                                    .iter()
+                                    .filter(|c| {
+                                        raw_cols.contains(&c.function_name)
+                                            && !decoded_cols.contains(&c.function_name)
+                                    })
+                                    .cloned()
+                                    .collect();
+
+                                if missing_configs.is_empty() {
+                                    continue; // All columns already decoded
                                 }
+
+                                tracing::debug!(
+                                    "File {}/{} missing decoded columns: {:?}",
+                                    contract_name,
+                                    file_name,
+                                    missing_configs
+                                        .iter()
+                                        .map(|c| &c.function_name)
+                                        .collect::<Vec<_>>()
+                                );
 
                                 // Parse range from filename
                                 let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
@@ -387,16 +473,14 @@ async fn catchup_decode_eth_calls(
                                     range_start,
                                     range_end,
                                     contract_name: contract_name.clone(),
-                                    configs: configs.clone(),
+                                    configs: missing_configs,
                                 });
                             }
                         }
                     } else {
-                        let config = regular_configs
-                            .iter()
-                            .find(|c| {
-                                c.contract_name == contract_name && c.function_name == function_name
-                            });
+                        let config = regular_configs.iter().find(|c| {
+                            c.contract_name == contract_name && c.function_name == function_name
+                        });
 
                         if config.is_none() {
                             continue;
@@ -486,8 +570,17 @@ async fn catchup_decode_eth_calls(
                     config,
                 } => {
                     let results = read_regular_calls_from_parquet(&file_path)?;
-                    process_regular_calls(&results, range_start, range_end, &config, &output_base, transform_tx.as_ref())
-                        .await
+                    process_regular_calls(
+                        &results,
+                        range_start,
+                        range_end,
+                        &config,
+                        &output_base,
+                        transform_tx.as_ref(),
+                    )
+                    .await?;
+                    // Regular calls don't need index updates
+                    Ok(None)
                 }
                 CatchupWorkItem::Once {
                     file_path,
@@ -498,6 +591,7 @@ async fn catchup_decode_eth_calls(
                 } => {
                     let config_refs: Vec<&CallDecodeConfig> = configs.iter().collect();
                     let results = read_once_calls_from_parquet(&file_path, &config_refs)?;
+                    // Return index info for batch update (avoids race condition)
                     process_once_calls(
                         &results,
                         range_start,
@@ -506,6 +600,7 @@ async fn catchup_decode_eth_calls(
                         &config_refs,
                         &output_base,
                         transform_tx.as_ref(),
+                        true, // return_index_info: batch update after all tasks complete
                     )
                     .await
                 }
@@ -513,13 +608,38 @@ async fn catchup_decode_eth_calls(
         });
     }
 
-    // Collect results and propagate errors
+    // Collect results and column index updates
+    // Using a HashMap to group updates by contract_name for batch updating
+    let mut index_updates: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
+
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(Some(once_result))) => {
+                // Collect index updates for batch processing
+                index_updates
+                    .entry(once_result.contract_name)
+                    .or_default()
+                    .push((once_result.file_name, once_result.columns));
+            }
+            Ok(Ok(None)) => {} // Regular call, no index update needed
             Ok(Err(e)) => return Err(e),
             Err(e) => return Err(EthCallDecodingError::JoinError(e.to_string())),
         }
+    }
+
+    // Batch update all column indexes (no race condition - sequential after all tasks complete)
+    for (contract_name, updates) in index_updates {
+        let output_dir = output_base.join(&contract_name).join("once");
+        let mut index = read_decoded_column_index(&output_dir);
+        for (file_name, columns) in updates {
+            index.insert(file_name, columns);
+        }
+        write_decoded_column_index(&output_dir, &index)?;
+        tracing::info!(
+            "Updated decoded column index for {}: {} files tracked",
+            contract_name,
+            index.len()
+        );
     }
 
     Ok(())
@@ -799,7 +919,9 @@ async fn process_regular_calls(
     Ok(())
 }
 
-/// Process "once" call results
+/// Process "once" call results.
+/// Returns `OnceCallsResult` with column index info for batch updating (avoids race conditions).
+/// When `return_index_info` is true, skips writing the column index (caller will batch update).
 async fn process_once_calls(
     results: &[OnceCallResult],
     range_start: u64,
@@ -808,7 +930,8 @@ async fn process_once_calls(
     configs: &[&CallDecodeConfig],
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
-) -> Result<(), EthCallDecodingError> {
+    return_index_info: bool,
+) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
     let mut decoded_records = Vec::new();
 
     for result in results {
@@ -850,14 +973,41 @@ async fn process_once_calls(
     let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
     let output_path = output_dir.join(&file_name);
 
-    write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
+    // Check if we need to merge with existing decoded data
+    if output_path.exists() {
+        tracing::info!(
+            "Merging new decoded columns into existing file {}",
+            output_path.display()
+        );
+        merge_decoded_once_calls(
+            &output_path,
+            &decoded_records,
+            configs,
+        )?;
+    } else {
+        write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
+    }
+
+    // Read actual columns from written file
+    let actual_cols: Vec<String> = read_decoded_parquet_function_names(&output_path)
+        .into_iter()
+        .collect();
 
     tracing::info!(
-        "Wrote {} decoded {}/once results to {}",
+        "Wrote {} decoded {}/once results to {} ({} columns: {:?})",
         decoded_records.len(),
         contract_name,
-        output_path.display()
+        output_path.display(),
+        actual_cols.len(),
+        actual_cols
     );
+
+    // If not returning index info, update column index directly (live mode)
+    if !return_index_info {
+        let mut index = read_decoded_column_index(&output_dir);
+        index.insert(file_name.clone(), actual_cols.clone());
+        write_decoded_column_index(&output_dir, &index)?;
+    }
 
     // Send to transformation channel if enabled
     if let Some(tx) = transform_tx {
@@ -893,7 +1043,16 @@ async fn process_once_calls(
         }
     }
 
-    Ok(())
+    // Return index info for batch updating (catchup mode)
+    if return_index_info {
+        Ok(Some(OnceCallsResult {
+            contract_name: contract_name.to_string(),
+            file_name,
+            columns: actual_cols,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Convert an EvmType to a DynSolType for decoding
@@ -1309,6 +1468,111 @@ fn extract_tuple_bytes(r: &DecodedCallRecord, idx: usize) -> Option<&[u8]> {
         }),
         _ => None,
     }
+}
+
+/// Read existing decoded once parquet file and return record batches
+fn read_existing_decoded_once_parquet(
+    path: &Path,
+) -> Result<Vec<RecordBatch>, EthCallDecodingError> {
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+    Ok(batches)
+}
+
+/// Merge new decoded columns into an existing decoded once parquet file
+fn merge_decoded_once_calls(
+    output_path: &Path,
+    new_records: &[DecodedOnceRecord],
+    new_configs: &[&CallDecodeConfig],
+) -> Result<(), EthCallDecodingError> {
+    // Read existing parquet
+    let existing_batches = read_existing_decoded_once_parquet(output_path)?;
+    if existing_batches.is_empty() {
+        // No existing data, just write new
+        return write_decoded_once_calls_to_parquet(new_records, new_configs, output_path);
+    }
+
+    let existing_batch = &existing_batches[0];
+    let existing_schema = existing_batch.schema();
+
+    // Build new schema with existing fields + new fields
+    let mut fields: Vec<Field> = existing_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+
+    // Add new fields for each new config
+    for config in new_configs {
+        match &config.output_type {
+            EvmType::NamedTuple(tuple_fields) => {
+                for (field_name, field_type) in tuple_fields {
+                    let col_name = format!("{}.{}", config.function_name, field_name);
+                    if !fields.iter().any(|f| f.name() == &col_name) {
+                        fields.push(Field::new(&col_name, field_type.to_arrow_type(), true));
+                    }
+                }
+            }
+            _ => {
+                let col_name = config.function_name.clone();
+                if !fields.iter().any(|f| f.name() == &col_name) {
+                    let value_type = config.output_type.to_arrow_type();
+                    fields.push(Field::new(&col_name, value_type, true));
+                }
+            }
+        }
+    }
+
+    let new_schema = Arc::new(Schema::new(fields));
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    // Copy existing columns
+    for i in 0..existing_batch.num_columns() {
+        arrays.push(existing_batch.column(i).clone());
+    }
+
+    // Build new columns from new_records
+    // The records should be in the same order as existing rows (by contract_address)
+    for config in new_configs {
+        match &config.output_type {
+            EvmType::NamedTuple(tuple_fields) => {
+                for (idx, (_, field_type)) in tuple_fields.iter().enumerate() {
+                    let col_name = format!("{}.{}", config.function_name, tuple_fields[idx].0);
+                    if existing_schema.index_of(&col_name).is_err() {
+                        let arr = build_once_tuple_field_array(
+                            new_records,
+                            &config.function_name,
+                            idx,
+                            field_type,
+                        )?;
+                        arrays.push(arr);
+                    }
+                }
+            }
+            _ => {
+                let col_name = config.function_name.clone();
+                if existing_schema.index_of(&col_name).is_err() {
+                    let arr = build_once_value_array(
+                        new_records,
+                        &config.function_name,
+                        &config.output_type,
+                    )?;
+                    arrays.push(arr);
+                }
+            }
+        }
+    }
+
+    // Write merged parquet
+    let batch = RecordBatch::try_new(new_schema.clone(), arrays)?;
+
+    let file = File::create(output_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, new_schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
 }
 
 /// Write decoded "once" calls to parquet
@@ -2010,4 +2274,228 @@ fn convert_once_to_transform_call(
         trigger_log_index: None,
         result: build_result_map(decoded_value, output_type, function_name),
     }
+}
+
+// ============================================================================
+// Column Index Functions for Decoded Data
+// ============================================================================
+
+/// Read the column index sidecar file from a decoded `once/` directory.
+/// Returns a map of filename -> list of decoded function names.
+fn read_decoded_column_index(decoded_once_dir: &Path) -> HashMap<String, Vec<String>> {
+    let index_path = decoded_once_dir.join("column_index.json");
+    match std::fs::read_to_string(&index_path) {
+        Ok(content) => {
+            let index: HashMap<String, Vec<String>> =
+                serde_json::from_str(&content).unwrap_or_default();
+            tracing::debug!(
+                "Read decoded column index from {}: {} files tracked",
+                index_path.display(),
+                index.len()
+            );
+            index
+        }
+        Err(e) => {
+            tracing::debug!(
+                "No decoded column index at {} ({}), starting fresh",
+                index_path.display(),
+                e.kind()
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Write the column index sidecar file to a decoded `once/` directory.
+fn write_decoded_column_index(
+    decoded_once_dir: &Path,
+    index: &HashMap<String, Vec<String>>,
+) -> Result<(), EthCallDecodingError> {
+    let index_path = decoded_once_dir.join("column_index.json");
+    tracing::debug!(
+        "Writing decoded column index to {}: {} files tracked",
+        index_path.display(),
+        index.len()
+    );
+    let content = serde_json::to_string_pretty(index).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("JSON serialize error: {}", e),
+        )
+    })?;
+    std::fs::write(&index_path, content)?;
+    Ok(())
+}
+
+/// Load or build the column index for a decoded once/ directory.
+/// If the index file exists, load it. Otherwise, scan all parquet files to build it.
+fn load_or_build_decoded_column_index(decoded_once_dir: &Path) -> HashMap<String, Vec<String>> {
+    let index_path = decoded_once_dir.join("column_index.json");
+
+    // Try to load existing index
+    if index_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&index_path) {
+            if let Ok(index) = serde_json::from_str::<HashMap<String, Vec<String>>>(&content) {
+                tracing::debug!(
+                    "Loaded decoded column index from {}: {} files tracked",
+                    index_path.display(),
+                    index.len()
+                );
+                return index;
+            }
+        }
+    }
+
+    // Index doesn't exist or couldn't be loaded - build from parquet files
+    if !decoded_once_dir.exists() {
+        return HashMap::new();
+    }
+
+    let mut index = HashMap::new();
+    let parquet_files: Vec<_> = match std::fs::read_dir(decoded_once_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => return HashMap::new(),
+    };
+
+    if parquet_files.is_empty() {
+        return HashMap::new();
+    }
+
+    tracing::info!(
+        "Building decoded column index for {} from {} parquet files",
+        decoded_once_dir.display(),
+        parquet_files.len()
+    );
+
+    for entry in parquet_files {
+        let path = entry.path();
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let cols: Vec<String> = read_decoded_parquet_function_names(&path)
+            .into_iter()
+            .collect();
+        if !cols.is_empty() {
+            index.insert(file_name, cols);
+        }
+    }
+
+    // Write the newly built index
+    if !index.is_empty() {
+        if let Err(e) = write_decoded_column_index(decoded_once_dir, &index) {
+            tracing::warn!(
+                "Failed to write decoded column index to {}: {}",
+                decoded_once_dir.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Built and saved decoded column index for {}: {} files tracked",
+                decoded_once_dir.display(),
+                index.len()
+            );
+        }
+    }
+
+    index
+}
+
+/// Read function names from a decoded parquet file's schema.
+/// Decoded columns are named like:
+/// - `name` (simple type) -> returns `name`
+/// - `getAssetData.numeraire` (tuple field) -> returns `getAssetData`
+/// Excludes standard columns like block_number, block_timestamp, address.
+fn read_decoded_parquet_function_names(path: &Path) -> HashSet<String> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashSet::new(),
+    };
+
+    let reader = match SerializedFileReader::new(file) {
+        Ok(r) => r,
+        Err(_) => return HashSet::new(),
+    };
+
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let mut fn_names = HashSet::new();
+
+    // Standard columns to skip
+    let skip_columns: HashSet<&str> =
+        ["block_number", "block_timestamp", "address", "contract_address"]
+            .into_iter()
+            .collect();
+
+    for field in schema.columns() {
+        let name = field.name();
+
+        // Skip standard columns
+        if skip_columns.contains(name) {
+            continue;
+        }
+
+        // Extract base function name (part before '.' for tuple fields)
+        let fn_name = name.split('.').next().unwrap_or(name);
+        fn_names.insert(fn_name.to_string());
+    }
+
+    fn_names
+}
+
+/// Read the raw column index from a raw `once/` directory.
+/// Returns a map of filename -> list of function names whose `{name}_result` columns exist.
+fn read_raw_column_index(raw_once_dir: &Path) -> HashMap<String, Vec<String>> {
+    let index_path = raw_once_dir.join("column_index.json");
+    match std::fs::read_to_string(&index_path) {
+        Ok(content) => {
+            let index: HashMap<String, Vec<String>> =
+                serde_json::from_str(&content).unwrap_or_default();
+            tracing::debug!(
+                "Read raw column index from {}: {} files tracked",
+                index_path.display(),
+                index.len()
+            );
+            index
+        }
+        Err(e) => {
+            tracing::debug!(
+                "No raw column index at {} ({}), will scan parquet schemas",
+                index_path.display(),
+                e.kind()
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Read function names from a raw parquet file's schema.
+/// Raw columns are named like `{function_name}_result` -> returns `function_name`.
+fn read_raw_parquet_function_names(path: &Path) -> HashSet<String> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashSet::new(),
+    };
+
+    let reader = match SerializedFileReader::new(file) {
+        Ok(r) => r,
+        Err(_) => return HashSet::new(),
+    };
+
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let mut fn_names = HashSet::new();
+
+    for field in schema.columns() {
+        let name = field.name();
+        // Extract function name from column name (e.g., "getAssetData_result" -> "getAssetData")
+        if let Some(fn_name) = name.strip_suffix("_result") {
+            fn_names.insert(fn_name.to_string());
+        }
+    }
+
+    fn_names
 }

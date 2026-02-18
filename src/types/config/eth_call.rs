@@ -212,6 +212,61 @@ impl<'de> Deserialize<'de> for Frequency {
     }
 }
 
+/// Optional target override for eth_calls.
+/// When specified, the call is made to this address instead of the contract it's configured under.
+#[derive(Debug, Clone)]
+pub enum CallTarget {
+    /// A direct hex address (e.g., "0x1234...")
+    Address(Address),
+    /// A contract name to look up from the chain's contract configs
+    Name(std::string::String),
+}
+
+impl CallTarget {
+    /// Resolve this target to an address, looking up contract names from the provided contracts map.
+    pub fn resolve(&self, contracts: &std::collections::HashMap<std::string::String, super::contract::ContractConfig>) -> Option<Address> {
+        match self {
+            CallTarget::Address(addr) => Some(*addr),
+            CallTarget::Name(name) => {
+                let contract = contracts.get(name)?;
+                match &contract.address {
+                    super::contract::AddressOrAddresses::Single(addr) => Some(*addr),
+                    super::contract::AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
+                }
+            }
+        }
+    }
+
+    /// Resolve this target to all addresses (for multi-address contracts).
+    pub fn resolve_all(&self, contracts: &std::collections::HashMap<std::string::String, super::contract::ContractConfig>) -> Option<Vec<Address>> {
+        match self {
+            CallTarget::Address(addr) => Some(vec![*addr]),
+            CallTarget::Name(name) => {
+                let contract = contracts.get(name)?;
+                match &contract.address {
+                    super::contract::AddressOrAddresses::Single(addr) => Some(vec![*addr]),
+                    super::contract::AddressOrAddresses::Multiple(addrs) => Some(addrs.clone()),
+                }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CallTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = std::string::String::deserialize(deserializer)?;
+        // Try parsing as an address first (starts with 0x and is 42 chars)
+        if let Ok(addr) = s.parse::<Address>() {
+            Ok(CallTarget::Address(addr))
+        } else {
+            Ok(CallTarget::Name(s))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EthCallConfig {
     pub function: String,
@@ -220,6 +275,10 @@ pub struct EthCallConfig {
     pub params: Vec<ParamConfig>,
     #[serde(default)]
     pub frequency: Frequency,
+    /// Optional target address override. Can be a hex address or a contract name to look up.
+    /// When omitted, calls are made to the contract this config is nested under.
+    #[serde(default)]
+    pub target: Option<CallTarget>,
 }
 
 impl EthCallConfig {
@@ -1104,5 +1163,59 @@ mod tests {
         }"#;
         let config_static: EthCallConfig = serde_json::from_str(json_static).unwrap();
         assert!(!config_static.has_self_address_param());
+    }
+
+    #[test]
+    fn test_call_target_deserialize_address() {
+        let json = r#""0x1234567890abcdef1234567890abcdef12345678""#;
+        let target: CallTarget = serde_json::from_str(json).unwrap();
+        assert!(matches!(target, CallTarget::Address(_)));
+    }
+
+    #[test]
+    fn test_call_target_deserialize_name() {
+        let json = r#""ChainlinkEthOracle""#;
+        let target: CallTarget = serde_json::from_str(json).unwrap();
+        match target {
+            CallTarget::Name(name) => assert_eq!(name, "ChainlinkEthOracle"),
+            _ => panic!("Expected Name variant"),
+        }
+    }
+
+    #[test]
+    fn test_eth_call_config_with_target_address() {
+        let json = r#"{
+            "function": "latestAnswer()",
+            "output_type": "int256",
+            "target": "0x1234567890abcdef1234567890abcdef12345678"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert!(config.target.is_some());
+        assert!(matches!(config.target.unwrap(), CallTarget::Address(_)));
+    }
+
+    #[test]
+    fn test_eth_call_config_with_target_name() {
+        let json = r#"{
+            "function": "latestAnswer()",
+            "output_type": "int256",
+            "target": "ChainlinkEthOracle"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert!(config.target.is_some());
+        match config.target.unwrap() {
+            CallTarget::Name(name) => assert_eq!(name, "ChainlinkEthOracle"),
+            _ => panic!("Expected Name variant"),
+        }
+    }
+
+    #[test]
+    fn test_eth_call_config_without_target() {
+        let json = r#"{
+            "function": "latestAnswer()",
+            "output_type": "int256"
+        }"#;
+        let config: EthCallConfig = serde_json::from_str(json).unwrap();
+        assert!(config.target.is_none());
     }
 }

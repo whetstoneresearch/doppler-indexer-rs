@@ -90,6 +90,8 @@ struct OnceCallConfig {
     preencoded_calldata: Option<Bytes>,
     /// Param configs needed when preencoded_calldata is None
     params: Vec<ParamConfig>,
+    /// Optional target address override (resolved from CallTarget)
+    target_addresses: Option<Vec<Address>>,
 }
 
 #[derive(Debug)]
@@ -179,7 +181,7 @@ pub async fn collect_eth_calls(
     }
 
     let once_configs = build_once_call_configs(&chain.contracts);
-    let factory_once_configs = build_factory_once_call_configs(&factory_call_configs);
+    let factory_once_configs = build_factory_once_call_configs(&factory_call_configs, &chain.contracts);
 
     let has_regular_calls = !call_configs.is_empty();
     let has_once_calls = !once_configs.is_empty();
@@ -233,6 +235,22 @@ pub async fn collect_eth_calls(
 
     if has_regular_calls || has_token_calls || has_once_calls {
         let block_ranges = get_existing_block_ranges(&chain.name);
+        tracing::info!(
+            "eth_calls catchup: checking {} block ranges (regular={}, token={}, once={})",
+            block_ranges.len(),
+            has_regular_calls,
+            has_token_calls,
+            has_once_calls
+        );
+
+        // Pre-load or build column indexes for all once directories
+        let mut once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        for contract_name in once_configs.keys() {
+            let once_dir = base_output_dir.join(contract_name).join("once");
+            let index = load_or_build_once_column_index(&once_dir);
+            once_column_indexes.insert(contract_name.clone(), index);
+        }
+
         let mut catchup_count = 0;
 
         for block_range in &block_ranges {
@@ -256,17 +274,55 @@ pub async fn collect_eth_calls(
             // Check if all once call files exist AND have all expected columns for this range
             let once_calls_done = !has_once_calls || once_configs.iter().all(|(contract_name, configs)| {
                 let rel_path = format!("{}/once/{}", contract_name, range.file_name());
-                if !existing_files.contains(&rel_path) {
-                    return false;
-                }
                 let expected: HashSet<&str> = configs
                     .iter()
                     .map(|c| c.function_name.as_str())
                     .collect();
-                let index = read_once_column_index(&base_output_dir.join(contract_name).join("once"));
+
+                if !existing_files.contains(&rel_path) {
+                    tracing::info!(
+                        "Once file missing for {} range {}-{}, will collect {} functions",
+                        contract_name,
+                        range.start,
+                        range.end - 1,
+                        expected.len()
+                    );
+                    return false;
+                }
+
+                // Use pre-loaded index (which was built from parquet schemas if index file didn't exist)
+                let index = once_column_indexes.get(contract_name).unwrap();
                 match index.get(&range.file_name()) {
-                    Some(cols) => expected.iter().all(|f| cols.contains(&f.to_string())),
-                    None => false, // index missing = needs recheck
+                    Some(cols) => {
+                        let missing: Vec<_> = expected.iter().filter(|f| !cols.contains(&f.to_string())).collect();
+                        if !missing.is_empty() {
+                            tracing::info!(
+                                "Once file {} for {} exists but missing columns: {:?} (has: {:?})",
+                                range.file_name(),
+                                contract_name,
+                                missing,
+                                cols
+                            );
+                            false
+                        } else {
+                            tracing::debug!(
+                                "Once file {} for {} complete with all {} columns",
+                                range.file_name(),
+                                contract_name,
+                                cols.len()
+                            );
+                            true
+                        }
+                    }
+                    None => {
+                        // File exists but wasn't found by index builder - shouldn't happen but handle it
+                        tracing::warn!(
+                            "Once file {} for {} exists but not in pre-built index, will collect",
+                            range.file_name(),
+                            contract_name
+                        );
+                        false
+                    }
                 }
             });
 
@@ -375,6 +431,83 @@ pub async fn collect_eth_calls(
                 catchup_count,
                 chain.name
             );
+        }
+    }
+
+    // =========================================================================
+    // Catchup phase for factory once calls: Check for missing columns in existing files
+    // =========================================================================
+    if has_factory_once_calls {
+        tracing::info!(
+            "Factory once calls catchup: checking {} factory collections for missing columns",
+            factory_once_configs.len()
+        );
+
+        // Pre-load or build column indexes for all factory once directories
+        let mut factory_once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        for collection_name in factory_once_configs.keys() {
+            let once_dir = base_output_dir.join(collection_name).join("once");
+            let index = load_or_build_once_column_index(&once_dir);
+            factory_once_column_indexes.insert(collection_name.clone(), index);
+        }
+
+        // Load factory address data from existing parquet files
+        let factory_catchup_data = load_factory_addresses_for_once_catchup(&chain.name, &factory_once_configs);
+
+        if !factory_catchup_data.is_empty() {
+            let block_ranges = get_existing_block_ranges(&chain.name);
+            let mut factory_once_catchup_count = 0;
+
+            for block_range in &block_ranges {
+                let range = BlockRange {
+                    start: block_range.start,
+                    end: block_range.end,
+                };
+
+                // Build FactoryAddressData for this range from loaded data
+                let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
+                for (collection_name, addr_data) in &factory_catchup_data {
+                    for (addr, block_num, timestamp) in addr_data {
+                        if *block_num >= range.start && *block_num < range.end {
+                            addresses_by_block
+                                .entry(*block_num)
+                                .or_default()
+                                .push((*timestamp, *addr, collection_name.clone()));
+                        }
+                    }
+                }
+
+                if addresses_by_block.is_empty() {
+                    continue;
+                }
+
+                let factory_data = FactoryAddressData {
+                    range_start: range.start,
+                    range_end: range.end,
+                    addresses_by_block,
+                };
+
+                process_factory_once_calls(
+                    &range,
+                    client,
+                    &factory_data,
+                    &factory_once_configs,
+                    &base_output_dir,
+                    &existing_files,
+                    &factory_once_column_indexes,
+                )
+                .await?;
+
+                factory_once_catchup_count += 1;
+            }
+
+            if factory_once_catchup_count > 0 {
+                tracing::info!(
+                    "Factory once calls catchup complete: checked {} ranges for chain {}",
+                    factory_once_catchup_count,
+                    chain.name
+                );
+            }
         }
     }
 
@@ -559,6 +692,7 @@ pub async fn collect_eth_calls(
                                         .await?;
 
                                         if has_factory_once_calls {
+                                            let empty_index = HashMap::new();
                                             process_factory_once_calls(
                                                 &range,
                                                 client,
@@ -566,6 +700,7 @@ pub async fn collect_eth_calls(
                                                 &factory_once_configs,
                                                 &base_output_dir,
                                                 &existing_files,
+                                                &empty_index,
                                             )
                                             .await?;
                                         }
@@ -721,6 +856,7 @@ pub async fn collect_eth_calls(
                                     }
 
                                     if has_factory_once_calls {
+                                        let empty_index = HashMap::new();
                                         process_factory_once_calls(
                                             &range,
                                             client,
@@ -728,6 +864,7 @@ pub async fn collect_eth_calls(
                                             &factory_once_configs,
                                             &base_output_dir,
                                             &existing_files,
+                                            &empty_index,
                                         )
                                         .await?;
                                     }
@@ -795,6 +932,7 @@ pub async fn collect_eth_calls(
                                     .await?;
 
                                     if has_factory_once_calls {
+                                        let empty_index = HashMap::new();
                                         process_factory_once_calls(
                                             &range,
                                             client,
@@ -802,6 +940,7 @@ pub async fn collect_eth_calls(
                                             &factory_once_configs,
                                             &base_output_dir,
                                             &existing_files,
+                                            &empty_index,
                                         )
                                         .await?;
                                     }
@@ -944,6 +1083,7 @@ pub async fn collect_eth_calls(
                     .await?;
 
                     if has_factory_once_calls {
+                        let empty_index = HashMap::new();
                         process_factory_once_calls(
                             &range,
                             client,
@@ -951,6 +1091,7 @@ pub async fn collect_eth_calls(
                             &factory_once_configs,
                             &base_output_dir,
                             &existing_files,
+                            &empty_index,
                         )
                         .await?;
                     }
@@ -998,8 +1139,24 @@ fn build_event_triggered_call_configs(
                         .unwrap_or(&call.function)
                         .to_string();
 
+                    // Resolve target override if specified, otherwise use contract addresses
+                    let target_addrs = if let Some(target) = &call.target {
+                        match target.resolve_all(contracts) {
+                            Some(addrs) => addrs,
+                            None => {
+                                tracing::warn!(
+                                    "Could not resolve target for event-triggered call {} on contract {}, skipping",
+                                    call.function, contract_name
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        addresses.clone()
+                    };
+
                     // For each target address, create a config
-                    for address in &addresses {
+                    for address in &target_addrs {
                         configs.entry(key.clone()).or_default().push(EventTriggeredCallConfig {
                             contract_name: contract_name.clone(),
                             target_address: Some(*address),
@@ -1029,10 +1186,21 @@ fn build_event_triggered_call_configs(
                                 .unwrap_or(&call.function)
                                 .to_string();
 
-                            // For factory collections, target address is determined at runtime from event emitter
+                            // If target is specified, use resolved target; otherwise use event emitter at runtime
+                            let target_address = call.target.as_ref().and_then(|t| {
+                                let resolved = t.resolve(contracts);
+                                if resolved.is_none() {
+                                    tracing::warn!(
+                                        "Could not resolve target for factory event-triggered call {} on collection {}, will use event emitter",
+                                        call.function, factory.collection
+                                    );
+                                }
+                                resolved
+                            });
+
                             configs.entry(key.clone()).or_default().push(EventTriggeredCallConfig {
                                 contract_name: factory.collection.clone(),
-                                target_address: None, // Will use event emitter address
+                                target_address,
                                 function_name: function_name.clone(),
                                 function_selector: selector,
                                 params: call.params.clone(),
@@ -1725,6 +1893,148 @@ fn load_historical_factory_addresses(
     result
 }
 
+/// Load factory addresses with block numbers and timestamps for once-call catchup.
+/// Returns a map of collection_name -> Vec<(address, block_number, timestamp)>
+fn load_factory_addresses_for_once_catchup(
+    chain_name: &str,
+    factory_once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+) -> HashMap<String, Vec<(Address, u64, u64)>> {
+    let mut result: HashMap<String, Vec<(Address, u64, u64)>> = HashMap::new();
+
+    let collections_needed: HashSet<&String> = factory_once_configs.keys().collect();
+    if collections_needed.is_empty() {
+        return result;
+    }
+
+    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain_name));
+    if !factories_dir.exists() {
+        tracing::debug!(
+            "No factories directory at {}, skipping factory once catchup",
+            factories_dir.display()
+        );
+        return result;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&factories_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let collection_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            if !collections_needed.contains(&collection_name) {
+                continue;
+            }
+
+            // Read parquet files in this collection
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for file_entry in files.flatten() {
+                    let file_path = file_entry.path();
+                    if !file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                        continue;
+                    }
+
+                    if let Ok(addresses) = read_factory_addresses_with_blocks(&file_path) {
+                        result
+                            .entry(collection_name.clone())
+                            .or_default()
+                            .extend(addresses);
+                    }
+                }
+            }
+        }
+    }
+
+    if !result.is_empty() {
+        tracing::info!(
+            "Loaded factory addresses for once-call catchup: {} collections",
+            result.len()
+        );
+        for (name, addrs) in &result {
+            tracing::info!("  {} - {} addresses", name, addrs.len());
+        }
+    }
+
+    result
+}
+
+/// Read factory addresses with block number and timestamp from a parquet file
+fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Address, u64, u64)>, std::io::Error> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path)?;
+    let reader = match ParquetRecordBatchReaderBuilder::try_new(file) {
+        Ok(builder) => match builder.build() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Failed to build parquet reader for {}: {}", path.display(), e);
+                return Ok(Vec::new());
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Failed to create parquet reader for {}: {}", path.display(), e);
+            return Ok(Vec::new());
+        }
+    };
+
+    let mut addresses = Vec::new();
+
+    for batch_result in reader {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Failed to read batch from {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        let addr_col_idx = batch.schema().index_of("factory_address").ok();
+        let block_col_idx = batch.schema().index_of("block_number").ok();
+        let ts_col_idx = batch.schema().index_of("block_timestamp").ok();
+
+        if addr_col_idx.is_none() || block_col_idx.is_none() {
+            continue;
+        }
+
+        let addr_col = batch.column(addr_col_idx.unwrap());
+        let block_col = batch.column(block_col_idx.unwrap());
+        let ts_col = ts_col_idx.map(|i| batch.column(i));
+
+        let addr_array = match addr_col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            Some(a) => a,
+            None => continue,
+        };
+        let block_array = match block_col.as_any().downcast_ref::<UInt64Array>() {
+            Some(a) => a,
+            None => continue,
+        };
+        let ts_array = ts_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+
+        for i in 0..addr_array.len() {
+            if addr_array.is_null(i) || block_array.is_null(i) {
+                continue;
+            }
+            let bytes = addr_array.value(i);
+            if bytes.len() != 20 {
+                continue;
+            }
+            let mut addr_bytes = [0u8; 20];
+            addr_bytes.copy_from_slice(bytes);
+            let block_num = block_array.value(i);
+            let timestamp = ts_array.map(|a| a.value(i)).unwrap_or(0);
+            addresses.push((Address::from(addr_bytes), block_num, timestamp));
+        }
+    }
+
+    Ok(addresses)
+}
+
 /// Read factory addresses from a parquet file
 fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, std::io::Error> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -2250,7 +2560,7 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
     let mut configs = Vec::new();
 
     for (contract_name, contract) in contracts {
-        let addresses = match &contract.address {
+        let default_addresses = match &contract.address {
             AddressOrAddresses::Single(addr) => vec![*addr],
             AddressOrAddresses::Multiple(addrs) => addrs.clone(),
         };
@@ -2261,6 +2571,22 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
                 if call.frequency.is_once() || call.frequency.is_on_events() {
                     continue;
                 }
+
+                // Resolve target addresses: use target override if specified, otherwise contract addresses
+                let addresses = if let Some(target) = &call.target {
+                    match target.resolve_all(contracts) {
+                        Some(addrs) => addrs,
+                        None => {
+                            tracing::warn!(
+                                "Could not resolve target for call {} on contract {}, skipping",
+                                call.function, contract_name
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    default_addresses.clone()
+                };
 
                 let selector = compute_function_selector(&call.function);
                 let function_name = call.function
@@ -2470,11 +2796,24 @@ fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCal
                         }
                     };
 
+                    // Resolve target override addresses if specified
+                    let target_addresses = call.target.as_ref().and_then(|t| {
+                        let resolved = t.resolve_all(contracts);
+                        if resolved.is_none() {
+                            tracing::warn!(
+                                "Could not resolve target for once call {} on contract {}, will use contract addresses",
+                                call.function, contract_name
+                            );
+                        }
+                        resolved
+                    });
+
                     configs.entry(contract_name.clone()).or_default().push(OnceCallConfig {
                         function_name,
                         function_selector: selector,
                         preencoded_calldata,
                         params,
+                        target_addresses,
                     });
                 }
             }
@@ -2484,7 +2823,10 @@ fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCal
     configs
 }
 
-fn build_factory_once_call_configs(factory_call_configs: &HashMap<String, Vec<EthCallConfig>>) -> HashMap<String, Vec<OnceCallConfig>> {
+fn build_factory_once_call_configs(
+    factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
+    contracts: &Contracts,
+) -> HashMap<String, Vec<OnceCallConfig>> {
     let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
 
     for (collection_name, call_configs) in factory_call_configs {
@@ -2496,6 +2838,19 @@ fn build_factory_once_call_configs(factory_call_configs: &HashMap<String, Vec<Et
                     .next()
                     .unwrap_or(&call.function)
                     .to_string();
+
+                // Resolve target override if specified (resolves to first address only for factory calls)
+                let target_addresses = call.target.as_ref().and_then(|t| {
+                    let resolved = t.resolve(contracts);
+                    if resolved.is_none() {
+                        tracing::warn!(
+                            "Could not resolve target for factory once call {} on collection {}, will use factory addresses",
+                            call.function, collection_name
+                        );
+                    }
+                    // For factory once calls, we resolve to a single target address
+                    resolved.map(|addr| vec![addr])
+                });
 
                 // Check if call has self-address params (requires dynamic encoding per address)
                 let (preencoded_calldata, params) = if call.has_self_address_param() {
@@ -2542,6 +2897,7 @@ fn build_factory_once_call_configs(factory_call_configs: &HashMap<String, Vec<Et
                     function_selector: selector,
                     preencoded_calldata,
                     params,
+                    target_addresses,
                 });
             }
         }
@@ -2606,12 +2962,17 @@ async fn process_once_calls_regular(
 
         let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
             let index = read_once_column_index(&sub_dir);
-            let existing_cols: HashSet<String> = index
-                .get(&file_name)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+            // Use index if file is tracked, otherwise fall back to reading parquet schema
+            let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
+                cols.iter().cloned().collect()
+            } else {
+                // File exists but not in index - read schema directly
+                tracing::debug!(
+                    "File {} exists but not in index, reading schema from parquet",
+                    output_path.display()
+                );
+                read_parquet_column_names(&output_path)
+            };
             let missing: Vec<String> = all_fn_names
                 .iter()
                 .filter(|f| !existing_cols.contains(*f))
@@ -2650,7 +3011,7 @@ async fn process_once_calls_regular(
             None => continue,
         };
 
-        let addresses = match &contract.address {
+        let default_addresses = match &contract.address {
             AddressOrAddresses::Single(addr) => vec![*addr],
             AddressOrAddresses::Multiple(addrs) => addrs.clone(),
         };
@@ -2658,8 +3019,11 @@ async fn process_once_calls_regular(
         let block_id = BlockId::Number(BlockNumberOrTag::Number(first_block.block_number));
         let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, String)> = Vec::new();
 
-        for address in &addresses {
-            for call_config in &configs_to_call {
+        for call_config in &configs_to_call {
+            // Use target override addresses if available, otherwise contract addresses
+            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+
+            for address in addresses {
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
@@ -2743,8 +3107,14 @@ async fn process_once_calls_regular(
                 );
             }
         } else {
-            // Write new file with all results
-            let results: Vec<OnceCallResult> = addresses
+            // Write new file with all results - collect all unique addresses from pending_calls
+            let all_addresses: Vec<Address> = pending_calls
+                .iter()
+                .map(|(_, _, addr, _)| *addr)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let results: Vec<OnceCallResult> = all_addresses
                 .iter()
                 .filter_map(|addr| {
                     results_by_address.remove(addr).map(|function_results| OnceCallResult {
@@ -2769,10 +3139,20 @@ async fn process_once_calls_regular(
             }
         }
 
-        // Update the column index with the complete list of function names now in the file
+        // Update the column index with columns actually present in the file
+        let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
+            .into_iter()
+            .collect();
         let mut index = read_once_column_index(&sub_dir);
-        index.insert(file_name.clone(), all_fn_names.clone());
+        index.insert(file_name.clone(), actual_cols.clone());
         write_once_column_index(&sub_dir, &index)?;
+        tracing::info!(
+            "Updated column index for {}: {} now has {} columns: {:?}",
+            contract_name,
+            file_name,
+            actual_cols.len(),
+            actual_cols
+        );
     }
 
     Ok(())
@@ -2785,6 +3165,7 @@ async fn process_factory_once_calls(
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
 ) -> Result<(), EthCallCollectionError> {
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -2802,13 +3183,13 @@ async fn process_factory_once_calls(
             .collect();
 
         let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
-            let index = read_once_column_index(&sub_dir);
+            // Use pre-loaded index
+            let index = column_indexes.get(collection_name);
             let existing_cols: HashSet<String> = index
-                .get(&file_name)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+                .and_then(|idx| idx.get(&file_name))
+                .map(|cols| cols.iter().cloned().collect())
+                .unwrap_or_default();
+
             let missing: Vec<String> = all_fn_names
                 .iter()
                 .filter(|f| !existing_cols.contains(*f))
@@ -2857,26 +3238,34 @@ async fn process_factory_once_calls(
 
         let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> = Vec::new();
 
-        for (address, (block_number, timestamp)) in &address_discovery {
+        for (discovered_address, (block_number, timestamp)) in &address_discovery {
             let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
 
             for call_config in &configs_to_call {
+                // Determine target: use override if set, otherwise call the discovered address
+                let target_address = call_config.target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                // For self-address params, use the discovered address (factory instance)
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
                     encode_once_call_params(
                         call_config.function_selector,
                         &call_config.params,
-                        *address,
+                        *discovered_address,
                     )?
                 };
                 let tx = TransactionRequest::default()
-                    .to(*address)
+                    .to(target_address)
                     .input(calldata.into());
+                // Store discovered_address for output (keyed by factory instance)
                 pending_calls.push((
                     tx,
                     block_id,
-                    *address,
+                    *discovered_address,
                     *block_number,
                     *timestamp,
                     call_config.function_name.clone(),
@@ -2974,10 +3363,20 @@ async fn process_factory_once_calls(
             }
         }
 
-        // Update the column index
+        // Update the column index with columns actually present in the file
+        let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
+            .into_iter()
+            .collect();
         let mut index = read_once_column_index(&sub_dir);
-        index.insert(file_name.clone(), all_fn_names.clone());
+        index.insert(file_name.clone(), actual_cols.clone());
         write_once_column_index(&sub_dir, &index)?;
+        tracing::info!(
+            "Updated column index for factory {}: {} now has {} columns: {:?}",
+            collection_name,
+            file_name,
+            actual_cols.len(),
+            actual_cols
+        );
     }
 
     Ok(())
@@ -3820,8 +4219,23 @@ fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
 fn read_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
     let index_path = once_dir.join("column_index.json");
     match std::fs::read_to_string(&index_path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HashMap::new(),
+        Ok(content) => {
+            let index: HashMap<String, Vec<String>> = serde_json::from_str(&content).unwrap_or_default();
+            tracing::debug!(
+                "Read column index from {}: {} files tracked",
+                index_path.display(),
+                index.len()
+            );
+            index
+        }
+        Err(e) => {
+            tracing::debug!(
+                "No column index at {} ({}), starting fresh",
+                index_path.display(),
+                e.kind()
+            );
+            HashMap::new()
+        }
     }
 }
 
@@ -3831,6 +4245,11 @@ fn write_once_column_index(
     index: &HashMap<String, Vec<String>>,
 ) -> Result<(), EthCallCollectionError> {
     let index_path = once_dir.join("column_index.json");
+    tracing::debug!(
+        "Writing column index to {}: {} files tracked",
+        index_path.display(),
+        index.len()
+    );
     let content = serde_json::to_string_pretty(index).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialize error: {}", e))
     })?;
@@ -3838,13 +4257,120 @@ fn write_once_column_index(
     Ok(())
 }
 
+/// Load or build the column index for a once/ directory.
+/// If the index file exists, load it. Otherwise, scan all parquet files to build it.
+fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
+    let index_path = once_dir.join("column_index.json");
+
+    // Try to load existing index
+    if index_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&index_path) {
+            if let Ok(index) = serde_json::from_str::<HashMap<String, Vec<String>>>(&content) {
+                tracing::debug!(
+                    "Loaded column index from {}: {} files tracked",
+                    index_path.display(),
+                    index.len()
+                );
+                return index;
+            }
+        }
+    }
+
+    // Index doesn't exist or couldn't be loaded - build from parquet files
+    if !once_dir.exists() {
+        return HashMap::new();
+    }
+
+    let mut index = HashMap::new();
+    let parquet_files: Vec<_> = match std::fs::read_dir(once_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|ext| ext == "parquet").unwrap_or(false))
+            .collect(),
+        Err(_) => return HashMap::new(),
+    };
+
+    if parquet_files.is_empty() {
+        return HashMap::new();
+    }
+
+    tracing::info!(
+        "Building column index for {} from {} parquet files",
+        once_dir.display(),
+        parquet_files.len()
+    );
+
+    for entry in parquet_files {
+        let path = entry.path();
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+        let cols: Vec<String> = read_parquet_column_names(&path).into_iter().collect();
+        if !cols.is_empty() {
+            index.insert(file_name, cols);
+        }
+    }
+
+    // Write the newly built index
+    if !index.is_empty() {
+        if let Err(e) = write_once_column_index(once_dir, &index) {
+            tracing::warn!("Failed to write column index to {}: {}", once_dir.display(), e);
+        } else {
+            tracing::info!(
+                "Built and saved column index for {}: {} files tracked",
+                once_dir.display(),
+                index.len()
+            );
+        }
+    }
+
+    index
+}
+
+/// Read column names from a parquet file's schema (for fallback when index is missing).
+/// Returns function names by stripping the `_result` suffix from column names.
+fn read_parquet_column_names(path: &Path) -> HashSet<String> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashSet::new(),
+    };
+
+    let reader = match SerializedFileReader::new(file) {
+        Ok(r) => r,
+        Err(_) => return HashSet::new(),
+    };
+
+    let schema = reader.metadata().file_metadata().schema_descr();
+    let mut fn_names = HashSet::new();
+
+    for field in schema.columns() {
+        let name = field.name();
+        // Extract function name from column name (e.g., "getAssetData_result" -> "getAssetData")
+        if let Some(fn_name) = name.strip_suffix("_result") {
+            fn_names.insert(fn_name.to_string());
+        }
+    }
+
+    fn_names
+}
+
 /// Read an existing once-call parquet file and return all record batches.
 fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    tracing::debug!("Reading existing once parquet from {}", path.display());
     let file = File::open(path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
         .build()?;
     let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let num_cols = batches.first().map(|b| b.num_columns()).unwrap_or(0);
+    tracing::debug!(
+        "Read {} batches ({} rows, {} columns) from {}",
+        batches.len(),
+        total_rows,
+        num_cols,
+        path.display()
+    );
     Ok(batches)
 }
 
@@ -3856,6 +4382,12 @@ fn merge_once_columns(
     new_results: &HashMap<[u8; 20], HashMap<String, Vec<u8>>>,
     new_fn_names: &[String],
 ) -> Result<RecordBatch, EthCallCollectionError> {
+    tracing::debug!(
+        "Merging {} new columns into existing data ({} addresses in new results)",
+        new_fn_names.len(),
+        new_results.len()
+    );
+
     // Concatenate existing batches into one
     let existing = arrow::compute::concat_batches(
         &existing_batches[0].schema(),
@@ -3871,41 +4403,77 @@ fn merge_once_columns(
         .downcast_ref::<FixedSizeBinaryArray>()
         .expect("address column must be FixedSizeBinary(20)");
 
+    tracing::debug!(
+        "Existing data has {} rows, {} columns",
+        num_rows,
+        existing.num_columns()
+    );
+
     // Build new columns by matching on address
     let mut new_columns: Vec<ArrayRef> = Vec::new();
     for fn_name in new_fn_names {
+        let mut matched_count = 0;
         let arr: BinaryArray = (0..num_rows)
             .map(|i| {
                 let addr_bytes: [u8; 20] = address_arr.value(i).try_into().unwrap();
-                new_results
+                let result = new_results
                     .get(&addr_bytes)
                     .and_then(|m| m.get(fn_name))
                     .filter(|v| !v.is_empty())
-                    .map(|v| v.as_slice())
+                    .map(|v| v.as_slice());
+                if result.is_some() {
+                    matched_count += 1;
+                }
+                result
             })
             .collect();
+        tracing::debug!(
+            "Column {}_result: matched {}/{} addresses",
+            fn_name,
+            matched_count,
+            num_rows
+        );
         new_columns.push(Arc::new(arr));
     }
 
-    // Build merged schema: existing fields + new result fields
+    // Build merged schema: existing fields, replacing any that match new columns
     let existing_schema = existing.schema();
-    let mut fields: Vec<Field> = existing_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    for fn_name in new_fn_names {
+    let new_col_names: HashSet<String> = new_fn_names
+        .iter()
+        .map(|fn_name| format!("{}_result", fn_name))
+        .collect();
+
+    let mut fields: Vec<Field> = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+
+    // Copy existing columns, skipping any that will be replaced
+    for (i, field) in existing_schema.fields().iter().enumerate() {
+        if new_col_names.contains(field.name()) {
+            tracing::debug!("Replacing existing column: {}", field.name());
+            continue;
+        }
+        fields.push(field.as_ref().clone());
+        columns.push(existing.column(i).clone());
+    }
+
+    // Add the new/replacement columns
+    for (i, fn_name) in new_fn_names.iter().enumerate() {
         fields.push(Field::new(
             &format!("{}_result", fn_name),
             DataType::Binary,
             true,
         ));
+        columns.push(new_columns[i].clone());
     }
+
     let merged_schema = Arc::new(Schema::new(fields));
-
-    // Combine columns
-    let mut columns: Vec<ArrayRef> = (0..existing.num_columns())
-        .map(|i| existing.column(i).clone())
-        .collect();
-    columns.extend(new_columns);
-
-    let merged = RecordBatch::try_new(merged_schema, columns)?;
+    let merged = RecordBatch::try_new(merged_schema.clone(), columns)?;
+    tracing::debug!(
+        "Merged result: {} rows, {} columns (schema: {:?})",
+        merged.num_rows(),
+        merged.num_columns(),
+        merged_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+    );
     Ok(merged)
 }
 
