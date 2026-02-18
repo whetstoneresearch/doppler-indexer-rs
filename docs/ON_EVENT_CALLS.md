@@ -11,6 +11,7 @@ The `on_events` frequency is an alternative to block-based frequencies (`EveryBl
 - Call `slot0()` on a Uniswap V3 pool whenever a `Swap` event occurs
 - Call `balanceOf(address)` on a token whenever a `Transfer` event occurs, using the recipient from the event
 - Call `getReserves()` on factory-created pairs whenever they emit a `Swap` event
+- Call `slot0()` whenever ANY of `Swap`, `Mint`, or `Burn` events occur (multiple event triggers)
 
 ## Configuration
 
@@ -95,6 +96,35 @@ Trigger calls when events are emitted from factory-created contracts:
 }
 ```
 
+### Multiple Event Triggers
+
+Trigger the same eth_call from multiple different events. This is useful when you want to refresh state on any state-changing event:
+
+```json
+{
+  "V3Pool": {
+    "address": "0x...",
+    "calls": [
+      {
+        "function": "slot0()",
+        "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex)",
+        "frequency": {
+          "on_events": [
+            {"source": "V3Pool", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"},
+            {"source": "V3Pool", "event": "Mint(address,int24,int24,uint128,uint256,uint256)"},
+            {"source": "V3Pool", "event": "Burn(address,int24,int24,uint128,uint256,uint256)"}
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+Both single-object and array syntax are supported:
+- **Single event (object):** `"on_events": {"source": "...", "event": "..."}`
+- **Multiple events (array):** `"on_events": [{"source": "...", "event": "..."}, ...]`
+
 ## Configuration Reference
 
 ### EventTriggerConfig
@@ -103,6 +133,17 @@ Trigger calls when events are emitted from factory-created contracts:
 |-------|------|-------------|
 | `source` | string | Contract name or factory collection name that emits the event |
 | `event` | string | Event signature (e.g., `"Transfer(address,address,uint256)"`) |
+
+### EventTriggerConfigs (on_events value)
+
+The `on_events` field accepts either a single config object or an array of configs:
+
+| Format | Example |
+|--------|---------|
+| Single | `{"source": "Pool", "event": "Swap(...)"}` |
+| Multiple | `[{"source": "Pool", "event": "Swap(...)"}, {"source": "Pool", "event": "Mint(...)"}]` |
+
+When using multiple events, the eth_call is triggered when ANY of the configured events occur.
 
 ### Parameter Sources
 
@@ -117,12 +158,14 @@ Parameters can be specified using three different sources:
 ```json
 {"type": "address", "from_event": "topics[1]"}
 {"type": "uint256", "from_event": "data[0]"}
+{"type": "address", "from_event": "address"}
 ```
 
 Event field references:
-- `topics[0]` - Event signature hash (topic0)
-- `topics[1]`, `topics[2]`, `topics[3]` - Indexed parameters
-- `data[0]`, `data[1]`, etc. - Non-indexed parameters (32-byte words)
+- `"address"` - The address of the contract that emitted the event (emitter address)
+- `"topics[0]"` - Event signature hash (topic0)
+- `"topics[1]"`, `"topics[2]"`, `"topics[3]"` - Indexed parameters
+- `"data[0]"`, `"data[1]"`, etc. - Non-indexed parameters (32-byte words)
 
 Supported types for `from_event`:
 - `address` - Ethereum address (20 bytes, right-aligned in 32-byte word)
@@ -139,6 +182,8 @@ Supported types for `from_event`:
 ```
 
 Uses the address of the contract that emitted the event. Useful for factory collections where you want to call back to the contract that emitted the event.
+
+**Note:** Both `{"type": "address", "from_event": "address"}` and `{"type": "address", "source": "self"}` achieve the same result - they use the event emitter's address. The `from_event: "address"` syntax provides consistency with other `from_event` patterns.
 
 ## Architecture
 
@@ -235,9 +280,15 @@ pub struct EventTriggerConfig {
     pub event: String,       // Event signature
 }
 
+/// Wrapper supporting single or multiple event triggers
+pub enum EventTriggerConfigs {
+    Single(EventTriggerConfig),
+    Multiple(Vec<EventTriggerConfig>),
+}
+
 pub enum ParamConfig {
     Static { param_type: EvmType, values: Vec<ParamValue> },
-    FromEvent { param_type: EvmType, from_event: String },
+    FromEvent { param_type: EvmType, from_event: String },  // "address", "topics[N]", "data[N]"
     SelfAddress { param_type: EvmType, source: String },
 }
 ```
@@ -366,10 +417,17 @@ Run config parsing tests specifically:
 cargo test types::config::eth_call
 ```
 
-Key tests (26 total):
-- `test_frequency_deserialize_on_events` - Deserialize `on_events` frequency
+Key tests (44 total):
+- `test_frequency_deserialize_on_events` - Deserialize single `on_events` frequency
+- `test_frequency_deserialize_on_events_array` - Deserialize array of events
+- `test_frequency_deserialize_on_events_single_still_works` - Backward compatibility
+- `test_frequency_deserialize_on_events_empty_array_fails` - Empty array validation
+- `test_eth_call_config_with_multiple_events` - Full config with multiple event triggers
+- `test_event_trigger_configs_iter` - Iterator over single and multiple configs
+- `test_event_trigger_configs_len_and_is_empty` - Helper method tests
 - `test_param_config_from_event` - Parse `from_event` parameter binding
 - `test_param_config_from_event_data` - Parse `from_event` with data fields
+- `test_param_config_from_event_address` - Parse `from_event: "address"` (emitter address)
 - `test_param_config_self_address` - Parse `source: "self"` parameter
 - `test_eth_call_config_with_on_events` - Full config with on_events frequency
 - `test_eth_call_config_with_from_event_param` - Config with event-bound parameters

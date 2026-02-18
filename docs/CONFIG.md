@@ -218,7 +218,7 @@ Contracts can include `calls` to read on-chain state:
 | `function` | string | Yes | - | Function signature (e.g., `totalSupply()`) |
 | `output_type` | string | Yes | - | Return type for decoding |
 | `params` | array | No | - | Parameters to pass to the function call |
-| `frequency` | string/number | No | every block | How often to make the call |
+| `frequency` | string/number/object | No | every block | How often to make the call. Supports `"once"`, `N` (every N blocks), `"5m"` (duration), or `{"on_events": ...}` |
 | `target` | string | No | *(contract address)* | Override target: a hex address or a contract name to look up |
 
 **Parameterized Calls:**

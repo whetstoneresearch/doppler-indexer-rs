@@ -250,6 +250,8 @@ The `frequency` field controls how often eth_calls are made. This is useful for 
 | `"once"` | Call once per contract address |
 | `100` (any positive integer) | Call every N blocks |
 | `"5m"`, `"1h"`, `"1d"` | Call at time intervals |
+| `{"on_events": {...}}` | Call when specific events are emitted (see [On-Events ETH Calls](./ON_EVENT_CALLS.md)) |
+| `{"on_events": [...]}` | Call when ANY of multiple events are emitted |
 
 ### Duration Format
 
@@ -263,6 +265,39 @@ Duration strings use a number followed by a unit suffix:
 | `d` | days |
 
 Examples: `"30s"`, `"5m"`, `"1h"`, `"7d"`
+
+### Event-Triggered Calls
+
+Use `on_events` to trigger eth_calls when specific blockchain events are emitted. This supports both single and multiple event triggers:
+
+**Single event:**
+```json
+{
+  "frequency": {
+    "on_events": {"source": "V3Pool", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"}
+  }
+}
+```
+
+**Multiple events (call on ANY of these events):**
+```json
+{
+  "frequency": {
+    "on_events": [
+      {"source": "V3Pool", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"},
+      {"source": "V3Pool", "event": "Mint(address,int24,int24,uint128,uint256,uint256)"},
+      {"source": "V3Pool", "event": "Burn(address,int24,int24,uint128,uint256,uint256)"}
+    ]
+  }
+}
+```
+
+Event-triggered calls support extracting parameters from event data:
+- `"topics[N]"` - Indexed event parameters
+- `"data[N]"` - Non-indexed event parameters (32-byte words)
+- `"address"` - The event emitter's address
+
+For full documentation, see [On-Events ETH Calls](./ON_EVENT_CALLS.md).
 
 ### Example Configuration
 
