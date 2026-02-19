@@ -1,6 +1,7 @@
-CREATE TABLE IF NOT EXISTS (
+CREATE TABLE IF NOT EXISTS v4_pool_configs (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,
+    pool_id BYTEA NOT NULL,
     hook_address BYTEA NOT NULL,
     num_tokens_to_sell BIGINT NOT NULL,
     min_proceeds BIGINT NOT NULL,

@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS pools (
     "address" BYTEA NOT NULL,
     base_token BYTEA NOT NULL,
     quote_token BYTEA NOT NULL,
-    quote_ticker VARCHAR(255),
     is_token_0 BOOLEAN NOT NULL,
     "type" VARCHAR(255) NOT NULL,
     fee INT NOT NULL,
@@ -21,6 +20,7 @@ CREATE TABLE IF NOT EXISTS pools (
     beneficiaries JSONB,
     pool_key JSONB, 
     starting_time TIMESTAMPTZ NOT NULL,
+    ending_time TIMESTAMPTZ NOT NULL,
     source VARCHAR(255) NOT NULL,
     source_version INT NOT NULL,
     UNIQUE (chain_id, address, source, source_version)

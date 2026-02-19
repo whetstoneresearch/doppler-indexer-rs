@@ -157,12 +157,14 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::Int2(v) => SqlParam::Int16(*v as i16),
         DbValue::Uint64(v) => SqlParam::Int64(*v as i64),
         DbValue::Text(v) => SqlParam::Text(v.clone()),
+        DbValue::VarChar(v) => SqlParam::Text(v.clone()),
         DbValue::Bytes(v) => SqlParam::Bytes(v.clone()),
         DbValue::Address(v) => SqlParam::Bytes(v.to_vec()),
         DbValue::Bytes32(v) => SqlParam::Bytes(v.to_vec()),
         DbValue::Numeric(v) => SqlParam::Text(v.clone()),
         DbValue::Timestamp(v) => SqlParam::Float64(*v as f64),
         DbValue::Json(v) => SqlParam::Json(v.clone()),
+        DbValue::JsonB(v) => SqlParam::Json(v.clone()),
     }
 }
 
@@ -178,6 +180,7 @@ fn placeholder_for(value: &DbValue, param_idx: usize) -> String {
     match value {
         DbValue::Timestamp(_) => format!("to_timestamp(${})", param_idx),
         DbValue::Numeric(_) => format!("${}::text::numeric", param_idx),
+        DbValue::JsonB(_) => format!("${}::jsonb", param_idx),
         _ => format!("${}", param_idx),
     }
 }

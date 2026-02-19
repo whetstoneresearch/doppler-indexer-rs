@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 /// A value that can be stored in the database.
@@ -15,8 +16,10 @@ pub enum DbValue {
     Int2(u8),
     /// Unsigned 64-bit integer (stored as BIGINT)
     Uint64(u64),
-    /// Text/varchar
+    /// Text (unlimited length)
     Text(String),
+    /// VARCHAR (length constraint enforced at schema level)
+    VarChar(String),
     /// Raw bytes (stored as BYTEA)
     Bytes(Vec<u8>),
     /// Ethereum address (20 bytes, stored as BYTEA)
@@ -29,12 +32,24 @@ pub enum DbValue {
     Timestamp(i64),
     /// JSON value
     Json(JsonValue),
+    /// JSONB value (binary JSON, more efficient for querying)
+    JsonB(JsonValue),
 }
 
 impl DbValue {
     /// Check if the value is null
     pub fn is_null(&self) -> bool {
         matches!(self, DbValue::Null)
+    }
+
+    /// Create a JSONB value from any serializable type
+    pub fn jsonb<T: Serialize>(value: T) -> Self {
+        DbValue::JsonB(serde_json::to_value(value).expect("Failed to serialize to JSON"))
+    }
+
+    /// Create a JSON value from any serializable type
+    pub fn json<T: Serialize>(value: T) -> Self {
+        DbValue::Json(serde_json::to_value(value).expect("Failed to serialize to JSON"))
     }
 }
 

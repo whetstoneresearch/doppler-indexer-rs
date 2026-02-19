@@ -13,7 +13,7 @@ sol! {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolKey {
     pub currency0: Address,
     pub currency1: Address,
@@ -40,14 +40,14 @@ pub struct V4PoolConfig {
     pub num_tokens_to_sell: U256,
     pub min_proceeds: U256,
     pub max_proceeds: U256,
-    pub starting_time: U256,
-    pub ending_time: U256,
+    pub starting_time: u64,
+    pub ending_time: u64,
     pub starting_tick: i32,
     pub ending_tick: i32,
     pub epoch_length: U256,
     pub gamma: u32,
-    pub is_token0: bool,
-    pub num_pd_slugs: U256,
+    pub is_token_0: bool,
+    pub num_pds_slugs: U256,
 }
 
 #[derive(Debug, Clone)]
