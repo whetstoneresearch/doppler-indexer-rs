@@ -9,12 +9,101 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
+use async_trait::async_trait;
 use governor::clock::{QuantaClock, QuantaInstant};
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Jitter, Quota, RateLimiter};
 use thiserror::Error;
 use url::Url;
+
+/// Trait for RPC providers that can execute Ethereum JSON-RPC calls.
+/// This abstracts over different client implementations (standard, Alchemy, etc.)
+/// and allows unified usage while each implementation handles rate limiting differently.
+#[async_trait]
+pub trait RpcProvider: Send + Sync {
+    /// Get the current block number
+    async fn get_block_number(&self) -> Result<BlockNumber, RpcError>;
+
+    /// Get a block by ID
+    async fn get_block(
+        &self,
+        block_id: BlockId,
+        full_transactions: bool,
+    ) -> Result<Option<Block>, RpcError>;
+
+    /// Get a block by number
+    async fn get_block_by_number(
+        &self,
+        number: BlockNumberOrTag,
+        full_transactions: bool,
+    ) -> Result<Option<Block>, RpcError> {
+        self.get_block(BlockId::Number(number), full_transactions)
+            .await
+    }
+
+    /// Get a transaction by hash
+    async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError>;
+
+    /// Get a transaction receipt by hash
+    async fn get_transaction_receipt(
+        &self,
+        hash: B256,
+    ) -> Result<Option<TransactionReceipt>, RpcError>;
+
+    /// Get logs matching a filter
+    async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError>;
+
+    /// Get account balance
+    async fn get_balance(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<U256, RpcError>;
+
+    /// Get contract code
+    async fn get_code(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<Bytes, RpcError>;
+
+    /// Execute an eth_call
+    async fn call(
+        &self,
+        tx: &alloy::rpc::types::TransactionRequest,
+        block: Option<BlockId>,
+    ) -> Result<Bytes, RpcError>;
+
+    /// Get block receipts
+    async fn get_block_receipts(
+        &self,
+        method_name: &str,
+        block_number: BlockNumberOrTag,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError>;
+
+    /// Batch get blocks
+    async fn get_blocks_batch(
+        &self,
+        block_numbers: Vec<BlockNumberOrTag>,
+        full_transactions: bool,
+    ) -> Result<Vec<Option<Block>>, RpcError>;
+
+    /// Batch get transaction receipts
+    async fn get_transaction_receipts_batch(
+        &self,
+        hashes: Vec<B256>,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError>;
+
+    /// Batch get logs
+    async fn get_logs_batch(&self, filters: Vec<Filter>) -> Result<Vec<Vec<Log>>, RpcError>;
+
+    /// Batch execute eth_calls
+    async fn call_batch(
+        &self,
+        calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
+    ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError>;
+}
 
 /// Extracts the full error chain from an error, including all source errors.
 /// This is useful for debugging because alloy errors like "error decoding response body"
@@ -152,7 +241,10 @@ impl RetryConfig {
     }
 }
 
-/// Execute an async operation with retry logic
+/// Execute an async operation with retry logic.
+///
+/// Retries the operation up to `config.max_retries` times with exponential backoff
+/// for retryable errors. All retry attempts are logged for debugging.
 pub async fn with_retry<F, Fut, T>(
     config: &RetryConfig,
     operation_name: &str,
@@ -162,7 +254,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, RpcError>>,
 {
-    let mut last_error = None;
+    let mut errors: Vec<String> = Vec::new();
 
     for attempt in 0..=config.max_retries {
         // Wait before retry (no wait on first attempt)
@@ -190,23 +282,28 @@ where
                 return Ok(result);
             }
             Err(e) => {
+                let error_msg = e.to_string();
+
                 if e.is_retryable() && attempt < config.max_retries {
                     tracing::warn!(
                         "RPC '{}' failed (attempt {}/{}): {}",
                         operation_name,
                         attempt + 1,
                         config.max_retries + 1,
-                        e
+                        error_msg
                     );
-                    last_error = Some(e);
+                    errors.push(format!("attempt {}: {}", attempt + 1, error_msg));
                 } else {
                     // Non-retryable error or exhausted retries
-                    if attempt > 0 {
+                    errors.push(format!("attempt {}: {}", attempt + 1, error_msg));
+
+                    if errors.len() > 1 {
+                        // Multiple attempts failed - log the full error history
                         tracing::error!(
-                            "RPC '{}' failed after {} attempts: {}",
+                            "RPC '{}' failed after {} attempts. Error history: [{}]",
                             operation_name,
                             attempt + 1,
-                            e
+                            errors.join("; ")
                         );
                     }
                     return Err(e);
@@ -215,7 +312,12 @@ where
         }
     }
 
-    Err(last_error.unwrap_or_else(|| RpcError::ProviderError("Unknown error".to_string())))
+    // This should be unreachable, but provide a meaningful error if it happens
+    Err(RpcError::ProviderError(format!(
+        "RPC '{}' exhausted retries. Errors: [{}]",
+        operation_name,
+        errors.join("; ")
+    )))
 }
 
 pub type StandardRateLimiter =
@@ -237,10 +339,17 @@ pub struct RateLimitConfig {
     pub jitter_max_ms: u64,
 }
 
+/// Default requests per second for rate limiting.
+/// Using a const ensures this is computed at compile time and cannot fail.
+const DEFAULT_REQUESTS_PER_SECOND: NonZeroU32 = match NonZeroU32::new(10) {
+    Some(v) => v,
+    None => unreachable!(),
+};
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            requests_per_second: NonZeroU32::new(10).unwrap(),
+            requests_per_second: DEFAULT_REQUESTS_PER_SECOND,
             jitter_min_ms: 5,
             jitter_max_ms: 50,
         }
@@ -775,6 +884,94 @@ impl RpcClient {
         }
 
         Ok(all_results)
+    }
+}
+
+#[async_trait]
+impl RpcProvider for RpcClient {
+    async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
+        RpcClient::get_block_number(self).await
+    }
+
+    async fn get_block(
+        &self,
+        block_id: BlockId,
+        full_transactions: bool,
+    ) -> Result<Option<Block>, RpcError> {
+        RpcClient::get_block(self, block_id, full_transactions).await
+    }
+
+    async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
+        RpcClient::get_transaction(self, hash).await
+    }
+
+    async fn get_transaction_receipt(
+        &self,
+        hash: B256,
+    ) -> Result<Option<TransactionReceipt>, RpcError> {
+        RpcClient::get_transaction_receipt(self, hash).await
+    }
+
+    async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {
+        RpcClient::get_logs(self, filter).await
+    }
+
+    async fn get_balance(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<U256, RpcError> {
+        RpcClient::get_balance(self, address, block).await
+    }
+
+    async fn get_code(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<Bytes, RpcError> {
+        RpcClient::get_code(self, address, block).await
+    }
+
+    async fn call(
+        &self,
+        tx: &alloy::rpc::types::TransactionRequest,
+        block: Option<BlockId>,
+    ) -> Result<Bytes, RpcError> {
+        RpcClient::call(self, tx, block).await
+    }
+
+    async fn get_block_receipts(
+        &self,
+        method_name: &str,
+        block_number: BlockNumberOrTag,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        RpcClient::get_block_receipts(self, method_name, block_number).await
+    }
+
+    async fn get_blocks_batch(
+        &self,
+        block_numbers: Vec<BlockNumberOrTag>,
+        full_transactions: bool,
+    ) -> Result<Vec<Option<Block>>, RpcError> {
+        RpcClient::get_blocks_batch(self, block_numbers, full_transactions).await
+    }
+
+    async fn get_transaction_receipts_batch(
+        &self,
+        hashes: Vec<B256>,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        RpcClient::get_transaction_receipts_batch(self, hashes).await
+    }
+
+    async fn get_logs_batch(&self, filters: Vec<Filter>) -> Result<Vec<Vec<Log>>, RpcError> {
+        RpcClient::get_logs_batch(self, filters).await
+    }
+
+    async fn call_batch(
+        &self,
+        calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
+    ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError> {
+        RpcClient::call_batch(self, calls).await
     }
 }
 

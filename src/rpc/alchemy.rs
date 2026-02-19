@@ -9,10 +9,13 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
+use async_trait::async_trait;
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
-use crate::rpc::rpc::{error_chain, with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError};
+use crate::rpc::rpc::{
+    error_chain, with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputeUnitCost(pub u32);
@@ -183,11 +186,20 @@ impl AlchemyConfig {
     }
 }
 
+/// Default compute units per second for Alchemy.
+/// Using a const ensures this is computed at compile time and cannot fail.
+const DEFAULT_COMPUTE_UNITS_PER_SECOND: NonZeroU32 = match NonZeroU32::new(330) {
+    Some(v) => v,
+    None => unreachable!(),
+};
+
 impl Default for AlchemyConfig {
     fn default() -> Self {
         Self {
-            url: Url::parse("http://localhost:8545").unwrap(),
-            compute_units_per_second: NonZeroU32::new(330).unwrap(),
+            // SAFETY: This is a valid URL literal and will always parse successfully.
+            url: Url::parse("http://localhost:8545")
+                .expect("default URL is a valid literal"),
+            compute_units_per_second: DEFAULT_COMPUTE_UNITS_PER_SECOND,
             max_batch_size: 100,
             batching_enabled: true,
             retry: RetryConfig::default(),
@@ -281,12 +293,14 @@ impl AlchemyClient {
     /// 2. Acquires CUs from the rate limiter
     /// 3. Executes the request
     /// 4. Stores result at its original index
+    ///
+    /// Returns an error if any task panics.
     async fn execute_concurrent_ordered<T, Req, F, Fut>(
         &self,
         requests: Vec<Req>,
         cost_per_request: u32,
         make_request: F,
-    ) -> Vec<T>
+    ) -> Result<Vec<T>, RpcError>
     where
         T: Send + 'static,
         Req: Send + 'static,
@@ -296,7 +310,7 @@ impl AlchemyClient {
         use tokio::task::JoinSet;
 
         if requests.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let num_requests = requests.len();
@@ -306,12 +320,19 @@ impl AlchemyClient {
 
         let mut join_set = JoinSet::new();
 
+        // Spawn all tasks immediately - permit acquisition happens inside each task.
+        // This allows all tasks to be spawned without blocking, maximizing parallelism.
         for (idx, request) in requests.into_iter().enumerate() {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let semaphore = semaphore.clone();
             let rate_limiter = rate_limiter.clone();
             let make_request = make_request.clone();
 
             join_set.spawn(async move {
+                // Acquire semaphore permit inside the task to avoid blocking task spawning
+                let permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore should never be closed during operation");
                 // Acquire CUs before making request
                 rate_limiter.acquire(cost_per_request).await;
                 let result = make_request(request).await;
@@ -322,19 +343,28 @@ impl AlchemyClient {
 
         // Collect results and sort by index to preserve order
         let mut indexed_results: Vec<(usize, T)> = Vec::with_capacity(num_requests);
+        let mut had_panic = false;
+
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok((idx, value)) => indexed_results.push((idx, value)),
                 Err(e) => {
-                    // Task panicked - this shouldn't happen in normal operation
+                    // Task panicked - track it and continue collecting other results
                     tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
+                    had_panic = true;
                 }
             }
         }
 
+        if had_panic {
+            return Err(RpcError::ProviderError(
+                "One or more concurrent tasks panicked".to_string(),
+            ));
+        }
+
         // Sort by index and extract values
         indexed_results.sort_by_key(|(idx, _)| *idx);
-        indexed_results.into_iter().map(|(_, v)| v).collect()
+        Ok(indexed_results.into_iter().map(|(_, v)| v).collect())
     }
 
     /// Execute requests concurrently, streaming results to a channel as they complete.
@@ -368,13 +398,20 @@ impl AlchemyClient {
 
             let mut join_set = JoinSet::new();
 
+            // Spawn all tasks immediately - permit acquisition happens inside each task.
+            // This allows all tasks to be spawned without blocking, maximizing parallelism.
             for request in requests {
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let semaphore = semaphore.clone();
                 let rate_limiter = rate_limiter.clone();
                 let make_request = make_request.clone();
                 let result_tx = result_tx.clone();
 
                 join_set.spawn(async move {
+                    // Acquire semaphore permit inside the task to avoid blocking task spawning
+                    let permit = semaphore
+                        .acquire_owned()
+                        .await
+                        .expect("semaphore should never be closed during operation");
                     // Acquire CUs before making request
                     rate_limiter.acquire(cost_per_request).await;
                     let result = make_request(request).await;
@@ -385,8 +422,12 @@ impl AlchemyClient {
                 });
             }
 
-            // Wait for all tasks to complete
-            while join_set.join_next().await.is_some() {}
+            // Wait for all tasks to complete, logging any panics
+            while let Some(result) = join_set.join_next().await {
+                if let Err(e) = result {
+                    tracing::error!("Task panicked in execute_streaming: {:?}", e);
+                }
+            }
         })
     }
 
@@ -482,11 +523,18 @@ impl AlchemyClient {
         self.inner.get_block_receipts(method_name, block_number).await
     }
 
+    /// Get block receipts for multiple blocks concurrently.
+    ///
+    /// # Arguments
+    /// * `method_name` - The RPC method name (e.g., "eth_getBlockReceipts")
+    /// * `block_numbers` - Block numbers to fetch receipts for
+    /// * `_concurrency` - **Deprecated and ignored.** Concurrency is controlled by
+    ///   `rpc_concurrency` in `AlchemyConfig`. This parameter is kept for API compatibility.
     pub async fn get_block_receipts_concurrent(
         &self,
         method_name: &str,
         block_numbers: Vec<BlockNumberOrTag>,
-        _concurrency: usize, // Deprecated: now uses rpc_concurrency from config
+        #[allow(unused_variables)] _concurrency: usize,
     ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
         if block_numbers.is_empty() {
             return Ok(vec![]);
@@ -505,7 +553,7 @@ impl AlchemyClient {
                     inner.get_block_receipts(&method_name, block_number).await
                 }
             })
-            .await;
+            .await?;
 
         // Collect results, failing on first error
         let mut receipts = Vec::with_capacity(results.len());
@@ -638,7 +686,7 @@ impl AlchemyClient {
                     .await
                 }
             })
-            .await;
+            .await?;
 
         // Collect results, failing on first error
         let mut blocks = Vec::with_capacity(results.len());
@@ -728,7 +776,7 @@ impl AlchemyClient {
                     }
                 }
             })
-            .await;
+            .await?;
 
         Ok(results)
     }
@@ -769,7 +817,7 @@ impl AlchemyClient {
                     .await
                 }
             })
-            .await;
+            .await?;
 
         // Collect results, failing on first error
         let mut logs = Vec::with_capacity(results.len());
@@ -815,9 +863,97 @@ impl AlchemyClient {
                     .await
                 }
             })
-            .await;
+            .await?;
 
         Ok(results)
+    }
+}
+
+#[async_trait]
+impl RpcProvider for AlchemyClient {
+    async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
+        AlchemyClient::get_block_number(self).await
+    }
+
+    async fn get_block(
+        &self,
+        block_id: BlockId,
+        full_transactions: bool,
+    ) -> Result<Option<Block>, RpcError> {
+        AlchemyClient::get_block(self, block_id, full_transactions).await
+    }
+
+    async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
+        AlchemyClient::get_transaction(self, hash).await
+    }
+
+    async fn get_transaction_receipt(
+        &self,
+        hash: B256,
+    ) -> Result<Option<TransactionReceipt>, RpcError> {
+        AlchemyClient::get_transaction_receipt(self, hash).await
+    }
+
+    async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {
+        AlchemyClient::get_logs(self, filter).await
+    }
+
+    async fn get_balance(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<U256, RpcError> {
+        AlchemyClient::get_balance(self, address, block).await
+    }
+
+    async fn get_code(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<Bytes, RpcError> {
+        AlchemyClient::get_code(self, address, block).await
+    }
+
+    async fn call(
+        &self,
+        tx: &alloy::rpc::types::TransactionRequest,
+        block: Option<BlockId>,
+    ) -> Result<Bytes, RpcError> {
+        AlchemyClient::call(self, tx, block).await
+    }
+
+    async fn get_block_receipts(
+        &self,
+        method_name: &str,
+        block_number: BlockNumberOrTag,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        AlchemyClient::get_block_receipts(self, method_name, block_number).await
+    }
+
+    async fn get_blocks_batch(
+        &self,
+        block_numbers: Vec<BlockNumberOrTag>,
+        full_transactions: bool,
+    ) -> Result<Vec<Option<Block>>, RpcError> {
+        AlchemyClient::get_blocks_batch(self, block_numbers, full_transactions).await
+    }
+
+    async fn get_transaction_receipts_batch(
+        &self,
+        hashes: Vec<B256>,
+    ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        AlchemyClient::get_transaction_receipts_batch(self, hashes).await
+    }
+
+    async fn get_logs_batch(&self, filters: Vec<Filter>) -> Result<Vec<Vec<Log>>, RpcError> {
+        AlchemyClient::get_logs_batch(self, filters).await
+    }
+
+    async fn call_batch(
+        &self,
+        calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
+    ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError> {
+        AlchemyClient::call_batch(self, calls).await
     }
 }
 
