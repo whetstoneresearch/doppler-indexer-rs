@@ -17,7 +17,7 @@ pub fn insert_pool_config(
     epoch_length: U256,
     gamma: u32,
     is_token_0: bool,
-    num_pds_slugs: U256,
+    num_pd_slugs: U256,
     ctx: &TransformationContext
 ) -> DbOperation {
     DbOperation::Insert {
@@ -36,7 +36,7 @@ pub fn insert_pool_config(
             "epoch_length".to_string(),
             "gamma".to_string(),
             "is_token_0".to_string(),
-            "num_pds_slugs".to_string()
+            "num_pd_slugs".to_string()
         ], 
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
@@ -53,6 +53,6 @@ pub fn insert_pool_config(
             DbValue::Numeric(epoch_length.to_string()),
             DbValue::Int32(gamma as i32),
             DbValue::Bool(is_token_0),
-            DbValue::Numeric(num_pds_slugs.to_string())
+            DbValue::Numeric(num_pd_slugs.to_string())
         ]}
 }

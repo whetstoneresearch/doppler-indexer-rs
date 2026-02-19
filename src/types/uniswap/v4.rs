@@ -47,7 +47,7 @@ pub struct V4PoolConfig {
     pub epoch_length: U256,
     pub gamma: u32,
     pub is_token_0: bool,
-    pub num_pds_slugs: U256,
+    pub num_pd_slugs: U256,
 }
 
 #[derive(Debug, Clone)]
