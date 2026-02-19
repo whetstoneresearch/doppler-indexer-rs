@@ -151,6 +151,20 @@ Each contract entry is keyed by a human-readable name:
 | `factories` | array | No | Factory configurations for tracking dynamically created contracts |
 | `events` | array | No | Event signatures to decode from this contract's logs |
 
+### Multicall3 Optimization
+
+Adding a `Multicall3` contract entry enables automatic batching of all eth_calls for the same block into a single `aggregate3` RPC call, significantly reducing RPC requests:
+
+```json
+{
+    "Multicall3": {
+        "address": "0xcA11bde05977b3631167028862bE2a173976CA11"
+    }
+}
+```
+
+The Multicall3 address is the same on most EVM chains. See [eth_call Collection](./ETH_CALL_COLLECTION.md#multicall3-optimization) for details.
+
 ### Event Configuration
 
 Events specify which contract events to decode:

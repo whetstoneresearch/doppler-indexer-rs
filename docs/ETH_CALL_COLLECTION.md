@@ -503,6 +503,54 @@ if 'param_0' in df.columns:
 
 ## Performance Considerations
 
+### Multicall3 Optimization
+
+When a `Multicall3` contract is configured, the eth_call collector automatically batches all calls for the same block into a single `aggregate3` RPC call. This significantly reduces the number of RPC requests and improves throughput.
+
+**Configuration:**
+
+Add the Multicall3 contract to your contracts configuration:
+
+```json
+{
+  "Multicall3": {
+    "address": "0xcA11bde05977b3631167028862bE2a173976CA11"
+  }
+}
+```
+
+The Multicall3 address is the same on most EVM chains. See [multicall3.eth](https://www.multicall3.com/) for deployment addresses.
+
+**How it works:**
+
+1. When Multicall3 is configured, all eth_calls targeting the same block are grouped together
+2. Instead of N individual `eth_call` RPCs, a single `aggregate3` call is made to the Multicall3 contract
+3. The Multicall3 contract executes all sub-calls and returns results in a single response
+4. Results are unpacked and distributed back to their respective output files
+
+**Supported call types:**
+- Regular calls (`process_range`)
+- Factory calls (`process_factory_range`)
+- Event-triggered calls (`process_event_triggers`)
+- Token pool calls (`process_token_range`)
+- Once calls (`process_once_calls_regular`)
+- Factory once calls (`process_factory_once_calls`)
+
+**Error handling:**
+- Uses `allowFailure=true` so individual call failures don't abort the entire batch
+- Failed sub-calls return empty bytes (same as direct call failures)
+- If the multicall RPC itself fails, all sub-calls for that block are treated as failed
+
+**Fallback behavior:**
+
+When Multicall3 is not configured, the collector falls back to making individual `eth_call` RPCs. The output format is identical in both modes — downstream consumers don't need to know which method was used.
+
+**Performance example:**
+
+For 100 contracts × 10 functions × 1000 blocks:
+- Without multicall: 1,000,000 individual RPC calls
+- With multicall: 1,000 aggregate3 calls (one per block)
+
 ### Batching
 
 The collector respects the `rpc_batch_size` configuration:
@@ -516,7 +564,7 @@ The collector respects the `rpc_batch_size` configuration:
 }
 ```
 
-- `rpc_batch_size`: Number of eth_calls per RPC batch (default: 100)
+- `rpc_batch_size`: Number of eth_calls per RPC batch (default: 100). When using Multicall3, this controls how many multicalls are batched into a single RPC request.
 - `parquet_block_range`: Number of blocks per parquet file (default: 1000)
 
 ### Compute Units

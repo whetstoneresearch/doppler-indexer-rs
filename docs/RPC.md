@@ -10,6 +10,8 @@ The RPC module consists of three main clients:
 - **`AlchemyClient`** - An Alchemy-specific client with compute unit (CU) based rate limiting
 - **`UnifiedRpcClient`** - A unified enum that automatically selects the appropriate client based on URL
 
+All three clients implement the **`RpcProvider`** trait, enabling polymorphic usage.
+
 Both clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying RPC operations and [governor](https://github.com/bheisler/governor) for rate limiting with jitter support.
 
 ## Module Structure
@@ -17,10 +19,50 @@ Both clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying R
 ```
 src/rpc/
 ├── mod.rs      # Module exports
-├── rpc.rs      # Generic RPC client with retry logic
+├── rpc.rs      # Generic RPC client, RpcProvider trait, retry logic
 ├── alchemy.rs  # Alchemy-specific client with CU rate limiting
 └── unified.rs  # Unified client that auto-selects based on URL
 ```
+
+## RpcProvider Trait
+
+All RPC clients implement the `RpcProvider` trait, which defines the common interface for Ethereum RPC operations:
+
+```rust
+use doppler_indexer_rs::rpc::RpcProvider;
+
+// Use any client through the trait
+async fn fetch_block_number(client: &dyn RpcProvider) -> Result<u64, RpcError> {
+    client.get_block_number().await
+}
+
+// Or use generics
+async fn fetch_blocks<P: RpcProvider>(
+    client: &P,
+    numbers: Vec<BlockNumberOrTag>,
+) -> Result<Vec<Option<Block>>, RpcError> {
+    client.get_blocks_batch(numbers, false).await
+}
+```
+
+### Trait Methods
+
+The `RpcProvider` trait includes:
+
+- `get_block_number()` - Current block number
+- `get_block(block_id, full_transactions)` - Get block by ID
+- `get_block_by_number(number, full_transactions)` - Get block by number
+- `get_transaction(hash)` - Get transaction by hash
+- `get_transaction_receipt(hash)` - Get transaction receipt
+- `get_logs(filter)` - Get logs matching filter
+- `get_balance(address, block)` - Get account balance
+- `get_code(address, block)` - Get contract code
+- `call(tx, block)` - Execute eth_call
+- `get_block_receipts(method_name, block_number)` - Get all receipts for a block
+- `get_blocks_batch(block_numbers, full_transactions)` - Batch get blocks
+- `get_transaction_receipts_batch(hashes)` - Batch get receipts
+- `get_logs_batch(filters)` - Batch get logs
+- `call_batch(calls)` - Batch execute eth_calls
 
 ## Generic RPC Client
 
@@ -68,11 +110,11 @@ let client = RpcClient::new(config)?;
 
 ### Default Rate Limit Configuration
 
-`RateLimitConfig` provides sensible defaults:
+`RateLimitConfig` provides sensible defaults (using compile-time constants):
 
 ```rust
 RateLimitConfig {
-    requests_per_second: NonZeroU32::new(10).unwrap(),
+    requests_per_second: NonZeroU32::new(10).unwrap(),  // Compile-time constant
     jitter_min_ms: 5,
     jitter_max_ms: 50,
 }
@@ -215,7 +257,7 @@ let retry_config = RetryConfig::new(5)  // 5 retry attempts
 
 ```rust
 RetryConfig {
-    max_retries: 3,
+    max_retries: 10,
     initial_delay: Duration::from_millis(500),
     max_delay: Duration::from_secs(30),
     backoff_multiplier: 2.0,
@@ -234,13 +276,21 @@ Errors are automatically classified as retryable or permanent. Retryable errors 
 
 Non-retryable errors (like invalid URL or malformed requests) fail immediately without retry.
 
-### Retry Logging
+### Retry Logging and Error History
 
 Retry attempts are logged at the `WARN` level with operation name and delay:
 
 ```
-WARN RPC retry 1/3 for 'eth_getBlockByNumber(Number(12345678))' in 500ms
+WARN RPC retry 1/10 for 'eth_getBlockByNumber(Number(12345678))' in 500ms
 ```
+
+When all retries fail, the **full error history** is logged at the `ERROR` level:
+
+```
+ERROR RPC 'eth_getBlockByNumber(Number(12345678))' failed after 3 attempts. Error history: [attempt 1: connection reset; attempt 2: timeout; attempt 3: rate limit exceeded]
+```
+
+This helps diagnose intermittent issues by preserving all error messages, not just the final one.
 
 ## Unified RPC Client
 
@@ -251,7 +301,7 @@ The `UnifiedRpcClient` provides a simple way to automatically select between `Rp
 ```rust
 use doppler_indexer_rs::rpc::UnifiedRpcClient;
 
-// Automatically detects Alchemy URLs and uses AlchemyClient with 9500 CU/s
+// Automatically detects Alchemy URLs and uses AlchemyClient with 7500 CU/s
 let client = UnifiedRpcClient::from_url("https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY")?;
 
 // For non-Alchemy URLs, uses standard RpcClient
@@ -288,15 +338,27 @@ let client = UnifiedRpcClient::from_url_with_options(
 
 ### Available Methods
 
-`UnifiedRpcClient` exposes a subset of methods available on both clients:
+`UnifiedRpcClient` implements the full `RpcProvider` trait plus additional methods:
 
+**From RpcProvider trait:**
 - `get_block_number()`
-- `get_blocks_batch(block_numbers, full_transactions)`
-- `get_blocks_streaming(block_numbers, full_transactions, result_tx)` - Streaming version
-- `get_transaction_receipts_batch(hashes)`
+- `get_block(block_id, full_transactions)`
+- `get_block_by_number(number, full_transactions)`
+- `get_transaction(hash)`
+- `get_transaction_receipt(hash)`
+- `get_logs(filter)`
+- `get_balance(address, block)`
+- `get_code(address, block)`
+- `call(tx, block)`
 - `get_block_receipts(method_name, block_number)`
-- `get_block_receipts_concurrent(method_name, block_numbers, concurrency)`
+- `get_blocks_batch(block_numbers, full_transactions)`
+- `get_transaction_receipts_batch(hashes)`
+- `get_logs_batch(filters)`
 - `call_batch(calls)`
+
+**Additional methods:**
+- `get_blocks_streaming(block_numbers, full_transactions, result_tx)` - Streaming version
+- `get_block_receipts_concurrent(method_name, block_numbers, concurrency)` - Concurrent receipts
 - `eth_call(to, data, block_number)` - Single eth_call convenience method
 
 ## Alchemy Client
@@ -359,17 +421,26 @@ This ensures combined CU usage across all collectors stays within your Alchemy p
 
 ### Concurrent Execution with Semaphore
 
-Batch operations use **semaphore-bounded concurrency** for maximum throughput:
+Batch operations use **non-blocking semaphore-bounded concurrency** for maximum throughput:
 
-1. Each request acquires a semaphore permit (limits concurrent in-flight requests)
-2. Each request acquires CUs from the rate limiter individually
-3. Requests execute immediately as permits become available
-4. No waiting for batch completion before starting new requests
+1. **All tasks spawn immediately** - no blocking during task creation
+2. Each task acquires a semaphore permit internally (limits concurrent in-flight requests)
+3. Each task acquires CUs from the rate limiter individually
+4. Results are collected and returned in order (or errors are propagated)
 
 This approach provides:
+- **Non-blocking task spawning** - 1000 requests spawn instantly, then compete for permits
 - **Continuous rate limit acquisition** instead of chunk-based batching
 - **Better throughput** by keeping the RPC pipeline full
 - **Configurable concurrency** via `RPC_CONCURRENCY` environment variable
+
+### Panic Handling
+
+Concurrent batch methods (`execute_concurrent_ordered`) handle task panics gracefully:
+
+- If any task panics, the error is logged and tracked
+- The method returns `Err(RpcError::ProviderError("One or more concurrent tasks panicked"))`
+- This prevents silent partial results where some requests never executed
 
 ### Streaming Execution
 
@@ -387,6 +458,19 @@ while let Some((block_num, result)) = rx.recv().await {
 }
 
 handle.await?;
+```
+
+### Deprecated Parameters
+
+**`get_block_receipts_concurrent` concurrency parameter**: For `AlchemyClient`, the `concurrency` parameter is deprecated and ignored. Concurrency is controlled by `rpc_concurrency` in `AlchemyConfig`. The parameter is kept for API compatibility with `RpcClient`.
+
+```rust
+// For AlchemyClient, the concurrency parameter (10) is ignored
+client.get_block_receipts_concurrent("eth_getBlockReceipts", block_numbers, 10).await?;
+
+// Actual concurrency is controlled by config
+let config = AlchemyConfig::new(url, 660)
+    .with_rpc_concurrency(500);  // This controls concurrency
 ```
 
 ### Compute Unit Costs
@@ -436,7 +520,7 @@ let url = Url::parse("https://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY")?;
 let config = AlchemyConfig::new(url, 660)  // Growth tier: 660 CU/s
     .with_batch_size(100)
     .with_batching(true)
-    .with_jitter(5, 50)
+    .with_rpc_concurrency(200)  // Max concurrent in-flight requests
     .with_retry(RetryConfig::new(5).with_initial_delay(Duration::from_millis(200)));
 
 let client = AlchemyClient::new(config)?;
@@ -446,8 +530,8 @@ let client = AlchemyClient::new(config)?;
 
 ```rust
 AlchemyConfig {
-    url: Url::parse("http://localhost:8545").unwrap(),
-    compute_units_per_second: NonZeroU32::new(330).unwrap(),  // Free tier
+    url: Url::parse("http://localhost:8545").expect("valid URL"),
+    compute_units_per_second: NonZeroU32::new(330).unwrap(),  // Free tier (compile-time const)
     max_batch_size: 100,
     batching_enabled: true,
     retry: RetryConfig::default(),
@@ -467,13 +551,14 @@ Note: When using `UnifiedRpcClient::from_url()`, the default is 7500 CU/s (Growt
 
 ### How CU Rate Limiting Works
 
-Before each request, the client consumes the appropriate number of compute units from the rate limiter. For batch operations, the total CU cost is calculated upfront:
+Before each request, the client consumes the appropriate number of compute units from the rate limiter. For batch operations, each request acquires CUs individually for continuous throughput:
 
 ```rust
 // Single request: consumes 16 CU
 let block = client.get_block_by_number(BlockNumberOrTag::Latest, false).await?;
 
-// Batch of 10 blocks: consumes 160 CU (10 * 16)
+// Batch of 10 blocks: each request acquires 16 CU individually
+// Total: 160 CU, but acquired continuously as permits become available
 let blocks = client.get_blocks_batch(block_numbers, false).await?;
 ```
 
@@ -561,6 +646,7 @@ The RPC module requires these dependencies in `Cargo.toml`:
 ```toml
 [dependencies]
 alloy = { version = "1.0", features = ["full", "provider-http", "rpc-types"] }
+async-trait = "0.1"
 governor = "0.10"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
