@@ -1,7 +1,0 @@
-{
-    "DopplerV4Pool": {
-        "events": [
-            { "signature": "Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)" }
-        ]
-    }
-}

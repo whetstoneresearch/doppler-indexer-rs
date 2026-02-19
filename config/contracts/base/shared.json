@@ -12,7 +12,30 @@
                 },
                 "calls": [
                     {"function": "name()", "output_type": "string", "frequency": "once"},
-                    {"function": "symbol()", "output_type": "string", "frequency": "once"}
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"},
+                    {"function": "tokenURI()", "output_type": "string", "frequency": "once"},
+                    {"function": "getAssetData(address)",
+                     "output_type": "(address numeraire, address timelock, address governance, address liquidityMigrator, address poolInitializer, address pool, address migrationPool, uint256 numTokensToSell, uint256 totalSupply, address integrator)",
+                    "frequency": "once",
+                    "target": "Airlock",
+                    "params": [{"type": "address", "source": "self"}]}
+                ],
+                "events": [
+                    { "signature": "Transfer(address indexed from, address indexed to, uint256 value)" }
+                ]
+            },
+            {
+                "collection_name": "Numeraires",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address",
+                    "data_signature": "address,address,address",
+                    "factory_parameters": "topics[0]"
+                },
+                "calls": [
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"},
+                    {"function": "decimals()", "output_type": "string", "frequency": "once"}
                 ],
                 "events": [
                     { "signature": "Transfer(address indexed from, address indexed to, uint256 value)" }
