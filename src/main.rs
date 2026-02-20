@@ -528,6 +528,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             chain.name.clone(),
             chain.chain_id,
             mode,
+            chain.contracts.clone(),
         )
         .await
         .context("failed to create transformation engine")?;

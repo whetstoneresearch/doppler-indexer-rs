@@ -13,6 +13,7 @@ use alloy::primitives::{Address, Bytes, I256, U256};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use crate::rpc::UnifiedRpcClient;
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
 /// A decoded value from an event parameter or eth_call result.
 #[derive(Debug, Clone)]
@@ -334,6 +335,10 @@ pub struct TransformationContext<'a> {
     pub(crate) historical: Arc<HistoricalDataReader>,
     /// RPC client for ad-hoc eth_calls
     pub(crate) rpc: Arc<UnifiedRpcClient>,
+
+    // ===== Contract Configuration =====
+    /// Contract configurations for the chain
+    pub(crate) contracts: Arc<Contracts>,
 }
 
 impl<'a> TransformationContext<'a> {
@@ -347,6 +352,7 @@ impl<'a> TransformationContext<'a> {
         calls: &'a [DecodedCall],
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
+        contracts: Arc<Contracts>,
     ) -> Self {
         Self {
             chain_name,
@@ -357,6 +363,7 @@ impl<'a> TransformationContext<'a> {
             calls,
             historical,
             rpc,
+            contracts,
         }
     }
 
@@ -400,6 +407,42 @@ impl<'a> TransformationContext<'a> {
         self.calls
             .iter()
             .filter(move |c| c.contract_address == address)
+    }
+
+    // ===== Contract Configuration Helpers =====
+
+    /// Look up a contract name by its address.
+    /// Returns the first matching contract name if the address is configured.
+    pub fn get_contract_name_by_address(&self, address: [u8; 20]) -> Option<&str> {
+        let addr = Address::from(address);
+        for (name, config) in self.contracts.iter() {
+            let matches = match &config.address {
+                AddressOrAddresses::Single(a) => *a == addr,
+                AddressOrAddresses::Multiple(addrs) => addrs.contains(&addr),
+            };
+            if matches {
+                return Some(name.as_str());
+            }
+        }
+        None
+    }
+
+    /// Check if an address matches any of the specified contract names.
+    /// Returns the first matching contract name from the provided list.
+    pub fn match_contract_address(&self, address: [u8; 20], contract_names: &[&'static str]) -> Option<&'static str> {
+        let addr = Address::from(address);
+        for contract_name in contract_names {
+            if let Some(config) = self.contracts.get(*contract_name) {
+                let matches = match &config.address {
+                    AddressOrAddresses::Single(a) => *a == addr,
+                    AddressOrAddresses::Multiple(addrs) => addrs.contains(&addr),
+                };
+                if matches {
+                    return Some(*contract_name);
+                }
+            }
+        }
+        None
     }
 
     // ===== Historical Data Access =====

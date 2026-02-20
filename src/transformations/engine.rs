@@ -16,6 +16,7 @@ use super::historical::HistoricalDataReader;
 use super::registry::{extract_event_name, TransformationRegistry};
 use crate::db::{DbPool, DbValue, DbOperation, WhereClause};
 use crate::rpc::UnifiedRpcClient;
+use crate::types::config::contract::Contracts;
 
 /// Message containing decoded events for a block range.
 #[derive(Debug)]
@@ -73,6 +74,7 @@ pub struct TransformationEngine {
     mode: ExecutionMode,
     decoded_logs_dir: PathBuf,
     decoded_calls_dir: PathBuf,
+    contracts: Arc<Contracts>,
 }
 
 impl TransformationEngine {
@@ -84,6 +86,7 @@ impl TransformationEngine {
         chain_name: String,
         chain_id: u64,
         mode: ExecutionMode,
+        contracts: Contracts,
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
         let decoded_logs_dir = PathBuf::from(format!("data/derived/{}/decoded/logs", chain_name));
@@ -100,6 +103,7 @@ impl TransformationEngine {
             mode,
             decoded_logs_dir,
             decoded_calls_dir,
+            contracts: Arc::new(contracts),
         })
     }
 
@@ -581,6 +585,7 @@ impl TransformationEngine {
                         &[],
                         self.historical_reader.clone(),
                         self.rpc_client.clone(),
+                        self.contracts.clone(),
                     );
 
                     match handler.handle(&ctx).await {
@@ -691,6 +696,7 @@ impl TransformationEngine {
                         &calls,
                         self.historical_reader.clone(),
                         self.rpc_client.clone(),
+                        self.contracts.clone(),
                     );
 
                     match handler.handle(&ctx).await {
@@ -948,6 +954,7 @@ impl TransformationEngine {
             &calls,
             self.historical_reader.clone(),
             self.rpc_client.clone(),
+            self.contracts.clone(),
         );
 
         // Get unique triggers from events
