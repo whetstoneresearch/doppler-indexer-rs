@@ -851,7 +851,7 @@ fn read_once_calls_from_parquet(
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema.index_of("address").ok();
+        let address_idx = schema.index_of("contract_address").ok();
 
         // Find function result columns
         let function_indices: Vec<(String, Option<usize>)> = configs
@@ -974,13 +974,22 @@ async fn process_regular_calls(
 
     write_decoded_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
 
-    tracing::info!(
-        "Wrote {} decoded {}.{} results to {}",
-        decoded_records.len(),
-        config.contract_name,
-        config.function_name,
-        output_path.display()
-    );
+    if decoded_records.is_empty() {
+        tracing::debug!(
+            "Wrote 0 decoded {}.{} results to {}",
+            config.contract_name,
+            config.function_name,
+            output_path.display()
+        );
+    } else {
+        tracing::info!(
+            "Wrote {} decoded {}.{} results to {}",
+            decoded_records.len(),
+            config.contract_name,
+            config.function_name,
+            output_path.display()
+        );
+    }
 
     // Send to transformation channel if enabled
     if let Some(tx) = transform_tx {
@@ -1080,14 +1089,24 @@ async fn process_once_calls(
         .into_iter()
         .collect();
 
-    tracing::info!(
-        "Wrote {} decoded {}/once results to {} ({} columns: {:?})",
-        decoded_records.len(),
-        contract_name,
-        output_path.display(),
-        actual_cols.len(),
-        actual_cols
-    );
+    if decoded_records.is_empty() {
+        tracing::debug!(
+            "Wrote 0 decoded {}/once results to {} ({} columns: {:?})",
+            contract_name,
+            output_path.display(),
+            actual_cols.len(),
+            actual_cols
+        );
+    } else {
+        tracing::info!(
+            "Wrote {} decoded {}/once results to {} ({} columns: {:?})",
+            decoded_records.len(),
+            contract_name,
+            output_path.display(),
+            actual_cols.len(),
+            actual_cols
+        );
+    }
 
     // If not returning index info, update column index directly (live mode)
     if !return_index_info {
@@ -1663,8 +1682,8 @@ fn merge_decoded_once_calls(
 
     // Extract address column from existing batch
     let address_col_idx = existing_schema
-        .index_of("address")
-        .map_err(|e| EthCallDecodingError::Decode(format!("Missing address column: {}", e)))?;
+        .index_of("contract_address")
+        .map_err(|e| EthCallDecodingError::Decode(format!("Missing contract_address column: {}", e)))?;
     let address_arr = existing_batch
         .column(address_col_idx)
         .as_any()
@@ -1766,7 +1785,7 @@ fn write_decoded_once_calls_to_parquet(
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     // Add a field for each function result
@@ -1805,7 +1824,7 @@ fn write_decoded_once_calls_to_parquet(
     let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp)).collect();
     arrays.push(Arc::new(arr));
 
-    // address
+    // contract_address
     if records.is_empty() {
         arrays.push(Arc::new(FixedSizeBinaryBuilder::new(20).finish()));
     } else {
