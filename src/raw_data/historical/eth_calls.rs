@@ -8,7 +8,7 @@ use std::time::Instant;
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -4029,8 +4029,20 @@ async fn process_factory_once_calls(
             }
         }
 
-        // Skip only if no new addresses AND no existing file to backfill
+        // Write empty file when no factory addresses discovered (no data for this range)
         if address_discovery.is_empty() && !has_existing_file {
+            std::fs::create_dir_all(&sub_dir)?;
+            write_once_results_to_parquet(&[], &output_path, &all_fn_names)?;
+            let mut index = read_once_column_index(&sub_dir);
+            index.insert(file_name.clone(), all_fn_names.clone());
+            write_once_column_index(&sub_dir, &index)?;
+            if let Some(tx) = decoder_tx {
+                let _ = tx.send(DecoderMessage::OnceFileBackfilled {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: collection_name.clone(),
+                }).await;
+            }
             continue;
         }
 
@@ -4589,8 +4601,13 @@ async fn process_factory_once_calls_multicall(
             }
         }
 
-        // Skip only if no new addresses AND no existing file to backfill
+        // Write empty file when no factory addresses discovered (no data for this range)
         if address_discovery.is_empty() && !has_existing_file {
+            std::fs::create_dir_all(&sub_dir)?;
+            write_once_results_to_parquet(&[], &output_path, &all_fn_names)?;
+            let mut index = read_once_column_index(&sub_dir);
+            index.insert(file_name.clone(), all_fn_names.clone());
+            write_once_column_index(&sub_dir, &index)?;
             continue;
         }
 
@@ -6433,10 +6450,14 @@ fn write_once_results_to_parquet(
     let arr: UInt64Array = results.iter().map(|r| Some(r.block_timestamp)).collect();
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        results.iter().map(|r| r.contract_address.as_slice()),
-    )?;
-    arrays.push(Arc::new(arr));
+    if results.is_empty() {
+        arrays.push(Arc::new(FixedSizeBinaryBuilder::new(20).finish()));
+    } else {
+        let arr = FixedSizeBinaryArray::try_from_iter(
+            results.iter().map(|r| r.contract_address.as_slice()),
+        )?;
+        arrays.push(Arc::new(arr));
+    }
 
     for fn_name in function_names {
         let arr: BinaryArray = results
