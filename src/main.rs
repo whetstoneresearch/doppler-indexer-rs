@@ -19,7 +19,7 @@ use db::DbPool;
 use raw_data::decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use raw_data::historical::blocks::collect_blocks;
 use raw_data::historical::eth_calls::collect_eth_calls;
-use raw_data::historical::factories::{collect_factories, RecollectRequest};
+use raw_data::historical::factories::{collect_factories, FactoryMessage, RecollectRequest};
 use raw_data::historical::logs::collect_logs;
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, collect_receipts, EventTriggerMessage, LogMessage,
@@ -279,7 +279,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     let (logs_factory_tx, logs_factory_rx) =
         optional_channel(needs_factory_filtering, factory_cap);
     let (eth_calls_factory_tx, eth_calls_factory_rx) =
-        optional_channel(has_factory_calls, factory_cap);
+        optional_channel::<FactoryMessage>(has_factory_calls, factory_cap);
     let (event_trigger_tx, event_trigger_rx) =
         optional_channel::<EventTriggerMessage>(has_event_triggered_calls, channel_cap);
     let (log_decoder_tx, log_decoder_rx) =

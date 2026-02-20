@@ -303,6 +303,24 @@ struct BlockInfo {
     tx_hashes: Vec<B256>,
 }
 
+/// State for batch-based receipt fetching within a range
+/// Enables early RPC fetching before the full range is complete
+#[derive(Debug)]
+struct ReceiptBatchState {
+    range_start: u64,
+    range_end: u64,
+    /// Blocks received from upstream but not yet fetched
+    blocks_received: HashMap<u64, BlockInfo>,
+    /// Block numbers that have already been fetched
+    blocks_fetched: HashSet<u64>,
+    /// Accumulated minimal receipt records (sorted before write)
+    minimal_records: Vec<MinimalReceiptRecord>,
+    /// Accumulated full receipt records (sorted before write)
+    full_records: Vec<FullReceiptRecord>,
+    /// Accumulated logs (sorted before write)
+    logs: Vec<LogData>,
+}
+
 /// Tracks channel backpressure metrics for monitoring
 #[derive(Debug, Default)]
 struct ChannelMetrics {
@@ -380,7 +398,8 @@ pub async fn collect_receipts(
 
     let existing_files = scan_existing_parquet_files(&output_dir);
 
-    let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
+    // Batch states for early RPC fetching - track blocks received vs fetched
+    let mut batch_states: HashMap<u64, ReceiptBatchState> = HashMap::new();
 
     // Check if factories need to wait for us before processing
     let has_factories = factory_log_tx.is_some();
@@ -507,6 +526,7 @@ pub async fn collect_receipts(
 
     // =========================================================================
     // Normal phase: Process new blocks from the channel and handle recollect requests
+    // Uses batch-based early fetching to start RPC work before full range is ready
     // =========================================================================
     let mut block_rx_closed = false;
 
@@ -516,65 +536,236 @@ pub async fn collect_receipts(
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
                         let range_start = (block_number / range_size) * range_size;
+                        let range_end = range_start + range_size;
 
-                        range_data
-                            .entry(range_start)
-                            .or_default()
-                            .push(BlockInfo {
-                                block_number,
-                                timestamp,
-                                tx_hashes,
-                            });
+                        // Initialize batch state if this is a new range
+                        let state = batch_states.entry(range_start).or_insert_with(|| {
+                            ReceiptBatchState {
+                                range_start,
+                                range_end,
+                                blocks_received: HashMap::new(),
+                                blocks_fetched: HashSet::new(),
+                                minimal_records: Vec::new(),
+                                full_records: Vec::new(),
+                                logs: Vec::new(),
+                            }
+                        });
 
-                        if let Some(blocks) = range_data.get(&range_start) {
-                            let expected_blocks: HashSet<u64> =
-                                (range_start..range_start + range_size).collect();
-                            let received_blocks: HashSet<u64> =
-                                blocks.iter().map(|b| b.block_number).collect();
+                        // Add block to received set
+                        state.blocks_received.insert(block_number, BlockInfo {
+                            block_number,
+                            timestamp,
+                            tx_hashes,
+                        });
 
-                            if expected_blocks.is_subset(&received_blocks) {
-                                let range = BlockRange {
-                                    start: range_start,
-                                    end: range_start + range_size,
+                        // Check if we should skip this range (file already exists)
+                        let range = BlockRange { start: range_start, end: range_end };
+                        if existing_files.contains(&range.file_name()) {
+                            // Check if range is now complete
+                            let expected: HashSet<u64> = (range_start..range_end).collect();
+                            let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
+                            if expected.is_subset(&received) {
+                                tracing::info!(
+                                    "Skipping receipts for blocks {}-{} (already exists)",
+                                    range.start,
+                                    range.end - 1
+                                );
+                                batch_states.remove(&range_start);
+                                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                            }
+                            continue;
+                        }
+
+                        // Calculate unfetched blocks
+                        let unfetched_blocks: Vec<u64> = state.blocks_received.keys()
+                            .filter(|bn| !state.blocks_fetched.contains(bn))
+                            .copied()
+                            .collect();
+
+                        // Early fetch: if we have enough unfetched blocks, fetch now
+                        if unfetched_blocks.len() >= rpc_batch_size {
+                            let mut blocks_to_fetch: Vec<u64> = unfetched_blocks
+                                .into_iter()
+                                .take(rpc_batch_size)
+                                .collect();
+                            blocks_to_fetch.sort();
+
+                            let block_refs: Vec<&BlockInfo> = blocks_to_fetch
+                                .iter()
+                                .filter_map(|bn| state.blocks_received.get(bn))
+                                .collect();
+
+                            tracing::debug!(
+                                "Early fetch: {} blocks for range {}-{} ({} of {} blocks received)",
+                                block_refs.len(),
+                                range_start,
+                                range_end - 1,
+                                state.blocks_received.len(),
+                                range_size
+                            );
+
+                            let result = fetch_receipts_for_blocks(
+                                &block_refs,
+                                client,
+                                receipt_fields,
+                                chain.block_receipts_method.as_deref(),
+                                block_receipt_concurrency,
+                                rpc_batch_size,
+                            )
+                            .await?;
+
+                            // Mark blocks as fetched
+                            for bn in &blocks_to_fetch {
+                                state.blocks_fetched.insert(*bn);
+                            }
+
+                            // Accumulate results
+                            state.minimal_records.extend(result.minimal_records);
+                            state.full_records.extend(result.full_records);
+
+                            // Send logs immediately for early processing by downstream collectors
+                            if !result.logs.is_empty() {
+                                let triggers = if !event_matchers.is_empty() {
+                                    extract_event_triggers(&result.logs, &event_matchers)
+                                } else {
+                                    Vec::new()
                                 };
 
-                                if existing_files.contains(&range.file_name()) {
-                                    tracing::info!(
-                                        "Skipping receipts for blocks {}-{} (already exists)",
-                                        range.start,
-                                        range.end - 1
-                                    );
-                                    range_data.remove(&range_start);
-
-                                    // Still need to signal range complete for skipped ranges
-                                    send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
-                                    continue;
-                                }
-
-                                let blocks = range_data.remove(&range_start).unwrap();
-                                process_range(
-                                    &range,
-                                    blocks,
-                                    client,
-                                    receipt_fields,
-                                    &schema,
-                                    &output_dir,
+                                send_logs_to_channels(
+                                    result.logs,
                                     &log_tx,
                                     &factory_log_tx,
-                                    &event_trigger_tx,
-                                    &event_matchers,
-                                    rpc_batch_size,
                                     &mut log_tx_metrics,
                                     &mut factory_log_tx_metrics,
                                     log_tx_capacity,
                                     factory_log_tx_capacity,
-                                    chain.block_receipts_method.as_deref(),
-                                    block_receipt_concurrency,
+                                    &mut std::time::Duration::default(),
                                 )
                                 .await?;
 
-                                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                                if !triggers.is_empty() {
+                                    if let Some(tx) = &event_trigger_tx {
+                                        tx.send(EventTriggerMessage::Triggers(triggers))
+                                            .await
+                                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                                    }
+                                }
                             }
+                        }
+
+                        // Check if range is complete
+                        let expected: HashSet<u64> = (range_start..range_end).collect();
+                        let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
+
+                        if expected.is_subset(&received) {
+                            // Process any remaining unfetched blocks
+                            let remaining_unfetched: Vec<u64> = state.blocks_received.keys()
+                                .filter(|bn| !state.blocks_fetched.contains(bn))
+                                .copied()
+                                .collect();
+
+                            if !remaining_unfetched.is_empty() {
+                                let mut remaining_sorted = remaining_unfetched;
+                                remaining_sorted.sort();
+
+                                let block_refs: Vec<&BlockInfo> = remaining_sorted
+                                    .iter()
+                                    .filter_map(|bn| state.blocks_received.get(bn))
+                                    .collect();
+
+                                tracing::debug!(
+                                    "Final fetch: {} remaining blocks for range {}-{}",
+                                    block_refs.len(),
+                                    range_start,
+                                    range_end - 1
+                                );
+
+                                let result = fetch_receipts_for_blocks(
+                                    &block_refs,
+                                    client,
+                                    receipt_fields,
+                                    chain.block_receipts_method.as_deref(),
+                                    block_receipt_concurrency,
+                                    rpc_batch_size,
+                                )
+                                .await?;
+
+                                state.minimal_records.extend(result.minimal_records);
+                                state.full_records.extend(result.full_records);
+
+                                // Send remaining logs
+                                if !result.logs.is_empty() {
+                                    let triggers = if !event_matchers.is_empty() {
+                                        extract_event_triggers(&result.logs, &event_matchers)
+                                    } else {
+                                        Vec::new()
+                                    };
+
+                                    send_logs_to_channels(
+                                        result.logs,
+                                        &log_tx,
+                                        &factory_log_tx,
+                                        &mut log_tx_metrics,
+                                        &mut factory_log_tx_metrics,
+                                        log_tx_capacity,
+                                        factory_log_tx_capacity,
+                                        &mut std::time::Duration::default(),
+                                    )
+                                    .await?;
+
+                                    if !triggers.is_empty() {
+                                        if let Some(tx) = &event_trigger_tx {
+                                            tx.send(EventTriggerMessage::Triggers(triggers))
+                                                .await
+                                                .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Remove state and write parquet
+                            let final_state = batch_states.remove(&range_start).unwrap();
+
+                            // Sort records by block number before writing
+                            let mut minimal_records = final_state.minimal_records;
+                            let mut full_records = final_state.full_records;
+                            minimal_records.sort_by_key(|r| r.block_number);
+                            full_records.sort_by_key(|r| r.block_number);
+
+                            let total_receipts = match receipt_fields {
+                                Some(fields) => {
+                                    let count = minimal_records.len();
+                                    let schema_clone = schema.clone();
+                                    let fields_vec = fields.to_vec();
+                                    let output_path = output_dir.join(range.file_name());
+                                    tokio::task::spawn_blocking(move || {
+                                        write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path)
+                                    })
+                                    .await
+                                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                                    count
+                                }
+                                None => {
+                                    let count = full_records.len();
+                                    let schema_clone = schema.clone();
+                                    let output_path = output_dir.join(range.file_name());
+                                    tokio::task::spawn_blocking(move || {
+                                        write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path)
+                                    })
+                                    .await
+                                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                                    count
+                                }
+                            };
+
+                            tracing::info!(
+                                "Receipts {}-{}: {} receipts written (early batch mode)",
+                                range.start,
+                                range.end - 1,
+                                total_receipts
+                            );
+
+                            send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
                         }
                     }
                     None => {
@@ -689,12 +880,13 @@ pub async fn collect_receipts(
         }
     }
 
-    for (range_start, blocks) in range_data.drain() {
-        if blocks.is_empty() {
+    // Process any remaining incomplete ranges at shutdown
+    for (range_start, mut state) in batch_states.drain() {
+        if state.blocks_received.is_empty() {
             continue;
         }
 
-        let max_block = blocks.iter().map(|b| b.block_number).max().unwrap_or(range_start);
+        let max_block = state.blocks_received.keys().max().copied().unwrap_or(range_start);
         let range = BlockRange {
             start: range_start,
             end: max_block + 1,
@@ -710,26 +902,102 @@ pub async fn collect_receipts(
             continue;
         }
 
-        process_range(
-            &range,
-            blocks,
-            client,
-            receipt_fields,
-            &schema,
-            &output_dir,
-            &log_tx,
-            &factory_log_tx,
-            &event_trigger_tx,
-            &event_matchers,
-            rpc_batch_size,
-            &mut log_tx_metrics,
-            &mut factory_log_tx_metrics,
-            log_tx_capacity,
-            factory_log_tx_capacity,
-            chain.block_receipts_method.as_deref(),
-            block_receipt_concurrency,
-        )
-        .await?;
+        // Process any remaining unfetched blocks
+        let remaining_unfetched: Vec<u64> = state.blocks_received.keys()
+            .filter(|bn| !state.blocks_fetched.contains(bn))
+            .copied()
+            .collect();
+
+        if !remaining_unfetched.is_empty() {
+            let mut remaining_sorted = remaining_unfetched;
+            remaining_sorted.sort();
+
+            let block_refs: Vec<&BlockInfo> = remaining_sorted
+                .iter()
+                .filter_map(|bn| state.blocks_received.get(bn))
+                .collect();
+
+            let result = fetch_receipts_for_blocks(
+                &block_refs,
+                client,
+                receipt_fields,
+                chain.block_receipts_method.as_deref(),
+                block_receipt_concurrency,
+                rpc_batch_size,
+            )
+            .await?;
+
+            state.minimal_records.extend(result.minimal_records);
+            state.full_records.extend(result.full_records);
+
+            // Send logs
+            if !result.logs.is_empty() {
+                let triggers = if !event_matchers.is_empty() {
+                    extract_event_triggers(&result.logs, &event_matchers)
+                } else {
+                    Vec::new()
+                };
+
+                send_logs_to_channels(
+                    result.logs,
+                    &log_tx,
+                    &factory_log_tx,
+                    &mut log_tx_metrics,
+                    &mut factory_log_tx_metrics,
+                    log_tx_capacity,
+                    factory_log_tx_capacity,
+                    &mut std::time::Duration::default(),
+                )
+                .await?;
+
+                if !triggers.is_empty() {
+                    if let Some(tx) = &event_trigger_tx {
+                        tx.send(EventTriggerMessage::Triggers(triggers))
+                            .await
+                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                    }
+                }
+            }
+        }
+
+        // Sort and write parquet
+        state.minimal_records.sort_by_key(|r| r.block_number);
+        state.full_records.sort_by_key(|r| r.block_number);
+
+        let total_receipts = match receipt_fields {
+            Some(fields) => {
+                let count = state.minimal_records.len();
+                let schema_clone = schema.clone();
+                let fields_vec = fields.to_vec();
+                let output_path = output_dir.join(range.file_name());
+                let minimal_records = state.minimal_records;
+                tokio::task::spawn_blocking(move || {
+                    write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path)
+                })
+                .await
+                .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                count
+            }
+            None => {
+                let count = state.full_records.len();
+                let schema_clone = schema.clone();
+                let output_path = output_dir.join(range.file_name());
+                let full_records = state.full_records;
+                tokio::task::spawn_blocking(move || {
+                    write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path)
+                })
+                .await
+                .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                count
+            }
+        };
+
+        tracing::info!(
+            "Receipts {}-{}: {} receipts written (shutdown cleanup)",
+            range.start,
+            range.end - 1,
+            total_receipts
+        );
 
         send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
     }
@@ -897,6 +1165,113 @@ async fn send_logs_to_channels(
     }
 
     Ok(())
+}
+
+/// Results from fetching receipts for a batch of blocks
+struct BatchFetchResult {
+    minimal_records: Vec<MinimalReceiptRecord>,
+    full_records: Vec<FullReceiptRecord>,
+    logs: Vec<LogData>,
+    rpc_time: std::time::Duration,
+    process_time: std::time::Duration,
+}
+
+/// Fetch receipts for a batch of blocks and return the results.
+/// This enables early RPC fetching before the full range is complete.
+async fn fetch_receipts_for_blocks(
+    blocks: &[&BlockInfo],
+    client: &UnifiedRpcClient,
+    receipt_fields: &Option<Vec<ReceiptField>>,
+    block_receipts_method: Option<&str>,
+    block_receipt_concurrency: usize,
+    rpc_batch_size: usize,
+) -> Result<BatchFetchResult, ReceiptCollectionError> {
+    let mut minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
+    let mut full_records: Vec<FullReceiptRecord> = Vec::new();
+    let mut all_logs: Vec<LogData> = Vec::new();
+    let mut total_rpc_time = std::time::Duration::ZERO;
+    let mut total_process_time = std::time::Duration::ZERO;
+
+    if let Some(method) = block_receipts_method {
+        // Using block receipts method (e.g., alchemy_getTransactionReceipts)
+        let blocks_with_txs: Vec<&&BlockInfo> = blocks
+            .iter()
+            .filter(|b| !b.tx_hashes.is_empty())
+            .collect();
+
+        for batch in blocks_with_txs.chunks(block_receipt_concurrency) {
+            let block_numbers: Vec<alloy::rpc::types::BlockNumberOrTag> = batch
+                .iter()
+                .map(|b| alloy::rpc::types::BlockNumberOrTag::Number(b.block_number))
+                .collect();
+
+            let rpc_start = Instant::now();
+            let all_receipts = client
+                .get_block_receipts_concurrent(method, block_numbers, block_receipt_concurrency)
+                .await?;
+            total_rpc_time += rpc_start.elapsed();
+
+            let process_start = Instant::now();
+            for (block, receipts) in batch.iter().zip(all_receipts.into_iter()) {
+                let tx_block_info: Vec<(B256, u64, u64)> = receipts
+                    .iter()
+                    .map(|r| {
+                        let tx_hash = r.as_ref().map_or(B256::ZERO, |r| r.transaction_hash);
+                        (tx_hash, block.block_number, block.timestamp)
+                    })
+                    .collect();
+
+                match receipt_fields {
+                    Some(_) => {
+                        let records = process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
+                        minimal_records.extend(records);
+                    }
+                    None => {
+                        let records = process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+                        full_records.extend(records);
+                    }
+                }
+            }
+            total_process_time += process_start.elapsed();
+        }
+    } else {
+        // Using individual transaction receipt fetches
+        let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
+        for block in blocks {
+            for tx_hash in &block.tx_hashes {
+                tx_block_info.push((*tx_hash, block.block_number, block.timestamp));
+            }
+        }
+
+        for chunk in tx_block_info.chunks(rpc_batch_size) {
+            let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
+
+            let rpc_start = Instant::now();
+            let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
+            total_rpc_time += rpc_start.elapsed();
+
+            let process_start = Instant::now();
+            match receipt_fields {
+                Some(_) => {
+                    let records = process_receipts_minimal(&receipts, chunk, &mut all_logs)?;
+                    minimal_records.extend(records);
+                }
+                None => {
+                    let records = process_receipts_full(&receipts, chunk, &mut all_logs)?;
+                    full_records.extend(records);
+                }
+            }
+            total_process_time += process_start.elapsed();
+        }
+    }
+
+    Ok(BatchFetchResult {
+        minimal_records,
+        full_records,
+        logs: all_logs,
+        rpc_time: total_rpc_time,
+        process_time: total_process_time,
+    })
 }
 
 async fn process_range(

@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::raw_data::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
-use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
+use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData, FactoryMessage};
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers, EventTriggerData, EventTriggerMessage,
     LogData,
@@ -151,7 +151,7 @@ pub async fn collect_eth_calls(
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
     mut block_rx: Receiver<(u64, u64)>,
-    mut factory_rx: Option<Receiver<FactoryAddressData>>,
+    mut factory_rx: Option<Receiver<FactoryMessage>>,
     mut event_trigger_rx: Option<Receiver<EventTriggerMessage>>,
     decoder_tx: Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
@@ -698,9 +698,8 @@ pub async fn collect_eth_calls(
                     }
                 } => {
                     match factory_result {
-                        Some(factory_data) => {
+                        Some(FactoryMessage::IncrementalAddresses(factory_data)) => {
                             let range_start = factory_data.range_start;
-                            let range_end = factory_data.range_end;
 
                             // Update factory addresses for event trigger filtering
                             for (_block, addrs) in &factory_data.addresses_by_block {
@@ -712,8 +711,19 @@ pub async fn collect_eth_calls(
                                 }
                             }
 
-                            range_factory_data.insert(range_start, factory_data.clone());
-
+                            // Merge into existing range_factory_data
+                            let existing = range_factory_data.entry(range_start).or_insert_with(|| {
+                                FactoryAddressData {
+                                    range_start: factory_data.range_start,
+                                    range_end: factory_data.range_end,
+                                    addresses_by_block: HashMap::new(),
+                                }
+                            });
+                            for (block, addrs) in factory_data.addresses_by_block {
+                                existing.addresses_by_block.entry(block).or_default().extend(addrs);
+                            }
+                        }
+                        Some(FactoryMessage::RangeComplete { range_start, range_end }) => {
                             if range_regular_done.contains(&range_start) {
                                 if !range_factory_done.contains(&range_start) {
                                     let range = BlockRange {
@@ -721,13 +731,13 @@ pub async fn collect_eth_calls(
                                         end: range_end,
                                     };
 
-                                    if let Some(blocks) = range_data.get(&range_start) {
+                                    if let (Some(blocks), Some(factory_data)) = (range_data.get(&range_start), range_factory_data.get(&range_start)) {
                                         if let Some(multicall_addr) = multicall3_address {
                                             process_factory_range_multicall(
                                                 &range,
                                                 blocks,
                                                 client,
-                                                &factory_data,
+                                                factory_data,
                                                 &factory_call_configs,
                                                 &base_output_dir,
                                                 &existing_files,
@@ -742,7 +752,7 @@ pub async fn collect_eth_calls(
                                                 &range,
                                                 blocks,
                                                 client,
-                                                &factory_data,
+                                                factory_data,
                                                 &factory_call_configs,
                                                 &base_output_dir,
                                                 &existing_files,
@@ -759,7 +769,7 @@ pub async fn collect_eth_calls(
                                                 process_factory_once_calls_multicall(
                                                     &range,
                                                     client,
-                                                    &factory_data,
+                                                    factory_data,
                                                     &factory_once_configs,
                                                     &base_output_dir,
                                                     &existing_files,
@@ -772,7 +782,7 @@ pub async fn collect_eth_calls(
                                                 process_factory_once_calls(
                                                     &range,
                                                     client,
-                                                    &factory_data,
+                                                    factory_data,
                                                     &factory_once_configs,
                                                     &base_output_dir,
                                                     &existing_files,
@@ -793,7 +803,7 @@ pub async fn collect_eth_calls(
                                 }
                             }
                         }
-                        None => {
+                        Some(FactoryMessage::AllComplete) | None => {
                             tracing::debug!("eth_calls: factory channel closed");
                             factory_rx = None;
                         }
@@ -1047,9 +1057,8 @@ pub async fn collect_eth_calls(
                 }
             } => {
                 match factory_result {
-                    Some(factory_data) => {
+                    Some(FactoryMessage::IncrementalAddresses(factory_data)) => {
                         let range_start = factory_data.range_start;
-                        let range_end = factory_data.range_end;
 
                         // Update factory addresses for event trigger filtering
                         for (_block, addrs) in &factory_data.addresses_by_block {
@@ -1061,8 +1070,19 @@ pub async fn collect_eth_calls(
                             }
                         }
 
-                        range_factory_data.insert(range_start, factory_data.clone());
-
+                        // Merge into existing range_factory_data
+                        let existing = range_factory_data.entry(range_start).or_insert_with(|| {
+                            FactoryAddressData {
+                                range_start: factory_data.range_start,
+                                range_end: factory_data.range_end,
+                                addresses_by_block: HashMap::new(),
+                            }
+                        });
+                        for (block, addrs) in factory_data.addresses_by_block {
+                            existing.addresses_by_block.entry(block).or_default().extend(addrs);
+                        }
+                    }
+                    Some(FactoryMessage::RangeComplete { range_start, range_end }) => {
                         if range_regular_done.contains(&range_start) {
                             if has_factory_calls && !range_factory_done.contains(&range_start) {
                                 let range = BlockRange {
@@ -1070,13 +1090,13 @@ pub async fn collect_eth_calls(
                                     end: range_end,
                                 };
 
-                                if let Some(blocks) = range_data.get(&range_start) {
+                                if let (Some(blocks), Some(factory_data)) = (range_data.get(&range_start), range_factory_data.get(&range_start)) {
                                     if let Some(multicall_addr) = multicall3_address {
                                         process_factory_range_multicall(
                                             &range,
                                             blocks,
                                             client,
-                                            &factory_data,
+                                            factory_data,
                                             &factory_call_configs,
                                             &base_output_dir,
                                             &existing_files,
@@ -1091,7 +1111,7 @@ pub async fn collect_eth_calls(
                                             &range,
                                             blocks,
                                             client,
-                                            &factory_data,
+                                            factory_data,
                                             &factory_call_configs,
                                             &base_output_dir,
                                             &existing_files,
@@ -1108,7 +1128,7 @@ pub async fn collect_eth_calls(
                                             process_factory_once_calls_multicall(
                                                 &range,
                                                 client,
-                                                &factory_data,
+                                                factory_data,
                                                 &factory_once_configs,
                                                 &base_output_dir,
                                                 &existing_files,
@@ -1121,7 +1141,7 @@ pub async fn collect_eth_calls(
                                             process_factory_once_calls(
                                                 &range,
                                                 client,
-                                                &factory_data,
+                                                factory_data,
                                                 &factory_once_configs,
                                                 &base_output_dir,
                                                 &existing_files,
@@ -1142,7 +1162,7 @@ pub async fn collect_eth_calls(
                             }
                         }
                     }
-                    None => {
+                    Some(FactoryMessage::AllComplete) | None => {
                         factory_rx = None;
                     }
                 }
@@ -4088,13 +4108,106 @@ async fn process_factory_once_calls(
 
         if has_existing_file {
             // Merge new columns into existing parquet
-            let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
+            let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                 .into_iter()
                 .map(|(addr, (_, _, fns))| (addr.0.0, fns))
                 .collect();
 
             let existing_batches = read_existing_once_parquet(&output_path)?;
             if !existing_batches.is_empty() {
+                // Check which addresses already have data for the missing functions
+                let existing_results = extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
+
+                // Find addresses in existing parquet that need backfill
+                let existing_addresses = extract_addresses_from_once_parquet(&existing_batches);
+
+                // Build list of (address, block, functions_to_call) for backfill
+                // Only call functions that don't already have data
+                let mut backfill_calls: Vec<(TransactionRequest, BlockId, [u8; 20], String)> = Vec::new();
+
+                for (addr_bytes, (block_num, _timestamp)) in &existing_addresses {
+                    // Skip addresses that are in current batch (already have new results)
+                    if new_results.contains_key(addr_bytes) {
+                        continue;
+                    }
+
+                    let discovered_address = Address::from_slice(addr_bytes);
+                    let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_num));
+
+                    // Check which functions this address already has data for
+                    let existing_fns = existing_results.get(addr_bytes);
+
+                    for call_config in &configs_to_call {
+                        // Skip if this address already has data for this function
+                        if let Some(fns) = existing_fns {
+                            if fns.contains_key(&call_config.function_name) {
+                                continue;
+                            }
+                        }
+
+                        let target_address = call_config.target_addresses
+                            .as_ref()
+                            .and_then(|addrs| addrs.first().copied())
+                            .unwrap_or(discovered_address);
+
+                        let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                            preencoded.clone()
+                        } else {
+                            encode_once_call_params(
+                                call_config.function_selector,
+                                &call_config.params,
+                                discovered_address,
+                            )?
+                        };
+                        let tx = TransactionRequest::default()
+                            .to(target_address)
+                            .input(calldata.into());
+                        backfill_calls.push((tx, block_id, *addr_bytes, call_config.function_name.clone()));
+                    }
+                }
+
+                // Merge existing results into new_results (preserve what we already have)
+                for (addr_bytes, fns) in existing_results {
+                    let entry = new_results.entry(addr_bytes).or_default();
+                    for (fn_name, data) in fns {
+                        entry.entry(fn_name).or_insert(data);
+                    }
+                }
+
+                // Make backfill calls for addresses/functions that don't have data
+                if !backfill_calls.is_empty() {
+                    tracing::info!(
+                        "Backfilling {} calls for factory once columns (addresses missing data)",
+                        backfill_calls.len()
+                    );
+
+                    let batch_calls: Vec<(TransactionRequest, BlockId)> = backfill_calls
+                        .iter()
+                        .map(|(tx, bid, _, _)| (tx.clone(), *bid))
+                        .collect();
+
+                    let batch_results = client.call_batch(batch_calls).await?;
+
+                    for (i, result) in batch_results.into_iter().enumerate() {
+                        let (_, _, addr_bytes, function_name) = &backfill_calls[i];
+                        let entry = new_results.entry(*addr_bytes).or_default();
+                        match result {
+                            Ok(bytes) => {
+                                entry.insert(function_name.clone(), bytes.to_vec());
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Backfill factory once eth_call failed for {}.{}: {}",
+                                    collection_name,
+                                    function_name,
+                                    e
+                                );
+                                entry.insert(function_name.clone(), Vec::new());
+                            }
+                        }
+                    }
+                }
+
                 let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
 
                 let file = File::create(&output_path)?;
@@ -4397,7 +4510,8 @@ async fn process_factory_once_calls_multicall(
     }
 
     let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
-    let mut collections_to_process: Vec<(String, Vec<String>, Vec<String>, PathBuf, bool)> = Vec::new();
+    // (collection_name, all_fn_names, missing_fn_names, output_path, has_existing_file, configs_to_call)
+    let mut collections_to_process: Vec<(String, Vec<String>, Vec<String>, PathBuf, bool, Vec<OnceCallConfig>)> = Vec::new();
 
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -4454,45 +4568,47 @@ async fn process_factory_once_calls_multicall(
         }
 
         // Build slots for all addresses × functions
+        // Always iterate over discovered factory addresses, using target override only for RPC call
         for call_config in &configs_to_call {
-            // Use target override if specified, otherwise use factory addresses
-            let target_addresses: Vec<(Address, u64, u64)> = if let Some(targets) = &call_config.target_addresses {
-                // Use first factory address's block info for target addresses
-                if let Some((_, &(block_num, timestamp))) = address_discovery.iter().next() {
-                    targets.iter().map(|a| (*a, block_num, timestamp)).collect()
-                } else {
-                    continue;
-                }
-            } else {
-                address_discovery.iter().map(|(a, (b, t))| (*a, *b, *t)).collect()
-            };
+            for (discovered_address, (block_num, timestamp)) in &address_discovery {
+                // Use target override for RPC call if set, otherwise use discovered address
+                let target_address = call_config.target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
 
-            for (address, block_num, timestamp) in target_addresses {
+                // Encode calldata with DISCOVERED address (for self params)
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
                     encode_once_call_params(
                         call_config.function_selector,
                         &call_config.params,
-                        address,
+                        *discovered_address,
                     )?
                 };
 
                 all_slots.push(MulticallSlotGeneric {
-                    block_number: block_num,
-                    block_timestamp: timestamp,
-                    target_address: address,
+                    block_number: *block_num,
+                    block_timestamp: *timestamp,
+                    target_address,  // Target for RPC call (may be override)
                     encoded_calldata: calldata,
                     metadata: FactoryOnceSlotMeta {
                         collection_name: collection_name.clone(),
                         function_name: call_config.function_name.clone(),
-                        address,
-                        block_number: block_num,
-                        block_timestamp: timestamp,
+                        address: *discovered_address,  // Store discovered address
+                        block_number: *block_num,
+                        block_timestamp: *timestamp,
                     },
                 });
             }
         }
+
+        // Clone configs for use in backfill phase
+        let configs_for_backfill: Vec<OnceCallConfig> = configs_to_call
+            .iter()
+            .map(|c| (*c).clone())
+            .collect();
 
         collections_to_process.push((
             collection_name.clone(),
@@ -4500,6 +4616,7 @@ async fn process_factory_once_calls_multicall(
             missing_fn_names,
             output_path,
             has_existing_file,
+            configs_for_backfill,
         ));
     }
 
@@ -4552,19 +4669,125 @@ async fn process_factory_once_calls_multicall(
     }
 
     // Write parquet for each collection
-    for (collection_name, all_fn_names, missing_fn_names, output_path, has_existing_file) in collections_to_process {
+    for (collection_name, all_fn_names, missing_fn_names, output_path, has_existing_file, configs_to_call) in collections_to_process {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
         if let Some(results_by_address) = results_by_collection.remove(&collection_name) {
             if has_existing_file {
-                let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
+                let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                     .into_iter()
                     .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
                     .collect();
 
                 let existing_batches = read_existing_once_parquet(&output_path)?;
                 if !existing_batches.is_empty() {
+                    // Check which addresses already have data for the missing functions
+                    let existing_results = extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
+
+                    // Find addresses in existing parquet
+                    let existing_addresses = extract_addresses_from_once_parquet(&existing_batches);
+
+                    // Build backfill slots only for addresses/functions that don't have data
+                    let mut backfill_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
+
+                    if !configs_to_call.is_empty() {
+                        for (addr_bytes, (block_num, timestamp)) in &existing_addresses {
+                            // Skip addresses that are in current batch (already have new results)
+                            if new_results.contains_key(addr_bytes) {
+                                continue;
+                            }
+
+                            let discovered_address = Address::from_slice(addr_bytes);
+
+                            // Check which functions this address already has data for
+                            let existing_fns = existing_results.get(addr_bytes);
+
+                            for call_config in &configs_to_call {
+                                // Skip if this address already has data for this function
+                                if let Some(fns) = existing_fns {
+                                    if fns.contains_key(&call_config.function_name) {
+                                        continue;
+                                    }
+                                }
+
+                                let target_address = call_config.target_addresses
+                                    .as_ref()
+                                    .and_then(|addrs| addrs.first().copied())
+                                    .unwrap_or(discovered_address);
+
+                                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                                    preencoded.clone()
+                                } else {
+                                    encode_once_call_params(
+                                        call_config.function_selector,
+                                        &call_config.params,
+                                        discovered_address,
+                                    )?
+                                };
+
+                                backfill_slots.push(MulticallSlotGeneric {
+                                    block_number: *block_num,
+                                    block_timestamp: *timestamp,
+                                    target_address,
+                                    encoded_calldata: calldata,
+                                    metadata: FactoryOnceSlotMeta {
+                                        collection_name: collection_name.clone(),
+                                        function_name: call_config.function_name.clone(),
+                                        address: discovered_address,
+                                        block_number: *block_num,
+                                        block_timestamp: *timestamp,
+                                    },
+                                });
+                            }
+                        }
+                    }
+
+                    // Merge existing results into new_results (preserve what we already have)
+                    for (addr_bytes, fns) in existing_results {
+                        let entry = new_results.entry(addr_bytes).or_default();
+                        for (fn_name, data) in fns {
+                            entry.entry(fn_name).or_insert(data);
+                        }
+                    }
+
+                    // Execute backfill multicalls for addresses/functions that don't have data
+                    if !backfill_slots.is_empty() {
+                        tracing::info!(
+                            "Backfilling {} multicall slots for factory once columns (addresses missing data)",
+                            backfill_slots.len()
+                        );
+
+                        // Group by block for multicall
+                        let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> = HashMap::new();
+                        for slot in backfill_slots {
+                            slots_by_block.entry(slot.block_number).or_default().push(slot);
+                        }
+
+                        let backfill_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> = slots_by_block
+                            .into_iter()
+                            .map(|(block_number, slots)| BlockMulticall {
+                                block_number,
+                                block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
+                                slots,
+                            })
+                            .collect();
+
+                        let backfill_results = execute_multicalls_generic(
+                            client,
+                            multicall3_address,
+                            backfill_multicalls,
+                            rpc_batch_size,
+                        )
+                        .await?;
+
+                        for (meta, return_data, _success) in backfill_results {
+                            let addr_bytes: [u8; 20] = meta.address.0.0;
+                            let entry = new_results.entry(addr_bytes).or_default();
+                            entry.insert(meta.function_name, return_data);
+                        }
+                    }
+
                     let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
 
                     let file = File::create(&output_path)?;
@@ -5956,6 +6179,101 @@ fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCo
         path.display()
     );
     Ok(batches)
+}
+
+/// Extract addresses from existing once-call parquet file.
+/// Returns a map of address bytes -> (block_number, timestamp).
+fn extract_addresses_from_once_parquet(
+    batches: &[RecordBatch],
+) -> HashMap<[u8; 20], (u64, u64)> {
+    let mut addresses = HashMap::new();
+
+    for batch in batches {
+        let address_col = match batch.column_by_name("address") {
+            Some(col) => col,
+            None => continue,
+        };
+        let address_arr = match address_col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        let block_col = batch.column_by_name("block_number");
+        let timestamp_col = batch.column_by_name("block_timestamp");
+
+        let block_arr = block_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+        let timestamp_arr = timestamp_col.and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+
+        for i in 0..batch.num_rows() {
+            let addr_bytes: [u8; 20] = match address_arr.value(i).try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let block_num = block_arr.map(|a| a.value(i)).unwrap_or(0);
+            let timestamp = timestamp_arr.map(|a| a.value(i)).unwrap_or(0);
+
+            addresses.entry(addr_bytes).or_insert((block_num, timestamp));
+        }
+    }
+
+    addresses
+}
+
+/// Extract existing non-null results for specific function columns from parquet.
+/// Returns a map of address bytes -> function_name -> result bytes.
+/// Only includes addresses that have non-null, non-empty data for at least one of the requested columns.
+fn extract_existing_results_from_parquet(
+    batches: &[RecordBatch],
+    fn_names: &[String],
+) -> HashMap<[u8; 20], HashMap<String, Vec<u8>>> {
+    let mut results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = HashMap::new();
+
+    for batch in batches {
+        let address_col = match batch.column_by_name("address") {
+            Some(col) => col,
+            None => continue,
+        };
+        let address_arr = match address_col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        // Get result columns for each function
+        let result_columns: Vec<(&String, Option<&BinaryArray>)> = fn_names
+            .iter()
+            .map(|fn_name| {
+                let col_name = format!("{}_result", fn_name);
+                let col = batch
+                    .column_by_name(&col_name)
+                    .and_then(|c| c.as_any().downcast_ref::<BinaryArray>());
+                (fn_name, col)
+            })
+            .collect();
+
+        for i in 0..batch.num_rows() {
+            let addr_bytes: [u8; 20] = match address_arr.value(i).try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            for (fn_name, maybe_col) in &result_columns {
+                if let Some(col) = maybe_col {
+                    if !col.is_null(i) {
+                        let value = col.value(i);
+                        if !value.is_empty() {
+                            results
+                                .entry(addr_bytes)
+                                .or_default()
+                                .insert((*fn_name).clone(), value.to_vec());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
 }
 
 /// Merge new function result columns into existing once-call record batches.

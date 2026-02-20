@@ -7,7 +7,8 @@ use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{I256, U256};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
-    Int64Array, Int8Array, StringArray, UInt64Array, UInt8Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array,
+    UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -1291,10 +1292,24 @@ fn build_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
+        EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
                 .map(|r| extract_tuple_uint64(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = records
+                .iter()
+                .map(|r| extract_tuple_uint32(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = records
+                .iter()
+                .map(|r| extract_tuple_uint16(r, field_idx))
                 .collect();
             Ok(Arc::new(arr))
         }
@@ -1312,10 +1327,24 @@ fn build_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
+        EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
                 .map(|r| extract_tuple_int64(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = records
+                .iter()
+                .map(|r| extract_tuple_int32(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = records
+                .iter()
+                .map(|r| extract_tuple_int16(r, field_idx))
                 .collect();
             Ok(Arc::new(arr))
         }
@@ -1396,6 +1425,28 @@ fn extract_tuple_uint64(r: &DecodedCallRecord, idx: usize) -> Option<u64> {
     }
 }
 
+fn extract_tuple_uint32(r: &DecodedCallRecord, idx: usize) -> Option<u32> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_uint16(r: &DecodedCallRecord, idx: usize) -> Option<u16> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 fn extract_tuple_uint256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
@@ -1421,6 +1472,28 @@ fn extract_tuple_int64(r: &DecodedCallRecord, idx: usize) -> Option<i64> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => Some(*val),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_int32(r: &DecodedCallRecord, idx: usize) -> Option<i32> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => (*val).try_into().ok(),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_tuple_int16(r: &DecodedCallRecord, idx: usize) -> Option<i16> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => (*val).try_into().ok(),
             DecodedValue::Int256(val) => (*val).try_into().ok(),
             _ => None,
         }),
@@ -1696,11 +1769,33 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
+        EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
                 .map(|r| match &r.decoded_value {
                     DecodedValue::Uint64(v) => Some(*v),
+                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint64(v) => (*v).try_into().ok(),
+                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint64(v) => (*v).try_into().ok(),
                     DecodedValue::Uint256(v) => (*v).try_into().ok(),
                     _ => None,
                 })
@@ -1728,11 +1823,33 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
+        EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
                 .map(|r| match &r.decoded_value {
                     DecodedValue::Int64(v) => Some(*v),
+                    DecodedValue::Int256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int64(v) => (*v).try_into().ok(),
+                    DecodedValue::Int256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int64(v) => (*v).try_into().ok(),
                     DecodedValue::Int256(v) => (*v).try_into().ok(),
                     _ => None,
                 })
@@ -1833,11 +1950,33 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
+        EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
                 .map(|r| match r.decoded_values.get(function_name) {
                     Some(DecodedValue::Uint64(v)) => Some(*v),
+                    Some(DecodedValue::Uint256(v)) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = records
+                .iter()
+                .map(|r| match r.decoded_values.get(function_name) {
+                    Some(DecodedValue::Uint64(v)) => (*v).try_into().ok(),
+                    Some(DecodedValue::Uint256(v)) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = records
+                .iter()
+                .map(|r| match r.decoded_values.get(function_name) {
+                    Some(DecodedValue::Uint64(v)) => (*v).try_into().ok(),
                     Some(DecodedValue::Uint256(v)) => (*v).try_into().ok(),
                     _ => None,
                 })
@@ -1865,11 +2004,33 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
+        EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
                 .map(|r| match r.decoded_values.get(function_name) {
                     Some(DecodedValue::Int64(v)) => Some(*v),
+                    Some(DecodedValue::Int256(v)) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = records
+                .iter()
+                .map(|r| match r.decoded_values.get(function_name) {
+                    Some(DecodedValue::Int64(v)) => (*v).try_into().ok(),
+                    Some(DecodedValue::Int256(v)) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = records
+                .iter()
+                .map(|r| match r.decoded_values.get(function_name) {
+                    Some(DecodedValue::Int64(v)) => (*v).try_into().ok(),
                     Some(DecodedValue::Int256(v)) => (*v).try_into().ok(),
                     _ => None,
                 })
@@ -1965,10 +2126,24 @@ fn build_once_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
+        EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
                 .map(|r| extract_once_tuple_uint64(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = records
+                .iter()
+                .map(|r| extract_once_tuple_uint32(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = records
+                .iter()
+                .map(|r| extract_once_tuple_uint16(r, function_name, field_idx))
                 .collect();
             Ok(Arc::new(arr))
         }
@@ -1986,10 +2161,24 @@ fn build_once_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
+        EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
                 .map(|r| extract_once_tuple_int64(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = records
+                .iter()
+                .map(|r| extract_once_tuple_int32(r, function_name, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = records
+                .iter()
+                .map(|r| extract_once_tuple_int16(r, function_name, field_idx))
                 .collect();
             Ok(Arc::new(arr))
         }
@@ -2080,6 +2269,28 @@ fn extract_once_tuple_uint64(r: &DecodedOnceRecord, function_name: &str, idx: us
     }
 }
 
+fn extract_once_tuple_uint32(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u32> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_uint16(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u16> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 fn extract_once_tuple_uint256_string(
     r: &DecodedOnceRecord,
     function_name: &str,
@@ -2109,6 +2320,28 @@ fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &str, idx: usi
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => Some(*val),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_int32(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i32> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => (*val).try_into().ok(),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_once_tuple_int16(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i16> {
+    match r.decoded_values.get(function_name) {
+        Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => (*val).try_into().ok(),
             DecodedValue::Int256(val) => (*val).try_into().ok(),
             _ => None,
         }),

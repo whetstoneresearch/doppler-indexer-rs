@@ -54,6 +54,34 @@ pub struct FactoryAddressData {
     pub addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>>,
 }
 
+/// Message type for factory -> eth_calls communication
+/// Supports incremental address forwarding for early RPC fetching
+#[derive(Debug, Clone)]
+pub enum FactoryMessage {
+    /// Incremental batch of factory addresses discovered (sent per rpc_batch_size logs)
+    IncrementalAddresses(FactoryAddressData),
+    /// A block range is complete - parquet files written
+    RangeComplete { range_start: u64, range_end: u64 },
+    /// All processing is complete
+    AllComplete,
+}
+
+/// State for batch-based factory processing within a range
+/// Enables early address forwarding before full range is complete
+#[derive(Debug)]
+struct FactoryBatchState {
+    range_start: u64,
+    range_end: u64,
+    /// Logs received but not yet processed
+    logs_buffered: Vec<LogData>,
+    /// Addresses already sent to downstream (avoid duplicates)
+    addresses_sent: HashSet<[u8; 20]>,
+    /// All factory records for parquet write
+    all_records: Vec<FactoryRecord>,
+    /// All addresses by block for final range complete message
+    addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>>,
+}
+
 #[derive(Debug)]
 struct FactoryRecord {
     block_number: u64,
@@ -75,7 +103,7 @@ pub async fn collect_factories(
     raw_data_config: &RawDataCollectionConfig,
     mut log_rx: Receiver<LogMessage>,
     logs_factory_tx: Option<Sender<FactoryAddressData>>,
-    eth_calls_factory_tx: Option<Sender<FactoryAddressData>>,
+    eth_calls_factory_tx: Option<Sender<FactoryMessage>>,
     log_decoder_tx: Option<Sender<DecoderMessage>>,
     call_decoder_tx: Option<Sender<DecoderMessage>>,
     recollect_tx: Option<Sender<RecollectRequest>>,
@@ -109,7 +137,7 @@ pub async fn collect_factories(
             }
 
             if let Some(ref tx) = eth_calls_factory_tx {
-                let _ = tx.send(factory_data.clone()).await;
+                let _ = tx.send(FactoryMessage::IncrementalAddresses(factory_data.clone())).await;
             }
 
             // Send to decoders
@@ -173,7 +201,7 @@ pub async fn collect_factories(
                     }
 
                     if let Some(ref tx) = eth_calls_factory_tx {
-                        let _ = tx.send(empty_data.clone()).await;
+                        let _ = tx.send(FactoryMessage::RangeComplete { range_start, range_end }).await;
                     }
 
                     // Send empty addresses to decoders
@@ -193,6 +221,10 @@ pub async fn collect_factories(
                     }
                 }
                 LogMessage::AllRangesComplete => {
+                    // Signal all complete to eth_calls
+                    if let Some(ref tx) = eth_calls_factory_tx {
+                        let _ = tx.send(FactoryMessage::AllComplete).await;
+                    }
                     break;
                 }
             }
@@ -352,7 +384,12 @@ pub async fn collect_factories(
             }
 
             if let Some(ref tx) = eth_calls_factory_tx {
-                let _ = tx.send(factory_data.clone()).await;
+                // Send incremental addresses during catchup, then range complete
+                let _ = tx.send(FactoryMessage::IncrementalAddresses(factory_data.clone())).await;
+                let _ = tx.send(FactoryMessage::RangeComplete {
+                    range_start: factory_data.range_start,
+                    range_end: factory_data.range_end,
+                }).await;
             }
 
             let addresses: HashMap<String, Vec<Address>> = factory_data
@@ -458,7 +495,12 @@ pub async fn collect_factories(
                 }
 
                 if let Some(ref tx) = eth_calls_factory_tx {
-                    let _ = tx.send(factory_data.clone()).await;
+                    // Send incremental addresses then range complete
+                    let _ = tx.send(FactoryMessage::IncrementalAddresses(factory_data.clone())).await;
+                    let _ = tx.send(FactoryMessage::RangeComplete {
+                        range_start: factory_data.range_start,
+                        range_end: factory_data.range_end,
+                    }).await;
                 }
 
                 // Send to decoders
@@ -488,6 +530,10 @@ pub async fn collect_factories(
                 }
             }
             LogMessage::AllRangesComplete => {
+                // Signal all complete to eth_calls
+                if let Some(ref tx) = eth_calls_factory_tx {
+                    let _ = tx.send(FactoryMessage::AllComplete).await;
+                }
                 break;
             }
         }
