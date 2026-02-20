@@ -145,7 +145,20 @@ impl ToSql for SqlParam {
             || <serde_json::Value as ToSql>::accepts(ty)
     }
 
-    tokio_postgres::types::to_sql_checked!();
+    fn to_sql_checked(
+        &self,
+        ty: &tokio_postgres::types::Type,
+        out: &mut BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        // Null is valid for any column type
+        if matches!(self, SqlParam::Null) {
+            return Ok(tokio_postgres::types::IsNull::Yes);
+        }
+        if !<Self as ToSql>::accepts(ty) {
+            return Err(format!("cannot convert SqlParam to PostgreSQL type {}", ty).into());
+        }
+        self.to_sql(ty, out)
+    }
 }
 
 fn convert_db_value(value: &DbValue) -> SqlParam {
@@ -154,7 +167,7 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::Bool(v) => SqlParam::Bool(*v),
         DbValue::Int64(v) => SqlParam::Int64(*v),
         DbValue::Int32(v) => SqlParam::Int32(*v),
-        DbValue::Int2(v) => SqlParam::Int16(*v as i16),
+        DbValue::Int2(v) => SqlParam::Text(v.to_string()),
         DbValue::Uint64(v) => SqlParam::Int64(*v as i64),
         DbValue::Text(v) => SqlParam::Text(v.clone()),
         DbValue::VarChar(v) => SqlParam::Text(v.clone()),
@@ -181,6 +194,7 @@ fn placeholder_for(value: &DbValue, param_idx: usize) -> String {
         DbValue::Timestamp(_) => format!("to_timestamp(${})", param_idx),
         DbValue::Numeric(_) => format!("${}::text::numeric", param_idx),
         DbValue::JsonB(_) => format!("${}::jsonb", param_idx),
+        DbValue::Int2(_) => format!("${}::text::smallint", param_idx),
         _ => format!("${}", param_idx),
     }
 }
