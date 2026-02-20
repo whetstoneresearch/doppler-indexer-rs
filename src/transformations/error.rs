@@ -18,6 +18,9 @@ pub enum TransformationError {
     #[error("Missing required field: {0}")]
     MissingField(String),
 
+    #[error("Missing required data: {0}")]
+    MissingData(String),
+
     #[error("Missing column in parquet file: {0}")]
     MissingColumn(String),
 
