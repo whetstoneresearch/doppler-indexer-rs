@@ -526,6 +526,7 @@ pub async fn collect_eth_calls(
                     &base_output_dir,
                     &existing_files,
                     &factory_once_column_indexes,
+                    &decoder_tx,
                 )
                 .await?;
 
@@ -787,6 +788,7 @@ pub async fn collect_eth_calls(
                                                     &base_output_dir,
                                                     &existing_files,
                                                     &empty_index,
+                                                    &decoder_tx,
                                                 )
                                                 .await?;
                                             }
@@ -1028,6 +1030,7 @@ pub async fn collect_eth_calls(
                                                 &base_output_dir,
                                                 &existing_files,
                                                 &empty_index,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         }
@@ -1146,6 +1149,7 @@ pub async fn collect_eth_calls(
                                                 &base_output_dir,
                                                 &existing_files,
                                                 &empty_index,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         }
@@ -1374,6 +1378,7 @@ pub async fn collect_eth_calls(
                                 &base_output_dir,
                                 &existing_files,
                                 &empty_index,
+                                &decoder_tx,
                             )
                             .await?;
                         }
@@ -3957,6 +3962,7 @@ async fn process_factory_once_calls(
     output_dir: &Path,
     existing_files: &HashSet<String>,
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -4023,7 +4029,8 @@ async fn process_factory_once_calls(
             }
         }
 
-        if address_discovery.is_empty() {
+        // Skip only if no new addresses AND no existing file to backfill
+        if address_discovery.is_empty() && !has_existing_file {
             continue;
         }
 
@@ -4064,45 +4071,53 @@ async fn process_factory_once_calls(
             }
         }
 
-        if pending_calls.is_empty() {
+        // Skip only if no pending calls AND no existing file to backfill
+        if pending_calls.is_empty() && !has_existing_file {
             continue;
         }
 
-        let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
-            .iter()
-            .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
-            .collect();
+        // Execute batch calls only if there are pending calls
+        let results_by_address: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> =
+            if !pending_calls.is_empty() {
+                let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+                    .iter()
+                    .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
+                    .collect();
 
-        let batch_results = client.call_batch(batch_calls).await?;
+                let batch_results = client.call_batch(batch_calls).await?;
 
-        let mut results_by_address: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> = HashMap::new();
+                let mut results_map: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> = HashMap::new();
 
-        for (i, result) in batch_results.into_iter().enumerate() {
-            let (tx, _, address, block_number, timestamp, function_name) = &pending_calls[i];
+                for (i, result) in batch_results.into_iter().enumerate() {
+                    let (tx, _, address, block_number, timestamp, function_name) = &pending_calls[i];
 
-            let entry = results_by_address
-                .entry(*address)
-                .or_insert_with(|| (*block_number, *timestamp, HashMap::new()));
+                    let entry = results_map
+                        .entry(*address)
+                        .or_insert_with(|| (*block_number, *timestamp, HashMap::new()));
 
-            match result {
-                Ok(bytes) => {
-                    entry.2.insert(function_name.clone(), bytes.to_vec());
+                    match result {
+                        Ok(bytes) => {
+                            entry.2.insert(function_name.clone(), bytes.to_vec());
+                        }
+                        Err(e) => {
+                            let calldata = tx.input.input.as_ref().map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default();
+                            tracing::warn!(
+                                "factory once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
+                                collection_name,
+                                function_name,
+                                block_number,
+                                address,
+                                calldata,
+                                e
+                            );
+                            entry.2.insert(function_name.clone(), Vec::new());
+                        }
+                    }
                 }
-                Err(e) => {
-                    let calldata = tx.input.input.as_ref().map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default();
-                    tracing::warn!(
-                        "factory once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
-                        collection_name,
-                        function_name,
-                        block_number,
-                        address,
-                        calldata,
-                        e
-                    );
-                    entry.2.insert(function_name.clone(), Vec::new());
-                }
-            }
-        }
+                results_map
+            } else {
+                HashMap::new()
+            };
 
         std::fs::create_dir_all(&sub_dir)?;
 
@@ -4261,6 +4276,17 @@ async fn process_factory_once_calls(
             actual_cols.len(),
             actual_cols
         );
+
+        // Notify decoder that this file was updated so it can decode new columns
+        if let Some(tx) = decoder_tx {
+            let _ = tx
+                .send(DecoderMessage::OnceFileBackfilled {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: collection_name.clone(),
+                })
+                .await;
+        }
     }
 
     Ok(())
@@ -4563,7 +4589,8 @@ async fn process_factory_once_calls_multicall(
             }
         }
 
-        if address_discovery.is_empty() {
+        // Skip only if no new addresses AND no existing file to backfill
+        if address_discovery.is_empty() && !has_existing_file {
             continue;
         }
 
@@ -4610,6 +4637,8 @@ async fn process_factory_once_calls_multicall(
             .map(|c| (*c).clone())
             .collect();
 
+        // Always add to collections_to_process - even with empty address_discovery,
+        // existing files may need backfill for missing columns
         collections_to_process.push((
             collection_name.clone(),
             all_fn_names,
@@ -4620,52 +4649,57 @@ async fn process_factory_once_calls_multicall(
         ));
     }
 
-    if all_slots.is_empty() {
+    // Skip multicall execution only if there are no slots AND no collections need backfill
+    let any_need_backfill = collections_to_process.iter().any(|(_, _, _, _, has_existing, _)| *has_existing);
+    if all_slots.is_empty() && !any_need_backfill {
         return Ok(());
     }
-
-    // Group slots by block for multicall batching
-    let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> = HashMap::new();
-    for slot in all_slots {
-        slots_by_block.entry(slot.block_number).or_default().push(slot);
-    }
-
-    let mut block_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> = Vec::new();
-    for (block_number, slots) in slots_by_block {
-        block_multicalls.push(BlockMulticall {
-            block_number,
-            block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
-            slots,
-        });
-    }
-
-    tracing::info!(
-        "Executing {} multicalls for factory once calls in blocks {}-{}",
-        block_multicalls.len(),
-        range.start,
-        range.end - 1
-    );
-
-    // Execute multicalls
-    let results = execute_multicalls_generic(
-        client,
-        multicall3_address,
-        block_multicalls,
-        rpc_batch_size,
-    )
-    .await?;
 
     // Group results by collection_name -> address -> (block_num, timestamp, function_results)
     let mut results_by_collection: HashMap<String, HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)>> =
         HashMap::new();
 
-    for (meta, return_data, _success) in results {
-        let entry = results_by_collection
-            .entry(meta.collection_name.clone())
-            .or_default()
-            .entry(meta.address)
-            .or_insert((meta.block_number, meta.block_timestamp, HashMap::new()));
-        entry.2.insert(meta.function_name, return_data);
+    // Execute multicalls only if there are slots to process
+    if !all_slots.is_empty() {
+        // Group slots by block for multicall batching
+        let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> = HashMap::new();
+        for slot in all_slots {
+            slots_by_block.entry(slot.block_number).or_default().push(slot);
+        }
+
+        let mut block_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> = Vec::new();
+        for (block_number, slots) in slots_by_block {
+            block_multicalls.push(BlockMulticall {
+                block_number,
+                block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
+                slots,
+            });
+        }
+
+        tracing::info!(
+            "Executing {} multicalls for factory once calls in blocks {}-{}",
+            block_multicalls.len(),
+            range.start,
+            range.end - 1
+        );
+
+        // Execute multicalls
+        let results = execute_multicalls_generic(
+            client,
+            multicall3_address,
+            block_multicalls,
+            rpc_batch_size,
+        )
+        .await?;
+
+        for (meta, return_data, _success) in results {
+            let entry = results_by_collection
+                .entry(meta.collection_name.clone())
+                .or_default()
+                .entry(meta.address)
+                .or_insert((meta.block_number, meta.block_timestamp, HashMap::new()));
+            entry.2.insert(meta.function_name, return_data);
+        }
     }
 
     // Write parquet for each collection
@@ -4673,7 +4707,13 @@ async fn process_factory_once_calls_multicall(
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
-        if let Some(results_by_address) = results_by_collection.remove(&collection_name) {
+        // Get results for this collection (may be None if no new addresses discovered)
+        let results_by_address = results_by_collection.remove(&collection_name);
+
+        // Process if we have results OR if existing file needs backfill
+        if results_by_address.is_some() || has_existing_file {
+            let results_by_address = results_by_address.unwrap_or_default();
+
             if has_existing_file {
                 let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                     .into_iter()

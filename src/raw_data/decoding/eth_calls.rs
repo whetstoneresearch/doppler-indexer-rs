@@ -200,7 +200,94 @@ pub async fn decode_eth_calls(
                     .await?;
                 }
             }
+            Some(DecoderMessage::OnceFileBackfilled {
+                range_start,
+                range_end,
+                contract_name,
+            }) => {
+                // A once-call file was backfilled with new columns - decode missing columns
+                let configs: Vec<&CallDecodeConfig> = once_configs
+                    .iter()
+                    .filter(|c| c.contract_name == contract_name)
+                    .collect();
+
+                if !configs.is_empty() {
+                    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+                    let raw_path = raw_calls_dir
+                        .join(&contract_name)
+                        .join("once")
+                        .join(&file_name);
+
+                    if raw_path.exists() {
+                        // Read raw columns from parquet
+                        let raw_cols: HashSet<String> = read_raw_parquet_function_names(&raw_path);
+
+                        // Read decoded columns from index or parquet
+                        let decoded_dir = output_base.join(&contract_name).join("once");
+                        let decoded_index = load_or_build_decoded_column_index(&decoded_dir);
+                        let decoded_cols: HashSet<String> = decoded_index
+                            .get(&file_name)
+                            .map(|cols| cols.iter().cloned().collect())
+                            .unwrap_or_default();
+
+                        // Find configs that need decoding
+                        let missing_configs: Vec<CallDecodeConfig> = configs
+                            .iter()
+                            .filter(|c| {
+                                raw_cols.contains(&c.function_name)
+                                    && !decoded_cols.contains(&c.function_name)
+                            })
+                            .cloned()
+                            .cloned()
+                            .collect();
+
+                        if !missing_configs.is_empty() {
+                            tracing::info!(
+                                "OnceFileBackfilled: decoding {} new columns for {}/{}",
+                                missing_configs.len(),
+                                contract_name,
+                                file_name
+                            );
+
+                            // Read raw parquet and decode the missing columns
+                            let configs_ref: Vec<&CallDecodeConfig> =
+                                missing_configs.iter().collect();
+                            let results = read_once_calls_from_parquet(&raw_path, &configs_ref)?;
+                            process_once_calls(
+                                &results,
+                                range_start,
+                                range_end,
+                                &contract_name,
+                                &configs_ref,
+                                &output_base,
+                                transform_tx.as_ref(),
+                                false,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
             Some(DecoderMessage::AllComplete) => {
+                // Re-run catchup to decode any new columns added by raw backfill.
+                // Initial catchup may have decoded partial data (e.g., name, symbol)
+                // while raw backfill was still adding new columns (e.g., getAssetData).
+                // This second pass picks up the newly added columns with fresh indexes.
+                if raw_calls_dir.exists() {
+                    tracing::info!(
+                        "Raw collection complete, re-running decode catchup for chain {}",
+                        chain.name
+                    );
+                    catchup_decode_eth_calls(
+                        &raw_calls_dir,
+                        &output_base,
+                        &regular_configs,
+                        &once_configs,
+                        raw_data_config,
+                        transform_tx.as_ref(),
+                    )
+                    .await?;
+                }
                 break;
             }
             None => {
@@ -417,7 +504,7 @@ async fn catchup_decode_eth_calls(
                                 let file_name =
                                     file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
-                                // Get raw columns for this file (from index or by reading parquet)
+                                // Get raw columns from index (source of truth for what's been collected)
                                 let raw_cols: HashSet<String> = raw_index
                                     .and_then(|idx| idx.get(file_name))
                                     .map(|cols| cols.iter().cloned().collect())
@@ -430,7 +517,6 @@ async fn catchup_decode_eth_calls(
                                     .unwrap_or_default();
 
                                 // Find functions that exist in raw but need decoding
-                                // Filter configs to only those whose function is in raw and not in decoded
                                 let missing_configs: Vec<CallDecodeConfig> = configs
                                     .iter()
                                     .filter(|c| {
@@ -1569,8 +1655,30 @@ fn merge_decoded_once_calls(
     let existing_batch = &existing_batches[0];
     let existing_schema = existing_batch.schema();
 
+    // Build address lookup map from new_records
+    let new_records_by_address: HashMap<[u8; 20], &DecodedOnceRecord> = new_records
+        .iter()
+        .map(|r| (r.contract_address, r))
+        .collect();
+
+    // Extract address column from existing batch
+    let address_col_idx = existing_schema
+        .index_of("address")
+        .map_err(|e| EthCallDecodingError::Decode(format!("Missing address column: {}", e)))?;
+    let address_arr = existing_batch
+        .column(address_col_idx)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .ok_or_else(|| {
+            EthCallDecodingError::Decode("address column is not FixedSizeBinaryArray".to_string())
+        })?;
+
     // Build new schema with existing fields + new fields
-    let mut fields: Vec<Field> = existing_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut fields: Vec<Field> = existing_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
 
     // Add new fields for each new config
     for config in new_configs {
@@ -1601,16 +1709,16 @@ fn merge_decoded_once_calls(
         arrays.push(existing_batch.column(i).clone());
     }
 
-    // Build new columns from new_records
-    // The records should be in the same order as existing rows (by contract_address)
+    // Build new columns aligned to existing addresses
     for config in new_configs {
         match &config.output_type {
             EvmType::NamedTuple(tuple_fields) => {
                 for (idx, (_, field_type)) in tuple_fields.iter().enumerate() {
                     let col_name = format!("{}.{}", config.function_name, tuple_fields[idx].0);
                     if existing_schema.index_of(&col_name).is_err() {
-                        let arr = build_once_tuple_field_array(
-                            new_records,
+                        let arr = build_once_tuple_field_array_aligned(
+                            address_arr,
+                            &new_records_by_address,
                             &config.function_name,
                             idx,
                             field_type,
@@ -1622,8 +1730,9 @@ fn merge_decoded_once_calls(
             _ => {
                 let col_name = config.function_name.clone();
                 if existing_schema.index_of(&col_name).is_err() {
-                    let arr = build_once_value_array(
-                        new_records,
+                    let arr = build_once_value_array_aligned(
+                        address_arr,
+                        &new_records_by_address,
                         &config.function_name,
                         &config.output_type,
                     )?;
@@ -2097,6 +2206,447 @@ fn build_once_value_array(
         // NamedTuple should use build_once_tuple_field_array instead
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "NamedTuple should use build_once_tuple_field_array".to_string(),
+        )),
+    }
+}
+
+/// Build an Arrow array for "once" decoded values, aligned to existing addresses.
+/// For each address in `address_arr`, looks up the record in `records_by_addr` and extracts the value.
+/// Returns NULL for addresses not found in the lookup map.
+fn build_once_value_array_aligned(
+    address_arr: &FixedSizeBinaryArray,
+    records_by_addr: &HashMap<[u8; 20], &DecodedOnceRecord>,
+    function_name: &str,
+    output_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    let num_rows = address_arr.len();
+
+    // Helper to get address at index
+    let get_addr = |i: usize| -> [u8; 20] {
+        address_arr
+            .value(i)
+            .try_into()
+            .unwrap_or([0u8; 20])
+    };
+
+    match output_type {
+        EvmType::Address => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 20);
+            for i in 0..num_rows {
+                let addr = get_addr(i);
+                match records_by_addr.get(&addr).and_then(|r| r.decoded_values.get(function_name)) {
+                    Some(DecodedValue::Address(a)) => builder.append_value(a)?,
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint8(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 => {
+            let arr: UInt64Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint64(val) => Some(*val),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint256(val) => Some(val.to_string()),
+                            DecodedValue::Uint64(val) => Some(val.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Int8(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 => {
+            let arr: Int64Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Int64(val) => Some(*val),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Int64(val) => (*val).try_into().ok(),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Int64(val) => (*val).try_into().ok(),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Int256(val) => Some(val.to_string()),
+                            DecodedValue::Int64(val) => Some(val.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Bool(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 32);
+            for i in 0..num_rows {
+                let addr = get_addr(i);
+                match records_by_addr.get(&addr).and_then(|r| r.decoded_values.get(function_name)) {
+                    Some(DecodedValue::Bytes32(b)) => builder.append_value(b)?,
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        EvmType::String => {
+            let arr: StringArray = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = (0..num_rows)
+                .map(|i| {
+                    let addr = get_addr(i);
+                    records_by_addr
+                        .get(&addr)
+                        .and_then(|r| r.decoded_values.get(function_name))
+                        .and_then(|v| match v {
+                            DecodedValue::Bytes(b) => Some(b.as_slice()),
+                            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => {
+            build_once_value_array_aligned(address_arr, records_by_addr, function_name, inner)
+        }
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "NamedTuple should use build_once_tuple_field_array_aligned".to_string(),
+        )),
+    }
+}
+
+/// Build an Arrow array for a specific field of a named tuple from "once" calls, aligned to existing addresses.
+fn build_once_tuple_field_array_aligned(
+    address_arr: &FixedSizeBinaryArray,
+    records_by_addr: &HashMap<[u8; 20], &DecodedOnceRecord>,
+    function_name: &str,
+    field_idx: usize,
+    field_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    let num_rows = address_arr.len();
+
+    // Helper to get address at index
+    let get_addr = |i: usize| -> [u8; 20] {
+        address_arr
+            .value(i)
+            .try_into()
+            .unwrap_or([0u8; 20])
+    };
+
+    // Helper to extract tuple field value
+    let get_tuple_field = |i: usize| -> Option<&DecodedValue> {
+        let addr = get_addr(i);
+        records_by_addr
+            .get(&addr)
+            .and_then(|r| r.decoded_values.get(function_name))
+            .and_then(|v| match v {
+                DecodedValue::NamedTuple(fields) => fields.get(field_idx).map(|(_, val)| val),
+                _ => None,
+            })
+    };
+
+    match field_type {
+        EvmType::Address => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 20);
+            for i in 0..num_rows {
+                match get_tuple_field(i) {
+                    Some(DecodedValue::Address(a)) => builder.append_value(a)?,
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Uint8(val)) => Some(*val),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 => {
+            let arr: UInt64Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Uint64(val)) => Some(*val),
+                    Some(DecodedValue::Uint256(val)) => (*val).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Uint64(val)) => (*val).try_into().ok(),
+                    Some(DecodedValue::Uint256(val)) => (*val).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Uint64(val)) => (*val).try_into().ok(),
+                    Some(DecodedValue::Uint256(val)) => (*val).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Uint256(val)) => Some(val.to_string()),
+                    Some(DecodedValue::Uint64(val)) => Some(val.to_string()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Int8(val)) => Some(*val),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 => {
+            let arr: Int64Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Int64(val)) => Some(*val),
+                    Some(DecodedValue::Int256(val)) => (*val).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Int64(val)) => (*val).try_into().ok(),
+                    Some(DecodedValue::Int256(val)) => (*val).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Int64(val)) => (*val).try_into().ok(),
+                    Some(DecodedValue::Int256(val)) => (*val).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Int256(val)) => Some(val.to_string()),
+                    Some(DecodedValue::Int64(val)) => Some(val.to_string()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Bool(val)) => Some(*val),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 32);
+            for i in 0..num_rows {
+                match get_tuple_field(i) {
+                    Some(DecodedValue::Bytes32(b)) => builder.append_value(b)?,
+                    _ => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        EvmType::String => {
+            let arr: StringArray = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::String(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = (0..num_rows)
+                .map(|i| match get_tuple_field(i) {
+                    Some(DecodedValue::Bytes(b)) => Some(b.as_slice()),
+                    Some(DecodedValue::Bytes32(b)) => Some(b.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => {
+            build_once_tuple_field_array_aligned(address_arr, records_by_addr, function_name, field_idx, inner)
+        }
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "Nested NamedTuple not supported".to_string(),
         )),
     }
 }

@@ -72,6 +72,12 @@ pub enum DecoderMessage {
         /// collection_name -> addresses discovered in this range
         addresses: HashMap<String, Vec<Address>>,
     },
+    /// A once-call file was backfilled with new columns - decoder should re-check it
+    OnceFileBackfilled {
+        range_start: u64,
+        range_end: u64,
+        contract_name: String,
+    },
     /// All ranges complete (shutdown signal)
     AllComplete,
 }
