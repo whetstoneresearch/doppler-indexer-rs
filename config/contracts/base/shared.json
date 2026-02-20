@@ -30,7 +30,7 @@
                     "name": "Create",
                     "topics_signature": "address",
                     "data_signature": "address,address,address",
-                    "factory_parameters": "topics[0]"
+                    "factory_parameters": "topics[1]"
                 },
                 "calls": [
                     {"function": "name()", "output_type": "string", "frequency": "once"},

@@ -40,7 +40,7 @@
                     { "function": "epochLength()", "output_type": "uint256", "frequency": "once" },
                     { "function": "gamma()", "output_type": "int24", "frequency": "once" },
                     { "function": "isToken0()", "output_type": "bool", "frequency": "once" },
-                    { "function": "numPdSlugs()", "output_type": "uint256", "frequency": "once" }
+                    { "function": "numPDSlugs()", "output_type": "uint256", "frequency": "once" }
                 ],
                 "events": [
                     { "signature": "Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)" }
