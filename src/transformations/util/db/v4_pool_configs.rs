@@ -4,9 +4,8 @@ use crate::db::{DbOperation, DbValue};
 use crate::transformations::TransformationContext;
 
 pub fn insert_pool_config(
-    block_number: u64,
-    block_timestamp: u64,
     pool_id: [u8; 32],
+    hook_address: [u8; 20],
     num_tokens_to_sell: U256,
     min_proceeds: U256,
     max_proceeds: U256,
@@ -20,13 +19,18 @@ pub fn insert_pool_config(
     num_pd_slugs: U256,
     ctx: &TransformationContext
 ) -> DbOperation {
-    DbOperation::Insert {
-        table: "v4_pool_configs".to_string(), 
+    DbOperation::Upsert {
+        table: "v4_pool_configs".to_string(),
+        conflict_columns: vec![
+            "chain_id".to_string(),
+            "hook_address".to_string(),
+        ],
+        update_columns: vec![],
         columns: vec![
             "chain_id".to_string(),
-            "block_number".to_string(),
-            "created_at".to_string(),
             "pool_id".to_string(),
+            "hook_address".to_string(),
+            "num_tokens_to_sell".to_string(),
             "min_proceeds".to_string(),
             "max_proceeds".to_string(),
             "starting_time".to_string(),
@@ -39,10 +43,9 @@ pub fn insert_pool_config(
             "num_pd_slugs".to_string()
         ], 
         values: vec![
-            DbValue::Int64(ctx.chain_id as i64),
-            DbValue::Uint64(block_number),
-            DbValue::Timestamp(block_timestamp as i64),
+            DbValue::Int64(ctx.chain_id as i64),            
             DbValue::Bytes32(pool_id),
+            DbValue::Address(hook_address),
             DbValue::Numeric(num_tokens_to_sell.to_string()),
             DbValue::Numeric(min_proceeds.to_string()),
             DbValue::Numeric(max_proceeds.to_string()),

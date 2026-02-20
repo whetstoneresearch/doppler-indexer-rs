@@ -46,8 +46,13 @@ pub fn insert_pool(
     ending_time: u64,
     ctx: &TransformationContext
 ) -> DbOperation {
-    DbOperation::Insert {
-        table: "pools".to_string(), 
+    DbOperation::Upsert {
+        table: "pools".to_string(),
+        conflict_columns: vec![
+            "chain_id".to_string(),
+            "address".to_string(),
+        ],
+        update_columns: vec![],
         columns: vec![
             "chain_id".to_string(),
             "block_number".to_string(),

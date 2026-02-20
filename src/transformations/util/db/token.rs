@@ -10,7 +10,9 @@ pub fn insert_token(
     block_number: u64,
     block_timestamp: u64,
     tx_hash: &[u8; 32],
-    token: &[u8; 20],
+    creator_address: Option<&[u8; 20]>,
+    integrator: Option<&[u8; 20]>,
+    token_address: &[u8; 20],
     pool: Option<&PoolAddressOrPoolId>,
     name: &str,
     symbol: &str,
@@ -21,11 +23,16 @@ pub fn insert_token(
     is_creator_coin: bool,
     is_content_coin: bool,
     creator_coin_pool: Option<&[u8; 32]>,
-    governance: &[u8; 20],
+    governance: Option<&[u8; 20]>,
     ctx: &TransformationContext,
 ) -> DbOperation {
-    DbOperation::Insert { 
-        table: "tokens".to_string(), 
+    DbOperation::Upsert {
+        table: "tokens".to_string(),
+        conflict_columns: vec![
+            "chain_id".to_string(),
+            "address".to_string(),
+        ],
+        update_columns: vec![],
         columns: vec![
             "chain_id".to_string(),
             "tx_hash".to_string(),
@@ -35,7 +42,7 @@ pub fn insert_token(
             "integrator".to_string(),
             "address".to_string(),
             "pool".to_string(),
-            "name".to_string()  ,
+            "name".to_string(),
             "symbol".to_string(),
             "decimals".to_string(),
             "total_supply".to_string(),
@@ -45,13 +52,21 @@ pub fn insert_token(
             "is_content_coin".to_string(),
             "creator_coin_pool".to_string(),
             "governance".to_string()
-        ], 
+        ],
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
             DbValue::Bytes32(*tx_hash),
             DbValue::Uint64(block_number),
             DbValue::Timestamp(block_timestamp as i64),
-            DbValue::Address(*token),
+            match creator_address {
+                Some(creator) => DbValue::Address(*creator),
+                None => DbValue::Null
+            },
+            match integrator {
+                Some(int_addr) => DbValue::Address(*int_addr),
+                None => DbValue::Null
+            },
+            DbValue::Address(*token_address),
             match pool {
                 Some(PoolAddressOrPoolId::Address(address)) => DbValue::Address(*address),
                 Some(PoolAddressOrPoolId::PoolId(pool_id)) => DbValue::Bytes32(*pool_id),
@@ -75,7 +90,10 @@ pub fn insert_token(
                 Some(creator_coin_pool) => DbValue::Bytes32(*creator_coin_pool),
                 None => DbValue::Null,
             },
-            DbValue::Address(*governance),
+            match governance {
+                Some(gov_addr) => DbValue::Address(*gov_addr),
+                None => DbValue::Null
+            },
         ]
     }
 }
