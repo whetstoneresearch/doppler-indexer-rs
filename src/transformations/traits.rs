@@ -110,6 +110,13 @@ impl EthCallTrigger {
 pub trait EventHandler: TransformationHandler {
     /// Event triggers this handler responds to.
     fn triggers(&self) -> Vec<EventTrigger>;
+
+    /// Declare eth_call types this handler needs access to.
+    /// Returns (source_name, function_name) pairs that must be available
+    /// in decoded parquet files before this handler can process a range.
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![]
+    }
 }
 
 /// Marker trait for handlers that respond to eth_call results.

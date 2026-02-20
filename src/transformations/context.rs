@@ -311,6 +311,13 @@ pub struct EthCallRequest {
     pub block_number: u64,
 }
 
+/// Transaction from/to addresses from receipt data.
+#[derive(Debug, Clone)]
+pub struct TransactionAddresses {
+    pub from_address: [u8; 20],
+    pub to_address: Option<[u8; 20]>,
+}
+
 /// Context provided to transformation handlers.
 ///
 /// Contains all decoded data for the current block range plus utilities
@@ -329,6 +336,10 @@ pub struct TransformationContext<'a> {
     pub events: &'a [DecodedEvent],
     /// All decoded eth_call results in this range
     pub calls: &'a [DecodedCall],
+
+    // ===== Transaction Address Data =====
+    /// Transaction hash -> from/to addresses from receipt data
+    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
 
     // ===== Services =====
     /// Historical data reader for querying parquet files
@@ -350,6 +361,7 @@ impl<'a> TransformationContext<'a> {
         block_range_end: u64,
         events: &'a [DecodedEvent],
         calls: &'a [DecodedCall],
+        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
         contracts: Arc<Contracts>,
@@ -361,6 +373,7 @@ impl<'a> TransformationContext<'a> {
             block_range_end,
             events,
             calls,
+            tx_addresses,
             historical,
             rpc,
             contracts,
@@ -443,6 +456,18 @@ impl<'a> TransformationContext<'a> {
             }
         }
         None
+    }
+
+    // ===== Transaction Address Lookup =====
+
+    /// Look up the from_address for a transaction by its hash.
+    pub fn tx_from(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
+        self.tx_addresses.get(tx_hash).map(|a| &a.from_address)
+    }
+
+    /// Look up the to_address for a transaction by its hash.
+    pub fn tx_to(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
+        self.tx_addresses.get(tx_hash).and_then(|a| a.to_address.as_ref())
     }
 
     // ===== Historical Data Access =====

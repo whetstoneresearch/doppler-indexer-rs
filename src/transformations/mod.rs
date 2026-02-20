@@ -66,7 +66,7 @@ pub mod util;
 // Re-exports for convenience
 pub use context::{
     DecodedCall, DecodedEvent, DecodedValue, EthCallRequest, HistoricalCallQuery,
-    HistoricalEventQuery, TransformationContext,
+    HistoricalEventQuery, TransactionAddresses, TransformationContext,
 };
 pub use engine::{
     DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteMessage,
