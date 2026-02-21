@@ -12,14 +12,12 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 
 use crate::raw_data::decoding::DecoderMessage;
-use crate::raw_data::historical::factories::FactoryAddressData;
-use crate::raw_data::historical::receipts::{LogData, LogMessage};
-use crate::types::config::chain::ChainConfig;
+use crate::raw_data::historical::receipts::LogData;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::raw_data::{LogField, RawDataCollectionConfig};
+use crate::types::config::raw_data::LogField;
 
 #[derive(Debug, Error)]
 pub enum LogCollectionError {
@@ -36,203 +34,52 @@ pub enum LogCollectionError {
     JoinError(String),
 }
 
+pub(crate) struct LogsCatchupState {
+    pub(crate) output_dir: PathBuf,
+    pub(crate) range_size: u64,
+    pub(crate) schema: Arc<Schema>,
+    pub(crate) configured_addresses: HashSet<[u8; 20]>,
+    pub(crate) existing_files: HashSet<String>,
+    pub(crate) contract_logs_only: bool,
+    pub(crate) needs_factory_wait: bool,
+    pub(crate) log_fields: Option<Vec<LogField>>,
+}
+
 #[derive(Debug, Clone)]
-struct BlockRange {
-    start: u64,
-    end: u64,
+pub(crate) struct BlockRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 impl BlockRange {
-    fn file_name(&self) -> String {
+    pub(crate) fn file_name(&self) -> String {
         format!("logs_{}-{}.parquet", self.start, self.end - 1)
     }
 }
 
 #[derive(Debug)]
-struct FullLogRecord {
-    block_number: u64,
-    block_timestamp: u64,
-    transaction_hash: [u8; 32],
-    log_index: u32,
-    address: [u8; 20],
-    topics: Vec<[u8; 32]>,
-    data: Vec<u8>,
+pub(crate) struct FullLogRecord {
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: u64,
+    pub(crate) transaction_hash: [u8; 32],
+    pub(crate) log_index: u32,
+    pub(crate) address: [u8; 20],
+    pub(crate) topics: Vec<[u8; 32]>,
+    pub(crate) data: Vec<u8>,
 }
 
 #[derive(Debug)]
-struct MinimalLogRecord {
-    block_number: u64,
-    block_timestamp: u64,
-    transaction_hash: [u8; 32],
-    log_index: u32,
-    address: [u8; 20],
-    topics: Vec<[u8; 32]>,
-    data: Vec<u8>,
+pub(crate) struct MinimalLogRecord {
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: u64,
+    pub(crate) transaction_hash: [u8; 32],
+    pub(crate) log_index: u32,
+    pub(crate) address: [u8; 20],
+    pub(crate) topics: Vec<[u8; 32]>,
+    pub(crate) data: Vec<u8>,
 }
 
-pub async fn collect_logs(
-    chain: &ChainConfig,
-    raw_data_config: &RawDataCollectionConfig,
-    mut log_rx: Receiver<LogMessage>,
-    mut factory_rx: Option<Receiver<FactoryAddressData>>,
-    decoder_tx: Option<Sender<DecoderMessage>>,
-) -> Result<(), LogCollectionError> {
-    let output_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
-    std::fs::create_dir_all(&output_dir)?;
-
-    let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-    let log_fields = &raw_data_config.fields.log_fields;
-    let schema = build_log_schema(log_fields);
-    let contract_logs_only = raw_data_config.contract_logs_only.unwrap_or(false);
-
-    let configured_addresses: HashSet<[u8; 20]> = if contract_logs_only {
-        build_configured_addresses(&chain.contracts)
-    } else {
-        HashSet::new()
-    };
-
-    let existing_files = scan_existing_parquet_files(&output_dir);
-
-    let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
-    let mut range_factory_addresses: HashMap<u64, HashSet<[u8; 20]>> = HashMap::new();
-
-    // Ranges that have received RangeComplete but are waiting for factory data
-    let mut pending_ranges: HashMap<u64, u64> = HashMap::new(); // range_start -> range_end
-    // Ranges that have received factory data
-    let mut factory_ready: HashSet<u64> = HashSet::new();
-
-    let has_factory_rx = factory_rx.is_some();
-    let needs_factory_wait = has_factory_rx && contract_logs_only;
-
-    tracing::info!(
-        "Starting log collection for chain {} (contract_logs_only: {}, waiting for factories: {})",
-        chain.name,
-        contract_logs_only,
-        needs_factory_wait
-    );
-
-    loop {
-        tokio::select! {
-            log_result = log_rx.recv() => {
-                match log_result {
-                    Some(message) => {
-                        match message {
-                            LogMessage::Logs(logs) => {
-                                for log in logs {
-                                    let range_start = (log.block_number / range_size) * range_size;
-                                    range_data.entry(range_start).or_default().push(log);
-                                }
-                            }
-                            LogMessage::RangeComplete { range_start, range_end } => {
-                                // Check if we can process this range now
-                                let factory_data_ready = !needs_factory_wait || factory_ready.contains(&range_start);
-
-                                if factory_data_ready {
-                                    process_completed_range(
-                                        range_start,
-                                        range_end,
-                                        &mut range_data,
-                                        &mut range_factory_addresses,
-                                        contract_logs_only,
-                                        &configured_addresses,
-                                        log_fields,
-                                        &schema,
-                                        &output_dir,
-                                        &existing_files,
-                                        &decoder_tx,
-                                    )
-                                    .await?;
-                                    factory_ready.remove(&range_start);
-                                } else {
-                                    // Wait for factory data
-                                    pending_ranges.insert(range_start, range_end);
-                                }
-                            }
-                            LogMessage::AllRangesComplete => {
-                                // All ranges from receipts are done, but we might still be waiting for factory data
-                                if pending_ranges.is_empty() {
-                                    break;
-                                }
-                                // Continue looping to receive remaining factory data
-                            }
-                        }
-                    }
-                    None => {
-                        // Channel closed unexpectedly
-                        tracing::warn!("log_rx channel closed unexpectedly");
-                        break;
-                    }
-                }
-            }
-
-            factory_result = async {
-                match &mut factory_rx {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match factory_result {
-                    Some(factory_data) => {
-                        let range_start = factory_data.range_start;
-
-                        let factory_addrs: HashSet<[u8; 20]> = factory_data
-                            .addresses_by_block
-                            .values()
-                            .flatten()
-                            .map(|(_, addr, _)| addr.0.0)
-                            .collect();
-
-                        tracing::debug!(
-                            "Received {} factory addresses for range {}",
-                            factory_addrs.len(),
-                            range_start
-                        );
-
-                        range_factory_addresses
-                            .entry(range_start)
-                            .or_default()
-                            .extend(factory_addrs);
-
-                        // Check if this range was pending
-                        if let Some(pending_end) = pending_ranges.remove(&range_start) {
-                            process_completed_range(
-                                range_start,
-                                pending_end,
-                                &mut range_data,
-                                &mut range_factory_addresses,
-                                contract_logs_only,
-                                &configured_addresses,
-                                log_fields,
-                                &schema,
-                                &output_dir,
-                                &existing_files,
-                                &decoder_tx,
-                            )
-                            .await?;
-                        } else {
-                            // Factory data arrived before RangeComplete, mark as ready
-                            factory_ready.insert(range_start);
-                        }
-                    }
-                    None => {
-                        tracing::debug!("factory_rx channel closed, pending_ranges: {}", pending_ranges.len());
-                        factory_rx = None;
-                    }
-                }
-            }
-        }
-    }
-
-    // Signal decoder that all ranges are complete
-    if let Some(tx) = decoder_tx {
-        let _ = tx.send(DecoderMessage::AllComplete).await;
-    }
-
-    tracing::info!("Log collection complete for chain {}", chain.name);
-    Ok(())
-}
-
-async fn process_completed_range(
+pub(crate) async fn process_completed_range(
     range_start: u64,
     range_end: u64,
     range_data: &mut HashMap<u64, Vec<LogData>>,
@@ -295,7 +142,7 @@ async fn process_completed_range(
     process_range(&range, logs, log_fields, schema, output_dir).await
 }
 
-fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
+pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
     let mut addresses = HashSet::new();
     for (_, contract) in contracts {
         match &contract.address {
@@ -312,7 +159,7 @@ fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
     addresses
 }
 
-async fn process_range(
+pub(crate) async fn process_range(
     range: &BlockRange,
     logs: Vec<LogData>,
     log_fields: &Option<Vec<LogField>>,
@@ -380,7 +227,7 @@ async fn process_range(
     Ok(())
 }
 
-fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
+pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     let mut files = HashSet::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -394,7 +241,7 @@ fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     files
 }
 
-fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {
+pub(crate) fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {
     match fields {
         Some(log_fields) => {
             let mut arrow_fields = Vec::new();
@@ -463,7 +310,7 @@ fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {
     }
 }
 
-fn write_minimal_logs_to_parquet(
+pub(crate) fn write_minimal_logs_to_parquet(
     records: &[MinimalLogRecord],
     schema: &Arc<Schema>,
     fields: &[LogField],
@@ -522,7 +369,7 @@ fn write_minimal_logs_to_parquet(
     write_parquet(arrays, schema, output_path)
 }
 
-fn write_full_logs_to_parquet(
+pub(crate) fn write_full_logs_to_parquet(
     records: &[FullLogRecord],
     schema: &Arc<Schema>,
     output_path: &Path,
@@ -574,7 +421,7 @@ fn write_full_logs_to_parquet(
     write_parquet(arrays, schema, output_path)
 }
 
-fn build_topics_array(records: &[MinimalLogRecord]) -> Result<arrow::array::ListArray, arrow::error::ArrowError> {
+pub(crate) fn build_topics_array(records: &[MinimalLogRecord]) -> Result<arrow::array::ListArray, arrow::error::ArrowError> {
     let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
     for record in records {
         for topic in &record.topics {
@@ -585,7 +432,7 @@ fn build_topics_array(records: &[MinimalLogRecord]) -> Result<arrow::array::List
     Ok(list_builder.finish())
 }
 
-fn write_parquet(
+pub(crate) fn write_parquet(
     arrays: Vec<ArrayRef>,
     schema: &Arc<Schema>,
     output_path: &Path,

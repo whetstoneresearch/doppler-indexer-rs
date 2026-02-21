@@ -14,20 +14,14 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 
 use crate::raw_data::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
-use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
-use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData, FactoryMessage};
-use crate::raw_data::historical::receipts::{
-    build_event_trigger_matchers, extract_event_triggers, EventTriggerData, EventTriggerMessage,
-    LogData,
-};
+use crate::raw_data::historical::factories::FactoryAddressData;
+use crate::raw_data::historical::receipts::{EventTriggerData, LogData};
 use crate::rpc::{RpcError, UnifiedRpcClient};
-use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue};
-use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 
 #[derive(Debug, Error)]
@@ -55,1353 +49,135 @@ pub enum EthCallCollectionError {
 }
 
 #[derive(Debug, Clone)]
-struct BlockRange {
-    start: u64,
-    end: u64,
+pub(crate) struct BlockRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 impl BlockRange {
-    fn file_name(&self) -> String {
+    pub(crate) fn file_name(&self) -> String {
         format!("{}-{}.parquet", self.start, self.end - 1)
     }
 }
 
 #[derive(Debug, Clone)]
-struct BlockInfo {
-    block_number: u64,
-    timestamp: u64,
+pub(crate) struct BlockInfo {
+    pub(crate) block_number: u64,
+    pub(crate) timestamp: u64,
 }
 
 #[derive(Debug, Clone)]
-struct CallConfig {
-    contract_name: String,
-    address: Address,
-    function_name: String,
-    encoded_calldata: Bytes,
-    param_values: Vec<Vec<u8>>,
-    frequency: Frequency,
+pub(crate) struct CallConfig {
+    pub(crate) contract_name: String,
+    pub(crate) address: Address,
+    pub(crate) function_name: String,
+    pub(crate) encoded_calldata: Bytes,
+    pub(crate) param_values: Vec<Vec<u8>>,
+    pub(crate) frequency: Frequency,
 }
 
 #[derive(Debug, Clone)]
-struct OnceCallConfig {
-    function_name: String,
-    function_selector: [u8; 4],
+pub(crate) struct OnceCallConfig {
+    pub(crate) function_name: String,
+    pub(crate) function_selector: [u8; 4],
     /// Pre-encoded calldata if no self-address params
-    preencoded_calldata: Option<Bytes>,
+    pub(crate) preencoded_calldata: Option<Bytes>,
     /// Param configs needed when preencoded_calldata is None
-    params: Vec<ParamConfig>,
+    pub(crate) params: Vec<ParamConfig>,
     /// Optional target address override (resolved from CallTarget)
-    target_addresses: Option<Vec<Address>>,
+    pub(crate) target_addresses: Option<Vec<Address>>,
 }
 
 #[derive(Debug)]
-struct OnceCallResult {
-    block_number: u64,
-    block_timestamp: u64,
-    contract_address: [u8; 20],
-    function_results: HashMap<String, Vec<u8>>,
+pub(crate) struct OnceCallResult {
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: u64,
+    pub(crate) contract_address: [u8; 20],
+    pub(crate) function_results: HashMap<String, Vec<u8>>,
 }
 
-struct FrequencyState {
-    last_call_times: HashMap<(String, String), u64>,
+pub(crate) struct FrequencyState {
+    pub(crate) last_call_times: HashMap<(String, String), u64>,
 }
 
 /// Configuration for an event-triggered call
 #[derive(Debug, Clone)]
-struct EventTriggeredCallConfig {
+pub(crate) struct EventTriggeredCallConfig {
     /// Contract name or factory collection name
-    contract_name: String,
+    pub(crate) contract_name: String,
     /// Target address for the call (None for factory collections - use event emitter)
-    target_address: Option<Address>,
+    pub(crate) target_address: Option<Address>,
     /// Function name (without params)
-    function_name: String,
+    pub(crate) function_name: String,
     /// Function selector (first 4 bytes of keccak256 of signature)
-    function_selector: [u8; 4],
+    pub(crate) function_selector: [u8; 4],
     /// Parameter configurations
-    params: Vec<ParamConfig>,
+    pub(crate) params: Vec<ParamConfig>,
     /// Whether this is for a factory collection
-    is_factory: bool,
+    pub(crate) is_factory: bool,
 }
 
 /// Result from an event-triggered call
 #[derive(Debug)]
-struct EventCallResult {
-    block_number: u64,
-    block_timestamp: u64,
-    log_index: u32,
-    target_address: [u8; 20],
-    value_bytes: Vec<u8>,
-    param_values: Vec<Vec<u8>>,
+pub(crate) struct EventCallResult {
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: u64,
+    pub(crate) log_index: u32,
+    pub(crate) target_address: [u8; 20],
+    pub(crate) value_bytes: Vec<u8>,
+    pub(crate) param_values: Vec<Vec<u8>>,
 }
 
 /// Key for grouping event-triggered calls: (source_name, event_signature_hash)
-type EventCallKey = (String, [u8; 32]);
+pub(crate) type EventCallKey = (String, [u8; 32]);
 
 #[derive(Debug)]
-struct CallResult {
-    block_number: u64,
-    block_timestamp: u64,
-    contract_address: [u8; 20],
-    value_bytes: Vec<u8>,
-    param_values: Vec<Vec<u8>>,
+pub(crate) struct CallResult {
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: u64,
+    pub(crate) contract_address: [u8; 20],
+    pub(crate) value_bytes: Vec<u8>,
+    pub(crate) param_values: Vec<Vec<u8>>,
 }
 
-pub async fn collect_eth_calls(
-    chain: &ChainConfig,
-    client: &UnifiedRpcClient,
-    raw_data_config: &RawDataCollectionConfig,
-    mut block_rx: Receiver<(u64, u64)>,
-    mut factory_rx: Option<Receiver<FactoryMessage>>,
-    mut event_trigger_rx: Option<Receiver<EventTriggerMessage>>,
-    decoder_tx: Option<Sender<DecoderMessage>>,
-) -> Result<(), EthCallCollectionError> {
-    let base_output_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
-    std::fs::create_dir_all(&base_output_dir)?;
-
-    let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-    let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
-
-    let call_configs = build_call_configs(&chain.contracts)?;
-    let factory_call_configs = get_factory_call_configs(&chain.contracts, &chain.factory_collections);
-    let event_call_configs = build_event_triggered_call_configs(&chain.contracts);
-    let token_call_configs = build_token_call_configs(&chain.tokens, &chain.contracts)?;
-
-    let multicall3_address: Option<Address> = chain.contracts.get("Multicall3").and_then(|c| {
-        match &c.address {
-            AddressOrAddresses::Single(addr) => Some(*addr),
-            AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
-        }
-    });
-
-    if multicall3_address.is_some() {
-        tracing::info!(
-            "Multicall3 found for chain {}, will batch all eth_calls",
-            chain.name
-        );
-    }
-
-    let once_configs = build_once_call_configs(&chain.contracts);
-    let factory_once_configs = build_factory_once_call_configs(&factory_call_configs, &chain.contracts);
-
-    let has_regular_calls = !call_configs.is_empty();
-    let has_once_calls = !once_configs.is_empty();
-    let has_factory_calls = !factory_call_configs.is_empty() && factory_rx.is_some();
-    let has_factory_once_calls = !factory_once_configs.is_empty() && factory_rx.is_some();
-    let has_event_triggered_calls = !event_call_configs.is_empty() && event_trigger_rx.is_some();
-    let has_token_calls = !token_call_configs.is_empty();
-
-    if !has_regular_calls && !has_once_calls && !has_factory_calls && !has_factory_once_calls && !has_event_triggered_calls && !has_token_calls {
-        tracing::info!("No eth_calls configured for chain {}", chain.name);
-        while block_rx.recv().await.is_some() {}
-        return Ok(());
-    }
-
-    // Track known factory addresses for filtering event triggers
-    let mut factory_addresses: HashMap<String, HashSet<Address>> = HashMap::new();
-
-    let max_params = call_configs
-        .iter()
-        .map(|c| c.param_values.len())
-        .max()
-        .unwrap_or(0);
-
-    let factory_max_params = factory_call_configs
-        .values()
-        .flat_map(|configs| configs.iter().map(|c| c.params.len()))
-        .max()
-        .unwrap_or(0);
-
-    let mut frequency_state = FrequencyState {
-        last_call_times: HashMap::new(),
-    };
-
-    tracing::info!(
-        "Starting eth_call collection for chain {} with {} regular configs, {} once configs, {} factory collections, {} factory once configs, {} event trigger configs, {} token pool configs",
-        chain.name,
-        call_configs.len(),
-        once_configs.len(),
-        factory_call_configs.len(),
-        factory_once_configs.len(),
-        event_call_configs.len(),
-        token_call_configs.len()
-    );
-
-    let existing_files = scan_existing_parquet_files(&base_output_dir);
-
-    let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
-    let mut range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
-    let mut range_regular_done: HashSet<u64> = HashSet::new();
-    let mut range_factory_done: HashSet<u64> = HashSet::new();
-
-    if has_regular_calls || has_token_calls || has_once_calls {
-        let block_ranges = get_existing_block_ranges(&chain.name);
-        tracing::info!(
-            "eth_calls catchup: checking {} block ranges (regular={}, token={}, once={})",
-            block_ranges.len(),
-            has_regular_calls,
-            has_token_calls,
-            has_once_calls
-        );
-
-        // Pre-load or build column indexes for all once directories
-        let mut once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
-        for contract_name in once_configs.keys() {
-            let once_dir = base_output_dir.join(contract_name).join("once");
-            let index = load_or_build_once_column_index(&once_dir);
-            once_column_indexes.insert(contract_name.clone(), index);
-        }
-
-        let mut catchup_count = 0;
-
-        for block_range in &block_ranges {
-            let range = BlockRange {
-                start: block_range.start,
-                end: block_range.end,
-            };
-
-            // Check if all regular call files exist for this range
-            let regular_calls_done = !has_regular_calls || call_configs.iter().all(|config| {
-                let rel_path = format!("{}/{}/{}", config.contract_name, config.function_name, range.file_name());
-                existing_files.contains(&rel_path)
-            });
-
-            // Check if all token pool call files exist for this range
-            let token_calls_done = !has_token_calls || token_call_configs.iter().all(|config| {
-                let rel_path = format!("{}_pool/{}/{}", config.token_name, config.function_name, range.file_name());
-                existing_files.contains(&rel_path)
-            });
-
-            // Check if all once call files exist AND have all expected columns for this range
-            let once_calls_done = !has_once_calls || once_configs.iter().all(|(contract_name, configs)| {
-                let rel_path = format!("{}/once/{}", contract_name, range.file_name());
-                let expected: HashSet<&str> = configs
-                    .iter()
-                    .map(|c| c.function_name.as_str())
-                    .collect();
-
-                if !existing_files.contains(&rel_path) {
-                    tracing::info!(
-                        "Once file missing for {} range {}-{}, will collect {} functions",
-                        contract_name,
-                        range.start,
-                        range.end - 1,
-                        expected.len()
-                    );
-                    return false;
-                }
-
-                // Use pre-loaded index (which was built from parquet schemas if index file didn't exist)
-                let index = once_column_indexes.get(contract_name).unwrap();
-                match index.get(&range.file_name()) {
-                    Some(cols) => {
-                        let missing: Vec<_> = expected.iter().filter(|f| !cols.contains(&f.to_string())).collect();
-                        if !missing.is_empty() {
-                            tracing::info!(
-                                "Once file {} for {} exists but missing columns: {:?} (has: {:?})",
-                                range.file_name(),
-                                contract_name,
-                                missing,
-                                cols
-                            );
-                            false
-                        } else {
-                            tracing::debug!(
-                                "Once file {} for {} complete with all {} columns",
-                                range.file_name(),
-                                contract_name,
-                                cols.len()
-                            );
-                            true
-                        }
-                    }
-                    None => {
-                        // File exists but wasn't found by index builder - shouldn't happen but handle it
-                        tracing::warn!(
-                            "Once file {} for {} exists but not in pre-built index, will collect",
-                            range.file_name(),
-                            contract_name
-                        );
-                        false
-                    }
-                }
-            });
-
-            // Skip this range only if ALL call types have their files
-            if regular_calls_done && token_calls_done && once_calls_done {
-                range_regular_done.insert(range.start);
-                continue;
-            }
-
-            let block_infos = match read_block_info_from_parquet(&block_range.file_path) {
-                Ok(infos) => infos,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read block info from {}: {}",
-                        block_range.file_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            if block_infos.is_empty() {
-                continue;
-            }
-
-            tracing::info!(
-                "Catchup: processing eth_calls for blocks {}-{} from existing block file",
-                range.start,
-                range.end - 1
-            );
-
-            let blocks: Vec<BlockInfo> = block_infos
-                .into_iter()
-                .map(|info| BlockInfo {
-                    block_number: info.block_number,
-                    timestamp: info.timestamp,
-                })
-                .collect();
-
-            range_data.insert(range.start, blocks.clone());
-
-            if has_regular_calls {
-                if let Some(multicall_addr) = multicall3_address {
-                    process_range_multicall(
-                        &range,
-                        blocks.clone(),
-                        client,
-                        &call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        rpc_batch_size,
-                        max_params,
-                        &mut frequency_state,
-                        multicall_addr,
-                    )
-                    .await?;
-                } else {
-                    process_range(
-                        &range,
-                        blocks.clone(),
-                        client,
-                        &call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        rpc_batch_size,
-                        max_params,
-                        &mut frequency_state,
-                    )
-                    .await?;
-                }
-            }
-
-            if has_token_calls {
-                if let Some(multicall_addr) = multicall3_address {
-                    process_token_range_multicall(
-                        &range,
-                        blocks.clone(),
-                        client,
-                        &token_call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        rpc_batch_size,
-                        &mut frequency_state,
-                        multicall_addr,
-                    )
-                    .await?;
-                } else {
-                    process_token_range(
-                        &range,
-                        blocks.clone(),
-                        client,
-                        &token_call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        rpc_batch_size,
-                        &mut frequency_state,
-                    )
-                    .await?;
-                }
-            }
-
-            if has_once_calls {
-                if let Some(multicall_addr) = multicall3_address {
-                    process_once_calls_multicall(
-                        &range,
-                        &blocks,
-                        client,
-                        &once_configs,
-                        &chain.contracts,
-                        &base_output_dir,
-                        &existing_files,
-                        multicall_addr,
-                        rpc_batch_size,
-                    )
-                    .await?;
-                } else {
-                    process_once_calls_regular(
-                        &range,
-                        &blocks,
-                        client,
-                        &once_configs,
-                        &chain.contracts,
-                        &base_output_dir,
-                        &existing_files,
-                    )
-                    .await?;
-                }
-            }
-
-            range_regular_done.insert(range.start);
-            catchup_count += 1;
-        }
-
-        if catchup_count > 0 {
-            tracing::info!(
-                "Catchup complete: processed {} eth_call ranges for chain {}",
-                catchup_count,
-                chain.name
-            );
-        }
-    }
-
-    // =========================================================================
-    // Catchup phase for factory once calls: Check for missing columns in existing files
-    // =========================================================================
-    if has_factory_once_calls {
-        tracing::info!(
-            "Factory once calls catchup: checking {} factory collections for missing columns",
-            factory_once_configs.len()
-        );
-
-        // Pre-load or build column indexes for all factory once directories
-        let mut factory_once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
-        for collection_name in factory_once_configs.keys() {
-            let once_dir = base_output_dir.join(collection_name).join("once");
-            let index = load_or_build_once_column_index(&once_dir);
-            factory_once_column_indexes.insert(collection_name.clone(), index);
-        }
-
-        // Load factory address data from existing parquet files
-        let factory_catchup_data = load_factory_addresses_for_once_catchup(&chain.name, &factory_once_configs);
-
-        if !factory_catchup_data.is_empty() {
-            let block_ranges = get_existing_block_ranges(&chain.name);
-            let mut factory_once_catchup_count = 0;
-
-            for block_range in &block_ranges {
-                let range = BlockRange {
-                    start: block_range.start,
-                    end: block_range.end,
-                };
-
-                // Build FactoryAddressData for this range from loaded data
-                let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
-                for (collection_name, addr_data) in &factory_catchup_data {
-                    for (addr, block_num, timestamp) in addr_data {
-                        if *block_num >= range.start && *block_num < range.end {
-                            addresses_by_block
-                                .entry(*block_num)
-                                .or_default()
-                                .push((*timestamp, *addr, collection_name.clone()));
-                        }
-                    }
-                }
-
-                if addresses_by_block.is_empty() {
-                    continue;
-                }
-
-                let factory_data = FactoryAddressData {
-                    range_start: range.start,
-                    range_end: range.end,
-                    addresses_by_block,
-                };
-
-                process_factory_once_calls(
-                    &range,
-                    client,
-                    &factory_data,
-                    &factory_once_configs,
-                    &base_output_dir,
-                    &existing_files,
-                    &factory_once_column_indexes,
-                    &decoder_tx,
-                )
-                .await?;
-
-                factory_once_catchup_count += 1;
-            }
-
-            if factory_once_catchup_count > 0 {
-                tracing::info!(
-                    "Factory once calls catchup complete: checked {} ranges for chain {}",
-                    factory_once_catchup_count,
-                    chain.name
-                );
-            }
-        }
-    }
-
-    // =========================================================================
-    // Catchup phase for event-triggered calls: Read from existing log parquet files
-    // =========================================================================
-    if has_event_triggered_calls {
-        // CRITICAL: Load historical factory addresses BEFORE processing event triggers
-        // This ensures we can properly filter events from factory-created contracts
-        let historical_factory_addrs = load_historical_factory_addresses(&chain.name, &event_call_configs);
-        for (collection_name, addrs) in historical_factory_addrs {
-            tracing::info!(
-                "Loaded {} historical factory addresses for collection {}",
-                addrs.len(),
-                collection_name
-            );
-            factory_addresses
-                .entry(collection_name)
-                .or_default()
-                .extend(addrs);
-        }
-
-        let log_ranges = get_existing_log_ranges(&chain.name);
-        let event_matchers = build_event_trigger_matchers(&chain.contracts);
-        let mut event_catchup_count = 0;
-
-        tracing::info!(
-            "Event-triggered calls catchup: checking {} log ranges for chain {}",
-            log_ranges.len(),
-            chain.name
-        );
-
-        for log_range in &log_ranges {
-            // Check if output already exists for all event-triggered call configs
-            let mut needs_processing = false;
-            for (_, configs) in &event_call_configs {
-                for config in configs {
-                    if !event_output_exists(
-                        &base_output_dir,
-                        &config.contract_name,
-                        &config.function_name,
-                        log_range.start,
-                        log_range.end,
-                    ) {
-                        needs_processing = true;
-                        break;
-                    }
-                }
-                if needs_processing {
-                    break;
-                }
-            }
-
-            if !needs_processing {
-                tracing::debug!(
-                    "Skipping event-triggered calls for blocks {}-{} (already exists)",
-                    log_range.start,
-                    log_range.end - 1
-                );
-                continue;
-            }
-
-            // Read logs from parquet file
-            let logs = match read_logs_from_parquet(&log_range.file_path) {
-                Ok(logs) => logs,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read logs from {}: {}",
-                        log_range.file_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            if logs.is_empty() {
-                continue;
-            }
-
-            tracing::info!(
-                "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
-                log_range.start,
-                log_range.end - 1,
-                logs.len()
-            );
-
-            // Extract event triggers from logs
-            let triggers = extract_event_triggers(&logs, &event_matchers);
-
-            if !triggers.is_empty() {
-                tracing::info!(
-                    "Extracted {} event triggers from {} logs for blocks {}-{}",
-                    triggers.len(),
-                    logs.len(),
-                    log_range.start,
-                    log_range.end - 1
-                );
-
-                // Process the triggers
-                if let Some(multicall_addr) = multicall3_address {
-                    process_event_triggers_multicall(
-                        triggers,
-                        &event_call_configs,
-                        &factory_addresses,
-                        client,
-                        &base_output_dir,
-                        rpc_batch_size,
-                        &decoder_tx,
-                        multicall_addr,
-                    )
-                    .await?;
-                } else {
-                    process_event_triggers(
-                        triggers,
-                        &event_call_configs,
-                        &factory_addresses,
-                        client,
-                        &base_output_dir,
-                        rpc_batch_size,
-                        &decoder_tx,
-                    )
-                    .await?;
-                }
-
-                event_catchup_count += 1;
-            }
-        }
-
-        if event_catchup_count > 0 {
-            tracing::info!(
-                "Event-triggered calls catchup complete: processed {} ranges for chain {}",
-                event_catchup_count,
-                chain.name
-            );
-        }
-    }
-
-    let mut block_rx_closed = false;
-    let mut event_trigger_rx_closed = !has_event_triggered_calls;
-
-    loop {
-        if block_rx_closed {
-            // Check if we should still wait for factory or event trigger data
-            let waiting_for_factory = has_factory_calls && factory_rx.is_some();
-            let waiting_for_events = has_event_triggered_calls && !event_trigger_rx_closed;
-
-            if !waiting_for_factory && !waiting_for_events {
-                break;
-            }
-
-            // Process remaining factory and event data
-            tokio::select! {
-                factory_result = async {
-                    match &mut factory_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match factory_result {
-                        Some(FactoryMessage::IncrementalAddresses(factory_data)) => {
-                            let range_start = factory_data.range_start;
-
-                            // Update factory addresses for event trigger filtering
-                            for (_block, addrs) in &factory_data.addresses_by_block {
-                                for (_, addr, collection_name) in addrs {
-                                    factory_addresses
-                                        .entry(collection_name.clone())
-                                        .or_default()
-                                        .insert(*addr);
-                                }
-                            }
-
-                            // Merge into existing range_factory_data
-                            let existing = range_factory_data.entry(range_start).or_insert_with(|| {
-                                FactoryAddressData {
-                                    range_start: factory_data.range_start,
-                                    range_end: factory_data.range_end,
-                                    addresses_by_block: HashMap::new(),
-                                }
-                            });
-                            for (block, addrs) in factory_data.addresses_by_block {
-                                existing.addresses_by_block.entry(block).or_default().extend(addrs);
-                            }
-                        }
-                        Some(FactoryMessage::RangeComplete { range_start, range_end }) => {
-                            if range_regular_done.contains(&range_start) {
-                                if !range_factory_done.contains(&range_start) {
-                                    let range = BlockRange {
-                                        start: range_start,
-                                        end: range_end,
-                                    };
-
-                                    if let (Some(blocks), Some(factory_data)) = (range_data.get(&range_start), range_factory_data.get(&range_start)) {
-                                        if let Some(multicall_addr) = multicall3_address {
-                                            process_factory_range_multicall(
-                                                &range,
-                                                blocks,
-                                                client,
-                                                factory_data,
-                                                &factory_call_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                rpc_batch_size,
-                                                factory_max_params,
-                                                &mut frequency_state,
-                                                multicall_addr,
-                                            )
-                                            .await?;
-                                        } else {
-                                            process_factory_range(
-                                                &range,
-                                                blocks,
-                                                client,
-                                                factory_data,
-                                                &factory_call_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                rpc_batch_size,
-                                                factory_max_params,
-                                                &mut frequency_state,
-                                            )
-                                            .await?;
-                                        }
-
-                                        if has_factory_once_calls {
-                                            let empty_index = HashMap::new();
-                                            if let Some(multicall_addr) = multicall3_address {
-                                                process_factory_once_calls_multicall(
-                                                    &range,
-                                                    client,
-                                                    factory_data,
-                                                    &factory_once_configs,
-                                                    &base_output_dir,
-                                                    &existing_files,
-                                                    &empty_index,
-                                                    multicall_addr,
-                                                    rpc_batch_size,
-                                                )
-                                                .await?;
-                                            } else {
-                                                process_factory_once_calls(
-                                                    &range,
-                                                    client,
-                                                    factory_data,
-                                                    &factory_once_configs,
-                                                    &base_output_dir,
-                                                    &existing_files,
-                                                    &empty_index,
-                                                    &decoder_tx,
-                                                )
-                                                .await?;
-                                            }
-                                        }
-                                    }
-                                    range_factory_done.insert(range_start);
-                                }
-
-                                if range_regular_done.contains(&range_start)
-                                    && range_factory_done.contains(&range_start)
-                                {
-                                    range_data.remove(&range_start);
-                                    range_factory_data.remove(&range_start);
-                                }
-                            }
-                        }
-                        Some(FactoryMessage::AllComplete) | None => {
-                            tracing::debug!("eth_calls: factory channel closed");
-                            factory_rx = None;
-                        }
-                    }
-                }
-
-                event_result = async {
-                    match &mut event_trigger_rx {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match event_result {
-                        Some(EventTriggerMessage::Triggers(triggers)) => {
-                            if let Some(multicall_addr) = multicall3_address {
-                                process_event_triggers_multicall(
-                                    triggers,
-                                    &event_call_configs,
-                                    &factory_addresses,
-                                    client,
-                                    &base_output_dir,
-                                    rpc_batch_size,
-                                    &decoder_tx,
-                                    multicall_addr,
-                                )
-                                .await?;
-                            } else {
-                                process_event_triggers(
-                                    triggers,
-                                    &event_call_configs,
-                                    &factory_addresses,
-                                    client,
-                                    &base_output_dir,
-                                    rpc_batch_size,
-                                    &decoder_tx,
-                                )
-                                .await?;
-                            }
-                        }
-                        Some(EventTriggerMessage::RangeComplete { .. }) => {
-                            // Range complete - no action needed
-                        }
-                        Some(EventTriggerMessage::AllComplete) | None => {
-                            tracing::debug!("eth_calls: event trigger channel closed");
-                            event_trigger_rx_closed = true;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        tokio::select! {
-            block_result = block_rx.recv() => {
-                match block_result {
-                    Some((block_number, timestamp)) => {
-                        let range_start = (block_number / range_size) * range_size;
-
-                        range_data.entry(range_start).or_default().push(BlockInfo {
-                            block_number,
-                            timestamp,
-                        });
-
-                        if let Some(blocks) = range_data.get(&range_start) {
-                            let expected_blocks: HashSet<u64> =
-                                (range_start..range_start + range_size).collect();
-                            let received_blocks: HashSet<u64> =
-                                blocks.iter().map(|b| b.block_number).collect();
-
-                            if expected_blocks.is_subset(&received_blocks)
-                                && !range_regular_done.contains(&range_start)
-                            {
-                                let range = BlockRange {
-                                    start: range_start,
-                                    end: range_start + range_size,
-                                };
-
-                                if has_regular_calls {
-                                    if let Some(multicall_addr) = multicall3_address {
-                                        process_range_multicall(
-                                            &range,
-                                            blocks.clone(),
-                                            client,
-                                            &call_configs,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            rpc_batch_size,
-                                            max_params,
-                                            &mut frequency_state,
-                                            multicall_addr,
-                                        )
-                                        .await?;
-                                    } else {
-                                        process_range(
-                                            &range,
-                                            blocks.clone(),
-                                            client,
-                                            &call_configs,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            rpc_batch_size,
-                                            max_params,
-                                            &mut frequency_state,
-                                        )
-                                        .await?;
-                                    }
-                                }
-
-                                if has_token_calls {
-                                    if let Some(multicall_addr) = multicall3_address {
-                                        process_token_range_multicall(
-                                            &range,
-                                            blocks.clone(),
-                                            client,
-                                            &token_call_configs,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            rpc_batch_size,
-                                            &mut frequency_state,
-                                            multicall_addr,
-                                        )
-                                        .await?;
-                                    } else {
-                                        process_token_range(
-                                            &range,
-                                            blocks.clone(),
-                                            client,
-                                            &token_call_configs,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            rpc_batch_size,
-                                            &mut frequency_state,
-                                        )
-                                        .await?;
-                                    }
-                                }
-
-                                if has_once_calls {
-                                    if let Some(multicall_addr) = multicall3_address {
-                                        process_once_calls_multicall(
-                                            &range,
-                                            blocks,
-                                            client,
-                                            &once_configs,
-                                            &chain.contracts,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            multicall_addr,
-                                            rpc_batch_size,
-                                        )
-                                        .await?;
-                                    } else {
-                                        process_once_calls_regular(
-                                            &range,
-                                            blocks,
-                                            client,
-                                            &once_configs,
-                                            &chain.contracts,
-                                            &base_output_dir,
-                                            &existing_files,
-                                        )
-                                        .await?;
-                                    }
-                                }
-                                range_regular_done.insert(range_start);
-
-                                if let Some(factory_data) = range_factory_data.get(&range_start) {
-                                    if has_factory_calls && !range_factory_done.contains(&range_start) {
-                                        if let Some(multicall_addr) = multicall3_address {
-                                            process_factory_range_multicall(
-                                                &range,
-                                                blocks,
-                                                client,
-                                                factory_data,
-                                                &factory_call_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                rpc_batch_size,
-                                                factory_max_params,
-                                                &mut frequency_state,
-                                                multicall_addr,
-                                            )
-                                            .await?;
-                                        } else {
-                                            process_factory_range(
-                                                &range,
-                                                blocks,
-                                                client,
-                                                factory_data,
-                                                &factory_call_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                rpc_batch_size,
-                                                factory_max_params,
-                                                &mut frequency_state,
-                                            )
-                                            .await?;
-                                        }
-                                    }
-
-                                    if has_factory_once_calls {
-                                        let empty_index = HashMap::new();
-                                        if let Some(multicall_addr) = multicall3_address {
-                                            process_factory_once_calls_multicall(
-                                                &range,
-                                                client,
-                                                factory_data,
-                                                &factory_once_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                &empty_index,
-                                                multicall_addr,
-                                                rpc_batch_size,
-                                            )
-                                            .await?;
-                                        } else {
-                                            process_factory_once_calls(
-                                                &range,
-                                                client,
-                                                factory_data,
-                                                &factory_once_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                &empty_index,
-                                                &decoder_tx,
-                                            )
-                                            .await?;
-                                        }
-                                    }
-                                    range_factory_done.insert(range_start);
-                                }
-
-                                if range_regular_done.contains(&range_start)
-                                    && (!has_factory_calls || range_factory_done.contains(&range_start))
-                                {
-                                    range_data.remove(&range_start);
-                                    range_factory_data.remove(&range_start);
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        block_rx_closed = true;
-                    }
-                }
-            }
-
-            factory_result = async {
-                match &mut factory_rx {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match factory_result {
-                    Some(FactoryMessage::IncrementalAddresses(factory_data)) => {
-                        let range_start = factory_data.range_start;
-
-                        // Update factory addresses for event trigger filtering
-                        for (_block, addrs) in &factory_data.addresses_by_block {
-                            for (_, addr, collection_name) in addrs {
-                                factory_addresses
-                                    .entry(collection_name.clone())
-                                    .or_default()
-                                    .insert(*addr);
-                            }
-                        }
-
-                        // Merge into existing range_factory_data
-                        let existing = range_factory_data.entry(range_start).or_insert_with(|| {
-                            FactoryAddressData {
-                                range_start: factory_data.range_start,
-                                range_end: factory_data.range_end,
-                                addresses_by_block: HashMap::new(),
-                            }
-                        });
-                        for (block, addrs) in factory_data.addresses_by_block {
-                            existing.addresses_by_block.entry(block).or_default().extend(addrs);
-                        }
-                    }
-                    Some(FactoryMessage::RangeComplete { range_start, range_end }) => {
-                        if range_regular_done.contains(&range_start) {
-                            if has_factory_calls && !range_factory_done.contains(&range_start) {
-                                let range = BlockRange {
-                                    start: range_start,
-                                    end: range_end,
-                                };
-
-                                if let (Some(blocks), Some(factory_data)) = (range_data.get(&range_start), range_factory_data.get(&range_start)) {
-                                    if let Some(multicall_addr) = multicall3_address {
-                                        process_factory_range_multicall(
-                                            &range,
-                                            blocks,
-                                            client,
-                                            factory_data,
-                                            &factory_call_configs,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            rpc_batch_size,
-                                            factory_max_params,
-                                            &mut frequency_state,
-                                            multicall_addr,
-                                        )
-                                        .await?;
-                                    } else {
-                                        process_factory_range(
-                                            &range,
-                                            blocks,
-                                            client,
-                                            factory_data,
-                                            &factory_call_configs,
-                                            &base_output_dir,
-                                            &existing_files,
-                                            rpc_batch_size,
-                                            factory_max_params,
-                                            &mut frequency_state,
-                                        )
-                                        .await?;
-                                    }
-
-                                    if has_factory_once_calls {
-                                        let empty_index = HashMap::new();
-                                        if let Some(multicall_addr) = multicall3_address {
-                                            process_factory_once_calls_multicall(
-                                                &range,
-                                                client,
-                                                factory_data,
-                                                &factory_once_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                &empty_index,
-                                                multicall_addr,
-                                                rpc_batch_size,
-                                            )
-                                            .await?;
-                                        } else {
-                                            process_factory_once_calls(
-                                                &range,
-                                                client,
-                                                factory_data,
-                                                &factory_once_configs,
-                                                &base_output_dir,
-                                                &existing_files,
-                                                &empty_index,
-                                                &decoder_tx,
-                                            )
-                                            .await?;
-                                        }
-                                    }
-                                }
-                                range_factory_done.insert(range_start);
-                            }
-
-                            if range_regular_done.contains(&range_start)
-                                && (!has_factory_calls || range_factory_done.contains(&range_start))
-                            {
-                                range_data.remove(&range_start);
-                                range_factory_data.remove(&range_start);
-                            }
-                        }
-                    }
-                    Some(FactoryMessage::AllComplete) | None => {
-                        factory_rx = None;
-                    }
-                }
-            }
-
-            event_result = async {
-                match &mut event_trigger_rx {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match event_result {
-                    Some(EventTriggerMessage::Triggers(triggers)) => {
-                        if let Some(multicall_addr) = multicall3_address {
-                            process_event_triggers_multicall(
-                                triggers,
-                                &event_call_configs,
-                                &factory_addresses,
-                                client,
-                                &base_output_dir,
-                                rpc_batch_size,
-                                &decoder_tx,
-                                multicall_addr,
-                            )
-                            .await?;
-                        } else {
-                            process_event_triggers(
-                                triggers,
-                                &event_call_configs,
-                                &factory_addresses,
-                                client,
-                                &base_output_dir,
-                                rpc_batch_size,
-                                &decoder_tx,
-                            )
-                            .await?;
-                        }
-                    }
-                    Some(EventTriggerMessage::RangeComplete { .. }) => {
-                        // Range complete - no action needed for event triggers
-                    }
-                    Some(EventTriggerMessage::AllComplete) | None => {
-                        tracing::debug!("eth_calls: event trigger channel closed");
-                        event_trigger_rx_closed = true;
-                    }
-                }
-            }
-        }
-    }
-
-    for (range_start, blocks) in range_data {
-        if blocks.is_empty() {
-            continue;
-        }
-
-        let max_block = blocks
-            .iter()
-            .map(|b| b.block_number)
-            .max()
-            .unwrap_or(range_start);
-        let range = BlockRange {
-            start: range_start,
-            end: max_block + 1,
-        };
-
-        if has_regular_calls && !range_regular_done.contains(&range_start) {
-            if let Some(multicall_addr) = multicall3_address {
-                process_range_multicall(
-                    &range,
-                    blocks.clone(),
-                    client,
-                    &call_configs,
-                    &base_output_dir,
-                    &existing_files,
-                    rpc_batch_size,
-                    max_params,
-                    &mut frequency_state,
-                    multicall_addr,
-                )
-                .await?;
-            } else {
-                process_range(
-                    &range,
-                    blocks.clone(),
-                    client,
-                    &call_configs,
-                    &base_output_dir,
-                    &existing_files,
-                    rpc_batch_size,
-                    max_params,
-                    &mut frequency_state,
-                )
-                .await?;
-            }
-        }
-
-        if has_token_calls && !range_regular_done.contains(&range_start) {
-            if let Some(multicall_addr) = multicall3_address {
-                process_token_range_multicall(
-                    &range,
-                    blocks.clone(),
-                    client,
-                    &token_call_configs,
-                    &base_output_dir,
-                    &existing_files,
-                    rpc_batch_size,
-                    &mut frequency_state,
-                    multicall_addr,
-                )
-                .await?;
-            } else {
-                process_token_range(
-                    &range,
-                    blocks.clone(),
-                    client,
-                    &token_call_configs,
-                    &base_output_dir,
-                    &existing_files,
-                    rpc_batch_size,
-                    &mut frequency_state,
-                )
-                .await?;
-            }
-        }
-
-        if has_once_calls && !range_regular_done.contains(&range_start) {
-            if let Some(multicall_addr) = multicall3_address {
-                process_once_calls_multicall(
-                    &range,
-                    &blocks,
-                    client,
-                    &once_configs,
-                    &chain.contracts,
-                    &base_output_dir,
-                    &existing_files,
-                    multicall_addr,
-                    rpc_batch_size,
-                )
-                .await?;
-            } else {
-                process_once_calls_regular(
-                    &range,
-                    &blocks,
-                    client,
-                    &once_configs,
-                    &chain.contracts,
-                    &base_output_dir,
-                    &existing_files,
-                )
-                .await?;
-            }
-        }
-
-        if has_factory_calls {
-            if let Some(factory_data) = range_factory_data.get(&range_start) {
-                if !range_factory_done.contains(&range_start) {
-                    if let Some(multicall_addr) = multicall3_address {
-                        process_factory_range_multicall(
-                            &range,
-                            &blocks,
-                            client,
-                            factory_data,
-                            &factory_call_configs,
-                            &base_output_dir,
-                            &existing_files,
-                            rpc_batch_size,
-                            factory_max_params,
-                            &mut frequency_state,
-                            multicall_addr,
-                        )
-                        .await?;
-                    } else {
-                        process_factory_range(
-                            &range,
-                            &blocks,
-                            client,
-                            factory_data,
-                            &factory_call_configs,
-                            &base_output_dir,
-                            &existing_files,
-                            rpc_batch_size,
-                            factory_max_params,
-                            &mut frequency_state,
-                        )
-                        .await?;
-                    }
-
-                    if has_factory_once_calls {
-                        let empty_index = HashMap::new();
-                        if let Some(multicall_addr) = multicall3_address {
-                            process_factory_once_calls_multicall(
-                                &range,
-                                client,
-                                factory_data,
-                                &factory_once_configs,
-                                &base_output_dir,
-                                &existing_files,
-                                &empty_index,
-                                multicall_addr,
-                                rpc_batch_size,
-                            )
-                            .await?;
-                        } else {
-                            process_factory_once_calls(
-                                &range,
-                                client,
-                                factory_data,
-                                &factory_once_configs,
-                                &base_output_dir,
-                                &existing_files,
-                                &empty_index,
-                                &decoder_tx,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Signal decoder that all ranges are complete
-    if let Some(tx) = decoder_tx {
-        let _ = tx.send(DecoderMessage::AllComplete).await;
-    }
-
-    tracing::info!("Eth_call collection complete for chain {}", chain.name);
-    Ok(())
+/// State computed during catchup and passed to the current/streaming phase
+pub(crate) struct EthCallCatchupState {
+    // Immutable configs
+    pub(crate) base_output_dir: PathBuf,
+    pub(crate) range_size: u64,
+    pub(crate) rpc_batch_size: usize,
+    pub(crate) multicall3_address: Option<Address>,
+    pub(crate) call_configs: Vec<CallConfig>,
+    pub(crate) factory_call_configs: HashMap<String, Vec<EthCallConfig>>,
+    pub(crate) event_call_configs: HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
+    pub(crate) token_call_configs: Vec<TokenCallConfig>,
+    pub(crate) once_configs: HashMap<String, Vec<OnceCallConfig>>,
+    pub(crate) factory_once_configs: HashMap<String, Vec<OnceCallConfig>>,
+    // Feature flags
+    pub(crate) has_regular_calls: bool,
+    pub(crate) has_once_calls: bool,
+    pub(crate) has_factory_calls: bool,
+    pub(crate) has_factory_once_calls: bool,
+    pub(crate) has_event_triggered_calls: bool,
+    pub(crate) has_token_calls: bool,
+    // Derived constants
+    pub(crate) max_params: usize,
+    pub(crate) factory_max_params: usize,
+    pub(crate) existing_files: HashSet<String>,
+    // Mutable state carried from catchup
+    pub(crate) factory_addresses: HashMap<String, HashSet<Address>>,
+    pub(crate) frequency_state: FrequencyState,
+    pub(crate) range_data: HashMap<u64, Vec<BlockInfo>>,
+    pub(crate) range_factory_data: HashMap<u64, FactoryAddressData>,
+    pub(crate) range_regular_done: HashSet<u64>,
+    pub(crate) range_factory_done: HashSet<u64>,
 }
 
 // NOTE: build_factory_call_configs was removed - use get_factory_call_configs from factories.rs instead
 
 /// Build event-triggered call configs from contracts configuration
 /// Returns a map from (source_name, event_signature_hash) -> Vec<EventTriggeredCallConfig>
-fn build_event_triggered_call_configs(
+pub(crate) fn build_event_triggered_call_configs(
     contracts: &Contracts,
 ) -> HashMap<EventCallKey, Vec<EventTriggeredCallConfig>> {
     let mut configs: HashMap<EventCallKey, Vec<EventTriggeredCallConfig>> = HashMap::new();
@@ -1507,13 +283,13 @@ fn build_event_triggered_call_configs(
 }
 
 /// Compute the keccak256 hash of an event signature
-fn compute_event_signature_hash(signature: &str) -> [u8; 32] {
+pub(crate) fn compute_event_signature_hash(signature: &str) -> [u8; 32] {
     use alloy::primitives::keccak256;
     keccak256(signature.as_bytes()).0
 }
 
 /// Extract a parameter value from event data (topics or data fields)
-fn extract_param_from_event(
+pub(crate) fn extract_param_from_event(
     trigger: &EventTriggerData,
     from_event: &str,
     param_type: &EvmType,
@@ -1598,7 +374,7 @@ fn extract_param_from_event(
 }
 
 /// Extract a typed value from a 32-byte word
-fn extract_value_from_32_bytes(
+pub(crate) fn extract_value_from_32_bytes(
     bytes: &[u8; 32],
     param_type: &EvmType,
 ) -> Result<(DynSolValue, Vec<u8>), EthCallCollectionError> {
@@ -1727,7 +503,7 @@ fn extract_value_from_32_bytes(
 
 /// Build parameters for an event-triggered call
 /// Encode calldata for "once" calls that have self-address params
-fn encode_once_call_params(
+pub(crate) fn encode_once_call_params(
     function_selector: [u8; 4],
     param_configs: &[ParamConfig],
     self_address: Address,
@@ -1776,7 +552,7 @@ fn encode_once_call_params(
     Ok(encode_call_with_params(function_selector, &params))
 }
 
-fn build_event_call_params(
+pub(crate) fn build_event_call_params(
     trigger: &EventTriggerData,
     param_configs: &[ParamConfig],
 ) -> Result<(Vec<DynSolValue>, Vec<Vec<u8>>), EthCallCollectionError> {
@@ -1833,7 +609,7 @@ fn build_event_call_params(
 }
 
 /// Process event triggers and make eth_calls
-async fn process_event_triggers(
+pub(crate) async fn process_event_triggers(
     triggers: Vec<EventTriggerData>,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
     factory_addresses: &HashMap<String, HashSet<Address>>,
@@ -2040,7 +816,7 @@ async fn process_event_triggers(
 }
 
 /// Process event triggers using Multicall3 aggregate3 to batch all calls per block
-async fn process_event_triggers_multicall(
+pub(crate) async fn process_event_triggers_multicall(
     triggers: Vec<EventTriggerData>,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
     factory_addresses: &HashMap<String, HashSet<Address>>,
@@ -2271,7 +1047,7 @@ async fn process_event_triggers_multicall(
 }
 
 /// Write event-triggered call results to parquet
-fn write_event_call_results_to_parquet(
+pub(crate) fn write_event_call_results_to_parquet(
     results: &[EventCallResult],
     output_path: &Path,
     num_params: usize,
@@ -2328,7 +1104,7 @@ fn write_event_call_results_to_parquet(
 }
 
 /// Build schema for event-triggered call results
-fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
+pub(crate) fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
@@ -2350,7 +1126,7 @@ fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
 
 /// Load historical factory addresses from parquet files for event trigger catchup
 /// This ensures factory addresses are known before processing historical event triggers
-fn load_historical_factory_addresses(
+pub(crate) fn load_historical_factory_addresses(
     chain_name: &str,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
 ) -> HashMap<String, HashSet<Address>> {
@@ -2430,7 +1206,7 @@ fn load_historical_factory_addresses(
 
 /// Load factory addresses with block numbers and timestamps for once-call catchup.
 /// Returns a map of collection_name -> Vec<(address, block_number, timestamp)>
-fn load_factory_addresses_for_once_catchup(
+pub(crate) fn load_factory_addresses_for_once_catchup(
     chain_name: &str,
     factory_once_configs: &HashMap<String, Vec<OnceCallConfig>>,
 ) -> HashMap<String, Vec<(Address, u64, u64)>> {
@@ -2500,7 +1276,7 @@ fn load_factory_addresses_for_once_catchup(
 }
 
 /// Read factory addresses with block number and timestamp from a parquet file
-fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Address, u64, u64)>, std::io::Error> {
+pub(crate) fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Address, u64, u64)>, std::io::Error> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = File::open(path)?;
@@ -2571,7 +1347,7 @@ fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Address, u64, 
 }
 
 /// Read factory addresses from a parquet file
-fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, std::io::Error> {
+pub(crate) fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, std::io::Error> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = File::open(path)?;
@@ -2622,14 +1398,14 @@ fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>,
 
 /// Existing log range info for catchup
 #[derive(Debug, Clone)]
-struct ExistingLogRange {
-    start: u64,
-    end: u64,
-    file_path: PathBuf,
+pub(crate) struct ExistingLogRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) file_path: PathBuf,
 }
 
 /// Get existing log file ranges for catchup
-fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
+pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
     let logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain_name));
     let mut ranges = Vec::new();
 
@@ -2681,7 +1457,7 @@ fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
 }
 
 /// Read logs from a parquet file for catchup
-fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, EthCallCollectionError> {
+pub(crate) fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, EthCallCollectionError> {
     use arrow::array::{Array, ListArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -2781,7 +1557,7 @@ fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, EthCallColle
 }
 
 /// Check if on_events output already exists for a range
-fn event_output_exists(
+pub(crate) fn event_output_exists(
     output_dir: &Path,
     contract_name: &str,
     function_name: &str,
@@ -2821,7 +1597,7 @@ fn event_output_exists(
     false
 }
 
-async fn process_factory_range(
+pub(crate) async fn process_factory_range(
     range: &BlockRange,
     blocks: &[BlockInfo],
     client: &UnifiedRpcClient,
@@ -3055,7 +1831,7 @@ async fn process_factory_range(
 }
 
 /// Process factory calls using Multicall3 aggregate3 to batch all calls per block
-async fn process_factory_range_multicall(
+pub(crate) async fn process_factory_range_multicall(
     range: &BlockRange,
     blocks: &[BlockInfo],
     client: &UnifiedRpcClient,
@@ -3315,7 +2091,7 @@ async fn process_factory_range_multicall(
     Ok(())
 }
 
-fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
+pub(crate) fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
     if params.is_empty() {
         return Ok(vec![vec![]]);
     }
@@ -3352,7 +2128,7 @@ fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmTyp
     Ok(result)
 }
 
-fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallCollectionError> {
+pub(crate) fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallCollectionError> {
     let mut configs = Vec::new();
 
     for (contract_name, contract) in contracts {
@@ -3426,25 +2202,25 @@ fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallC
 
 /// Configuration for a token pool call
 #[derive(Debug, Clone)]
-struct TokenCallConfig {
+pub(crate) struct TokenCallConfig {
     /// Token name (used for output directory naming as {token_name}_pool)
-    token_name: String,
+    pub(crate) token_name: String,
     /// Pool type (v2, v3, v4)
-    pool_type: PoolType,
+    pub(crate) pool_type: PoolType,
     /// Target address for the call (pool address for v2/v3, StateView for v4)
-    target_address: Address,
+    pub(crate) target_address: Address,
     /// Function name (e.g., "slot0")
-    function_name: String,
+    pub(crate) function_name: String,
     /// Encoded calldata including selector and any params
-    encoded_calldata: Bytes,
+    pub(crate) encoded_calldata: Bytes,
     /// Call frequency
-    frequency: Frequency,
+    pub(crate) frequency: Frequency,
     /// Output type for decoding
-    output_type: EvmType,
+    pub(crate) output_type: EvmType,
 }
 
 /// Build call configs from token pool configurations
-fn build_token_call_configs(
+pub(crate) fn build_token_call_configs(
     tokens: &Tokens,
     contracts: &Contracts,
 ) -> Result<Vec<TokenCallConfig>, EthCallCollectionError> {
@@ -3537,7 +2313,7 @@ fn build_token_call_configs(
     Ok(configs)
 }
 
-fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
+pub(crate) fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
     let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
 
     for (contract_name, contract) in contracts {
@@ -3619,7 +2395,7 @@ fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCal
     configs
 }
 
-fn build_factory_once_call_configs(
+pub(crate) fn build_factory_once_call_configs(
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
     contracts: &Contracts,
 ) -> HashMap<String, Vec<OnceCallConfig>> {
@@ -3702,7 +2478,7 @@ fn build_factory_once_call_configs(
     configs
 }
 
-fn filter_blocks_for_frequency<'a>(
+pub(crate) fn filter_blocks_for_frequency<'a>(
     blocks: &'a [BlockInfo],
     frequency: &Frequency,
     last_call_timestamp: Option<u64>,
@@ -3726,7 +2502,7 @@ fn filter_blocks_for_frequency<'a>(
     }
 }
 
-async fn process_once_calls_regular(
+pub(crate) async fn process_once_calls_regular(
     range: &BlockRange,
     blocks: &[BlockInfo],
     client: &UnifiedRpcClient,
@@ -3954,7 +2730,7 @@ async fn process_once_calls_regular(
     Ok(())
 }
 
-async fn process_factory_once_calls(
+pub(crate) async fn process_factory_once_calls(
     range: &BlockRange,
     client: &UnifiedRpcClient,
     factory_data: &FactoryAddressData,
@@ -4305,7 +3081,7 @@ async fn process_factory_once_calls(
 }
 
 /// Process regular once calls using Multicall3 aggregate3
-async fn process_once_calls_multicall(
+pub(crate) async fn process_once_calls_multicall(
     range: &BlockRange,
     blocks: &[BlockInfo],
     client: &UnifiedRpcClient,
@@ -4526,7 +3302,7 @@ async fn process_once_calls_multicall(
 }
 
 /// Process factory once calls using Multicall3 aggregate3
-async fn process_factory_once_calls_multicall(
+pub(crate) async fn process_factory_once_calls_multicall(
     range: &BlockRange,
     client: &UnifiedRpcClient,
     factory_data: &FactoryAddressData,
@@ -4898,7 +3674,7 @@ async fn process_factory_once_calls_multicall(
     Ok(())
 }
 
-fn compute_function_selector(signature: &str) -> [u8; 4] {
+pub(crate) fn compute_function_selector(signature: &str) -> [u8; 4] {
     use alloy::primitives::keccak256;
     let hash = keccak256(signature.as_bytes());
     let mut selector = [0u8; 4];
@@ -4906,7 +3682,7 @@ fn compute_function_selector(signature: &str) -> [u8; 4] {
     selector
 }
 
-async fn process_range(
+pub(crate) async fn process_range(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
     client: &UnifiedRpcClient,
@@ -5092,7 +3868,7 @@ async fn process_range(
 }
 
 /// Process regular calls using Multicall3 aggregate3 to batch all calls per block
-async fn process_range_multicall(
+pub(crate) async fn process_range_multicall(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
     client: &UnifiedRpcClient,
@@ -5304,7 +4080,7 @@ async fn process_range_multicall(
 
 /// Build aggregate3 calldata for a batch of (target, calldata) pairs.
 /// Encodes as: aggregate3((address target, bool allowFailure, bytes callData)[])
-fn build_multicall_calldata(calls: &[(Address, &Bytes)]) -> Bytes {
+pub(crate) fn build_multicall_calldata(calls: &[(Address, &Bytes)]) -> Bytes {
     // aggregate3((address,bool,bytes)[]) selector
     let selector = compute_function_selector("aggregate3((address,bool,bytes)[])");
 
@@ -5326,7 +4102,7 @@ fn build_multicall_calldata(calls: &[(Address, &Bytes)]) -> Bytes {
 
 /// Decode the return data from an aggregate3 call.
 /// Returns Vec<(success: bool, returnData: Vec<u8>)>.
-fn decode_multicall_results(
+pub(crate) fn decode_multicall_results(
     return_data: &[u8],
     expected_count: usize,
 ) -> Result<Vec<(bool, Vec<u8>)>, String> {
@@ -5377,10 +4153,10 @@ fn decode_multicall_results(
 }
 
 /// Tracks which group and config index a multicall slot maps back to
-struct MulticallSlot<'a> {
-    group_key: (String, String), // (token_name, function_name)
-    config: &'a TokenCallConfig,
-    block: BlockInfo,
+pub(crate) struct MulticallSlot<'a> {
+    pub(crate) group_key: (String, String), // (token_name, function_name)
+    pub(crate) config: &'a TokenCallConfig,
+    pub(crate) block: BlockInfo,
 }
 
 // =============================================================================
@@ -5389,59 +4165,59 @@ struct MulticallSlot<'a> {
 
 /// Generic slot for tracking call metadata through multicall execution
 #[derive(Clone)]
-struct MulticallSlotGeneric<M> {
-    block_number: u64,
-    block_timestamp: u64,
-    target_address: Address,
-    encoded_calldata: Bytes,
-    metadata: M,
+pub(crate) struct MulticallSlotGeneric<M> {
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: u64,
+    pub(crate) target_address: Address,
+    pub(crate) encoded_calldata: Bytes,
+    pub(crate) metadata: M,
 }
 
 /// Pending multicall for a single block
-struct BlockMulticall<M> {
-    block_number: u64,
-    block_id: BlockId,
-    slots: Vec<MulticallSlotGeneric<M>>,
+pub(crate) struct BlockMulticall<M> {
+    pub(crate) block_number: u64,
+    pub(crate) block_id: BlockId,
+    pub(crate) slots: Vec<MulticallSlotGeneric<M>>,
 }
 
 /// Metadata for regular calls
 #[derive(Clone)]
-struct RegularCallMeta {
-    contract_name: String,
-    function_name: String,
-    contract_address: Address,
-    param_values: Vec<Vec<u8>>,
+pub(crate) struct RegularCallMeta {
+    pub(crate) contract_name: String,
+    pub(crate) function_name: String,
+    pub(crate) contract_address: Address,
+    pub(crate) param_values: Vec<Vec<u8>>,
 }
 
 /// Metadata for factory calls
 #[derive(Clone)]
-struct FactoryCallMeta {
-    collection_name: String,
-    function_name: String,
-    contract_address: Address,
-    param_values: Vec<Vec<u8>>,
+pub(crate) struct FactoryCallMeta {
+    pub(crate) collection_name: String,
+    pub(crate) function_name: String,
+    pub(crate) contract_address: Address,
+    pub(crate) param_values: Vec<Vec<u8>>,
 }
 
 /// Metadata for event-triggered calls
 #[derive(Clone)]
-struct EventCallMeta {
-    contract_name: String,
-    function_name: String,
-    target_address: Address,
-    log_index: u32,
-    param_values: Vec<Vec<u8>>,
+pub(crate) struct EventCallMeta {
+    pub(crate) contract_name: String,
+    pub(crate) function_name: String,
+    pub(crate) target_address: Address,
+    pub(crate) log_index: u32,
+    pub(crate) param_values: Vec<Vec<u8>>,
 }
 
 /// Metadata for once calls
 #[derive(Clone)]
-struct OnceCallMeta {
-    contract_name: String,
-    function_name: String,
-    contract_address: Address,
+pub(crate) struct OnceCallMeta {
+    pub(crate) contract_name: String,
+    pub(crate) function_name: String,
+    pub(crate) contract_address: Address,
 }
 
 /// Execute multicalls and return (metadata, return_data, success) for each slot
-async fn execute_multicalls_generic<M: Clone>(
+pub(crate) async fn execute_multicalls_generic<M: Clone>(
     client: &UnifiedRpcClient,
     multicall3_address: Address,
     block_multicalls: Vec<BlockMulticall<M>>,
@@ -5521,7 +4297,7 @@ async fn execute_multicalls_generic<M: Clone>(
 // =============================================================================
 
 /// Process token pool calls using Multicall3 aggregate3 to batch all calls per block
-async fn process_token_range_multicall(
+pub(crate) async fn process_token_range_multicall(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
     client: &UnifiedRpcClient,
@@ -5801,7 +4577,7 @@ async fn process_token_range_multicall(
 }
 
 /// Process token pool calls for a range of blocks
-async fn process_token_range(
+pub(crate) async fn process_token_range(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
     client: &UnifiedRpcClient,
@@ -5947,7 +4723,7 @@ async fn process_token_range(
     Ok(())
 }
 
-fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
+pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     let mut files = HashSet::new();
 
     // Scan nested directories: dir/contract/function/*.parquet
@@ -5990,7 +4766,7 @@ fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     files
 }
 
-fn build_schema(num_params: usize) -> Arc<Schema> {
+pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
@@ -6009,7 +4785,7 @@ fn build_schema(num_params: usize) -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
-fn write_results_to_parquet(
+pub(crate) fn write_results_to_parquet(
     results: &[CallResult],
     output_path: &Path,
     num_params: usize,
@@ -6060,7 +4836,7 @@ fn write_results_to_parquet(
     Ok(())
 }
 
-fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
+pub(crate) fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
@@ -6080,7 +4856,7 @@ fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
 
 /// Read the column index sidecar file from a `once/` directory.
 /// Returns a map of filename -> list of function names whose `{name}_result` columns are present.
-fn read_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
+pub(crate) fn read_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
     let index_path = once_dir.join("column_index.json");
     match std::fs::read_to_string(&index_path) {
         Ok(content) => {
@@ -6104,7 +4880,7 @@ fn read_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
 }
 
 /// Write the column index sidecar file to a `once/` directory.
-fn write_once_column_index(
+pub(crate) fn write_once_column_index(
     once_dir: &Path,
     index: &HashMap<String, Vec<String>>,
 ) -> Result<(), EthCallCollectionError> {
@@ -6123,7 +4899,7 @@ fn write_once_column_index(
 
 /// Load or build the column index for a once/ directory.
 /// If the index file exists, load it. Otherwise, scan all parquet files to build it.
-fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
+pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
     let index_path = once_dir.join("column_index.json");
 
     // Try to load existing index
@@ -6191,7 +4967,7 @@ fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String, Vec<Strin
 
 /// Read column names from a parquet file's schema (for fallback when index is missing).
 /// Returns function names by stripping the `_result` suffix from column names.
-fn read_parquet_column_names(path: &Path) -> HashSet<String> {
+pub(crate) fn read_parquet_column_names(path: &Path) -> HashSet<String> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     let file = match File::open(path) {
@@ -6219,7 +4995,7 @@ fn read_parquet_column_names(path: &Path) -> HashSet<String> {
 }
 
 /// Read an existing once-call parquet file and return all record batches.
-fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
+pub(crate) fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     tracing::debug!("Reading existing once parquet from {}", path.display());
     let file = File::open(path)?;
@@ -6240,7 +5016,7 @@ fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCo
 
 /// Extract addresses from existing once-call parquet file.
 /// Returns a map of address bytes -> (block_number, timestamp).
-fn extract_addresses_from_once_parquet(
+pub(crate) fn extract_addresses_from_once_parquet(
     batches: &[RecordBatch],
 ) -> HashMap<[u8; 20], (u64, u64)> {
     let mut addresses = HashMap::new();
@@ -6280,7 +5056,7 @@ fn extract_addresses_from_once_parquet(
 /// Extract existing non-null results for specific function columns from parquet.
 /// Returns a map of address bytes -> function_name -> result bytes.
 /// Only includes addresses that have non-null, non-empty data for at least one of the requested columns.
-fn extract_existing_results_from_parquet(
+pub(crate) fn extract_existing_results_from_parquet(
     batches: &[RecordBatch],
     fn_names: &[String],
 ) -> HashMap<[u8; 20], HashMap<String, Vec<u8>>> {
@@ -6336,7 +5112,7 @@ fn extract_existing_results_from_parquet(
 /// Merge new function result columns into existing once-call record batches.
 /// Matches rows by the `address` column (FixedSizeBinary(20)).
 /// Returns a single merged RecordBatch.
-fn merge_once_columns(
+pub(crate) fn merge_once_columns(
     existing_batches: &[RecordBatch],
     new_results: &HashMap<[u8; 20], HashMap<String, Vec<u8>>>,
     new_fn_names: &[String],
@@ -6436,7 +5212,7 @@ fn merge_once_columns(
     Ok(merged)
 }
 
-fn write_once_results_to_parquet(
+pub(crate) fn write_once_results_to_parquet(
     results: &[OnceCallResult],
     output_path: &Path,
     function_names: &[String],

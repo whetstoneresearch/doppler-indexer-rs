@@ -584,27 +584,63 @@ impl EvmType {
                 return Err(EvmTypeParseError::EmptyField);
             }
 
-            // Each field is "type name"
-            let parts: Vec<&str> = field.splitn(2, ' ').collect();
-            if parts.len() != 2 {
-                return Err(EvmTypeParseError::InvalidTuple(format!(
-                    "field '{}' must have type and name",
-                    field
-                )));
+            // Each field is "type name" — but type may be a nested tuple like
+            // "(address currency0, address currency1, uint24 fee) poolKey"
+            if field.starts_with('(') {
+                // Find the matching closing paren for the nested tuple
+                let mut depth = 0;
+                let mut close_idx = None;
+                for (i, c) in field.char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close_idx = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let close_idx = close_idx.ok_or_else(|| {
+                    EvmTypeParseError::InvalidTuple(format!(
+                        "unmatched parenthesis in field '{}'",
+                        field
+                    ))
+                })?;
+                let tuple_str = &field[..=close_idx];
+                let name = field[close_idx + 1..].trim();
+                if name.is_empty() {
+                    return Err(EvmTypeParseError::InvalidTuple(format!(
+                        "nested tuple field '{}' must have a name",
+                        field
+                    )));
+                }
+                let field_type = Self::parse_named_tuple(tuple_str)?;
+                parsed_fields.push((name.to_string(), Box::new(field_type)));
+            } else {
+                let parts: Vec<&str> = field.splitn(2, ' ').collect();
+                if parts.len() != 2 {
+                    return Err(EvmTypeParseError::InvalidTuple(format!(
+                        "field '{}' must have type and name",
+                        field
+                    )));
+                }
+
+                let type_str = parts[0].trim();
+                let name = parts[1].trim();
+
+                if name.is_empty() {
+                    return Err(EvmTypeParseError::InvalidTuple(format!(
+                        "field '{}' has empty name",
+                        field
+                    )));
+                }
+
+                let field_type = Self::parse_simple(type_str)?;
+                parsed_fields.push((name.to_string(), Box::new(field_type)));
             }
-
-            let type_str = parts[0].trim();
-            let name = parts[1].trim();
-
-            if name.is_empty() {
-                return Err(EvmTypeParseError::InvalidTuple(format!(
-                    "field '{}' has empty name",
-                    field
-                )));
-            }
-
-            let field_type = Self::parse_simple(type_str)?;
-            parsed_fields.push((name.to_string(), Box::new(field_type)));
         }
 
         Ok(EvmType::NamedTuple(parsed_fields))

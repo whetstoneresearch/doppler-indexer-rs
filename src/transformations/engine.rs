@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
@@ -1061,7 +1062,15 @@ impl TransformationEngine {
         mut events_rx: Receiver<DecodedEventsMessage>,
         mut calls_rx: Receiver<DecodedCallsMessage>,
         mut _complete_rx: Receiver<RangeCompleteMessage>,
+        decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<(), TransformationError> {
+        // Wait for decode catchup to finish so all decoded parquet files exist
+        if let Some(rx) = decode_catchup_done_rx {
+            tracing::info!("Waiting for eth_call decode catchup to complete before transformation catchup...");
+            let _ = rx.await;
+            tracing::info!("Eth_call decode catchup complete, proceeding with transformation catchup");
+        }
+
         // Run catchup first
         self.run_catchup().await?;
 

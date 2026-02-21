@@ -11,18 +11,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
 use raw_data::decoding::{decode_eth_calls, decode_logs, DecoderMessage};
-use raw_data::historical::blocks::collect_blocks;
-use raw_data::historical::eth_calls::collect_eth_calls;
-use raw_data::historical::factories::{collect_factories, FactoryMessage, RecollectRequest};
-use raw_data::historical::logs::collect_logs;
+use raw_data::historical::catchup::blocks::collect_blocks;
+use raw_data::historical::factories::{FactoryMessage, RecollectRequest};
 use raw_data::historical::receipts::{
-    build_event_trigger_matchers, collect_receipts, EventTriggerMessage, LogMessage,
+    build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
 use transformations::{
@@ -176,7 +174,7 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
             async move {
                 let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
                 drop(_tx);
-                decode_eth_calls(&chain, &cfg, rx, None)
+                decode_eth_calls(&chain, &cfg, rx, None, None, None)
                     .await
                     .context("eth call decoding failed")
             }
@@ -291,6 +289,23 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     let (recollect_tx, recollect_rx) =
         optional_channel::<RecollectRequest>(needs_recollect, channel_cap);
 
+    // Catchup synchronization barriers:
+    // Factory catchup must complete before factory-dependent eth_call catchup
+    let (factory_catchup_done_tx, factory_catchup_done_rx) = if has_factories {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Eth_call catchup must complete before decode catchup
+    let (eth_calls_catchup_done_tx, eth_calls_catchup_done_rx) = if has_calls {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let event_matchers = if has_event_triggered_calls {
         build_event_trigger_matchers(&chain.contracts)
     } else {
@@ -307,6 +322,14 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
     let (_transform_complete_tx, transform_complete_rx) =
         optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
+
+    // Decode catchup must complete before transformation engine catchup
+    let (decode_catchup_done_tx, decode_catchup_done_rx) = if transformations_enabled && has_calls {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     let db_pool = if transformations_enabled {
         let tc = config.transformations.as_ref().unwrap();
@@ -422,13 +445,28 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
+        let log_tx = Some(log_tx);
         async move {
-            collect_receipts(
+            // Catchup: process existing block ranges missing receipts
+            raw_data::historical::catchup::receipts::collect_receipts(
+                &chain,
+                &receipts_client,
+                &cfg,
+                &log_tx,
+                &factory_log_tx,
+                &event_trigger_tx,
+                &event_matchers,
+            )
+            .await
+            .context("receipt catchup failed")?;
+
+            // Current: process new blocks from channel
+            raw_data::historical::current::receipts::collect_receipts(
                 &chain,
                 &receipts_client,
                 &cfg,
                 block_rx,
-                Some(log_tx),
+                log_tx,
                 factory_log_tx,
                 event_trigger_tx,
                 event_matchers,
@@ -442,26 +480,53 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
         async move {
-            collect_logs(&chain, &cfg, log_rx, logs_factory_rx, log_decoder_tx)
-                .await
-                .context("log collection failed")
+            let catchup_state =
+                raw_data::historical::catchup::logs::collect_logs(&chain, &cfg)
+                    .await
+                    .context("log catchup failed")?;
+
+            raw_data::historical::current::logs::collect_logs(
+                &chain,
+                log_rx,
+                logs_factory_rx,
+                log_decoder_tx,
+                catchup_state,
+            )
+            .await
+            .context("log collection failed")
         }
     });
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
         async move {
-            collect_eth_calls(
+            // Catchup: process existing block/log ranges
+            let catchup_state =
+                raw_data::historical::catchup::eth_calls::collect_eth_calls(
+                    &chain,
+                    &eth_calls_client,
+                    &cfg,
+                    &call_decoder_tx,
+                    eth_calls_factory_rx.is_some(),
+                    event_trigger_rx.is_some(),
+                    factory_catchup_done_rx,
+                    eth_calls_catchup_done_tx,
+                )
+                .await
+                .context("eth_calls catchup failed")?;
+
+            // Current: process new blocks/factory/event data from channels
+            raw_data::historical::current::eth_calls::collect_eth_calls(
                 &chain,
                 &eth_calls_client,
-                &cfg,
                 eth_call_rx,
                 eth_calls_factory_rx,
                 event_trigger_rx,
                 call_decoder_tx,
+                catchup_state,
             )
             .await
-            .context("eth call collection failed")
+            .context("eth_calls collection failed")
         }
     });
 
@@ -469,7 +534,23 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
-                collect_factories(
+                // Catchup: load existing factory data and process gaps
+                let catchup_state =
+                    raw_data::historical::catchup::factories::collect_factories(
+                        &chain,
+                        &cfg,
+                        &logs_factory_tx,
+                        &eth_calls_factory_tx,
+                        &log_decoder_tx_for_factories,
+                        &call_decoder_tx_for_factories,
+                        &recollect_tx_for_factories,
+                        factory_catchup_done_tx,
+                    )
+                    .await
+                    .context("factory catchup failed")?;
+
+                // Current: process new logs from channel
+                raw_data::historical::current::factories::collect_factories(
                     &chain,
                     &cfg,
                     factory_log_rx.unwrap(),
@@ -477,7 +558,9 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
                     eth_calls_factory_tx,
                     log_decoder_tx_for_factories,
                     call_decoder_tx_for_factories,
-                    recollect_tx_for_factories,
+                    catchup_state.matchers,
+                    catchup_state.existing_files,
+                    catchup_state.output_dir,
                 )
                 .await
                 .context("factory collection failed")
@@ -502,7 +585,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
-                decode_eth_calls(&chain, &cfg, call_decoder_rx.unwrap(), transform_calls_tx)
+                decode_eth_calls(&chain, &cfg, call_decoder_rx.unwrap(), transform_calls_tx, eth_calls_catchup_done_rx, decode_catchup_done_tx)
                     .await
                     .context("eth call decoding failed")
             }
@@ -550,6 +633,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
                     transform_events_rx.unwrap(),
                     transform_calls_rx.unwrap(),
                     transform_complete_rx.unwrap(),
+                    decode_catchup_done_rx,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))
