@@ -36,7 +36,7 @@
 //!
 //!     async fn handle(
 //!         &self,
-//!         ctx: &TransformationContext<'_>,
+//!         ctx: &TransformationContext,
 //!     ) -> Result<Vec<DbOperation>, TransformationError> {
 //!         let mut ops = Vec::new();
 //!         for event in ctx.events_of_type("MyContract", "Swap") {

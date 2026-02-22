@@ -121,12 +121,11 @@ impl HistoricalDataReader {
     }
 
     /// Query historical events from parquet files.
+    /// All matching files are read concurrently using `spawn_blocking`.
     pub async fn query_events(
         &self,
         query: HistoricalEventQuery,
     ) -> Result<Vec<DecodedEvent>, TransformationError> {
-        let mut results = Vec::new();
-
         // Determine which files to read
         let files = {
             let index = self.file_index.read().unwrap();
@@ -139,37 +138,34 @@ impl HistoricalDataReader {
             )
         };
 
+        let mut read_tasks = tokio::task::JoinSet::new();
         for (source, event_name, file_path, _range_start, _range_end) in files {
-            let events = tokio::task::spawn_blocking({
-                let file_path = file_path.clone();
-                let query = query.clone();
-                let source = source.clone();
-                let event_name = event_name.clone();
-                move || read_events_from_parquet(&file_path, &query, &source, &event_name)
-            })
-            .await
-            .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
+            let query = query.clone();
+            read_tasks.spawn_blocking(move || {
+                read_events_from_parquet(&file_path, &query, &source, &event_name)
+            });
+        }
 
+        let mut results = Vec::new();
+        while let Some(result) = read_tasks.join_next().await {
+            let events = result
+                .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
             results.extend(events);
+        }
 
-            if let Some(limit) = query.limit {
-                if results.len() >= limit {
-                    results.truncate(limit);
-                    break;
-                }
-            }
+        if let Some(limit) = query.limit {
+            results.truncate(limit);
         }
 
         Ok(results)
     }
 
     /// Query historical call results from parquet files.
+    /// All matching files are read concurrently using `spawn_blocking`.
     pub async fn query_calls(
         &self,
         query: HistoricalCallQuery,
     ) -> Result<Vec<DecodedCall>, TransformationError> {
-        let mut results = Vec::new();
-
         let files = {
             let index = self.file_index.read().unwrap();
             self.find_files_for_range(
@@ -181,25 +177,23 @@ impl HistoricalDataReader {
             )
         };
 
+        let mut read_tasks = tokio::task::JoinSet::new();
         for (source, function_name, file_path, _range_start, _range_end) in files {
-            let calls = tokio::task::spawn_blocking({
-                let file_path = file_path.clone();
-                let query = query.clone();
-                let source = source.clone();
-                let function_name = function_name.clone();
-                move || read_calls_from_parquet(&file_path, &query, &source, &function_name)
-            })
-            .await
-            .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
+            let query = query.clone();
+            read_tasks.spawn_blocking(move || {
+                read_calls_from_parquet(&file_path, &query, &source, &function_name)
+            });
+        }
 
+        let mut results = Vec::new();
+        while let Some(result) = read_tasks.join_next().await {
+            let calls = result
+                .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
             results.extend(calls);
+        }
 
-            if let Some(limit) = query.limit {
-                if results.len() >= limit {
-                    results.truncate(limit);
-                    break;
-                }
-            }
+        if let Some(limit) = query.limit {
+            results.truncate(limit);
         }
 
         Ok(results)

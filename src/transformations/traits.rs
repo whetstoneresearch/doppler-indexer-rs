@@ -58,7 +58,7 @@ pub trait TransformationHandler: Send + Sync + 'static {
     /// execute transactionally.
     async fn handle(
         &self,
-        ctx: &TransformationContext<'_>,
+        ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError>;
 
     /// Optional: Called once at startup for initialization.

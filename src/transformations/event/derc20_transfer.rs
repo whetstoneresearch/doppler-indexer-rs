@@ -30,7 +30,7 @@ impl TransformationHandler for DERC20TransferHandler {
 
     async fn handle(
         &self,
-        ctx: &TransformationContext<'_>,
+        ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError>{
         let mut ops = Vec::new();
 

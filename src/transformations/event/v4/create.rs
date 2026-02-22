@@ -55,7 +55,7 @@ impl TransformationHandler for V4CreateHandler {
 
     async fn handle(
         &self,
-        ctx: &TransformationContext<'_>,
+        ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError>{
         let mut ops = Vec::new();
 

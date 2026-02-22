@@ -322,9 +322,9 @@ pub struct TransactionAddresses {
 ///
 /// Contains all decoded data for the current block range plus utilities
 /// for querying historical data and making additional RPC calls.
-pub struct TransformationContext<'a> {
+pub struct TransformationContext {
     // ===== Chain Information =====
-    pub chain_name: &'a str,
+    pub chain_name: String,
     pub chain_id: u64,
 
     // ===== Block Range =====
@@ -333,9 +333,9 @@ pub struct TransformationContext<'a> {
 
     // ===== Decoded Data for Current Block Range =====
     /// All decoded events in this range
-    pub events: &'a [DecodedEvent],
+    pub events: Arc<Vec<DecodedEvent>>,
     /// All decoded eth_call results in this range
-    pub calls: &'a [DecodedCall],
+    pub calls: Arc<Vec<DecodedCall>>,
 
     // ===== Transaction Address Data =====
     /// Transaction hash -> from/to addresses from receipt data
@@ -352,15 +352,15 @@ pub struct TransformationContext<'a> {
     pub(crate) contracts: Arc<Contracts>,
 }
 
-impl<'a> TransformationContext<'a> {
+impl TransformationContext {
     /// Create a new transformation context.
     pub fn new(
-        chain_name: &'a str,
+        chain_name: String,
         chain_id: u64,
         block_range_start: u64,
         block_range_end: u64,
-        events: &'a [DecodedEvent],
-        calls: &'a [DecodedCall],
+        events: Arc<Vec<DecodedEvent>>,
+        calls: Arc<Vec<DecodedCall>>,
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
@@ -557,7 +557,7 @@ impl<'a> TransformationContext<'a> {
         Ok(decoded)
     }
 
-    /// Make multiple eth_calls in a batch (more efficient).
+    /// Make multiple eth_calls concurrently (more efficient than sequential).
     pub async fn eth_call_batch(
         &self,
         requests: Vec<EthCallRequest>,
@@ -572,22 +572,20 @@ impl<'a> TransformationContext<'a> {
             }
         }
 
-        let mut results = Vec::with_capacity(requests.len());
-
-        // For now, execute sequentially. Could be optimized with batch RPC.
-        for req in requests {
-            let result = self
-                .eth_call(
+        let futures: Vec<_> = requests
+            .into_iter()
+            .map(|req| async move {
+                self.eth_call(
                     req.contract_address,
                     &req.function_signature,
                     req.params,
                     req.block_number,
                 )
-                .await;
-            results.push(result);
-        }
+                .await
+            })
+            .collect();
 
-        Ok(results)
+        Ok(futures::future::join_all(futures).await)
     }
 }
 
