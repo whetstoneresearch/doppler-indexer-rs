@@ -4840,7 +4840,7 @@ pub(crate) fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     for fn_name in function_names {
