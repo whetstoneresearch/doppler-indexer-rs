@@ -2532,13 +2532,11 @@ pub(crate) async fn process_once_calls_regular(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
+        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
             let index = read_once_column_index(&sub_dir);
-            // Use index if file is tracked, otherwise fall back to reading parquet schema
             let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
                 cols.iter().cloned().collect()
             } else {
-                // File exists but not in index - read schema directly
                 tracing::debug!(
                     "File {} exists but not in index, reading schema from parquet",
                     output_path.display()
@@ -2550,32 +2548,57 @@ pub(crate) async fn process_once_calls_regular(
                 .filter(|f| !existing_cols.contains(*f))
                 .cloned()
                 .collect();
-            if missing.is_empty() {
+            // Find addresses with null values for existing columns
+            let all_null_entries = find_null_entries(&output_path);
+            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
+                .into_iter()
+                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
+                .collect();
+            if missing.is_empty() && null_entries.is_empty() {
                 tracing::debug!(
-                    "Skipping once eth_calls for {} blocks {}-{} (all columns present)",
+                    "Skipping once eth_calls for {} blocks {}-{} (all columns present, no nulls)",
                     contract_name,
                     range.start,
                     range.end - 1
                 );
                 continue;
             }
-            tracing::info!(
-                "Found {} missing once columns for {} blocks {}-{}: {:?}",
-                missing.len(),
-                contract_name,
-                range.start,
-                range.end - 1,
-                missing
-            );
-            (missing, true)
+            if !missing.is_empty() {
+                tracing::info!(
+                    "Found {} missing once columns for {} blocks {}-{}: {:?}",
+                    missing.len(),
+                    contract_name,
+                    range.start,
+                    range.end - 1,
+                    missing
+                );
+            }
+            if !null_entries.is_empty() {
+                let null_count: usize = null_entries.values().map(|s| s.len()).sum();
+                tracing::info!(
+                    "Found {} null entries across {} columns for {} blocks {}-{}, will re-fetch",
+                    null_count,
+                    null_entries.len(),
+                    contract_name,
+                    range.start,
+                    range.end - 1,
+                );
+            }
+            (missing, true, null_entries)
         } else {
-            (all_fn_names.clone(), false)
+            (all_fn_names.clone(), false, HashMap::new())
         };
 
         // Filter call configs to only missing functions
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
             .iter()
             .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        // Configs for partially-null columns (only need to call specific addresses)
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
             .collect();
 
         let contract = match contracts.get(contract_name) {
@@ -2591,11 +2614,36 @@ pub(crate) async fn process_once_calls_regular(
         let block_id = BlockId::Number(BlockNumberOrTag::Number(first_block.block_number));
         let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, String)> = Vec::new();
 
+        // Missing columns: call ALL addresses
         for call_config in &configs_to_call {
-            // Use target override addresses if available, otherwise contract addresses
             let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
 
             for address in addresses {
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
+                let tx = TransactionRequest::default()
+                    .to(*address)
+                    .input(calldata.into());
+                pending_calls.push((tx, block_id, *address, call_config.function_name.clone()));
+            }
+        }
+
+        // Partially-null columns: call only addresses with null values
+        for call_config in &configs_to_patch {
+            let null_addrs = &null_entries[&call_config.function_name];
+            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+
+            for address in addresses {
+                if !null_addrs.contains(&address.0 .0) {
+                    continue;
+                }
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
@@ -2661,7 +2709,13 @@ pub(crate) async fn process_once_calls_regular(
 
             let existing_batches = read_existing_once_parquet(&output_path)?;
             if !existing_batches.is_empty() {
-                let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
+                // Combine missing + patch function names for merge
+                let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+                let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                    .chain(patch_fn_names.iter())
+                    .cloned()
+                    .collect();
+                let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                 let file = File::create(&output_path)?;
                 let props = WriterProperties::builder()
@@ -2672,8 +2726,9 @@ pub(crate) async fn process_once_calls_regular(
                 writer.close()?;
 
                 tracing::info!(
-                    "Merged {} new once columns into {} for {}",
+                    "Merged {} new + {} patched once columns into {} for {}",
                     missing_fn_names.len(),
+                    patch_fn_names.len(),
                     output_path.display(),
                     contract_name
                 );
@@ -2711,7 +2766,7 @@ pub(crate) async fn process_once_calls_regular(
             }
         }
 
-        // Update the column index with columns actually present in the file
+        // Update the column index with all columns present in the file
         let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
             .into_iter()
             .collect();
@@ -2755,7 +2810,7 @@ pub(crate) async fn process_factory_once_calls(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
+        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
             // Use pre-loaded index
             let index = column_indexes.get(collection_name);
             let existing_cols: HashSet<String> = index
@@ -2768,31 +2823,56 @@ pub(crate) async fn process_factory_once_calls(
                 .filter(|f| !existing_cols.contains(*f))
                 .cloned()
                 .collect();
-            if missing.is_empty() {
+            // Find addresses with null values for existing columns
+            let all_null_entries = find_null_entries(&output_path);
+            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
+                .into_iter()
+                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
+                .collect();
+            if missing.is_empty() && null_entries.is_empty() {
                 tracing::debug!(
-                    "Skipping factory once eth_calls for {} blocks {}-{} (all columns present)",
+                    "Skipping factory once eth_calls for {} blocks {}-{} (all columns present, no nulls)",
                     collection_name,
                     range.start,
                     range.end - 1
                 );
                 continue;
             }
-            tracing::info!(
-                "Found {} missing factory once columns for {} blocks {}-{}: {:?}",
-                missing.len(),
-                collection_name,
-                range.start,
-                range.end - 1,
-                missing
-            );
-            (missing, true)
+            if !missing.is_empty() {
+                tracing::info!(
+                    "Found {} missing factory once columns for {} blocks {}-{}: {:?}",
+                    missing.len(),
+                    collection_name,
+                    range.start,
+                    range.end - 1,
+                    missing
+                );
+            }
+            if !null_entries.is_empty() {
+                let null_count: usize = null_entries.values().map(|s| s.len()).sum();
+                tracing::info!(
+                    "Found {} null entries across {} factory columns for {} blocks {}-{}, will re-fetch",
+                    null_count,
+                    null_entries.len(),
+                    collection_name,
+                    range.start,
+                    range.end - 1,
+                );
+            }
+            (missing, true, null_entries)
         } else {
-            (all_fn_names.clone(), false)
+            (all_fn_names.clone(), false, HashMap::new())
         };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
             .iter()
             .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        // Configs for partially-null columns (only need to call specific addresses)
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
             .collect();
 
         let mut address_discovery: HashMap<Address, (u64, u64)> = HashMap::new();
@@ -2824,17 +2904,16 @@ pub(crate) async fn process_factory_once_calls(
 
         let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> = Vec::new();
 
+        // Missing columns: call ALL discovered addresses
         for (discovered_address, (block_number, timestamp)) in &address_discovery {
             let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
 
             for call_config in &configs_to_call {
-                // Determine target: use override if set, otherwise call the discovered address
                 let target_address = call_config.target_addresses
                     .as_ref()
                     .and_then(|addrs| addrs.first().copied())
                     .unwrap_or(*discovered_address);
 
-                // For self-address params, use the discovered address (factory instance)
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
@@ -2847,7 +2926,43 @@ pub(crate) async fn process_factory_once_calls(
                 let tx = TransactionRequest::default()
                     .to(target_address)
                     .input(calldata.into());
-                // Store discovered_address for output (keyed by factory instance)
+                pending_calls.push((
+                    tx,
+                    block_id,
+                    *discovered_address,
+                    *block_number,
+                    *timestamp,
+                    call_config.function_name.clone(),
+                ));
+            }
+        }
+
+        // Partially-null columns: call only addresses with null values
+        for (discovered_address, (block_number, timestamp)) in &address_discovery {
+            let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
+
+            for call_config in &configs_to_patch {
+                let null_addrs = &null_entries[&call_config.function_name];
+                if !null_addrs.contains(&discovered_address.0 .0) {
+                    continue;
+                }
+                let target_address = call_config.target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *discovered_address,
+                    )?
+                };
+                let tx = TransactionRequest::default()
+                    .to(target_address)
+                    .input(calldata.into());
                 pending_calls.push((
                     tx,
                     block_id,
@@ -3011,7 +3126,13 @@ pub(crate) async fn process_factory_once_calls(
                     }
                 }
 
-                let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
+                // Combine missing + patch function names for merge
+                let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+                let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                    .chain(patch_fn_names.iter())
+                    .cloned()
+                    .collect();
+                let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                 let file = File::create(&output_path)?;
                 let props = WriterProperties::builder()
@@ -3022,8 +3143,9 @@ pub(crate) async fn process_factory_once_calls(
                 writer.close()?;
 
                 tracing::info!(
-                    "Merged {} new factory once columns into {} for {}",
+                    "Merged {} new + {} patched factory once columns into {} for {}",
                     missing_fn_names.len(),
+                    patch_fn_names.len(),
                     output_path.display(),
                     collection_name
                 );
@@ -3050,7 +3172,7 @@ pub(crate) async fn process_factory_once_calls(
             }
         }
 
-        // Update the column index with columns actually present in the file
+        // Update the column index with all columns present in the file
         let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
             .into_iter()
             .collect();
@@ -3105,7 +3227,8 @@ pub(crate) async fn process_once_calls_multicall(
     }
 
     let mut all_slots: Vec<MulticallSlotGeneric<OnceCallMeta>> = Vec::new();
-    let mut contracts_to_process: Vec<(String, Vec<String>, Vec<String>, PathBuf, bool)> = Vec::new();
+    // (contract_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file)
+    let mut contracts_to_process: Vec<(String, Vec<String>, Vec<String>, Vec<String>, PathBuf, bool)> = Vec::new();
 
     for (contract_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -3122,7 +3245,7 @@ pub(crate) async fn process_once_calls_multicall(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
+        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
             let index = read_once_column_index(&sub_dir);
             let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
                 cols.iter().cloned().collect()
@@ -3134,17 +3257,28 @@ pub(crate) async fn process_once_calls_multicall(
                 .filter(|f| !existing_cols.contains(*f))
                 .cloned()
                 .collect();
-            if missing.is_empty() {
+            // Find addresses with null values for existing columns
+            let all_null_entries = find_null_entries(&output_path);
+            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
+                .into_iter()
+                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
+                .collect();
+            if missing.is_empty() && null_entries.is_empty() {
                 continue;
             }
-            (missing, true)
+            (missing, true, null_entries)
         } else {
-            (all_fn_names.clone(), false)
+            (all_fn_names.clone(), false, HashMap::new())
         };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
             .iter()
             .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
             .collect();
 
         let contract = match contracts.get(contract_name) {
@@ -3157,7 +3291,7 @@ pub(crate) async fn process_once_calls_multicall(
             AddressOrAddresses::Multiple(addrs) => addrs.clone(),
         };
 
-        // Build slots for all addresses × functions
+        // Missing columns: slots for ALL addresses
         for call_config in &configs_to_call {
             let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
 
@@ -3186,10 +3320,45 @@ pub(crate) async fn process_once_calls_multicall(
             }
         }
 
+        // Partially-null columns: slots only for addresses with null values
+        for call_config in &configs_to_patch {
+            let null_addrs = &null_entries[&call_config.function_name];
+            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+
+            for address in addresses {
+                if !null_addrs.contains(&address.0 .0) {
+                    continue;
+                }
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
+
+                all_slots.push(MulticallSlotGeneric {
+                    block_number: first_block.block_number,
+                    block_timestamp: first_block.timestamp,
+                    target_address: *address,
+                    encoded_calldata: calldata,
+                    metadata: OnceCallMeta {
+                        contract_name: contract_name.clone(),
+                        function_name: call_config.function_name.clone(),
+                        contract_address: *address,
+                    },
+                });
+            }
+        }
+
+        let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
         contracts_to_process.push((
             contract_name.clone(),
             all_fn_names,
             missing_fn_names,
+            patch_fn_names,
             output_path,
             has_existing_file,
         ));
@@ -3235,7 +3404,7 @@ pub(crate) async fn process_once_calls_multicall(
     }
 
     // Write parquet for each contract
-    for (contract_name, all_fn_names, missing_fn_names, output_path, has_existing_file) in contracts_to_process {
+    for (contract_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file) in contracts_to_process {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
@@ -3248,7 +3417,12 @@ pub(crate) async fn process_once_calls_multicall(
 
                 let existing_batches = read_existing_once_parquet(&output_path)?;
                 if !existing_batches.is_empty() {
-                    let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
+                    // Combine missing + patch function names for merge
+                    let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                        .chain(patch_fn_names.iter())
+                        .cloned()
+                        .collect();
+                    let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                     let file = File::create(&output_path)?;
                     let props = WriterProperties::builder()
@@ -3259,8 +3433,9 @@ pub(crate) async fn process_once_calls_multicall(
                     writer.close()?;
 
                     tracing::info!(
-                        "Merged {} new multicall once columns into {} for {}",
+                        "Merged {} new + {} patched multicall once columns into {} for {}",
                         missing_fn_names.len(),
+                        patch_fn_names.len(),
                         output_path.display(),
                         contract_name
                     );
@@ -3287,7 +3462,7 @@ pub(crate) async fn process_once_calls_multicall(
                 }
             }
 
-            // Update column index
+            // Update column index with all columns present in the file
             let file_name = output_path.file_name().unwrap().to_string_lossy().to_string();
             let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
                 .into_iter()
@@ -3324,8 +3499,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
-    // (collection_name, all_fn_names, missing_fn_names, output_path, has_existing_file, configs_to_call)
-    let mut collections_to_process: Vec<(String, Vec<String>, Vec<String>, PathBuf, bool, Vec<OnceCallConfig>)> = Vec::new();
+    // (collection_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file, configs_to_call)
+    let mut collections_to_process: Vec<(String, Vec<String>, Vec<String>, Vec<String>, PathBuf, bool, Vec<OnceCallConfig>)> = Vec::new();
 
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -3342,7 +3517,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file) = if existing_files.contains(&rel_path) {
+        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
             let index = column_indexes.get(collection_name);
             let existing_cols: HashSet<String> = index
                 .and_then(|idx| idx.get(&file_name))
@@ -3354,17 +3529,28 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 .filter(|f| !existing_cols.contains(*f))
                 .cloned()
                 .collect();
-            if missing.is_empty() {
+            // Find addresses with null values for existing columns
+            let all_null_entries = find_null_entries(&output_path);
+            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
+                .into_iter()
+                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
+                .collect();
+            if missing.is_empty() && null_entries.is_empty() {
                 continue;
             }
-            (missing, true)
+            (missing, true, null_entries)
         } else {
-            (all_fn_names.clone(), false)
+            (all_fn_names.clone(), false, HashMap::new())
         };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
             .iter()
             .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
             .collect();
 
         // Build address discovery map
@@ -3387,17 +3573,14 @@ pub(crate) async fn process_factory_once_calls_multicall(
             continue;
         }
 
-        // Build slots for all addresses × functions
-        // Always iterate over discovered factory addresses, using target override only for RPC call
+        // Missing columns: slots for ALL discovered addresses
         for call_config in &configs_to_call {
             for (discovered_address, (block_num, timestamp)) in &address_discovery {
-                // Use target override for RPC call if set, otherwise use discovered address
                 let target_address = call_config.target_addresses
                     .as_ref()
                     .and_then(|addrs| addrs.first().copied())
                     .unwrap_or(*discovered_address);
 
-                // Encode calldata with DISCOVERED address (for self params)
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
                     preencoded.clone()
                 } else {
@@ -3411,12 +3594,50 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 all_slots.push(MulticallSlotGeneric {
                     block_number: *block_num,
                     block_timestamp: *timestamp,
-                    target_address,  // Target for RPC call (may be override)
+                    target_address,
                     encoded_calldata: calldata,
                     metadata: FactoryOnceSlotMeta {
                         collection_name: collection_name.clone(),
                         function_name: call_config.function_name.clone(),
-                        address: *discovered_address,  // Store discovered address
+                        address: *discovered_address,
+                        block_number: *block_num,
+                        block_timestamp: *timestamp,
+                    },
+                });
+            }
+        }
+
+        // Partially-null columns: slots only for addresses with null values
+        for call_config in &configs_to_patch {
+            let null_addrs = &null_entries[&call_config.function_name];
+            for (discovered_address, (block_num, timestamp)) in &address_discovery {
+                if !null_addrs.contains(&discovered_address.0 .0) {
+                    continue;
+                }
+                let target_address = call_config.target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *discovered_address,
+                    )?
+                };
+
+                all_slots.push(MulticallSlotGeneric {
+                    block_number: *block_num,
+                    block_timestamp: *timestamp,
+                    target_address,
+                    encoded_calldata: calldata,
+                    metadata: FactoryOnceSlotMeta {
+                        collection_name: collection_name.clone(),
+                        function_name: call_config.function_name.clone(),
+                        address: *discovered_address,
                         block_number: *block_num,
                         block_timestamp: *timestamp,
                     },
@@ -3430,12 +3651,15 @@ pub(crate) async fn process_factory_once_calls_multicall(
             .map(|c| (*c).clone())
             .collect();
 
+        let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+
         // Always add to collections_to_process - even with empty address_discovery,
         // existing files may need backfill for missing columns
         collections_to_process.push((
             collection_name.clone(),
             all_fn_names,
             missing_fn_names,
+            patch_fn_names,
             output_path,
             has_existing_file,
             configs_for_backfill,
@@ -3443,7 +3667,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     // Skip multicall execution only if there are no slots AND no collections need backfill
-    let any_need_backfill = collections_to_process.iter().any(|(_, _, _, _, has_existing, _)| *has_existing);
+    let any_need_backfill = collections_to_process.iter().any(|(_, _, _, _, _, has_existing, _)| *has_existing);
     if all_slots.is_empty() && !any_need_backfill {
         return Ok(());
     }
@@ -3496,7 +3720,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     // Write parquet for each collection
-    for (collection_name, all_fn_names, missing_fn_names, output_path, has_existing_file, configs_to_call) in collections_to_process {
+    for (collection_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file, configs_to_call) in collections_to_process {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
@@ -3621,7 +3845,12 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         }
                     }
 
-                    let merged = merge_once_columns(&existing_batches, &new_results, &missing_fn_names)?;
+                    // Combine missing + patch function names for merge
+                    let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                        .chain(patch_fn_names.iter())
+                        .cloned()
+                        .collect();
+                    let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                     let file = File::create(&output_path)?;
                     let props = WriterProperties::builder()
@@ -3632,8 +3861,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
                     writer.close()?;
 
                     tracing::info!(
-                        "Merged {} new multicall factory once columns into {} for {}",
+                        "Merged {} new + {} patched multicall factory once columns into {} for {}",
                         missing_fn_names.len(),
+                        patch_fn_names.len(),
                         output_path.display(),
                         collection_name
                     );
@@ -3660,7 +3890,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 }
             }
 
-            // Update column index
+            // Update column index with all columns present in the file
             let file_name = output_path.file_name().unwrap().to_string_lossy().to_string();
             let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
                 .into_iter()
@@ -4223,7 +4453,16 @@ pub(crate) async fn execute_multicalls_generic<M: Clone>(
     block_multicalls: Vec<BlockMulticall<M>>,
     rpc_batch_size: usize,
 ) -> Result<Vec<(M, Vec<u8>, bool)>, EthCallCollectionError> {
+    struct FailedCall {
+        result_index: usize,
+        target_address: Address,
+        calldata: Bytes,
+        block_number: u64,
+        block_id: BlockId,
+    }
+
     let mut all_results: Vec<(M, Vec<u8>, bool)> = Vec::new();
+    let mut failed_retries: Vec<FailedCall> = Vec::new();
 
     for chunk in block_multicalls.chunks(rpc_batch_size) {
         let calls: Vec<(TransactionRequest, BlockId)> = chunk
@@ -4254,6 +4493,20 @@ pub(crate) async fn execute_multicalls_generic<M: Clone>(
                         Ok(decoded) => {
                             for (j, (success, return_data)) in decoded.into_iter().enumerate() {
                                 let slot = &bm.slots[j];
+                                if !success {
+                                    tracing::warn!(
+                                        "Multicall sub-call failed at block {} targeting {}",
+                                        bm.block_number,
+                                        slot.target_address
+                                    );
+                                    failed_retries.push(FailedCall {
+                                        result_index: all_results.len(),
+                                        target_address: slot.target_address,
+                                        calldata: slot.encoded_calldata.clone(),
+                                        block_number: bm.block_number,
+                                        block_id: bm.block_id,
+                                    });
+                                }
                                 all_results.push((
                                     slot.metadata.clone(),
                                     if success { return_data } else { Vec::new() },
@@ -4284,6 +4537,56 @@ pub(crate) async fn execute_multicalls_generic<M: Clone>(
                     for slot in &bm.slots {
                         all_results.push((slot.metadata.clone(), Vec::new(), false));
                     }
+                }
+            }
+        }
+    }
+
+    // Retry failed multicall sub-calls individually
+    if !failed_retries.is_empty() {
+        tracing::info!(
+            "Retrying {} failed multicall sub-calls individually",
+            failed_retries.len()
+        );
+
+        let retry_batch: Vec<(TransactionRequest, BlockId)> = failed_retries
+            .iter()
+            .map(|f| {
+                let tx = TransactionRequest::default()
+                    .to(f.target_address)
+                    .input(f.calldata.clone().into());
+                (tx, f.block_id)
+            })
+            .collect();
+
+        let retry_results = client.call_batch(retry_batch).await?;
+
+        for (i, result) in retry_results.into_iter().enumerate() {
+            let failed = &failed_retries[i];
+            match result {
+                Ok(bytes) if !bytes.is_empty() => {
+                    tracing::info!(
+                        "Individual retry succeeded for block {} target {}",
+                        failed.block_number,
+                        failed.target_address
+                    );
+                    let entry = &mut all_results[failed.result_index];
+                    *entry = (entry.0.clone(), bytes.to_vec(), true);
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "Individual retry returned empty for block {} target {}",
+                        failed.block_number,
+                        failed.target_address
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Individual retry also failed for block {} target {}: {}",
+                        failed.block_number,
+                        failed.target_address,
+                        e
+                    );
                 }
             }
         }
@@ -4994,6 +5297,64 @@ pub(crate) fn read_parquet_column_names(path: &Path) -> HashSet<String> {
     fn_names
 }
 
+/// Find per-address null entries in `_result` columns.
+/// Returns a map of function_name -> set of addresses that have null values for that function.
+/// Used to identify which specific (address, column) pairs need re-fetching.
+pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]>> {
+    let batches = match read_existing_once_parquet(path) {
+        Ok(b) => b,
+        Err(_) => return HashMap::new(),
+    };
+    if batches.is_empty() {
+        return HashMap::new();
+    }
+    let schema = batches[0].schema();
+    let result_fn_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .filter_map(|f| f.name().strip_suffix("_result").map(|s| s.to_string()))
+        .collect();
+    if result_fn_names.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut null_entries: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
+    for batch in &batches {
+        let address_col = match batch.column_by_name("address") {
+            Some(col) => col,
+            None => continue,
+        };
+        let address_arr = match address_col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for fn_name in &result_fn_names {
+            let col_name = format!("{}_result", fn_name);
+            let col = match batch.column_by_name(&col_name) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Skip column entirely if no nulls (O(1) check)
+            if col.null_count() == 0 {
+                continue;
+            }
+            for i in 0..batch.num_rows() {
+                if col.is_null(i) {
+                    let addr_bytes: [u8; 20] = match address_arr.value(i).try_into() {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    null_entries
+                        .entry(fn_name.clone())
+                        .or_default()
+                        .insert(addr_bytes);
+                }
+            }
+        }
+    }
+    null_entries
+}
+
 /// Read an existing once-call parquet file and return all record batches.
 pub(crate) fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -5171,28 +5532,57 @@ pub(crate) fn merge_once_columns(
         new_columns.push(Arc::new(arr));
     }
 
-    // Build merged schema: existing fields, replacing any that match new columns
+    // Build merged schema with cell-level merge for existing columns
     let existing_schema = existing.schema();
-    let new_col_names: HashSet<String> = new_fn_names
+
+    // Map new fn_name -> index in new_columns
+    let new_col_map: HashMap<String, usize> = new_fn_names
         .iter()
-        .map(|fn_name| format!("{}_result", fn_name))
+        .enumerate()
+        .map(|(i, fn_name)| (format!("{}_result", fn_name), i))
         .collect();
 
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
+    let mut merged_new_indices: HashSet<usize> = HashSet::new();
 
-    // Copy existing columns, skipping any that will be replaced
+    // Copy existing columns, doing cell-level merge where new data is available
     for (i, field) in existing_schema.fields().iter().enumerate() {
-        if new_col_names.contains(field.name()) {
-            tracing::debug!("Replacing existing column: {}", field.name());
-            continue;
+        if let Some(&new_idx) = new_col_map.get(field.name()) {
+            // Column exists in both old and new: cell-level merge
+            // Keep existing non-null values, fill nulls with new data
+            let existing_col = existing.column(i);
+            let new_col = &new_columns[new_idx];
+            let existing_binary = existing_col.as_any().downcast_ref::<BinaryArray>()
+                .expect("existing result column must be Binary");
+            let new_binary = new_col.as_any().downcast_ref::<BinaryArray>()
+                .expect("new result column must be Binary");
+            let merged: BinaryArray = (0..existing_binary.len())
+                .map(|row| {
+                    if existing_binary.is_valid(row) {
+                        Some(existing_binary.value(row))
+                    } else if new_binary.is_valid(row) {
+                        Some(new_binary.value(row))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            tracing::debug!("Cell-level merged column: {}", field.name());
+            fields.push(field.as_ref().clone());
+            columns.push(Arc::new(merged));
+            merged_new_indices.insert(new_idx);
+        } else {
+            fields.push(field.as_ref().clone());
+            columns.push(existing.column(i).clone());
         }
-        fields.push(field.as_ref().clone());
-        columns.push(existing.column(i).clone());
     }
 
-    // Add the new/replacement columns
+    // Add truly new columns (not present in existing schema)
     for (i, fn_name) in new_fn_names.iter().enumerate() {
+        if merged_new_indices.contains(&i) {
+            continue;
+        }
         fields.push(Field::new(
             &format!("{}_result", fn_name),
             DataType::Binary,
