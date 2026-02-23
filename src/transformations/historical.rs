@@ -399,7 +399,7 @@ fn batch_to_events(
     let addresses = get_address_column(&batch, "contract_address")?;
 
     // Get parameter columns (everything except standard columns)
-    let standard_cols = ["block_number", "block_timestamp", "transaction_hash", "log_index", "contract_address"];
+    let standard_cols = ["block_number", "block_timestamp", "transaction_hash", "log_index", "address"];
     let schema = batch.schema();
     let param_columns: Vec<_> = schema
         .fields()
@@ -449,10 +449,10 @@ fn batch_to_calls(
     // Extract standard columns
     let block_numbers = get_u64_column(&batch, "block_number")?;
     let block_timestamps = get_u64_column(&batch, "block_timestamp")?;
-    let addresses = get_address_column(&batch, "contract_address")?;
+    let addresses = get_address_column(&batch, "address")?;
 
     // Get result columns
-    let standard_cols = ["block_number", "block_timestamp", "contract_address"];
+    let standard_cols = ["block_number", "block_timestamp", "address"];
     let schema = batch.schema();
     let result_columns: Vec<_> = schema
         .fields()

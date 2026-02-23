@@ -793,7 +793,7 @@ fn read_regular_calls_from_parquet(path: &Path) -> Result<Vec<EthCallResult>, Et
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema.index_of("contract_address").ok();
+        let address_idx = schema.index_of("address").ok();
         let value_idx = schema.index_of("value").ok();
 
         for row in 0..batch.num_rows() {
@@ -875,7 +875,7 @@ fn read_once_calls_from_parquet(
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema.index_of("contract_address")
+        let address_idx = schema.index_of("address")
             .or_else(|_| schema.index_of("address"))
             .ok();
 
@@ -1310,7 +1310,7 @@ fn write_decoded_calls_to_parquet(
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
+        Field::new("address", DataType::FixedSizeBinary(20), false),
     ];
 
     // Add value fields based on output type
@@ -1708,8 +1708,8 @@ fn merge_decoded_once_calls(
 
     // Extract address column from existing batch
     let address_col_idx = existing_schema
-        .index_of("contract_address")
-        .map_err(|e| EthCallDecodingError::Decode(format!("Missing contract_address column: {}", e)))?;
+        .index_of("address")
+        .map_err(|e| EthCallDecodingError::Decode(format!("Missing address column: {}", e)))?;
     let address_arr = existing_batch
         .column(address_col_idx)
         .as_any()
@@ -1811,7 +1811,7 @@ fn write_decoded_once_calls_to_parquet(
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
+        Field::new("address", DataType::FixedSizeBinary(20), false),
     ];
 
     // Add a field for each function result
@@ -3255,7 +3255,7 @@ fn read_decoded_parquet_function_names(path: &Path) -> HashSet<String> {
 
     // Standard columns to skip
     let skip_columns: HashSet<&str> =
-        ["block_number", "block_timestamp", "address", "contract_address"]
+        ["block_number", "block_timestamp", "address", "address"]
             .into_iter()
             .collect();
 
