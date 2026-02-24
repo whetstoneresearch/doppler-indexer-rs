@@ -8,7 +8,7 @@ use std::sync::RwLock;
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, Int8Array,
-    StringArray, UInt32Array, UInt64Array,
+    StringArray, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -576,6 +576,9 @@ fn extract_value_from_batch(
     if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
         return Ok(Some(DecodedValue::Int8(arr.value(row))));
     }
+    if let Some(arr) = col.as_any().downcast_ref::<UInt8Array>() {
+        return Ok(Some(DecodedValue::Uint8(arr.value(row))));
+    }
     if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
         return Ok(Some(DecodedValue::Bool(arr.value(row))));
     }
@@ -600,6 +603,14 @@ fn extract_value_from_batch(
         };
     }
 
-    // Unknown type, skip
+    // Unknown type - log warning so we don't silently drop data
+    let schema = batch.schema();
+    let field_name = schema.field(col_idx).name();
+    let data_type = col.data_type();
+    tracing::warn!(
+        field = %field_name,
+        data_type = ?data_type,
+        "Unhandled Arrow data type in extract_value_from_batch - value will be dropped"
+    );
     Ok(None)
 }
