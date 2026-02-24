@@ -248,7 +248,9 @@ pub async fn decode_eth_calls(
 
                         // Read decoded columns from index or parquet
                         let decoded_dir = output_base.join(&contract_name).join("once");
-                        let decoded_index = load_or_build_decoded_column_index(&decoded_dir);
+                        let raw_once_dir = raw_calls_dir.join(&contract_name).join("once");
+                        let decoded_index =
+                            load_or_build_decoded_column_index(&decoded_dir, &raw_once_dir);
                         let decoded_cols: HashSet<String> = decoded_index
                             .get(&file_name)
                             .map(|cols| cols.iter().cloned().collect())
@@ -466,7 +468,8 @@ async fn catchup_decode_eth_calls(
         raw_column_indexes.insert(contract_name.clone(), raw_index);
 
         let decoded_once_dir = output_base.join(contract_name).join("once");
-        let decoded_index = load_or_build_decoded_column_index(&decoded_once_dir);
+        let decoded_index =
+            load_or_build_decoded_column_index(&decoded_once_dir, &raw_once_dir);
         decoded_column_indexes.insert(contract_name.clone(), decoded_index);
     }
 
@@ -962,11 +965,14 @@ async fn process_regular_calls(
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
     let mut decoded_records = Vec::new();
+    let mut decode_failures = 0u64;
+    let mut non_empty_count = 0u64;
 
     for result in results {
         if result.value.is_empty() {
             continue;
         }
+        non_empty_count += 1;
 
         match decode_value(&result.value, &config.output_type) {
             Ok(decoded) => {
@@ -978,6 +984,7 @@ async fn process_regular_calls(
                 });
             }
             Err(e) => {
+                decode_failures += 1;
                 tracing::debug!(
                     "Failed to decode {}.{} at block {}: {}",
                     config.contract_name,
@@ -987,6 +994,28 @@ async fn process_regular_calls(
                 );
             }
         }
+    }
+
+    if decode_failures > 0 && decode_failures == non_empty_count {
+        tracing::warn!(
+            "All {} decode attempts failed for {}.{} (output_type: {:?}) in blocks {}-{} — check output_type in config",
+            decode_failures,
+            config.contract_name,
+            config.function_name,
+            config.output_type,
+            range_start,
+            range_end - 1
+        );
+    } else if decode_failures > 0 {
+        tracing::warn!(
+            "{}/{} decode failures for {}.{} in blocks {}-{}",
+            decode_failures,
+            non_empty_count,
+            config.contract_name,
+            config.function_name,
+            range_start,
+            range_end - 1
+        );
     }
 
     // Write decoded data
@@ -1055,6 +1084,8 @@ async fn process_once_calls(
     return_index_info: bool,
 ) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
     let mut decoded_records = Vec::new();
+    // Track decode failures per function: fn_name -> (successes, failures)
+    let mut decode_stats: HashMap<String, (u64, u64)> = HashMap::new();
 
     for result in results {
         let mut decoded_values = HashMap::new();
@@ -1062,11 +1093,16 @@ async fn process_once_calls(
         for config in configs {
             if let Some(raw_value) = result.results.get(&config.function_name) {
                 if !raw_value.is_empty() {
+                    let stats = decode_stats
+                        .entry(config.function_name.clone())
+                        .or_insert((0, 0));
                     match decode_value(raw_value, &config.output_type) {
                         Ok(decoded) => {
+                            stats.0 += 1;
                             decoded_values.insert(config.function_name.clone(), decoded);
                         }
                         Err(e) => {
+                            stats.1 += 1;
                             tracing::debug!(
                                 "Failed to decode {}.{} at block {}: {}",
                                 contract_name,
@@ -1086,6 +1122,37 @@ async fn process_once_calls(
             contract_address: result.contract_address,
             decoded_values,
         });
+    }
+
+    // Log warnings for functions with decode failures
+    for (fn_name, (successes, failures)) in &decode_stats {
+        if *failures > 0 {
+            let config = configs.iter().find(|c| &c.function_name == fn_name);
+            let output_type_str = config
+                .map(|c| format!("{:?}", c.output_type))
+                .unwrap_or_default();
+            if *successes == 0 {
+                tracing::warn!(
+                    "All {} decode attempts failed for {}/{} (output_type: {}) in blocks {}-{} — check output_type in config",
+                    failures,
+                    contract_name,
+                    fn_name,
+                    output_type_str,
+                    range_start,
+                    range_end - 1
+                );
+            } else {
+                tracing::warn!(
+                    "{}/{} decode failures for {}/{} in blocks {}-{}",
+                    failures,
+                    successes + failures,
+                    contract_name,
+                    fn_name,
+                    range_start,
+                    range_end - 1
+                );
+            }
+        }
     }
 
     // Write decoded data
@@ -1746,12 +1813,86 @@ fn merge_decoded_once_calls(
         }
     }
 
-    let new_schema = Arc::new(Schema::new(fields));
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
-    // Copy existing columns
+    // Build a lookup from column name -> (config, optional tuple field info)
+    // This is used to fill nulls in existing columns from new decoded records.
+    let mut col_config_lookup: HashMap<
+        String,
+        (&CallDecodeConfig, Option<(usize, &EvmType)>),
+    > = HashMap::new();
+    for config in new_configs {
+        match &config.output_type {
+            EvmType::NamedTuple(tuple_fields) => {
+                for (idx, (field_name, field_type)) in tuple_fields.iter().enumerate() {
+                    let col_name = format!("{}.{}", config.function_name, field_name);
+                    col_config_lookup.insert(col_name, (config, Some((idx, field_type))));
+                }
+            }
+            _ => {
+                col_config_lookup
+                    .insert(config.function_name.clone(), (config, None));
+            }
+        }
+    }
+
+    // Copy existing columns, filling nulls where possible from new decoded records
     for i in 0..existing_batch.num_columns() {
-        arrays.push(existing_batch.column(i).clone());
+        let col = existing_batch.column(i);
+        let col_name = existing_schema.field(i).name().clone();
+
+        if col.null_count() > 0 {
+            if let Some((config, tuple_info)) = col_config_lookup.get(&col_name) {
+                // This column has nulls and we have new decoded data — rebuild it
+                let rebuilt = match tuple_info {
+                    Some((field_idx, field_type)) => build_once_tuple_field_array_aligned(
+                        address_arr,
+                        &new_records_by_address,
+                        &config.function_name,
+                        *field_idx,
+                        field_type,
+                    )?,
+                    None => build_once_value_array_aligned(
+                        address_arr,
+                        &new_records_by_address,
+                        &config.function_name,
+                        &config.output_type,
+                    )?,
+                };
+
+                let old_nulls = col.null_count();
+                let new_nulls = rebuilt.null_count();
+                if new_nulls < old_nulls {
+                    tracing::info!(
+                        "Replacing column '{}' (had {} nulls, now {} nulls)",
+                        col_name,
+                        old_nulls,
+                        new_nulls
+                    );
+                    // Update field type if the config's output type changed
+                    if rebuilt.data_type() != col.data_type() {
+                        tracing::info!(
+                            "Column '{}' type changed from {:?} to {:?}",
+                            col_name,
+                            col.data_type(),
+                            rebuilt.data_type()
+                        );
+                        fields[i] = Field::new(&col_name, rebuilt.data_type().clone(), true);
+                    }
+                    arrays.push(rebuilt);
+                    continue;
+                } else if old_nulls > 0 {
+                    tracing::warn!(
+                        "Column '{}' has {} nulls but rebuilt column still has {} nulls (all decodes failed — check output_type {:?})",
+                        col_name,
+                        old_nulls,
+                        new_nulls,
+                        config.output_type
+                    );
+                }
+            }
+        }
+        arrays.push(col.clone());
     }
 
     // Build new columns aligned to existing addresses
@@ -1786,6 +1927,9 @@ fn merge_decoded_once_calls(
             }
         }
     }
+
+    // Build schema after column processing (fields may have been updated during null-filling)
+    let new_schema = Arc::new(Schema::new(fields));
 
     // Write merged parquet
     let batch = RecordBatch::try_new(new_schema.clone(), arrays)?;
@@ -3155,9 +3299,145 @@ fn write_decoded_column_index(
     Ok(())
 }
 
+/// Find decoded function names that have null values fillable from raw data.
+///
+/// For each column in the decoded parquet that has null values, checks whether
+/// the corresponding raw parquet has non-null `{fn_name}_result` values at
+/// those positions. Returns the set of function names that can be filled.
+fn find_columns_with_fillable_nulls(decoded_path: &Path, raw_path: &Path) -> HashSet<String> {
+    let mut fillable = HashSet::new();
+
+    // Read decoded parquet
+    let decoded_file = match File::open(decoded_path) {
+        Ok(f) => f,
+        Err(_) => return fillable,
+    };
+    let decoded_reader = match ParquetRecordBatchReaderBuilder::try_new(decoded_file) {
+        Ok(b) => match b.build() {
+            Ok(r) => r,
+            Err(_) => return fillable,
+        },
+        Err(_) => return fillable,
+    };
+    let decoded_batches: Vec<RecordBatch> = decoded_reader.filter_map(|r| r.ok()).collect();
+    if decoded_batches.is_empty() {
+        return fillable;
+    }
+    let decoded_batch = &decoded_batches[0];
+    let decoded_schema = decoded_batch.schema();
+
+    let skip_columns: HashSet<&str> = ["block_number", "block_timestamp", "address"]
+        .into_iter()
+        .collect();
+
+    // Find columns with nulls, grouped by base function name
+    let mut fn_null_positions: HashMap<String, Vec<usize>> = HashMap::new();
+    for (col_idx, field) in decoded_schema.fields().iter().enumerate() {
+        let name = field.name().as_str();
+        if skip_columns.contains(name) {
+            continue;
+        }
+        let col = decoded_batch.column(col_idx);
+        if col.null_count() == 0 {
+            continue;
+        }
+        let fn_name = name.split('.').next().unwrap_or(name).to_string();
+        // Collect null row positions (only if not already tracked for this fn)
+        let positions = fn_null_positions.entry(fn_name).or_default();
+        for row in 0..col.len() {
+            if col.is_null(row) && !positions.contains(&row) {
+                positions.push(row);
+            }
+        }
+    }
+
+    if fn_null_positions.is_empty() {
+        return fillable;
+    }
+
+    // Read raw parquet
+    let raw_file = match File::open(raw_path) {
+        Ok(f) => f,
+        Err(_) => return fillable,
+    };
+    let raw_reader = match ParquetRecordBatchReaderBuilder::try_new(raw_file) {
+        Ok(b) => match b.build() {
+            Ok(r) => r,
+            Err(_) => return fillable,
+        },
+        Err(_) => return fillable,
+    };
+    let raw_batches: Vec<RecordBatch> = raw_reader.filter_map(|r| r.ok()).collect();
+    if raw_batches.is_empty() {
+        return fillable;
+    }
+    let raw_batch = &raw_batches[0];
+    let raw_schema = raw_batch.schema();
+
+    // Build address -> row index lookup from decoded parquet
+    let decoded_addr_idx = match decoded_schema.index_of("address") {
+        Ok(idx) => idx,
+        Err(_) => return fillable,
+    };
+    let decoded_addr_arr = match decoded_batch
+        .column(decoded_addr_idx)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+    {
+        Some(a) => a,
+        None => return fillable,
+    };
+
+    // Build address -> row index lookup from raw parquet
+    let raw_addr_idx = match raw_schema.index_of("address") {
+        Ok(idx) => idx,
+        Err(_) => return fillable,
+    };
+    let raw_addr_arr = match raw_batch
+        .column(raw_addr_idx)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+    {
+        Some(a) => a,
+        None => return fillable,
+    };
+    let mut raw_addr_to_row: HashMap<Vec<u8>, usize> = HashMap::new();
+    for i in 0..raw_addr_arr.len() {
+        raw_addr_to_row.insert(raw_addr_arr.value(i).to_vec(), i);
+    }
+
+    // For each function with nulls, check if raw has non-null values
+    for (fn_name, null_positions) in &fn_null_positions {
+        let result_col_name = format!("{}_result", fn_name);
+        let raw_col_idx = match raw_schema.index_of(&result_col_name) {
+            Ok(idx) => idx,
+            Err(_) => continue,
+        };
+        let raw_col = raw_batch.column(raw_col_idx);
+
+        // Short-circuit: check if any null position in decoded has a non-null in raw
+        for &row in null_positions {
+            let addr = decoded_addr_arr.value(row).to_vec();
+            if let Some(&raw_row) = raw_addr_to_row.get(&addr) {
+                if !raw_col.is_null(raw_row) {
+                    fillable.insert(fn_name.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    fillable
+}
+
 /// Load or build the column index for a decoded once/ directory.
 /// If the index file exists, load it. Otherwise, scan all parquet files to build it.
-fn load_or_build_decoded_column_index(decoded_once_dir: &Path) -> HashMap<String, Vec<String>> {
+/// When rebuilding from parquet, checks for columns with fillable nulls and excludes them
+/// so that catchup will re-decode those columns from raw data.
+fn load_or_build_decoded_column_index(
+    decoded_once_dir: &Path,
+    raw_once_dir: &Path,
+) -> HashMap<String, Vec<String>> {
     let index_path = decoded_once_dir.join("column_index.json");
 
     // Try to load existing index
@@ -3210,6 +3490,27 @@ fn load_or_build_decoded_column_index(decoded_once_dir: &Path) -> HashMap<String
             .into_iter()
             .collect();
         if !cols.is_empty() {
+            // Check if any columns have nulls fillable from raw data
+            let raw_path = raw_once_dir.join(&file_name);
+            if raw_path.exists() {
+                let fillable = find_columns_with_fillable_nulls(&path, &raw_path);
+                if !fillable.is_empty() {
+                    tracing::info!(
+                        "Excluded {} columns with fillable nulls from index for {}: {:?}",
+                        fillable.len(),
+                        file_name,
+                        fillable
+                    );
+                    let filtered: Vec<String> = cols
+                        .into_iter()
+                        .filter(|c| !fillable.contains(c))
+                        .collect();
+                    if !filtered.is_empty() {
+                        index.insert(file_name, filtered);
+                    }
+                    continue;
+                }
+            }
             index.insert(file_name, cols);
         }
     }
