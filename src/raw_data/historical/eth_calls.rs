@@ -2883,27 +2883,45 @@ pub(crate) async fn process_factory_once_calls(
             .collect();
 
         let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
-            // Use pre-loaded index
             let index = column_indexes.get(collection_name);
-            let existing_cols: HashSet<String> = index
+            let indexed_cols: HashSet<String> = index
                 .and_then(|idx| idx.get(&file_name))
                 .map(|cols| cols.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // Check actual parquet schema to determine truly missing columns
+            let parquet_cols = read_parquet_column_names(&output_path);
+
+            // Missing: in config but not in the parquet file
             let missing: Vec<String> = all_fn_names
                 .iter()
-                .filter(|f| !existing_cols.contains(*f))
+                .filter(|f| !parquet_cols.contains(*f))
                 .cloned()
                 .collect();
-            // Find addresses with null values for existing columns
-            let all_null_entries = find_null_entries(&output_path);
-            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
-                .into_iter()
-                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
-                .collect();
+
+            // Only try to fill null results if:
+            // 1) there is no column index file (indexed_cols is empty)
+            // 2) the block range file is not in the column index
+            // 3) the column with nulls is not in the column index for that file
+            // If a column IS in the index, nulls are considered permanent.
+            let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
+                let unindexed_in_parquet: Vec<&String> = all_fn_names.iter()
+                    .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
+                    .collect();
+                if unindexed_in_parquet.is_empty() {
+                    HashMap::new()
+                } else {
+                    let all_null_entries = find_null_entries(&output_path);
+                    all_null_entries
+                        .into_iter()
+                        .filter(|(k, _)| !indexed_cols.contains(k))
+                        .collect()
+                }
+            };
+
             if missing.is_empty() && null_entries.is_empty() {
                 tracing::debug!(
-                    "Skipping factory once eth_calls for {} blocks {}-{} (all columns present, no nulls)",
+                    "Skipping factory once eth_calls for {} blocks {}-{} (all columns present and indexed)",
                     collection_name,
                     range.start,
                     range.end - 1
@@ -2923,7 +2941,7 @@ pub(crate) async fn process_factory_once_calls(
             if !null_entries.is_empty() {
                 let null_count: usize = null_entries.values().map(|s| s.len()).sum();
                 tracing::info!(
-                    "Found {} null entries across {} factory columns for {} blocks {}-{}, will re-fetch",
+                    "Found {} null entries across {} unindexed factory columns for {} blocks {}-{}, will re-fetch",
                     null_count,
                     null_entries.len(),
                     collection_name,
@@ -3615,22 +3633,41 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
         let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
             let index = column_indexes.get(collection_name);
-            let existing_cols: HashSet<String> = index
+            let indexed_cols: HashSet<String> = index
                 .and_then(|idx| idx.get(&file_name))
                 .map(|cols| cols.iter().cloned().collect())
                 .unwrap_or_default();
 
+            // Check actual parquet schema to determine truly missing columns
+            let parquet_cols = read_parquet_column_names(&output_path);
+
+            // Missing: in config but not in the parquet file
             let missing: Vec<String> = all_fn_names
                 .iter()
-                .filter(|f| !existing_cols.contains(*f))
+                .filter(|f| !parquet_cols.contains(*f))
                 .cloned()
                 .collect();
-            // Find addresses with null values for existing columns
-            let all_null_entries = find_null_entries(&output_path);
-            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
-                .into_iter()
-                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
-                .collect();
+
+            // Only try to fill null results if:
+            // 1) there is no column index file (indexed_cols is empty)
+            // 2) the block range file is not in the column index
+            // 3) the column with nulls is not in the column index for that file
+            // If a column IS in the index, nulls are considered permanent.
+            let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
+                let unindexed_in_parquet: Vec<&String> = all_fn_names.iter()
+                    .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
+                    .collect();
+                if unindexed_in_parquet.is_empty() {
+                    HashMap::new()
+                } else {
+                    let all_null_entries = find_null_entries(&output_path);
+                    all_null_entries
+                        .into_iter()
+                        .filter(|(k, _)| !indexed_cols.contains(k))
+                        .collect()
+                }
+            };
+
             if missing.is_empty() && null_entries.is_empty() {
                 continue;
             }

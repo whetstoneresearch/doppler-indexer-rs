@@ -12,6 +12,7 @@ use crate::raw_data::historical::eth_calls::{
     build_once_call_configs, build_token_call_configs, event_output_exists,
     get_existing_log_ranges, load_factory_addresses_for_once_catchup,
     load_historical_factory_addresses, load_or_build_once_column_index, process_event_triggers,
+    read_once_column_index,
     process_event_triggers_multicall, process_factory_once_calls, process_once_calls_multicall,
     process_once_calls_regular, process_range, process_range_multicall, process_token_range,
     process_token_range_multicall, read_logs_from_parquet, scan_existing_parquet_files, BlockInfo,
@@ -424,12 +425,14 @@ pub async fn collect_eth_calls(
             factory_once_configs.len()
         );
 
-        // Pre-load or build column indexes for all factory once directories
+        // Read column indexes for all factory once directories (don't auto-build).
+        // Using read_once_column_index so we can detect when no index file exists
+        // and properly handle null-filling conditions.
         let mut factory_once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> =
             HashMap::new();
         for collection_name in factory_once_configs.keys() {
             let once_dir = base_output_dir.join(collection_name).join("once");
-            let index = load_or_build_once_column_index(&once_dir);
+            let index = read_once_column_index(&once_dir);
             factory_once_column_indexes.insert(collection_name.clone(), index);
         }
 
