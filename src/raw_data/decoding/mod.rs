@@ -1,3 +1,5 @@
+mod catchup;
+mod current;
 mod eth_calls;
 mod event_parsing;
 mod logs;
