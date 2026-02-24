@@ -105,6 +105,7 @@ pub async fn collect_eth_calls(
                                                 state.factory_max_params,
                                                 &mut state.frequency_state,
                                                 multicall_addr,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         } else {
@@ -119,6 +120,7 @@ pub async fn collect_eth_calls(
                                                 state.rpc_batch_size,
                                                 state.factory_max_params,
                                                 &mut state.frequency_state,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         }
@@ -136,6 +138,7 @@ pub async fn collect_eth_calls(
                                                     &empty_index,
                                                     multicall_addr,
                                                     state.rpc_batch_size,
+                                                    &decoder_tx,
                                                 )
                                                 .await?;
                                             } else {
@@ -255,6 +258,7 @@ pub async fn collect_eth_calls(
                                             state.max_params,
                                             &mut state.frequency_state,
                                             multicall_addr,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     } else {
@@ -268,6 +272,7 @@ pub async fn collect_eth_calls(
                                             state.rpc_batch_size,
                                             state.max_params,
                                             &mut state.frequency_state,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     }
@@ -285,6 +290,7 @@ pub async fn collect_eth_calls(
                                             state.rpc_batch_size,
                                             &mut state.frequency_state,
                                             multicall_addr,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     } else {
@@ -297,6 +303,7 @@ pub async fn collect_eth_calls(
                                             &state.existing_files,
                                             state.rpc_batch_size,
                                             &mut state.frequency_state,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     }
@@ -314,6 +321,7 @@ pub async fn collect_eth_calls(
                                             &state.existing_files,
                                             multicall_addr,
                                             state.rpc_batch_size,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     } else {
@@ -325,6 +333,7 @@ pub async fn collect_eth_calls(
                                             &chain.contracts,
                                             &state.base_output_dir,
                                             &state.existing_files,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     }
@@ -346,6 +355,7 @@ pub async fn collect_eth_calls(
                                                 state.factory_max_params,
                                                 &mut state.frequency_state,
                                                 multicall_addr,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         } else {
@@ -360,6 +370,7 @@ pub async fn collect_eth_calls(
                                                 state.rpc_batch_size,
                                                 state.factory_max_params,
                                                 &mut state.frequency_state,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         }
@@ -378,6 +389,7 @@ pub async fn collect_eth_calls(
                                                 &empty_index,
                                                 multicall_addr,
                                                 state.rpc_batch_size,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         } else {
@@ -466,6 +478,7 @@ pub async fn collect_eth_calls(
                                             state.factory_max_params,
                                             &mut state.frequency_state,
                                             multicall_addr,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     } else {
@@ -480,6 +493,7 @@ pub async fn collect_eth_calls(
                                             state.rpc_batch_size,
                                             state.factory_max_params,
                                             &mut state.frequency_state,
+                                            &decoder_tx,
                                         )
                                         .await?;
                                     }
@@ -497,6 +511,7 @@ pub async fn collect_eth_calls(
                                                 &empty_index,
                                                 multicall_addr,
                                                 state.rpc_batch_size,
+                                                &decoder_tx,
                                             )
                                             .await?;
                                         } else {
@@ -605,6 +620,7 @@ pub async fn collect_eth_calls(
                     state.max_params,
                     &mut state.frequency_state,
                     multicall_addr,
+                    &decoder_tx,
                 )
                 .await?;
             } else {
@@ -618,6 +634,7 @@ pub async fn collect_eth_calls(
                     state.rpc_batch_size,
                     state.max_params,
                     &mut state.frequency_state,
+                    &decoder_tx,
                 )
                 .await?;
             }
@@ -635,6 +652,7 @@ pub async fn collect_eth_calls(
                     state.rpc_batch_size,
                     &mut state.frequency_state,
                     multicall_addr,
+                    &decoder_tx,
                 )
                 .await?;
             } else {
@@ -647,6 +665,7 @@ pub async fn collect_eth_calls(
                     &state.existing_files,
                     state.rpc_batch_size,
                     &mut state.frequency_state,
+                    &decoder_tx,
                 )
                 .await?;
             }
@@ -664,6 +683,7 @@ pub async fn collect_eth_calls(
                     &state.existing_files,
                     multicall_addr,
                     state.rpc_batch_size,
+                    &decoder_tx,
                 )
                 .await?;
             } else {
@@ -675,6 +695,7 @@ pub async fn collect_eth_calls(
                     &chain.contracts,
                     &state.base_output_dir,
                     &state.existing_files,
+                    &decoder_tx,
                 )
                 .await?;
             }
@@ -696,6 +717,7 @@ pub async fn collect_eth_calls(
                             state.factory_max_params,
                             &mut state.frequency_state,
                             multicall_addr,
+                            &decoder_tx,
                         )
                         .await?;
                     } else {
@@ -710,6 +732,7 @@ pub async fn collect_eth_calls(
                             state.rpc_batch_size,
                             state.factory_max_params,
                             &mut state.frequency_state,
+                            &decoder_tx,
                         )
                         .await?;
                     }
@@ -727,6 +750,7 @@ pub async fn collect_eth_calls(
                                 &empty_index,
                                 multicall_addr,
                                 state.rpc_batch_size,
+                                &decoder_tx,
                             )
                             .await?;
                         } else {

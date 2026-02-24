@@ -310,6 +310,7 @@ pub async fn collect_eth_calls(
                         max_params,
                         &mut frequency_state,
                         multicall_addr,
+                        &None,
                     )
                     .await?;
                 } else {
@@ -323,6 +324,7 @@ pub async fn collect_eth_calls(
                         rpc_batch_size,
                         max_params,
                         &mut frequency_state,
+                        &None,
                     )
                     .await?;
                 }
@@ -340,6 +342,7 @@ pub async fn collect_eth_calls(
                         rpc_batch_size,
                         &mut frequency_state,
                         multicall_addr,
+                        &None,
                     )
                     .await?;
                 } else {
@@ -352,6 +355,7 @@ pub async fn collect_eth_calls(
                         &existing_files,
                         rpc_batch_size,
                         &mut frequency_state,
+                        &None,
                     )
                     .await?;
                 }
@@ -369,6 +373,7 @@ pub async fn collect_eth_calls(
                         &existing_files,
                         multicall_addr,
                         rpc_batch_size,
+                        &None,
                     )
                     .await?;
                 } else {
@@ -380,6 +385,7 @@ pub async fn collect_eth_calls(
                         &chain.contracts,
                         &base_output_dir,
                         &existing_files,
+                        &None,
                     )
                     .await?;
                 }

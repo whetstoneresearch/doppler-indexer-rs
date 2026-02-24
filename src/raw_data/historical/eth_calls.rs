@@ -16,7 +16,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
-use crate::raw_data::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
+use crate::raw_data::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult, EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::{EventTriggerData, LogData};
 use crate::rpc::{RpcError, UnifiedRpcClient};
@@ -1608,6 +1608,7 @@ pub(crate) async fn process_factory_range(
     rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for (_block, addrs) in &factory_data.addresses_by_block {
@@ -1789,6 +1790,18 @@ pub(crate) async fn process_factory_range(
             let sub_dir = output_dir.join(collection_name).join(&function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
+
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+                Some(all_results.iter().map(|r| DecoderEthCallResult {
+                    block_number: r.block_number,
+                    block_timestamp: r.block_timestamp,
+                    contract_address: r.contract_address,
+                    value: r.value_bytes.clone(),
+                }).collect())
+            } else {
+                None
+            };
+
             #[cfg(feature = "bench")]
             let write_start = Instant::now();
             tokio::task::spawn_blocking(move || {
@@ -1815,6 +1828,18 @@ pub(crate) async fn process_factory_range(
                 result_count,
                 sub_dir.join(&file_name).display()
             );
+
+            if let Some(tx) = decoder_tx {
+                if let Some(results) = decoder_results {
+                    let _ = tx.send(DecoderMessage::EthCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: collection_name.clone(),
+                        function_name: function_name.clone(),
+                        results,
+                    }).await;
+                }
+            }
 
             if let Frequency::Duration(_) = call_config.frequency {
                 if let Some(last_block) = filtered_blocks.last() {
@@ -1843,6 +1868,7 @@ pub(crate) async fn process_factory_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -2065,6 +2091,17 @@ pub(crate) async fn process_factory_range_multicall(
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+                Some(results.iter().map(|r| DecoderEthCallResult {
+                    block_number: r.block_number,
+                    block_timestamp: r.block_timestamp,
+                    contract_address: r.contract_address,
+                    value: r.value_bytes.clone(),
+                }).collect())
+            } else {
+                None
+            };
+
             let results_owned = std::mem::take(results);
             tokio::task::spawn_blocking(move || {
                 write_results_to_parquet(&results_owned, &output_path, max_params)
@@ -2077,6 +2114,18 @@ pub(crate) async fn process_factory_range_multicall(
                 result_count,
                 sub_dir.join(&file_name).display()
             );
+
+            if let Some(tx) = decoder_tx {
+                if let Some(results) = decoder_results {
+                    let _ = tx.send(DecoderMessage::EthCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: group.collection_name.clone(),
+                        function_name: group.function_name.clone(),
+                        results,
+                    }).await;
+                }
+            }
 
             if let Frequency::Duration(_) = &group.frequency {
                 if let Some(last_block) = group.filtered_blocks.last() {
@@ -2510,6 +2559,7 @@ pub(crate) async fn process_once_calls_regular(
     contracts: &Contracts,
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     let first_block = match blocks.first() {
         Some(b) => b,
@@ -2700,6 +2750,17 @@ pub(crate) async fn process_once_calls_regular(
 
         std::fs::create_dir_all(&sub_dir)?;
 
+        let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if decoder_tx.is_some() {
+            Some(results_by_address.iter().map(|(addr, function_results)| DecoderOnceCallResult {
+                block_number: first_block.block_number,
+                block_timestamp: first_block.timestamp,
+                contract_address: addr.0.0,
+                results: function_results.clone(),
+            }).collect())
+        } else {
+            None
+        };
+
         if has_existing_file {
             // Merge new columns into existing parquet
             let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
@@ -2780,6 +2841,17 @@ pub(crate) async fn process_once_calls_regular(
             actual_cols.len(),
             actual_cols
         );
+
+        if let Some(tx) = decoder_tx {
+            if let Some(results) = decoder_once_results {
+                let _ = tx.send(DecoderMessage::OnceCallsReady {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: contract_name.clone(),
+                    results,
+                }).await;
+            }
+        }
     }
 
     Ok(())
@@ -3213,6 +3285,7 @@ pub(crate) async fn process_once_calls_multicall(
     existing_files: &HashSet<String>,
     multicall3_address: Address,
     rpc_batch_size: usize,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     let first_block = match blocks.first() {
         Some(b) => b,
@@ -3409,6 +3482,17 @@ pub(crate) async fn process_once_calls_multicall(
         std::fs::create_dir_all(sub_dir)?;
 
         if let Some(results_by_address) = results_by_contract.remove(&contract_name) {
+            let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if decoder_tx.is_some() {
+                Some(results_by_address.iter().map(|(addr, function_results)| DecoderOnceCallResult {
+                    block_number: first_block.block_number,
+                    block_timestamp: first_block.timestamp,
+                    contract_address: addr.0.0,
+                    results: function_results.clone(),
+                }).collect())
+            } else {
+                None
+            };
+
             if has_existing_file {
                 let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                     .into_iter()
@@ -3470,6 +3554,17 @@ pub(crate) async fn process_once_calls_multicall(
             let mut index = read_once_column_index(sub_dir);
             index.insert(file_name.clone(), actual_cols.clone());
             write_once_column_index(sub_dir, &index)?;
+
+            if let Some(tx) = decoder_tx {
+                if let Some(results) = decoder_once_results {
+                    let _ = tx.send(DecoderMessage::OnceCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: contract_name.clone(),
+                        results,
+                    }).await;
+                }
+            }
         }
     }
 
@@ -3487,6 +3582,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
     multicall3_address: Address,
     rpc_batch_size: usize,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all calls across all collections into one multicall
     #[derive(Clone)]
@@ -3898,6 +3994,14 @@ pub(crate) async fn process_factory_once_calls_multicall(
             let mut index = read_once_column_index(sub_dir);
             index.insert(file_name.clone(), actual_cols.clone());
             write_once_column_index(sub_dir, &index)?;
+
+            if let Some(tx) = decoder_tx {
+                let _ = tx.send(DecoderMessage::OnceFileBackfilled {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: collection_name.clone(),
+                }).await;
+            }
         }
     }
 
@@ -3922,6 +4026,7 @@ pub(crate) async fn process_range(
     rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -4057,6 +4162,18 @@ pub(crate) async fn process_range(
         let sub_dir = output_dir.join(contract_name).join(function_name);
         std::fs::create_dir_all(&sub_dir)?;
         let output_path = sub_dir.join(&file_name);
+
+        let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+            Some(all_results.iter().map(|r| DecoderEthCallResult {
+                block_number: r.block_number,
+                block_timestamp: r.block_timestamp,
+                contract_address: r.contract_address,
+                value: r.value_bytes.clone(),
+            }).collect())
+        } else {
+            None
+        };
+
         #[cfg(feature = "bench")]
         let write_start = Instant::now();
         tokio::task::spawn_blocking(move || {
@@ -4084,6 +4201,18 @@ pub(crate) async fn process_range(
             sub_dir.join(&file_name).display()
         );
 
+        if let Some(tx) = decoder_tx {
+            if let Some(results) = decoder_results {
+                let _ = tx.send(DecoderMessage::EthCallsReady {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: contract_name.clone(),
+                    function_name: function_name.clone(),
+                    results,
+                }).await;
+            }
+        }
+
         if let Frequency::Duration(_) = frequency {
             if let Some(last_block) = filtered_blocks.last() {
                 frequency_state.last_call_times.insert(
@@ -4109,6 +4238,7 @@ pub(crate) async fn process_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (contract_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
@@ -4282,6 +4412,17 @@ pub(crate) async fn process_range_multicall(
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+                Some(results.iter().map(|r| DecoderEthCallResult {
+                    block_number: r.block_number,
+                    block_timestamp: r.block_timestamp,
+                    contract_address: r.contract_address,
+                    value: r.value_bytes.clone(),
+                }).collect())
+            } else {
+                None
+            };
+
             let results_owned = std::mem::take(results);
             tokio::task::spawn_blocking(move || {
                 write_results_to_parquet(&results_owned, &output_path, max_params)
@@ -4294,6 +4435,18 @@ pub(crate) async fn process_range_multicall(
                 result_count,
                 sub_dir.join(&file_name).display()
             );
+
+            if let Some(tx) = decoder_tx {
+                if let Some(results) = decoder_results {
+                    let _ = tx.send(DecoderMessage::EthCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: group.contract_name.clone(),
+                        function_name: group.function_name.clone(),
+                        results,
+                    }).await;
+                }
+            }
 
             if let Frequency::Duration(_) = &group.frequency {
                 if let Some(last_block) = group.filtered_blocks.last() {
@@ -4610,6 +4763,7 @@ pub(crate) async fn process_token_range_multicall(
     rpc_batch_size: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (token_name, function_name) — same as process_token_range
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
@@ -4853,6 +5007,17 @@ pub(crate) async fn process_token_range_multicall(
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+                Some(results.iter().map(|r| DecoderEthCallResult {
+                    block_number: r.block_number,
+                    block_timestamp: r.block_timestamp,
+                    contract_address: r.contract_address,
+                    value: r.value_bytes.clone(),
+                }).collect())
+            } else {
+                None
+            };
+
             let results_owned = std::mem::take(results);
             tokio::task::spawn_blocking(move || {
                 write_results_to_parquet(&results_owned, &output_path, 0)
@@ -4865,6 +5030,18 @@ pub(crate) async fn process_token_range_multicall(
                 result_count,
                 sub_dir.join(&file_name).display()
             );
+
+            if let Some(tx) = decoder_tx {
+                if let Some(results) = decoder_results {
+                    let _ = tx.send(DecoderMessage::EthCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: group.output_name.clone(),
+                        function_name: group.function_name.clone(),
+                        results,
+                    }).await;
+                }
+            }
 
             if let Frequency::Duration(_) = &group.frequency {
                 if let Some(last_block) = group.filtered_blocks.last() {
@@ -4889,6 +5066,7 @@ pub(crate) async fn process_token_range(
     existing_files: &HashSet<String>,
     rpc_batch_size: usize,
     frequency_state: &mut FrequencyState,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (token_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
@@ -5002,6 +5180,17 @@ pub(crate) async fn process_token_range(
         std::fs::create_dir_all(&sub_dir)?;
         let output_path = sub_dir.join(&file_name);
 
+        let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+            Some(all_results.iter().map(|r| DecoderEthCallResult {
+                block_number: r.block_number,
+                block_timestamp: r.block_timestamp,
+                contract_address: r.contract_address,
+                value: r.value_bytes.clone(),
+            }).collect())
+        } else {
+            None
+        };
+
         tokio::task::spawn_blocking(move || {
             write_results_to_parquet(&all_results, &output_path, 0) // No params
         })
@@ -5013,6 +5202,18 @@ pub(crate) async fn process_token_range(
             result_count,
             sub_dir.join(&file_name).display()
         );
+
+        if let Some(tx) = decoder_tx {
+            if let Some(results) = decoder_results {
+                let _ = tx.send(DecoderMessage::EthCallsReady {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: output_name.clone(),
+                    function_name: function_name.clone(),
+                    results,
+                }).await;
+            }
+        }
 
         if let Frequency::Duration(_) = frequency {
             if let Some(last_block) = filtered_blocks.last() {
