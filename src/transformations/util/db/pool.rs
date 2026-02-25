@@ -3,8 +3,8 @@ use alloy_primitives::U256;
 
 use crate::db::{DbOperation, DbValue};
 use crate::transformations::TransformationContext;
-use crate::transformations::util::db::token::PoolAddressOrPoolId;
-use crate::types::uniswap::v4::PoolKey;
+
+use crate::types::uniswap::v4::{PoolKey, PoolAddressOrPoolId};
 
 fn serialize_address<S>(address: &[u8; 20], serializer: S) -> Result<S::Ok, S::Error>
 where

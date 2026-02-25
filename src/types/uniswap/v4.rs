@@ -13,6 +13,11 @@ sol! {
     }
 }
 
+pub enum PoolAddressOrPoolId {
+    Address([u8; 20]),
+    PoolId([u8; 32]),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolKey {
     pub currency0: Address,

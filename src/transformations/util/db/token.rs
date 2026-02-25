@@ -1,10 +1,6 @@
 use crate::db::{DbOperation, DbValue};
 use crate::transformations::TransformationContext;
-
-pub enum PoolAddressOrPoolId {
-    Address([u8; 20]),
-    PoolId([u8; 32]),
-}
+use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
 pub fn insert_token(
     block_number: u64,

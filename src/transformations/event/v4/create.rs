@@ -8,11 +8,11 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
-use crate::transformations::util::db::token::{PoolAddressOrPoolId, insert_token};
+use crate::transformations::util::db::token::insert_token;
 use crate::transformations::util::db::v4_pool_configs::insert_pool_config;
 use crate::transformations::util::db::pool::insert_pool;
 
-use crate::types::uniswap::v4::{PoolKey, V4PoolConfig};
+use crate::types::uniswap::v4::{PoolKey, V4PoolConfig, PoolAddressOrPoolId};
 
 struct TokenMetadata {
     name: String,
