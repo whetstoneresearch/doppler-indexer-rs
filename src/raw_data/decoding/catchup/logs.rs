@@ -212,6 +212,7 @@ pub async fn catchup_decode_logs(
                 &factory_addrs,
                 &output_base,
                 transform_tx.as_ref(),
+                None, // catchup already handles progress recording correctly
             )
             .await
         });

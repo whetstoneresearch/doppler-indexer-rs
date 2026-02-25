@@ -22,7 +22,7 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage,
-    DecodedValue as TransformDecodedValue,
+    DecodedValue as TransformDecodedValue, RangeCompleteMessage,
 };
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
@@ -103,6 +103,7 @@ pub async fn decode_logs(
     mut decoder_rx: Receiver<DecoderMessage>,
     transform_tx: Option<Sender<DecodedEventsMessage>>,
     recollect_tx: Option<Sender<RecollectRequest>>,
+    complete_tx: Option<Sender<RangeCompleteMessage>>,
 ) -> Result<(), LogDecodingError> {
     let output_base = PathBuf::from(format!("data/derived/{}/decoded/logs", chain.name));
     std::fs::create_dir_all(&output_base)?;
@@ -167,6 +168,7 @@ pub async fn decode_logs(
         &factory_matchers,
         &output_base,
         transform_tx.as_ref(),
+        complete_tx.as_ref(),
     )
     .await?;
 
@@ -259,6 +261,7 @@ pub(crate) async fn process_logs(
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedEventsMessage>>,
+    complete_tx: Option<&Sender<RangeCompleteMessage>>,
 ) -> Result<(), LogDecodingError> {
     // Group decoded logs by (contract_name, event_name)
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
@@ -450,6 +453,14 @@ pub(crate) async fn process_logs(
             if let Err(e) = tx.send(msg).await {
                 tracing::warn!("Failed to send decoded events to transformation channel: {}", e);
             }
+        }
+    }
+
+    // Signal that all events for this range have been sent
+    if let Some(tx) = complete_tx {
+        let msg = RangeCompleteMessage { range_start, range_end };
+        if let Err(e) = tx.send(msg).await {
+            tracing::warn!("Failed to send range complete: {}", e);
         }
     }
 

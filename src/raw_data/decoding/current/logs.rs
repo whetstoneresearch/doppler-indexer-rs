@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::raw_data::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::raw_data::decoding::types::DecoderMessage;
-use crate::transformations::DecodedEventsMessage;
+use crate::transformations::{DecodedEventsMessage, RangeCompleteMessage};
 
 /// Live phase: Process new log data as it arrives via channel.
 /// Returns when AllComplete message is received or channel closes.
@@ -16,6 +16,7 @@ pub async fn decode_logs_live(
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     output_base: &std::path::Path,
     transform_tx: Option<&Sender<DecodedEventsMessage>>,
+    complete_tx: Option<&Sender<RangeCompleteMessage>>,
 ) -> Result<(), LogDecodingError> {
     // Track factory addresses per range
     let mut factory_addresses: HashMap<u64, HashMap<String, HashSet<[u8; 20]>>> = HashMap::new();
@@ -39,6 +40,7 @@ pub async fn decode_logs_live(
                     &factory_addrs,
                     output_base,
                     transform_tx,
+                    complete_tx,
                 )
                 .await?;
             }

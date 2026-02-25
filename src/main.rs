@@ -161,7 +161,7 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
                 // runs catchup then exits the live phase immediately.
                 let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
                 drop(_tx);
-                decode_logs(&chain, &cfg, rx, None, None)
+                decode_logs(&chain, &cfg, rx, None, None, None)
                     .await
                     .context("log decoding failed")
             }
@@ -320,7 +320,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         optional_channel::<DecodedEventsMessage>(transformations_enabled, channel_cap);
     let (transform_calls_tx, transform_calls_rx) =
         optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
-    let (_transform_complete_tx, transform_complete_rx) =
+    let (transform_complete_tx, transform_complete_rx) =
         optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
 
     // Decode catchup must complete before transformation engine catchup
@@ -570,10 +570,11 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
 
     if has_events {
         let transform_events_tx = transform_events_tx.clone();
+        let transform_complete_tx = transform_complete_tx.clone();
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
-                decode_logs(&chain, &cfg, log_decoder_rx.unwrap(), transform_events_tx, recollect_tx_for_log_decoder)
+                decode_logs(&chain, &cfg, log_decoder_rx.unwrap(), transform_events_tx, recollect_tx_for_log_decoder, transform_complete_tx)
                     .await
                     .context("log decoding failed")
             }
