@@ -8,6 +8,7 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 
 use crate::transformations::util::db::users::upsert_user;
 use crate::transformations::util::db::transfers::insert_transfer;
+use crate::transformations::util::sanitize::is_precompile_address;
 
 pub struct DERC20TransferHandler;
 
@@ -38,6 +39,10 @@ impl TransformationHandler for DERC20TransferHandler {
             let from_address = event.get("from")?.as_address().ok_or_else(|| {
                 TransformationError::TypeConversion("from is not an address".to_string())
             })?;
+
+            if is_precompile_address(from_address.into()) == true {
+                continue;
+            };
 
             let to_address = event.get("to")?.as_address().ok_or_else(|| {
                 TransformationError::TypeConversion("to is not an address".to_string())

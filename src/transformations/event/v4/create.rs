@@ -11,6 +11,7 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 use crate::transformations::util::db::token::insert_token;
 use crate::transformations::util::db::v4_pool_configs::insert_pool_config;
 use crate::transformations::util::db::pool::insert_pool;
+use crate::transformations::util::sanitize::is_precompile_address;
 
 use crate::types::uniswap::v4::{PoolKey, V4PoolConfig, PoolAddressOrPoolId};
 
@@ -67,6 +68,11 @@ impl TransformationHandler for V4CreateHandler {
             let numeraire = event.get("numeraire")?.as_address().ok_or_else(|| {
                 TransformationError::TypeConversion("numeraire is not an address".to_string())
             })?;
+
+            let precompile_checks: Vec<bool> = vec![asset, numeraire].into_iter().map(|addr| is_precompile_address(addr.into())).collect();
+            if precompile_checks.contains(&true) {
+                continue;
+            }
 
             let hook = event.get("poolOrHook")?.as_address().ok_or_else(|| {
                 TransformationError::TypeConversion("poolOrHook is not an address".to_string())
