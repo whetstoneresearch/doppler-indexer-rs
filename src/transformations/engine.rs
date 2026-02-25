@@ -1161,7 +1161,7 @@ impl TransformationEngine {
         &self,
         mut events_rx: Receiver<DecodedEventsMessage>,
         mut calls_rx: Receiver<DecodedCallsMessage>,
-        mut _complete_rx: Receiver<RangeCompleteMessage>,
+        mut complete_rx: Receiver<RangeCompleteMessage>,
         decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<(), TransformationError> {
         // Wait for decode catchup to finish so all decoded parquet files exist
@@ -1189,7 +1189,7 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    tracing::debug!(
+                    tracing::info!(
                         "Processing {} events for {}/{} in range {}-{}",
                         msg.events.len(),
                         msg.source_name,
@@ -1207,7 +1207,7 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    tracing::debug!(
+                    tracing::info!(
                         "Processing {} calls for {}/{} in range {}-{}",
                         msg.calls.len(),
                         msg.source_name,
@@ -1218,6 +1218,10 @@ impl TransformationEngine {
 
                     // Process calls and check if any pending events can now be processed
                     self.process_calls_message(msg).await?;
+                }
+
+                Some(msg) = complete_rx.recv() => {
+                    self.process_range_complete(msg).await?;
                 }
 
                 else => {
@@ -1241,7 +1245,23 @@ impl TransformationEngine {
         &self,
         msg: DecodedEventsMessage,
     ) -> Result<(), TransformationError> {
+        tracing::info!(
+            "process_events_message: source={}, event={}, range=({}, {}), {} events",
+            msg.source_name, msg.event_name, msg.range_start, msg.range_end, msg.events.len()
+        );
         let handlers = self.registry.handlers_for_event(&msg.source_name, &msg.event_name);
+        if handlers.is_empty() {
+            tracing::debug!(
+                "No handlers registered for {}/{}",
+                msg.source_name, msg.event_name
+            );
+        } else {
+            let handler_names: Vec<_> = handlers.iter().map(|h| h.handler_key()).collect();
+            tracing::info!(
+                "Found {} handlers for {}/{}: {:?}",
+                handlers.len(), msg.source_name, msg.event_name, handler_names
+            );
+        }
         let events = Arc::new(msg.events.clone());
 
         // Categorize handlers: ready to run vs needs buffering
@@ -1256,19 +1276,35 @@ impl TransformationEngine {
                 if call_deps.is_empty() {
                     ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
                 } else {
+                    // Log what we're checking
+                    let received_keys: Vec<_> = state.received_calls.keys().cloned().collect();
+                    tracing::info!(
+                        "Handler {} checking call deps {:?} for range {:?}. Currently received call keys: {:?}",
+                        handler_key, call_deps, range_key, received_keys
+                    );
+
                     let deps_ready = call_deps.iter().all(|dep| {
-                        state.received_calls
+                        let found = state.received_calls
                             .get(dep)
                             .map(|ranges| ranges.contains(&range_key))
-                            .unwrap_or(false)
+                            .unwrap_or(false);
+                        tracing::info!(
+                            "  Dep {:?} for range {:?}: {}",
+                            dep, range_key, if found { "FOUND" } else { "NOT FOUND" }
+                        );
+                        found
                     });
 
                     if deps_ready {
                         let calls = state.calls_buffer.get(&range_key).cloned().unwrap_or_default();
+                        tracing::info!(
+                            "Handler {} deps ready for range {:?}, {} calls in buffer",
+                            handler_key, range_key, calls.len()
+                        );
                         ready_handlers.push((handler.clone(), Arc::new(calls)));
                     } else {
-                        tracing::debug!(
-                            "Handler {} buffering events for range {}-{}: waiting for call dependencies {:?}",
+                        tracing::info!(
+                            "Handler {} BUFFERING events for range {}-{}: waiting for call dependencies {:?}",
                             handler_key, msg.range_start, msg.range_end, call_deps
                         );
                         let pending = PendingEventData {
@@ -1378,6 +1414,11 @@ impl TransformationEngine {
         let range_key = (msg.range_start, msg.range_end);
         let call_key = (msg.source_name.clone(), msg.function_name.clone());
 
+        tracing::info!(
+            "Registering call key {:?} for range {:?} ({} calls)",
+            call_key, range_key, msg.calls.len()
+        );
+
         // Mark this call type as received for this range and buffer the calls
         {
             let mut state = self.live_state.lock().await;
@@ -1389,6 +1430,13 @@ impl TransformationEngine {
                 .entry(range_key)
                 .or_default()
                 .extend(msg.calls.clone());
+
+            // Log current state
+            let pending_handlers: Vec<_> = state.pending_events.keys().cloned().collect();
+            tracing::info!(
+                "After registering {:?}: {} pending handlers with buffered events: {:?}",
+                call_key, pending_handlers.len(), pending_handlers
+            );
         }
 
         // Process call handlers (existing behavior)
@@ -1410,30 +1458,61 @@ impl TransformationEngine {
         &self,
         range_key: (u64, u64),
     ) -> Result<(), TransformationError> {
+        tracing::info!("try_process_pending_events for range {:?}", range_key);
+
         // Collect ready events under lock, then process outside lock
         let ready_events: Vec<(String, PendingEventData, Arc<dyn EventHandler>)> = {
             let mut state = self.live_state.lock().await;
             let mut ready = Vec::new();
 
+            // Log current received calls state
+            let received_keys: Vec<_> = state.received_calls.keys().cloned().collect();
+            tracing::info!(
+                "  Current received_calls keys: {:?}",
+                received_keys
+            );
+
             // Check each handler's pending events
             let handler_keys: Vec<_> = state.pending_events.keys().cloned().collect();
+            tracing::info!(
+                "  Handlers with pending events: {:?}",
+                handler_keys
+            );
+
             for handler_key in handler_keys {
                 // First pass: identify ready indices without holding mutable borrow
                 let ready_indices: Vec<usize> = {
                     let pending = state.pending_events.get(&handler_key).unwrap();
+                    tracing::info!(
+                        "  Handler {} has {} pending event batches",
+                        handler_key, pending.len()
+                    );
+
                     pending
                         .iter()
                         .enumerate()
-                        .filter(|(_, event_data)| {
-                            (event_data.range_start, event_data.range_end) == range_key
+                        .filter(|(idx, event_data)| {
+                            let matches_range = (event_data.range_start, event_data.range_end) == range_key;
+                            tracing::info!(
+                                "    Pending[{}] range ({}, {}) vs {:?}: {}",
+                                idx, event_data.range_start, event_data.range_end, range_key,
+                                if matches_range { "MATCHES" } else { "no match" }
+                            );
+                            matches_range
                         })
-                        .filter(|(_, event_data)| {
-                            event_data.required_calls.iter().all(|dep| {
-                                state.received_calls
+                        .filter(|(idx, event_data)| {
+                            let all_deps_ready = event_data.required_calls.iter().all(|dep| {
+                                let found = state.received_calls
                                     .get(dep)
                                     .map(|ranges| ranges.contains(&range_key))
-                                    .unwrap_or(false)
-                            })
+                                    .unwrap_or(false);
+                                tracing::info!(
+                                    "    Pending[{}] dep {:?} for range {:?}: {}",
+                                    idx, dep, range_key, if found { "READY" } else { "NOT READY" }
+                                );
+                                found
+                            });
+                            all_deps_ready
                         })
                         .map(|(i, _)| i)
                         .collect()
@@ -1551,6 +1630,47 @@ impl TransformationEngine {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Process range completion signal.
+    /// Records progress for all handlers even when no events matched their triggers.
+    /// This ensures handlers don't unnecessarily re-process empty ranges on restart.
+    async fn process_range_complete(
+        &self,
+        msg: RangeCompleteMessage,
+    ) -> Result<(), TransformationError> {
+        // Get all unique event handlers
+        let handlers = self.registry.unique_event_handlers();
+
+        for info in &handlers {
+            let handler_key = info.handler.handler_key();
+            // UPSERT handles duplicates gracefully - if a handler already recorded
+            // progress for this range (because it had events), this is a no-op
+            self.record_completed_range_for_handler(
+                &handler_key,
+                msg.range_start,
+                msg.range_end,
+            ).await?;
+        }
+
+        // Clean up buffered state for this range
+        let range_key = (msg.range_start, msg.range_end);
+        {
+            let mut state = self.live_state.lock().await;
+            state.calls_buffer.remove(&range_key);
+            for ranges in state.received_calls.values_mut() {
+                ranges.remove(&range_key);
+            }
+        }
+
+        tracing::debug!(
+            "Recorded progress for {} handlers on range {}-{}",
+            handlers.len(),
+            msg.range_start,
+            msg.range_end
+        );
 
         Ok(())
     }
