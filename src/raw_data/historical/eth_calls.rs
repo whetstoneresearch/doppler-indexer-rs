@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
+use futures::{stream, StreamExt, TryStreamExt};
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array};
@@ -617,8 +618,22 @@ pub(crate) async fn process_event_triggers(
     output_dir: &Path,
     rpc_batch_size: usize,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    range_start: u64,
+    range_end: u64,
 ) -> Result<(), EthCallCollectionError> {
+    // Collect all configured (contract_name, function_name) pairs so we can write empty files
+    // for pairs with no matching events (prevents catchup from retrying)
+    let configured_pairs: HashSet<(String, String)> = event_call_configs
+        .values()
+        .flatten()
+        .map(|c| (c.contract_name.clone(), c.function_name.clone()))
+        .collect();
+
     if triggers.is_empty() {
+        // Write empty files for all configured pairs
+        for (contract_name, function_name) in &configured_pairs {
+            write_empty_event_call_file(output_dir, contract_name, function_name, range_start, range_end)?;
+        }
         return Ok(());
     }
 
@@ -686,11 +701,17 @@ pub(crate) async fn process_event_triggers(
         }
     }
 
+    // Track which (contract_name, function_name) pairs got results
+    let mut written_pairs: HashSet<(String, String)> = HashSet::new();
+
     // Process each group of calls
     for ((contract_name, function_name), calls) in calls_by_output {
         if calls.is_empty() {
             continue;
         }
+
+        // Mark this pair as having results
+        written_pairs.insert((contract_name.clone(), function_name.clone()));
 
         // Get block range for output file naming
         let min_block = calls.iter().map(|(t, _, _, _, _)| t.block_number).min().unwrap();
@@ -717,56 +738,83 @@ pub(crate) async fn process_event_triggers(
             pending_calls.push((tx, block_id, trigger, *target_address, encoded_params.clone()));
         }
 
-        // Execute calls in batches
-        let mut all_results: Vec<EventCallResult> = Vec::new();
+        // Execute calls in batches with concurrent chunk processing
         let max_params = calls.iter().map(|(_, _, _, _, p)| p.len()).max().unwrap_or(0);
 
-        for chunk in pending_calls.chunks(rpc_batch_size) {
-            let batch_calls: Vec<(TransactionRequest, BlockId)> = chunk
-                .iter()
-                .map(|(tx, block_id, _, _, _)| (tx.clone(), *block_id))
+        // Number of chunks to process concurrently
+        let chunk_concurrency = 4;
+
+        // Pre-collect chunks into owned data to avoid lifetime issues
+        let owned_chunks: Vec<Vec<(TransactionRequest, BlockId, EventTriggerData, Address, Vec<Vec<u8>>)>> =
+            pending_calls.chunks(rpc_batch_size)
+                .map(|chunk| {
+                    chunk.iter()
+                        .map(|(tx, block_id, trigger, addr, params)| {
+                            (tx.clone(), *block_id, (*trigger).clone(), *addr, params.clone())
+                        })
+                        .collect()
+                })
                 .collect();
 
-            let results = client.call_batch(batch_calls).await?;
+        let chunk_results: Vec<Vec<EventCallResult>> = stream::iter(owned_chunks)
+            .map(|chunk| {
+                let contract_name = contract_name.clone();
+                let function_name = function_name.clone();
+                async move {
+                    let batch_calls: Vec<(TransactionRequest, BlockId)> = chunk
+                        .iter()
+                        .map(|(tx, block_id, _, _, _)| (tx.clone(), *block_id))
+                        .collect();
 
-            for (i, result) in results.into_iter().enumerate() {
-                let (_, _, trigger, target_address, encoded_params) = &chunk[i];
+                    let results = client.call_batch(batch_calls).await?;
 
-                match result {
-                    Ok(bytes) => {
-                        all_results.push(EventCallResult {
-                            block_number: trigger.block_number,
-                            block_timestamp: trigger.block_timestamp,
-                            log_index: trigger.log_index,
-                            target_address: target_address.0.0,
-                            value_bytes: bytes.to_vec(),
-                            param_values: encoded_params.clone(),
-                        });
+                    let mut chunk_results = Vec::with_capacity(results.len());
+                    for (i, result) in results.into_iter().enumerate() {
+                        let (_, _, trigger, target_address, encoded_params) = &chunk[i];
+
+                        match result {
+                            Ok(bytes) => {
+                                chunk_results.push(EventCallResult {
+                                    block_number: trigger.block_number,
+                                    block_timestamp: trigger.block_timestamp,
+                                    log_index: trigger.log_index,
+                                    target_address: target_address.0.0,
+                                    value_bytes: bytes.to_vec(),
+                                    param_values: encoded_params.clone(),
+                                });
+                            }
+                            Err(e) => {
+                                let params_hex: Vec<String> = encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
+                                tracing::warn!(
+                                    "Event-triggered eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
+                                    contract_name,
+                                    function_name,
+                                    trigger.block_number,
+                                    target_address,
+                                    params_hex,
+                                    e
+                                );
+                                // Store empty result to maintain consistency
+                                chunk_results.push(EventCallResult {
+                                    block_number: trigger.block_number,
+                                    block_timestamp: trigger.block_timestamp,
+                                    log_index: trigger.log_index,
+                                    target_address: target_address.0.0,
+                                    value_bytes: Vec::new(),
+                                    param_values: encoded_params.clone(),
+                                });
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let params_hex: Vec<String> = encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
-                        tracing::warn!(
-                            "Event-triggered eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
-                            contract_name,
-                            function_name,
-                            trigger.block_number,
-                            target_address,
-                            params_hex,
-                            e
-                        );
-                        // Store empty result to maintain consistency
-                        all_results.push(EventCallResult {
-                            block_number: trigger.block_number,
-                            block_timestamp: trigger.block_timestamp,
-                            log_index: trigger.log_index,
-                            target_address: target_address.0.0,
-                            value_bytes: Vec::new(),
-                            param_values: encoded_params.clone(),
-                        });
-                    }
+                    Ok::<_, EthCallCollectionError>(chunk_results)
                 }
-            }
-        }
+            })
+            .buffer_unordered(chunk_concurrency)
+            .try_collect()
+            .await?;
+
+        // Flatten chunk results
+        let mut all_results: Vec<EventCallResult> = chunk_results.into_iter().flatten().collect();
 
         // Sort by block number, log index
         all_results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
@@ -812,6 +860,38 @@ pub(crate) async fn process_event_triggers(
         }
     }
 
+    // Write empty files for configured pairs that didn't have any matching events
+    for (contract_name, function_name) in configured_pairs {
+        if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
+            write_empty_event_call_file(output_dir, &contract_name, &function_name, range_start, range_end)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Write an empty parquet file for event-triggered calls when no events matched
+fn write_empty_event_call_file(
+    output_dir: &Path,
+    contract_name: &str,
+    function_name: &str,
+    range_start: u64,
+    range_end: u64,
+) -> Result<(), EthCallCollectionError> {
+    let sub_dir = output_dir.join(contract_name).join(function_name).join("on_events");
+    std::fs::create_dir_all(&sub_dir)?;
+
+    let file_name = format!("{}-{}.parquet", range_start, range_end);
+    let output_path = sub_dir.join(&file_name);
+
+    // Write empty parquet with 0 params
+    write_event_call_results_to_parquet(&[], &output_path, 0)?;
+
+    tracing::debug!(
+        "Wrote empty event-triggered eth_call file to {} (no matching events)",
+        output_path.display()
+    );
+
     Ok(())
 }
 
@@ -825,8 +905,22 @@ pub(crate) async fn process_event_triggers_multicall(
     rpc_batch_size: usize,
     decoder_tx: &Option<Sender<DecoderMessage>>,
     multicall3_address: Address,
+    range_start: u64,
+    range_end: u64,
 ) -> Result<(), EthCallCollectionError> {
+    // Collect all configured (contract_name, function_name) pairs so we can write empty files
+    // for pairs with no matching events (prevents catchup from retrying)
+    let configured_pairs: HashSet<(String, String)> = event_call_configs
+        .values()
+        .flatten()
+        .map(|c| (c.contract_name.clone(), c.function_name.clone()))
+        .collect();
+
     if triggers.is_empty() {
+        // Write empty files for all configured pairs
+        for (contract_name, function_name) in &configured_pairs {
+            write_empty_event_call_file(output_dir, contract_name, function_name, range_start, range_end)?;
+        }
         return Ok(());
     }
 
@@ -995,11 +1089,17 @@ pub(crate) async fn process_event_triggers_multicall(
             });
     }
 
+    // Track which (contract_name, function_name) pairs got results
+    let mut written_pairs: HashSet<(String, String)> = HashSet::new();
+
     // Write parquet and send to decoder for each group
     for ((contract_name, function_name), mut results) in group_results {
         if results.is_empty() {
             continue;
         }
+
+        // Mark this pair as having results
+        written_pairs.insert((contract_name.clone(), function_name.clone()));
 
         // Sort by block number, log index
         results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
@@ -1043,6 +1143,13 @@ pub(crate) async fn process_event_triggers_multicall(
         }
     }
 
+    // Write empty files for configured pairs that didn't have any matching events
+    for (contract_name, function_name) in configured_pairs {
+        if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
+            write_empty_event_call_file(output_dir, &contract_name, &function_name, range_start, range_end)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1067,11 +1174,12 @@ pub(crate) fn write_event_call_results_to_parquet(
     let arr: UInt32Array = results.iter().map(|r| Some(r.log_index)).collect();
     arrays.push(Arc::new(arr));
 
-    // target_address
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        results.iter().map(|r| r.target_address.as_slice()),
-    )?;
-    arrays.push(Arc::new(arr));
+    // target_address - use FixedSizeBinaryBuilder for empty case compatibility
+    let mut builder = FixedSizeBinaryBuilder::new(20);
+    for r in results {
+        builder.append_value(r.target_address.as_slice())?;
+    }
+    arrays.push(Arc::new(builder.finish()));
 
     // value
     let arr: BinaryArray = results
@@ -4594,6 +4702,7 @@ pub(crate) struct MulticallSlotGeneric<M> {
 }
 
 /// Pending multicall for a single block
+#[derive(Clone)]
 pub(crate) struct BlockMulticall<M> {
     pub(crate) block_number: u64,
     pub(crate) block_id: BlockId,
@@ -4637,12 +4746,126 @@ pub(crate) struct OnceCallMeta {
 }
 
 /// Execute multicalls and return (metadata, return_data, success) for each slot
-pub(crate) async fn execute_multicalls_generic<M: Clone>(
+pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
     client: &UnifiedRpcClient,
     multicall3_address: Address,
     block_multicalls: Vec<BlockMulticall<M>>,
     rpc_batch_size: usize,
 ) -> Result<Vec<(M, Vec<u8>, bool)>, EthCallCollectionError> {
+    // Track failed calls with chunk-relative indices
+    struct ChunkFailedCall {
+        relative_index: usize,  // Index within the chunk's results
+        target_address: Address,
+        calldata: Bytes,
+        block_number: u64,
+        block_id: BlockId,
+    }
+
+    struct ChunkResult<M> {
+        results: Vec<(M, Vec<u8>, bool)>,
+        failed_calls: Vec<ChunkFailedCall>,
+    }
+
+    // Number of chunks to process concurrently
+    let chunk_concurrency = 4;
+
+    // Pre-collect chunks into owned vectors to avoid lifetime issues
+    let owned_chunks: Vec<Vec<BlockMulticall<M>>> = block_multicalls
+        .chunks(rpc_batch_size)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    // Process chunks concurrently using buffered (maintains order for correct index calculation)
+    let chunk_results: Vec<ChunkResult<M>> = stream::iter(owned_chunks)
+        .map(|chunk| async move {
+            let calls: Vec<(TransactionRequest, BlockId)> = chunk
+                .iter()
+                .map(|bm| {
+                    let sub_calls: Vec<(Address, &Bytes)> = bm
+                        .slots
+                        .iter()
+                        .map(|s| (s.target_address, &s.encoded_calldata))
+                        .collect();
+                    let multicall_data = build_multicall_calldata(&sub_calls);
+                    let tx = TransactionRequest::default()
+                        .to(multicall3_address)
+                        .input(multicall_data.into());
+                    (tx, bm.block_id)
+                })
+                .collect();
+
+            let results = client.call_batch(calls).await?;
+
+            let mut chunk_results: Vec<(M, Vec<u8>, bool)> = Vec::new();
+            let mut chunk_failed_calls: Vec<ChunkFailedCall> = Vec::new();
+
+            for (i, result) in results.into_iter().enumerate() {
+                let bm = &chunk[i];
+                let slot_count = bm.slots.len();
+
+                match result {
+                    Ok(bytes) => {
+                        match decode_multicall_results(&bytes, slot_count) {
+                            Ok(decoded) => {
+                                for (j, (success, return_data)) in decoded.into_iter().enumerate() {
+                                    let slot = &bm.slots[j];
+                                    if !success {
+                                        tracing::warn!(
+                                            "Multicall sub-call failed at block {} targeting {}",
+                                            bm.block_number,
+                                            slot.target_address
+                                        );
+                                        chunk_failed_calls.push(ChunkFailedCall {
+                                            relative_index: chunk_results.len(),
+                                            target_address: slot.target_address,
+                                            calldata: slot.encoded_calldata.clone(),
+                                            block_number: bm.block_number,
+                                            block_id: bm.block_id,
+                                        });
+                                    }
+                                    chunk_results.push((
+                                        slot.metadata.clone(),
+                                        if success { return_data } else { Vec::new() },
+                                        success,
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to decode multicall results for block {}: {}",
+                                    bm.block_number,
+                                    e
+                                );
+                                // Treat all sub-calls as failed
+                                for slot in &bm.slots {
+                                    chunk_results.push((slot.metadata.clone(), Vec::new(), false));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Multicall RPC failed for block {}: {}",
+                            bm.block_number,
+                            e
+                        );
+                        // Treat all sub-calls as failed
+                        for slot in &bm.slots {
+                            chunk_results.push((slot.metadata.clone(), Vec::new(), false));
+                        }
+                    }
+                }
+            }
+            Ok::<_, EthCallCollectionError>(ChunkResult {
+                results: chunk_results,
+                failed_calls: chunk_failed_calls,
+            })
+        })
+        .buffered(chunk_concurrency)
+        .try_collect()
+        .await?;
+
+    // Flatten results and compute global indices for failed calls
     struct FailedCall {
         result_index: usize,
         target_address: Address,
@@ -4654,82 +4877,21 @@ pub(crate) async fn execute_multicalls_generic<M: Clone>(
     let mut all_results: Vec<(M, Vec<u8>, bool)> = Vec::new();
     let mut failed_retries: Vec<FailedCall> = Vec::new();
 
-    for chunk in block_multicalls.chunks(rpc_batch_size) {
-        let calls: Vec<(TransactionRequest, BlockId)> = chunk
-            .iter()
-            .map(|bm| {
-                let sub_calls: Vec<(Address, &Bytes)> = bm
-                    .slots
-                    .iter()
-                    .map(|s| (s.target_address, &s.encoded_calldata))
-                    .collect();
-                let multicall_data = build_multicall_calldata(&sub_calls);
-                let tx = TransactionRequest::default()
-                    .to(multicall3_address)
-                    .input(multicall_data.into());
-                (tx, bm.block_id)
-            })
-            .collect();
+    for chunk_result in chunk_results {
+        let base_index = all_results.len();
 
-        let results = client.call_batch(calls).await?;
-
-        for (i, result) in results.into_iter().enumerate() {
-            let bm = &chunk[i];
-            let slot_count = bm.slots.len();
-
-            match result {
-                Ok(bytes) => {
-                    match decode_multicall_results(&bytes, slot_count) {
-                        Ok(decoded) => {
-                            for (j, (success, return_data)) in decoded.into_iter().enumerate() {
-                                let slot = &bm.slots[j];
-                                if !success {
-                                    tracing::warn!(
-                                        "Multicall sub-call failed at block {} targeting {}",
-                                        bm.block_number,
-                                        slot.target_address
-                                    );
-                                    failed_retries.push(FailedCall {
-                                        result_index: all_results.len(),
-                                        target_address: slot.target_address,
-                                        calldata: slot.encoded_calldata.clone(),
-                                        block_number: bm.block_number,
-                                        block_id: bm.block_id,
-                                    });
-                                }
-                                all_results.push((
-                                    slot.metadata.clone(),
-                                    if success { return_data } else { Vec::new() },
-                                    success,
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to decode multicall results for block {}: {}",
-                                bm.block_number,
-                                e
-                            );
-                            // Treat all sub-calls as failed
-                            for slot in &bm.slots {
-                                all_results.push((slot.metadata.clone(), Vec::new(), false));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Multicall RPC failed for block {}: {}",
-                        bm.block_number,
-                        e
-                    );
-                    // Treat all sub-calls as failed
-                    for slot in &bm.slots {
-                        all_results.push((slot.metadata.clone(), Vec::new(), false));
-                    }
-                }
-            }
+        // Convert chunk-relative indices to global indices
+        for failed in chunk_result.failed_calls {
+            failed_retries.push(FailedCall {
+                result_index: base_index + failed.relative_index,
+                target_address: failed.target_address,
+                calldata: failed.calldata,
+                block_number: failed.block_number,
+                block_id: failed.block_id,
+            });
         }
+
+        all_results.extend(chunk_result.results);
     }
 
     // Retry failed multicall sub-calls individually

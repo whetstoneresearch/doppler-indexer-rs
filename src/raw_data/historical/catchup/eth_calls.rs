@@ -594,35 +594,41 @@ pub async fn collect_eth_calls(
                     log_range.start,
                     log_range.end - 1
                 );
-
-                // Process the triggers
-                if let Some(multicall_addr) = multicall3_address {
-                    process_event_triggers_multicall(
-                        triggers,
-                        &event_call_configs,
-                        &factory_addresses,
-                        client,
-                        &base_output_dir,
-                        rpc_batch_size,
-                        decoder_tx,
-                        multicall_addr,
-                    )
-                    .await?;
-                } else {
-                    process_event_triggers(
-                        triggers,
-                        &event_call_configs,
-                        &factory_addresses,
-                        client,
-                        &base_output_dir,
-                        rpc_batch_size,
-                        decoder_tx,
-                    )
-                    .await?;
-                }
-
-                event_catchup_count += 1;
             }
+
+            // Process the triggers (or write empty files if no triggers)
+            let range_start = log_range.start;
+            let range_end = log_range.end - 1;
+            if let Some(multicall_addr) = multicall3_address {
+                process_event_triggers_multicall(
+                    triggers,
+                    &event_call_configs,
+                    &factory_addresses,
+                    client,
+                    &base_output_dir,
+                    rpc_batch_size,
+                    decoder_tx,
+                    multicall_addr,
+                    range_start,
+                    range_end,
+                )
+                .await?;
+            } else {
+                process_event_triggers(
+                    triggers,
+                    &event_call_configs,
+                    &factory_addresses,
+                    client,
+                    &base_output_dir,
+                    rpc_batch_size,
+                    decoder_tx,
+                    range_start,
+                    range_end,
+                )
+                .await?;
+            }
+
+            event_catchup_count += 1;
         }
 
         if event_catchup_count > 0 {

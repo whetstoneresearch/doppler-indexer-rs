@@ -182,6 +182,10 @@ pub async fn collect_eth_calls(
                 } => {
                     match event_result {
                         Some(EventTriggerMessage::Triggers(triggers)) => {
+                            // Derive range from trigger block numbers
+                            let range_start = triggers.iter().map(|t| t.block_number).min().unwrap_or(0);
+                            let range_end = triggers.iter().map(|t| t.block_number).max().unwrap_or(0);
+
                             if let Some(multicall_addr) = state.multicall3_address {
                                 process_event_triggers_multicall(
                                     triggers,
@@ -192,6 +196,8 @@ pub async fn collect_eth_calls(
                                     state.rpc_batch_size,
                                     &decoder_tx,
                                     multicall_addr,
+                                    range_start,
+                                    range_end,
                                 )
                                 .await?;
                             } else {
@@ -203,12 +209,40 @@ pub async fn collect_eth_calls(
                                     &state.base_output_dir,
                                     state.rpc_batch_size,
                                     &decoder_tx,
+                                    range_start,
+                                    range_end,
                                 )
                                 .await?;
                             }
                         }
-                        Some(EventTriggerMessage::RangeComplete { .. }) => {
-                            // Range complete - no action needed
+                        Some(EventTriggerMessage::RangeComplete { range_start, range_end }) => {
+                            // Range complete - write empty files for configured pairs that had no events
+                            // Note: This handles the case where no events matched any trigger patterns
+                            // The process_event_triggers functions handle empty files for pairs that
+                            // had some events but not for all configured pairs
+                            let configured_pairs: std::collections::HashSet<(String, String)> = state.event_call_configs
+                                .values()
+                                .flatten()
+                                .map(|c| (c.contract_name.clone(), c.function_name.clone()))
+                                .collect();
+
+                            for (contract_name, function_name) in configured_pairs {
+                                let sub_dir = state.base_output_dir.join(&contract_name).join(&function_name).join("on_events");
+                                let file_name = format!("{}-{}.parquet", range_start, range_end);
+                                let output_path = sub_dir.join(&file_name);
+                                // Only write if file doesn't exist (don't overwrite if we already wrote results)
+                                if !output_path.exists() {
+                                    if let Err(e) = std::fs::create_dir_all(&sub_dir) {
+                                        tracing::warn!("Failed to create dir for empty event file: {}", e);
+                                        continue;
+                                    }
+                                    if let Err(e) = crate::raw_data::historical::eth_calls::write_event_call_results_to_parquet(&[], &output_path, 0) {
+                                        tracing::warn!("Failed to write empty event file: {}", e);
+                                    } else {
+                                        tracing::debug!("Wrote empty event-triggered eth_call file to {} (no matching events)", output_path.display());
+                                    }
+                                }
+                            }
                         }
                         Some(EventTriggerMessage::AllComplete) | None => {
                             tracing::debug!("eth_calls: event trigger channel closed");
@@ -554,6 +588,10 @@ pub async fn collect_eth_calls(
             } => {
                 match event_result {
                     Some(EventTriggerMessage::Triggers(triggers)) => {
+                        // Derive range from trigger block numbers
+                        let range_start = triggers.iter().map(|t| t.block_number).min().unwrap_or(0);
+                        let range_end = triggers.iter().map(|t| t.block_number).max().unwrap_or(0);
+
                         if let Some(multicall_addr) = state.multicall3_address {
                             process_event_triggers_multicall(
                                 triggers,
@@ -564,6 +602,8 @@ pub async fn collect_eth_calls(
                                 state.rpc_batch_size,
                                 &decoder_tx,
                                 multicall_addr,
+                                range_start,
+                                range_end,
                             )
                             .await?;
                         } else {
@@ -575,12 +615,37 @@ pub async fn collect_eth_calls(
                                 &state.base_output_dir,
                                 state.rpc_batch_size,
                                 &decoder_tx,
+                                range_start,
+                                range_end,
                             )
                             .await?;
                         }
                     }
-                    Some(EventTriggerMessage::RangeComplete { .. }) => {
-                        // Range complete - no action needed for event triggers
+                    Some(EventTriggerMessage::RangeComplete { range_start, range_end }) => {
+                        // Range complete - write empty files for configured pairs that had no events
+                        let configured_pairs: std::collections::HashSet<(String, String)> = state.event_call_configs
+                            .values()
+                            .flatten()
+                            .map(|c| (c.contract_name.clone(), c.function_name.clone()))
+                            .collect();
+
+                        for (contract_name, function_name) in configured_pairs {
+                            let sub_dir = state.base_output_dir.join(&contract_name).join(&function_name).join("on_events");
+                            let file_name = format!("{}-{}.parquet", range_start, range_end);
+                            let output_path = sub_dir.join(&file_name);
+                            // Only write if file doesn't exist
+                            if !output_path.exists() {
+                                if let Err(e) = std::fs::create_dir_all(&sub_dir) {
+                                    tracing::warn!("Failed to create dir for empty event file: {}", e);
+                                    continue;
+                                }
+                                if let Err(e) = crate::raw_data::historical::eth_calls::write_event_call_results_to_parquet(&[], &output_path, 0) {
+                                    tracing::warn!("Failed to write empty event file: {}", e);
+                                } else {
+                                    tracing::debug!("Wrote empty event-triggered eth_call file to {} (no matching events)", output_path.display());
+                                }
+                            }
+                        }
                     }
                     Some(EventTriggerMessage::AllComplete) | None => {
                         tracing::debug!("eth_calls: event trigger channel closed");
