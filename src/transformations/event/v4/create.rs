@@ -14,25 +14,7 @@ use crate::transformations::util::db::pool::insert_pool;
 use crate::transformations::util::sanitize::is_precompile_address;
 
 use crate::types::uniswap::v4::{PoolKey, V4PoolConfig, PoolAddressOrPoolId};
-
-struct TokenMetadata {
-    name: String,
-    symbol: String,
-    decimals: u8,
-}
-
-struct AssetTokenMetadata {
-    name: String,
-    symbol: String,
-    decimals: u8,
-    token_uri: String,
-    total_supply: U256,
-    governance: Address,
-    integrator: Address,
-    initializer: Address,
-    migrator: Address,
-    migration_pool: PoolAddressOrPoolId,
-}
+use crate::types::shared::metadata::{TokenMetadata, AssetTokenMetadata};
 
 pub struct V4CreateHandler;
 

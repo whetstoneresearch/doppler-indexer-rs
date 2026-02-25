@@ -1,22 +1,22 @@
 use alloy_primitives::{Address, U256};
 
-use crate::types::v4::PoolAddressOrPoolId;
+use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
-struct TokenMetadata {
-    name: String,
-    symbol: String,
-    decimals: u8,
+pub struct TokenMetadata {
+    pub(crate) name: String,
+    pub(crate) symbol: String,
+    pub(crate) decimals: u8,
 }
 
-struct AssetTokenMetadata {
-    name: String,
-    symbol: String,
-    decimals: u8,
-    token_uri: String,
-    total_supply: U256,
-    governance: Address,
-    integrator: Address,
-    initializer: Address,
-    migrator: Address,
-    migration_pool: PoolAddressOrPoolId,
+pub struct AssetTokenMetadata {
+    pub(crate) name: String,
+    pub(crate) symbol: String,
+    pub(crate) decimals: u8,
+    pub(crate) token_uri: String,
+    pub(crate) total_supply: U256,
+    pub(crate) governance: Address,
+    pub(crate) integrator: Address,
+    pub(crate) initializer: Address,
+    pub(crate) migrator: Address,
+    pub(crate) migration_pool: PoolAddressOrPoolId,
 }
