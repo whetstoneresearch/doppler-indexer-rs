@@ -13,6 +13,7 @@ use super::constants::WAD;
 /// - `decimals`: decimals of the quote price feed (default 8)
 ///
 /// Returns a value with 18 decimals of precision.
+#[allow(dead_code)]
 pub fn calculate_market_cap(
     price: U256,
     total_supply: U256,
@@ -42,6 +43,7 @@ pub fn calculate_market_cap(
 /// - `decimals`: decimals of the quote price feed (default 8)
 /// - `asset_decimals`: decimals of the asset token (default 18)
 /// - `quote_decimals`: decimals of the quote token (default 18)
+#[allow(dead_code)]
 pub fn calculate_liquidity(
     asset_balance: U256,
     quote_balance: U256,
@@ -83,6 +85,7 @@ pub fn calculate_liquidity(
 /// - `is_quote_usd`: if true, quote is already denominated in USD
 /// - `quote_decimals`: decimals of the quote token (default 18)
 /// - `decimals`: decimals of the quote price feed (default 8)
+#[allow(dead_code)]
 pub fn calculate_volume(
     amount_in: U256,
     amount_out: U256,

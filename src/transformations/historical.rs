@@ -122,6 +122,7 @@ impl HistoricalDataReader {
 
     /// Query historical events from parquet files.
     /// All matching files are read concurrently using `spawn_blocking`.
+    #[allow(dead_code)]
     pub async fn query_events(
         &self,
         query: HistoricalEventQuery,
@@ -162,6 +163,7 @@ impl HistoricalDataReader {
 
     /// Query historical call results from parquet files.
     /// All matching files are read concurrently using `spawn_blocking`.
+    #[allow(dead_code)]
     pub async fn query_calls(
         &self,
         query: HistoricalCallQuery,
@@ -246,6 +248,7 @@ impl HistoricalDataReader {
     }
 
     /// Find files that overlap with the requested block range.
+    #[allow(dead_code)]
     fn find_files_for_range(
         &self,
         index: &HashMap<(String, String), Vec<(u64, u64, PathBuf)>>,
@@ -312,6 +315,7 @@ fn parse_range_from_filename(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// Read events from a parquet file with filtering.
+#[allow(dead_code)]
 fn read_events_from_parquet(
     file_path: &Path,
     query: &HistoricalEventQuery,
@@ -347,6 +351,7 @@ fn read_events_from_parquet(
 }
 
 /// Read calls from a parquet file with filtering.
+#[allow(dead_code)]
 fn read_calls_from_parquet(
     file_path: &Path,
     query: &HistoricalCallQuery,

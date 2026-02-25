@@ -1,4 +1,3 @@
-use alloy::serde::quantity::vec;
 use alloy_primitives::{address, Address};
 
 pub fn is_precompile_address(addr: Address) -> bool {
