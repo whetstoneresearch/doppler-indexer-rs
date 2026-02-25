@@ -5,6 +5,7 @@
 pub mod constants;
 pub mod db;
 pub mod market;
+pub mod metadata;
 pub mod price;
 pub mod price_fetch;
 pub mod quote_info;

@@ -50,6 +50,9 @@ pub enum TransformationError {
 
     #[error("Channel send error: {0}")]
     ChannelError(String),
+
+    #[error("Includes precompile address: {0}")]
+    IncludesPrecompileError(String)
 }
 
 impl TransformationError {
