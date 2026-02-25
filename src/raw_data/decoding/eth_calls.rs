@@ -515,35 +515,55 @@ pub(crate) async fn process_once_calls(
 
     // Send to transformation channel if enabled
     if let Some(tx) = transform_tx {
-        // For "once" calls, we send each function as a separate message
-        for config in configs {
-            let transform_calls: Vec<TransformDecodedCall> = decoded_records
-                .iter()
-                .filter_map(|r| {
-                    r.decoded_values.get(&config.function_name).map(|decoded| {
-                        convert_once_to_transform_call(
-                            r,
-                            contract_name,
-                            &config.function_name,
-                            decoded,
-                            &config.output_type,
-                        )
-                    })
-                })
-                .collect();
-
-            if !transform_calls.is_empty() {
-                let msg = DecodedCallsMessage {
-                    range_start,
-                    range_end,
-                    source_name: contract_name.to_string(),
-                    function_name: config.function_name.clone(),
-                    calls: transform_calls,
-                };
-                if let Err(e) = tx.send(msg).await {
-                    tracing::warn!("Failed to send decoded calls to transformation channel: {}", e);
+        // For "once" calls, we consolidate ALL functions per address into a single DecodedCall
+        // with function_name = "once" and ALL results merged. This matches:
+        // 1. How handlers specify call_dependencies (e.g., ("DERC20", "once"))
+        // 2. How catchup reads from parquet (one row per address with all columns as result fields)
+        // 3. How handlers filter (call.function_name == "once") and access (call.result.get("name"))
+        let transform_calls: Vec<TransformDecodedCall> = decoded_records
+            .iter()
+            .map(|record| {
+                // Merge all function results for this address into one result map
+                let mut merged_result = HashMap::new();
+                for config in configs {
+                    if let Some(decoded_value) = record.decoded_values.get(&config.function_name) {
+                        let partial_result = build_result_map(decoded_value, &config.output_type, &config.function_name);
+                        merged_result.extend(partial_result);
+                    }
                 }
+                TransformDecodedCall {
+                    block_number: record.block_number,
+                    block_timestamp: record.block_timestamp,
+                    contract_address: record.contract_address,
+                    source_name: contract_name.to_string(),
+                    function_name: "once".to_string(),
+                    trigger_log_index: None,
+                    result: merged_result,
+                }
+            })
+            .filter(|call| !call.result.is_empty())
+            .collect();
+
+        if !transform_calls.is_empty() {
+            tracing::info!(
+                "Sending DecodedCallsMessage: source_name={}, function_name=once, range=({}, {}), {} calls",
+                contract_name, range_start, range_end, transform_calls.len()
+            );
+            let msg = DecodedCallsMessage {
+                range_start,
+                range_end,
+                source_name: contract_name.to_string(),
+                function_name: "once".to_string(),
+                calls: transform_calls,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!("Failed to send decoded calls to transformation channel: {}", e);
             }
+        } else {
+            tracing::debug!(
+                "No transform_calls to send for {}/once range ({}, {})",
+                contract_name, range_start, range_end
+            );
         }
     }
 
