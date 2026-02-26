@@ -385,46 +385,73 @@ impl TransformationContext {
     // ===== Filtering Helpers =====
 
     /// Get events of a specific type from the current block range.
+    /// Filters out events before the contract's start_block if configured.
     pub fn events_of_type(
         &self,
         source: &str,
         event_name: &str,
     ) -> impl Iterator<Item = &DecodedEvent> {
+        let start_block = self.get_contract_start_block(source);
         let source = source.to_string();
         let event_name = event_name.to_string();
-        self.events
-            .iter()
-            .filter(move |e| e.source_name == source && e.event_name == event_name)
+        self.events.iter().filter(move |e| {
+            e.source_name == source
+                && e.event_name == event_name
+                && start_block.map_or(true, |sb| e.block_number >= sb)
+        })
     }
 
     /// Get all events for a specific contract address in the current range.
-    pub fn events_for_address(&self, address: [u8; 20]) -> impl Iterator<Item = &DecodedEvent> {
-        self.events
-            .iter()
-            .filter(move |e| e.contract_address == address)
+    /// Filters out events before the contract's start_block if configured.
+    pub fn events_for_address(&self, address: [u8; 20]) -> impl Iterator<Item = &DecodedEvent> + '_ {
+        self.events.iter().filter(move |e| {
+            if e.contract_address != address {
+                return false;
+            }
+            // Look up start_block by source_name
+            let start_block = self.get_contract_start_block(&e.source_name);
+            start_block.map_or(true, |sb| e.block_number >= sb)
+        })
     }
 
     /// Get calls of a specific type from the current block range.
+    /// Filters out calls before the contract's start_block if configured.
     pub fn calls_of_type(
         &self,
         source: &str,
         function_name: &str,
     ) -> impl Iterator<Item = &DecodedCall> {
+        let start_block = self.get_contract_start_block(source);
         let source = source.to_string();
         let function_name = function_name.to_string();
-        self.calls
-            .iter()
-            .filter(move |c| c.source_name == source && c.function_name == function_name)
+        self.calls.iter().filter(move |c| {
+            c.source_name == source
+                && c.function_name == function_name
+                && start_block.map_or(true, |sb| c.block_number >= sb)
+        })
     }
 
     /// Get all calls for a specific contract address in the current range.
-    pub fn calls_for_address(&self, address: [u8; 20]) -> impl Iterator<Item = &DecodedCall> {
-        self.calls
-            .iter()
-            .filter(move |c| c.contract_address == address)
+    /// Filters out calls before the contract's start_block if configured.
+    pub fn calls_for_address(&self, address: [u8; 20]) -> impl Iterator<Item = &DecodedCall> + '_ {
+        self.calls.iter().filter(move |c| {
+            if c.contract_address != address {
+                return false;
+            }
+            // Look up start_block by source_name
+            let start_block = self.get_contract_start_block(&c.source_name);
+            start_block.map_or(true, |sb| c.block_number >= sb)
+        })
     }
 
     // ===== Contract Configuration Helpers =====
+
+    /// Get the start_block for a contract or collection by name.
+    pub fn get_contract_start_block(&self, name: &str) -> Option<u64> {
+        self.contracts
+            .get(name)
+            .and_then(|c| c.start_block.map(|u| u.to::<u64>()))
+    }
 
     /// Look up a contract name by its address.
     /// Returns the first matching contract name if the address is configured.

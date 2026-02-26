@@ -633,6 +633,9 @@ impl TransformationEngine {
                     &event_triggers,
                 ).await?;
 
+                // Filter events by contract start_block
+                let events = self.filter_events_by_start_block(events);
+
                 // Only check call dependencies when we have events that need them
                 if !events.is_empty() && !call_deps.is_empty() {
                     let calls_ready = available_call_ranges
@@ -653,7 +656,9 @@ impl TransformationEngine {
 
                 // Read call dependencies for this range
                 let calls = if !events.is_empty() && !call_deps.is_empty() {
-                    self.read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps).await?
+                    let calls = self.read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps).await?;
+                    // Filter calls by contract start_block
+                    self.filter_calls_by_start_block(calls)
                 } else {
                     Vec::new()
                 };
@@ -810,6 +815,9 @@ impl TransformationEngine {
                     *range_end,
                     &call_triggers,
                 ).await?;
+
+                // Filter calls by contract start_block
+                let calls = self.filter_calls_by_start_block(calls);
 
                 processed += 1;
 
@@ -1262,7 +1270,10 @@ impl TransformationEngine {
                 handlers.len(), msg.source_name, msg.event_name, handler_names
             );
         }
-        let events = Arc::new(msg.events.clone());
+
+        // Filter events by contract start_block
+        let filtered_events = self.filter_events_by_start_block(msg.events.clone());
+        let events = Arc::new(filtered_events.clone());
 
         // Categorize handlers: ready to run vs needs buffering
         let range_key = (msg.range_start, msg.range_end);
@@ -1297,6 +1308,17 @@ impl TransformationEngine {
 
                     if deps_ready {
                         let calls = state.calls_buffer.get(&range_key).cloned().unwrap_or_default();
+                        // Filter calls by contract start_block (inline to avoid borrowing self inside lock)
+                        let calls: Vec<_> = calls
+                            .into_iter()
+                            .filter(|c| {
+                                let start_block = self
+                                    .contracts
+                                    .get(&c.source_name)
+                                    .and_then(|ct| ct.start_block.map(|u| u.to::<u64>()));
+                                start_block.map_or(true, |sb| c.block_number >= sb)
+                            })
+                            .collect();
                         tracing::info!(
                             "Handler {} deps ready for range {:?}, {} calls in buffer",
                             handler_key, range_key, calls.len()
@@ -1312,7 +1334,7 @@ impl TransformationEngine {
                             range_end: msg.range_end,
                             source_name: msg.source_name.clone(),
                             event_name: msg.event_name.clone(),
-                            events: msg.events.clone(),
+                            events: filtered_events.clone(),
                             required_calls: call_deps.clone(),
                         };
                         state.pending_events
@@ -1439,12 +1461,13 @@ impl TransformationEngine {
             );
         }
 
-        // Process call handlers (existing behavior)
+        // Process call handlers (existing behavior) - filter calls by start_block
+        let filtered_calls = self.filter_calls_by_start_block(msg.calls);
         self.process_range(
             msg.range_start,
             msg.range_end,
             Vec::new(),
-            msg.calls,
+            filtered_calls,
         ).await?;
 
         // Check if any pending events can now be processed
@@ -1548,10 +1571,11 @@ impl TransformationEngine {
             return Ok(());
         }
 
-        // Fetch calls once for this range
+        // Fetch calls once for this range and filter by start_block
         let calls = {
             let state = self.live_state.lock().await;
-            Arc::new(state.calls_buffer.get(&range_key).cloned().unwrap_or_default())
+            let calls = state.calls_buffer.get(&range_key).cloned().unwrap_or_default();
+            Arc::new(self.filter_calls_by_start_block(calls))
         };
 
         // Process ready events concurrently
@@ -1839,5 +1863,39 @@ impl TransformationEngine {
         }
 
         Ok(())
+    }
+
+    // ─── Start Block Filtering ──────────────────────────────────────────
+
+    /// Filter events by contract start_block.
+    /// Events from contracts with a start_block are excluded if the event's
+    /// block_number is before that start_block.
+    fn filter_events_by_start_block(&self, events: Vec<DecodedEvent>) -> Vec<DecodedEvent> {
+        events
+            .into_iter()
+            .filter(|e| {
+                let start_block = self
+                    .contracts
+                    .get(&e.source_name)
+                    .and_then(|c| c.start_block.map(|u| u.to::<u64>()));
+                start_block.map_or(true, |sb| e.block_number >= sb)
+            })
+            .collect()
+    }
+
+    /// Filter calls by contract start_block.
+    /// Calls from contracts with a start_block are excluded if the call's
+    /// block_number is before that start_block.
+    fn filter_calls_by_start_block(&self, calls: Vec<DecodedCall>) -> Vec<DecodedCall> {
+        calls
+            .into_iter()
+            .filter(|c| {
+                let start_block = self
+                    .contracts
+                    .get(&c.source_name)
+                    .and_then(|ct| ct.start_block.map(|u| u.to::<u64>()));
+                start_block.map_or(true, |sb| c.block_number >= sb)
+            })
+            .collect()
     }
 }

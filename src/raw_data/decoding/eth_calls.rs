@@ -57,6 +57,8 @@ pub(crate) struct CallDecodeConfig {
     pub function_name: String,
     pub output_type: EvmType,
     pub is_once: bool,
+    /// Start block for this contract (calls before this block are skipped)
+    pub start_block: Option<u64>,
 }
 
 /// Configuration for an event-triggered call to decode
@@ -65,6 +67,8 @@ pub(crate) struct EventCallDecodeConfig {
     pub contract_name: String,
     pub function_name: String,
     pub output_type: EvmType,
+    /// Start block for this contract (calls before this block are skipped)
+    pub start_block: Option<u64>,
 }
 
 /// Decoded call result
@@ -229,6 +233,8 @@ pub(crate) fn build_decode_configs(
     let mut event = Vec::new();
 
     for (contract_name, contract) in contracts {
+        let start_block = contract.start_block.map(|u| u.to::<u64>());
+
         if let Some(calls) = &contract.calls {
             for call in calls {
                 let function_name = call
@@ -244,12 +250,14 @@ pub(crate) fn build_decode_configs(
                         function_name,
                         output_type: call.output_type.clone(),
                         is_once: true,
+                        start_block,
                     });
                 } else if call.frequency.is_on_events() {
                     event.push(EventCallDecodeConfig {
                         contract_name: contract_name.clone(),
                         function_name,
                         output_type: call.output_type.clone(),
+                        start_block,
                     });
                 } else {
                     regular.push(CallDecodeConfig {
@@ -257,12 +265,13 @@ pub(crate) fn build_decode_configs(
                         function_name,
                         output_type: call.output_type.clone(),
                         is_once: false,
+                        start_block,
                     });
                 }
             }
         }
 
-        // Factory calls
+        // Factory calls - use None for start_block (they use discovery block)
         if let Some(factories) = &contract.factories {
             for factory in factories {
                 if let Some(calls) = &factory.calls {
@@ -280,12 +289,14 @@ pub(crate) fn build_decode_configs(
                                 function_name,
                                 output_type: call.output_type.clone(),
                                 is_once: true,
+                                start_block: None,
                             });
                         } else if call.frequency.is_on_events() {
                             event.push(EventCallDecodeConfig {
                                 contract_name: factory.collection.clone(),
                                 function_name,
                                 output_type: call.output_type.clone(),
+                                start_block: None,
                             });
                         } else {
                             regular.push(CallDecodeConfig {
@@ -293,6 +304,7 @@ pub(crate) fn build_decode_configs(
                                 function_name,
                                 output_type: call.output_type.clone(),
                                 is_once: false,
+                                start_block: None,
                             });
                         }
                     }
@@ -313,11 +325,24 @@ pub(crate) async fn process_regular_calls(
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
+    // Skip if entire range is before contract's start_block
+    if let Some(sb) = config.start_block {
+        if range_end <= sb {
+            return Ok(());
+        }
+    }
+
     let mut decoded_records = Vec::new();
     let mut decode_failures = 0u64;
     let mut non_empty_count = 0u64;
 
     for result in results {
+        // Skip if block is before contract's start_block
+        if let Some(sb) = config.start_block {
+            if result.block_number < sb {
+                continue;
+            }
+        }
         if result.value.is_empty() {
             continue;
         }
@@ -432,11 +457,27 @@ pub(crate) async fn process_once_calls(
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     return_index_info: bool,
 ) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
+    // Get start_block from first config (all configs for a contract share the same start_block)
+    let start_block = configs.first().and_then(|c| c.start_block);
+
+    // Skip if entire range is before contract's start_block
+    if let Some(sb) = start_block {
+        if range_end <= sb {
+            return Ok(None);
+        }
+    }
+
     let mut decoded_records = Vec::new();
     // Track decode failures per function: fn_name -> (successes, failures)
     let mut decode_stats: HashMap<String, (u64, u64)> = HashMap::new();
 
     for result in results {
+        // Skip if block is before contract's start_block
+        if let Some(sb) = start_block {
+            if result.block_number < sb {
+                continue;
+            }
+        }
         let mut decoded_values = HashMap::new();
 
         for config in configs {
@@ -632,11 +673,24 @@ pub(crate) async fn process_event_calls(
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
+    // Skip if entire range is before contract's start_block
+    if let Some(sb) = config.start_block {
+        if range_end <= sb {
+            return Ok(());
+        }
+    }
+
     let mut decoded_records = Vec::new();
     let mut decode_failures = 0u64;
     let mut non_empty_count = 0u64;
 
     for result in results {
+        // Skip if block is before contract's start_block
+        if let Some(sb) = config.start_block {
+            if result.block_number < sb {
+                continue;
+            }
+        }
         if result.value.is_empty() {
             continue;
         }

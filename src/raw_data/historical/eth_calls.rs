@@ -75,6 +75,8 @@ pub(crate) struct CallConfig {
     pub(crate) encoded_calldata: Bytes,
     pub(crate) param_values: Vec<Vec<u8>>,
     pub(crate) frequency: Frequency,
+    /// Start block for this contract (calls before this block are skipped)
+    pub(crate) start_block: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +89,8 @@ pub(crate) struct OnceCallConfig {
     pub(crate) params: Vec<ParamConfig>,
     /// Optional target address override (resolved from CallTarget)
     pub(crate) target_addresses: Option<Vec<Address>>,
+    /// Start block for this contract (calls before this block are skipped)
+    pub(crate) start_block: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -116,6 +120,8 @@ pub(crate) struct EventTriggeredCallConfig {
     pub(crate) params: Vec<ParamConfig>,
     /// Whether this is for a factory collection
     pub(crate) is_factory: bool,
+    /// Start block for this contract (calls before this block are skipped)
+    pub(crate) start_block: Option<u64>,
 }
 
 /// Result from an event-triggered call
@@ -189,6 +195,7 @@ pub(crate) fn build_event_triggered_call_configs(
             AddressOrAddresses::Single(addr) => vec![*addr],
             AddressOrAddresses::Multiple(addrs) => addrs.clone(),
         };
+        let start_block = contract.start_block.map(|u| u.to::<u64>());
 
         // Check contract-level calls for on_events frequency
         if let Some(calls) = &contract.calls {
@@ -230,6 +237,7 @@ pub(crate) fn build_event_triggered_call_configs(
                             function_selector: selector,
                             params: call.params.clone(),
                             is_factory: false,
+                            start_block,
                         });
                     }
                 }
@@ -272,6 +280,8 @@ pub(crate) fn build_event_triggered_call_configs(
                                 function_selector: selector,
                                 params: call.params.clone(),
                                 is_factory: true,
+                                // Factory events use discovery block, not start_block
+                                start_block: None,
                             });
                         }
                     }
@@ -656,6 +666,13 @@ pub(crate) async fn process_event_triggers(
 
         if let Some(configs) = event_call_configs.get(&key) {
             for config in configs {
+                // Skip if trigger block is before contract's start_block
+                if let Some(sb) = config.start_block {
+                    if trigger.block_number < sb {
+                        continue;
+                    }
+                }
+
                 // Determine target address
                 let target_address = if let Some(addr) = config.target_address {
                     addr
@@ -944,6 +961,13 @@ pub(crate) async fn process_event_triggers_multicall(
 
         if let Some(configs) = event_call_configs.get(&key) {
             for config in configs {
+                // Skip if trigger block is before contract's start_block
+                if let Some(sb) = config.start_block {
+                    if trigger.block_number < sb {
+                        continue;
+                    }
+                }
+
                 // Determine target address
                 let target_address = if let Some(addr) = config.target_address {
                     addr
@@ -1792,6 +1816,8 @@ pub(crate) async fn process_factory_range(
                         encoded_calldata,
                         param_values,
                         frequency: call_config.frequency.clone(),
+                        // Factory calls use discovery block, not start_block
+                        start_block: None,
                     });
                 }
             }
@@ -1838,6 +1864,12 @@ pub(crate) async fn process_factory_range(
 
             for block in &filtered_blocks {
                 for config in &configs {
+                    // Skip if block is before contract's start_block
+                    if let Some(sb) = config.start_block {
+                        if block.block_number < sb {
+                            continue;
+                        }
+                    }
                     let tx = TransactionRequest::default()
                         .to(config.address)
                         .input(config.encoded_calldata.clone().into());
@@ -2064,6 +2096,8 @@ pub(crate) async fn process_factory_range_multicall(
                         encoded_calldata,
                         param_values,
                         frequency: call_config.frequency.clone(),
+                        // Factory calls use discovery block, not start_block
+                        start_block: None,
                     });
                 }
             }
@@ -2303,6 +2337,7 @@ pub(crate) fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig
             AddressOrAddresses::Single(addr) => vec![*addr],
             AddressOrAddresses::Multiple(addrs) => addrs.clone(),
         };
+        let start_block = contract.start_block.map(|u| u.to::<u64>());
 
         if let Some(calls) = &contract.calls {
             for call in calls {
@@ -2357,6 +2392,7 @@ pub(crate) fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig
                             encoded_calldata,
                             param_values,
                             frequency: call.frequency.clone(),
+                            start_block,
                         });
                     }
                 }
@@ -2484,6 +2520,8 @@ pub(crate) fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, 
     let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
 
     for (contract_name, contract) in contracts {
+        let start_block = contract.start_block.map(|u| u.to::<u64>());
+
         if let Some(calls) = &contract.calls {
             for call in calls {
                 if call.frequency.is_once() {
@@ -2553,6 +2591,7 @@ pub(crate) fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, 
                         preencoded_calldata,
                         params,
                         target_addresses,
+                        start_block,
                     });
                 }
             }
@@ -2637,6 +2676,8 @@ pub(crate) fn build_factory_once_call_configs(
                     preencoded_calldata,
                     params,
                     target_addresses,
+                    // Factory calls use discovery block, not start_block
+                    start_block: None,
                 });
             }
         }
@@ -2784,6 +2825,12 @@ pub(crate) async fn process_once_calls_regular(
 
         // Missing columns: call ALL addresses
         for call_config in &configs_to_call {
+            // Skip if first_block is before contract's start_block
+            if let Some(sb) = call_config.start_block {
+                if first_block.block_number < sb {
+                    continue;
+                }
+            }
             let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
 
             for address in addresses {
@@ -2805,6 +2852,12 @@ pub(crate) async fn process_once_calls_regular(
 
         // Partially-null columns: call only addresses with null values
         for call_config in &configs_to_patch {
+            // Skip if first_block is before contract's start_block
+            if let Some(sb) = call_config.start_block {
+                if first_block.block_number < sb {
+                    continue;
+                }
+            }
             let null_addrs = &null_entries[&call_config.function_name];
             let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
 
@@ -3494,6 +3547,20 @@ pub(crate) async fn process_once_calls_multicall(
             Some(c) => c,
             None => continue,
         };
+
+        // Skip if first_block is before contract's start_block
+        if let Some(sb) = contract.start_block {
+            let start_block = sb.to::<u64>();
+            if first_block.block_number < start_block {
+                tracing::debug!(
+                    "Skipping once calls for {} at block {} (before start_block {})",
+                    contract_name,
+                    first_block.block_number,
+                    start_block
+                );
+                continue;
+            }
+        }
 
         let default_addresses = match &contract.address {
             AddressOrAddresses::Single(addr) => vec![*addr],
@@ -4248,6 +4315,12 @@ pub(crate) async fn process_range(
 
         for block in &filtered_blocks {
             for config in configs {
+                // Skip if block is before contract's start_block
+                if let Some(sb) = config.start_block {
+                    if block.block_number < sb {
+                        continue;
+                    }
+                }
                 let tx = TransactionRequest::default()
                     .to(config.address)
                     .input(config.encoded_calldata.clone().into());
@@ -4488,6 +4561,12 @@ pub(crate) async fn process_range_multicall(
                 continue;
             }
             for config in &group.configs {
+                // Skip if block is before contract's start_block
+                if let Some(sb) = config.start_block {
+                    if block_number < sb {
+                        continue;
+                    }
+                }
                 slots.push(MulticallSlotGeneric {
                     block_number,
                     block_timestamp: block_info.timestamp,
@@ -5512,10 +5591,14 @@ pub(crate) fn write_results_to_parquet(
     let arr: UInt64Array = results.iter().map(|r| Some(r.block_timestamp)).collect();
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        results.iter().map(|r| r.contract_address.as_slice()),
-    )?;
-    arrays.push(Arc::new(arr));
+    if results.is_empty() {
+        arrays.push(Arc::new(FixedSizeBinaryBuilder::new(20).finish()));
+    } else {
+        let arr = FixedSizeBinaryArray::try_from_iter(
+            results.iter().map(|r| r.contract_address.as_slice()),
+        )?;
+        arrays.push(Arc::new(arr));
+    }
 
     let arr: BinaryArray = results
         .iter()

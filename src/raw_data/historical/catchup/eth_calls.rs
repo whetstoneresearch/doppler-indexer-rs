@@ -180,6 +180,12 @@ pub async fn collect_eth_calls(
             // Check if all regular call files exist for this range
             let regular_calls_done = !has_regular_calls
                 || call_configs.iter().all(|config| {
+                    // Skip check if range is entirely before contract's start_block (considered done)
+                    if let Some(sb) = config.start_block {
+                        if range.end <= sb {
+                            return true;
+                        }
+                    }
                     let rel_path = format!(
                         "{}/{}/{}",
                         config.contract_name,
@@ -204,6 +210,14 @@ pub async fn collect_eth_calls(
             // Check if all once call files exist AND have all expected columns for this range
             let once_calls_done = !has_once_calls
                 || once_configs.iter().all(|(contract_name, configs)| {
+                    // Skip check if range is entirely before contract's start_block (considered done)
+                    // All configs for a contract share the same start_block
+                    if let Some(sb) = configs.first().and_then(|c| c.start_block) {
+                        if range.end <= sb {
+                            return true;
+                        }
+                    }
+
                     let rel_path = format!("{}/once/{}", contract_name, range.file_name());
                     let expected: HashSet<&str> = configs
                         .iter()

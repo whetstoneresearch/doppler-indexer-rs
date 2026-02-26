@@ -64,6 +64,8 @@ pub(crate) struct EventMatcher {
     pub addresses: HashSet<[u8; 20]>,
     /// If true, this is a factory event (addresses come from factory discovery)
     pub is_factory: bool,
+    /// Start block for this contract (events before this block are skipped)
+    pub start_block: Option<u64>,
 }
 
 /// Decoded log record ready for writing
@@ -192,6 +194,7 @@ pub(crate) fn build_event_matchers(
 
         // Regular contract events
         if let Some(events) = &contract.events {
+            let start_block = contract.start_block.map(|u| u.to::<u64>());
             for event_config in events {
                 let parsed = match ParsedEvent::from_signature(&event_config.signature) {
                     Ok(p) => p,
@@ -215,6 +218,7 @@ pub(crate) fn build_event_matchers(
                     event: parsed,
                     addresses: addresses.clone(),
                     is_factory: false,
+                    start_block,
                 });
             }
         }
@@ -239,6 +243,8 @@ pub(crate) fn build_event_matchers(
                                     event: parsed,
                                     addresses: HashSet::new(),
                                     is_factory: true,
+                                    // Factory events use discovery block, not start_block
+                                    start_block: None,
                                 });
                             }
                         }
@@ -276,6 +282,12 @@ pub(crate) async fn process_logs(
 
         // Try regular matchers
         for matcher in regular_matchers {
+            // Skip if block is before contract's start_block
+            if let Some(sb) = matcher.start_block {
+                if log.block_number < sb {
+                    continue;
+                }
+            }
             if !matcher.addresses.contains(&log.address) {
                 continue;
             }
@@ -353,6 +365,13 @@ pub(crate) async fn process_logs(
     let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
 
     for matcher in regular_matchers {
+        // Skip if entire range is before contract's start_block
+        if let Some(sb) = matcher.start_block {
+            if range_end <= sb {
+                continue;
+            }
+        }
+
         let output_dir = output_base.join(&matcher.name).join(&matcher.event_name);
         let output_path = output_dir.join(&file_name);
 
@@ -364,6 +383,13 @@ pub(crate) async fn process_logs(
 
     for (_, matchers) in factory_matchers {
         for matcher in matchers {
+            // Skip if entire range is before contract's start_block (for factories, start_block is None)
+            if let Some(sb) = matcher.start_block {
+                if range_end <= sb {
+                    continue;
+                }
+            }
+
             let output_dir = output_base.join(&matcher.name).join(&matcher.event_name);
             let output_path = output_dir.join(&file_name);
 
@@ -389,6 +415,12 @@ pub(crate) async fn process_logs(
 
             // Try regular matchers
             for matcher in regular_matchers {
+                // Skip if block is before contract's start_block
+                if let Some(sb) = matcher.start_block {
+                    if log.block_number < sb {
+                        continue;
+                    }
+                }
                 if !matcher.addresses.contains(&log.address) {
                     continue;
                 }
