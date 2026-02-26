@@ -10,7 +10,8 @@ use crate::raw_data::decoding::catchup::eth_calls::{
     read_raw_parquet_function_names,
 };
 use crate::raw_data::decoding::eth_calls::{
-    CallDecodeConfig, EthCallDecodingError, process_once_calls, process_regular_calls,
+    CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig, process_event_calls,
+    process_once_calls, process_regular_calls,
 };
 use crate::raw_data::decoding::types::DecoderMessage;
 use crate::transformations::DecodedCallsMessage;
@@ -26,6 +27,7 @@ pub async fn decode_eth_calls_live(
     output_base: &Path,
     regular_configs: &[CallDecodeConfig],
     once_configs: &[CallDecodeConfig],
+    event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
@@ -77,6 +79,29 @@ pub async fn decode_eth_calls_live(
                         output_base,
                         transform_tx,
                         false, // Live mode: update index directly (no concurrent tasks)
+                    )
+                    .await?;
+                }
+            }
+            Some(DecoderMessage::EventCallsReady {
+                range_start,
+                range_end,
+                contract_name,
+                function_name,
+                results,
+            }) => {
+                // Find the decode config for this event-triggered call
+                if let Some(config) = event_configs
+                    .iter()
+                    .find(|c| c.contract_name == contract_name && c.function_name == function_name)
+                {
+                    process_event_calls(
+                        &results,
+                        range_start,
+                        range_end,
+                        config,
+                        output_base,
+                        transform_tx,
                     )
                     .await?;
                 }
@@ -165,6 +190,7 @@ pub async fn decode_eth_calls_live(
                         output_base,
                         regular_configs,
                         once_configs,
+                        event_configs,
                         raw_data_config,
                         transform_tx,
                     )

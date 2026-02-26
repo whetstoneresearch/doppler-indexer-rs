@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use super::catchup;
 use super::catchup::eth_calls::{read_decoded_column_index, read_decoded_parquet_function_names, write_decoded_column_index};
 use super::current;
-use super::types::{EthCallResult, OnceCallResult};
+use super::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage,
     DecodedValue as TransformDecodedValue,
@@ -59,12 +59,30 @@ pub(crate) struct CallDecodeConfig {
     pub is_once: bool,
 }
 
+/// Configuration for an event-triggered call to decode
+#[derive(Debug, Clone)]
+pub(crate) struct EventCallDecodeConfig {
+    pub contract_name: String,
+    pub function_name: String,
+    pub output_type: EvmType,
+}
+
 /// Decoded call result
 #[derive(Debug)]
 pub(crate) struct DecodedCallRecord {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub contract_address: [u8; 20],
+    pub decoded_value: DecodedValue,
+}
+
+/// Decoded event-triggered call result
+#[derive(Debug)]
+pub(crate) struct DecodedEventCallRecord {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub target_address: [u8; 20],
     pub decoded_value: DecodedValue,
 }
 
@@ -115,9 +133,9 @@ pub async fn decode_eth_calls(
     std::fs::create_dir_all(&output_base)?;
 
     // Build decode configs from contract configurations
-    let (regular_configs, once_configs) = build_decode_configs(&chain.contracts);
+    let (regular_configs, once_configs, event_configs) = build_decode_configs(&chain.contracts);
 
-    if regular_configs.is_empty() && once_configs.is_empty() {
+    if regular_configs.is_empty() && once_configs.is_empty() && event_configs.is_empty() {
         tracing::info!(
             "No eth_calls configured for decoding on chain {}",
             chain.name
@@ -133,10 +151,11 @@ pub async fn decode_eth_calls(
     }
 
     tracing::info!(
-        "Eth_call decoder starting for chain {} with {} regular configs and {} once configs",
+        "Eth_call decoder starting for chain {} with {} regular configs, {} once configs, {} event configs",
         chain.name,
         regular_configs.len(),
-        once_configs.len()
+        once_configs.len(),
+        event_configs.len()
     );
 
     // =========================================================================
@@ -162,6 +181,7 @@ pub async fn decode_eth_calls(
             &output_base,
             &regular_configs,
             &once_configs,
+            &event_configs,
             raw_data_config,
             None,
         )
@@ -186,6 +206,7 @@ pub async fn decode_eth_calls(
         &output_base,
         &regular_configs,
         &once_configs,
+        &event_configs,
         raw_data_config,
         transform_tx.as_ref(),
     )
@@ -198,9 +219,10 @@ pub async fn decode_eth_calls(
 /// Build decode configurations from contracts
 pub(crate) fn build_decode_configs(
     contracts: &Contracts,
-) -> (Vec<CallDecodeConfig>, Vec<CallDecodeConfig>) {
+) -> (Vec<CallDecodeConfig>, Vec<CallDecodeConfig>, Vec<EventCallDecodeConfig>) {
     let mut regular = Vec::new();
     let mut once = Vec::new();
+    let mut event = Vec::new();
 
     for (contract_name, contract) in contracts {
         if let Some(calls) = &contract.calls {
@@ -212,17 +234,26 @@ pub(crate) fn build_decode_configs(
                     .unwrap_or(&call.function)
                     .to_string();
 
-                let config = CallDecodeConfig {
-                    contract_name: contract_name.clone(),
-                    function_name,
-                    output_type: call.output_type.clone(),
-                    is_once: call.frequency.is_once(),
-                };
-
                 if call.frequency.is_once() {
-                    once.push(config);
+                    once.push(CallDecodeConfig {
+                        contract_name: contract_name.clone(),
+                        function_name,
+                        output_type: call.output_type.clone(),
+                        is_once: true,
+                    });
+                } else if call.frequency.is_on_events() {
+                    event.push(EventCallDecodeConfig {
+                        contract_name: contract_name.clone(),
+                        function_name,
+                        output_type: call.output_type.clone(),
+                    });
                 } else {
-                    regular.push(config);
+                    regular.push(CallDecodeConfig {
+                        contract_name: contract_name.clone(),
+                        function_name,
+                        output_type: call.output_type.clone(),
+                        is_once: false,
+                    });
                 }
             }
         }
@@ -239,17 +270,26 @@ pub(crate) fn build_decode_configs(
                             .unwrap_or(&call.function)
                             .to_string();
 
-                        let config = CallDecodeConfig {
-                            contract_name: factory.collection.clone(),
-                            function_name,
-                            output_type: call.output_type.clone(),
-                            is_once: call.frequency.is_once(),
-                        };
-
                         if call.frequency.is_once() {
-                            once.push(config);
+                            once.push(CallDecodeConfig {
+                                contract_name: factory.collection.clone(),
+                                function_name,
+                                output_type: call.output_type.clone(),
+                                is_once: true,
+                            });
+                        } else if call.frequency.is_on_events() {
+                            event.push(EventCallDecodeConfig {
+                                contract_name: factory.collection.clone(),
+                                function_name,
+                                output_type: call.output_type.clone(),
+                            });
                         } else {
-                            regular.push(config);
+                            regular.push(CallDecodeConfig {
+                                contract_name: factory.collection.clone(),
+                                function_name,
+                                output_type: call.output_type.clone(),
+                                is_once: false,
+                            });
                         }
                     }
                 }
@@ -257,7 +297,7 @@ pub(crate) fn build_decode_configs(
         }
     }
 
-    (regular, once)
+    (regular, once, event)
 }
 
 /// Process regular call results
@@ -579,6 +619,124 @@ pub(crate) async fn process_once_calls(
     }
 }
 
+/// Process event-triggered call results
+pub(crate) async fn process_event_calls(
+    results: &[EventCallResult],
+    range_start: u64,
+    range_end: u64,
+    config: &EventCallDecodeConfig,
+    output_base: &Path,
+    transform_tx: Option<&Sender<DecodedCallsMessage>>,
+) -> Result<(), EthCallDecodingError> {
+    let mut decoded_records = Vec::new();
+    let mut decode_failures = 0u64;
+    let mut non_empty_count = 0u64;
+
+    for result in results {
+        if result.value.is_empty() {
+            continue;
+        }
+        non_empty_count += 1;
+
+        match decode_value(&result.value, &config.output_type) {
+            Ok(decoded) => {
+                decoded_records.push(DecodedEventCallRecord {
+                    block_number: result.block_number,
+                    block_timestamp: result.block_timestamp,
+                    log_index: result.log_index,
+                    target_address: result.target_address,
+                    decoded_value: decoded,
+                });
+            }
+            Err(e) => {
+                decode_failures += 1;
+                tracing::debug!(
+                    "Failed to decode {}.{} at block {}: {}",
+                    config.contract_name,
+                    config.function_name,
+                    result.block_number,
+                    e
+                );
+            }
+        }
+    }
+
+    if decode_failures > 0 && decode_failures == non_empty_count {
+        tracing::warn!(
+            "All {} decode attempts failed for {}.{} (output_type: {:?}) in blocks {}-{} — check output_type in config",
+            decode_failures,
+            config.contract_name,
+            config.function_name,
+            config.output_type,
+            range_start,
+            range_end - 1
+        );
+    } else if decode_failures > 0 {
+        tracing::warn!(
+            "{}/{} decode failures for {}.{} in blocks {}-{}",
+            decode_failures,
+            non_empty_count,
+            config.contract_name,
+            config.function_name,
+            range_start,
+            range_end - 1
+        );
+    }
+
+    // Write decoded data to on_events/ subdirectory
+    let output_dir = output_base
+        .join(&config.contract_name)
+        .join(&config.function_name)
+        .join("on_events");
+    std::fs::create_dir_all(&output_dir)?;
+
+    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+    let output_path = output_dir.join(&file_name);
+
+    // Always write file (even if empty) for catchup idempotency
+    write_decoded_event_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
+
+    if decoded_records.is_empty() {
+        tracing::debug!(
+            "Wrote 0 decoded {}.{} event call results to {}",
+            config.contract_name,
+            config.function_name,
+            output_path.display()
+        );
+    } else {
+        tracing::info!(
+            "Wrote {} decoded {}.{} event call results to {}",
+            decoded_records.len(),
+            config.contract_name,
+            config.function_name,
+            output_path.display()
+        );
+    }
+
+    // Send to transformation channel if enabled
+    if let Some(tx) = transform_tx {
+        let transform_calls: Vec<TransformDecodedCall> = decoded_records
+            .iter()
+            .map(|r| convert_event_call_to_transform_call(r, &config.contract_name, &config.function_name, &config.output_type))
+            .collect();
+
+        if !transform_calls.is_empty() {
+            let msg = DecodedCallsMessage {
+                range_start,
+                range_end,
+                source_name: config.contract_name.clone(),
+                function_name: config.function_name.clone(),
+                calls: transform_calls,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!("Failed to send decoded event calls to transformation channel: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Convert an EvmType to a DynSolType for decoding
 fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
     match output_type {
@@ -778,6 +936,555 @@ fn write_decoded_calls_to_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+/// Write decoded event-triggered calls to parquet
+fn write_decoded_event_calls_to_parquet(
+    records: &[DecodedEventCallRecord],
+    output_type: &EvmType,
+    output_path: &Path,
+) -> Result<(), EthCallDecodingError> {
+    // Build schema based on output type - includes log_index for event-triggered calls
+    let mut fields = vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("block_timestamp", DataType::UInt64, false),
+        Field::new("log_index", DataType::UInt32, false),
+        Field::new("address", DataType::FixedSizeBinary(20), false),
+    ];
+
+    // Add value fields based on output type
+    match output_type {
+        EvmType::Named { name, inner } => {
+            fields.push(Field::new(name, inner.to_arrow_type(), true));
+        }
+        EvmType::NamedTuple(tuple_fields) => {
+            for (field_name, field_type) in tuple_fields {
+                fields.push(Field::new(field_name, field_type.to_arrow_type(), true));
+            }
+        }
+        _ => {
+            fields.push(Field::new("decoded_value", output_type.to_arrow_type(), true));
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    // block_number
+    let arr: UInt64Array = records.iter().map(|r| Some(r.block_number)).collect();
+    arrays.push(Arc::new(arr));
+
+    // block_timestamp
+    let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp)).collect();
+    arrays.push(Arc::new(arr));
+
+    // log_index
+    let arr: UInt32Array = records.iter().map(|r| Some(r.log_index)).collect();
+    arrays.push(Arc::new(arr));
+
+    // target_address
+    if records.is_empty() {
+        arrays.push(Arc::new(FixedSizeBinaryBuilder::new(20).finish()));
+    } else {
+        let arr = FixedSizeBinaryArray::try_from_iter(
+            records.iter().map(|r| r.target_address.as_slice()),
+        )?;
+        arrays.push(Arc::new(arr));
+    }
+
+    // Add value arrays based on output type
+    match output_type {
+        EvmType::Named { inner, .. } => {
+            let value_array = build_event_value_array(records, inner)?;
+            arrays.push(value_array);
+        }
+        EvmType::NamedTuple(tuple_fields) => {
+            for (idx, (_, field_type)) in tuple_fields.iter().enumerate() {
+                let arr = build_event_tuple_field_array(records, idx, field_type)?;
+                arrays.push(arr);
+            }
+        }
+        _ => {
+            let value_array = build_event_value_array(records, output_type)?;
+            arrays.push(value_array);
+        }
+    }
+
+    // Write to parquet
+    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+
+    let file = File::create(output_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(())
+}
+
+/// Build an Arrow array for event call decoded values
+fn build_event_value_array(
+    records: &[DecodedEventCallRecord],
+    output_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    match output_type {
+        EvmType::Address => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    match &r.decoded_value {
+                        DecodedValue::Address(addr) => addr.as_slice(),
+                        _ => &[0u8; 20][..],
+                    }
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint8(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 => {
+            let arr: UInt64Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint64(v) => Some(*v),
+                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint64(v) => (*v).try_into().ok(),
+                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint64(v) => (*v).try_into().ok(),
+                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Uint256(v) => Some(v.to_string()),
+                    DecodedValue::Uint64(v) => Some(v.to_string()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int8(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 => {
+            let arr: Int64Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int64(v) => Some(*v),
+                    DecodedValue::Int256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int64(v) => (*v).try_into().ok(),
+                    DecodedValue::Int256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int64(v) => (*v).try_into().ok(),
+                    DecodedValue::Int256(v) => (*v).try_into().ok(),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Int256(v) => Some(v.to_string()),
+                    DecodedValue::Int64(v) => Some(v.to_string()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Bool(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    match &r.decoded_value {
+                        DecodedValue::Bytes32(b) => b.as_slice(),
+                        _ => &[0u8; 32][..],
+                    }
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::String => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = records
+                .iter()
+                .map(|r| match &r.decoded_value {
+                    DecodedValue::Bytes(b) => Some(b.as_slice()),
+                    DecodedValue::Bytes32(b) => Some(b.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => build_event_value_array(records, inner),
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "NamedTuple should use build_event_tuple_field_array".to_string(),
+        )),
+    }
+}
+
+/// Build an Arrow array for a specific field of a named tuple in event calls
+fn build_event_tuple_field_array(
+    records: &[DecodedEventCallRecord],
+    field_idx: usize,
+    field_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    match field_type {
+        EvmType::Address => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    match &r.decoded_value {
+                        DecodedValue::NamedTuple(fields) => {
+                            if let Some((_, DecodedValue::Address(addr))) = fields.get(field_idx) {
+                                addr.as_slice()
+                            } else {
+                                &[0u8; 20][..]
+                            }
+                        }
+                        _ => &[0u8; 20][..],
+                    }
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = records
+                .iter()
+                .map(|r| extract_event_tuple_uint8(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 => {
+            let arr: UInt64Array = records
+                .iter()
+                .map(|r| extract_event_tuple_uint64(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = records
+                .iter()
+                .map(|r| extract_event_tuple_uint32(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = records
+                .iter()
+                .map(|r| extract_event_tuple_uint16(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_event_tuple_uint256_string(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = records
+                .iter()
+                .map(|r| extract_event_tuple_int8(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 => {
+            let arr: Int64Array = records
+                .iter()
+                .map(|r| extract_event_tuple_int64(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = records
+                .iter()
+                .map(|r| extract_event_tuple_int32(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = records
+                .iter()
+                .map(|r| extract_event_tuple_int16(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_event_tuple_int256_string(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = records
+                .iter()
+                .map(|r| extract_event_tuple_bool(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            if records.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
+                    match &r.decoded_value {
+                        DecodedValue::NamedTuple(fields) => {
+                            if let Some((_, DecodedValue::Bytes32(b))) = fields.get(field_idx) {
+                                b.as_slice()
+                            } else {
+                                &[0u8; 32][..]
+                            }
+                        }
+                        _ => &[0u8; 32][..],
+                    }
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::String => {
+            let arr: StringArray = records
+                .iter()
+                .map(|r| extract_event_tuple_string(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = records
+                .iter()
+                .map(|r| extract_event_tuple_bytes(r, field_idx))
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => build_event_tuple_field_array(records, field_idx, inner),
+        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "Nested NamedTuple not supported".to_string(),
+        )),
+    }
+}
+
+// Helper functions for extracting event tuple field values
+
+fn extract_event_tuple_uint8(r: &DecodedEventCallRecord, idx: usize) -> Option<u8> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint8(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_uint64(r: &DecodedEventCallRecord, idx: usize) -> Option<u64> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => Some(*val),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_uint32(r: &DecodedEventCallRecord, idx: usize) -> Option<u32> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_uint16(r: &DecodedEventCallRecord, idx: usize) -> Option<u16> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_uint256_string(r: &DecodedEventCallRecord, idx: usize) -> Option<String> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Uint256(val) => Some(val.to_string()),
+            DecodedValue::Uint64(val) => Some(val.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_int8(r: &DecodedEventCallRecord, idx: usize) -> Option<i8> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int8(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_int64(r: &DecodedEventCallRecord, idx: usize) -> Option<i64> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => Some(*val),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_int32(r: &DecodedEventCallRecord, idx: usize) -> Option<i32> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => (*val).try_into().ok(),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_int16(r: &DecodedEventCallRecord, idx: usize) -> Option<i16> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int64(val) => (*val).try_into().ok(),
+            DecodedValue::Int256(val) => (*val).try_into().ok(),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_int256_string(r: &DecodedEventCallRecord, idx: usize) -> Option<String> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Int256(val) => Some(val.to_string()),
+            DecodedValue::Int64(val) => Some(val.to_string()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_bool(r: &DecodedEventCallRecord, idx: usize) -> Option<bool> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Bool(val) => Some(*val),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_string(r: &DecodedEventCallRecord, idx: usize) -> Option<&str> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn extract_event_tuple_bytes(r: &DecodedEventCallRecord, idx: usize) -> Option<&[u8]> {
+    match &r.decoded_value {
+        DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
+            DecodedValue::Bytes(b) => Some(b.as_slice()),
+            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 /// Build an Arrow array for a specific field of a named tuple
@@ -2570,5 +3277,23 @@ fn convert_once_to_transform_call(
         function_name: function_name.to_string(),
         trigger_log_index: None,
         result: build_result_map(decoded_value, output_type, function_name),
+    }
+}
+
+/// Convert a DecodedEventCallRecord to a TransformDecodedCall
+fn convert_event_call_to_transform_call(
+    record: &DecodedEventCallRecord,
+    source_name: &str,
+    function_name: &str,
+    output_type: &EvmType,
+) -> TransformDecodedCall {
+    TransformDecodedCall {
+        block_number: record.block_number,
+        block_timestamp: record.block_timestamp,
+        contract_address: record.target_address,
+        source_name: source_name.to_string(),
+        function_name: function_name.to_string(),
+        trigger_log_index: Some(record.log_index),
+        result: build_result_map(&record.decoded_value, output_type, function_name),
     }
 }

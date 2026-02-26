@@ -14,9 +14,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::raw_data::decoding::eth_calls::{
-    CallDecodeConfig, EthCallDecodingError, process_once_calls, process_regular_calls,
+    CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig, process_event_calls,
+    process_once_calls, process_regular_calls,
 };
-use crate::raw_data::decoding::types::{EthCallResult, OnceCallResult};
+use crate::raw_data::decoding::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::DecodedCallsMessage;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -35,6 +36,12 @@ pub(crate) enum CatchupWorkItem {
         contract_name: String,
         configs: Vec<CallDecodeConfig>,
     },
+    EventTriggered {
+        file_path: std::path::PathBuf,
+        range_start: u64,
+        range_end: u64,
+        config: EventCallDecodeConfig,
+    },
 }
 
 /// Result of processing once calls, used to batch update column indexes after all tasks complete.
@@ -51,6 +58,7 @@ pub async fn catchup_decode_eth_calls(
     output_base: &Path,
     regular_configs: &[CallDecodeConfig],
     once_configs: &[CallDecodeConfig],
+    event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
@@ -274,6 +282,62 @@ pub async fn catchup_decode_eth_calls(
                                 });
                             }
                         }
+
+                        // Check for on_events/ subdirectory within this function directory
+                        let on_events_path = function_path.join("on_events");
+                        if on_events_path.exists() && on_events_path.is_dir() {
+                            // Find event config for this contract/function
+                            let event_config = event_configs.iter().find(|c| {
+                                c.contract_name == contract_name && c.function_name == function_name
+                            });
+
+                            if let Some(event_config) = event_config {
+                                if let Ok(file_entries) = std::fs::read_dir(&on_events_path) {
+                                    for file_entry in file_entries.flatten() {
+                                        let file_path = file_entry.path();
+                                        if !file_path
+                                            .extension()
+                                            .map(|e| e == "parquet")
+                                            .unwrap_or(false)
+                                        {
+                                            continue;
+                                        }
+
+                                        let file_name =
+                                            file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+                                        // Check if already decoded
+                                        let rel_path =
+                                            format!("{}/{}/on_events/{}", contract_name, function_name, file_name);
+                                        if existing_decoded.contains(&rel_path) {
+                                            continue;
+                                        }
+
+                                        // Parse range from filename
+                                        let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
+                                        let parts: Vec<&str> = range_str.split('-').collect();
+                                        if parts.len() != 2 {
+                                            continue;
+                                        }
+                                        let range_start: u64 = match parts[0].parse() {
+                                            Ok(v) => v,
+                                            Err(_) => continue,
+                                        };
+                                        let range_end: u64 = match parts[1].parse::<u64>() {
+                                            Ok(v) => v + 1,
+                                            Err(_) => continue,
+                                        };
+
+                                        work_items.push(CatchupWorkItem::EventTriggered {
+                                            file_path,
+                                            range_start,
+                                            range_end,
+                                            config: event_config.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -345,6 +409,25 @@ pub async fn catchup_decode_eth_calls(
                         true, // return_index_info: batch update after all tasks complete
                     )
                     .await
+                }
+                CatchupWorkItem::EventTriggered {
+                    file_path,
+                    range_start,
+                    range_end,
+                    config,
+                } => {
+                    let results = read_event_calls_from_parquet(&file_path)?;
+                    process_event_calls(
+                        &results,
+                        range_start,
+                        range_end,
+                        &config,
+                        &output_base,
+                        transform_tx.as_ref(),
+                    )
+                    .await?;
+                    // Event calls don't need index updates
+                    Ok(None)
                 }
             }
         });
@@ -481,6 +564,99 @@ pub fn read_regular_calls_from_parquet(path: &Path) -> Result<Vec<EthCallResult>
                 block_number,
                 block_timestamp,
                 contract_address,
+                value,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Read event-triggered call results from parquet
+pub fn read_event_calls_from_parquet(path: &Path) -> Result<Vec<EventCallResult>, EthCallDecodingError> {
+    use arrow::array::UInt32Array;
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut results = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let schema = batch.schema();
+
+        let block_number_idx = schema.index_of("block_number").ok();
+        let block_timestamp_idx = schema.index_of("block_timestamp").ok();
+        let log_index_idx = schema.index_of("log_index").ok();
+        let address_idx = schema.index_of("target_address").ok();
+        let value_idx = schema.index_of("value").ok();
+
+        for row in 0..batch.num_rows() {
+            let block_number = block_number_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let block_timestamp = block_timestamp_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let log_index = log_index_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let target_address = address_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<FixedSizeBinaryArray>()
+                        .and_then(|a| {
+                            let bytes = a.value(row);
+                            if bytes.len() == 20 {
+                                let mut arr = [0u8; 20];
+                                arr.copy_from_slice(bytes);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .unwrap_or_default();
+
+            let value = value_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .map(|a| a.value(row).to_vec())
+                })
+                .unwrap_or_default();
+
+            results.push(EventCallResult {
+                block_number,
+                block_timestamp,
+                log_index,
+                target_address,
                 value,
             });
         }
