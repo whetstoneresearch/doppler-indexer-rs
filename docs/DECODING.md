@@ -14,17 +14,24 @@ Decoded data is written to `data/derived/{chain}/decoded/` organized by data typ
 ## Architecture
 
 ```
-┌─────────────────────┐     DecoderMessage      ┌──────────────────┐
-│  Raw Data Collector │ ──────────────────────► │   Log Decoder    │
-│  (logs, eth_calls)  │                         │                  │
-└─────────────────────┘                         └────────┬─────────┘
-                                                         │
-                                                         ▼
-                                                data/derived/{chain}/
-                                                  decoded/logs/
-                                                    {contract}/
-                                                      {event}/
-                                                        {range}.parquet
+                                    DecoderMessage
+┌─────────────────────┐     ┌───────────────────────┐
+│  Raw Data Collector │ ────┤  LogsReady            │───► Log Decoder
+│  (logs, eth_calls)  │     │  EthCallsReady        │───► Eth Call Decoder
+└─────────────────────┘     │  OnceCallsReady       │───► Eth Call Decoder
+                            │  EventCallsReady      │───► Eth Call Decoder
+                            │  FactoryAddresses     │───► Log Decoder
+                            │  OnceFileBackfilled   │───► Eth Call Decoder
+                            │  AllComplete          │───► Both Decoders
+                            └───────────────────────┘
+                                      │
+                                      ▼
+                               data/derived/{chain}/decoded/
+                               ├── logs/{contract}/{event}/{range}.parquet
+                               └── eth_calls/{contract}/
+                                   ├── {function}/{range}.parquet
+                                   ├── once/{range}.parquet
+                                   └── {function}/on_events/{range}.parquet
 ```
 
 ## Decoder Messages
@@ -36,7 +43,9 @@ The `DecoderMessage` enum coordinates communication between collectors and decod
 | `LogsReady` | Raw logs for a block range are ready for decoding |
 | `EthCallsReady` | Regular eth_call results ready for decoding |
 | `OnceCallsReady` | One-time eth_call results ready for decoding |
+| `EventCallsReady` | Event-triggered eth_call results ready for decoding |
 | `FactoryAddresses` | Factory-discovered addresses for a range (needed for factory event matching) |
+| `OnceFileBackfilled` | A once-call file was backfilled with new columns - decoder should re-check it |
 | `AllComplete` | Shutdown signal when all ranges are complete |
 
 ## Log Decoding
@@ -211,6 +220,35 @@ Regular eth_calls are made at a configured frequency (every N blocks). Each call
 
 "Once" calls are made only once per newly discovered address (typically for immutable values like `token0()`, `token1()`, `decimals()`). Multiple once-call functions for the same contract are grouped together.
 
+### Event-Triggered Calls
+
+Event-triggered calls (`frequency: {"on_events": ...}`) are made when specific events are emitted. These calls are useful for querying state that changes in response to events, such as getting pool data after a swap or fetching asset information after a transfer.
+
+**Configuration example (single event):**
+```json
+{
+  "function": "getAssetData(address)",
+  "output_type": "(address numeraire, uint256 amount)",
+  "frequency": {"on_events": {"source": "V3Pools", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"}},
+  "params": [{"type": "address", "source": "self"}]
+}
+```
+
+**Configuration example (multiple events):**
+```json
+{
+  "function": "getAssetData(address)",
+  "output_type": "(address numeraire, uint256 amount)",
+  "frequency": {"on_events": [
+    {"source": "V3Pools", "event": "Swap(address,address,int256,int256,uint160,uint128,int24)"},
+    {"source": "V3Pools", "event": "Mint(address,address,int24,int24,uint128,uint256,uint256)"}
+  ]},
+  "params": [{"type": "address", "source": "self"}]
+}
+```
+
+The call is made at the block where the event was emitted, and the `log_index` is recorded to correlate the call result with the triggering event.
+
 ### Output Schema - Regular Calls
 
 | Column | Type | Description |
@@ -229,6 +267,17 @@ Regular eth_calls are made at a configured frequency (every N blocks). Each call
 | `address` | FixedSizeBinary(20) | Contract address |
 | `{function}` | varies | One column per function result (simple types) |
 | `{function}.{field}` | varies | One column per tuple field (named tuples) |
+
+### Output Schema - Event-Triggered Calls
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_number` | UInt64 | Block number |
+| `block_timestamp` | UInt64 | Block timestamp |
+| `log_index` | UInt32 | Log index of the triggering event |
+| `address` | FixedSizeBinary(20) | Target contract address |
+| `decoded_value` | varies | Decoded return value (simple types) |
+| `{field}` | varies | One column per tuple field (named tuples) |
 
 **Named Tuple Support for Once Calls:**
 
@@ -267,6 +316,9 @@ data/derived/{chain}/decoded/eth_calls/{contract_name}/{function_name}/{start}-{
 
 # Once calls
 data/derived/{chain}/decoded/eth_calls/{contract_name}/once/{start}-{end}.parquet
+
+# Event-triggered calls
+data/derived/{chain}/decoded/eth_calls/{contract_name}/{function_name}/on_events/{start}-{end}.parquet
 ```
 
 ## Supported Types
@@ -277,10 +329,14 @@ data/derived/{chain}/decoded/eth_calls/{contract_name}/once/{start}-{end}.parque
 |---------------|----------------------|------------|
 | `address` | `[u8; 20]` | FixedSizeBinary(20) |
 | `uint8` | `u8` | UInt8 |
-| `uint16`-`uint64` | `u64` | UInt64 |
+| `uint16` | `u16` | UInt16 |
+| `uint24`, `uint32` | `u32` | UInt32 |
+| `uint64` | `u64` | UInt64 |
 | `uint80`-`uint256` | `U256` (string) | Utf8 |
 | `int8` | `i8` | Int8 |
-| `int16`-`int64` | `i64` | Int64 |
+| `int16` | `i16` | Int16 |
+| `int24`, `int32` | `i32` | Int32 |
+| `int64` | `i64` | Int64 |
 | `int128`-`int256` | `I256` (string) | Utf8 |
 | `bool` | `bool` | Boolean |
 | `bytes32` | `[u8; 32]` | FixedSizeBinary(32) |
@@ -288,6 +344,15 @@ data/derived/{chain}/decoded/eth_calls/{contract_name}/once/{start}-{end}.parque
 | `string` | `String` | Utf8 |
 
 Large integers (> 64 bits) are stored as decimal strings to avoid precision loss.
+
+### Composite Types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| Named single | `type name` | `"int256 latestAnswer"` -> column `latestAnswer` |
+| Named tuple | `(type1 name1, type2 name2)` | `"(uint160 sqrtPriceX96, int24 tick)"` -> columns `sqrtPriceX96`, `tick` |
+| Unnamed tuple | `(type1, type2)` | `"(address, uint96)"` -> column `decoded_value` (struct) |
+| Array | `type[]` | `"address[]"`, `"(address, uint96)[]"` -> List array |
 
 ## Factory Support
 
@@ -310,6 +375,14 @@ On startup, the decoder:
 
 For factory events during catchup, the decoder loads factory addresses from `data/derived/{chain}/factories/` parquet files.
 
+### Re-Catchup on Completion
+
+When the eth_call decoder receives `AllComplete`, it re-runs the catchup phase. This ensures any columns that were backfilled during the live phase (e.g., new `once` call functions added while collection was in progress) are properly decoded. The re-catchup uses fresh column indexes to detect newly added raw data.
+
+### Synchronization Barrier
+
+The eth_call decoder waits for raw eth_call collection catchup to complete before starting its own catchup phase. This is coordinated via a `oneshot` channel (`eth_calls_catchup_done_rx`). After the decoder's catchup completes, it signals back via `decode_catchup_done_tx` to allow the transformation engine to proceed. This prevents deadlocks where the engine might be waiting for decoded data that hasn't been produced yet.
+
 ### Incremental Decoding
 
 When a new event is added to the configuration, the catchup phase efficiently processes only what's needed:
@@ -319,6 +392,15 @@ When a new event is added to the configuration, the catchup phase efficiently pr
 - Events that were previously decoded are skipped entirely (no re-reading, re-decoding, or re-writing)
 
 This means adding a new event to the config doesn't require re-processing all historical data for existing events—only the new event is decoded across all ranges.
+
+### Once Call Incremental Decoding
+
+For "once" calls, incremental decoding works at the column level:
+
+- A **column index** tracks which function columns have been decoded for each parquet file
+- When raw data is backfilled with new columns, an `OnceFileBackfilled` message triggers re-decoding
+- Only missing columns are decoded and merged into existing decoded files
+- The column index is updated in batch after all concurrent tasks complete to avoid race conditions
 
 ## Error Handling
 

@@ -62,18 +62,34 @@ SQL migrations are stored in the `migrations/` directory and run automatically o
 
 ```
 migrations/
-├── 000_handler_progress.sql
-├── 001_active_versions.sql
-└── handlers/
-    ├── pools/
-    │   └── create_table.sql
-    └── swaps/
-        └── create_table.sql
+├── tables/              # Handler table migrations
+│   ├── tokens.sql
+│   ├── pools.sql
+│   ├── transfers.sql
+│   └── users.sql
+└── (global migrations tracked in _migrations table)
 ```
 
-Global migrations in `migrations/` are executed in alphabetical order. Each migration runs once and is tracked in a `_migrations` table.
+Global migrations in `migrations/` are executed in alphabetical order. Each migration runs once and is tracked in a `_migrations` table with a `handlers/` prefix for handler-specific migrations.
 
-Handler migration folders are specified by each handler via `migration_folders()`. Folders are scanned flat (no version subdirectories) and `.sql` files are run in alphabetical order.
+Handler migration paths are specified by each handler via `migration_paths()`. Each path can be:
+- **A directory**: All `.sql` files in it are run in alphabetical order (scanned flat, no subdirectories)
+- **A single `.sql` file**: Run directly
+
+Examples:
+```rust
+fn migration_paths(&self) -> Vec<&'static str> {
+    vec![
+        "migrations/tables/tokens.sql",      // Single file
+        "migrations/tables/pools.sql",       // Another single file
+    ]
+}
+
+// Or using a directory:
+fn migration_paths(&self) -> Vec<&'static str> {
+    vec!["migrations/handlers/pools"]        // All .sql files in directory
+}
+```
 
 ## Active Versions
 
@@ -109,24 +125,48 @@ All handlers implement the `TransformationHandler` trait:
 ```rust
 #[async_trait]
 pub trait TransformationHandler: Send + Sync + 'static {
-    /// Unique name for logging and error messages
+    /// Unique name for this handler (used in logging and progress tracking).
     fn name(&self) -> &'static str;
 
-    /// Version of this handler. Bump when handler logic changes.
+    /// Version of this handler. Bump when the handler logic changes and you
+    /// want to reprocess all data into a new versioned output table.
     fn version(&self) -> u32 { 1 }
 
-    /// Migration folders for this handler's SQL files (flat, no version subdirs).
-    /// Multiple folders supported for handlers that write to multiple tables.
-    fn migration_folders(&self) -> Vec<&'static str> { vec![] }
+    /// Computed identity key: `"{name}_v{version}"`.
+    /// Used for progress tracking in the `_handler_progress` table.
+    fn handler_key(&self) -> String {
+        format!("{}_v{}", self.name(), self.version())
+    }
 
-    /// Process decoded data and return database operations.
+    /// Migration paths for this handler's SQL files, relative to the project root.
+    /// Each path can be either:
+    /// - A directory: all `.sql` files in it are run in alphabetical order
+    /// - A single `.sql` file: run directly
+    ///
+    /// Multiple paths are supported for handlers that write to multiple tables.
+    /// Directories are scanned flat (no subdirectories).
+    ///
+    /// Examples:
+    /// - `vec!["migrations/handlers/pools"]` — run all SQL in the `pools/` dir
+    /// - `vec!["migrations/handlers/pools/create_table.sql"]` — run one file
+    /// - `vec!["migrations/handlers/pools", "migrations/handlers/swaps"]` — multiple dirs
+    fn migration_paths(&self) -> Vec<&'static str> { vec![] }
+
+    /// Process decoded data for a block range.
+    ///
+    /// Called once per block range with all decoded events/calls matching
+    /// this handler's triggers. Returns a list of database operations to
+    /// execute transactionally.
+    ///
     /// Do NOT include `source` or `source_version` columns — the engine injects them.
     async fn handle(
         &self,
-        ctx: &TransformationContext<'_>,
+        ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError>;
 
-    /// Optional initialization (create indexes, warm caches, etc.)
+    /// Optional: Called once at startup for initialization.
+    ///
+    /// Can be used to create indexes, warm caches, etc.
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         Ok(())
     }
@@ -137,7 +177,13 @@ Event handlers also implement `EventHandler`:
 
 ```rust
 pub trait EventHandler: TransformationHandler {
+    /// Event triggers this handler responds to.
     fn triggers(&self) -> Vec<EventTrigger>;
+
+    /// Declare eth_call types this handler needs access to.
+    /// Returns (source_name, function_name) pairs that must be available
+    /// in decoded parquet files before this handler can process a range.
+    fn call_dependencies(&self) -> Vec<(String, String)> { vec![] }
 }
 ```
 
@@ -145,6 +191,7 @@ Call handlers implement `EthCallHandler`:
 
 ```rust
 pub trait EthCallHandler: TransformationHandler {
+    /// eth_call triggers this handler responds to.
     fn triggers(&self) -> Vec<EthCallTrigger>;
 }
 ```
@@ -163,91 +210,192 @@ The engine automatically injects `source` (handler name) and `source_version` (h
 
 Handlers should **not** include `source` or `source_version` in their operations — the engine handles this.
 
-### Example: V4 Swap Handler
+### Example: DERC20 Transfer Handler
+
+A simple handler that processes ERC20 Transfer events:
 
 ```rust
-// src/transformations/event/v4.rs
+// src/transformations/event/derc20_transfer.rs
 
 use async_trait::async_trait;
-use crate::db::{DbOperation, DbValue};
+use crate::db::{DbOperation, DbPool};
 use crate::transformations::{
     TransformationHandler, EventHandler, EventTrigger,
     TransformationContext, TransformationError,
 };
 
-pub struct V4SwapHandler;
+pub struct DERC20TransferHandler;
 
 #[async_trait]
-impl TransformationHandler for V4SwapHandler {
+impl TransformationHandler for DERC20TransferHandler {
     fn name(&self) -> &'static str {
-        "V4SwapHandler"
+        "DERC20TransferHandler"
     }
 
-    fn migration_folders(&self) -> Vec<&'static str> {
-        vec!["migrations/handlers/swaps"]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![
+            "migrations/tables/transfers.sql",
+            "migrations/tables/users.sql",
+        ]
     }
 
     async fn handle(
         &self,
-        ctx: &TransformationContext<'_>,
+        ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
         let mut ops = Vec::new();
 
-        for event in ctx.events_of_type("UniswapV4PoolManager", "Swap") {
-            let pool_id = event.get("id")?.as_bytes32()
-                .ok_or_else(|| TransformationError::TypeConversion("id".into()))?;
-            let sender = event.get("sender")?.as_address()
-                .ok_or_else(|| TransformationError::TypeConversion("sender".into()))?;
-            let amount0 = event.get("amount0")?.to_numeric_string()
-                .ok_or_else(|| TransformationError::TypeConversion("amount0".into()))?;
-            let tick = event.get("tick")?.as_i32()
-                .ok_or_else(|| TransformationError::TypeConversion("tick".into()))?;
+        for event in ctx.events_of_type("DERC20", "Transfer") {
+            let from_address = event.get("from")?.as_address().ok_or_else(|| {
+                TransformationError::TypeConversion("from is not an address".to_string())
+            })?;
 
-            // Note: source and source_version are injected by the engine
-            ops.push(DbOperation::Upsert {
-                table: "swaps".to_string(),
-                columns: vec![
-                    "pool_id".into(), "block_number".into(), "log_index".into(),
-                    "tx_hash".into(), "sender".into(), "amount0".into(),
-                    "tick".into(), "chain_id".into(),
-                ],
-                values: vec![
-                    DbValue::Bytes32(pool_id),
-                    DbValue::Uint64(event.block_number),
-                    DbValue::Uint64(event.log_index as u64),
-                    DbValue::Bytes32(event.transaction_hash),
-                    DbValue::Address(sender),
-                    DbValue::Numeric(amount0),
-                    DbValue::Int32(tick),
-                    DbValue::Uint64(ctx.chain_id),
-                ],
-                conflict_columns: vec!["pool_id".into(), "block_number".into(), "log_index".into()],
-                update_columns: vec!["amount0".into(), "tick".into()],
-            });
+            let to_address = event.get("to")?.as_address().ok_or_else(|| {
+                TransformationError::TypeConversion("to is not an address".to_string())
+            })?;
+
+            let value = event.get("value")?.as_uint256().ok_or_else(|| {
+                TransformationError::TypeConversion("value is not a uint256".to_string())
+            })?;
+
+            // Build database operations...
+            // source and source_version are injected automatically by the engine
+        }
+
+        Ok(ops)
+    }
+
+    async fn initialize(&self, _db_pool: &DbPool) -> Result<(), TransformationError> {
+        tracing::info!("DERC20TransferHandler initialized");
+        Ok(())
+    }
+}
+
+impl EventHandler for DERC20TransferHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![EventTrigger::new(
+            "DERC20",
+            "Transfer(address,address,uint256)"
+        )]
+    }
+}
+```
+
+### Example: Handler with Call Dependencies
+
+Handlers can declare eth_call dependencies that must be available before processing:
+
+```rust
+// src/transformations/event/v4/create.rs
+
+pub struct V4CreateHandler;
+
+#[async_trait]
+impl TransformationHandler for V4CreateHandler {
+    fn name(&self) -> &'static str {
+        "V4CreateHandler"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![
+            "migrations/tables/tokens.sql",
+            "migrations/tables/pools.sql",
+            "migrations/tables/v4_pool_configs.sql",
+        ]
+    }
+
+    async fn handle(
+        &self,
+        ctx: &TransformationContext,
+    ) -> Result<Vec<DbOperation>, TransformationError> {
+        let mut ops = Vec::new();
+
+        for event in ctx.events_of_type("UniswapV4Initializer", "Create") {
+            let hook = event.get("poolOrHook")?.as_address().ok_or_else(|| {
+                TransformationError::TypeConversion("poolOrHook is not an address".to_string())
+            })?;
+
+            // Access call data that matches this event's block
+            let hook_call = ctx.calls_for_address(hook)
+                .filter(|call| call.function_name == "once")
+                .next()
+                .ok_or_else(|| {
+                    TransformationError::MissingData(format!(
+                        "No 'once' call found for hook {}",
+                        alloy::primitives::Address::from(hook)
+                    ))
+                })?;
+
+            // Extract data from the call result
+            let pool_key_currency0 = hook_call.result.get("poolKey.currency0")
+                .ok_or_else(|| TransformationError::MissingField("poolKey.currency0".into()))?
+                .as_address()
+                .ok_or_else(|| TransformationError::TypeConversion("currency0".into()))?;
+
+            // Build database operations...
         }
 
         Ok(ops)
     }
 }
 
-impl EventHandler for V4SwapHandler {
+impl EventHandler for V4CreateHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(
-            "UniswapV4PoolManager",
-            "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)",
+            "UniswapV4Initializer",
+            "Create(address,address,address)"
         )]
+    }
+
+    // Declare that this handler needs these eth_call results to be decoded
+    // before it can process events
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![
+            ("DERC20".to_string(), "once".to_string()),
+            ("Numeraires".to_string(), "once".to_string()),
+            ("DopplerV4Hook".to_string(), "once".to_string()),
+        ]
     }
 }
 ```
 
 ### Registering Handlers
 
-Register handlers in `src/transformations/event/mod.rs`:
+Handlers are registered at compile-time via the `build_registry()` function in `src/transformations/registry.rs`. Each handler category has its own registration function:
+
+**Event handlers** in `src/transformations/event/mod.rs`:
 
 ```rust
 pub fn register_handlers(registry: &mut TransformationRegistry) {
-    registry.register_event_handler(v4::V4SwapHandler);
-    // Add more handlers here
+    derc20_transfer::register_handlers(registry);
+    v4::create::register_handlers(registry);
+    // Add more handler registrations here
+}
+```
+
+**Eth_call handlers** in `src/transformations/eth_call/mod.rs`:
+
+```rust
+pub fn register_handlers(registry: &mut TransformationRegistry) {
+    // oracle::register_handlers(registry);
+    // pool_state::register_handlers(registry);
+}
+```
+
+Each handler module typically exports a `register_handlers` function:
+
+```rust
+// In src/transformations/event/v4/create.rs
+pub fn register_handlers(registry: &mut TransformationRegistry) {
+    registry.register_event_handler(V4CreateHandler);
 }
 ```
 
@@ -267,10 +415,10 @@ ctx.block_range_end
 ### Decoded Data Access
 
 ```rust
-// All events in current range
+// All events in current range (Arc<Vec<DecodedEvent>>)
 ctx.events
 
-// All calls in current range
+// All calls in current range (Arc<Vec<DecodedCall>>)
 ctx.calls
 
 // Filter by type
@@ -280,6 +428,46 @@ for call in ctx.calls_of_type("Contract", "functionName") { ... }
 // Filter by address
 for event in ctx.events_for_address(address) { ... }
 for call in ctx.calls_for_address(address) { ... }
+```
+
+### Transaction Address Lookup
+
+Access transaction sender and recipient addresses from receipt data:
+
+```rust
+// Get the from_address for a transaction
+if let Some(from) = ctx.tx_from(&event.transaction_hash) {
+    // from is &[u8; 20]
+}
+
+// Get the to_address for a transaction (may be None for contract creation)
+if let Some(to) = ctx.tx_to(&event.transaction_hash) {
+    // to is &[u8; 20]
+}
+```
+
+### Contract Configuration Helpers
+
+Look up contract names and match addresses against configured contracts:
+
+```rust
+// Look up a contract name by its address
+if let Some(name) = ctx.get_contract_name_by_address(address) {
+    println!("Address belongs to contract: {}", name);
+}
+
+// Check if an address matches any of the specified contract names
+let migration_type = ctx.match_contract_address(
+    migrator_address,
+    &["UniswapV4Migrator", "UniswapV2Migrator", "UniswapV3Migrator"],
+).map(|contract_name| {
+    match contract_name {
+        "UniswapV4Migrator" => "v4",
+        "UniswapV2Migrator" => "v2",
+        "UniswapV3Migrator" => "v3",
+        _ => "unknown",
+    }
+}).unwrap_or("unknown");
 ```
 
 ### Historical Queries
@@ -390,23 +578,26 @@ pub enum DecodedValue {
     Bytes32([u8; 32]),
     Bytes(Vec<u8>),
     String(String),
-    NamedTuple(Vec<(String, DecodedValue)>),
+    NamedTuple(Vec<(String, DecodedValue)>),  // Tuple with named fields
+    UnnamedTuple(Vec<DecodedValue>),           // Tuple without field names
     Array(Vec<DecodedValue>),
 }
 
 // Conversion methods
 value.as_address()      // Option<[u8; 20]>
 value.as_bytes32()      // Option<[u8; 32]>
-value.as_uint256()      // Option<U256>
-value.as_int256()       // Option<I256>
+value.as_uint256()      // Option<U256> (also converts from smaller uint types)
+value.as_int256()       // Option<I256> (also converts from smaller int types)
 value.as_u64()          // Option<u64>
 value.as_i64()          // Option<i64>
 value.as_i32()          // Option<i32>
+value.as_u32()          // Option<u32>
+value.as_u8()           // Option<u8>
 value.as_bool()         // Option<bool>
 value.as_string()       // Option<&str>
 value.as_bytes()        // Option<&[u8]>
 value.to_numeric_string() // Option<String> (for database storage)
-value.get_field("name") // Option<&DecodedValue> (for tuples)
+value.get_field("name") // Option<&DecodedValue> (for named tuples)
 ```
 
 ## Database Operations
@@ -496,14 +687,23 @@ Transformation errors halt processing to maintain data integrity:
 pub enum TransformationError {
     HandlerError { handler_name: String, message: String },
     DatabaseError(DbError),
-    MissingField(String),
-    MissingColumn(String),
+    MissingField(String),           // Required field missing from event/call params
+    MissingData(String),            // Required data not found (e.g., no matching call)
+    MissingColumn(String),          // Column missing in parquet file
     RpcError(String),
     FutureBlockAccess { requested: u64, current_max: u64 },
     DecodeError(String),
+    IoError(std::io::Error),
+    ParquetError(parquet::errors::ParquetError),
+    ArrowError(arrow::error::ArrowError),
     TypeConversion(String),
-    // ...
+    ConfigError(String),
+    ChannelError(String),
+    IncludesPrecompileError(String),
 }
+
+// Create a handler error with context
+TransformationError::handler("MyHandler", "Failed to process swap event")
 ```
 
 When any handler returns an error, the engine:
@@ -538,35 +738,46 @@ Configure in `mode.batch_for_catchup` and `mode.catchup_batch_size`.
 
 ```
 src/transformations/
-├── mod.rs           # Module exports
-├── traits.rs        # TransformationHandler, EventHandler, EthCallHandler
-├── context.rs       # TransformationContext, DecodedEvent, DecodedCall
-├── engine.rs        # TransformationEngine
-├── registry.rs      # Handler registration
-├── historical.rs    # Parquet reader for historical queries
-├── error.rs         # TransformationError
+├── mod.rs           # Module exports and re-exports
+├── traits.rs        # TransformationHandler, EventHandler, EthCallHandler traits
+├── context.rs       # TransformationContext, DecodedEvent, DecodedCall, DecodedValue
+├── engine.rs        # TransformationEngine (orchestration, catchup, execution)
+├── registry.rs      # Handler registration and build_registry()
+├── historical.rs    # HistoricalDataReader for parquet queries
+├── error.rs         # TransformationError enum
 ├── event/           # Event handlers
-│   ├── mod.rs
-│   ├── v3.rs        # V3 pool creation handler
-│   └── v4.rs        # V4 swap handler
+│   ├── mod.rs           # register_handlers() for all event handlers
+│   ├── derc20_transfer.rs  # ERC20 Transfer handler
+│   └── v4/              # V4-specific handlers
+│       ├── mod.rs
+│       └── create.rs    # V4 pool creation handler
 ├── eth_call/        # Call handlers
-│   └── mod.rs
+│   └── mod.rs           # register_handlers() for all call handlers
 └── util/            # Shared utilities (see [TRANSFORMATION_UTILS.md](TRANSFORMATION_UTILS.md))
     ├── mod.rs           # Byte/address/hex conversions
     ├── constants.rs     # Q192, WAD, time intervals
     ├── price.rs         # sqrtPriceX96 and reserve price computation
     ├── market.rs        # Market cap, liquidity, volume calculations
     ├── price_fetch.rs   # PriceFetcher — reads prices from parquet files
-    └── quote_info.rs    # QuoteResolver — quote token identification & USD pricing
+    ├── quote_info.rs    # QuoteResolver — quote token identification & USD pricing
+    ├── metadata.rs      # Token metadata extraction utilities
+    ├── sanitize.rs      # Address validation (precompile detection)
+    └── db/              # Database operation helpers
+        ├── mod.rs
+        ├── pool.rs      # insert_pool helper
+        ├── token.rs     # insert_token helper
+        ├── users.rs     # upsert_user helper
+        ├── transfers.rs # insert_transfer helper
+        └── v4_pool_configs.rs  # insert_pool_config helper
 
 migrations/
-├── 000_handler_progress.sql
-├── 001_active_versions.sql
-└── handlers/
-    ├── pools/
-    │   └── create_table.sql
-    └── swaps/
-        └── create_table.sql
+├── tables/              # Table creation migrations
+│   ├── tokens.sql
+│   ├── pools.sql
+│   ├── transfers.sql
+│   ├── users.sql
+│   └── v4_pool_configs.sql
+└── (global migrations tracked in _migrations table)
 ```
 
 ## Performance Considerations

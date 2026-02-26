@@ -6,13 +6,13 @@ This module provides a generic Ethereum RPC client with support for rate limitin
 
 The RPC module consists of three main clients:
 
-- **`RpcClient`** - A generic RPC client with optional request-based rate limiting
-- **`AlchemyClient`** - An Alchemy-specific client with compute unit (CU) based rate limiting
+- **`RpcClient`** - A generic RPC client with optional request-based rate limiting (uses governor token bucket)
+- **`AlchemyClient`** - An Alchemy-specific client with compute unit (CU) based rate limiting (uses sliding window)
 - **`UnifiedRpcClient`** - A unified enum that automatically selects the appropriate client based on URL
 
 All three clients implement the **`RpcProvider`** trait, enabling polymorphic usage.
 
-Both clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying RPC operations and [governor](https://github.com/bheisler/governor) for rate limiting with jitter support.
+The clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying RPC operations. `RpcClient` uses [governor](https://github.com/bheisler/governor) for token bucket rate limiting, while `AlchemyClient` uses a custom `SlidingWindowRateLimiter` that accurately models Alchemy's 10-second window rate limiting.
 
 ## Module Structure
 
@@ -20,9 +20,20 @@ Both clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying R
 src/rpc/
 ├── mod.rs      # Module exports
 ├── rpc.rs      # Generic RPC client, RpcProvider trait, retry logic
-├── alchemy.rs  # Alchemy-specific client with CU rate limiting
+├── alchemy.rs  # Alchemy-specific client with CU rate limiting, SlidingWindowRateLimiter
 └── unified.rs  # Unified client that auto-selects based on URL
 ```
+
+### Public Exports
+
+```rust
+// From mod.rs
+pub use alchemy::{AlchemyClient, AlchemyConfig, ComputeUnitCost, SlidingWindowRateLimiter};
+pub use rpc::{RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider};
+pub use unified::UnifiedRpcClient;
+```
+
+Note: `RateLimitConfig` (for governor-based rate limiting in `RpcClient`) is defined in `rpc.rs` but not re-exported from the module root. To use it, either add it to the `pub use` in `mod.rs` or import directly from the submodule.
 
 ## RpcProvider Trait
 
@@ -162,7 +173,9 @@ let result = client.call(&tx_request, None).await?;
 
 #### Batch Requests
 
-Batch methods automatically chunk requests based on `max_batch_size` and execute them concurrently:
+Batch methods automatically chunk requests based on `max_batch_size` and execute them concurrently within each chunk using `futures::future::join_all`:
+
+**Note:** `RpcClient` uses chunk-based batching, while `AlchemyClient` uses semaphore-bounded concurrency for better throughput with rate limiting.
 
 ```rust
 // Fetch multiple blocks
@@ -294,7 +307,14 @@ This helps diagnose intermittent issues by preserving all error messages, not ju
 
 ## Unified RPC Client
 
-The `UnifiedRpcClient` provides a simple way to automatically select between `RpcClient` and `AlchemyClient` based on the URL.
+The `UnifiedRpcClient` is an enum that automatically selects between `RpcClient` and `AlchemyClient` based on URL detection (checks for "alchemy" in the URL string).
+
+```rust
+pub enum UnifiedRpcClient {
+    Standard(RpcClient),
+    Alchemy(AlchemyClient),
+}
+```
 
 ### Basic Usage
 
@@ -304,7 +324,7 @@ use doppler_indexer_rs::rpc::UnifiedRpcClient;
 // Automatically detects Alchemy URLs and uses AlchemyClient with 7500 CU/s
 let client = UnifiedRpcClient::from_url("https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY")?;
 
-// For non-Alchemy URLs, uses standard RpcClient
+// For non-Alchemy URLs, uses standard RpcClient (no rate limiting by default)
 let client = UnifiedRpcClient::from_url("https://eth.drpc.org")?;
 ```
 
@@ -336,6 +356,8 @@ let client = UnifiedRpcClient::from_url_with_options(
 )?;
 ```
 
+Note: For non-Alchemy URLs, `from_url_with_options()` ignores the CU, concurrency, and limiter parameters and creates a standard `RpcClient`.
+
 ### Available Methods
 
 `UnifiedRpcClient` implements the full `RpcProvider` trait plus additional methods:
@@ -356,9 +378,9 @@ let client = UnifiedRpcClient::from_url_with_options(
 - `get_logs_batch(filters)`
 - `call_batch(calls)`
 
-**Additional methods:**
-- `get_blocks_streaming(block_numbers, full_transactions, result_tx)` - Streaming version
-- `get_block_receipts_concurrent(method_name, block_numbers, concurrency)` - Concurrent receipts
+**Additional methods (not in RpcProvider trait):**
+- `get_blocks_streaming(block_numbers, full_transactions, result_tx)` - Streaming version that sends results via channel as they complete
+- `get_block_receipts_concurrent(method_name, block_numbers, concurrency)` - Concurrent receipts (note: `concurrency` param is deprecated for AlchemyClient)
 - `eth_call(to, data, block_number)` - Single eth_call convenience method
 
 ## Alchemy Client
@@ -387,13 +409,25 @@ The Alchemy client uses a **sliding window rate limiter** that accurately models
 - Alchemy measures usage over **10-second sliding windows** at 10x the per-second rate
 - Unlike token bucket algorithms, you cannot "save up" compute units by being idle
 - The limiter tracks exact timestamps of CU consumption and calculates available capacity
+- Async-safe with `Mutex<VecDeque<(Instant, u32)>>` for history tracking
 
 ```rust
 // Internal implementation
 pub struct SlidingWindowRateLimiter {
-    max_in_window: u32,        // CU limit for 10-second window (cu_per_second * 10)
-    window: Duration,          // 10 seconds
-    history: VecDeque<(Instant, u32)>,  // (timestamp, units) consumption history
+    max_in_window: u32,                   // CU limit for 10-second window (cu_per_second * 10)
+    window: Duration,                      // 10 seconds
+    history: Mutex<VecDeque<(Instant, u32)>>,  // (timestamp, units) consumption history
+}
+
+impl SlidingWindowRateLimiter {
+    pub fn new(max_per_second: u32) -> Self;
+
+    /// Wait until we can consume the requested units, then record them.
+    /// Returns immediately if there's capacity, otherwise waits.
+    pub async fn acquire(&self, units: u32);
+
+    /// Get current usage (for debugging/metrics)
+    pub async fn current_usage_async(&self) -> u32;
 }
 ```
 
@@ -421,18 +455,29 @@ This ensures combined CU usage across all collectors stays within your Alchemy p
 
 ### Concurrent Execution with Semaphore
 
-Batch operations use **non-blocking semaphore-bounded concurrency** for maximum throughput:
+Batch operations use **non-blocking semaphore-bounded concurrency** via the internal `execute_concurrent_ordered()` method for maximum throughput:
 
-1. **All tasks spawn immediately** - no blocking during task creation
+1. **All tasks spawn immediately** using `JoinSet` - no blocking during task creation
 2. Each task acquires a semaphore permit internally (limits concurrent in-flight requests)
 3. Each task acquires CUs from the rate limiter individually
-4. Results are collected and returned in order (or errors are propagated)
+4. Results are collected, sorted by original index, and returned in order (or errors are propagated)
+
+```rust
+// Internal method signature (not public, but drives all batch operations)
+async fn execute_concurrent_ordered<T, Req, F, Fut>(
+    &self,
+    requests: Vec<Req>,
+    cost_per_request: u32,
+    make_request: F,
+) -> Result<Vec<T>, RpcError>
+```
 
 This approach provides:
 - **Non-blocking task spawning** - 1000 requests spawn instantly, then compete for permits
 - **Continuous rate limit acquisition** instead of chunk-based batching
 - **Better throughput** by keeping the RPC pipeline full
 - **Configurable concurrency** via `RPC_CONCURRENCY` environment variable
+- **Order preservation** - results are sorted by index before returning
 
 ### Panic Handling
 
@@ -444,20 +489,40 @@ Concurrent batch methods (`execute_concurrent_ordered`) handle task panics grace
 
 ### Streaming Execution
 
-For pipelined collection, streaming methods send results via channels as they complete:
+For pipelined collection, the `execute_streaming()` method sends results via channels as they complete, enabling immediate downstream processing without waiting for the entire batch:
 
 ```rust
-// Start streaming block fetch (returns immediately)
+use tokio::sync::mpsc;
+
+// Start streaming block fetch (returns JoinHandle immediately)
 let (tx, mut rx) = mpsc::channel(256);
 let handle = client.get_blocks_streaming(block_numbers, false, tx);
 
-// Process blocks as they arrive
+// Process blocks as they arrive (in completion order, not request order)
 while let Some((block_num, result)) = rx.recv().await {
     // Forward to downstream immediately
     process_block(result?);
 }
 
+// Wait for all requests to complete
 handle.await?;
+```
+
+Key differences from `execute_concurrent_ordered()`:
+- **Completion order** - Results are sent as they complete, not in original request order
+- **Immediate processing** - Downstream can process results while other requests are in flight
+- **Non-blocking return** - Returns a `JoinHandle` immediately, doesn't wait for completion
+
+The underlying `execute_streaming()` method signature:
+
+```rust
+pub fn execute_streaming<T, Req, F, Fut>(
+    &self,
+    requests: Vec<Req>,
+    cost_per_request: u32,
+    result_tx: tokio::sync::mpsc::Sender<T>,
+    make_request: F,
+) -> tokio::task::JoinHandle<()>
 ```
 
 ### Deprecated Parameters
@@ -539,7 +604,11 @@ AlchemyConfig {
 }
 ```
 
-Note: When using `UnifiedRpcClient::from_url()`, the default is 7500 CU/s (Growth tier). Use `ALCHEMY_CU_PER_SECOND` env var to override.
+**Important:** The default CU/s varies by constructor:
+- `AlchemyConfig::default()`: 330 CU/s (Free tier)
+- `UnifiedRpcClient::from_url()`: 7500 CU/s (Scale tier)
+
+Use `ALCHEMY_CU_PER_SECOND` env var or explicit constructor parameters to match your actual Alchemy plan.
 
 ### Alchemy Tier Limits
 
@@ -547,7 +616,9 @@ Note: When using `UnifiedRpcClient::from_url()`, the default is 7500 CU/s (Growt
 |------|---------------------|
 | Free | 330 |
 | Growth | 660 |
-| Scale | Custom |
+| Scale | 7500+ (Custom) |
+
+Note: `UnifiedRpcClient::from_url()` defaults to 7500 CU/s, suitable for Scale tier. Use `ALCHEMY_CU_PER_SECOND` env var or `from_url_with_alchemy_cu()` to match your actual plan.
 
 ### How CU Rate Limiting Works
 
@@ -566,7 +637,7 @@ The rate limiter ensures you don't exceed your CU/second limit, automatically th
 
 ## Error Handling
 
-Both clients return `Result<T, RpcError>`:
+All clients return `Result<T, RpcError>`. Errors include the full error chain (including nested source errors) for better debugging via the internal `error_chain()` helper:
 
 ```rust
 use doppler_indexer_rs::rpc::RpcError;
@@ -600,6 +671,12 @@ if error.is_retryable() {
     // Permanent error, don't retry
 }
 ```
+
+The `is_retryable()` method checks for common transient error patterns:
+- Network/connection errors: "connection", "timeout", "reset", "broken pipe", "eof"
+- Rate limiting: "rate limit", "too many requests", "429"
+- Server errors: "502", "503", "504", "internal server error", "service unavailable"
+- Temporary failures: "temporarily", "try again", "retry"
 
 ## Accessing the Underlying Provider
 

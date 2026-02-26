@@ -297,6 +297,13 @@ Event-triggered calls support extracting parameters from event data:
 - `"data[N]"` - Non-indexed event parameters (32-byte words)
 - `"address"` - The event emitter's address
 
+**Processing Flow:**
+
+1. During **live collection**, the receipts collector extracts event triggers from logs and sends them via channel to the eth_calls collector
+2. During **catchup**, the eth_calls collector reads logs from existing parquet files and extracts triggers directly
+3. For factory collections, only events from known factory addresses are processed (unknown addresses are skipped and caught up later)
+4. Empty parquet files are written for configured call pairs that had no matching events in a range (prevents re-processing during catchup)
+
 For full documentation, see [On-Events ETH Calls](./ON_EVENT_CALLS.md).
 
 ### Example Configuration
@@ -431,8 +438,29 @@ This avoids re-executing calls that were already collected, significantly reduci
 
 ## Data Flow
 
+The eth_call collector operates in two phases: **catchup** (processing historical data) and **live** (processing new blocks).
+
+### Catchup Phase
+
 ```
-blocks collector ──(block_number, timestamp)──> eth_calls collector ──> parquet files
+Existing block parquet files ──> eth_calls collector ──> parquet files
+Existing log parquet files ──> [Event Trigger Extraction] ──> event-triggered eth_calls ──> parquet files
+Factory parquet files ──> [Load Addresses] ──> factory eth_calls
+```
+
+1. **Regular calls catchup**: Scans `data/raw/{chain}/blocks/` for existing block ranges, checks if eth_call parquet files exist for all configured contract/function pairs, and re-processes missing ranges
+2. **Once calls catchup**: Column-aware - checks `column_index.json` to detect newly added "once" functions and merges new columns into existing parquet files
+3. **Factory once calls catchup**: Waits for factory catchup to complete, then processes "once" calls for factory-created contracts
+4. **Event-triggered calls catchup**: Reads from existing log parquet files in `data/raw/{chain}/logs/`, extracts event triggers, and processes them through the same pipeline as live mode
+
+### Live Phase
+
+```
+Blocks → Receipts Collector → [Event Trigger Extraction] → Channel → ETH Calls Collector → RPC Calls → Parquet + Decoder
+                ↓
+           (logs extracted)
+
+Blocks → (block_number, timestamp) → ETH Calls Collector → RPC Calls → Parquet
 ```
 
 1. The blocks collector sends `(block_number, timestamp)` to the eth_calls channel after each RPC batch
@@ -440,6 +468,7 @@ blocks collector ──(block_number, timestamp)──> eth_calls collector ─�
 3. For each block in the range, it builds `eth_call` requests for all configured contracts/functions
 4. Calls are executed in batches (controlled by `rpc_batch_size` config)
 5. Results are written to parquet, grouped by contract and function
+6. Event triggers arrive via a separate channel from the receipts collector and are processed independently
 
 ## Output Format
 
@@ -453,7 +482,21 @@ Files are written to `data/raw/{chain}/eth_calls/{contract_name}/{function_name}
 
 Example: `data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet`
 
+### Event-Triggered Calls Output
+
+Event-triggered call results are written to a separate `on_events/` subdirectory:
+
+```
+data/raw/{chain}/eth_calls/{contract_name}/{function_name}/on_events/{start_block}-{end_block}.parquet
+```
+
+Example: `data/raw/base/eth_calls/V3Pool/slot0/on_events/0-9999.parquet`
+
+**Empty files:** When no events match the configured triggers for a range, an empty parquet file is written. This prevents the catchup phase from re-processing the range on subsequent runs.
+
 ### Parquet Schema
+
+**Regular/Factory/Token Calls:**
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -462,6 +505,17 @@ Example: `data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet`
 | `contract_address` | FixedSizeBinary(20) | The contract address called |
 | `value` | Binary | Raw bytes returned by eth_call |
 | `param_0`, `param_1`, ... | Binary | ABI-encoded parameter values (only present if function has parameters) |
+
+**Event-Triggered Calls:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `block_number` | UInt64 | Block number where the triggering event occurred |
+| `block_timestamp` | UInt64 | Block timestamp |
+| `log_index` | UInt32 | Index of the triggering log within the block (for correlation with event data) |
+| `target_address` | FixedSizeBinary(20) | Address the eth_call was made to |
+| `value` | Binary | Raw ABI-encoded return value |
+| `param_0`, `param_1`, ... | Binary | ABI-encoded parameter values (if any) |
 
 ### Decoding Values
 
@@ -529,12 +583,12 @@ The Multicall3 address is the same on most EVM chains. See [multicall3.eth](http
 4. Results are unpacked and distributed back to their respective output files
 
 **Supported call types:**
-- Regular calls (`process_range`)
-- Factory calls (`process_factory_range`)
-- Event-triggered calls (`process_event_triggers`)
-- Token pool calls (`process_token_range`)
-- Once calls (`process_once_calls_regular`)
-- Factory once calls (`process_factory_once_calls`)
+- Regular calls (`process_range_multicall`)
+- Factory calls (`process_factory_range_multicall`)
+- Event-triggered calls (`process_event_triggers_multicall`)
+- Token pool calls (`process_token_range_multicall`)
+- Once calls (`process_once_calls_multicall`)
+- Factory once calls (`process_factory_once_calls_multicall`)
 
 **Error handling:**
 - Uses `allowFailure=true` so individual call failures don't abort the entire batch
@@ -745,7 +799,16 @@ When using named tuple output types, the decoded parquet files will have named c
 
 ## Resumability
 
-Collection is fully resumable with catchup logic for all eth_call types:
+Collection is fully resumable with catchup logic for all eth_call types. The catchup phase runs at startup before live collection begins.
+
+### Catchup Ordering
+
+The catchup phases are executed in a specific order to ensure dependencies are satisfied:
+
+1. **Regular, token, and once calls** - Process independently using existing block parquet files
+2. **Factory catchup wait** - Wait for factory collector to complete its catchup (required for factory address discovery)
+3. **Factory once calls** - Process "once" calls for factory-created contracts using discovered addresses
+4. **Event-triggered calls** - Load historical factory addresses, then process event triggers from log parquet files
 
 ### Catchup Phase (Regular Calls)
 
@@ -769,13 +832,37 @@ This means you can add new `frequency: "once"` calls to an existing configuratio
 
 ### Factory Calls
 
-Factory eth_calls are handled during the normal processing phase (not during catchup). When the factory collector sends addresses, those calls are executed regardless of what catchup has processed. This is because factory addresses may not be known until the factory collector processes the corresponding log data.
+Factory eth_calls are processed in two ways:
+
+**During catchup:**
+- Factory "once" calls wait for factory catchup to complete before processing
+- Factory addresses are loaded from existing factory parquet files in `data/derived/{chain}/factories/`
+
+**During live collection:**
+- Factory addresses arrive via channel from the factory collector
+- Factory calls are processed when both block data and factory addresses are available for a range
+- Factory addresses are tracked in memory for event trigger filtering
+
+### Event-Triggered Calls Catchup
+
+For `on_events` frequency calls, the catchup phase:
+
+1. **Loads historical factory addresses** - Reads from `data/derived/{chain}/factories/` parquet files to know which addresses are valid factory-created contracts
+2. **Scans log parquet files** - Reads `data/raw/{chain}/logs/` to find existing log ranges
+3. **Checks for existing output** - For each log range, checks if output already exists in `{contract}/{function}/on_events/` subdirectory
+4. **Extracts event triggers** - Reads logs from parquet and extracts matching event triggers using configured matchers
+5. **Filters factory events** - For factory collections, only processes events from known factory addresses
+6. **Writes empty files** - For configured call pairs with no matching events, writes empty parquet files to prevent re-processing
+
+**Important:** Historical factory addresses are loaded before processing any event triggers. This ensures proper filtering of factory collection events and prevents calling random addresses.
 
 ### Manual Re-collection
 
 **Regular calls:** Delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/`.
 
 **Once calls:** Remove the function name from the `column_index.json` for that file, or delete the entire parquet file to recollect all columns.
+
+**Event-triggered calls:** Delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/on_events/`.
 
 ### Column Merging
 
@@ -849,3 +936,5 @@ python scripts/remove_parquet_column.py data/raw/base/eth_calls/DERC20/once getA
 - Results are stored as raw bytes; decoding is left to the consumer
 - Factory calls require the factory collector to discover addresses first
 - Functions with `frequency: "once"` support `source: "self"` and static `values` parameters, but not `from_event` parameters
+- Event-triggered calls for factory collections may skip events during live processing if factory addresses haven't been discovered yet (these are caught up later)
+- Dynamic types (`bytes`, `string`) cannot be extracted from event data directly for `from_event` parameters

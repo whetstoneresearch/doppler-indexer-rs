@@ -198,28 +198,41 @@ Blocks → Receipts Collector → [Event Trigger Extraction] → Channel → ETH
            (logs extracted)
 ```
 
+The ETH Calls Collector:
+1. Writes raw results to parquet in `on_events/` subdirectory
+2. Sends `DecoderMessage::EventCallsReady` to the decoder for decoded output
+3. Writes empty files for configured call pairs with no matching events in the range
+
 #### Catchup Mode (Historical Events)
 ```
-Existing Log Parquet Files → [Read Logs] → [Event Trigger Extraction] → ETH Calls → RPC Calls → Parquet + Decoder
+Factory Parquet Files → [Load Addresses] ─────────────────────────────────────────┐
+                                                                                  ↓
+Existing Log Parquet Files → [Read Logs] → [Event Trigger Extraction] → ETH Calls Collector → RPC Calls → Parquet + Decoder
 ```
+
+**Catchup ordering:** Factory addresses are loaded from `data/derived/{chain}/factories/` before processing event triggers. This ensures factory collection events are properly filtered.
 
 ### Processing Steps
 
-1. **Event Trigger Matchers** are built from contract configurations at startup
-2. **Receipts Collector** extracts logs and checks for matching events
+1. **Event Trigger Matchers** are built from contract configurations at startup via `build_event_trigger_matchers()`
+2. **Receipts Collector** extracts logs and checks for matching events via `extract_event_triggers()`
 3. **EventTriggerMessage** is sent via channel to ETH Calls collector (live mode)
-4. **ETH Calls Collector** processes triggers:
+4. **ETH Calls Collector** processes triggers via `process_event_triggers()` or `process_event_triggers_multicall()`:
    - Resolves target address (from config or event emitter for factories)
-   - Extracts parameters from event data (topics/data fields)
-   - Makes RPC calls at the event's block number
-   - Writes results to parquet
-   - Sends results to decoder for decoded output
+   - Extracts parameters from event data (topics/data fields) via `build_event_call_params()`
+   - Makes RPC calls at the event's block number (batched or multicalled)
+   - Writes results to parquet via `write_event_call_results_to_parquet()`
+   - Sends `DecoderMessage::EventCallsReady` to decoder
+5. **Decoder** processes results via `process_event_calls()`:
+   - Decodes raw values using configured `output_type`
+   - Writes decoded results to parquet
+   - Sends to transformation channel if enabled
 
 ### Catchup Mode
 
 On startup, the eth_calls collector runs a catchup phase that:
 
-1. **Loads historical factory addresses** from `data/raw/{chain}/factories/` parquet files (for factory collections only)
+1. **Loads historical factory addresses** from `data/derived/{chain}/factories/` parquet files (for factory collections only) via `load_historical_factory_addresses()`
 2. Scans `data/raw/{chain}/logs/` for existing parquet files
 3. For each log file, checks if output already exists in the `on_events/` subdirectory
 4. If output doesn't exist:
@@ -227,6 +240,7 @@ On startup, the eth_calls collector runs a catchup phase that:
    - Extracts event triggers using configured matchers
    - Filters factory collection triggers by known factory addresses
    - Processes triggers through the same pipeline as live mode
+   - Writes empty files for configured pairs with no matching events
 5. Skips ranges where output already exists to avoid duplicate processing
 
 This ensures that historical data is processed even if the indexer was started after events occurred.
@@ -235,12 +249,17 @@ This ensures that historical data is processed even if the indexer was started a
 
 ## Output Format
 
-### File Location
+### Raw File Location
 ```
 data/raw/{chain}/eth_calls/{contract}/{function}/on_events/{start_block}-{end_block}.parquet
 ```
 
-### Schema
+### Decoded File Location
+```
+data/derived/{chain}/decoded/eth_calls/{contract}/{function}/on_events/{start_block}-{end_block}.parquet
+```
+
+### Raw Schema
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -249,7 +268,11 @@ data/raw/{chain}/eth_calls/{contract}/{function}/on_events/{start_block}-{end_bl
 | `log_index` | uint32 | Index of the triggering log within the block (for correlation) |
 | `target_address` | bytes(20) | Address the eth_call was made to |
 | `value` | binary | Raw ABI-encoded return value |
-| `param_0`, `param_1`, ... | binary | ABI-encoded parameter values (if any) |
+| `param_0`, `param_1`, ... | binary | ABI-encoded parameter values (if any, dynamically added) |
+
+### Decoded Schema
+
+The decoded schema includes the same base columns plus decoded value columns based on the `output_type` configuration. For named tuples, each field becomes a separate column. For unnamed tuples, fields are named `0`, `1`, etc.
 
 ### Decoder Integration
 
@@ -265,19 +288,22 @@ DecoderMessage::EventCallsReady {
 }
 ```
 
-Where `EventCallResult` contains:
-- `block_number`, `block_timestamp`, `log_index`
-- `target_address`
-- `value` (raw bytes for decoding)
+Where `EventCallResult` (from `src/raw_data/decoding/types.rs`) contains:
+- `block_number: u64`
+- `block_timestamp: u64`
+- `log_index: u32`
+- `target_address: [u8; 20]`
+- `value: Vec<u8>` (raw bytes for decoding)
 
 ## Key Types
 
 ### Configuration Types (`src/types/config/eth_call.rs`)
 
 ```rust
+/// Configuration for event-triggered eth_calls
 pub struct EventTriggerConfig {
-    pub source: String,      // Contract/collection name
-    pub event: String,       // Event signature
+    pub source: String,      // Contract/collection name that emits the trigger event
+    pub event: String,       // Event signature (e.g., "Transfer(address,address,uint256)")
 }
 
 /// Wrapper supporting single or multiple event triggers
@@ -286,72 +312,149 @@ pub enum EventTriggerConfigs {
     Multiple(Vec<EventTriggerConfig>),
 }
 
+impl EventTriggerConfigs {
+    pub fn iter(&self) -> impl Iterator<Item = &EventTriggerConfig>;
+    pub fn configs(&self) -> Vec<&EventTriggerConfig>;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+
+/// Parameter configuration for eth_calls
 pub enum ParamConfig {
+    /// Static values: {"type": "address", "values": ["0x..."]}
     Static { param_type: EvmType, values: Vec<ParamValue> },
+    /// Bind from event data: {"type": "address", "from_event": "topics[1]"}
     FromEvent { param_type: EvmType, from_event: String },  // "address", "topics[N]", "data[N]"
+    /// Self address (event emitter): {"type": "address", "source": "self"}
     SelfAddress { param_type: EvmType, source: String },
+}
+
+/// Frequency enum with OnEvents variant
+pub enum Frequency {
+    EveryBlock,
+    Once,
+    EveryNBlocks(u64),
+    Duration(u64),
+    OnEvents(EventTriggerConfigs),  // Call when specific events are emitted
 }
 ```
 
 ### Runtime Types (`src/raw_data/historical/receipts.rs`)
 
 ```rust
+/// Data from an event that triggered an eth_call
 pub struct EventTriggerData {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub log_index: u32,
-    pub emitter_address: [u8; 20],
-    pub source_name: String,
-    pub event_signature: [u8; 32],
-    pub topics: Vec<[u8; 32]>,
-    pub data: Vec<u8>,
+    pub emitter_address: [u8; 20],  // Address that emitted the event
+    pub source_name: String,        // Matched source name (contract or factory collection)
+    pub event_signature: [u8; 32],  // Event signature hash (topic[0])
+    pub topics: Vec<[u8; 32]>,      // All topics including topic0
+    pub data: Vec<u8>,              // ABI-encoded event data
 }
 
+/// Message for event-triggered eth_calls channel
 pub enum EventTriggerMessage {
-    Triggers(Vec<EventTriggerData>),
+    Triggers(Vec<EventTriggerData>),  // Batch of event triggers from a range
     RangeComplete { range_start: u64, range_end: u64 },
     AllComplete,
 }
 
+/// Matcher for detecting events that should trigger eth_calls
 pub struct EventTriggerMatcher {
-    pub source_name: String,
-    pub addresses: HashSet<[u8; 20]>,
-    pub is_factory: bool,
-    pub event_topic0: [u8; 32],
+    pub source_name: String,            // Source name (contract or factory collection name)
+    pub addresses: HashSet<[u8; 20]>,   // Addresses to match (empty for factory collections)
+    pub is_factory: bool,               // Whether this is a factory collection
+    pub event_topic0: [u8; 32],         // Event signature hash
 }
 ```
 
 ### Processing Types (`src/raw_data/historical/eth_calls.rs`)
 
 ```rust
-struct EventTriggeredCallConfig {
-    contract_name: String,
-    target_address: Option<Address>,  // None for factory collections
-    function_name: String,
-    function_selector: [u8; 4],
-    params: Vec<ParamConfig>,
-    is_factory: bool,
+/// Configuration for an event-triggered call
+pub(crate) struct EventTriggeredCallConfig {
+    pub contract_name: String,
+    pub target_address: Option<Address>,  // None for factory collections (use event emitter)
+    pub function_name: String,
+    pub function_selector: [u8; 4],
+    pub params: Vec<ParamConfig>,
+    pub is_factory: bool,
 }
 
-struct EventCallResult {
-    block_number: u64,
-    block_timestamp: u64,
-    log_index: u32,
-    target_address: [u8; 20],
-    value_bytes: Vec<u8>,
-    param_values: Vec<Vec<u8>>,
+/// Result from an event-triggered call (internal processing type)
+pub(crate) struct EventCallResult {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub target_address: [u8; 20],
+    pub value_bytes: Vec<u8>,
+    pub param_values: Vec<Vec<u8>>,
+}
+
+/// Key for grouping event-triggered calls: (source_name, event_signature_hash)
+pub(crate) type EventCallKey = (String, [u8; 32]);
+```
+
+### Decoder Types (`src/raw_data/decoding/types.rs`)
+
+```rust
+/// Event-triggered eth_call result data for decoding
+pub struct EventCallResult {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub target_address: [u8; 20],
+    pub value: Vec<u8>,
 }
 ```
+
+### Decoder Configuration (`src/raw_data/decoding/eth_calls.rs`)
+
+```rust
+/// Configuration for an event-triggered call to decode
+pub(crate) struct EventCallDecodeConfig {
+    pub contract_name: String,
+    pub function_name: String,
+    pub output_type: EvmType,
+}
+
+/// Decoded event-triggered call result
+pub(crate) struct DecodedEventCallRecord {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub target_address: [u8; 20],
+    pub decoded_value: DecodedValue,
+}
+```
+
+### Transformation Integration
+
+Decoded event-triggered calls are sent to the transformation layer via `DecodedCallsMessage`. The transformation system receives:
+
+```rust
+pub struct DecodedCallsMessage {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub source_name: String,      // Contract or factory collection name
+    pub function_name: String,    // Function that was called
+    pub calls: Vec<DecodedCall>,  // Decoded results with trigger_log_index set
+}
+```
+
+Event-triggered calls include `trigger_log_index: Some(log_index)` to correlate with the triggering event. Handlers can use this to match calls to their triggering events within the same block.
 
 ## Files Modified
 
 | File | Changes |
 |------|---------|
-| `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, extended `ParamConfig` with `FromEvent` and `SelfAddress` variants; added `Int24`, `Int16`, `Uint24` types |
-| `src/raw_data/historical/receipts.rs` | Added `EventTriggerData`, `EventTriggerMessage`, `EventTriggerMatcher` types; `build_event_trigger_matchers()`, `extract_event_triggers()` functions with deduplication; channel sending |
-| `src/raw_data/historical/eth_calls.rs` | Added event processing: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `extract_value_from_32_bytes()`, `build_event_call_params()`, `process_event_triggers()`, `write_event_call_results_to_parquet()`; catchup: `get_existing_log_ranges()`, `read_logs_from_parquet()`, `event_output_exists()`, `load_historical_factory_addresses()`, `read_factory_addresses_from_parquet()` |
+| `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, `EventTriggerConfigs` (single/multiple support), extended `ParamConfig` with `FromEvent` and `SelfAddress` variants; added `Int24`, `Int16`, `Uint24` types; `CallTarget` for target address overrides |
+| `src/raw_data/historical/receipts.rs` | Added `EventTriggerData`, `EventTriggerMessage`, `EventTriggerMatcher` types; `build_event_trigger_matchers()`, `extract_event_triggers()` functions with deduplication; channel sending; `send_range_complete()` |
+| `src/raw_data/historical/eth_calls.rs` | Added event processing: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `extract_value_from_32_bytes()`, `build_event_call_params()`, `process_event_triggers()`, `process_event_triggers_multicall()`, `write_event_call_results_to_parquet()`, `write_empty_event_call_file()`, `build_event_call_schema()`; catchup: `load_historical_factory_addresses()`, `read_factory_addresses_from_parquet()` |
 | `src/raw_data/decoding/types.rs` | Added `EventCallResult` type and `EventCallsReady` variant to `DecoderMessage` |
-| `src/raw_data/decoding/eth_calls.rs` | Added support for `Int24`, `Int16`, `Uint24` types in decoding |
+| `src/raw_data/decoding/eth_calls.rs` | Added `EventCallDecodeConfig`, `DecodedEventCallRecord` types; `process_event_calls()`, `build_decode_configs()` includes event configs; support for all int/uint types in decoding |
 | `src/raw_data/decoding/mod.rs` | Exported `EventCallResult` |
 | `src/main.rs` | Added channel creation, event matchers building, and wiring |
 
@@ -395,15 +498,29 @@ The catchup mode checks for existing output files before processing. This ensure
 - Partially completed runs can be resumed
 - New event-triggered call configurations are automatically backfilled
 
+### 7. Empty File Writing
+
+When processing a block range with no matching events for a configured (contract_name, function_name) pair, an empty parquet file is written. This prevents the catchup system from repeatedly retrying ranges that have no relevant events.
+
+### 8. Multicall3 Support
+
+When Multicall3 is configured, event-triggered calls are batched using the `aggregate3` function. This significantly reduces RPC requests by combining multiple eth_calls to the same block into a single multicall. The system groups calls by block number and executes them in batches.
+
+### 9. Target Address Overrides
+
+The `target` field in call configuration allows routing event-triggered calls to a different contract than the one emitting events. This is useful for oracles or shared state contracts. Target can be specified as a hex address or a contract name to look up.
+
 ## Known Limitations
 
 1. **Dynamic types not supported in `from_event`:** The `bytes` and `string` types cannot be extracted from event data directly because they require complex ABI decoding with offset handling.
 
 2. **Factory collection race window:** During live processing, there may be a brief window where events from newly-created factory contracts are skipped because the factory address hasn't been discovered yet. These events will be processed during the next catchup phase.
 
-3. **Failed calls stored as empty:** If an eth_call fails (e.g., contract reverted), an empty result is stored. Failed calls during catchup are not automatically retried on subsequent runs.
+3. **Failed calls stored as empty:** If an eth_call fails (e.g., contract reverted), an empty result is stored with empty `value_bytes`. Failed calls during catchup are not automatically retried on subsequent runs. Decode failures are logged with warnings.
 
 4. **No cross-event parameter passing:** Parameters can only be extracted from the triggering event itself, not from other events in the same block or transaction.
+
+5. **Tuple types not supported for `from_event` parameters:** `NamedTuple`, `UnnamedTuple`, and `Array` types cannot be used as parameter types when extracting from event data.
 
 ## Testing
 

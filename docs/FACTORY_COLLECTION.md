@@ -25,9 +25,9 @@ Factories are configured within the `factories` array of a contract:
                 "factory_events": {
                     "name": "Create",
                     "topics_signature": "address",
-                    "data_signature": "address,address,address"
+                    "data_signature": "address,address,address",
+                    "factory_parameters": "data[0]"
                 },
-                "factory_parameters": "data[0]",
                 "calls": [
                     {"function": "totalSupply()", "output_type": "uint256"}
                 ]
@@ -42,8 +42,7 @@ Factories are configured within the `factories` array of a contract:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `collection` | string | Yes | Identifier for this group of factory-created contracts (alias: `collection_name` for backward compatibility) |
-| `factory_events` | object | Yes | Event signature information for matching |
-| `factory_parameters` | string | Yes | Which parameter contains the created contract address |
+| `factory_events` | object or array | Yes | Event signature information for matching (can be single object or array of objects) |
 | `calls` | array | No | eth_call configs to execute on factory-created contracts (merged with collection type if defined) |
 | `events` | array | No | Event configs to decode from factory-created contracts (merged with collection type if defined) |
 
@@ -153,13 +152,34 @@ This would include all DERC20 collection calls PLUS the custom `customCall()`.
 
 ### Factory Events
 
-The `factory_events` object defines how to match factory creation events:
+The `factory_events` field can be a single object or an array of objects, allowing a single factory config to match multiple event types. Each object defines how to match a factory creation event:
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Event name (e.g., "Create", "PairCreated", "PoolCreated") |
 | `topics_signature` | string | Comma-separated types of indexed parameters (after topic0) |
-| `data_signature` | string | Comma-separated types of non-indexed parameters in event data |
+| `data_signature` | string | Comma-separated types of non-indexed parameters in event data (optional) |
+| `factory_parameters` | string | Which parameter contains the created contract address |
+
+**Multiple Events Example:**
+
+```json
+{
+    "factory_events": [
+        {
+            "name": "Create",
+            "topics_signature": "address,address,address",
+            "factory_parameters": "topics[1]"
+        },
+        {
+            "name": "TokenDeployed",
+            "topics_signature": "address",
+            "data_signature": "uint256",
+            "factory_parameters": "topics[1]"
+        }
+    ]
+}
+```
 
 **Event Signature Computation:**
 
@@ -174,7 +194,7 @@ topic0: keccak256("Create(address,address,address,address)")
 
 ### Factory Parameters
 
-The `factory_parameters` field specifies where to extract the created contract address:
+The `factory_parameters` field (inside `factory_events`) specifies where to extract the created contract address:
 
 | Format | Description |
 |--------|-------------|
@@ -201,13 +221,46 @@ When using nested access, the `data_signature` should include the tuple type:
     "factory_events": {
         "name": "Created",
         "topics_signature": "",
-        "data_signature": "(address,uint256,address)"
-    },
-    "factory_parameters": "data[0][0]"
+        "data_signature": "(address,uint256,address)",
+        "factory_parameters": "data[0][0]"
+    }
 }
 ```
 
-## Function Signature
+## Architecture
+
+Factory collection uses a two-phase architecture to maximize throughput and support resumability:
+
+### Phase 1: Catchup (`catchup/factories.rs`)
+
+Processes existing data to ensure consistency before streaming new data:
+
+1. Loads existing factory parquet files and sends addresses to downstream collectors
+2. Scans for log parquet files missing corresponding factory files
+3. Processes gaps concurrently using semaphore-bounded parallelism
+4. Signals completion via `factory_catchup_done_tx` oneshot channel
+
+```rust
+pub async fn collect_factories(
+    chain: &ChainConfig,
+    raw_data_config: &RawDataCollectionConfig,
+    logs_factory_tx: &Option<Sender<FactoryAddressData>>,
+    eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
+    log_decoder_tx: &Option<Sender<DecoderMessage>>,
+    call_decoder_tx: &Option<Sender<DecoderMessage>>,
+    recollect_tx: &Option<Sender<RecollectRequest>>,
+    factory_catchup_done_tx: Option<oneshot::Sender<()>>,
+) -> Result<FactoryCatchupState, FactoryCollectionError>
+```
+
+Returns `FactoryCatchupState` containing:
+- `matchers`: Arc-wrapped factory matchers for reuse
+- `existing_files`: Arc-wrapped set of existing parquet file paths
+- `output_dir`: Arc-wrapped output directory path
+
+### Phase 2: Current/Streaming (`current/factories.rs`)
+
+Processes new logs from the receipt collector channel:
 
 ```rust
 pub async fn collect_factories(
@@ -215,10 +268,12 @@ pub async fn collect_factories(
     raw_data_config: &RawDataCollectionConfig,
     log_rx: Receiver<LogMessage>,
     logs_factory_tx: Option<Sender<FactoryAddressData>>,
-    eth_calls_factory_tx: Option<Sender<FactoryAddressData>>,
+    eth_calls_factory_tx: Option<Sender<FactoryMessage>>,
     log_decoder_tx: Option<Sender<DecoderMessage>>,
     call_decoder_tx: Option<Sender<DecoderMessage>>,
-    recollect_tx: Option<Sender<RecollectRequest>>,
+    matchers: Arc<Vec<FactoryMatcher>>,
+    existing_files: Arc<HashSet<String>>,
+    output_dir: Arc<PathBuf>,
 ) -> Result<(), FactoryCollectionError>
 ```
 
@@ -227,13 +282,17 @@ pub async fn collect_factories(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with contracts |
-| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size configuration |
-| `log_rx` | `Receiver<LogMessage>` | Channel receiving log messages from receipt collector |
+| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and concurrency configuration |
+| `log_rx` | `Receiver<LogMessage>` | Channel receiving log messages from receipt collector (current phase only) |
 | `logs_factory_tx` | `Option<Sender<FactoryAddressData>>` | Channel to send addresses to logs collector |
-| `eth_calls_factory_tx` | `Option<Sender<FactoryAddressData>>` | Channel to send addresses to eth_calls collector |
+| `eth_calls_factory_tx` | `Option<Sender<FactoryMessage>>` | Channel to send factory messages to eth_calls collector |
 | `log_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to log decoder |
 | `call_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to call decoder |
-| `recollect_tx` | `Option<Sender<RecollectRequest>>` | Channel to request recollection of corrupted log files |
+| `recollect_tx` | `Option<Sender<RecollectRequest>>` | Channel to request recollection of corrupted log files (catchup only) |
+| `factory_catchup_done_tx` | `Option<oneshot::Sender<()>>` | Signal when catchup completes (catchup only) |
+| `matchers` | `Arc<Vec<FactoryMatcher>>` | Pre-built factory matchers from catchup (current only) |
+| `existing_files` | `Arc<HashSet<String>>` | Pre-scanned existing files from catchup (current only) |
+| `output_dir` | `Arc<PathBuf>` | Output directory from catchup (current only) |
 
 ### LogMessage Protocol
 
@@ -244,6 +303,18 @@ The factory collector receives messages via the `LogMessage` enum:
 | `Logs(Vec<LogData>)` | Batch of log entries to process |
 | `RangeComplete { range_start, range_end }` | Signals a block range is complete, triggers parquet writing |
 | `AllRangesComplete` | Signals all ranges are done, collector can shut down |
+
+### FactoryMessage Protocol
+
+The factory collector sends messages to eth_calls via the `FactoryMessage` enum:
+
+| Variant | Description |
+|---------|-------------|
+| `IncrementalAddresses(FactoryAddressData)` | Batch of discovered factory addresses |
+| `RangeComplete { range_start, range_end }` | Signals a block range is complete, triggers factory eth_call processing |
+| `AllComplete` | Signals all processing is complete |
+
+This incremental forwarding allows eth_calls to begin RPC fetching for factory contracts before the full range is complete.
 
 ## Output
 
@@ -283,25 +354,59 @@ The `addresses_by_block` map contains `(timestamp, address, collection_name)` tu
 ## Data Flow
 
 ```
-┌──────────────────┐                              ┌─────────────────┐
-│   receipts.rs    │ ───(LogMessage)────────────▶ │  factories.rs   │
-│                  │                              │                 │
-│  extracts logs   │                              │ matches factory │
-│  from receipts   │                              │ events, extracts│
-└──────────────────┘                              │ addresses       │
-                                                  └────────┬────────┘
-                                                           │
-              ┌────────────────────┬───────────────────────┼───────────────────────┬────────────────────┐
-              │                    │                       │                       │                    │
-              ▼                    ▼                       ▼                       ▼                    ▼
-    ┌─────────────────┐  ┌─────────────────┐   ┌──────────────────┐   ┌─────────────────┐   ┌─────────────────┐
-    │    logs.rs      │  │  eth_calls.rs   │   │    parquet       │   │  log_decoder    │   │  call_decoder   │
-    │                 │  │                 │   │                  │   │                 │   │                 │
-    │  filters logs   │  │ executes calls  │   │ data/derived/    │   │ decodes logs    │   │ decodes calls   │
-    │  to include     │  │ on factory      │   │ {chain}/         │   │ from factory    │   │ from factory    │
-    │  factory        │  │ contracts       │   │ factories/       │   │ contracts       │   │ contracts       │
-    │  contracts      │  │                 │   │                  │   │                 │   │                 │
-    └─────────────────┘  └─────────────────┘   └──────────────────┘   └─────────────────┘   └─────────────────┘
+                                     CATCHUP PHASE
+                    ┌─────────────────────────────────────────────────┐
+                    │                                                 │
+┌──────────────────┐│  ┌─────────────────────────────────────────┐   │
+│ existing logs    ││  │     catchup/factories.rs                │   │
+│ parquet files    │├─▶│                                         │   │
+│ (gaps only)      ││  │  • loads existing factory parquet       │   │
+└──────────────────┘│  │  • processes gaps concurrently          │   │
+                    │  │  • signals factory_catchup_done_tx      │   │
+                    │  └──────────────────┬──────────────────────┘   │
+                    │                     │                          │
+                    │                     ▼ FactoryCatchupState      │
+                    │                     │ (matchers, existing_files│
+                    │                     │  output_dir)             │
+                    └─────────────────────┼──────────────────────────┘
+                                          │
+                                          ▼
+                                    CURRENT PHASE
+                    ┌─────────────────────────────────────────────────┐
+                    │                                                 │
+┌──────────────────┐│  ┌─────────────────────────────────────────┐   │
+│   receipts.rs    ││  │     current/factories.rs                │   │
+│                  │├─▶│                                         │   │
+│  extracts logs   ││  │  • receives LogMessage from channel     │   │
+│  from receipts   ││  │  • matches factory events               │   │
+└──────────────────┘│  │  • extracts addresses                   │   │
+      LogMessage    │  └──────────────────┬──────────────────────┘   │
+                    │                     │                          │
+                    └─────────────────────┼──────────────────────────┘
+                                          │
+              ┌───────────────────────────┼───────────────────────────┬────────────────────┐
+              │                           │                           │                    │
+              ▼                           ▼                           ▼                    ▼
+    ┌─────────────────┐         ┌──────────────────┐       ┌─────────────────┐   ┌─────────────────┐
+    │    logs.rs      │         │  eth_calls.rs    │       │  log_decoder    │   │  call_decoder   │
+    │                 │         │                  │       │                 │   │                 │
+    │  filters logs   │         │ receives         │       │ decodes logs    │   │ decodes calls   │
+    │  to include     │         │ FactoryMessage:  │       │ from factory    │   │ from factory    │
+    │  factory        │         │ • Incremental    │       │ contracts       │   │ contracts       │
+    │  contracts      │         │   Addresses      │       │                 │   │                 │
+    │                 │         │ • RangeComplete  │       │                 │   │                 │
+    │ FactoryAddress  │         │ • AllComplete    │       │ DecoderMessage  │   │ DecoderMessage  │
+    │ Data            │         │                  │       │ ::FactoryAddr   │   │ ::FactoryAddr   │
+    └─────────────────┘         └──────────────────┘       └─────────────────┘   └─────────────────┘
+              │                           │
+              │                           ▼
+              │                 ┌──────────────────┐
+              │                 │    parquet       │
+              │                 │                  │
+              └────────────────▶│ data/derived/    │
+                                │ {chain}/         │
+                                │ factories/       │
+                                └──────────────────┘
 ```
 
 ## Integration with Other Collectors
@@ -317,10 +422,11 @@ When `contract_logs_only: true` is configured:
 
 When factories have `calls` configured:
 1. Regular eth_calls execute immediately (don't wait for factory data)
-2. Factory eth_calls execute when factory addresses arrive
-3. Factory call results use the collection name in the directory path (e.g., `eth_calls/DERC20/totalSupply/0-9999.parquet`)
-4. Calls with `frequency: "once"` are made at the discovery block and stored in `eth_calls/{collection}/once/`
-5. Calls with block-based or duration-based frequency are filtered accordingly
+2. Factory eth_calls receive addresses via `FactoryMessage::IncrementalAddresses` as they're discovered
+3. Processing triggers on `FactoryMessage::RangeComplete` after all addresses for a range are sent
+4. Factory call results use the collection name in the directory path (e.g., `eth_calls/DERC20/totalSupply/0-9999.parquet`)
+5. Calls with `frequency: "once"` are made at the discovery block and stored in `eth_calls/{collection}/once/`
+6. Calls with block-based or duration-based frequency are filtered accordingly
 
 See [eth_call Collection](./ETH_CALL_COLLECTION.md) for detailed frequency documentation.
 
@@ -362,6 +468,47 @@ These are useful for:
 - Building the eth_calls collector configuration
 - Checking which collections exist before processing
 - Getting the resolved (merged) configuration for a factory
+
+### Internal Functions
+
+The shared `factories.rs` module provides internal functions used by both catchup and current phases:
+
+```rust
+// Build factory matchers from contract configuration
+pub(crate) fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher>
+
+// Scan existing factory parquet files, returns relative paths like "collection/start-end.parquet"
+pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String>
+
+// Load factory addresses from existing parquet files
+pub(crate) fn load_factory_addresses_from_parquet(dir: &Path) -> Result<Vec<FactoryAddressData>, ...>
+
+// Get existing log file ranges for catchup gap detection
+pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange>
+
+// Read log batches from parquet with column projection (block_number, block_timestamp, address, topics, data)
+pub(crate) fn read_log_batches_from_parquet(file_path: &Path) -> Result<Vec<RecordBatch>, ...>
+
+// Process log batches using Arrow-native column access (efficient for catchup)
+pub(crate) async fn process_range_batches(
+    range_start: u64,
+    range_end: u64,
+    batches: Vec<RecordBatch>,
+    matchers: &[FactoryMatcher],
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<FactoryAddressData, ...>
+
+// Process logs from Vec<LogData> (used by current/streaming phase)
+pub(crate) async fn process_range(
+    range_start: u64,
+    range_end: u64,
+    logs: Vec<LogData>,
+    matchers: &[FactoryMatcher],
+    output_dir: &Path,
+    existing_files: &HashSet<String>,
+) -> Result<FactoryAddressData, ...>
+```
 
 ## Example Use Cases
 
@@ -524,13 +671,38 @@ FROM read_parquet('data/derived/base/factories/**/*.parquet')
 GROUP BY collection_name;
 ```
 
+## Runtime Configuration
+
+Factory collection behavior is controlled by `RawDataCollectionConfig`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `parquet_block_range` | u32 | 1000 | Number of blocks per parquet file |
+| `factory_concurrency` | usize | 4 | Number of concurrent tasks for catchup processing |
+| `factory_channel_capacity` | usize | 1000 | Capacity for factory-related channels |
+
+Example configuration:
+
+```json
+{
+    "raw_data": {
+        "parquet_block_range": 1000,
+        "factory_concurrency": 8,
+        "factory_channel_capacity": 2000
+    }
+}
+```
+
 ## Performance Considerations
 
-- Factory matching is O(n × m) where n is logs and m is matchers
+- Factory matching is O(n x m) where n is logs and m is matchers
 - ABI decoding for data extraction adds overhead
 - Large numbers of factory contracts increase eth_call RPC costs
 - Consider using `parquet_block_range` to balance file count vs. size
 - When no factory matchers are configured, the collector simply forwards empty `FactoryAddressData` to downstream collectors without writing any files
+- **Catchup concurrency**: Controlled by `factory_concurrency` config (default: 4). Higher values improve catchup throughput but use more memory
+- **Arrow-native processing**: Catchup uses `process_range_batches` which operates directly on Arrow arrays instead of materializing `LogData` structs, reducing memory allocations
+- **Incremental forwarding**: Factory addresses are sent to eth_calls via `FactoryMessage::IncrementalAddresses` as they're discovered, allowing RPC fetching to begin before the full range completes
 
 ## Resumability
 
@@ -544,15 +716,20 @@ Existing parquet files are scanned on startup and their ranges are skipped durin
 
 On startup, before processing new logs from the channel, the factory collector performs a catchup phase:
 
-1. Scans `data/raw/{chain}/logs/` for existing log parquet files
-2. For each log file, checks if corresponding factory files exist for all configured collections
-3. If any factory files are missing, reads logs from the existing parquet file and processes them
-4. This avoids re-fetching receipts when logs already exist but factory processing was interrupted
+1. **Load existing factory data**: Reads all existing factory parquet files and sends addresses to downstream collectors (logs, eth_calls, decoders)
+2. **Scan for gaps**: Scans `data/raw/{chain}/logs/` for existing log parquet files
+3. **Check completeness**: For each log file, checks if corresponding factory files exist for all configured collections
+4. **Process gaps concurrently**: If any factory files are missing, reads logs from the existing parquet file and processes them using semaphore-bounded concurrency (controlled by `factory_concurrency` config)
+5. **Signal completion**: Sends `factory_catchup_done_tx` oneshot to unblock dependent catchup phases (e.g., eth_calls)
 
 This is particularly useful when:
 - Factory collection was interrupted mid-run
 - New factory configurations are added to existing contracts
 - Factory files were manually deleted for re-processing
+
+### Synchronization with eth_calls
+
+The eth_calls catchup phase waits for `factory_catchup_done_rx` before processing factory-dependent calls. This ensures factory addresses are available before eth_calls attempts to fetch data from factory-created contracts.
 
 ### Corrupted File Recovery
 

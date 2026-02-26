@@ -2,10 +2,18 @@
 
 The block collection module fetches historical Ethereum blocks via RPC and writes them to Parquet files for efficient storage and querying.
 
+## Module Structure
+
+Block collection is organized into submodules:
+
+- `src/raw_data/historical/catchup/blocks.rs` - Main collection logic for historical blocks
+- `src/raw_data/historical/current/blocks.rs` - Placeholder for real-time block tracking
+- `src/raw_data/historical/blocks.rs` - Shared types, schemas, and Parquet writing utilities
+
 ## Usage
 
 ```rust
-use doppler_indexer_rs::raw_data::historical::blocks::collect_blocks;
+use doppler_indexer_rs::raw_data::historical::catchup::blocks::collect_blocks;
 use doppler_indexer_rs::rpc::UnifiedRpcClient;
 use tokio::sync::mpsc;
 
@@ -38,7 +46,7 @@ pub async fn collect_blocks(
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with name and start block |
 | `client` | `&UnifiedRpcClient` | Shared RPC client (enables rate limit sharing across operations) |
-| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size, RPC batch size, and field configuration |
+| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
 | `tx_sender` | `Option<Sender<(u64, u64, Vec<B256>)>>` | Optional channel for receipt/log collection |
 | `eth_call_sender` | `Option<Sender<(u64, u64)>>` | Optional channel for eth_call data collection |
 
@@ -140,11 +148,41 @@ When no fields are specified, all block header fields are stored:
 
 Block collection uses a **streaming approach** for maximum throughput:
 
-1. **Concurrent dispatch**: All block requests for a range are dispatched at once
+1. **Concurrent dispatch**: All block requests for a range are dispatched at once via `get_blocks_streaming()`
 2. **Rate limiting**: Semaphore limits concurrent in-flight requests (`RPC_CONCURRENCY`)
 3. **Per-request CU tracking**: Each request acquires compute units individually from the sliding window limiter
 4. **Immediate forwarding**: As each block arrives, it's immediately forwarded to downstream collectors
 5. **Ordered output**: Records are buffered in a BTreeMap for sorted parquet output
+
+### Internal Architecture
+
+The `collect_blocks_streaming()` helper manages the streaming process for each block range:
+
+```rust
+async fn collect_blocks_streaming(
+    client: &UnifiedRpcClient,
+    range: &BlockRange,
+    block_fields: &Option<Vec<BlockField>>,
+    schema: &Arc<Schema>,
+    output_dir: &Path,
+    tx_sender: &Option<Sender<(u64, u64, Vec<B256>)>>,
+    eth_call_sender: &Option<Sender<(u64, u64)>>,
+) -> Result<usize, BlockCollectionError>
+```
+
+1. Creates a channel for streaming results with buffer size 256
+2. Spawns `get_blocks_streaming()` which dispatches all block requests concurrently
+3. Processes blocks as they arrive via the channel receiver
+4. Immediately forwards block info to downstream collectors (receipts, eth_calls)
+5. Buffers records in a `BTreeMap<u64, Record>` for ordered output
+6. Writes sorted records to Parquet using `spawn_blocking` to avoid blocking async runtime
+
+### RPC Client Behavior
+
+The `UnifiedRpcClient::get_blocks_streaming()` method behaves differently based on the client type:
+
+- **Alchemy URLs** (containing "alchemy"): Uses concurrent fetching with compute unit rate limiting
+- **Standard URLs**: Falls back to sequential fetching (no concurrent dispatch)
 
 ### Benefits
 
@@ -158,7 +196,6 @@ Block collection uses a **streaming approach** for maximum throughput:
 |----------|---------|-------------|
 | `RPC_CONCURRENCY` | 100 | Max concurrent in-flight block requests |
 | `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second |
-| `RPC_BATCH_SIZE` | from config | Override for batch size |
 
 **Example for high throughput:**
 ```bash
@@ -167,10 +204,28 @@ RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
 
 ## RPC Client Selection
 
-The `UnifiedRpcClient` automatically selects the appropriate rate limiting strategy:
+The `UnifiedRpcClient` automatically selects the appropriate client implementation based on the URL:
 
-- **Alchemy URLs** (containing "alchemy"): Uses compute unit rate limiting with sliding window
-- **Other URLs**: Uses request-based rate limiting
+- **Alchemy URLs** (containing "alchemy"): Uses `AlchemyClient` with compute unit rate limiting and concurrent streaming
+- **Other URLs**: Uses standard `RpcClient` with sequential fetching fallback
+
+### Client Creation Options
+
+```rust
+// Basic creation (auto-detects client type)
+let client = UnifiedRpcClient::from_url(&rpc_url)?;
+
+// With custom Alchemy CU limit
+let client = UnifiedRpcClient::from_url_with_alchemy_cu(&rpc_url, 7500)?;
+
+// With full options (including shared rate limiter)
+let client = UnifiedRpcClient::from_url_with_options(
+    &rpc_url,
+    7500,                    // compute_units_per_second
+    100,                     // rpc_concurrency
+    Some(shared_limiter),    // optional shared rate limiter
+)?;
+```
 
 All clients can share a rate limiter for account-level rate limiting across block, receipt, and eth_call collection.
 
@@ -200,7 +255,7 @@ All clients can share a rate limiter for account-level rate limiting across bloc
   ],
   "raw_data_collection": {
     "parquet_block_range": 10000,
-    "rpc_batch_size": 100,
+    "channel_capacity": 1000,
     "fields": {
       "block_fields": null
     }
@@ -211,9 +266,19 @@ All clients can share a rate limiter for account-level rate limiting across bloc
 This configuration:
 - Collects blocks starting from 17,000,000 (aligned to 17,000,000 since 17000000 % 10000 == 0)
 - Writes 10,000 blocks per Parquet file
-- Fetches 100 blocks per RPC batch request (default: 100)
+- Uses streaming collection with channel buffer size of 1000
 - Stores all block fields (full schema)
 - Reads RPC URL from `ETHEREUM_RPC_URL` environment variable
+
+### Additional Configuration Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `parquet_block_range` | 1000 | Number of blocks per Parquet file |
+| `channel_capacity` | 1000 | Capacity for main channels (blocks, logs, eth_calls) |
+| `block_receipt_concurrency` | 10 | Concurrent block receipt fetches |
+| `decoding_concurrency` | 4 | Concurrent decoding tasks |
+| `factory_concurrency` | 4 | Concurrent factory collection tasks |
 
 ## Helper Functions
 

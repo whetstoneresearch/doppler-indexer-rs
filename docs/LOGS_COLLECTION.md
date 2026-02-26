@@ -2,10 +2,39 @@
 
 The log collection module receives logs extracted from transaction receipts and writes them to Parquet files. Logs are obtained from the receipt collector rather than via separate RPC calls, ensuring consistency and efficiency.
 
+## Architecture
+
+Log collection is split into two phases to support resumable operation:
+
+1. **Catchup Phase** (`catchup/logs.rs`): Scans existing parquet files, builds the schema and configured addresses, and returns a `LogsCatchupState` containing all initialization data.
+
+2. **Current Phase** (`current/logs.rs`): Receives logs from the receipt collector via channels and writes them to parquet files, using the state from the catchup phase.
+
+This separation allows the indexer to:
+- Quickly determine which ranges have already been processed
+- Pre-compute schemas and address sets once
+- Seamlessly transition from catchup to live processing
+
+### Module Structure
+
+```
+src/raw_data/historical/
+├── logs.rs              # Shared types, helpers, and parquet writing functions
+├── catchup/
+│   └── logs.rs          # Catchup phase: initialization and state building
+└── current/
+    └── logs.rs          # Current phase: channel processing loop
+```
+
+- **`logs.rs`**: Contains `LogsCatchupState`, `LogCollectionError`, schema building, and parquet writing utilities shared by both phases
+- **`catchup/logs.rs`**: Initializes state by scanning existing files and building configuration
+- **`current/logs.rs`**: Processes `LogMessage` from channels using the pre-built state
+
 ## Usage
 
 ```rust
-use doppler_indexer_rs::raw_data::historical::logs::collect_logs;
+use doppler_indexer_rs::raw_data::historical::catchup::logs as catchup_logs;
+use doppler_indexer_rs::raw_data::historical::current::logs as current_logs;
 use doppler_indexer_rs::raw_data::historical::receipts::{LogData, LogMessage};
 use doppler_indexer_rs::raw_data::historical::factories::FactoryAddressData;
 use doppler_indexer_rs::raw_data::decoding::DecoderMessage;
@@ -20,30 +49,64 @@ let factory_rx: Option<Receiver<FactoryAddressData>> = None;
 // Optional decoder channel (for ABI decoding)
 let decoder_tx: Option<Sender<DecoderMessage>> = None;
 
-collect_logs(&chain_config, &raw_data_config, log_rx, factory_rx, decoder_tx).await?;
+// Phase 1: Catchup - initialize state
+let catchup_state = catchup_logs::collect_logs(&chain_config, &raw_data_config).await?;
+
+// Phase 2: Current - process logs from channel
+current_logs::collect_logs(&chain_config, log_rx, factory_rx, decoder_tx, catchup_state).await?;
 ```
 
-## Function Signature
+## Function Signatures
+
+### Catchup Phase
 
 ```rust
 pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
+) -> Result<LogsCatchupState, LogCollectionError>
+```
+
+Returns a `LogsCatchupState` containing:
+- `output_dir`: Path to the logs parquet directory
+- `range_size`: Number of blocks per parquet file
+- `schema`: Arrow schema for writing parquet files
+- `configured_addresses`: Set of contract addresses for filtering
+- `existing_files`: Set of already-processed parquet file names
+- `contract_logs_only`: Whether to filter to configured contracts only
+- `needs_factory_wait`: Whether to wait for factory addresses before writing
+- `log_fields`: Optional list of specific fields to include
+
+### Current Phase
+
+```rust
+pub async fn collect_logs(
+    chain: &ChainConfig,
     log_rx: Receiver<LogMessage>,
     factory_rx: Option<Receiver<FactoryAddressData>>,
     decoder_tx: Option<Sender<DecoderMessage>>,
+    state: LogsCatchupState,
 ) -> Result<(), LogCollectionError>
 ```
 
 ### Parameters
 
+#### Catchup Phase
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with name and contracts |
 | `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
+
+#### Current Phase
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `chain` | `&ChainConfig` | Chain configuration with name and contracts |
 | `log_rx` | `Receiver<LogMessage>` | Channel receiving log messages from receipt collector |
 | `factory_rx` | `Option<Receiver<FactoryAddressData>>` | Optional channel receiving factory addresses for filtering |
 | `decoder_tx` | `Option<Sender<DecoderMessage>>` | Optional channel for sending logs to the decoder for ABI decoding |
+| `state` | `LogsCatchupState` | Pre-computed state from the catchup phase |
 
 ### Input Channel Message Format
 
@@ -97,6 +160,16 @@ data/raw/ethereum/logs/
 ```
 
 ## Processing Flow
+
+### Catchup Phase
+
+1. Creates the output directory (`data/raw/{chain}/logs/`) if it doesn't exist
+2. Builds the Arrow schema based on configured log fields
+3. If `contract_logs_only` is enabled, extracts all configured contract addresses
+4. Scans existing parquet files to determine which ranges are already processed
+5. Returns `LogsCatchupState` with all pre-computed data
+
+### Current Phase
 
 1. Receives `LogMessage` from the receipt collector via channel
 2. For `LogMessage::Logs`: accumulates logs into per-range buckets
@@ -156,11 +229,21 @@ When a `decoder_tx` channel is provided, the log collector forwards logs to the 
 
 ### Configuration
 
-To enable decoding, provide a decoder channel when calling `collect_logs`:
+To enable decoding, provide a decoder channel when calling the current phase of `collect_logs`:
 
 ```rust
+use doppler_indexer_rs::raw_data::historical::{
+    catchup::logs as catchup_logs,
+    current::logs as current_logs,
+};
+
 let (decoder_tx, decoder_rx) = mpsc::channel(1000);
-collect_logs(&chain, &config, log_rx, factory_rx, Some(decoder_tx)).await?;
+
+// Phase 1: Catchup
+let catchup_state = catchup_logs::collect_logs(&chain, &config).await?;
+
+// Phase 2: Current - with decoder channel
+current_logs::collect_logs(&chain, log_rx, factory_rx, Some(decoder_tx), catchup_state).await?;
 ```
 
 See [Decoding](./DECODING.md) for more details on ABI-based event and call decoding.
@@ -248,12 +331,14 @@ When no fields are specified, all log fields are stored:
 ### Basic Flow (without factories)
 
 ```
-┌─────────────┐                              ┌──────────────────┐                              ┌─────────────┐
-│   blocks.rs │ ───(block info)────────────▶ │   receipts.rs    │ ───(LogMessage)────────────▶ │   logs.rs   │
-└─────────────┘                              │                  │                              │             │
-                                             │  extracts logs   │                              │ writes logs │
-                                             │  from receipts   │                              │ to parquet  │
-                                             └──────────────────┘                              └─────────────┘
+┌─────────────┐                              ┌──────────────────┐                              ┌───────────────────────────────────────┐
+│   blocks.rs │ ───(block info)────────────▶ │   receipts.rs    │ ───(LogMessage)────────────▶ │            logs collection            │
+└─────────────┘                              │                  │                              │                                       │
+                                             │  extracts logs   │                              │  ┌───────────────┐  ┌─────────────┐  │
+                                             │  from receipts   │                              │  │ catchup/logs  │─▶│current/logs │  │
+                                             └──────────────────┘                              │  │ (init state)  │  │(process rx) │  │
+                                                                                               │  └───────────────┘  └─────────────┘  │
+                                                                                               └───────────────────────────────────────┘
 ```
 
 ### With Factory Filtering (contract_logs_only: true)
@@ -377,11 +462,15 @@ ORDER BY block_number, log_index;
 
 ## Complete Pipeline Example
 
-Running all three collectors together:
+Running all three collectors together with the two-phase log collection:
 
 ```rust
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use doppler_indexer_rs::raw_data::historical::{
+    catchup::{blocks as catchup_blocks, logs as catchup_logs, receipts as catchup_receipts},
+    current::{logs as current_logs, receipts as current_receipts},
+};
 
 let client = UnifiedRpcClient::from_url(&rpc_url)?;
 
@@ -391,20 +480,57 @@ let (log_tx, log_rx) = mpsc::channel(1000);
 
 let mut tasks = JoinSet::new();
 
-// Spawn collectors
-tasks.spawn(collect_blocks(chain.clone(), client.clone(), config.clone(), Some(block_tx)));
-tasks.spawn(collect_receipts(
+// Spawn block collector
+tasks.spawn(catchup_blocks::collect_blocks(
     chain.clone(),
     client.clone(),
     config.clone(),
-    block_rx,
-    Some(log_tx),
-    None,  // factory_log_tx
-    None,  // event_trigger_tx
-    vec![], // event_matchers
-    None,  // recollect_rx
+    Some(block_tx),
+    None,  // eth_call_tx
 ));
-tasks.spawn(collect_logs(chain.clone(), config.clone(), log_rx, None, None));
+
+// Spawn receipt collector (handles both catchup and current phases internally)
+tasks.spawn({
+    let (chain, client, config) = (chain.clone(), client.clone(), config.clone());
+    let log_tx = Some(log_tx);
+    async move {
+        // Catchup phase
+        catchup_receipts::collect_receipts(
+            &chain,
+            &client,
+            &config,
+            &log_tx,
+            &None,  // factory_log_tx
+            &None,  // event_trigger_tx
+            &[],    // event_matchers
+        ).await?;
+
+        // Current phase
+        current_receipts::collect_receipts(
+            &chain,
+            &client,
+            &config,
+            block_rx,
+            log_tx,
+            None,  // factory_log_tx
+            None,  // event_trigger_tx
+            vec![], // event_matchers
+            None,  // recollect_rx
+        ).await
+    }
+});
+
+// Spawn log collector with two-phase approach
+tasks.spawn({
+    let (chain, config) = (chain.clone(), config.clone());
+    async move {
+        // Phase 1: Catchup - initialize state
+        let catchup_state = catchup_logs::collect_logs(&chain, &config).await?;
+
+        // Phase 2: Current - process logs from channel
+        current_logs::collect_logs(&chain, log_rx, None, None, catchup_state).await
+    }
+});
 
 // Wait for all to complete
 while let Some(result) = tasks.join_next().await {

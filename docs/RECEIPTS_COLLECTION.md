@@ -2,10 +2,44 @@
 
 The receipt collection module fetches transaction receipts via RPC and writes them to Parquet files. It receives block information from the block collector and extracts logs to forward to the log collector.
 
+Receipt collection is split into two phases:
+
+1. **Catchup Phase** (`catchup/receipts.rs`): On startup, processes any block ranges where blocks exist but receipts or logs are missing
+2. **Current Phase** (`current/receipts.rs`): Processes new blocks from a channel with early batch-based RPC fetching
+
 ## Usage
 
+### Catchup Phase
+
 ```rust
-use doppler_indexer_rs::raw_data::historical::receipts::{collect_receipts, LogMessage};
+use doppler_indexer_rs::raw_data::historical::catchup::receipts::collect_receipts;
+use doppler_indexer_rs::raw_data::historical::receipts::LogMessage;
+use doppler_indexer_rs::rpc::UnifiedRpcClient;
+use tokio::sync::mpsc;
+
+let client = UnifiedRpcClient::from_url(&rpc_url)?;
+
+// Channels to downstream collectors
+let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
+let (factory_log_tx, factory_log_rx) = mpsc::channel::<LogMessage>(1000);
+
+// Run catchup phase (no block_rx needed - reads from existing block parquet files)
+collect_receipts(
+    &chain_config,
+    &client,
+    &raw_data_config,
+    &Some(log_tx),
+    &Some(factory_log_tx),
+    &None,  // event_trigger_tx
+    &[],    // event_matchers
+).await?;
+```
+
+### Current Phase
+
+```rust
+use doppler_indexer_rs::raw_data::historical::current::receipts::collect_receipts;
+use doppler_indexer_rs::raw_data::historical::receipts::LogMessage;
 use doppler_indexer_rs::raw_data::historical::factories::RecollectRequest;
 use doppler_indexer_rs::rpc::UnifiedRpcClient;
 use tokio::sync::mpsc;
@@ -14,13 +48,13 @@ let client = UnifiedRpcClient::from_url(&rpc_url)?;
 
 // Channel from block collector
 let (block_tx, block_rx) = mpsc::channel(1000);
-// Channel to log collector
+// Channels to downstream collectors
 let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
-// Channel to factory collector (optional)
 let (factory_log_tx, factory_log_rx) = mpsc::channel::<LogMessage>(1000);
 // Channel for recollection requests from factory collector (optional)
 let (recollect_tx, recollect_rx) = mpsc::channel::<RecollectRequest>(100);
 
+// Run current phase (processes new blocks from channel)
 collect_receipts(
     &chain_config,
     &client,
@@ -34,9 +68,27 @@ collect_receipts(
 ).await?;
 ```
 
-## Function Signature
+## Function Signatures
+
+### Catchup Phase
 
 ```rust
+// src/raw_data/historical/catchup/receipts.rs
+pub async fn collect_receipts(
+    chain: &ChainConfig,
+    client: &UnifiedRpcClient,
+    raw_data_config: &RawDataCollectionConfig,
+    log_tx: &Option<Sender<LogMessage>>,
+    factory_log_tx: &Option<Sender<LogMessage>>,
+    event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
+    event_matchers: &[EventTriggerMatcher],
+) -> Result<(), ReceiptCollectionError>
+```
+
+### Current Phase
+
+```rust
+// src/raw_data/historical/current/receipts.rs
 pub async fn collect_receipts(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,
@@ -52,6 +104,20 @@ pub async fn collect_receipts(
 
 ### Parameters
 
+#### Catchup Phase Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `chain` | `&ChainConfig` | Chain configuration with name and optional `block_receipts_method` |
+| `client` | `&UnifiedRpcClient` | Shared RPC client for fetching receipts |
+| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size, batch sizes, and field configuration |
+| `log_tx` | `&Option<Sender<LogMessage>>` | Optional channel for forwarding logs to log collector (reference) |
+| `factory_log_tx` | `&Option<Sender<LogMessage>>` | Optional channel for forwarding logs to factory collector (reference) |
+| `event_trigger_tx` | `&Option<Sender<EventTriggerMessage>>` | Optional channel for event-triggered eth_calls (reference) |
+| `event_matchers` | `&[EventTriggerMatcher]` | Matchers for detecting events that trigger eth_calls (slice reference) |
+
+#### Current Phase Parameters
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with name and optional `block_receipts_method` |
@@ -64,7 +130,7 @@ pub async fn collect_receipts(
 | `event_matchers` | `Vec<EventTriggerMatcher>` | Matchers for detecting events that trigger eth_calls |
 | `recollect_rx` | `Option<Receiver<RecollectRequest>>` | Optional channel for receiving recollection requests from factory collector |
 
-### Input Channel Message Format
+### Input Channel Message Format (Current Phase)
 
 Receives from block collector:
 - `u64` - Block number
@@ -110,11 +176,28 @@ data/raw/ethereum/receipts/
 
 ## Processing Flow
 
+### Catchup Phase
+
+1. Scans existing block parquet files in `data/raw/{chain}/blocks/`
+2. For each block range, checks if receipts and logs parquet files exist
+3. If missing, reads block info from existing block parquet file
+4. Fetches receipts via RPC and processes them
+5. Sends `RangeComplete` signals for each range (even if already complete) to synchronize downstream collectors
+
+### Current Phase (Early Batch Fetching)
+
+The current phase uses early batch-based RPC fetching to improve throughput:
+
 1. Receives block info (block number, timestamp, tx hashes) from block collector
-2. Accumulates messages until a complete block range is received
-3. Fetches transaction receipts (see [Fetching Strategies](#fetching-strategies) below)
-4. Extracts logs from receipts and forwards to log collector
-5. Writes receipt data to Parquet file
+2. Tracks blocks in batch states per range (`ReceiptBatchState`)
+3. **Early fetch**: When unfetched blocks reach `rpc_batch_size`, immediately fetches receipts via RPC without waiting for full range
+4. Sends logs immediately to downstream collectors as batches complete
+5. When all blocks in a range are received:
+   - Fetches any remaining unfetched blocks
+   - Sorts records by block number
+   - Writes receipt data to Parquet file
+6. Handles recollection requests via `tokio::select!` alongside normal block processing
+7. On shutdown, processes any incomplete ranges with partial data
 
 ## Fetching Strategies
 
@@ -166,20 +249,31 @@ This matches the behavior of per-transaction fetching, where individual failures
 
 ## Resumability
 
-Collection is fully resumable with comprehensive catchup logic:
+Collection is fully resumable with comprehensive catchup logic. The catchup and current phases are now separate functions that run sequentially:
 
-### Catchup Phase
+### Catchup Phase (Separate Function)
 
-On startup, the receipt collector performs a catchup phase before listening for new blocks:
+The catchup phase runs first as a separate function (`catchup::receipts::collect_receipts`):
 
 1. **Scans existing block files** - Reads `data/raw/{chain}/blocks/` to find all available block ranges
 2. **Checks downstream files** - For each block range, checks if:
    - Receipt parquet file exists
    - Logs parquet file exists (if log collection is enabled)
-   - Factory parquet files exist for all configured collections (if factories are configured)
 3. **Re-processes missing ranges** - If any downstream files are missing, reads block info from the existing block parquet file and re-processes that range
+4. **Signals completion** - Sends `RangeComplete` for all ranges (including already-complete ones) to synchronize downstream collectors
 
-This ensures that if the indexer crashes after writing block files but before completing receipt/log/factory collection, those ranges will be automatically re-processed on restart.
+Note: Factory catchup is handled separately by the factories module reading from logs files directly.
+
+### Current Phase (Separate Function)
+
+The current phase runs after catchup completes (`current::receipts::collect_receipts`):
+
+1. **Processes new blocks** - Receives block info from the block collector channel
+2. **Uses early batch fetching** - Starts RPC work before full range is complete for better throughput
+3. **Handles recollection requests** - Processes requests from factory collector in parallel via `tokio::select!`
+4. **Shutdown cleanup** - Processes any incomplete ranges when the block channel closes
+
+This separation ensures that catchup completes fully before processing new blocks, preventing race conditions between historical and live data.
 
 ### Empty Range Handling
 
@@ -191,7 +285,7 @@ To re-collect a range, delete the corresponding file from `data/raw/{chain}/rece
 
 ## Automatic Recollection (Corrupted File Recovery)
 
-The receipt collector supports automatic recollection of ranges when downstream collectors detect corrupted files. This is primarily used by the factory collector during its catchup phase.
+The current phase receipt collector supports automatic recollection of ranges when downstream collectors detect corrupted files. This is primarily used by the factory collector during its catchup phase.
 
 ### How It Works
 
@@ -199,12 +293,14 @@ The receipt collector supports automatic recollection of ranges when downstream 
    - Deletes the corrupted file
    - Sends a `RecollectRequest` through the `recollect_tx` channel
 
-2. **Re-processing**: The receipt collector listens on `recollect_rx` using `tokio::select!`:
+2. **Re-processing**: The current phase receipt collector listens on `recollect_rx` using `tokio::select!`:
    - Reads block info from the corresponding block parquet file
    - Re-fetches receipts via RPC for that range
    - Sends logs through the normal `factory_log_tx` channel
 
 3. **Normal Processing**: The factory collector receives the re-fetched logs through its normal `log_rx` channel and processes them as usual
+
+Note: Only the current phase function accepts `recollect_rx`. The catchup phase does not handle recollection requests since it runs before the current phase and any corrupted files would be naturally re-processed.
 
 ### RecollectRequest Structure
 
@@ -288,25 +384,52 @@ When no fields are specified, all receipt fields are stored:
 | `status` | Boolean | No |
 | `log_count` | UInt32 | No |
 
+## Module Structure
+
+The receipt collection code is organized into multiple modules:
+
+```
+src/raw_data/historical/
+├── receipts.rs          # Shared types, helpers, and processing logic
+├── catchup/
+│   └── receipts.rs      # Catchup phase: process existing block ranges
+└── current/
+    └── receipts.rs      # Current phase: process new blocks from channel
+```
+
+- **`receipts.rs`**: Contains shared types (`LogMessage`, `EventTriggerMessage`, `ReceiptCollectionError`, etc.), helper functions (`process_range`, `fetch_receipts_for_blocks`, `send_logs_to_channels`), and schema/parquet utilities
+- **`catchup/receipts.rs`**: Standalone catchup function that scans existing block files and re-processes missing ranges
+- **`current/receipts.rs`**: Main collection function with early batch fetching and recollection support
+
 ## Data Flow
 
 ```
-┌─────────────┐     (block_number, timestamp, tx_hashes)     ┌──────────────────┐
-│   blocks.rs │ ──────────────────────────────────────────▶  │   receipts.rs    │
-└─────────────┘                                              │                  │
-                                                             │  1. Accumulate   │
-                                                             │  2. Fetch RPC    │
-                                                             │  3. Write parquet│
-                                                             │  4. Extract logs │
-                                                             └────────┬─────────┘
-                                                                      │
-                                                               LogMessage
-                                                              ┌───────┴───────┐
-                                                              │               │
-                                                              ▼               ▼
-                                                     ┌──────────────┐  ┌──────────────┐
-                                                     │   logs.rs    │  │ factories.rs │
-                                                     └──────────────┘  └──────────────┘
+                          ┌─────────────────────────────────────────────────────────┐
+                          │                    Startup                              │
+                          │                                                         │
+                          │  ┌─────────────────┐    RangeComplete     ┌───────────┐ │
+                          │  │ catchup/        │──────────────────────▶│ downstream│ │
+                          │  │ receipts.rs     │     (all ranges)     │ collectors│ │
+                          │  │ (reads blocks)  │                      └───────────┘ │
+                          │  └─────────────────┘                                    │
+                          └─────────────────────────────────────────────────────────┘
+                                               ▼
+┌─────────────┐     (block_number, timestamp, tx_hashes)     ┌──────────────────────┐
+│   blocks.rs │ ──────────────────────────────────────────▶  │ current/receipts.rs  │
+└─────────────┘                                              │                      │
+                                                             │ 1. Track in batch    │
+                                                             │ 2. Early fetch RPC   │
+                                                             │ 3. Send logs immed.  │
+                                                             │ 4. Write parquet     │
+                                                             └──────────┬───────────┘
+                                                                        │
+                                                                 LogMessage
+                                                                ┌───────┴───────┐
+                                                                │               │
+                                                                ▼               ▼
+                                                       ┌──────────────┐  ┌──────────────┐
+                                                       │   logs.rs    │  │ factories.rs │
+                                                       └──────────────┘  └──────────────┘
 ```
 
 ## Configuration Options
@@ -316,8 +439,23 @@ The following `raw_data_collection` options affect receipt collection:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `parquet_block_range` | 1000 | Number of blocks per Parquet file |
-| `rpc_batch_size` | 100 | Transactions per RPC batch (per-transaction fetching only) |
+| `rpc_batch_size` | 100 | Transactions per RPC batch. Also controls early batch fetch threshold in current phase. |
 | `block_receipt_concurrency` | 10 | Concurrent block receipt requests (block-level fetching only) |
+
+### Early Batch Fetching (Current Phase)
+
+In the current phase, the collector uses `rpc_batch_size` as the threshold for early batch fetching:
+
+- As blocks arrive, they are accumulated in a `ReceiptBatchState`
+- When the number of unfetched blocks reaches `rpc_batch_size`, receipts are fetched immediately
+- Logs are sent to downstream collectors as each batch completes
+- This allows RPC work to overlap with block collection, improving throughput
+
+Example: With `rpc_batch_size: 100` and `parquet_block_range: 1000`:
+- First 100 blocks arrive: immediate RPC fetch, logs sent downstream
+- Next 100 blocks arrive: immediate RPC fetch, logs sent downstream
+- ... (8 more batches)
+- Final batch may be smaller, fetched when range is complete
 
 ## Backpressure Monitoring
 

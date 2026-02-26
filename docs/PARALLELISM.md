@@ -180,7 +180,7 @@ The block collector uses a **streaming approach** for maximum throughput:
                      │                    RPC Layer                                 │
                      │  ┌─────────┐    ┌─────────────────────┐    ┌─────────────┐  │
                      │  │Semaphore│───▶│Sliding Window Limiter│───▶│   Execute   │  │
-                     │  │(100-500)│    │   (7500 CU/sec)      │    │   Request   │  │
+                     │  │(100-500)│    │   (75000 CU/10sec)   │    │   Request   │  │
                      │  └─────────┘    └─────────────────────┘    └──────┬──────┘  │
                      └───────────────────────────────────────────────────┼─────────┘
                                                                          │
@@ -198,6 +198,8 @@ The block collector uses a **streaming approach** for maximum throughput:
                                                                                    Eth Calls
 ```
 
+Note: The sliding window tracks CU usage over 10-second windows (7500 CU/s * 10 = 75000 CU per window).
+
 ## Concurrency Settings
 
 ### Environment Variables
@@ -212,6 +214,25 @@ The block collector uses a **streaming approach** for maximum throughput:
 ```bash
 RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
 ```
+
+### Shared Rate Limiter
+
+All RPC clients share a single `SlidingWindowRateLimiter` for account-level rate limiting:
+
+```rust
+// Create shared limiter for account-level rate limiting across all clients
+let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(alchemy_cu_per_second));
+
+// All clients share the same limiter
+let blocks_client = UnifiedRpcClient::from_url_with_options(
+    &rpc_url, alchemy_cu_per_second, rpc_concurrency, Some(shared_limiter.clone())
+)?;
+let receipts_client = UnifiedRpcClient::from_url_with_options(
+    &rpc_url, alchemy_cu_per_second, rpc_concurrency, Some(shared_limiter.clone())
+)?;
+```
+
+This ensures combined CU usage across all collectors (blocks, receipts, eth_calls) stays within your Alchemy plan limits.
 
 ### Block Receipt Concurrency
 
@@ -325,13 +346,60 @@ tasks.spawn(collect_factories(...));  // if factories configured
 tasks.spawn(collect_eth_calls(...));  // if eth_calls configured
 tasks.spawn(decode_logs(...));        // if events configured
 tasks.spawn(decode_calls(...));       // if eth_calls with output_type configured
+tasks.spawn(engine.run(...));         // if transformations configured
 
 while let Some(result) = tasks.join_next().await {
     result??;
 }
 ```
 
-All tasks share the same RPC client (`UnifiedRpcClient`), which manages rate limiting across all operations. This ensures the combined RPC usage stays within provider limits.
+All RPC tasks share the same rate limiter (`SlidingWindowRateLimiter`), which manages CU consumption across all operations. This ensures the combined RPC usage stays within provider limits.
+
+## Transformation Engine Parallelism
+
+The transformation engine uses semaphore-bounded concurrency for handler execution:
+
+### Handler Concurrency
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `handler_concurrency` | 4 | Number of handlers that can execute concurrently |
+
+```json
+{
+  "transformations": {
+    "handler_concurrency": 4,
+    "mode": {
+      "batch_for_catchup": true,
+      "catchup_batch_size": 10000
+    }
+  }
+}
+```
+
+### Execution Pattern
+
+Handlers process ranges concurrently using a semaphore to limit parallelism:
+
+```rust
+let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
+let mut join_set: JoinSet<Result<...>> = JoinSet::new();
+
+for range in ranges_to_process {
+    let permit = semaphore.clone().acquire_owned().await?;
+    join_set.spawn(async move {
+        let result = handler.handle(events).await;
+        drop(permit);
+        result
+    });
+}
+```
+
+This ensures:
+- **Bounded memory usage**: Only `handler_concurrency` handlers run simultaneously
+- **Independent progress**: Each handler tracks its own progress in `_handler_progress`
+- **Independent transactions**: Each handler's operations execute in their own transaction
+- **Fault isolation**: One handler's failure doesn't affect others
 
 ## Performance Tuning
 
@@ -344,8 +412,20 @@ All tasks share the same RPC client (`UnifiedRpcClient`), which manages rate lim
     "rpc_batch_size": 100,
     "channel_capacity": 5000,
     "block_receipt_concurrency": 20
+  },
+  "transformations": {
+    "handler_concurrency": 8,
+    "mode": {
+      "batch_for_catchup": true,
+      "catchup_batch_size": 10000
+    }
   }
 }
+```
+
+With environment variables:
+```bash
+RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
 ```
 
 ### For Memory-Constrained Environments
@@ -357,6 +437,13 @@ All tasks share the same RPC client (`UnifiedRpcClient`), which manages rate lim
     "rpc_batch_size": 50,
     "channel_capacity": 500,
     "factory_channel_capacity": 500
+  },
+  "transformations": {
+    "handler_concurrency": 2,
+    "mode": {
+      "batch_for_catchup": true,
+      "catchup_batch_size": 1000
+    }
   }
 }
 ```
@@ -367,6 +454,83 @@ All tasks share the same RPC client (`UnifiedRpcClient`), which manages rate lim
 2. **Check RPC rate limit errors** - May need to reduce batch size or concurrency
 3. **Monitor file sizes** - Very large parquet files may indicate `parquet_block_range` is too high
 4. **Track catchup duration** - Long catchup suggests many ranges need re-processing
+5. **Handler execution time** - If handlers are slow, consider increasing `handler_concurrency`
+
+### Concurrent Execution Methods
+
+The codebase uses two main patterns for concurrent execution:
+
+**1. Semaphore-bounded JoinSet (for ordered results)**
+
+Used by `execute_concurrent_ordered` in AlchemyClient for batch RPC calls:
+
+```rust
+let semaphore = Arc::new(Semaphore::new(rpc_concurrency));
+let mut join_set = JoinSet::new();
+
+for (idx, request) in requests.into_iter().enumerate() {
+    let semaphore = semaphore.clone();
+    join_set.spawn(async move {
+        let permit = semaphore.acquire_owned().await?;
+        let result = make_request(request).await;
+        drop(permit);
+        (idx, result)
+    });
+}
+
+// Collect and sort by index to preserve order
+let mut results = Vec::new();
+while let Some(result) = join_set.join_next().await {
+    results.push(result?);
+}
+results.sort_by_key(|(idx, _)| *idx);
+```
+
+**2. Streaming execution (for immediate forwarding)**
+
+Used by `execute_streaming` in AlchemyClient for block fetching:
+
+```rust
+let semaphore = Arc::new(Semaphore::new(rpc_concurrency));
+
+for request in requests {
+    let result_tx = result_tx.clone();
+    join_set.spawn(async move {
+        let permit = semaphore.acquire_owned().await?;
+        let result = make_request(request).await;
+        drop(permit);
+        let _ = result_tx.send(result).await;
+    });
+}
+```
+
+Results are sent immediately as they complete, enabling pipeline parallelism.
+
+## Retry and Error Handling
+
+All RPC operations use automatic retry with exponential backoff:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `max_retries` | 10 | Maximum retry attempts |
+| `initial_delay` | 500ms | Delay before first retry |
+| `max_delay` | 30s | Maximum delay between retries |
+| `backoff_multiplier` | 2.0 | Exponential backoff factor |
+
+Retryable errors include:
+- Network/connection errors
+- Rate limit responses (429)
+- Server errors (502, 503, 504)
+- Timeout errors
+
+Non-retryable errors (invalid URL, malformed requests) fail immediately.
+
+### Panic Handling
+
+Concurrent batch methods handle task panics gracefully:
+- Panics are logged and tracked
+- Method returns `Err(RpcError::ProviderError("One or more concurrent tasks panicked"))`
+- Prevents silent partial results
 
 ## See Also
 
@@ -377,4 +541,5 @@ All tasks share the same RPC client (`UnifiedRpcClient`), which manages rate lim
 - [eth_call Collection](./ETH_CALL_COLLECTION.md) - eth_call execution and storage
 - [Decoding](./DECODING.md) - ABI-based log and call decoding
 - [RPC](./RPC.md) - Rate limiting and retry configuration
+- [Transformations](./TRANSFORMATIONS.md) - Handler concurrency and batch mode
 - [Configuration](./CONFIG.md) - Full configuration reference
