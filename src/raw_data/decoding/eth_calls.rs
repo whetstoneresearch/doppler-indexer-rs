@@ -7,7 +7,7 @@ use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{I256, U256};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
-    Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, StringArray, StructArray, UInt16Array, UInt32Array,
     UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
@@ -112,6 +112,10 @@ pub(crate) enum DecodedValue {
     String(String),
     /// Named tuple of (field_name, field_value) pairs
     NamedTuple(Vec<(std::string::String, DecodedValue)>),
+    /// Unnamed tuple of values (no field names)
+    UnnamedTuple(Vec<DecodedValue>),
+    /// Array of values
+    Array(Vec<DecodedValue>),
 }
 
 /// Result of processing once calls, used to batch update column indexes after all tasks complete.
@@ -770,6 +774,16 @@ fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
                 .collect();
             DynSolType::Tuple(field_types)
         }
+        EvmType::UnnamedTuple(fields) => {
+            let field_types: Vec<DynSolType> = fields
+                .iter()
+                .map(|ty| evm_type_to_dyn_sol_type(ty))
+                .collect();
+            DynSolType::Tuple(field_types)
+        }
+        EvmType::Array(inner) => {
+            DynSolType::Array(Box::new(evm_type_to_dyn_sol_type(inner)))
+        }
     }
 }
 
@@ -813,6 +827,46 @@ fn convert_dyn_sol_value(
         } else {
             return Err(EthCallDecodingError::Decode(format!(
                 "Expected tuple value for NamedTuple type, got {:?}",
+                value
+            )));
+        }
+    }
+
+    // Handle UnnamedTuple types
+    if let EvmType::UnnamedTuple(field_types) = output_type {
+        if let DynSolValue::Tuple(values) = value {
+            if values.len() != field_types.len() {
+                return Err(EthCallDecodingError::Decode(format!(
+                    "Tuple length mismatch: expected {}, got {}",
+                    field_types.len(),
+                    values.len()
+                )));
+            }
+            let decoded: Vec<DecodedValue> = field_types
+                .iter()
+                .zip(values.iter())
+                .map(|(ty, val)| convert_dyn_sol_value(val, ty))
+                .collect::<Result<_, _>>()?;
+            return Ok(DecodedValue::UnnamedTuple(decoded));
+        } else {
+            return Err(EthCallDecodingError::Decode(format!(
+                "Expected tuple value for UnnamedTuple type, got {:?}",
+                value
+            )));
+        }
+    }
+
+    // Handle Array types
+    if let EvmType::Array(inner_type) = output_type {
+        if let DynSolValue::Array(values) = value {
+            let decoded: Vec<DecodedValue> = values
+                .iter()
+                .map(|v| convert_dyn_sol_value(v, inner_type))
+                .collect::<Result<_, _>>()?;
+            return Ok(DecodedValue::Array(decoded));
+        } else {
+            return Err(EthCallDecodingError::Decode(format!(
+                "Expected array value for Array type, got {:?}",
                 value
             )));
         }
@@ -1200,6 +1254,136 @@ fn build_event_value_array(
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "NamedTuple should use build_event_tuple_field_array".to_string(),
         )),
+        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "UnnamedTuple should use specialized handling".to_string(),
+        )),
+        EvmType::Array(inner) => {
+            build_event_array_value_array(records, inner)
+        }
+    }
+}
+
+/// Build an Arrow ListArray for array-typed decoded values in event calls
+fn build_event_array_value_array(
+    records: &[DecodedEventCallRecord],
+    inner_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::array::{ListBuilder, StringBuilder};
+    use arrow::datatypes::Fields;
+
+    // Extract array elements from each record
+    let arrays: Vec<Option<&Vec<DecodedValue>>> = records
+        .iter()
+        .map(|r| match &r.decoded_value {
+            DecodedValue::Array(arr) => Some(arr),
+            _ => None,
+        })
+        .collect();
+
+    // Build ListArray based on inner type
+    match inner_type {
+        EvmType::NamedTuple(_) | EvmType::UnnamedTuple(_) => {
+            // For tuple arrays, build a List of Structs
+            let (field_names, field_types): (Vec<String>, Vec<&EvmType>) = match inner_type {
+                EvmType::NamedTuple(fields) => {
+                    let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                    let types: Vec<&EvmType> = fields.iter().map(|(_, t)| t.as_ref()).collect();
+                    (names, types)
+                }
+                EvmType::UnnamedTuple(fields) => {
+                    let names: Vec<String> = (0..fields.len()).map(|i| i.to_string()).collect();
+                    let types: Vec<&EvmType> = fields.iter().map(|t| t.as_ref()).collect();
+                    (names, types)
+                }
+                _ => unreachable!(),
+            };
+
+            let arrow_fields: Vec<Field> = field_names
+                .iter()
+                .zip(field_types.iter())
+                .map(|(name, ty)| Field::new(name, ty.to_arrow_type(), true))
+                .collect();
+            let struct_fields: Fields = arrow_fields.clone().into();
+
+            // Build struct arrays for each element in each record's array
+            let mut all_struct_arrays: Vec<arrow::array::StructArray> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut current_offset: i32 = 0;
+
+            for arr_opt in &arrays {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        let struct_arr = build_decoded_value_struct(elem, &field_names, &field_types)?;
+                        all_struct_arrays.push(struct_arr);
+                        current_offset += 1;
+                    }
+                }
+                offsets.push(current_offset);
+            }
+
+            // Concatenate all struct arrays
+            if all_struct_arrays.is_empty() {
+                // Empty list - create struct array with 0 length
+                let empty_struct = StructArray::new_null(struct_fields.clone(), 0);
+                let list_arr = arrow::array::ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+                    Arc::new(empty_struct),
+                    None,
+                )?;
+                Ok(Arc::new(list_arr))
+            } else {
+                let struct_refs: Vec<&dyn Array> = all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
+                let concatenated = arrow::compute::concat(&struct_refs)?;
+                let list_arr = arrow::array::ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+                    concatenated,
+                    None,
+                )?;
+                Ok(Arc::new(list_arr))
+            }
+        }
+        EvmType::Address => {
+            let mut builder = ListBuilder::new(FixedSizeBinaryBuilder::new(20));
+            for arr_opt in &arrays {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        if let DecodedValue::Address(addr) = elem {
+                            builder.values().append_value(addr)?;
+                        } else {
+                            builder.values().append_value(&[0u8; 20])?;
+                        }
+                    }
+                    builder.append(true);
+                } else {
+                    builder.append(false);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for arr_opt in &arrays {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        match elem {
+                            DecodedValue::Uint256(v) => builder.values().append_value(v.to_string()),
+                            DecodedValue::Uint64(v) => builder.values().append_value(v.to_string()),
+                            _ => builder.values().append_null(),
+                        }
+                    }
+                    builder.append(true);
+                } else {
+                    builder.append(false);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(EthCallDecodingError::Decode(format!(
+            "Unsupported array inner type for event calls: {:?}",
+            inner_type
+        ))),
     }
 }
 
@@ -1340,9 +1524,535 @@ fn build_event_tuple_field_array(
             Ok(Arc::new(arr))
         }
         EvmType::Named { inner, .. } => build_event_tuple_field_array(records, field_idx, inner),
-        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
-            "Nested NamedTuple not supported".to_string(),
+        EvmType::NamedTuple(nested_fields) => {
+            // Build a StructArray for the nested tuple
+            build_event_nested_struct_array(records, field_idx, nested_fields)
+        }
+        EvmType::UnnamedTuple(nested_fields) => {
+            // Build a StructArray for the nested tuple with positional names
+            build_event_nested_unnamed_struct_array(records, field_idx, nested_fields)
+        }
+        EvmType::Array(_) => Err(EthCallDecodingError::Decode(
+            "Nested Array in tuple fields not supported".to_string(),
         )),
+    }
+}
+
+/// Build a StructArray for a nested NamedTuple field in event call records
+fn build_event_nested_struct_array(
+    records: &[DecodedEventCallRecord],
+    field_idx: usize,
+    nested_fields: &[(String, Box<EvmType>)],
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::datatypes::Fields;
+
+    // Extract the nested tuple values from each record
+    let nested_values: Vec<Option<&Vec<(String, DecodedValue)>>> = records
+        .iter()
+        .map(|r| match &r.decoded_value {
+            DecodedValue::NamedTuple(fields) => {
+                fields.get(field_idx).and_then(|(_, v)| match v {
+                    DecodedValue::NamedTuple(nested) => Some(nested),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Build arrays for each nested field
+    let mut field_arrays: Vec<ArrayRef> = Vec::new();
+    let mut arrow_fields: Vec<Field> = Vec::new();
+
+    for (nested_idx, (field_name, field_type)) in nested_fields.iter().enumerate() {
+        let arr = build_nested_field_array(&nested_values, nested_idx, field_type)?;
+        field_arrays.push(arr);
+        arrow_fields.push(Field::new(field_name, field_type.to_arrow_type(), true));
+    }
+
+    let struct_fields: Fields = arrow_fields.into();
+    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+}
+
+/// Build a StructArray for a nested UnnamedTuple field in event call records
+fn build_event_nested_unnamed_struct_array(
+    records: &[DecodedEventCallRecord],
+    field_idx: usize,
+    nested_fields: &[Box<EvmType>],
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::datatypes::Fields;
+
+    // Extract the nested tuple values from each record
+    let nested_values: Vec<Option<&Vec<DecodedValue>>> = records
+        .iter()
+        .map(|r| match &r.decoded_value {
+            DecodedValue::NamedTuple(fields) => {
+                fields.get(field_idx).and_then(|(_, v)| match v {
+                    DecodedValue::UnnamedTuple(nested) => Some(nested),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Build arrays for each nested field
+    let mut field_arrays: Vec<ArrayRef> = Vec::new();
+    let mut arrow_fields: Vec<Field> = Vec::new();
+
+    for (nested_idx, field_type) in nested_fields.iter().enumerate() {
+        let arr = build_unnamed_nested_field_array(&nested_values, nested_idx, field_type)?;
+        field_arrays.push(arr);
+        arrow_fields.push(Field::new(nested_idx.to_string(), field_type.to_arrow_type(), true));
+    }
+
+    let struct_fields: Fields = arrow_fields.into();
+    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+}
+
+/// Build an array for a specific field within nested named tuple values
+fn build_nested_field_array(
+    nested_values: &[Option<&Vec<(String, DecodedValue)>>],
+    nested_idx: usize,
+    field_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    match field_type {
+        EvmType::Address => {
+            if nested_values.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(nested_values.iter().map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Address(addr) => Some(addr.as_slice()),
+                            _ => None,
+                        })
+                        .unwrap_or(&[0u8; 20][..])
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Uint8(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 => {
+            let arr: UInt64Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Uint64(val) => Some(*val),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Uint256(val) => Some(val.to_string()),
+                            DecodedValue::Uint64(val) => Some(val.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Int8(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 => {
+            let arr: Int64Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Int64(val) => Some(*val),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Int64(val) => (*val).try_into().ok(),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Int64(val) => (*val).try_into().ok(),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Int256(val) => Some(val.to_string()),
+                            DecodedValue::Int64(val) => Some(val.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Bool(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            if nested_values.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(nested_values.iter().map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+                            _ => None,
+                        })
+                        .unwrap_or(&[0u8; 32][..])
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::String => {
+            let arr: StringArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|(_, v)| match v {
+                            DecodedValue::Bytes(b) => Some(b.as_slice()),
+                            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => build_nested_field_array(nested_values, nested_idx, inner),
+        _ => Err(EthCallDecodingError::Decode(format!(
+            "Unsupported nested field type: {:?}",
+            field_type
+        ))),
+    }
+}
+
+/// Build an array for a specific field within nested unnamed tuple values
+fn build_unnamed_nested_field_array(
+    nested_values: &[Option<&Vec<DecodedValue>>],
+    nested_idx: usize,
+    field_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    match field_type {
+        EvmType::Address => {
+            if nested_values.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(nested_values.iter().map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Address(addr) => Some(addr.as_slice()),
+                            _ => None,
+                        })
+                        .unwrap_or(&[0u8; 20][..])
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::Uint8 => {
+            let arr: UInt8Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint8(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint64 => {
+            let arr: UInt64Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint64(val) => Some(*val),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint32 | EvmType::Uint24 => {
+            let arr: UInt32Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint16 => {
+            let arr: UInt16Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint64(val) => (*val).try_into().ok(),
+                            DecodedValue::Uint256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let arr: StringArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Uint256(val) => Some(val.to_string()),
+                            DecodedValue::Uint64(val) => Some(val.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int8 => {
+            let arr: Int8Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Int8(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int64 => {
+            let arr: Int64Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Int64(val) => Some(*val),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int32 | EvmType::Int24 => {
+            let arr: Int32Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Int64(val) => (*val).try_into().ok(),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int16 => {
+            let arr: Int16Array = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Int64(val) => (*val).try_into().ok(),
+                            DecodedValue::Int256(val) => (*val).try_into().ok(),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Int256 | EvmType::Int128 => {
+            let arr: StringArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Int256(val) => Some(val.to_string()),
+                            DecodedValue::Int64(val) => Some(val.to_string()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bool => {
+            let arr: BooleanArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Bool(val) => Some(*val),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes32 => {
+            if nested_values.is_empty() {
+                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
+            } else {
+                let arr = FixedSizeBinaryArray::try_from_iter(nested_values.iter().map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+                            _ => None,
+                        })
+                        .unwrap_or(&[0u8; 32][..])
+                }))?;
+                Ok(Arc::new(arr))
+            }
+        }
+        EvmType::String => {
+            let arr: StringArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Bytes => {
+            let arr: BinaryArray = nested_values
+                .iter()
+                .map(|opt| {
+                    opt.and_then(|fields| fields.get(nested_idx))
+                        .and_then(|v| match v {
+                            DecodedValue::Bytes(b) => Some(b.as_slice()),
+                            DecodedValue::Bytes32(b) => Some(b.as_slice()),
+                            _ => None,
+                        })
+                })
+                .collect();
+            Ok(Arc::new(arr))
+        }
+        EvmType::Named { inner, .. } => build_unnamed_nested_field_array(nested_values, nested_idx, inner),
+        _ => Err(EthCallDecodingError::Decode(format!(
+            "Unsupported nested field type: {:?}",
+            field_type
+        ))),
     }
 }
 
@@ -1626,10 +2336,90 @@ fn build_tuple_field_array(
             Ok(Arc::new(arr))
         }
         EvmType::Named { inner, .. } => build_tuple_field_array(records, field_idx, inner),
-        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
-            "Nested NamedTuple not supported".to_string(),
+        EvmType::NamedTuple(nested_fields) => {
+            // Build a StructArray for the nested tuple
+            build_nested_struct_array(records, field_idx, nested_fields)
+        }
+        EvmType::UnnamedTuple(nested_fields) => {
+            // Build a StructArray for the nested tuple with positional names
+            build_nested_unnamed_struct_array(records, field_idx, nested_fields)
+        }
+        EvmType::Array(_) => Err(EthCallDecodingError::Decode(
+            "Nested Array in tuple fields not supported".to_string(),
         )),
     }
+}
+
+/// Build a StructArray for a nested NamedTuple field in regular call records
+fn build_nested_struct_array(
+    records: &[DecodedCallRecord],
+    field_idx: usize,
+    nested_fields: &[(String, Box<EvmType>)],
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::datatypes::Fields;
+
+    // Extract the nested tuple values from each record
+    let nested_values: Vec<Option<&Vec<(String, DecodedValue)>>> = records
+        .iter()
+        .map(|r| match &r.decoded_value {
+            DecodedValue::NamedTuple(fields) => {
+                fields.get(field_idx).and_then(|(_, v)| match v {
+                    DecodedValue::NamedTuple(nested) => Some(nested),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Build arrays for each nested field
+    let mut field_arrays: Vec<ArrayRef> = Vec::new();
+    let mut arrow_fields: Vec<Field> = Vec::new();
+
+    for (nested_idx, (field_name, field_type)) in nested_fields.iter().enumerate() {
+        let arr = build_nested_field_array(&nested_values, nested_idx, field_type)?;
+        field_arrays.push(arr);
+        arrow_fields.push(Field::new(field_name, field_type.to_arrow_type(), true));
+    }
+
+    let struct_fields: Fields = arrow_fields.into();
+    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+}
+
+/// Build a StructArray for a nested UnnamedTuple field in regular call records
+fn build_nested_unnamed_struct_array(
+    records: &[DecodedCallRecord],
+    field_idx: usize,
+    nested_fields: &[Box<EvmType>],
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::datatypes::Fields;
+
+    // Extract the nested tuple values from each record
+    let nested_values: Vec<Option<&Vec<DecodedValue>>> = records
+        .iter()
+        .map(|r| match &r.decoded_value {
+            DecodedValue::NamedTuple(fields) => {
+                fields.get(field_idx).and_then(|(_, v)| match v {
+                    DecodedValue::UnnamedTuple(nested) => Some(nested),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Build arrays for each nested field
+    let mut field_arrays: Vec<ArrayRef> = Vec::new();
+    let mut arrow_fields: Vec<Field> = Vec::new();
+
+    for (nested_idx, field_type) in nested_fields.iter().enumerate() {
+        let arr = build_unnamed_nested_field_array(&nested_values, nested_idx, field_type)?;
+        field_arrays.push(arr);
+        arrow_fields.push(Field::new(nested_idx.to_string(), field_type.to_arrow_type(), true));
+    }
+
+    let struct_fields: Fields = arrow_fields.into();
+    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
 }
 
 // Helper functions for extracting tuple field values
@@ -2247,6 +3037,253 @@ fn build_value_array(
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "NamedTuple should use build_named_tuple_arrays".to_string(),
         )),
+        // UnnamedTuple and Array need special handling
+        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "UnnamedTuple should use specialized handling".to_string(),
+        )),
+        EvmType::Array(inner) => {
+            build_array_value_array(records, inner)
+        }
+    }
+}
+
+/// Build an Arrow ListArray for array-typed decoded values
+fn build_array_value_array(
+    records: &[DecodedCallRecord],
+    inner_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    use arrow::array::{GenericListBuilder, ListBuilder, StructArray, StringBuilder, StructBuilder};
+    use arrow::datatypes::Fields;
+
+    // Extract array elements from each record
+    let arrays: Vec<Option<&Vec<DecodedValue>>> = records
+        .iter()
+        .map(|r| match &r.decoded_value {
+            DecodedValue::Array(arr) => Some(arr),
+            _ => None,
+        })
+        .collect();
+
+    // Build ListArray based on inner type
+    match inner_type {
+        EvmType::NamedTuple(_) | EvmType::UnnamedTuple(_) => {
+            // For tuple arrays, build a List of Structs
+            let (field_names, field_types): (Vec<String>, Vec<&EvmType>) = match inner_type {
+                EvmType::NamedTuple(fields) => {
+                    let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                    let types: Vec<&EvmType> = fields.iter().map(|(_, t)| t.as_ref()).collect();
+                    (names, types)
+                }
+                EvmType::UnnamedTuple(fields) => {
+                    let names: Vec<String> = (0..fields.len()).map(|i| i.to_string()).collect();
+                    let types: Vec<&EvmType> = fields.iter().map(|t| t.as_ref()).collect();
+                    (names, types)
+                }
+                _ => unreachable!(),
+            };
+
+            let arrow_fields: Vec<Field> = field_names
+                .iter()
+                .zip(field_types.iter())
+                .map(|(name, ty)| Field::new(name, ty.to_arrow_type(), true))
+                .collect();
+            let struct_fields: Fields = arrow_fields.clone().into();
+
+            // Build struct arrays for each element in each record's array
+            let mut all_struct_arrays: Vec<StructArray> = Vec::new();
+            let mut offsets: Vec<i32> = vec![0];
+            let mut current_offset: i32 = 0;
+
+            for arr_opt in &arrays {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        let struct_arr = build_decoded_value_struct(elem, &field_names, &field_types)?;
+                        all_struct_arrays.push(struct_arr);
+                        current_offset += 1;
+                    }
+                }
+                offsets.push(current_offset);
+            }
+
+            // Concatenate all struct arrays
+            if all_struct_arrays.is_empty() {
+                // Empty list - create struct array with 0 length
+                let empty_struct = StructArray::new_null(struct_fields.clone(), 0);
+                let list_arr = arrow::array::ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+                    Arc::new(empty_struct),
+                    None,
+                )?;
+                Ok(Arc::new(list_arr))
+            } else {
+                let struct_refs: Vec<&dyn Array> = all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
+                let concatenated = arrow::compute::concat(&struct_refs)?;
+                let list_arr = arrow::array::ListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
+                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
+                    concatenated,
+                    None,
+                )?;
+                Ok(Arc::new(list_arr))
+            }
+        }
+        EvmType::Address => {
+            let mut builder = ListBuilder::new(FixedSizeBinaryBuilder::new(20));
+            for arr_opt in &arrays {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        if let DecodedValue::Address(addr) = elem {
+                            builder.values().append_value(addr)?;
+                        } else {
+                            builder.values().append_value(&[0u8; 20])?;
+                        }
+                    }
+                    builder.append(true);
+                } else {
+                    builder.append(false);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for arr_opt in &arrays {
+                if let Some(arr) = arr_opt {
+                    for elem in arr.iter() {
+                        match elem {
+                            DecodedValue::Uint256(v) => builder.values().append_value(v.to_string()),
+                            DecodedValue::Uint64(v) => builder.values().append_value(v.to_string()),
+                            _ => builder.values().append_null(),
+                        }
+                    }
+                    builder.append(true);
+                } else {
+                    builder.append(false);
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(EthCallDecodingError::Decode(format!(
+            "Unsupported array inner type: {:?}",
+            inner_type
+        ))),
+    }
+}
+
+/// Build a StructArray from a single DecodedValue (NamedTuple or UnnamedTuple)
+fn build_decoded_value_struct(
+    value: &DecodedValue,
+    field_names: &[String],
+    field_types: &[&EvmType],
+) -> Result<StructArray, EthCallDecodingError> {
+    use arrow::datatypes::Fields;
+
+    let fields_vec: Vec<(&DecodedValue, &String, &EvmType)> = match value {
+        DecodedValue::NamedTuple(named_fields) => {
+            named_fields
+                .iter()
+                .zip(field_names.iter().zip(field_types.iter()))
+                .map(|((_, v), (n, t))| (v, n, *t))
+                .collect()
+        }
+        DecodedValue::UnnamedTuple(unnamed_fields) => {
+            unnamed_fields
+                .iter()
+                .zip(field_names.iter().zip(field_types.iter()))
+                .map(|(v, (n, t))| (v, n, *t))
+                .collect()
+        }
+        _ => {
+            return Err(EthCallDecodingError::Decode(
+                "Expected tuple value for struct building".to_string(),
+            ))
+        }
+    };
+
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+    let mut arrow_fields: Vec<Field> = Vec::new();
+
+    for (val, name, ty) in fields_vec {
+        let arr = build_single_decoded_value_array(val, ty)?;
+        arrays.push(arr);
+        arrow_fields.push(Field::new(name, ty.to_arrow_type(), true));
+    }
+
+    let struct_fields: Fields = arrow_fields.into();
+    Ok(StructArray::try_new(struct_fields, arrays, None)?)
+}
+
+/// Build an Arrow array from a single DecodedValue
+fn build_single_decoded_value_array(
+    value: &DecodedValue,
+    output_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    match (value, output_type) {
+        (DecodedValue::Address(addr), EvmType::Address) => {
+            let arr = FixedSizeBinaryArray::try_from_iter(std::iter::once(addr.as_slice()))?;
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Uint8(v), EvmType::Uint8) => {
+            let arr: UInt8Array = vec![Some(*v)].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Uint64(v), EvmType::Uint64) => {
+            let arr: UInt64Array = vec![Some(*v)].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Uint64(v), EvmType::Uint32 | EvmType::Uint24) => {
+            let arr: UInt32Array = vec![(*v).try_into().ok()].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Uint64(v), EvmType::Uint16) => {
+            let arr: UInt16Array = vec![(*v).try_into().ok()].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Uint256(v), EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80) => {
+            let arr: StringArray = vec![Some(v.to_string())].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Int8(v), EvmType::Int8) => {
+            let arr: Int8Array = vec![Some(*v)].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Int64(v), EvmType::Int64) => {
+            let arr: Int64Array = vec![Some(*v)].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Int64(v), EvmType::Int32 | EvmType::Int24) => {
+            let arr: Int32Array = vec![(*v).try_into().ok()].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Int64(v), EvmType::Int16) => {
+            let arr: Int16Array = vec![(*v).try_into().ok()].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Int256(v), EvmType::Int256 | EvmType::Int128) => {
+            let arr: StringArray = vec![Some(v.to_string())].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Bool(v), EvmType::Bool) => {
+            let arr: BooleanArray = vec![Some(*v)].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Bytes32(v), EvmType::Bytes32) => {
+            let arr = FixedSizeBinaryArray::try_from_iter(std::iter::once(v.as_slice()))?;
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::String(v), EvmType::String) => {
+            let arr: StringArray = vec![Some(v.as_str())].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        (DecodedValue::Bytes(v), EvmType::Bytes) => {
+            let arr: BinaryArray = vec![Some(v.as_slice())].into_iter().collect();
+            Ok(Arc::new(arr))
+        }
+        _ => Err(EthCallDecodingError::Decode(format!(
+            "Type mismatch: value {:?} doesn't match type {:?}",
+            value, output_type
+        ))),
     }
 }
 
@@ -2427,6 +3464,12 @@ fn build_once_value_array(
         // NamedTuple should use build_once_tuple_field_array instead
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "NamedTuple should use build_once_tuple_field_array".to_string(),
+        )),
+        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "UnnamedTuple not supported for once calls".to_string(),
+        )),
+        EvmType::Array(_) => Err(EthCallDecodingError::Decode(
+            "Array not supported for once calls".to_string(),
         )),
     }
 }
@@ -2683,6 +3726,12 @@ fn build_once_value_array_aligned(
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "NamedTuple should use build_once_tuple_field_array_aligned".to_string(),
         )),
+        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "UnnamedTuple not supported for aligned once calls".to_string(),
+        )),
+        EvmType::Array(_) => Err(EthCallDecodingError::Decode(
+            "Array not supported for aligned once calls".to_string(),
+        )),
     }
 }
 
@@ -2869,6 +3918,12 @@ fn build_once_tuple_field_array_aligned(
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "Nested NamedTuple not supported".to_string(),
         )),
+        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "Nested UnnamedTuple not supported".to_string(),
+        )),
+        EvmType::Array(_) => Err(EthCallDecodingError::Decode(
+            "Nested Array in tuple fields not supported".to_string(),
+        )),
     }
 }
 
@@ -2996,6 +4051,12 @@ fn build_once_tuple_field_array(
         }
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "Nested NamedTuple not supported".to_string(),
+        )),
+        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
+            "Nested UnnamedTuple not supported".to_string(),
+        )),
+        EvmType::Array(_) => Err(EthCallDecodingError::Decode(
+            "Nested Array in tuple fields not supported".to_string(),
         )),
     }
 }
@@ -3211,6 +4272,20 @@ fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
                 .map(|(name, val)| (name.clone(), convert_decoded_value(val)))
                 .collect();
             TransformDecodedValue::NamedTuple(converted)
+        }
+        DecodedValue::UnnamedTuple(values) => {
+            let converted: Vec<TransformDecodedValue> = values
+                .iter()
+                .map(|val| convert_decoded_value(val))
+                .collect();
+            TransformDecodedValue::UnnamedTuple(converted)
+        }
+        DecodedValue::Array(values) => {
+            let converted: Vec<TransformDecodedValue> = values
+                .iter()
+                .map(|val| convert_decoded_value(val))
+                .collect();
+            TransformDecodedValue::Array(converted)
         }
     }
 }

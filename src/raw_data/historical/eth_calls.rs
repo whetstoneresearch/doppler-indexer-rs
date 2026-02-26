@@ -499,6 +499,16 @@ pub(crate) fn extract_value_from_32_bytes(
                 "NamedTuple cannot be used as a parameter type".to_string(),
             ))
         }
+        EvmType::UnnamedTuple(_) => {
+            Err(EthCallCollectionError::EventParamExtraction(
+                "UnnamedTuple cannot be used as a parameter type".to_string(),
+            ))
+        }
+        EvmType::Array(_) => {
+            Err(EthCallCollectionError::EventParamExtraction(
+                "Array cannot be used as a parameter type".to_string(),
+            ))
+        }
     }
 }
 

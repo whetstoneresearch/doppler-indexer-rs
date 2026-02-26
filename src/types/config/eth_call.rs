@@ -1,9 +1,10 @@
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes, B256, I256, U256};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use serde::de::{self, Visitor};
 use serde::Deserialize;
 use std::fmt;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -503,6 +504,10 @@ pub enum EvmType {
     },
     /// Named tuple: "(uint160 sqrtPriceX96, int24 tick)" → columns "sqrtPriceX96", "tick"
     NamedTuple(Vec<(std::string::String, Box<EvmType>)>),
+    /// Unnamed tuple: "(address, uint96)" - no field names
+    UnnamedTuple(Vec<Box<EvmType>>),
+    /// Dynamic array: "address[]" or "(address, uint96)[]"
+    Array(Box<EvmType>),
 }
 
 impl EvmType {
@@ -536,13 +541,21 @@ impl EvmType {
     }
 
     /// Parse an output_type string into EvmType
-    /// Handles: "uint256", "int256 latestAnswer", "(uint160 sqrtPriceX96, int24 tick)"
+    /// Handles: "uint256", "int256 latestAnswer", "(uint160 sqrtPriceX96, int24 tick)",
+    /// "address[]", "(address, uint96)[]", "(address beneficiary, uint96 shares)[]"
     pub fn parse(s: &str) -> Result<EvmType, EvmTypeParseError> {
         let s = s.trim();
 
+        // Check if it's an array (ends with [])
+        if s.ends_with("[]") {
+            let inner_str = &s[..s.len() - 2];
+            let inner_type = Self::parse(inner_str)?;
+            return Ok(EvmType::Array(Box::new(inner_type)));
+        }
+
         // Check if it's a tuple
         if s.starts_with('(') && s.ends_with(')') {
-            return Self::parse_named_tuple(s);
+            return Self::parse_tuple(s);
         }
 
         // Check if it's a named single value (contains space but not a tuple)
@@ -562,8 +575,10 @@ impl EvmType {
         Self::parse_simple(s)
     }
 
-    /// Parse a named tuple like "(uint160 sqrtPriceX96, int24 tick)"
-    fn parse_named_tuple(s: &str) -> Result<EvmType, EvmTypeParseError> {
+    /// Parse a tuple - detects whether named or unnamed based on field patterns
+    /// Named: "(uint160 sqrtPriceX96, int24 tick)" - fields have "type name" pattern
+    /// Unnamed: "(address, uint96)" - fields are just types
+    fn parse_tuple(s: &str) -> Result<EvmType, EvmTypeParseError> {
         // Strip outer parentheses
         let inner = s
             .strip_prefix('(')
@@ -577,6 +592,92 @@ impl EvmType {
         // Split by comma, respecting nested parentheses
         let fields = split_tuple_fields(inner)?;
 
+        // First pass: determine if this is a named or unnamed tuple
+        // A tuple is named if ALL non-tuple fields have "type name" pattern
+        let is_named = Self::detect_named_tuple(&fields)?;
+
+        if is_named {
+            Self::parse_named_tuple_fields(&fields)
+        } else {
+            Self::parse_unnamed_tuple_fields(&fields)
+        }
+    }
+
+    /// Detect if tuple fields follow named pattern (type + name) or unnamed pattern (type only)
+    fn detect_named_tuple(fields: &[&str]) -> Result<bool, EvmTypeParseError> {
+        for field in fields {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err(EvmTypeParseError::EmptyField);
+            }
+
+            if field.starts_with('(') {
+                // Nested tuple/array - check if there's a name after the closing paren/bracket
+                let (_, remainder) = Self::find_type_end(field)?;
+                if !remainder.is_empty() {
+                    // Has a name after type
+                    return Ok(true);
+                }
+            } else {
+                // Simple type - check if there's a space indicating a name
+                if field.contains(' ') {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Find the end of a type expression (handles nested parens and array suffix)
+    /// Returns (type_str, remainder after type)
+    fn find_type_end(field: &str) -> Result<(&str, &str), EvmTypeParseError> {
+        let field = field.trim();
+        if field.starts_with('(') {
+            // Find matching closing paren
+            let mut depth = 0;
+            let mut close_idx = None;
+            for (i, c) in field.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_idx = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close_idx = close_idx.ok_or_else(|| {
+                EvmTypeParseError::InvalidTuple(format!(
+                    "unmatched parenthesis in field '{}'",
+                    field
+                ))
+            })?;
+
+            // Check for array suffix after the paren
+            let after_paren = &field[close_idx + 1..];
+            if after_paren.starts_with("[]") {
+                let type_end = close_idx + 3; // include "[]"
+                let remainder = field[type_end..].trim();
+                Ok((&field[..type_end], remainder))
+            } else {
+                let remainder = field[close_idx + 1..].trim();
+                Ok((&field[..=close_idx], remainder))
+            }
+        } else {
+            // Simple type - find space or end
+            if let Some(space_idx) = field.find(' ') {
+                Ok((&field[..space_idx], field[space_idx..].trim()))
+            } else {
+                Ok((field, ""))
+            }
+        }
+    }
+
+    /// Parse fields as a named tuple
+    fn parse_named_tuple_fields(fields: &[&str]) -> Result<EvmType, EvmTypeParseError> {
         let mut parsed_fields = Vec::new();
         for field in fields {
             let field = field.trim();
@@ -584,66 +685,34 @@ impl EvmType {
                 return Err(EvmTypeParseError::EmptyField);
             }
 
-            // Each field is "type name" — but type may be a nested tuple like
-            // "(address currency0, address currency1, uint24 fee) poolKey"
-            if field.starts_with('(') {
-                // Find the matching closing paren for the nested tuple
-                let mut depth = 0;
-                let mut close_idx = None;
-                for (i, c) in field.char_indices() {
-                    match c {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                close_idx = Some(i);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let close_idx = close_idx.ok_or_else(|| {
-                    EvmTypeParseError::InvalidTuple(format!(
-                        "unmatched parenthesis in field '{}'",
-                        field
-                    ))
-                })?;
-                let tuple_str = &field[..=close_idx];
-                let name = field[close_idx + 1..].trim();
-                if name.is_empty() {
-                    return Err(EvmTypeParseError::InvalidTuple(format!(
-                        "nested tuple field '{}' must have a name",
-                        field
-                    )));
-                }
-                let field_type = Self::parse_named_tuple(tuple_str)?;
-                parsed_fields.push((name.to_string(), Box::new(field_type)));
-            } else {
-                let parts: Vec<&str> = field.splitn(2, ' ').collect();
-                if parts.len() != 2 {
-                    return Err(EvmTypeParseError::InvalidTuple(format!(
-                        "field '{}' must have type and name",
-                        field
-                    )));
-                }
-
-                let type_str = parts[0].trim();
-                let name = parts[1].trim();
-
-                if name.is_empty() {
-                    return Err(EvmTypeParseError::InvalidTuple(format!(
-                        "field '{}' has empty name",
-                        field
-                    )));
-                }
-
-                let field_type = Self::parse_simple(type_str)?;
-                parsed_fields.push((name.to_string(), Box::new(field_type)));
+            let (type_str, name) = Self::find_type_end(field)?;
+            if name.is_empty() {
+                return Err(EvmTypeParseError::InvalidTuple(format!(
+                    "field '{}' must have a name in named tuple",
+                    field
+                )));
             }
-        }
 
+            let field_type = Self::parse(type_str)?;
+            parsed_fields.push((name.to_string(), Box::new(field_type)));
+        }
         Ok(EvmType::NamedTuple(parsed_fields))
+    }
+
+    /// Parse fields as an unnamed tuple
+    fn parse_unnamed_tuple_fields(fields: &[&str]) -> Result<EvmType, EvmTypeParseError> {
+        let mut parsed_fields = Vec::new();
+        for field in fields {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err(EvmTypeParseError::EmptyField);
+            }
+
+            // Field should be just a type
+            let field_type = Self::parse(field)?;
+            parsed_fields.push(Box::new(field_type));
+        }
+        Ok(EvmType::UnnamedTuple(parsed_fields))
     }
 
     /// Get the column name for named single values
@@ -678,6 +747,24 @@ impl EvmType {
     /// Check if this is a named single value
     pub fn is_named(&self) -> bool {
         matches!(self, EvmType::Named { .. })
+    }
+
+    /// Check if this is an unnamed tuple
+    pub fn is_unnamed_tuple(&self) -> bool {
+        matches!(self, EvmType::UnnamedTuple(_))
+    }
+
+    /// Check if this is an array
+    pub fn is_array(&self) -> bool {
+        matches!(self, EvmType::Array(_))
+    }
+
+    /// Get the element type for arrays
+    pub fn array_element_type(&self) -> Option<&EvmType> {
+        match self {
+            EvmType::Array(inner) => Some(inner),
+            _ => None,
+        }
     }
 }
 
@@ -859,6 +946,16 @@ impl EvmType {
                 expected: "simple type".to_string(),
                 got: "named tuple".to_string(),
             }),
+            // UnnamedTuple doesn't support parsing from ParamValue
+            EvmType::UnnamedTuple(_) => Err(ParamError::TypeMismatch {
+                expected: "simple type".to_string(),
+                got: "unnamed tuple".to_string(),
+            }),
+            // Array doesn't support parsing from ParamValue
+            EvmType::Array(_) => Err(ParamError::TypeMismatch {
+                expected: "simple type".to_string(),
+                got: "array".to_string(),
+            }),
         }
     }
 
@@ -884,8 +981,27 @@ impl EvmType {
             EvmType::String => DataType::Utf8,
             // Named types delegate to their inner type
             EvmType::Named { inner, .. } => inner.to_arrow_type(),
-            // NamedTuple - should use field_arrow_types() instead
-            EvmType::NamedTuple(_) => DataType::Utf8, // Fallback, shouldn't be used directly
+            // NamedTuple - struct with named fields
+            EvmType::NamedTuple(fields) => {
+                let struct_fields: Vec<Field> = fields
+                    .iter()
+                    .map(|(name, ty)| Field::new(name, ty.to_arrow_type(), true))
+                    .collect();
+                DataType::Struct(struct_fields.into())
+            }
+            // UnnamedTuple - struct with positional field names: "0", "1", etc.
+            EvmType::UnnamedTuple(fields) => {
+                let struct_fields: Vec<Field> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| Field::new(i.to_string(), ty.to_arrow_type(), true))
+                    .collect();
+                DataType::Struct(struct_fields.into())
+            }
+            // Array - list of elements
+            EvmType::Array(inner) => {
+                DataType::List(Arc::new(Field::new("item", inner.to_arrow_type(), true)))
+            }
         }
     }
 
@@ -1466,5 +1582,139 @@ mod tests {
         assert_eq!(*param.param_type(), EvmType::Address);
         assert_eq!(param.from_event(), Some("address"));
         assert!(!param.is_self_address());
+    }
+
+    // Array type parsing tests
+
+    #[test]
+    fn test_parse_simple_array() {
+        let parsed = EvmType::parse("address[]").unwrap();
+        assert!(matches!(parsed, EvmType::Array(_)));
+        if let EvmType::Array(inner) = parsed {
+            assert_eq!(*inner, EvmType::Address);
+        }
+    }
+
+    #[test]
+    fn test_parse_uint256_array() {
+        let parsed = EvmType::parse("uint256[]").unwrap();
+        assert!(matches!(parsed, EvmType::Array(_)));
+        if let EvmType::Array(inner) = parsed {
+            assert_eq!(*inner, EvmType::Uint256);
+        }
+    }
+
+    #[test]
+    fn test_parse_unnamed_tuple() {
+        let parsed = EvmType::parse("(address, uint96)").unwrap();
+        assert!(matches!(parsed, EvmType::UnnamedTuple(_)));
+        if let EvmType::UnnamedTuple(fields) = parsed {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(*fields[0], EvmType::Address);
+            assert_eq!(*fields[1], EvmType::Uint96);
+        }
+    }
+
+    #[test]
+    fn test_parse_array_of_unnamed_tuple() {
+        let parsed = EvmType::parse("(address, uint96)[]").unwrap();
+        assert!(matches!(parsed, EvmType::Array(_)));
+        if let EvmType::Array(inner) = &parsed {
+            assert!(matches!(inner.as_ref(), EvmType::UnnamedTuple(_)));
+            if let EvmType::UnnamedTuple(fields) = inner.as_ref() {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(*fields[0], EvmType::Address);
+                assert_eq!(*fields[1], EvmType::Uint96);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_array_of_named_tuple() {
+        let parsed = EvmType::parse("(address beneficiary, uint96 shares)[]").unwrap();
+        assert!(matches!(parsed, EvmType::Array(_)));
+        if let EvmType::Array(inner) = &parsed {
+            assert!(matches!(inner.as_ref(), EvmType::NamedTuple(_)));
+            if let EvmType::NamedTuple(fields) = inner.as_ref() {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "beneficiary");
+                assert_eq!(*fields[0].1, EvmType::Address);
+                assert_eq!(fields[1].0, "shares");
+                assert_eq!(*fields[1].1, EvmType::Uint96);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_named_tuple_with_array_field() {
+        let parsed = EvmType::parse("((address, uint96)[] beneficiaryData)").unwrap();
+        assert!(matches!(parsed, EvmType::NamedTuple(_)));
+        if let EvmType::NamedTuple(fields) = parsed {
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].0, "beneficiaryData");
+            assert!(matches!(fields[0].1.as_ref(), EvmType::Array(_)));
+        }
+    }
+
+    #[test]
+    fn test_parse_named_tuple_unchanged() {
+        // Verify existing named tuple parsing still works
+        let parsed = EvmType::parse("(uint160 sqrtPriceX96, int24 tick)").unwrap();
+        assert!(matches!(parsed, EvmType::NamedTuple(_)));
+        if let EvmType::NamedTuple(fields) = parsed {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "sqrtPriceX96");
+            assert_eq!(*fields[0].1, EvmType::Uint160);
+            assert_eq!(fields[1].0, "tick");
+            assert_eq!(*fields[1].1, EvmType::Int24);
+        }
+    }
+
+    #[test]
+    fn test_evm_type_is_array() {
+        let arr = EvmType::parse("address[]").unwrap();
+        assert!(arr.is_array());
+        assert!(!arr.is_unnamed_tuple());
+        assert!(!arr.is_named_tuple());
+    }
+
+    #[test]
+    fn test_evm_type_is_unnamed_tuple() {
+        let tuple = EvmType::parse("(address, uint96)").unwrap();
+        assert!(tuple.is_unnamed_tuple());
+        assert!(!tuple.is_array());
+        assert!(!tuple.is_named_tuple());
+    }
+
+    #[test]
+    fn test_array_element_type() {
+        let arr = EvmType::parse("address[]").unwrap();
+        let elem = arr.array_element_type().unwrap();
+        assert_eq!(*elem, EvmType::Address);
+    }
+
+    #[test]
+    fn test_parse_nested_named_tuple() {
+        // Like getState output: (address numeraire, uint8 status, (address currency0, ...) poolKey, int24 farTick)
+        let parsed = EvmType::parse("(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee) poolKey, int24 farTick)").unwrap();
+        assert!(matches!(parsed, EvmType::NamedTuple(_)));
+        if let EvmType::NamedTuple(fields) = &parsed {
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0].0, "numeraire");
+            assert_eq!(*fields[0].1, EvmType::Address);
+            assert_eq!(fields[1].0, "status");
+            assert_eq!(*fields[1].1, EvmType::Uint8);
+            assert_eq!(fields[2].0, "poolKey");
+            // poolKey should be a nested NamedTuple
+            assert!(matches!(fields[2].1.as_ref(), EvmType::NamedTuple(_)));
+            if let EvmType::NamedTuple(pool_fields) = fields[2].1.as_ref() {
+                assert_eq!(pool_fields.len(), 3);
+                assert_eq!(pool_fields[0].0, "currency0");
+                assert_eq!(pool_fields[1].0, "currency1");
+                assert_eq!(pool_fields[2].0, "fee");
+            }
+            assert_eq!(fields[3].0, "farTick");
+            assert_eq!(*fields[3].1, EvmType::Int24);
+        }
     }
 }
