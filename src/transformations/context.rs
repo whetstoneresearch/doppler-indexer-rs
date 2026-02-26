@@ -35,6 +35,8 @@ pub enum DecodedValue {
     String(String),
     /// Named tuple of (field_name, field_value) pairs
     NamedTuple(Vec<(String, DecodedValue)>),
+    /// Unnamed tuple of values (no field names)
+    UnnamedTuple(Vec<DecodedValue>),
     /// Array of values
     Array(Vec<DecodedValue>),
 }
