@@ -167,6 +167,21 @@ pub async fn catchup_decode_eth_calls(
                                 let file_name =
                                     file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
+                                // Parse range from filename first (needed for start_block check)
+                                let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
+                                let parts: Vec<&str> = range_str.split('-').collect();
+                                if parts.len() != 2 {
+                                    continue;
+                                }
+                                let range_start: u64 = match parts[0].parse() {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                                let range_end: u64 = match parts[1].parse::<u64>() {
+                                    Ok(v) => v + 1,
+                                    Err(_) => continue,
+                                };
+
                                 // Get raw columns from index (source of truth for what's been collected)
                                 let raw_cols: HashSet<String> = raw_index
                                     .and_then(|idx| idx.get(file_name))
@@ -183,6 +198,12 @@ pub async fn catchup_decode_eth_calls(
                                 let missing_configs: Vec<CallDecodeConfig> = configs
                                     .iter()
                                     .filter(|c| {
+                                        // Skip configs that can't have data in this range
+                                        if let Some(start) = c.start_block {
+                                            if start >= range_end {
+                                                return false;
+                                            }
+                                        }
                                         raw_cols.contains(&c.function_name)
                                             && !decoded_cols.contains(&c.function_name)
                                     })
@@ -202,21 +223,6 @@ pub async fn catchup_decode_eth_calls(
                                         .map(|c| &c.function_name)
                                         .collect::<Vec<_>>()
                                 );
-
-                                // Parse range from filename
-                                let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
-                                let parts: Vec<&str> = range_str.split('-').collect();
-                                if parts.len() != 2 {
-                                    continue;
-                                }
-                                let range_start: u64 = match parts[0].parse() {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
-                                };
-                                let range_end: u64 = match parts[1].parse::<u64>() {
-                                    Ok(v) => v + 1,
-                                    Err(_) => continue,
-                                };
 
                                 work_items.push(CatchupWorkItem::Once {
                                     file_path,
@@ -274,6 +280,13 @@ pub async fn catchup_decode_eth_calls(
                                     Err(_) => continue,
                                 };
 
+                                // Skip if config's start_block is beyond this range
+                                if let Some(start) = config.start_block {
+                                    if start >= range_end {
+                                        continue;
+                                    }
+                                }
+
                                 work_items.push(CatchupWorkItem::Regular {
                                     file_path,
                                     range_start,
@@ -327,6 +340,13 @@ pub async fn catchup_decode_eth_calls(
                                             Ok(v) => v + 1,
                                             Err(_) => continue,
                                         };
+
+                                        // Skip if config's start_block is beyond this range
+                                        if let Some(start) = event_config.start_block {
+                                            if start >= range_end {
+                                                continue;
+                                            }
+                                        }
 
                                         work_items.push(CatchupWorkItem::EventTriggered {
                                             file_path,

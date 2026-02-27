@@ -244,6 +244,13 @@ fn get_missing_matchers(
     let missing_regular: Vec<EventMatcher> = regular_matchers
         .iter()
         .filter(|matcher| {
+            // Skip matchers that can't have events in this range
+            if let Some(start) = matcher.start_block {
+                if start >= range_end {
+                    return false;
+                }
+            }
+            // Check if output file is missing
             let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
             !existing.contains(&rel_path)
         })
@@ -256,6 +263,13 @@ fn get_missing_matchers(
             let missing: Vec<EventMatcher> = matchers
                 .iter()
                 .filter(|matcher| {
+                    // Skip matchers that can't have events in this range
+                    if let Some(start) = matcher.start_block {
+                        if start >= range_end {
+                            return false;
+                        }
+                    }
+                    // Check if output file is missing
                     let rel_path =
                         format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
                     !existing.contains(&rel_path)
