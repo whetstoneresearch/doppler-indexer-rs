@@ -14,7 +14,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
-use crate::raw_data::decoding::DecoderMessage;
+use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::LogField;

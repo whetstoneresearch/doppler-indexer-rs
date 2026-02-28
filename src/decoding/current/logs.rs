@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
-use crate::raw_data::decoding::types::DecoderMessage;
+use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
+use crate::decoding::types::DecoderMessage;
 use crate::transformations::{DecodedEventsMessage, RangeCompleteMessage};
 
 /// Live phase: Process new log data as it arrives via channel.

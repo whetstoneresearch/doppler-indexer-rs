@@ -11,7 +11,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::raw_data::decoding::logs::{
+use crate::decoding::logs::{
     process_logs, EventMatcher, LogDecodingError,
 };
 use crate::raw_data::historical::factories::RecollectRequest;

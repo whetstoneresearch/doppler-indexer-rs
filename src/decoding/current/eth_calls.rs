@@ -5,15 +5,15 @@ use std::path::Path;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::decoding::catchup::eth_calls::{
+use crate::decoding::catchup::eth_calls::{
     load_or_build_decoded_column_index, read_once_calls_from_parquet,
     read_raw_parquet_function_names,
 };
-use crate::raw_data::decoding::eth_calls::{
+use crate::decoding::eth_calls::{
     CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig, process_event_calls,
     process_once_calls, process_regular_calls,
 };
-use crate::raw_data::decoding::types::DecoderMessage;
+use crate::decoding::types::DecoderMessage;
 use crate::transformations::DecodedCallsMessage;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 

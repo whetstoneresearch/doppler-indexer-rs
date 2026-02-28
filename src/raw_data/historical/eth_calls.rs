@@ -17,7 +17,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
-use crate::raw_data::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult, EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult};
+use crate::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult, EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::{EventTriggerData, LogData};
 use crate::rpc::{RpcError, UnifiedRpcClient};

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::decoding::DecoderMessage;
+use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::{
     process_event_triggers, process_event_triggers_multicall, process_factory_once_calls,
     process_factory_once_calls_multicall, process_factory_range, process_factory_range_multicall,

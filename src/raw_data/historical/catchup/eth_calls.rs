@@ -5,7 +5,7 @@ use alloy::primitives::Address;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
-use crate::raw_data::decoding::DecoderMessage;
+use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,

@@ -13,11 +13,11 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::raw_data::decoding::eth_calls::{
+use crate::decoding::eth_calls::{
     CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig, process_event_calls,
     process_once_calls, process_regular_calls,
 };
-use crate::raw_data::decoding::types::{EthCallResult, EventCallResult, OnceCallResult};
+use crate::decoding::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::DecodedCallsMessage;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 

@@ -3,6 +3,7 @@ mod bench;
 mod db;
 mod raw_data;
 mod rpc;
+mod decoding;
 mod transformations;
 mod types;
 
@@ -16,7 +17,7 @@ use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
-use raw_data::decoding::{decode_eth_calls, decode_logs, DecoderMessage};
+use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use raw_data::historical::catchup::blocks::collect_blocks;
 use raw_data::historical::factories::{FactoryMessage, RecollectRequest};
 use raw_data::historical::receipts::{

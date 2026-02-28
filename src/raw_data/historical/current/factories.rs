@@ -5,7 +5,7 @@ use std::sync::Arc;
 use alloy::primitives::Address;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::decoding::DecoderMessage;
+use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::{
     process_range, FactoryAddressData, FactoryCollectionError, FactoryMatcher, FactoryMessage,
 };
