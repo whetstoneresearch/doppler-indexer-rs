@@ -207,7 +207,7 @@ impl LiveCollector {
                     .map(|log| LogData {
                         block_number,
                         block_timestamp: updated_block.timestamp,
-                        transaction_hash: B256::ZERO, // TODO: Get from receipt
+                        transaction_hash: B256::from(log.transaction_hash),
                         log_index: log.log_index,
                         address: log.address,
                         topics: log.topics.clone(),
@@ -375,6 +375,7 @@ impl LiveCollector {
                             data: log.data().data.to_vec(),
                             log_index: log_idx as u32,
                             transaction_index: idx as u32,
+                            transaction_hash: receipt.transaction_hash.0,
                         })
                         .collect(),
                 };

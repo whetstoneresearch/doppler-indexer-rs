@@ -712,4 +712,49 @@ mod tests {
         storage.delete_all(999).unwrap();
         assert!(!storage.block_exists(999));
     }
+
+    #[test]
+    fn test_logs_with_transaction_hash() {
+        let (storage, _tmp) = test_storage();
+
+        // Create a block first (required for logs)
+        let block = LiveBlock {
+            number: 1000,
+            hash: [1u8; 32],
+            parent_hash: [0u8; 32],
+            timestamp: 1234567890,
+            tx_hashes: vec![[5u8; 32]],
+        };
+        storage.write_block(&block).unwrap();
+
+        // Create logs with transaction_hash field
+        let logs = vec![
+            LiveLog {
+                address: [0xAAu8; 20],
+                topics: vec![[0xBBu8; 32]],
+                data: vec![1, 2, 3, 4],
+                log_index: 0,
+                transaction_index: 0,
+                transaction_hash: [0xCCu8; 32],
+            },
+            LiveLog {
+                address: [0xDDu8; 20],
+                topics: vec![[0xEEu8; 32], [0xFFu8; 32]],
+                data: vec![5, 6, 7],
+                log_index: 1,
+                transaction_index: 0,
+                transaction_hash: [0xCCu8; 32],
+            },
+        ];
+
+        storage.write_logs(1000, &logs).unwrap();
+        let read_logs = storage.read_logs(1000).unwrap();
+
+        assert_eq!(read_logs.len(), 2);
+        // Verify transaction_hash is correctly serialized and deserialized
+        assert_eq!(read_logs[0].transaction_hash, [0xCCu8; 32]);
+        assert_eq!(read_logs[1].transaction_hash, [0xCCu8; 32]);
+        assert_eq!(read_logs[0].address, [0xAAu8; 20]);
+        assert_eq!(read_logs[1].topics.len(), 2);
+    }
 }
