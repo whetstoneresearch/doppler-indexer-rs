@@ -136,6 +136,7 @@ pub(crate) async fn process_completed_range(
             range_start,
             range_end,
             logs: logs.clone(),
+            live_mode: false, // Historical mode: write to parquet
         }).await;
     }
 
