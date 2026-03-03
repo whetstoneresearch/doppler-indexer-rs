@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
+use crate::live::{LiveDecodedLog, LiveDecodedValue, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::{
@@ -169,6 +170,7 @@ pub async fn decode_logs(
         &regular_matchers,
         &factory_matchers,
         &output_base,
+        &chain.name,
         transform_tx.as_ref(),
         complete_tx.as_ref(),
     )
@@ -1001,4 +1003,278 @@ fn convert_to_transform_event(
         event_signature: parsed_event.signature.clone(),
         params,
     }
+}
+
+// =========================================================================
+// Live mode support
+// =========================================================================
+
+/// Convert DecodedValue to LiveDecodedValue for bincode storage.
+fn convert_to_live_decoded_value(value: &DecodedValue) -> LiveDecodedValue {
+    match value {
+        DecodedValue::Address(a) => LiveDecodedValue::Address(*a),
+        DecodedValue::Uint256(v) => LiveDecodedValue::Uint256(v.to_string()),
+        DecodedValue::Int256(v) => LiveDecodedValue::Int256(v.to_string()),
+        DecodedValue::Uint64(v) => LiveDecodedValue::Uint64(*v),
+        DecodedValue::Int64(v) => LiveDecodedValue::Int64(*v),
+        DecodedValue::Uint8(v) => LiveDecodedValue::Uint8(*v),
+        DecodedValue::Int8(v) => LiveDecodedValue::Int8(*v),
+        DecodedValue::Bool(v) => LiveDecodedValue::Bool(*v),
+        DecodedValue::Bytes32(b) => LiveDecodedValue::Bytes32(*b),
+        DecodedValue::Bytes(b) => LiveDecodedValue::Bytes(b.clone()),
+        DecodedValue::String(s) => LiveDecodedValue::String(s.clone()),
+        DecodedValue::NamedTuple(fields) => {
+            let converted: Vec<(String, LiveDecodedValue)> = fields
+                .iter()
+                .map(|(name, val)| (name.clone(), convert_to_live_decoded_value(val)))
+                .collect();
+            LiveDecodedValue::NamedTuple(converted)
+        }
+    }
+}
+
+/// Convert DecodedLogRecord to LiveDecodedLog for bincode storage.
+fn convert_to_live_decoded_log(record: &DecodedLogRecord) -> LiveDecodedLog {
+    LiveDecodedLog {
+        block_number: record.block_number,
+        block_timestamp: record.block_timestamp,
+        transaction_hash: record.transaction_hash,
+        log_index: record.log_index,
+        contract_address: record.contract_address,
+        decoded_values: record
+            .decoded_values
+            .iter()
+            .map(convert_to_live_decoded_value)
+            .collect(),
+    }
+}
+
+/// Process logs in live mode - writes to bincode storage.
+pub(crate) async fn process_logs_live(
+    logs: &[LogData],
+    block_number: u64,
+    regular_matchers: &[EventMatcher],
+    factory_matchers: &HashMap<String, Vec<EventMatcher>>,
+    factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
+    storage: &LiveStorage,
+    transform_tx: Option<&Sender<DecodedEventsMessage>>,
+    complete_tx: Option<&Sender<RangeCompleteMessage>>,
+) -> Result<(), LogDecodingError> {
+    // Group decoded logs by (contract_name, event_name)
+    let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
+        HashMap::new();
+
+    for log in logs {
+        // Skip if no topic0
+        if log.topics.is_empty() {
+            continue;
+        }
+        let topic0 = log.topics[0];
+
+        // Try regular matchers
+        for matcher in regular_matchers {
+            // Skip if block is before contract's start_block
+            if let Some(sb) = matcher.start_block {
+                if log.block_number < sb {
+                    continue;
+                }
+            }
+            if !matcher.addresses.contains(&log.address) {
+                continue;
+            }
+            if topic0 != matcher.event.topic0 {
+                continue;
+            }
+
+            if let Some(decoded) = decode_log(log, &matcher.event)? {
+                let key = (matcher.name.clone(), matcher.event_name.clone());
+                decoded_by_event
+                    .entry(key)
+                    .or_insert_with(|| (Vec::new(), &matcher.event))
+                    .0
+                    .push(decoded);
+            }
+        }
+
+        // Try factory matchers
+        for (collection_name, matchers) in factory_matchers {
+            let addrs = match factory_addresses.get(collection_name) {
+                Some(addrs) => addrs,
+                None => continue,
+            };
+
+            if !addrs.contains(&log.address) {
+                continue;
+            }
+
+            for matcher in matchers {
+                if topic0 != matcher.event.topic0 {
+                    continue;
+                }
+
+                if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    let key = (collection_name.clone(), matcher.event_name.clone());
+                    decoded_by_event
+                        .entry(key)
+                        .or_insert_with(|| (Vec::new(), &matcher.event))
+                        .0
+                        .push(decoded);
+                }
+            }
+        }
+    }
+
+    let total_decoded: usize = decoded_by_event.values().map(|(v, _)| v.len()).sum();
+    tracing::debug!(
+        "Live log decoding block {}: {} logs in file, {} decoded events across {} event types",
+        block_number,
+        logs.len(),
+        total_decoded,
+        decoded_by_event.len()
+    );
+
+    // Write decoded data to bincode files
+    for ((contract_name, event_name), (records, _parsed_event)) in &decoded_by_event {
+        let live_records: Vec<LiveDecodedLog> =
+            records.iter().map(convert_to_live_decoded_log).collect();
+
+        storage
+            .write_decoded_logs(block_number, contract_name, event_name, &live_records)
+            .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
+
+        tracing::debug!(
+            "Wrote {} decoded {} events to live storage for block {}",
+            live_records.len(),
+            event_name,
+            block_number
+        );
+    }
+
+    // Send to transformation channel if enabled
+    if let Some(tx) = transform_tx {
+        let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
+            HashMap::new();
+
+        for log in logs {
+            if log.topics.is_empty() {
+                continue;
+            }
+            let topic0 = log.topics[0];
+
+            // Try regular matchers
+            for matcher in regular_matchers {
+                if let Some(sb) = matcher.start_block {
+                    if log.block_number < sb {
+                        continue;
+                    }
+                }
+                if !matcher.addresses.contains(&log.address) {
+                    continue;
+                }
+                if topic0 != matcher.event.topic0 {
+                    continue;
+                }
+
+                if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    let transform_event = convert_to_transform_event(
+                        &decoded,
+                        &matcher.event,
+                        &matcher.name,
+                        &matcher.event_name,
+                    );
+                    let key = (matcher.name.clone(), matcher.event_name.clone());
+                    transform_events_by_type
+                        .entry(key)
+                        .or_default()
+                        .push(transform_event);
+                }
+            }
+
+            // Try factory matchers
+            for (collection_name, matchers) in factory_matchers {
+                let addrs = match factory_addresses.get(collection_name) {
+                    Some(addrs) => addrs,
+                    None => continue,
+                };
+
+                if !addrs.contains(&log.address) {
+                    continue;
+                }
+
+                for matcher in matchers {
+                    if topic0 != matcher.event.topic0 {
+                        continue;
+                    }
+
+                    if let Some(decoded) = decode_log(log, &matcher.event)? {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            collection_name,
+                            &matcher.event_name,
+                        );
+                        let key = (collection_name.clone(), matcher.event_name.clone());
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
+                    }
+                }
+            }
+        }
+
+        // Send each event type as a message
+        for ((source_name, event_name), events) in transform_events_by_type {
+            if events.is_empty() {
+                continue;
+            }
+            let msg = DecodedEventsMessage {
+                range_start: block_number,
+                range_end: block_number + 1,
+                source_name,
+                event_name,
+                events,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(
+                    "Failed to send decoded events to transformation channel: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Update block status to mark decoding complete
+    if let Ok(mut status) = storage.read_status(block_number) {
+        status.decoded = true;
+        if let Err(e) = storage.write_status(block_number, &status) {
+            tracing::warn!("Failed to update block status after decoding: {}", e);
+        }
+    }
+
+    // Signal that all events for this block have been sent
+    if let Some(tx) = complete_tx {
+        let msg = RangeCompleteMessage {
+            range_start: block_number,
+            range_end: block_number + 1,
+        };
+        if let Err(e) = tx.send(msg).await {
+            tracing::warn!("Failed to send range complete: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete decoded log data for orphaned blocks (reorg cleanup).
+pub(crate) fn delete_decoded_logs_for_blocks(
+    storage: &LiveStorage,
+    blocks: &[u64],
+) -> Result<(), LogDecodingError> {
+    for &block_number in blocks {
+        storage
+            .delete_all_decoded_logs(block_number)
+            .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
+    }
+    Ok(())
 }

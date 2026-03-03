@@ -14,6 +14,7 @@ use crate::decoding::eth_calls::{
     process_once_calls, process_regular_calls,
 };
 use crate::decoding::types::DecoderMessage;
+use crate::live::LiveStorage;
 use crate::transformations::DecodedCallsMessage;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -25,12 +26,16 @@ pub async fn decode_eth_calls_live(
     mut decoder_rx: Receiver<DecoderMessage>,
     raw_calls_dir: &Path,
     output_base: &Path,
+    chain_name: &str,
     regular_configs: &[CallDecodeConfig],
     once_configs: &[CallDecodeConfig],
     event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
+    // Live storage for live_mode=true messages
+    let live_storage = LiveStorage::new(chain_name);
+
     loop {
         match decoder_rx.recv().await {
             Some(DecoderMessage::EthCallsReady {
@@ -39,6 +44,7 @@ pub async fn decode_eth_calls_live(
                 contract_name,
                 function_name,
                 results,
+                live_mode,
             }) => {
                 // Find the decode config for this call
                 let config = regular_configs
@@ -46,6 +52,13 @@ pub async fn decode_eth_calls_live(
                     .find(|c| c.contract_name == contract_name && c.function_name == function_name);
 
                 if let Some(config) = config {
+                    if live_mode {
+                        // TODO: Implement live mode for eth_calls (write to bincode)
+                        // For now, just process to parquet and log a warning
+                        tracing::debug!(
+                            "Live mode eth_calls decoding not yet fully implemented, writing to parquet"
+                        );
+                    }
                     process_regular_calls(
                         &results,
                         range_start,
@@ -62,6 +75,7 @@ pub async fn decode_eth_calls_live(
                 range_end,
                 contract_name,
                 results,
+                live_mode,
             }) => {
                 // Find the once configs for this contract
                 let configs: Vec<&CallDecodeConfig> = once_configs
@@ -70,6 +84,12 @@ pub async fn decode_eth_calls_live(
                     .collect();
 
                 if !configs.is_empty() {
+                    if live_mode {
+                        // TODO: Implement live mode for once calls (write to bincode)
+                        tracing::debug!(
+                            "Live mode once_calls decoding not yet fully implemented, writing to parquet"
+                        );
+                    }
                     process_once_calls(
                         &results,
                         range_start,
@@ -78,7 +98,7 @@ pub async fn decode_eth_calls_live(
                         &configs,
                         output_base,
                         transform_tx,
-                        false, // Live mode: update index directly (no concurrent tasks)
+                        false, // Update index directly (no concurrent tasks)
                     )
                     .await?;
                 }
@@ -89,12 +109,19 @@ pub async fn decode_eth_calls_live(
                 contract_name,
                 function_name,
                 results,
+                live_mode,
             }) => {
                 // Find the decode config for this event-triggered call
                 if let Some(config) = event_configs
                     .iter()
                     .find(|c| c.contract_name == contract_name && c.function_name == function_name)
                 {
+                    if live_mode {
+                        // TODO: Implement live mode for event calls (write to bincode)
+                        tracing::debug!(
+                            "Live mode event_calls decoding not yet fully implemented, writing to parquet"
+                        );
+                    }
                     process_event_calls(
                         &results,
                         range_start,
@@ -104,6 +131,16 @@ pub async fn decode_eth_calls_live(
                         transform_tx,
                     )
                     .await?;
+                }
+            }
+            Some(DecoderMessage::Reorg { orphaned, .. }) => {
+                // Delete decoded data for orphaned blocks
+                tracing::info!(
+                    "Handling reorg in eth_calls decoder, deleting {} orphaned blocks",
+                    orphaned.len()
+                );
+                for block_number in orphaned {
+                    let _ = live_storage.delete_all_decoded_calls(block_number);
                 }
             }
             Some(DecoderMessage::OnceFileBackfilled {
