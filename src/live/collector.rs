@@ -15,6 +15,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
 use super::storage::{LiveStorage, StorageError};
 use super::types::{LiveBlock, LiveBlockStatus, LiveLog, LiveMessage, LiveModeConfig, LiveReceipt};
@@ -45,6 +46,10 @@ pub struct LiveCollector {
     config: LiveModeConfig,
     /// Buffer for blocks that arrive faster than we can process.
     buffer: VecDeque<LiveBlock>,
+    /// Progress tracker for coordination with compaction service.
+    progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    /// Expected starting block from historical processing or previous live session.
+    expected_start_block: Option<u64>,
 }
 
 impl LiveCollector {
@@ -53,9 +58,45 @@ impl LiveCollector {
         chain: Arc<ChainConfig>,
         http_client: Arc<UnifiedRpcClient>,
         config: LiveModeConfig,
+        progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain.name);
-        let reorg_detector = ReorgDetector::new(config.reorg_depth);
+        let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
+
+        // Get expected start block from storage (max block + 1)
+        let expected_start_block = match storage.max_block_number() {
+            Ok(Some(max)) => {
+                tracing::info!(
+                    "Live storage has blocks up to {}, expecting next block to be {}",
+                    max,
+                    max + 1
+                );
+                Some(max)
+            }
+            Ok(None) => {
+                tracing::info!("Live storage is empty, no gap detection on first block");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to query max block number: {}", e);
+                None
+            }
+        };
+
+        // Seed reorg detector from existing storage on restart
+        match storage.get_recent_blocks_for_reorg(config.reorg_depth) {
+            Ok(recent) if !recent.is_empty() => {
+                tracing::info!(
+                    "Seeding reorg detector with {} blocks from storage",
+                    recent.len()
+                );
+                reorg_detector.seed(recent);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to seed reorg detector from storage: {}", e);
+            }
+            _ => {}
+        }
 
         Self {
             chain,
@@ -64,6 +105,8 @@ impl LiveCollector {
             reorg_detector,
             config,
             buffer: VecDeque::new(),
+            progress_tracker,
+            expected_start_block,
         }
     }
 

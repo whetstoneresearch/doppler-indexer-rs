@@ -975,7 +975,12 @@ async fn spawn_live_mode(
     });
 
     // Start live collector
-    let collector = LiveCollector::new(chain.clone(), http_client.clone(), live_config.clone());
+    let collector = LiveCollector::new(
+        chain.clone(),
+        http_client.clone(),
+        live_config.clone(),
+        Some(progress_tracker.clone()),
+    );
     tasks.spawn(async move {
         collector
             .run(ws_event_rx, live_msg_tx, log_decoder_tx, transform_reorg_tx)
