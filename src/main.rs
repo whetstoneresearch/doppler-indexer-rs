@@ -310,6 +310,7 @@ async fn process_chain_live_only(
         db_pool,
         log_decoder_tx,
         None, // No transform_reorg_tx in live-only mode
+        None, // No progress tracker in live-only mode (no handlers)
         &mut tasks,
     )
     .await?;
@@ -747,6 +748,28 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         None
     };
 
+    // Create progress tracker for live mode (must be before engine creation so we can pass it)
+    let progress_tracker = if should_enable_live_mode(config, &chain) && db_pool.is_some() {
+        Some(Arc::new(Mutex::new(LiveProgressTracker::new(
+            chain.chain_id as i64,
+            db_pool.clone(),
+        ))))
+    } else {
+        None
+    };
+
+    // Register handlers with progress tracker
+    if let Some(ref tracker) = progress_tracker {
+        let mut t = tracker.lock().await;
+        for handler in registry.all_handlers() {
+            t.register_handler(&handler.handler_key());
+        }
+        tracing::info!(
+            "Registered {} handlers with live progress tracker",
+            t.handler_keys().len()
+        );
+    }
+
     if transformations_enabled {
         let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
         let tc = config.transformations.as_ref().unwrap();
@@ -768,6 +791,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             mode,
             chain.contracts.clone(),
             tc.handler_concurrency,
+            progress_tracker.clone(),
         )
         .await
         .context("failed to create transformation engine")?;
@@ -813,6 +837,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             db_pool_for_live,
             log_decoder_tx_for_live,
             transform_reorg_tx,
+            progress_tracker,
             &mut tasks,
         )
         .await?;
@@ -880,6 +905,7 @@ async fn spawn_live_mode(
     db_pool: Option<Arc<DbPool>>,
     log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
+    progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let ws_env_var = chain
@@ -922,14 +948,22 @@ async fn spawn_live_mode(
 
     // Create channels
     let (ws_event_tx, ws_event_rx) = mpsc::unbounded_channel();
-    let (live_msg_tx, _live_msg_rx) = mpsc::channel::<LiveMessage>(1000);
+    let (live_msg_tx, mut live_msg_rx) = mpsc::channel::<LiveMessage>(1000);
     let (compaction_shutdown_tx, compaction_shutdown_rx) = oneshot::channel();
 
-    // Create progress tracker
-    let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
-        chain.chain_id as i64,
-        db_pool.clone(),
-    )));
+    // Drain live messages (prevents channel from filling up and blocking collector)
+    tasks.spawn(async move {
+        while live_msg_rx.recv().await.is_some() {}
+        Ok(())
+    });
+
+    // Use provided progress tracker or create a fallback (for live-only mode)
+    let progress_tracker = progress_tracker.unwrap_or_else(|| {
+        Arc::new(Mutex::new(LiveProgressTracker::new(
+            chain.chain_id as i64,
+            db_pool.clone(),
+        )))
+    });
 
     // Start WebSocket subscription
     let ws_handle = ws_client.clone().subscribe(ws_event_tx);

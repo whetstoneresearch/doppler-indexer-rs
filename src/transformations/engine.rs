@@ -19,6 +19,7 @@ use super::historical::HistoricalDataReader;
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::traits::EventHandler;
 use crate::db::{DbPool, DbValue, DbOperation, WhereClause};
+use crate::live::LiveProgressTracker;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::Contracts;
 
@@ -141,6 +142,8 @@ pub struct TransformationEngine {
     handler_concurrency: usize,
     /// Live processing state for buffering events with call dependencies.
     live_state: Mutex<LiveProcessingState>,
+    /// Live mode progress tracker for marking block completion.
+    progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
 }
 
 impl TransformationEngine {
@@ -154,6 +157,7 @@ impl TransformationEngine {
         mode: ExecutionMode,
         contracts: Contracts,
         handler_concurrency: usize,
+        progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
         let decoded_logs_dir = PathBuf::from(format!("data/derived/{}/decoded/logs", chain_name));
@@ -175,6 +179,7 @@ impl TransformationEngine {
             contracts: Arc::new(contracts),
             handler_concurrency,
             live_state: Mutex::new(LiveProcessingState::default()),
+            progress_tracker,
         })
     }
 
@@ -1459,6 +1464,19 @@ impl TransformationEngine {
             match result {
                 Ok(Ok(Some((handler_key, rs, re)))) => {
                     self.record_completed_range_for_handler(&handler_key, rs, re).await?;
+
+                    // Mark live progress for single-block ranges (live mode)
+                    if re - rs == 1 {
+                        if let Some(ref tracker) = self.progress_tracker {
+                            let mut t = tracker.lock().await;
+                            if let Err(e) = t.mark_complete(rs, &handler_key).await {
+                                tracing::warn!(
+                                    "Failed to mark live progress for block {} handler {}: {}",
+                                    rs, handler_key, e
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -1689,6 +1707,19 @@ impl TransformationEngine {
             match result {
                 Ok(Ok(Some((handler_key, rs, re)))) => {
                     self.record_completed_range_for_handler(&handler_key, rs, re).await?;
+
+                    // Mark live progress for single-block ranges (live mode)
+                    if re - rs == 1 {
+                        if let Some(ref tracker) = self.progress_tracker {
+                            let mut t = tracker.lock().await;
+                            if let Err(e) = t.mark_complete(rs, &handler_key).await {
+                                tracing::warn!(
+                                    "Failed to mark live progress for block {} handler {}: {}",
+                                    rs, handler_key, e
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => {
@@ -1722,6 +1753,19 @@ impl TransformationEngine {
                 msg.range_start,
                 msg.range_end,
             ).await?;
+
+            // Mark live progress for single-block ranges (live mode)
+            if msg.range_end - msg.range_start == 1 {
+                if let Some(ref tracker) = self.progress_tracker {
+                    let mut t = tracker.lock().await;
+                    if let Err(e) = t.mark_complete(msg.range_start, &handler_key).await {
+                        tracing::warn!(
+                            "Failed to mark live progress for block {} handler {}: {}",
+                            msg.range_start, handler_key, e
+                        );
+                    }
+                }
+            }
         }
 
         // Clean up buffered state for this range and warn about stuck events
@@ -2103,6 +2147,19 @@ impl TransformationEngine {
             match result {
                 Ok(Ok(Some((handler_key, rs, re)))) => {
                     self.record_completed_range_for_handler(&handler_key, rs, re).await?;
+
+                    // Mark live progress for single-block ranges (live mode)
+                    if re - rs == 1 {
+                        if let Some(ref tracker) = self.progress_tracker {
+                            let mut t = tracker.lock().await;
+                            if let Err(e) = t.mark_complete(rs, &handler_key).await {
+                                tracing::warn!(
+                                    "Failed to mark live progress for block {} handler {}: {}",
+                                    rs, handler_key, e
+                                );
+                            }
+                        }
+                    }
                 }
                 Ok(Ok(None)) => {
                     // Handler failed or had no ops — already logged
