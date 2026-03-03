@@ -529,6 +529,32 @@ impl LiveStorage {
     }
 
     // =========================================================================
+    // Reorg detection helpers
+    // =========================================================================
+
+    /// Get recent blocks for seeding the reorg detector on restart.
+    ///
+    /// Returns up to `count` most recent (block_number, block_hash) pairs.
+    pub fn get_recent_blocks_for_reorg(&self, count: u64) -> Result<Vec<(u64, [u8; 32])>, StorageError> {
+        let blocks = self.list_blocks()?;
+        let start = blocks.len().saturating_sub(count as usize);
+
+        let mut result = Vec::with_capacity(blocks.len() - start);
+        for &block_number in &blocks[start..] {
+            if let Ok(block) = self.read_block(block_number) {
+                result.push((block.number, block.hash));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get the maximum block number in storage.
+    pub fn max_block_number(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self.list_blocks()?.into_iter().max())
+    }
+
+    // =========================================================================
     // Bulk operations
     // =========================================================================
 
