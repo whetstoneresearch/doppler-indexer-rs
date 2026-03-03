@@ -68,6 +68,24 @@ pub trait TransformationHandler: Send + Sync + 'static {
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         Ok(())
     }
+
+    /// Tables this handler writes to that can be rolled back on reorg.
+    ///
+    /// Each table returned must have a `block_number` column for deletion targeting.
+    /// Tables are automatically scoped by `source` and `source_version` during reorg cleanup.
+    ///
+    /// Handlers opt-in by implementing this method. By default, no tables are tracked
+    /// for reorg rollback (returns empty vec).
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn reorg_tables(&self) -> Vec<&'static str> {
+    ///     vec!["transfers", "swaps"]
+    /// }
+    /// ```
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec![]
+    }
 }
 
 /// Trigger for event-based handlers.

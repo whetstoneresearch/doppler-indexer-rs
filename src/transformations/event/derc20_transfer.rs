@@ -29,6 +29,12 @@ impl TransformationHandler for DERC20TransferHandler {
         ]
     }
 
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        // transfers has block_number for rollback
+        // users only has timestamps, accept eventual consistency
+        vec!["transfers"]
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,
