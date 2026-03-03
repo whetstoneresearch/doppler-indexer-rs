@@ -10,15 +10,48 @@ use crate::decoding::catchup::eth_calls::{
     read_raw_parquet_function_names,
 };
 use crate::decoding::eth_calls::{
-    CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig, process_event_calls,
-    process_once_calls, process_regular_calls,
+    decode_value, CallDecodeConfig, DecodedValue, EthCallDecodingError, EventCallDecodeConfig,
+    process_event_calls, process_once_calls, process_regular_calls,
 };
 use crate::decoding::types::DecoderMessage;
+use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
 use crate::live::LiveStorage;
 use crate::transformations::DecodedCallsMessage;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 use super::super::catchup;
+
+/// Convert DecodedValue to LiveDecodedValue for bincode serialization.
+fn to_live_value(value: &DecodedValue) -> LiveDecodedValue {
+    match value {
+        DecodedValue::Address(a) => LiveDecodedValue::Address(*a),
+        DecodedValue::Uint256(v) => LiveDecodedValue::Uint256(v.to_string()),
+        DecodedValue::Int256(v) => LiveDecodedValue::Int256(v.to_string()),
+        DecodedValue::Uint64(v) => LiveDecodedValue::Uint64(*v),
+        DecodedValue::Int64(v) => LiveDecodedValue::Int64(*v),
+        DecodedValue::Uint8(v) => LiveDecodedValue::Uint8(*v),
+        DecodedValue::Int8(v) => LiveDecodedValue::Int8(*v),
+        DecodedValue::Bool(v) => LiveDecodedValue::Bool(*v),
+        DecodedValue::Bytes32(v) => LiveDecodedValue::Bytes32(*v),
+        DecodedValue::Bytes(v) => LiveDecodedValue::Bytes(v.clone()),
+        DecodedValue::String(v) => LiveDecodedValue::String(v.clone()),
+        DecodedValue::NamedTuple(fields) => {
+            let converted: Vec<(String, LiveDecodedValue)> = fields
+                .iter()
+                .map(|(name, val)| (name.clone(), to_live_value(val)))
+                .collect();
+            LiveDecodedValue::NamedTuple(converted)
+        }
+        DecodedValue::UnnamedTuple(values) => {
+            let converted: Vec<LiveDecodedValue> = values.iter().map(to_live_value).collect();
+            LiveDecodedValue::UnnamedTuple(converted)
+        }
+        DecodedValue::Array(values) => {
+            let converted: Vec<LiveDecodedValue> = values.iter().map(to_live_value).collect();
+            LiveDecodedValue::Array(converted)
+        }
+    }
+}
 
 /// Live phase: Process new data as it arrives via channel.
 /// Returns when AllComplete message is received or channel closes.
@@ -53,21 +86,52 @@ pub async fn decode_eth_calls_live(
 
                 if let Some(config) = config {
                     if live_mode {
-                        // TODO: Implement live mode for eth_calls (write to bincode)
-                        // For now, just process to parquet and log a warning
-                        tracing::debug!(
-                            "Live mode eth_calls decoding not yet fully implemented, writing to parquet"
-                        );
+                        // Live mode: decode and write to bincode storage
+                        let mut decoded_calls: Vec<LiveDecodedCall> = Vec::with_capacity(results.len());
+                        for result in &results {
+                            match decode_value(&result.value, &config.output_type) {
+                                Ok(decoded) => {
+                                    decoded_calls.push(LiveDecodedCall {
+                                        block_number: result.block_number,
+                                        block_timestamp: result.block_timestamp,
+                                        contract_address: result.contract_address,
+                                        decoded_value: to_live_value(&decoded),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to decode eth_call {}/{} at block {}: {}",
+                                        contract_name, function_name, result.block_number, e
+                                    );
+                                }
+                            }
+                        }
+
+                        if !decoded_calls.is_empty() {
+                            if let Err(e) = live_storage.write_decoded_calls(
+                                range_start,
+                                &contract_name,
+                                &function_name,
+                                &decoded_calls,
+                            ) {
+                                tracing::warn!(
+                                    "Failed to write decoded eth_calls for {}/{} at block {}: {}",
+                                    contract_name, function_name, range_start, e
+                                );
+                            }
+                        }
+                    } else {
+                        // Historical mode: write to parquet
+                        process_regular_calls(
+                            &results,
+                            range_start,
+                            range_end,
+                            config,
+                            output_base,
+                            transform_tx,
+                        )
+                        .await?;
                     }
-                    process_regular_calls(
-                        &results,
-                        range_start,
-                        range_end,
-                        config,
-                        output_base,
-                        transform_tx,
-                    )
-                    .await?;
                 }
             }
             Some(DecoderMessage::OnceCallsReady {
@@ -85,22 +149,67 @@ pub async fn decode_eth_calls_live(
 
                 if !configs.is_empty() {
                     if live_mode {
-                        // TODO: Implement live mode for once calls (write to bincode)
-                        tracing::debug!(
-                            "Live mode once_calls decoding not yet fully implemented, writing to parquet"
-                        );
+                        // Live mode: decode and write to bincode storage
+                        let mut decoded_once_calls: Vec<LiveDecodedOnceCall> = Vec::with_capacity(results.len());
+
+                        for result in &results {
+                            let mut decoded_values: Vec<(String, LiveDecodedValue)> = Vec::new();
+
+                            for config in &configs {
+                                if let Some(raw_value) = result.results.get(&config.function_name) {
+                                    match decode_value(raw_value, &config.output_type) {
+                                        Ok(decoded) => {
+                                            decoded_values.push((
+                                                config.function_name.clone(),
+                                                to_live_value(&decoded),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to decode once_call {}/{} at block {}: {}",
+                                                contract_name, config.function_name, result.block_number, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !decoded_values.is_empty() {
+                                decoded_once_calls.push(LiveDecodedOnceCall {
+                                    block_number: result.block_number,
+                                    block_timestamp: result.block_timestamp,
+                                    contract_address: result.contract_address,
+                                    decoded_values,
+                                });
+                            }
+                        }
+
+                        if !decoded_once_calls.is_empty() {
+                            if let Err(e) = live_storage.write_decoded_once_calls(
+                                range_start,
+                                &contract_name,
+                                &decoded_once_calls,
+                            ) {
+                                tracing::warn!(
+                                    "Failed to write decoded once_calls for {} at block {}: {}",
+                                    contract_name, range_start, e
+                                );
+                            }
+                        }
+                    } else {
+                        // Historical mode: write to parquet
+                        process_once_calls(
+                            &results,
+                            range_start,
+                            range_end,
+                            &contract_name,
+                            &configs,
+                            output_base,
+                            transform_tx,
+                            false, // Update index directly (no concurrent tasks)
+                        )
+                        .await?;
                     }
-                    process_once_calls(
-                        &results,
-                        range_start,
-                        range_end,
-                        &contract_name,
-                        &configs,
-                        output_base,
-                        transform_tx,
-                        false, // Update index directly (no concurrent tasks)
-                    )
-                    .await?;
                 }
             }
             Some(DecoderMessage::EventCallsReady {
@@ -117,20 +226,54 @@ pub async fn decode_eth_calls_live(
                     .find(|c| c.contract_name == contract_name && c.function_name == function_name)
                 {
                     if live_mode {
-                        // TODO: Implement live mode for event calls (write to bincode)
-                        tracing::debug!(
-                            "Live mode event_calls decoding not yet fully implemented, writing to parquet"
-                        );
+                        // Live mode: decode and write to bincode storage
+                        let mut decoded_event_calls: Vec<LiveDecodedEventCall> = Vec::with_capacity(results.len());
+
+                        for result in &results {
+                            match decode_value(&result.value, &config.output_type) {
+                                Ok(decoded) => {
+                                    decoded_event_calls.push(LiveDecodedEventCall {
+                                        block_number: result.block_number,
+                                        block_timestamp: result.block_timestamp,
+                                        log_index: result.log_index,
+                                        target_address: result.target_address,
+                                        decoded_value: to_live_value(&decoded),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to decode event_call {}/{} at block {}: {}",
+                                        contract_name, function_name, result.block_number, e
+                                    );
+                                }
+                            }
+                        }
+
+                        if !decoded_event_calls.is_empty() {
+                            if let Err(e) = live_storage.write_decoded_event_calls(
+                                range_start,
+                                &contract_name,
+                                &function_name,
+                                &decoded_event_calls,
+                            ) {
+                                tracing::warn!(
+                                    "Failed to write decoded event_calls for {}/{} at block {}: {}",
+                                    contract_name, function_name, range_start, e
+                                );
+                            }
+                        }
+                    } else {
+                        // Historical mode: write to parquet
+                        process_event_calls(
+                            &results,
+                            range_start,
+                            range_end,
+                            config,
+                            output_base,
+                            transform_tx,
+                        )
+                        .await?;
                     }
-                    process_event_calls(
-                        &results,
-                        range_start,
-                        range_end,
-                        config,
-                        output_base,
-                        transform_tx,
-                    )
-                    .await?;
                 }
             }
             Some(DecoderMessage::Reorg { orphaned, .. }) => {
