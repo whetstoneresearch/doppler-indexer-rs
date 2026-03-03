@@ -77,6 +77,23 @@ Each block's processing status is tracked in a JSON file:
 
 A block is ready for compaction when all flags are `true`.
 
+### LiveLog (Raw Log Storage)
+
+Raw logs are stored with full transaction context for downstream traceability:
+
+```rust
+pub struct LiveLog {
+    pub address: [u8; 20],
+    pub topics: Vec<[u8; 32]>,
+    pub data: Vec<u8>,
+    pub log_index: u32,
+    pub transaction_index: u32,
+    pub transaction_hash: [u8; 32],  // For log-receipt correlation
+}
+```
+
+The `transaction_hash` field enables correlation between logs and their originating transactions, which is essential for downstream processing and debugging.
+
 ## DecoderMessage Live Mode
 
 The `DecoderMessage` variants include a `live_mode` flag:
@@ -136,6 +153,40 @@ pub struct LiveDecodedLog {
 }
 ```
 
+### LiveDecodedCall
+
+```rust
+pub struct LiveDecodedCall {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub contract_address: [u8; 20],
+    pub decoded_value: LiveDecodedValue,
+}
+```
+
+### LiveDecodedEventCall
+
+```rust
+pub struct LiveDecodedEventCall {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub target_address: [u8; 20],
+    pub decoded_value: LiveDecodedValue,
+}
+```
+
+### LiveDecodedOnceCall
+
+```rust
+pub struct LiveDecodedOnceCall {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub contract_address: [u8; 20],
+    pub decoded_values: Vec<(String, LiveDecodedValue)>,  // function_name -> value
+}
+```
+
 ## Reorg Handling
 
 When the LiveCollector detects a chain reorganization (parent hash mismatch):
@@ -162,9 +213,26 @@ The CompactionService periodically checks for complete block ranges and compacts
 ### Compaction Criteria
 
 A range is ready for compaction when:
-1. All blocks in the range are present (e.g., blocks 1000-1999 all exist)
+1. All blocks in the range are present **and sequential** (e.g., blocks 1000-1999 with no gaps)
 2. All blocks have `status.is_complete() == true`
 3. All transformation handlers have completed for all blocks
+
+**Sequential validation:** The compaction service validates that blocks form a complete sequential range, not just that the count matches. This prevents compacting sparse ranges (e.g., `[0,2,4,6,8...]`) that happen to have the correct count:
+
+```rust
+// Sort and verify blocks are sequential
+block_numbers.sort_unstable();
+if block_numbers.first() != Some(&range_start)
+    || block_numbers.last() != Some(&range_end) {
+    continue;  // Wrong boundaries
+}
+
+// Verify no gaps
+let has_gap = block_numbers.windows(2).any(|w| w[1] != w[0] + 1);
+if has_gap {
+    continue;  // Gaps in sequence
+}
+```
 
 ### Compaction Process
 
@@ -208,6 +276,35 @@ CREATE TABLE _live_progress (
 ```
 
 During compaction, entries are migrated to `_handler_progress` with the range information.
+
+**Progress migration semantics:** The `range_start` column in `_handler_progress` means "next range to process starts at". After compacting range 0-999, the value inserted is 1000 (not 999). This matches historical mode semantics where `range_start` indicates the starting point for the next processing run.
+
+### LiveProgressTracker
+
+The `LiveProgressTracker` coordinates between the transformation engine and compaction service:
+
+```rust
+pub struct LiveProgressTracker {
+    chain_id: i64,
+    completed: HashMap<u64, HashSet<String>>,  // block -> completed handler keys
+    handler_keys: HashSet<String>,              // all registered handlers
+    db_pool: Option<Arc<DbPool>>,
+}
+```
+
+**Initialization:**
+1. Created in `process_chain()` before the transformation engine
+2. All handlers are registered via `register_handler(&handler.handler_key())`
+3. Passed to both `TransformationEngine` and `spawn_live_mode()`
+
+**Block completion flow:**
+1. Handler processes a block and calls `record_completed_range_for_handler()`
+2. Engine calls `progress_tracker.mark_complete(block, handler_key)` for single-block ranges
+3. Tracker persists to `_live_progress` table and updates in-memory state
+4. `is_block_complete(block)` returns `true` when all handlers have marked complete
+5. Compaction service checks completion before compacting ranges
+
+**Why this matters:** Without handler registration, `is_block_complete()` returns `true` immediately (empty handler set), allowing compaction before handlers finish processing.
 
 ## Mode Transition
 
@@ -278,15 +375,25 @@ impl LiveStorage {
     fn write_block(&self, block: &LiveBlock) -> Result<()>;
     fn read_block(&self, block_number: u64) -> Result<LiveBlock>;
     fn delete_block(&self, block_number: u64) -> Result<()>;
+    fn list_blocks(&self) -> Result<Vec<u64>>;
 
     // Decoded log operations
     fn write_decoded_logs(&self, block_number: u64, contract: &str, event: &str, logs: &[LiveDecodedLog]) -> Result<()>;
     fn read_decoded_logs(&self, block_number: u64, contract: &str, event: &str) -> Result<Vec<LiveDecodedLog>>;
     fn delete_all_decoded_logs(&self, block_number: u64) -> Result<()>;
 
+    // Decoded eth_call operations
+    fn write_decoded_calls(&self, block_number: u64, contract: &str, function: &str, calls: &[LiveDecodedCall]) -> Result<()>;
+    fn write_decoded_once_calls(&self, block_number: u64, contract: &str, calls: &[LiveDecodedOnceCall]) -> Result<()>;
+    fn write_decoded_event_calls(&self, block_number: u64, contract: &str, function: &str, calls: &[LiveDecodedEventCall]) -> Result<()>;
+
     // Status operations
     fn write_status(&self, block_number: u64, status: &LiveBlockStatus) -> Result<()>;
     fn read_status(&self, block_number: u64) -> Result<LiveBlockStatus>;
+
+    // Reorg detection helpers
+    fn get_recent_blocks_for_reorg(&self, count: u64) -> Result<Vec<(u64, [u8; 32])>>;
+    fn max_block_number(&self) -> Result<Option<u64>>;
 
     // Bulk operations
     fn delete_all(&self, block_number: u64) -> Result<()>;  // Deletes all data for a block
@@ -301,7 +408,84 @@ impl LiveStorage {
 - **Compaction batching**: Processes complete ranges to minimize parquet file count
 - **Reorg depth**: 128 blocks covers most reorgs while limiting memory usage
 
+## Data Safety
+
+### Atomic Writes
+
+All file writes use atomic operations to prevent corruption from crashes:
+
+```rust
+// Write to temp file, flush, sync, then atomic rename
+let temp_path = path.with_extension("tmp");
+let file = fs::File::create(&temp_path)?;
+let mut writer = BufWriter::new(file);
+bincode::serialize_into(&mut writer, data)?;
+writer.flush()?;
+writer.into_inner()?.sync_all()?;
+fs::rename(&temp_path, path)?;
+```
+
+On startup, `ensure_dirs()` cleans up any leftover `.tmp` files from interrupted writes.
+
+### TOCTOU Race Prevention
+
+Read operations handle `NotFound` from the actual read instead of checking `exists()` first:
+
+```rust
+// Correct: handle error from actual operation
+pub fn read_block(&self, block_number: u64) -> Result<LiveBlock, StorageError> {
+    let path = self.block_path(block_number);
+    read_bincode(&path).map_err(|e| map_not_found(e, block_number))
+}
+```
+
+This prevents race conditions where a file could be deleted between the exists check and the read.
+
+### Reorg Detector Seeding
+
+On restart, the `ReorgDetector` is seeded from existing storage to detect reorgs for the first 128 blocks:
+
+```rust
+// In LiveCollector::new()
+match storage.get_recent_blocks_for_reorg(config.reorg_depth) {
+    Ok(recent) if !recent.is_empty() => {
+        reorg_detector.seed(recent);
+    }
+    // ...
+}
+```
+
+### Gap Detection
+
+On transition to live mode, gaps between historical and live blocks are detected and backfilled:
+
+```rust
+// On first block received
+if block_number > expected_start_block + 1 {
+    tracing::warn!("Gap detected, backfilling...");
+    backfill_blocks(expected_start + 1, block_number - 1).await?;
+}
+```
+
+### Reorg During Compaction
+
+The progress tracker is shared between collector and compaction service. When a reorg occurs:
+
+1. Collector deletes orphaned blocks and clears their progress
+2. Compaction gracefully handles `NotFound` errors (skips the range)
+
+```rust
+// In compact_range()
+match self.storage.read_block(block_number) {
+    Ok(block) => blocks.push(block),
+    Err(StorageError::NotFound(_)) => {
+        tracing::warn!("Block deleted during compaction (reorg?), skipping range");
+        return Ok(());
+    }
+    Err(e) => return Err(e.into()),
+}
+```
+
 ## Current Limitations
 
 - Decoded data compaction relies on re-decoding from compacted raw parquet (avoids schema synchronization complexity)
-- ETH call live mode writes to parquet (placeholder for full bincode support)
