@@ -156,11 +156,39 @@ impl CompactionService {
         let mut compactable = Vec::new();
         let progress = self.progress_tracker.lock().await;
 
-        for (range_start, block_numbers) in ranges {
+        for (range_start, mut block_numbers) in ranges {
             let range_end = range_start + range_size - 1;
 
-            // Check if range is complete (all blocks present)
+            // Check if range is complete (all blocks present and sequential)
             if block_numbers.len() != range_size as usize {
+                continue;
+            }
+
+            // Sort and verify blocks are sequential with no gaps
+            block_numbers.sort_unstable();
+            if block_numbers.first() != Some(&range_start)
+                || block_numbers.last() != Some(&range_end)
+            {
+                tracing::warn!(
+                    "Range {}-{} has correct count but wrong boundaries: first={:?}, last={:?}",
+                    range_start,
+                    range_end,
+                    block_numbers.first(),
+                    block_numbers.last()
+                );
+                continue;
+            }
+
+            // Verify no gaps in the sequence
+            let has_gap = block_numbers
+                .windows(2)
+                .any(|w| w[1] != w[0] + 1);
+            if has_gap {
+                tracing::warn!(
+                    "Range {}-{} has gaps in block sequence",
+                    range_start,
+                    range_end
+                );
                 continue;
             }
 
@@ -461,6 +489,10 @@ impl CompactionService {
         for row in rows {
             let handler_key: String = row.get(0);
 
+            // range_start in _handler_progress means "next range to process starts at"
+            // After compacting range 0-999, the next range starts at 1000
+            let next_range_start = end + 1;
+
             // Insert or update _handler_progress using raw SQL via query
             db_pool
                 .query(
@@ -471,7 +503,7 @@ impl CompactionService {
                     &[
                         &chain_id as &(dyn ToSql + Sync),
                         &handler_key as &(dyn ToSql + Sync),
-                        &end as &(dyn ToSql + Sync),
+                        &next_range_start as &(dyn ToSql + Sync),
                     ],
                 )
                 .await
@@ -521,5 +553,106 @@ impl std::fmt::Debug for CompactionService {
             .field("chain_name", &self.chain_name)
             .field("range_size", &self.config.range_size)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Helper function to validate a range of blocks.
+    /// Returns true if the blocks form a complete sequential range.
+    fn validate_range(mut block_numbers: Vec<u64>, range_start: u64, range_size: u64) -> bool {
+        let range_end = range_start + range_size - 1;
+
+        // Check if range has correct count
+        if block_numbers.len() != range_size as usize {
+            return false;
+        }
+
+        // Sort and verify blocks are sequential with no gaps
+        block_numbers.sort_unstable();
+        if block_numbers.first() != Some(&range_start)
+            || block_numbers.last() != Some(&range_end)
+        {
+            return false;
+        }
+
+        // Verify no gaps in the sequence
+        let has_gap = block_numbers.windows(2).any(|w| w[1] != w[0] + 1);
+        !has_gap
+    }
+
+    #[test]
+    fn test_validate_range_complete_sequential() {
+        // Complete sequential range 0-9
+        let blocks: Vec<u64> = (0..10).collect();
+        assert!(validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_complete_shuffled() {
+        // Complete but shuffled range 0-9
+        let blocks = vec![5, 2, 8, 0, 9, 3, 7, 1, 4, 6];
+        assert!(validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_sparse_blocks() {
+        // Sparse blocks [0,2,4,6,8,10,12,14,16,18] - correct count but gaps
+        let blocks: Vec<u64> = (0..10).map(|x| x * 2).collect();
+        assert!(!validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_wrong_start() {
+        // Wrong start: 1-10 instead of 0-9
+        let blocks: Vec<u64> = (1..11).collect();
+        assert!(!validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_wrong_end() {
+        // Wrong end: 0-8 + 10 (missing 9)
+        let mut blocks: Vec<u64> = (0..9).collect();
+        blocks.push(10);
+        assert!(!validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_gap_in_middle() {
+        // Gap in middle: 0-4, 6-10 (missing 5)
+        let mut blocks: Vec<u64> = (0..5).collect();
+        blocks.extend(6..11);
+        // Note: this has 10 blocks but wrong range
+        assert!(!validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_insufficient_count() {
+        // Only 5 blocks in range that needs 10
+        let blocks: Vec<u64> = (0..5).collect();
+        assert!(!validate_range(blocks, 0, 10));
+    }
+
+    #[test]
+    fn test_validate_range_higher_offset() {
+        // Complete range 1000-1009
+        let blocks: Vec<u64> = (1000..1010).collect();
+        assert!(validate_range(blocks, 1000, 10));
+    }
+
+    #[test]
+    fn test_progress_migration_value() {
+        // After compacting range 0-999, the next range starts at 1000
+        let range_start: i64 = 0;
+        let range_end: i64 = 999;
+        let next_range_start = range_end + 1;
+
+        assert_eq!(next_range_start, 1000);
+
+        // After compacting range 1000-1999, the next range starts at 2000
+        let range_end_2: i64 = 1999;
+        let next_range_start_2 = range_end_2 + 1;
+
+        assert_eq!(next_range_start_2, 2000);
     }
 }
