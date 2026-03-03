@@ -21,6 +21,7 @@ use super::types::{LiveBlock, LiveBlockStatus, LiveLog, LiveMessage, LiveModeCon
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
 use crate::rpc::{RpcError, UnifiedRpcClient, WsEvent};
+use crate::transformations::ReorgMessage;
 use crate::types::config::chain::ChainConfig;
 
 #[derive(Debug, Error)]
@@ -69,11 +70,14 @@ impl LiveCollector {
     /// Run the live collector.
     ///
     /// Listens for WebSocket events and processes blocks.
+    /// The optional `transform_reorg_tx` sends reorg notifications to the transformation engine
+    /// so it can clean up pending events for orphaned blocks.
     pub async fn run(
         mut self,
         mut ws_rx: mpsc::UnboundedReceiver<WsEvent>,
         live_tx: mpsc::Sender<LiveMessage>,
         log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+        transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         // Ensure storage directories exist
         self.storage.ensure_dirs()?;
@@ -101,7 +105,7 @@ impl LiveCollector {
                     };
 
                     if let Err(e) = self
-                        .process_block(block, &live_tx, &log_decoder_tx)
+                        .process_block(block, &live_tx, &log_decoder_tx, &transform_reorg_tx)
                         .await
                     {
                         tracing::error!("Error processing block {}: {}", number, e);
@@ -126,7 +130,7 @@ impl LiveCollector {
                     );
 
                     if let Err(e) = self
-                        .backfill_blocks(missed_from, missed_to, &live_tx, &log_decoder_tx)
+                        .backfill_blocks(missed_from, missed_to, &live_tx, &log_decoder_tx, &transform_reorg_tx)
                         .await
                     {
                         tracing::error!(
@@ -150,12 +154,13 @@ impl LiveCollector {
         block: LiveBlock,
         live_tx: &mpsc::Sender<LiveMessage>,
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         let block_number = block.number;
 
         // Check for reorg
         if let Some(reorg_event) = self.reorg_detector.process_block(&block) {
-            self.handle_reorg(&reorg_event, live_tx, log_decoder_tx).await?;
+            self.handle_reorg(&reorg_event, live_tx, log_decoder_tx, transform_reorg_tx).await?;
         }
 
         // Store the block header
@@ -237,6 +242,7 @@ impl LiveCollector {
         event: &ReorgEvent,
         live_tx: &mpsc::Sender<LiveMessage>,
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         tracing::warn!(
             "Handling reorg: common_ancestor={}, orphaned={:?}, depth={}",
@@ -262,6 +268,16 @@ impl LiveCollector {
                 .await;
         }
 
+        // Notify transformation engine of reorg so it can clean up pending events
+        if let Some(transform_tx) = transform_reorg_tx {
+            let _ = transform_tx
+                .send(ReorgMessage {
+                    common_ancestor: event.common_ancestor,
+                    orphaned: event.orphaned.clone(),
+                })
+                .await;
+        }
+
         // Notify downstream of reorg
         live_tx
             .send(LiveMessage::Reorg {
@@ -281,6 +297,7 @@ impl LiveCollector {
         to: u64,
         live_tx: &mpsc::Sender<LiveMessage>,
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         tracing::info!("Backfilling {} blocks ({} to {})", to - from + 1, from, to);
 
@@ -288,7 +305,7 @@ impl LiveCollector {
             let block = self.fetch_full_block(block_number).await?;
 
             // Process as if it came from WebSocket
-            self.process_block(block, live_tx, log_decoder_tx).await?;
+            self.process_block(block, live_tx, log_decoder_tx, transform_reorg_tx).await?;
         }
 
         Ok(())
