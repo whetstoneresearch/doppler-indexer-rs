@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
+use crate::metrics::{chain_label_from_url, RpcMetricsGuard, RpcMethod};
 use crate::rpc::rpc::{
     error_chain, with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider,
 };
@@ -274,6 +275,11 @@ impl AlchemyClient {
         &self.config.retry
     }
 
+    /// Get the chain label for metrics, derived from the RPC URL.
+    fn chain_label(&self) -> String {
+        chain_label_from_url(&self.config.url)
+    }
+
     /// Consume compute units, waiting if necessary.
     /// Uses sliding window rate limiting to prevent burst accumulation.
     async fn consume_compute_units(&self, cost: ComputeUnitCost) {
@@ -432,16 +438,22 @@ impl AlchemyClient {
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetBlockNumber, &self.chain_label());
         self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
             .await;
-        with_retry(&self.config.retry, "get_block_number", || async {
+        let result = with_retry(&self.config.retry, "get_block_number", || async {
             self.inner
                 .provider()
                 .get_block_number()
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_block(
@@ -449,6 +461,7 @@ impl AlchemyClient {
         block_id: BlockId,
         full_transactions: bool,
     ) -> Result<Option<Block>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetBlock, &self.chain_label());
         let cost = match block_id {
             BlockId::Hash(_) => ComputeUnitCost::GET_BLOCK_BY_HASH,
             BlockId::Number(_) => ComputeUnitCost::GET_BLOCK_BY_NUMBER,
@@ -456,7 +469,7 @@ impl AlchemyClient {
         let op_name = format!("eth_getBlockByNumber({:?})", block_id);
 
         self.consume_compute_units(cost).await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             let builder = self.inner.provider().get_block(block_id);
             if full_transactions {
                 builder
@@ -469,7 +482,12 @@ impl AlchemyClient {
                     .map_err(|e| RpcError::ProviderError(error_chain(&e)))
             }
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_block_by_number(
@@ -482,34 +500,46 @@ impl AlchemyClient {
     }
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetTransaction, &self.chain_label());
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
         self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
             .await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             self.inner
                 .provider()
                 .get_transaction_by_hash(hash)
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_transaction_receipt(
         &self,
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetTransactionReceipt, &self.chain_label());
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
         self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
             .await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             self.inner
                 .provider()
                 .get_transaction_receipt(hash)
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_block_receipts(
@@ -517,10 +547,16 @@ impl AlchemyClient {
         method_name: &str,
         block_number: BlockNumberOrTag,
     ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetBlockReceipts, &self.chain_label());
         // Note: inner.get_block_receipts already has retry logic
         self.consume_compute_units(ComputeUnitCost::GET_BLOCK_RECEIPTS)
             .await;
-        self.inner.get_block_receipts(method_name, block_number).await
+        let result = self.inner.get_block_receipts(method_name, block_number).await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     /// Get block receipts for multiple blocks concurrently.
@@ -536,7 +572,9 @@ impl AlchemyClient {
         block_numbers: Vec<BlockNumberOrTag>,
         #[allow(unused_variables)] _concurrency: usize,
     ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetBlockReceiptsConcurrent, &self.chain_label());
         if block_numbers.is_empty() {
+            guard.success();
             return Ok(vec![]);
         }
 
@@ -553,7 +591,15 @@ impl AlchemyClient {
                     inner.get_block_receipts(&method_name, block_number).await
                 }
             })
-            .await?;
+            .await;
+
+        let results = match results {
+            Ok(r) => r,
+            Err(e) => {
+                guard.failure(&e);
+                return Err(e);
+            }
+        };
 
         // Collect results, failing on first error
         let mut receipts = Vec::with_capacity(results.len());
@@ -562,14 +608,17 @@ impl AlchemyClient {
                 Ok(r) => receipts.push(r),
                 Err(e) => {
                     tracing::error!("get_block_receipts failed for block index {}: {}", i, e);
+                    guard.failure(&e);
                     return Err(e);
                 }
             }
         }
+        guard.success();
         Ok(receipts)
     }
 
     pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetLogs, &self.chain_label());
         let filter = filter.clone();
         let op_name = format!(
             "eth_getLogs(blocks {:?}-{:?})",
@@ -577,14 +626,19 @@ impl AlchemyClient {
             filter.get_to_block()
         );
         self.consume_compute_units(ComputeUnitCost::GET_LOGS).await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             self.inner
                 .provider()
                 .get_logs(&filter)
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_balance(
@@ -592,10 +646,11 @@ impl AlchemyClient {
         address: Address,
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetBalance, &self.chain_label());
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
         self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
             .await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             self.inner
                 .provider()
                 .get_balance(address)
@@ -603,7 +658,12 @@ impl AlchemyClient {
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_code(
@@ -611,9 +671,10 @@ impl AlchemyClient {
         address: Address,
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetCode, &self.chain_label());
         let op_name = format!("eth_getCode({:?}, {:?})", address, block);
         self.consume_compute_units(ComputeUnitCost::GET_CODE).await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             self.inner
                 .provider()
                 .get_code_at(address)
@@ -621,7 +682,12 @@ impl AlchemyClient {
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn call(
@@ -629,10 +695,11 @@ impl AlchemyClient {
         tx: &alloy::rpc::types::TransactionRequest,
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::EthCall, &self.chain_label());
         let tx = tx.clone();
         let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
         self.consume_compute_units(ComputeUnitCost::ETH_CALL).await;
-        with_retry(&self.config.retry, &op_name, || async {
+        let result = with_retry(&self.config.retry, &op_name, || async {
             self.inner
                 .provider()
                 .call(tx.clone())
@@ -640,7 +707,12 @@ impl AlchemyClient {
                 .await
                 .map_err(|e| RpcError::ProviderError(error_chain(&e)))
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => guard.success(),
+            Err(e) => guard.failure(e),
+        }
+        result
     }
 
     pub async fn get_blocks_batch(
@@ -648,15 +720,24 @@ impl AlchemyClient {
         block_numbers: Vec<BlockNumberOrTag>,
         full_transactions: bool,
     ) -> Result<Vec<Option<Block>>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetBlocksBatch, &self.chain_label());
         if !self.config.batching_enabled {
             let mut results = Vec::with_capacity(block_numbers.len());
             for number in block_numbers {
-                results.push(self.get_block_by_number(number, full_transactions).await?);
+                match self.get_block_by_number(number, full_transactions).await {
+                    Ok(block) => results.push(block),
+                    Err(e) => {
+                        guard.failure(&e);
+                        return Err(e);
+                    }
+                }
             }
+            guard.success();
             return Ok(results);
         }
 
         if block_numbers.is_empty() {
+            guard.success();
             return Ok(vec![]);
         }
 
@@ -686,13 +767,28 @@ impl AlchemyClient {
                     .await
                 }
             })
-            .await?;
+            .await;
+
+        let results = match results {
+            Ok(r) => r,
+            Err(e) => {
+                guard.failure(&e);
+                return Err(e);
+            }
+        };
 
         // Collect results, failing on first error
         let mut blocks = Vec::with_capacity(results.len());
         for result in results {
-            blocks.push(result?);
+            match result {
+                Ok(block) => blocks.push(block),
+                Err(e) => {
+                    guard.failure(&e);
+                    return Err(e);
+                }
+            }
         }
+        guard.success();
         Ok(blocks)
     }
 
@@ -742,6 +838,7 @@ impl AlchemyClient {
         &self,
         hashes: Vec<B256>,
     ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetTransactionReceiptsBatch, &self.chain_label());
         if !self.config.batching_enabled {
             let mut results = Vec::with_capacity(hashes.len());
             for hash in hashes {
@@ -753,10 +850,12 @@ impl AlchemyClient {
                     }
                 }
             }
+            guard.success();
             return Ok(results);
         }
 
         if hashes.is_empty() {
+            guard.success();
             return Ok(vec![]);
         }
 
@@ -776,21 +875,39 @@ impl AlchemyClient {
                     }
                 }
             })
-            .await?;
+            .await;
 
-        Ok(results)
+        match results {
+            Ok(r) => {
+                guard.success();
+                Ok(r)
+            }
+            Err(e) => {
+                guard.failure(&e);
+                Err(e)
+            }
+        }
     }
 
     pub async fn get_logs_batch(&self, filters: Vec<Filter>) -> Result<Vec<Vec<Log>>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::GetLogsBatch, &self.chain_label());
         if !self.config.batching_enabled {
             let mut results = Vec::with_capacity(filters.len());
             for filter in filters {
-                results.push(self.get_logs(&filter).await?);
+                match self.get_logs(&filter).await {
+                    Ok(logs) => results.push(logs),
+                    Err(e) => {
+                        guard.failure(&e);
+                        return Err(e);
+                    }
+                }
             }
+            guard.success();
             return Ok(results);
         }
 
         if filters.is_empty() {
+            guard.success();
             return Ok(vec![]);
         }
 
@@ -817,13 +934,28 @@ impl AlchemyClient {
                     .await
                 }
             })
-            .await?;
+            .await;
+
+        let results = match results {
+            Ok(r) => r,
+            Err(e) => {
+                guard.failure(&e);
+                return Err(e);
+            }
+        };
 
         // Collect results, failing on first error
         let mut logs = Vec::with_capacity(results.len());
         for result in results {
-            logs.push(result?);
+            match result {
+                Ok(l) => logs.push(l),
+                Err(e) => {
+                    guard.failure(&e);
+                    return Err(e);
+                }
+            }
         }
+        guard.success();
         Ok(logs)
     }
 
@@ -831,15 +963,18 @@ impl AlchemyClient {
         &self,
         calls: Vec<(alloy::rpc::types::TransactionRequest, BlockId)>,
     ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError> {
+        let guard = RpcMetricsGuard::new(RpcMethod::EthCallBatch, &self.chain_label());
         if !self.config.batching_enabled {
             let mut results = Vec::with_capacity(calls.len());
             for (tx, block) in calls {
                 results.push(self.call(&tx, Some(block)).await);
             }
+            guard.success();
             return Ok(results);
         }
 
         if calls.is_empty() {
+            guard.success();
             return Ok(vec![]);
         }
 
@@ -863,9 +998,18 @@ impl AlchemyClient {
                     .await
                 }
             })
-            .await?;
+            .await;
 
-        Ok(results)
+        match results {
+            Ok(r) => {
+                guard.success();
+                Ok(r)
+            }
+            Err(e) => {
+                guard.failure(&e);
+                Err(e)
+            }
+        }
     }
 }
 
