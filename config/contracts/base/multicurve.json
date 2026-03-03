@@ -17,6 +17,19 @@
                 "params": [
                     { "type": "address", "from_event": "topics[2]"}
                 ]
+            },
+            {
+                "function": "getBeneficiaries(address)",
+                "output_type": "(address, uint96)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4MulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
             }
         ]   
     },
@@ -45,6 +58,19 @@
                 "params": [
                     { "type": "address", "from_event": "topics[2]"}
                 ]
+            },
+            {
+                "function": "getBeneficiaries(address)",
+                "output_type": "(address, uint96)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
             }
         ]          
     },
@@ -64,6 +90,19 @@
             {
                 "function": "getState(address)",
                 "output_type": "(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
+                "frequency": {
+                    "on_events": {
+                        "source": "DecayMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            },
+            {
+                "function": "getBeneficiaries(address)",
+                "output_type": "(address, uint96)[]",
                 "frequency": {
                     "on_events": {
                         "source": "DecayMulticurveInitializer",

@@ -4,6 +4,7 @@
 
 pub mod derc20_transfer;
 pub mod v4;
+//pub mod multicurve;
 
 use super::registry::TransformationRegistry;
 
