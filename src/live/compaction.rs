@@ -230,8 +230,20 @@ impl CompactionService {
         // Read all blocks in range
         let mut blocks = Vec::new();
         for block_number in range.start..=range.end {
-            let block = self.storage.read_block(block_number)?;
-            blocks.push(block);
+            match self.storage.read_block(block_number) {
+                Ok(block) => blocks.push(block),
+                Err(StorageError::NotFound(_)) => {
+                    // Block was deleted during compaction (likely due to reorg), skip this range
+                    tracing::warn!(
+                        "Block {} deleted during compaction (reorg?), skipping range {}-{}",
+                        block_number,
+                        range.start,
+                        range.end
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         // Write blocks parquet
