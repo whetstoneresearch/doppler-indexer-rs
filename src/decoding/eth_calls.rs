@@ -843,7 +843,7 @@ fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
 }
 
 /// Decode a raw value using the specified type
-fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCallDecodingError> {
+pub fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCallDecodingError> {
     let sol_type = evm_type_to_dyn_sol_type(output_type);
 
     let decoded = sol_type
