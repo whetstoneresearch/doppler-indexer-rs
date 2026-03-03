@@ -105,6 +105,7 @@ pub struct LiveLog {
     pub data: Vec<u8>,
     pub log_index: u32,
     pub transaction_index: u32,
+    pub transaction_hash: [u8; 32],
 }
 
 /// Eth call result for live mode storage.
