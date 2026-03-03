@@ -1,6 +1,7 @@
 #[cfg(feature = "bench")]
 mod bench;
 mod db;
+mod metrics;
 mod raw_data;
 mod rpc;
 mod decoding;
@@ -69,6 +70,16 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all("data")?;
         bench::init(Path::new("data/bench.csv"))?;
         tracing::info!("Benchmarking enabled, writing to data/bench.csv");
+    }
+
+    // Initialize metrics server if configured
+    if let Some(ref metrics_config) = config.metrics {
+        let addr = metrics_config
+            .addr
+            .parse()
+            .context("Invalid metrics.addr in config")?;
+        metrics::init_metrics_server(addr);
+        metrics::describe_rpc_metrics();
     }
 
     if decode_only {
