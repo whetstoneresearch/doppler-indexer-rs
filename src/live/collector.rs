@@ -258,14 +258,17 @@ impl LiveCollector {
                     })
                     .collect();
 
-                let _ = decoder_tx
+                if let Err(e) = decoder_tx
                     .send(DecoderMessage::LogsReady {
                         range_start: block_number,
                         range_end: block_number + 1, // Exclusive end for single block
                         logs: log_data,
                         live_mode: true, // Live mode: write to bincode
                     })
-                    .await;
+                    .await
+                {
+                    tracing::warn!("Failed to send logs for block {} to decoder: {}", block_number, e);
+                }
             }
         }
 
@@ -299,26 +302,36 @@ impl LiveCollector {
             if let Err(e) = self.storage.delete_all(orphaned_number) {
                 tracing::warn!("Failed to delete orphaned block {}: {}", orphaned_number, e);
             }
+            // Clear progress for orphaned blocks to prevent compaction race
+            if let Some(ref tracker) = self.progress_tracker {
+                tracker.lock().await.clear_block(orphaned_number);
+            }
         }
 
         // Notify decoder of reorg so it can clean up any orphaned decoded data
         if let Some(decoder_tx) = log_decoder_tx {
-            let _ = decoder_tx
+            if let Err(e) = decoder_tx
                 .send(DecoderMessage::Reorg {
                     common_ancestor: event.common_ancestor,
                     orphaned: event.orphaned.clone(),
                 })
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to send reorg notification to decoder: {}", e);
+            }
         }
 
         // Notify transformation engine of reorg so it can clean up pending events
         if let Some(transform_tx) = transform_reorg_tx {
-            let _ = transform_tx
+            if let Err(e) = transform_tx
                 .send(ReorgMessage {
                     common_ancestor: event.common_ancestor,
                     orphaned: event.orphaned.clone(),
                 })
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to send reorg notification to transform engine: {}", e);
+            }
         }
 
         // Notify downstream of reorg
