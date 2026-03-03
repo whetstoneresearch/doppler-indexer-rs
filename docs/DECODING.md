@@ -46,7 +46,32 @@ The `DecoderMessage` enum coordinates communication between collectors and decod
 | `EventCallsReady` | Event-triggered eth_call results ready for decoding |
 | `FactoryAddresses` | Factory-discovered addresses for a range (needed for factory event matching) |
 | `OnceFileBackfilled` | A once-call file was backfilled with new columns - decoder should re-check it |
+| `Reorg` | A chain reorganization was detected - decoder should clean up orphaned blocks |
 | `AllComplete` | Shutdown signal when all ranges are complete |
+
+### Live Mode Flag
+
+The `LogsReady`, `EthCallsReady`, `OnceCallsReady`, and `EventCallsReady` variants include a `live_mode: bool` field that determines the output format:
+
+- **`live_mode: false`** (Historical mode): Decoded data is written to parquet files in `data/derived/{chain}/decoded/`
+- **`live_mode: true`** (Live mode): Decoded data is written to bincode files in `data/live/{chain}/decoded/` for fast per-block storage
+
+Live mode is used when processing blocks from WebSocket subscriptions, where data arrives one block at a time. The compact bincode format is later compacted into parquet ranges by the CompactionService.
+
+### Reorg Handling
+
+When the collector detects a chain reorganization (via parent hash mismatch), it sends a `Reorg` message to the decoder:
+
+```rust
+DecoderMessage::Reorg {
+    common_ancestor: u64,  // Last valid block number
+    orphaned: Vec<u64>,    // Block numbers to clean up
+}
+```
+
+The decoder responds by:
+1. Deleting decoded bincode files for all orphaned blocks
+2. Continuing to process new canonical blocks as they arrive
 
 ## Log Decoding
 
