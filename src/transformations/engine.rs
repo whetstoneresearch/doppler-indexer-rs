@@ -49,6 +49,15 @@ pub struct RangeCompleteMessage {
     pub range_end: u64,
 }
 
+/// Signal that a reorg occurred and orphaned blocks need cleanup.
+#[derive(Debug)]
+pub struct ReorgMessage {
+    /// The block number of the common ancestor (last valid block).
+    pub common_ancestor: u64,
+    /// Block numbers that were orphaned and need cleanup.
+    pub orphaned: Vec<u64>,
+}
+
 /// Execution mode for the transformation engine.
 #[derive(Debug, Clone, Copy)]
 pub enum ExecutionMode {
@@ -1165,11 +1174,15 @@ impl TransformationEngine {
     /// Events and calls are processed immediately as they arrive.
     /// For event handlers with call dependencies, events are buffered until
     /// their required calls arrive.
+    ///
+    /// The optional `reorg_rx` channel receives reorg notifications from live mode
+    /// to clean up pending events for orphaned blocks.
     pub async fn run(
         &self,
         mut events_rx: Receiver<DecodedEventsMessage>,
         mut calls_rx: Receiver<DecodedCallsMessage>,
         mut complete_rx: Receiver<RangeCompleteMessage>,
+        mut reorg_rx: Option<Receiver<ReorgMessage>>,
         decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<(), TransformationError> {
         // Wait for decode catchup to finish so all decoded parquet files exist
@@ -1230,6 +1243,15 @@ impl TransformationEngine {
 
                 Some(msg) = complete_rx.recv() => {
                     self.process_range_complete(msg).await?;
+                }
+
+                Some(msg) = async {
+                    match reorg_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.process_reorg(msg).await?;
                 }
 
                 else => {
@@ -1679,13 +1701,32 @@ impl TransformationEngine {
             ).await?;
         }
 
-        // Clean up buffered state for this range
+        // Clean up buffered state for this range and warn about stuck events
         let range_key = (msg.range_start, msg.range_end);
         {
             let mut state = self.live_state.lock().await;
             state.calls_buffer.remove(&range_key);
             for ranges in state.received_calls.values_mut() {
                 ranges.remove(&range_key);
+            }
+
+            // Check for pending events that are still waiting for this range
+            // This indicates a potential configuration issue or missing call data
+            for (handler_key, pending_list) in state.pending_events.iter() {
+                for pending in pending_list {
+                    if (pending.range_start, pending.range_end) == range_key {
+                        tracing::warn!(
+                            "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for={:?}. \
+                             This may indicate missing eth_call configuration or RPC failure.",
+                            handler_key,
+                            pending.range_start,
+                            pending.range_end,
+                            pending.source_name,
+                            pending.event_name,
+                            pending.required_calls
+                        );
+                    }
+                }
             }
         }
 
@@ -1695,6 +1736,66 @@ impl TransformationEngine {
             msg.range_start,
             msg.range_end
         );
+
+        Ok(())
+    }
+
+    /// Process a reorg notification by cleaning up pending events for orphaned blocks.
+    ///
+    /// When a reorg occurs, any events buffered for orphaned blocks should be discarded
+    /// since those blocks are no longer part of the canonical chain.
+    async fn process_reorg(&self, msg: ReorgMessage) -> Result<(), TransformationError> {
+        tracing::info!(
+            "Processing reorg: common_ancestor={}, orphaned={:?}",
+            msg.common_ancestor,
+            msg.orphaned
+        );
+
+        let mut state = self.live_state.lock().await;
+        let mut total_removed = 0;
+
+        // For each orphaned block number, remove pending events with matching ranges
+        for &orphaned_block in &msg.orphaned {
+            // In live mode, each block is its own range: (block, block+1)
+            let range_key = (orphaned_block, orphaned_block + 1);
+
+            // Remove from calls_buffer
+            if state.calls_buffer.remove(&range_key).is_some() {
+                tracing::debug!("Removed calls buffer for orphaned range {:?}", range_key);
+            }
+
+            // Remove from received_calls
+            for ranges in state.received_calls.values_mut() {
+                ranges.remove(&range_key);
+            }
+
+            // Remove pending events for this range from all handlers
+            for (handler_key, pending_list) in state.pending_events.iter_mut() {
+                let initial_len = pending_list.len();
+                pending_list.retain(|pending| {
+                    let matches = (pending.range_start, pending.range_end) == range_key;
+                    if matches {
+                        tracing::debug!(
+                            "Removing pending event for handler {} at orphaned range {:?}",
+                            handler_key, range_key
+                        );
+                    }
+                    !matches
+                });
+                total_removed += initial_len - pending_list.len();
+            }
+
+            // Clean up empty entries
+            state.pending_events.retain(|_, v| !v.is_empty());
+        }
+
+        if total_removed > 0 {
+            tracing::info!(
+                "Reorg cleanup: removed {} pending events for {} orphaned blocks",
+                total_removed,
+                msg.orphaned.len()
+            );
+        }
 
         Ok(())
     }

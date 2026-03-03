@@ -29,7 +29,7 @@ use live::{CompactionService, LiveCollector, LiveMessage, LiveModeConfig, LivePr
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
-    RangeCompleteMessage, TransformationEngine,
+    RangeCompleteMessage, ReorgMessage, TransformationEngine,
 };
 use types::config::chain::ChainConfig;
 use types::config::eth_call::Frequency;
@@ -302,12 +302,14 @@ async fn process_chain_live_only(
     }
 
     // Spawn live mode directly (no historical processing)
+    // Note: In live-only mode, transformation engine is not running, so no reorg channel
     spawn_live_mode(
         Arc::new(chain.clone()),
         config,
         http_client,
         db_pool,
         log_decoder_tx,
+        None, // No transform_reorg_tx in live-only mode
         &mut tasks,
     )
     .await?;
@@ -450,6 +452,9 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
     let (transform_complete_tx, transform_complete_rx) =
         optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
+    // Reorg channel for live mode cleanup of pending events
+    let (transform_reorg_tx, transform_reorg_rx) =
+        optional_channel::<ReorgMessage>(transformations_enabled, channel_cap);
 
     // Decode catchup must complete before transformation engine catchup
     let (decode_catchup_done_tx, decode_catchup_done_rx) = if transformations_enabled && has_calls {
@@ -784,6 +789,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
                     transform_events_rx.unwrap(),
                     transform_calls_rx.unwrap(),
                     transform_complete_rx.unwrap(),
+                    transform_reorg_rx,
                     decode_catchup_done_rx,
                 )
                 .await
@@ -806,6 +812,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             http_client_for_live.unwrap(),
             db_pool_for_live,
             log_decoder_tx_for_live,
+            transform_reorg_tx,
             &mut tasks,
         )
         .await?;
@@ -872,6 +879,7 @@ async fn spawn_live_mode(
     http_client: Arc<UnifiedRpcClient>,
     db_pool: Option<Arc<DbPool>>,
     log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+    transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let ws_env_var = chain
@@ -936,7 +944,7 @@ async fn spawn_live_mode(
     let collector = LiveCollector::new(chain.clone(), http_client.clone(), live_config.clone());
     tasks.spawn(async move {
         collector
-            .run(ws_event_rx, live_msg_tx, log_decoder_tx)
+            .run(ws_event_rx, live_msg_tx, log_decoder_tx, transform_reorg_tx)
             .await
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
     });

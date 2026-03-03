@@ -70,7 +70,7 @@ pub use context::{
 };
 pub use engine::{
     DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteMessage,
-    TransformationEngine,
+    ReorgMessage, TransformationEngine,
 };
 pub use error::TransformationError;
 pub use historical::HistoricalDataReader;
