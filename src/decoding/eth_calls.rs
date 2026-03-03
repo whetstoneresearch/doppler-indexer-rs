@@ -212,6 +212,7 @@ pub async fn decode_eth_calls(
         decoder_rx,
         &raw_calls_dir,
         &output_base,
+        &chain.name,
         &regular_configs,
         &once_configs,
         &event_configs,

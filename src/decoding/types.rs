@@ -41,6 +41,8 @@ pub enum DecoderMessage {
         range_start: u64,
         range_end: u64,
         logs: Vec<LogData>,
+        /// If true, write to live bincode storage instead of parquet
+        live_mode: bool,
     },
     /// Regular eth_call results ready for decoding
     EthCallsReady {
@@ -49,6 +51,8 @@ pub enum DecoderMessage {
         contract_name: String,
         function_name: String,
         results: Vec<EthCallResult>,
+        /// If true, write to live bincode storage instead of parquet
+        live_mode: bool,
     },
     /// "Once" eth_call results ready for decoding
     OnceCallsReady {
@@ -56,6 +60,8 @@ pub enum DecoderMessage {
         range_end: u64,
         contract_name: String,
         results: Vec<OnceCallResult>,
+        /// If true, write to live bincode storage instead of parquet
+        live_mode: bool,
     },
     /// Event-triggered eth_call results ready for decoding
     EventCallsReady {
@@ -64,6 +70,8 @@ pub enum DecoderMessage {
         contract_name: String,
         function_name: String,
         results: Vec<EventCallResult>,
+        /// If true, write to live bincode storage instead of parquet
+        live_mode: bool,
     },
     /// Factory addresses discovered for a range (needed for factory log/call decoding)
     FactoryAddresses {
@@ -77,6 +85,13 @@ pub enum DecoderMessage {
         range_start: u64,
         range_end: u64,
         contract_name: String,
+    },
+    /// A reorg was detected - decoder should clean up orphaned data
+    Reorg {
+        /// The common ancestor block number (last valid block)
+        common_ancestor: u64,
+        /// Block numbers that were orphaned and need cleanup
+        orphaned: Vec<u64>,
     },
     /// All ranges complete (shutdown signal)
     AllComplete,
