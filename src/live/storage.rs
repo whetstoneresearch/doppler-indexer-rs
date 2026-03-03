@@ -14,7 +14,7 @@
 //! ```
 
 use std::fs;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -61,9 +61,9 @@ impl LiveStorage {
         &self.base_dir
     }
 
-    /// Ensure all subdirectories exist.
+    /// Ensure all subdirectories exist and clean up leftover .tmp files.
     pub fn ensure_dirs(&self) -> Result<(), StorageError> {
-        for subdir in &[
+        let subdirs = [
             "blocks",
             "receipts",
             "logs",
@@ -71,8 +71,55 @@ impl LiveStorage {
             "status",
             "decoded/logs",
             "decoded/eth_calls",
-        ] {
+        ];
+
+        for subdir in &subdirs {
             fs::create_dir_all(self.base_dir.join(subdir))?;
+        }
+
+        // Clean up leftover .tmp files from interrupted writes
+        self.cleanup_temp_files(&subdirs)?;
+
+        Ok(())
+    }
+
+    /// Clean up leftover .tmp files from interrupted writes.
+    fn cleanup_temp_files(&self, subdirs: &[&str]) -> Result<(), StorageError> {
+        for subdir in subdirs {
+            let dir = self.base_dir.join(subdir);
+            if !dir.exists() {
+                continue;
+            }
+
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "tmp") {
+                        tracing::debug!("Cleaning up leftover temp file: {:?}", path);
+                        let _ = fs::remove_file(&path);
+                    }
+                    // Recursively clean subdirectories (for decoded/logs/{block}/{contract})
+                    if path.is_dir() {
+                        self.cleanup_temp_files_recursive(&path)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively clean up .tmp files in nested directories.
+    fn cleanup_temp_files_recursive(&self, dir: &Path) -> Result<(), StorageError> {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    self.cleanup_temp_files_recursive(&path)?;
+                } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                    tracing::debug!("Cleaning up leftover temp file: {:?}", path);
+                    let _ = fs::remove_file(&path);
+                }
+            }
         }
         Ok(())
     }
@@ -94,10 +141,7 @@ impl LiveStorage {
     /// Read a live block from storage.
     pub fn read_block(&self, block_number: u64) -> Result<LiveBlock, StorageError> {
         let path = self.block_path(block_number);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete a live block from storage.
@@ -141,10 +185,7 @@ impl LiveStorage {
     /// Read receipts for a block.
     pub fn read_receipts(&self, block_number: u64) -> Result<Vec<LiveReceipt>, StorageError> {
         let path = self.receipts_path(block_number);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete receipts for a block.
@@ -173,10 +214,7 @@ impl LiveStorage {
     /// Read logs for a block.
     pub fn read_logs(&self, block_number: u64) -> Result<Vec<LiveLog>, StorageError> {
         let path = self.logs_path(block_number);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete logs for a block.
@@ -210,10 +248,7 @@ impl LiveStorage {
     /// Read eth call results for a block.
     pub fn read_eth_calls(&self, block_number: u64) -> Result<Vec<LiveEthCall>, StorageError> {
         let path = self.eth_calls_path(block_number);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete eth call results for a block.
@@ -240,19 +275,30 @@ impl LiveStorage {
         status: &LiveBlockStatus,
     ) -> Result<(), StorageError> {
         let path = self.status_path(block_number);
-        let file = fs::File::create(&path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, status)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Write to temp file, flush, sync, then atomic rename
+        let temp_path = path.with_extension("tmp");
+        let file = fs::File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, status)?;
+
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .sync_all()?;
+
+        fs::rename(&temp_path, &path)?;
         Ok(())
     }
 
     /// Read status for a block.
     pub fn read_status(&self, block_number: u64) -> Result<LiveBlockStatus, StorageError> {
         let path = self.status_path(block_number);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        let file = fs::File::open(&path)?;
+        let file = fs::File::open(&path).map_err(|e| map_io_not_found(e, block_number))?;
         let reader = BufReader::new(file);
         let status = serde_json::from_reader(reader)?;
         Ok(status)
@@ -306,10 +352,7 @@ impl LiveStorage {
         event_name: &str,
     ) -> Result<Vec<LiveDecodedLog>, StorageError> {
         let path = self.decoded_logs_path(block_number, contract_name, event_name);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete decoded logs for a specific event type.
@@ -406,10 +449,7 @@ impl LiveStorage {
         function_name: &str,
     ) -> Result<Vec<LiveDecodedCall>, StorageError> {
         let path = self.decoded_calls_path(block_number, contract_name, function_name);
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete decoded eth_calls for a specific function.
@@ -459,10 +499,7 @@ impl LiveStorage {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join(format!("{}_event.bin", function_name));
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Write decoded "once" calls.
@@ -487,10 +524,7 @@ impl LiveStorage {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join("_once.bin");
-        if !path.exists() {
-            return Err(StorageError::NotFound(block_number));
-        }
-        read_bincode(&path)
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
 
     /// List all (contract_name, function_name) pairs with decoded calls for a block.
@@ -604,9 +638,20 @@ fn write_bincode<T: Serialize>(path: &Path, data: &T) -> Result<(), StorageError
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = fs::File::create(path)?;
-    let writer = BufWriter::new(file);
-    bincode::serialize_into(writer, data)?;
+
+    // Write to temp file, flush, sync, then atomic rename
+    let temp_path = path.with_extension("tmp");
+    let file = fs::File::create(&temp_path)?;
+    let mut writer = BufWriter::new(file);
+    bincode::serialize_into(&mut writer, data)?;
+
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .sync_all()?;
+
+    fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -614,9 +659,20 @@ fn write_bincode_slice<T: Serialize>(path: &Path, data: &[T]) -> Result<(), Stor
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = fs::File::create(path)?;
-    let writer = BufWriter::new(file);
-    bincode::serialize_into(writer, data)?;
+
+    // Write to temp file, flush, sync, then atomic rename
+    let temp_path = path.with_extension("tmp");
+    let file = fs::File::create(&temp_path)?;
+    let mut writer = BufWriter::new(file);
+    bincode::serialize_into(&mut writer, data)?;
+
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .sync_all()?;
+
+    fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -625,6 +681,25 @@ fn read_bincode<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
     let reader = BufReader::new(file);
     let data = bincode::deserialize_from(reader)?;
     Ok(data)
+}
+
+/// Map IO NotFound errors to StorageError::NotFound for bincode operations.
+fn map_not_found(err: StorageError, block_number: u64) -> StorageError {
+    match err {
+        StorageError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            StorageError::NotFound(block_number)
+        }
+        other => other,
+    }
+}
+
+/// Map raw IO NotFound errors to StorageError::NotFound.
+fn map_io_not_found(err: std::io::Error, block_number: u64) -> StorageError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        StorageError::NotFound(block_number)
+    } else {
+        StorageError::Io(err)
+    }
 }
 
 fn list_block_numbers(dir: &Path) -> Result<Vec<u64>, StorageError> {
