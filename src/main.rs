@@ -1,6 +1,7 @@
 #[cfg(feature = "bench")]
 mod bench;
 mod db;
+mod live;
 mod metrics;
 mod raw_data;
 mod rpc;
@@ -13,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
@@ -24,7 +25,8 @@ use raw_data::historical::factories::{FactoryMessage, RecollectRequest};
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
+use live::{CompactionService, LiveCollector, LiveMessage, LiveModeConfig, LiveProgressTracker};
+use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
     RangeCompleteMessage, TransformationEngine,
@@ -59,9 +61,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = env::args().collect();
     let decode_only = args.iter().any(|a| a == "--decode-only");
+    let live_only = args.iter().any(|a| a == "--live-only");
+
+    if live_only && decode_only {
+        anyhow::bail!("Cannot use --live-only and --decode-only together");
+    }
 
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
-    if !decode_only {
+    if !decode_only && !live_only {
         load_required_env_vars(&config)?;
     }
 
@@ -86,12 +93,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             "Running in decode-only mode (no collection, no transformations)"
         );
+    } else if live_only {
+        tracing::info!(
+            "Running in live-only mode (skips historical processing)"
+        );
     }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
     for chain in &config.chains {
-        if decode_only {
+        if live_only {
+            process_chain_live_only(&config, chain).await?;
+        } else if decode_only {
             decode_only_chain(&config, chain).await?;
         } else {
             process_chain(&config, chain).await?;
@@ -202,6 +215,109 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
     }
 
     tracing::info!("Decode-only processing complete for chain {}", chain.name);
+    Ok(())
+}
+
+/// Live-only mode: skips historical processing and starts directly in live mode.
+/// Useful for testing live mode in isolation or running on a dedicated machine.
+async fn process_chain_live_only(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+) -> anyhow::Result<()> {
+    tracing::info!("Processing chain {} in live-only mode", chain.name);
+
+    // Validate WebSocket is configured
+    if !should_enable_live_mode(config, chain) {
+        anyhow::bail!(
+            "Live-only mode requires live_mode=true (or not set) and ws_url_env_var configured for chain {}",
+            chain.name
+        );
+    }
+
+    // Load .env if needed for WS URL
+    if let Some(ref ws_env_var) = chain.ws_url_env_var {
+        if env::var(ws_env_var).is_err() {
+            dotenvy::dotenv().ok();
+        }
+    }
+
+    // Setup RPC client
+    let rpc_url = env::var(&chain.rpc_url_env_var).with_context(|| {
+        format!(
+            "env var {} not set for chain {}",
+            chain.rpc_url_env_var, chain.name
+        )
+    })?;
+    let http_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
+
+    // Setup database if transformations enabled
+    let db_pool = if let Some(ref tc) = config.transformations {
+        let database_url = env::var(&tc.database_url_env_var).with_context(|| {
+            format!(
+                "env var {} not set for transformations",
+                tc.database_url_env_var
+            )
+        })?;
+
+        let pool = DbPool::new(&database_url)
+            .await
+            .context("failed to create database pool")?;
+        pool.run_migrations()
+            .await
+            .context("failed to run database migrations")?;
+
+        tracing::info!("Database pool initialized for live mode");
+        Some(Arc::new(pool))
+    } else {
+        None
+    };
+
+    // Check if decoding is needed
+    let has_events = chain.contracts.values().any(|c| {
+        has_items(&c.events)
+            || c.factories
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.events)))
+    });
+
+    // Setup decoder channel
+    let (log_decoder_tx, log_decoder_rx) = if has_events {
+        let (tx, rx) = mpsc::channel(1000);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+
+    // Spawn decoder task for live mode (if events are configured)
+    if let Some(rx) = log_decoder_rx {
+        let chain = Arc::new(chain.clone());
+        let cfg = config.raw_data_collection.clone();
+        tasks.spawn(async move {
+            decode_logs(&chain, &cfg, rx, None, None, None)
+                .await
+                .context("log decoding failed")
+        });
+    }
+
+    // Spawn live mode directly (no historical processing)
+    spawn_live_mode(
+        Arc::new(chain.clone()),
+        config,
+        http_client,
+        db_pool,
+        log_decoder_tx,
+        &mut tasks,
+    )
+    .await?;
+
+    // Run until shutdown
+    while let Some(result) = tasks.join_next().await {
+        result.context("live-only task panicked")??;
+    }
+
+    tracing::info!("Live-only processing complete for chain {}", chain.name);
     Ok(())
 }
 
@@ -444,6 +560,20 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         None
     };
 
+    // Clone for live mode transition (before originals are moved)
+    let log_decoder_tx_for_live = if has_events && should_enable_live_mode(config, &chain) {
+        log_decoder_tx.clone()
+    } else {
+        None
+    };
+
+    // Create HTTP client for live mode (if enabled)
+    let http_client_for_live = if should_enable_live_mode(config, &chain) {
+        Some(Arc::new(UnifiedRpcClient::from_url(&rpc_url)?))
+    } else {
+        None
+    };
+
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     tasks.spawn({
@@ -605,6 +735,13 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         });
     }
 
+    // Clone db_pool for live mode before it's potentially consumed by transformation engine
+    let db_pool_for_live = if should_enable_live_mode(config, &chain) {
+        db_pool.clone()
+    } else {
+        None
+    };
+
     if transformations_enabled {
         let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
         let tc = config.transformations.as_ref().unwrap();
@@ -658,6 +795,164 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         result.context("pipeline task panicked")??;
     }
 
-    tracing::info!("Completed collection for chain {}", chain.name);
+    tracing::info!("Completed historical processing for chain {}", chain.name);
+
+    // Transition to live mode (default behavior unless explicitly disabled)
+    if should_enable_live_mode(config, &chain) {
+        tracing::info!("Historical processing complete, transitioning to live mode");
+        spawn_live_mode(
+            chain.clone(),
+            config,
+            http_client_for_live.unwrap(),
+            db_pool_for_live,
+            log_decoder_tx_for_live,
+            &mut tasks,
+        )
+        .await?;
+
+        // Wait for live mode tasks (run indefinitely until shutdown)
+        while let Some(result) = tasks.join_next().await {
+            result.context("live mode task panicked")??;
+        }
+    } else {
+        tracing::info!("Live mode not enabled, exiting after historical processing");
+    }
+
+    Ok(())
+}
+
+/// Check if live mode should be enabled for a chain.
+///
+/// Live mode is enabled by default and only disabled if:
+/// - `live_mode` is explicitly set to `false` in config
+/// - `ws_url_env_var` is not set in chain config
+/// - The WebSocket URL environment variable is not set
+fn should_enable_live_mode(config: &IndexerConfig, chain: &ChainConfig) -> bool {
+    // Live mode is enabled by default, only disabled if explicitly set to false
+    let live_mode_enabled = config
+        .raw_data_collection
+        .live_mode
+        .unwrap_or(true);
+
+    if !live_mode_enabled {
+        tracing::info!("Live mode explicitly disabled for chain {}", chain.name);
+        return false;
+    }
+
+    // Require WebSocket URL to be configured
+    let Some(ref ws_env_var) = chain.ws_url_env_var else {
+        tracing::debug!(
+            "Live mode skipped: ws_url_env_var not set for chain {}",
+            chain.name
+        );
+        return false;
+    };
+
+    if env::var(ws_env_var).is_err() {
+        tracing::debug!(
+            "Live mode skipped: {} env var not set for chain {}",
+            ws_env_var,
+            chain.name
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Spawn live mode tasks for a chain.
+///
+/// This sets up:
+/// - WebSocket client subscription
+/// - Live block collector
+/// - Compaction service
+async fn spawn_live_mode(
+    chain: Arc<ChainConfig>,
+    config: &IndexerConfig,
+    http_client: Arc<UnifiedRpcClient>,
+    db_pool: Option<Arc<DbPool>>,
+    log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+    tasks: &mut JoinSet<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let ws_env_var = chain
+        .ws_url_env_var
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ws_url_env_var not set"))?;
+
+    let ws_url = env::var(ws_env_var).with_context(|| {
+        format!("env var {} not set for chain {}", ws_env_var, chain.name)
+    })?;
+
+    // Build live mode config
+    let live_config = LiveModeConfig {
+        reorg_depth: config
+            .raw_data_collection
+            .reorg_depth
+            .unwrap_or(128),
+        compaction_interval_secs: config
+            .raw_data_collection
+            .compaction_interval_secs
+            .unwrap_or(10),
+        range_size: config
+            .raw_data_collection
+            .parquet_block_range
+            .unwrap_or(1000) as u64,
+    };
+
+    tracing::info!(
+        "Starting live mode for chain {} with reorg_depth={}, compaction_interval={}s",
+        chain.name,
+        live_config.reorg_depth,
+        live_config.compaction_interval_secs
+    );
+
+    // Create WebSocket client
+    let ws_client = Arc::new(
+        WsClient::from_urls(&ws_url, http_client.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to create WebSocket client: {}", e))?,
+    );
+
+    // Create channels
+    let (ws_event_tx, ws_event_rx) = mpsc::unbounded_channel();
+    let (live_msg_tx, _live_msg_rx) = mpsc::channel::<LiveMessage>(1000);
+    let (compaction_shutdown_tx, compaction_shutdown_rx) = oneshot::channel();
+
+    // Create progress tracker
+    let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
+        chain.chain_id as i64,
+        db_pool.clone(),
+    )));
+
+    // Start WebSocket subscription
+    let ws_handle = ws_client.clone().subscribe(ws_event_tx);
+    tasks.spawn(async move {
+        ws_handle
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket task panicked: {:?}", e))?
+            .map_err(|e| anyhow::anyhow!("WebSocket error: {}", e))
+    });
+
+    // Start live collector
+    let collector = LiveCollector::new(chain.clone(), http_client.clone(), live_config.clone());
+    tasks.spawn(async move {
+        collector
+            .run(ws_event_rx, live_msg_tx, log_decoder_tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
+    });
+
+    // Start compaction service
+    let compaction = CompactionService::new(
+        chain.name.clone(),
+        chain.chain_id,
+        live_config,
+        db_pool,
+        progress_tracker,
+    );
+    tasks.spawn(async move {
+        compaction.run(compaction_shutdown_rx).await;
+        Ok(())
+    });
+
     Ok(())
 }
