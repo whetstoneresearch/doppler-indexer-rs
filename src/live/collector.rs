@@ -13,7 +13,7 @@ use std::sync::Arc;
 use alloy::primitives::B256;
 use alloy::rpc::types::BlockNumberOrTag;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
@@ -131,6 +131,10 @@ impl LiveCollector {
             self.config.reorg_depth
         );
 
+        // Gap detection and backfill happen on first block
+        let mut first_block_seen = false;
+        let expected_start_block = self.expected_start_block;
+
         while let Some(event) = ws_rx.recv().await {
             match event {
                 WsEvent::NewBlock {
@@ -139,6 +143,39 @@ impl LiveCollector {
                     parent_hash,
                     timestamp,
                 } => {
+                    // Check for gap on first block
+                    if !first_block_seen {
+                        first_block_seen = true;
+                        if let Some(expected) = expected_start_block {
+                            if number > expected + 1 {
+                                tracing::warn!(
+                                    "Gap detected: expected block {}, received {}. Backfilling {} blocks.",
+                                    expected + 1,
+                                    number,
+                                    number - expected - 1
+                                );
+                                // Backfill the gap before processing this block
+                                if let Err(e) = self
+                                    .backfill_blocks(
+                                        expected + 1,
+                                        number - 1,
+                                        &live_tx,
+                                        &log_decoder_tx,
+                                        &transform_reorg_tx,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        "Error backfilling gap blocks {}-{}: {}",
+                                        expected + 1,
+                                        number - 1,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     let block = LiveBlock {
                         number,
                         hash: hash.0,
