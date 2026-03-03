@@ -37,7 +37,7 @@ use doppler_indexer_rs::raw_data::historical::catchup::logs as catchup_logs;
 use doppler_indexer_rs::raw_data::historical::current::logs as current_logs;
 use doppler_indexer_rs::raw_data::historical::receipts::{LogData, LogMessage};
 use doppler_indexer_rs::raw_data::historical::factories::FactoryAddressData;
-use doppler_indexer_rs::raw_data::decoding::DecoderMessage;
+use doppler_indexer_rs::decoding::DecoderMessage;
 use tokio::sync::mpsc;
 
 // Channel from receipt collector (sends LogMessage)
@@ -139,12 +139,16 @@ When `decoder_tx` is provided, the collector sends `DecoderMessage` for each com
 
 ```rust
 pub enum DecoderMessage {
-    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData> },
+    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData>, live_mode: bool },
+    Reorg { common_ancestor: u64, orphaned: Vec<u64> },
     AllComplete,
 }
 ```
 
 - **`LogsReady`** - Sends the filtered logs for a completed range to the decoder
+  - `live_mode: false` for historical collection (writes parquet)
+  - `live_mode: true` for live WebSocket collection (writes bincode)
+- **`Reorg`** - Signals a chain reorganization for cleanup of orphaned blocks
 - **`AllComplete`** - Signals that all log collection is finished
 
 ## Output

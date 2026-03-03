@@ -237,6 +237,15 @@ cargo run --release -- --decode-only
 
 Useful for re-decoding data after ABI changes or profiling the decoding pipeline.
 
+## Live-Only Mode
+
+Skip historical processing and start directly in live mode:
+```bash
+cargo run --release -- --live-only
+```
+
+Requires WebSocket URL (`ws_url_env_var`) to be configured. Useful for testing live mode in isolation.
+
 ## Quick Start
 
 1. Create a configuration file (see [Configuration](./CONFIG.md))
@@ -280,6 +289,7 @@ cargo run --release
 | [On-Event Calls](./ON_EVENT_CALLS.md) | Event-triggered eth_calls |
 | [Decoding](./DECODING.md) | ABI-based event and call decoding |
 | [Transformations](./TRANSFORMATIONS.md) | Custom handlers, PostgreSQL output, historical queries |
+| [Live Mode](./LIVE_MODE.md) | Real-time block processing via WebSocket |
 | [Parallelism](./PARALLELISM.md) | Task architecture and data flow |
 | [RPC](./RPC.md) | RPC client, rate limiting, and retries |
 

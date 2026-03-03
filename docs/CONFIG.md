@@ -40,6 +40,7 @@ An array of chain configurations. Each chain requires:
 | `name` | string | Yes | Human-readable chain identifier |
 | `chain_id` | number | Yes | EVM chain ID |
 | `rpc_url_env_var` | string | Yes | Environment variable name containing the RPC URL |
+| `ws_url_env_var` | string | No | Environment variable name containing WebSocket URL (enables live mode) |
 | `start_block` | number | No | Block number to start indexing from |
 | `contracts` | object \| string | Yes | Inline contracts object or path to contracts file/directory |
 | `tokens` | object \| string | Yes | Inline tokens object or path to tokens file/directory |
@@ -86,17 +87,20 @@ When omitted, the default per-transaction batching is used (`eth_getTransactionR
 
 Controls how raw blockchain data is collected and stored:
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `parquet_block_range` | number | No | Number of blocks per parquet file |
-| `rpc_batch_size` | number | No | Batch size for RPC requests |
-| `fields` | object | Yes | Specifies which fields to collect |
-| `contract_logs_only` | boolean | No | If true, only collect logs from configured contracts |
-| `channel_capacity` | number | No | Capacity for main channels (blocks, logs, eth_calls). Default: 1000 |
-| `factory_channel_capacity` | number | No | Capacity for factory-related channels. Default: 1000 |
-| `block_receipt_concurrency` | number | No | Number of blocks to fetch receipts for concurrently when using `block_receipts_method`. Default: 10 |
-| `decoding_concurrency` | number | No | Number of concurrent decoding tasks for log and eth_call decoding. Default: 4 |
-| `factory_concurrency` | number | No | Number of concurrent tasks for factory collection catchup. Default: 4 |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `parquet_block_range` | number | No | - | Number of blocks per parquet file |
+| `rpc_batch_size` | number | No | - | Batch size for RPC requests |
+| `fields` | object | Yes | - | Specifies which fields to collect |
+| `contract_logs_only` | boolean | No | - | If true, only collect logs from configured contracts |
+| `channel_capacity` | number | No | 1000 | Capacity for main channels (blocks, logs, eth_calls) |
+| `factory_channel_capacity` | number | No | 1000 | Capacity for factory-related channels |
+| `block_receipt_concurrency` | number | No | 10 | Number of blocks to fetch receipts for concurrently when using `block_receipts_method` |
+| `decoding_concurrency` | number | No | 4 | Number of concurrent decoding tasks for log and eth_call decoding |
+| `factory_concurrency` | number | No | 4 | Number of concurrent tasks for factory collection catchup |
+| `live_mode` | boolean | No | `true` | Enable live mode after historical catchup (requires `ws_url_env_var` in chain config) |
+| `reorg_depth` | number | No | 128 | Blocks to track for reorg detection in live mode |
+| `compaction_interval_secs` | number | No | 10 | Interval between compaction checks in live mode |
 
 #### Fields Configuration
 
