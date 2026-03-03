@@ -734,6 +734,46 @@ For historical catchup, transformations process larger batches:
 
 Configure in `mode.batch_for_catchup` and `mode.catchup_batch_size`.
 
+## Live Mode Progress Tracking
+
+In live mode, the transformation engine integrates with `LiveProgressTracker` to coordinate handler completion with the compaction service.
+
+### How It Works
+
+1. **Registration:** Before starting, all handlers are registered with the progress tracker:
+   ```rust
+   for handler in registry.all_handlers() {
+       tracker.register_handler(&handler.handler_key());
+   }
+   ```
+
+2. **Completion marking:** After processing a single-block range (live mode), the engine marks progress:
+   ```rust
+   // After record_completed_range_for_handler()
+   if range_end - range_start == 1 {
+       tracker.mark_complete(range_start, &handler_key).await?;
+   }
+   ```
+
+3. **Compaction coordination:** The compaction service checks `is_block_complete(block)` before compacting. A block is complete only when ALL registered handlers have marked it complete.
+
+### Why Single-Block Detection?
+
+The engine uses `range_end - range_start == 1` to identify live mode ranges:
+- Historical catchup: ranges like 1000-1999 (multi-block)
+- Live mode: ranges like 100-101 (single block)
+
+This heuristic allows the engine to use the same code path for both modes while only updating the live progress tracker for actual live blocks.
+
+### Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `_handler_progress` | Per-handler catchup progress (range-based) |
+| `_live_progress` | Per-handler live block completion (block-based) |
+
+During compaction, `_live_progress` entries are migrated to `_handler_progress` and deleted.
+
 ## File Structure
 
 ```
