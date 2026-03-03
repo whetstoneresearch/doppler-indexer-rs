@@ -2,3 +2,5 @@
 .env
 data/
 output.log
+scripts/
+.claude
