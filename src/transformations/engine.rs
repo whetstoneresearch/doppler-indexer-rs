@@ -85,6 +85,26 @@ struct PendingEventData {
     required_calls: Vec<(String, String)>,
 }
 
+/// Tracks the state of a row before an UPSERT modification (for reorg restoration).
+///
+/// When a reorg occurs, we need to restore rows to their pre-modification state.
+/// For rows that existed before the orphaned block modified them, we re-INSERT
+/// the previous values. For rows that didn't exist, the DELETE by block_number
+/// is sufficient.
+#[derive(Debug, Clone)]
+struct UpsertSnapshot {
+    /// Table name
+    table: String,
+    /// Handler source name (for scoped restoration)
+    source: String,
+    /// Handler version (for scoped restoration)
+    source_version: u32,
+    /// Primary key columns and their values
+    key_columns: Vec<(String, DbValue)>,
+    /// Full row data before modification (None if row didn't exist)
+    previous_row: Option<HashMap<String, DbValue>>,
+}
+
 /// Live processing state for buffering events with call dependencies.
 #[derive(Default)]
 struct LiveProcessingState {
@@ -96,6 +116,9 @@ struct LiveProcessingState {
     calls_buffer: HashMap<(u64, u64), Vec<DecodedCall>>,
     /// Buffer events waiting for calls, keyed by handler_key.
     pending_events: HashMap<String, Vec<PendingEventData>>,
+    /// Pre-modification snapshots per block (for reorg rollback).
+    /// Key: block_number, Value: list of snapshots for that block
+    upsert_snapshots: HashMap<u64, Vec<UpsertSnapshot>>,
 }
 
 /// The transformation engine processes decoded data and invokes handlers.
@@ -1730,6 +1753,11 @@ impl TransformationEngine {
             }
         }
 
+        // Clean up old upsert snapshots beyond reorg depth
+        // Typical reorg depth is 128 blocks for Ethereum
+        const REORG_DEPTH: u64 = 128;
+        self.cleanup_old_snapshots(msg.range_end, REORG_DEPTH).await;
+
         tracing::debug!(
             "Recorded progress for {} handlers on range {}-{}",
             handlers.len(),
@@ -1740,10 +1768,31 @@ impl TransformationEngine {
         Ok(())
     }
 
-    /// Process a reorg notification by cleaning up pending events for orphaned blocks.
+    /// Clean up upsert snapshots older than reorg_depth blocks.
+    /// Called after processing each range to keep memory bounded.
+    async fn cleanup_old_snapshots(&self, current_block: u64, reorg_depth: u64) {
+        let cutoff = current_block.saturating_sub(reorg_depth);
+        let mut state = self.live_state.lock().await;
+        let before = state.upsert_snapshots.len();
+        state.upsert_snapshots.retain(|&block, _| block > cutoff);
+        let removed = before - state.upsert_snapshots.len();
+        if removed > 0 {
+            tracing::debug!(
+                "Cleaned up {} old upsert snapshots (blocks <= {})",
+                removed,
+                cutoff
+            );
+        }
+    }
+
+    /// Process a reorg notification by:
+    /// 1. Cleaning up pending events for orphaned blocks (memory)
+    /// 2. Deleting committed rows from database tables
+    /// 3. Cleaning up _live_progress entries
     ///
     /// When a reorg occurs, any events buffered for orphaned blocks should be discarded
-    /// since those blocks are no longer part of the canonical chain.
+    /// since those blocks are no longer part of the canonical chain. Additionally,
+    /// data already committed to the database for orphaned blocks must be rolled back.
     async fn process_reorg(&self, msg: ReorgMessage) -> Result<(), TransformationError> {
         tracing::info!(
             "Processing reorg: common_ancestor={}, orphaned={:?}",
@@ -1751,11 +1800,44 @@ impl TransformationEngine {
             msg.orphaned
         );
 
+        if msg.orphaned.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: Clean up in-memory state
+        let total_removed = self.cleanup_pending_state(&msg.orphaned).await;
+        if total_removed > 0 {
+            tracing::info!(
+                "Reorg cleanup: removed {} pending events for {} orphaned blocks",
+                total_removed,
+                msg.orphaned.len()
+            );
+        }
+
+        // Phase 2: Delete committed rows from database tables
+        self.cleanup_reorg_tables(&msg.orphaned).await?;
+
+        // Phase 3: Clean up _live_progress entries
+        self.cleanup_live_progress(&msg.orphaned).await?;
+
+        // Phase 4: Clean up upsert snapshots for orphaned blocks
+        {
+            let mut state = self.live_state.lock().await;
+            for &orphaned_block in &msg.orphaned {
+                state.upsert_snapshots.remove(&orphaned_block);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clean up in-memory pending state for orphaned blocks.
+    /// Returns the number of pending events removed.
+    async fn cleanup_pending_state(&self, orphaned: &[u64]) -> usize {
         let mut state = self.live_state.lock().await;
         let mut total_removed = 0;
 
-        // For each orphaned block number, remove pending events with matching ranges
-        for &orphaned_block in &msg.orphaned {
+        for &orphaned_block in orphaned {
             // In live mode, each block is its own range: (block, block+1)
             let range_key = (orphaned_block, orphaned_block + 1);
 
@@ -1784,18 +1866,89 @@ impl TransformationEngine {
                 });
                 total_removed += initial_len - pending_list.len();
             }
-
-            // Clean up empty entries
-            state.pending_events.retain(|_, v| !v.is_empty());
         }
 
-        if total_removed > 0 {
-            tracing::info!(
-                "Reorg cleanup: removed {} pending events for {} orphaned blocks",
-                total_removed,
-                msg.orphaned.len()
-            );
+        // Clean up empty entries
+        state.pending_events.retain(|_, v| !v.is_empty());
+
+        total_removed
+    }
+
+    /// Delete committed rows from handler-declared reorg tables for orphaned blocks.
+    async fn cleanup_reorg_tables(&self, orphaned: &[u64]) -> Result<(), TransformationError> {
+        // Collect all unique reorg tables from all handlers
+        let mut tables_to_clean: HashSet<&str> = HashSet::new();
+        for handler in self.registry.all_handlers() {
+            tables_to_clean.extend(handler.reorg_tables());
         }
+
+        if tables_to_clean.is_empty() {
+            tracing::debug!("No reorg tables declared by handlers, skipping database cleanup");
+            return Ok(());
+        }
+
+        // Build the block_number IN clause
+        let block_list = orphaned
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Generate DELETE operations for each table
+        let mut ops = Vec::new();
+        for table in &tables_to_clean {
+            ops.push(DbOperation::Delete {
+                table: table.to_string(),
+                where_clause: WhereClause::Raw {
+                    condition: format!(
+                        "chain_id = {} AND block_number IN ({})",
+                        self.chain_id, block_list
+                    ),
+                    params: vec![],
+                },
+            });
+        }
+
+        // Execute all deletes in single transaction
+        tracing::info!(
+            "Reorg cleanup: deleting from {} tables ({:?}) for {} orphaned blocks",
+            ops.len(),
+            tables_to_clean,
+            orphaned.len()
+        );
+        self.db_pool.execute_transaction(ops).await?;
+
+        Ok(())
+    }
+
+    /// Clean up _live_progress entries for orphaned blocks.
+    async fn cleanup_live_progress(&self, orphaned: &[u64]) -> Result<(), TransformationError> {
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        let block_list = orphaned
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let ops = vec![DbOperation::Delete {
+            table: "_live_progress".to_string(),
+            where_clause: WhereClause::Raw {
+                condition: format!(
+                    "chain_id = {} AND block_number IN ({})",
+                    self.chain_id, block_list
+                ),
+                params: vec![],
+            },
+        }];
+
+        tracing::debug!(
+            "Reorg cleanup: deleting _live_progress for {} orphaned blocks",
+            orphaned.len()
+        );
+        self.db_pool.execute_transaction(ops).await?;
 
         Ok(())
     }

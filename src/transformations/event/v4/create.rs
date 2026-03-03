@@ -35,6 +35,12 @@ impl TransformationHandler for V4CreateHandler {
         ]
     }
 
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        // tokens and pools have block_number for rollback
+        // v4_pool_configs is immutable config without block_number
+        vec!["tokens", "pools"]
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,
