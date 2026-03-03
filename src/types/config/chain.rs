@@ -14,6 +14,8 @@ pub struct ChainConfigRaw {
     pub name: String,
     pub chain_id: u64,
     pub rpc_url_env_var: String,
+    /// Environment variable name for WebSocket URL (for live mode).
+    pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
     pub contracts: ContractsOrPath,
     pub tokens: TokensOrPath,
@@ -27,6 +29,8 @@ pub struct ChainConfig {
     pub name: String,
     pub chain_id: u64,
     pub rpc_url_env_var: String,
+    /// Environment variable name for WebSocket URL (for live mode).
+    pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
     pub contracts: Contracts,
     pub tokens: Tokens,
@@ -82,6 +86,7 @@ pub fn resolve_chain_config(
         name: raw_config.name,
         chain_id: raw_config.chain_id,
         rpc_url_env_var: raw_config.rpc_url_env_var,
+        ws_url_env_var: raw_config.ws_url_env_var,
         start_block: raw_config.start_block,
         contracts,
         tokens,
