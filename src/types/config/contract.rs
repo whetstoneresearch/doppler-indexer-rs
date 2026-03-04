@@ -4,6 +4,8 @@ use std::path::Path;
 use alloy_primitives::{keccak256, Address, U256};
 use serde::Deserialize;
 use crate::types::config::eth_call::EthCallConfig;
+use crate::types::config::generic::{InlineOrPath, SingleOrMultiple};
+use crate::types::config::loader::{load_config_from_path, ConfigLoadError};
 
 /// Configuration for an event to decode
 /// Signature format: "Transfer(address indexed from, address indexed to, uint256 value)"
@@ -55,12 +57,8 @@ pub struct FactoryCollectionType {
 /// Map of collection name to shared collection type config
 pub type FactoryCollections = HashMap<String, FactoryCollectionType>;
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum FactoryCollectionsOrPath {
-    Inline(FactoryCollections),
-    Path(String),
-}
+/// Factory collections config: inline or path to file/directory
+pub type FactoryCollectionsOrPath = InlineOrPath<FactoryCollections>;
 
 /// Resolved factory config with collection type merged in
 #[derive(Debug, Clone)]
@@ -115,21 +113,8 @@ pub struct FactoryEventConfig {
     pub factory_parameters: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum FactoryEventConfigOrArray {
-    Single(FactoryEventConfig),
-    Multiple(Vec<FactoryEventConfig>),
-}
-
-impl FactoryEventConfigOrArray {
-    pub fn into_vec(self) -> Vec<FactoryEventConfig> {
-        match self {
-            Self::Single(config) => vec![config],
-            Self::Multiple(configs) => configs,
-        }
-    }
-}
+/// Factory event config: single event or multiple events
+pub type FactoryEventConfigOrArray = SingleOrMultiple<FactoryEventConfig>;
 
 #[derive(Debug, Clone)]
 pub enum FactoryParameterLocation {
@@ -216,173 +201,47 @@ pub enum AddressOrAddresses {
 
 pub type Contracts = HashMap<String, ContractConfig>;
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ContractsOrPath {
-    Inline(Contracts),
-    Path(String),
-}
+/// Contracts config: inline or path to file/directory
+pub type ContractsOrPath = InlineOrPath<Contracts>;
 
+/// Load contracts from a path (file or directory).
+///
+/// Uses the generic config loader with duplicate key detection.
+/// Panics on error for backwards compatibility with existing code.
 pub fn load_contracts_from_path(base_dir: &Path, path: &str) -> anyhow::Result<Contracts> {
-    let full_path = base_dir.join(path);
-
-    if full_path.is_dir() {
-        load_contracts_from_dir(&full_path)
-    } else {
-        load_contracts_from_file(&full_path)
-    }
+    load_config_from_path::<Contracts>(base_dir, path)
+        .map_err(|e| panic_on_load_error("contracts", e))
 }
 
-fn load_contracts_from_file(path: &Path) -> anyhow::Result<Contracts> {
-    let content = std::fs::read_to_string(path);
-    match content {
-        Ok(content) => {
-            let contracts: Result<Contracts, _> = serde_json::from_str(&content);
-            match contracts {
-                Ok(contracts) => Ok(contracts),
-                Err(e) => {
-                    panic!("Failed to parse contracts file at {}: {}", path.display(), e);
-                }
-            }
-        }
-        Err(e) => {
-            panic!("Failed to load contracts file at {}: {}", path.display(), e);
-        }
-    }
+/// Load contracts with proper error handling (no panics).
+pub fn try_load_contracts_from_path(
+    base_dir: &Path,
+    path: &str,
+) -> Result<Contracts, ConfigLoadError> {
+    load_config_from_path(base_dir, path)
 }
 
-fn load_contracts_from_dir(path: &Path) -> anyhow::Result<Contracts> {
-    let mut merged = Contracts::new();
-
-    let entries = std::fs::read_dir(path);
-    let mut entries: Vec<_> = match entries {
-        Ok(entries) => {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "json")
-                        .unwrap_or(false)
-                })
-                .collect()
-        }
-        Err(e) => {
-            panic!("Failed to read contracts directory at {}: {}", path.display(), e);
-        }
-    };
-
-    entries.sort_by_key(|e| e.path());
-
-    for entry in entries {
-        let contracts = load_contracts_from_file(&entry.path());
-        match contracts {
-            Ok(contracts) => {
-                for key in contracts.keys() {
-                    if merged.contains_key(key) {
-                        panic!("Duplicate contract key '{}' found in {}", key, path.display());
-                    }
-                }
-                merged.extend(contracts);
-            }
-            Err(e) => {
-                panic!("Failed to load contracts file at {}: {}", path.display(), e);
-            }
-        }
-    }
-
-    Ok(merged)
-}
-
-/// Load factory collections from a path (file or directory)
+/// Load factory collections from a path (file or directory).
+///
+/// Uses the generic config loader with duplicate key detection.
+/// Panics on error for backwards compatibility with existing code.
 pub fn load_factory_collections_from_path(
     base_dir: &Path,
     path: &str,
 ) -> anyhow::Result<FactoryCollections> {
-    let full_path = base_dir.join(path);
-
-    if full_path.is_dir() {
-        load_factory_collections_from_dir(&full_path)
-    } else {
-        load_factory_collections_from_file(&full_path)
-    }
+    load_config_from_path::<FactoryCollections>(base_dir, path)
+        .map_err(|e| panic_on_load_error("factory collections", e))
 }
 
-fn load_factory_collections_from_file(path: &Path) -> anyhow::Result<FactoryCollections> {
-    let content = std::fs::read_to_string(path);
-    match content {
-        Ok(content) => {
-            let collections: Result<FactoryCollections, _> = serde_json::from_str(&content);
-            match collections {
-                Ok(collections) => Ok(collections),
-                Err(e) => {
-                    panic!(
-                        "Failed to parse factory collections file at {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            panic!(
-                "Failed to load factory collections file at {}: {}",
-                path.display(),
-                e
-            );
-        }
-    }
+/// Load factory collections with proper error handling (no panics).
+pub fn try_load_factory_collections_from_path(
+    base_dir: &Path,
+    path: &str,
+) -> Result<FactoryCollections, ConfigLoadError> {
+    load_config_from_path(base_dir, path)
 }
 
-fn load_factory_collections_from_dir(path: &Path) -> anyhow::Result<FactoryCollections> {
-    let mut merged = FactoryCollections::new();
-
-    let entries = std::fs::read_dir(path);
-    let mut entries: Vec<_> = match entries {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "json")
-                    .unwrap_or(false)
-            })
-            .collect(),
-        Err(e) => {
-            panic!(
-                "Failed to read factory collections directory at {}: {}",
-                path.display(),
-                e
-            );
-        }
-    };
-
-    entries.sort_by_key(|e| e.path());
-
-    for entry in entries {
-        let collections = load_factory_collections_from_file(&entry.path());
-        match collections {
-            Ok(collections) => {
-                for key in collections.keys() {
-                    if merged.contains_key(key) {
-                        panic!(
-                            "Duplicate factory collection key '{}' found in {}",
-                            key,
-                            path.display()
-                        );
-                    }
-                }
-                merged.extend(collections);
-            }
-            Err(e) => {
-                panic!(
-                    "Failed to load factory collections file at {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(merged)
+/// Helper to panic with a formatted error message (for backwards compatibility).
+fn panic_on_load_error(config_type: &str, error: ConfigLoadError) -> anyhow::Error {
+    panic!("Failed to load {}: {}", config_type, error)
 }

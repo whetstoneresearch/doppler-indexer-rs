@@ -4,10 +4,11 @@ use alloy_primitives::U256;
 use serde::Deserialize;
 
 use crate::types::config::contract::{
-    load_contracts_from_path, load_factory_collections_from_path, Contracts, ContractsOrPath,
-    FactoryCollections, FactoryCollectionsOrPath,
+    load_contracts_from_path, load_factory_collections_from_path, Contracts,
+    FactoryCollections,
 };
-use crate::types::config::tokens::{load_tokens_from_path, Tokens, TokensOrPath};
+use crate::types::config::generic::InlineOrPath;
+use crate::types::config::tokens::{load_tokens_from_path, Tokens};
 
 #[derive(Debug, Deserialize)]
 pub struct ChainConfigRaw {
@@ -17,11 +18,11 @@ pub struct ChainConfigRaw {
     /// Environment variable name for WebSocket URL (for live mode).
     pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
-    pub contracts: ContractsOrPath,
-    pub tokens: TokensOrPath,
+    pub contracts: InlineOrPath<Contracts>,
+    pub tokens: InlineOrPath<Tokens>,
     pub block_receipts_method: Option<String>,
     #[serde(default)]
-    pub factory_collections: Option<FactoryCollectionsOrPath>,
+    pub factory_collections: Option<InlineOrPath<FactoryCollections>>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,8 +44,8 @@ pub fn resolve_chain_config(
     base_dir: &Path,
 ) -> anyhow::Result<ChainConfig> {
     let contracts = match raw_config.contracts {
-        ContractsOrPath::Inline(contracts) => contracts,
-        ContractsOrPath::Path(p) => {
+        InlineOrPath::Inline(contracts) => contracts,
+        InlineOrPath::Path(p) => {
             let contracts = load_contracts_from_path(base_dir, &p);
             match contracts {
                 Ok(contracts) => contracts,
@@ -56,8 +57,8 @@ pub fn resolve_chain_config(
     };
 
     let tokens = match raw_config.tokens {
-        TokensOrPath::Inline(tokens) => tokens,
-        TokensOrPath::Path(p) => {
+        InlineOrPath::Inline(tokens) => tokens,
+        InlineOrPath::Path(p) => {
             let tokens = load_tokens_from_path(base_dir, &p);
             match tokens {
                 Ok(tokens) => tokens,
@@ -69,8 +70,8 @@ pub fn resolve_chain_config(
     };
 
     let factory_collections = match raw_config.factory_collections {
-        Some(FactoryCollectionsOrPath::Inline(collections)) => collections,
-        Some(FactoryCollectionsOrPath::Path(p)) => {
+        Some(InlineOrPath::Inline(collections)) => collections,
+        Some(InlineOrPath::Path(p)) => {
             let collections = load_factory_collections_from_path(base_dir, &p);
             match collections {
                 Ok(collections) => collections,
