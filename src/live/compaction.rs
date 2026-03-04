@@ -214,6 +214,18 @@ impl CompactionService {
             }
 
             if all_complete {
+                // Only compact ranges safely beyond reorg depth
+                if let Ok(Some(latest_block)) = self.storage.max_block_number() {
+                    let safe_boundary = latest_block.saturating_sub(self.config.reorg_depth);
+                    if range_end >= safe_boundary {
+                        tracing::debug!(
+                            "Skipping range {}-{}: within reorg depth (latest={}, safe={})",
+                            range_start, range_end, latest_block, safe_boundary
+                        );
+                        continue;
+                    }
+                }
+
                 compactable.push(CompactableRange {
                     start: range_start,
                     end: range_end,
