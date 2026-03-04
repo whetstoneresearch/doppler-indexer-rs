@@ -458,31 +458,14 @@ impl LiveCollector {
             }
         }
 
-        // Notify log decoder of reorg so it can clean up any orphaned decoded data
-        if let Some(decoder_tx) = log_decoder_tx {
-            if let Err(e) = decoder_tx
-                .send(DecoderMessage::Reorg {
-                    common_ancestor: event.common_ancestor,
-                    orphaned: event.orphaned.clone(),
-                })
-                .await
-            {
-                tracing::warn!("Failed to send reorg notification to log decoder: {}", e);
-            }
-        }
-
-        // Notify eth_call decoder of reorg
-        if let Some(decoder_tx) = eth_call_decoder_tx {
-            if let Err(e) = decoder_tx
-                .send(DecoderMessage::Reorg {
-                    common_ancestor: event.common_ancestor,
-                    orphaned: event.orphaned.clone(),
-                })
-                .await
-            {
-                tracing::warn!("Failed to send reorg notification to eth_call decoder: {}", e);
-            }
-        }
+        // Broadcast reorg to decoder channels
+        broadcast_reorg_to_decoders(
+            event.common_ancestor,
+            &event.orphaned,
+            log_decoder_tx,
+            eth_call_decoder_tx,
+        )
+        .await;
 
         // Notify transformation engine of reorg so it can clean up pending events
         if let Some(transform_tx) = transform_reorg_tx {
@@ -711,6 +694,37 @@ fn extract_address_recursive(values: &[DynSolValue], indices: &[usize]) -> Optio
             extract_address_recursive(inner_values, &indices[1..])
         } else {
             None
+        }
+    }
+}
+
+/// Broadcast a reorg notification to decoder channels.
+///
+/// Sends `DecoderMessage::Reorg` to multiple optional decoder channels,
+/// logging warnings for any failures but not propagating errors.
+async fn broadcast_reorg_to_decoders(
+    common_ancestor: u64,
+    orphaned: &[u64],
+    log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+) {
+    if let Some(decoder_tx) = log_decoder_tx {
+        let msg = DecoderMessage::Reorg {
+            common_ancestor,
+            orphaned: orphaned.to_vec(),
+        };
+        if let Err(e) = decoder_tx.send(msg).await {
+            tracing::warn!("Failed to send reorg notification to log decoder: {}", e);
+        }
+    }
+
+    if let Some(decoder_tx) = eth_call_decoder_tx {
+        let msg = DecoderMessage::Reorg {
+            common_ancestor,
+            orphaned: orphaned.to_vec(),
+        };
+        if let Err(e) = decoder_tx.send(msg).await {
+            tracing::warn!("Failed to send reorg notification to eth_call decoder: {}", e);
         }
     }
 }
