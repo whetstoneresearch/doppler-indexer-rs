@@ -554,17 +554,6 @@ match self.storage.read_block(block_number) {
 
 ### Critical Issues
 
-#### 1. No eth_call Collection in Live Mode
-
-The `LiveCollector` only collects blocks, receipts, and logs. It does **not** collect eth_calls:
-
-- No `eth_call_tx` channel passed to `LiveCollector::run()`
-- No RPC calls made for configured eth_calls (regular, once, or event-triggered)
-- The `LiveEthCall` type exists but is never populated
-- The decoder receives log data but never eth_call data in live mode
-
-**Impact**: Handlers depending on eth_call data (e.g., `slot0()` for Uniswap pools) will not receive data in live mode.
-
 #### 3. Transformation Engine Not Running in Live Mode
 
 In `spawn_live_mode()`, the `live_msg_rx` channel is simply drained:
@@ -645,11 +634,6 @@ Per the TODO in `compact_range()`:
 Decoded bincode files are deleted during compaction without being converted to parquet. The data must be re-decoded from raw parquet later, which is inefficient.
 
 ### Summary: What's Needed for Working Live Mode
-
-1. **Wire up eth_call collection** in live mode:
-   - Add eth_call channel to `LiveCollector`
-   - Make RPC calls for configured contracts at each block
-   - Coordinate factory calls with receipt collection
 
 3. **Spawn transformation engine** in live mode:
    - Create and run engine after live collector starts
