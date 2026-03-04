@@ -565,17 +565,6 @@ The `LiveCollector` only collects blocks, receipts, and logs. It does **not** co
 
 **Impact**: Handlers depending on eth_call data (e.g., `slot0()` for Uniswap pools) will not receive data in live mode.
 
-#### 2. No Factory Address Parsing in Live Mode
-
-Factory-related functionality is entirely missing from live mode:
-
-- Logs are sent directly to the decoder without factory filtering
-- No `logs_factory_tx` or `eth_calls_factory_tx` channels in live mode
-- New pool/contract addresses discovered via factory events are not tracked
-- Factory-triggered eth_calls (e.g., calling `slot0()` on newly created pools) won't happen
-
-**Impact**: Factory-dependent configurations (common for Uniswap V3/V4 style indexers) won't work in live mode.
-
 #### 3. Transformation Engine Not Running in Live Mode
 
 In `spawn_live_mode()`, the `live_msg_rx` channel is simply drained:
@@ -614,48 +603,6 @@ Since `is_complete()` requires all flags to be `true`:
 
 - Compaction will **never** find any compactable ranges
 - Blocks will accumulate indefinitely in `data/live/`
-
-#### 5. Compaction Doesn't Respect Reorg Depth
-
-The expected behavior is: *"compact at range_size PLUS reorg_depth"* to ensure reorgs can't affect already-compacted data.
-
-Current implementation (`find_compactable_ranges`) compacts any complete range immediately without considering proximity to chain tip:
-
-- A range could be compacted while still within the reorg window
-- A reorg affecting compacted blocks would require re-processing from parquet
-
-**Required fix**: Only compact ranges where `range_end < (latest_block - reorg_depth)`.
-
-### Medium Issues
-
-#### 6. Reorg Tables Use Direct Deletion, Not Shadow Tables
-
-The expected design mentions `_reorg_{table_name}` shadow tables for storing row state before modification. Current implementation:
-
-- `handler.reorg_tables()` returns actual table names (e.g., `["v3_pools_v1"]`)
-- Cleanup deletes directly using `DELETE WHERE chain_id = X AND block_number IN (...)`
-- No shadow tables store pre-modification state
-
-**Consequence**: Modified rows are deleted entirely rather than rolled back to previous values. For example, if block N updates a pool's `liquidity` value that was originally set in block M, a reorg of block N will delete the row entirely instead of restoring the block M value.
-
-#### 7. UpsertSnapshot Not Fully Implemented
-
-`UpsertSnapshot` exists in `LiveProcessingState` to track pre-modification row state:
-
-```rust
-struct UpsertSnapshot {
-    table: String,
-    source: String,
-    source_version: u32,
-    key_columns: Vec<(String, DbValue)>,
-    previous_row: Option<HashMap<String, DbValue>>,  // Row state before modification
-}
-```
-
-However:
-- No code captures snapshots before writes
-- `upsert_snapshots` HashMap is cleared on reorg but values are never restored
-- The restoration logic is not implemented
 
 #### 8. Logs Parquet Missing transaction_hash
 
