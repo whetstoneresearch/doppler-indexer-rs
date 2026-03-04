@@ -2295,8 +2295,12 @@ impl TransformationEngine {
 ///
 /// For live mode (single-block ranges), this function:
 /// 1. Queries current row state for upserts with update_columns
-/// 2. Executes the transaction
-/// 3. Writes snapshots to storage for later rollback
+/// 2. Writes snapshots to storage (before transaction, for crash safety)
+/// 3. Executes the transaction
+///
+/// Writing snapshots before the transaction ensures that if a crash occurs after
+/// the transaction commits, the snapshot is already persisted. Orphan snapshots
+/// from failed transactions are harmless and cleaned up during compaction.
 async fn execute_with_snapshot_capture(
     ops: Vec<DbOperation>,
     db_pool: &DbPool,
@@ -2362,10 +2366,9 @@ async fn execute_with_snapshot_capture(
         }
     }
 
-    // Execute the transaction
-    db_pool.execute_transaction(ops).await?;
-
-    // Write snapshots to storage (after successful transaction)
+    // Write snapshots to storage BEFORE transaction (for crash safety)
+    // If we crash after transaction but before snapshot write, we'd lose rollback ability.
+    // Orphan snapshots from failed transactions are cleaned up during compaction.
     if !snapshots.is_empty() {
         // Read existing snapshots and append new ones
         let mut all_snapshots = storage.read_snapshots(block_number).unwrap_or_default();
@@ -2376,9 +2379,10 @@ async fn execute_with_snapshot_capture(
                 "Failed to write upsert snapshots for block {}: {}",
                 block_number, e
             );
-            // Don't fail the transaction for snapshot write errors
+            // Continue with transaction even if snapshot write fails - fallback DELETE still works
         }
     }
 
-    Ok(())
+    // Execute the transaction
+    db_pool.execute_transaction(ops).await
 }
