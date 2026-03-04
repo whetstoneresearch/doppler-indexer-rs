@@ -8,6 +8,7 @@
 
 mod collector;
 mod compaction;
+mod eth_calls;
 mod progress;
 mod reorg;
 mod storage;
@@ -15,6 +16,7 @@ mod types;
 
 pub use collector::LiveCollector;
 pub use compaction::CompactionService;
+pub use eth_calls::LiveEthCallCollector;
 pub use progress::LiveProgressTracker;
 pub use reorg::{ReorgDetector, ReorgEvent};
 pub use storage::{LiveStorage, StorageError};

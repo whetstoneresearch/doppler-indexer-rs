@@ -704,11 +704,6 @@ Decoded bincode files are deleted during compaction without being converted to p
    - Make RPC calls for configured contracts at each block
    - Coordinate factory calls with receipt collection
 
-2. **Implement factory address parsing** in live mode:
-   - Parse factory events from logs
-   - Track new addresses per factory collection
-   - Trigger eth_calls for newly discovered addresses
-
 3. **Spawn transformation engine** in live mode:
    - Create and run engine after live collector starts
    - Connect decoded events/calls channels
@@ -717,10 +712,6 @@ Decoded bincode files are deleted during compaction without being converted to p
 4. **Set decoded/transformed status**:
    - After log decoding completes, set `status.decoded = true`
    - After transformation completes, set `status.transformed = true`
-
-5. **Add reorg depth buffer to compaction**:
-   - Track latest block number
-   - Only compact ranges where `range_end < latest_block - reorg_depth`
 
 6. **Include transaction_hash in compacted logs parquet**
 

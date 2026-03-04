@@ -16,6 +16,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 
+use super::eth_calls::LiveEthCallCollector;
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
 use super::storage::{LiveStorage, StorageError};
@@ -58,6 +59,8 @@ pub struct LiveCollector {
     expected_start_block: Option<u64>,
     /// Factory matchers for extracting new contract addresses from factory events.
     factory_matchers: Arc<Vec<FactoryMatcher>>,
+    /// Optional eth_call collector for live mode.
+    eth_call_collector: Option<LiveEthCallCollector>,
 }
 
 impl LiveCollector {
@@ -68,6 +71,7 @@ impl LiveCollector {
         config: LiveModeConfig,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
         factory_matchers: Arc<Vec<FactoryMatcher>>,
+        eth_call_collector: Option<LiveEthCallCollector>,
     ) -> Self {
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
@@ -114,6 +118,10 @@ impl LiveCollector {
             );
         }
 
+        if eth_call_collector.is_some() {
+            tracing::info!("Live collector initialized with eth_call collector");
+        }
+
         Self {
             chain,
             http_client,
@@ -124,6 +132,7 @@ impl LiveCollector {
             progress_tracker,
             expected_start_block,
             factory_matchers,
+            eth_call_collector,
         }
     }
 
@@ -137,6 +146,7 @@ impl LiveCollector {
         mut ws_rx: mpsc::UnboundedReceiver<WsEvent>,
         live_tx: mpsc::Sender<LiveMessage>,
         log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
         transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         // Ensure storage directories exist
@@ -178,6 +188,7 @@ impl LiveCollector {
                                         number - 1,
                                         &live_tx,
                                         &log_decoder_tx,
+                                        &eth_call_decoder_tx,
                                         &transform_reorg_tx,
                                     )
                                     .await
@@ -202,7 +213,7 @@ impl LiveCollector {
                     };
 
                     if let Err(e) = self
-                        .process_block(block, &live_tx, &log_decoder_tx, &transform_reorg_tx)
+                        .process_block(block, &live_tx, &log_decoder_tx, &eth_call_decoder_tx, &transform_reorg_tx)
                         .await
                     {
                         tracing::error!("Error processing block {}: {}", number, e);
@@ -227,7 +238,7 @@ impl LiveCollector {
                     );
 
                     if let Err(e) = self
-                        .backfill_blocks(missed_from, missed_to, &live_tx, &log_decoder_tx, &transform_reorg_tx)
+                        .backfill_blocks(missed_from, missed_to, &live_tx, &log_decoder_tx, &eth_call_decoder_tx, &transform_reorg_tx)
                         .await
                     {
                         tracing::error!(
@@ -251,13 +262,14 @@ impl LiveCollector {
         block: LiveBlock,
         live_tx: &mpsc::Sender<LiveMessage>,
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         let block_number = block.number;
 
         // Check for reorg
         if let Some(reorg_event) = self.reorg_detector.process_block(&block) {
-            self.handle_reorg(&reorg_event, live_tx, log_decoder_tx, transform_reorg_tx).await?;
+            self.handle_reorg(&reorg_event, live_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx).await?;
         }
 
         // Store the block header
@@ -372,11 +384,48 @@ impl LiveCollector {
             }
         }
 
+        // Collect eth_calls if configured
+        let eth_call_count = if let Some(ref mut eth_collector) = self.eth_call_collector {
+            // Update factory addresses in collector
+            eth_collector.update_factory_addresses(&factory_addresses);
+
+            // Collect eth_calls for this block
+            match eth_collector
+                .collect_for_block(
+                    block_number,
+                    updated_block.timestamp,
+                    &logs,
+                    &factory_addresses,
+                    eth_call_decoder_tx,
+                )
+                .await
+            {
+                Ok(calls) => {
+                    let count = calls.len();
+                    if !calls.is_empty() {
+                        self.storage.write_eth_calls(block_number, &calls)?;
+                    }
+                    count
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to collect eth_calls for block {}: {}",
+                        block_number,
+                        e
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
         tracing::debug!(
-            "Processed live block {} with {} receipts and {} logs",
+            "Processed live block {} with {} receipts, {} logs, {} eth_calls",
             block_number,
             receipts.len(),
-            logs.len()
+            logs.len(),
+            eth_call_count
         );
 
         Ok(())
@@ -388,6 +437,7 @@ impl LiveCollector {
         event: &ReorgEvent,
         live_tx: &mpsc::Sender<LiveMessage>,
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         tracing::warn!(
@@ -408,7 +458,7 @@ impl LiveCollector {
             }
         }
 
-        // Notify decoder of reorg so it can clean up any orphaned decoded data
+        // Notify log decoder of reorg so it can clean up any orphaned decoded data
         if let Some(decoder_tx) = log_decoder_tx {
             if let Err(e) = decoder_tx
                 .send(DecoderMessage::Reorg {
@@ -417,7 +467,20 @@ impl LiveCollector {
                 })
                 .await
             {
-                tracing::warn!("Failed to send reorg notification to decoder: {}", e);
+                tracing::warn!("Failed to send reorg notification to log decoder: {}", e);
+            }
+        }
+
+        // Notify eth_call decoder of reorg
+        if let Some(decoder_tx) = eth_call_decoder_tx {
+            if let Err(e) = decoder_tx
+                .send(DecoderMessage::Reorg {
+                    common_ancestor: event.common_ancestor,
+                    orphaned: event.orphaned.clone(),
+                })
+                .await
+            {
+                tracing::warn!("Failed to send reorg notification to eth_call decoder: {}", e);
             }
         }
 
@@ -453,6 +516,7 @@ impl LiveCollector {
         to: u64,
         live_tx: &mpsc::Sender<LiveMessage>,
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         tracing::info!("Backfilling {} blocks ({} to {})", to - from + 1, from, to);
@@ -461,7 +525,7 @@ impl LiveCollector {
             let block = self.fetch_full_block(block_number).await?;
 
             // Process as if it came from WebSocket
-            self.process_block(block, live_tx, log_decoder_tx, transform_reorg_tx).await?;
+            self.process_block(block, live_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx).await?;
         }
 
         Ok(())

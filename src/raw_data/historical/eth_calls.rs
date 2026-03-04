@@ -68,29 +68,29 @@ pub(crate) struct BlockInfo {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CallConfig {
-    pub(crate) contract_name: String,
-    pub(crate) address: Address,
-    pub(crate) function_name: String,
-    pub(crate) encoded_calldata: Bytes,
-    pub(crate) param_values: Vec<Vec<u8>>,
-    pub(crate) frequency: Frequency,
+pub struct CallConfig {
+    pub contract_name: String,
+    pub address: Address,
+    pub function_name: String,
+    pub encoded_calldata: Bytes,
+    pub param_values: Vec<Vec<u8>>,
+    pub frequency: Frequency,
     /// Start block for this contract (calls before this block are skipped)
-    pub(crate) start_block: Option<u64>,
+    pub start_block: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OnceCallConfig {
-    pub(crate) function_name: String,
-    pub(crate) function_selector: [u8; 4],
+pub struct OnceCallConfig {
+    pub function_name: String,
+    pub function_selector: [u8; 4],
     /// Pre-encoded calldata if no self-address params
-    pub(crate) preencoded_calldata: Option<Bytes>,
+    pub preencoded_calldata: Option<Bytes>,
     /// Param configs needed when preencoded_calldata is None
-    pub(crate) params: Vec<ParamConfig>,
+    pub params: Vec<ParamConfig>,
     /// Optional target address override (resolved from CallTarget)
-    pub(crate) target_addresses: Option<Vec<Address>>,
+    pub target_addresses: Option<Vec<Address>>,
     /// Start block for this contract (calls before this block are skipped)
-    pub(crate) start_block: Option<u64>,
+    pub start_block: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -101,27 +101,27 @@ pub(crate) struct OnceCallResult {
     pub(crate) function_results: HashMap<String, Vec<u8>>,
 }
 
-pub(crate) struct FrequencyState {
-    pub(crate) last_call_times: HashMap<(String, String), u64>,
+pub struct FrequencyState {
+    pub last_call_times: HashMap<(String, String), u64>,
 }
 
 /// Configuration for an event-triggered call
 #[derive(Debug, Clone)]
-pub(crate) struct EventTriggeredCallConfig {
+pub struct EventTriggeredCallConfig {
     /// Contract name or factory collection name
-    pub(crate) contract_name: String,
+    pub contract_name: String,
     /// Target address for the call (None for factory collections - use event emitter)
-    pub(crate) target_address: Option<Address>,
+    pub target_address: Option<Address>,
     /// Function name (without params)
-    pub(crate) function_name: String,
+    pub function_name: String,
     /// Function selector (first 4 bytes of keccak256 of signature)
-    pub(crate) function_selector: [u8; 4],
+    pub function_selector: [u8; 4],
     /// Parameter configurations
-    pub(crate) params: Vec<ParamConfig>,
+    pub params: Vec<ParamConfig>,
     /// Whether this is for a factory collection
-    pub(crate) is_factory: bool,
+    pub is_factory: bool,
     /// Start block for this contract (calls before this block are skipped)
-    pub(crate) start_block: Option<u64>,
+    pub start_block: Option<u64>,
 }
 
 /// Result from an event-triggered call
@@ -136,7 +136,7 @@ pub(crate) struct EventCallResult {
 }
 
 /// Key for grouping event-triggered calls: (source_name, event_signature_hash)
-pub(crate) type EventCallKey = (String, [u8; 32]);
+pub type EventCallKey = (String, [u8; 32]);
 
 #[derive(Debug)]
 pub(crate) struct CallResult {
@@ -184,7 +184,7 @@ pub(crate) struct EthCallCatchupState {
 
 /// Build event-triggered call configs from contracts configuration
 /// Returns a map from (source_name, event_signature_hash) -> Vec<EventTriggeredCallConfig>
-pub(crate) fn build_event_triggered_call_configs(
+pub fn build_event_triggered_call_configs(
     contracts: &Contracts,
 ) -> HashMap<EventCallKey, Vec<EventTriggeredCallConfig>> {
     let mut configs: HashMap<EventCallKey, Vec<EventTriggeredCallConfig>> = HashMap::new();
@@ -2333,7 +2333,7 @@ pub(crate) fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<
     Ok(result)
 }
 
-pub(crate) fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallCollectionError> {
+pub fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallCollectionError> {
     let mut configs = Vec::new();
 
     for (contract_name, contract) in contracts {
@@ -2520,7 +2520,7 @@ pub(crate) fn build_token_call_configs(
     Ok(configs)
 }
 
-pub(crate) fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
+pub fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
     let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
 
     for (contract_name, contract) in contracts {
@@ -2605,7 +2605,7 @@ pub(crate) fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, 
     configs
 }
 
-pub(crate) fn build_factory_once_call_configs(
+pub fn build_factory_once_call_configs(
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
     contracts: &Contracts,
 ) -> HashMap<String, Vec<OnceCallConfig>> {

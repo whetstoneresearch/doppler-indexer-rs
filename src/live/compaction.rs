@@ -307,6 +307,26 @@ impl CompactionService {
             );
         }
 
+        // Read and write eth_calls parquet
+        let mut all_eth_calls = Vec::new();
+        for block_number in range.start..=range.end {
+            if let Ok(calls) = self.storage.read_eth_calls(block_number) {
+                all_eth_calls.extend(calls);
+            }
+        }
+
+        if !all_eth_calls.is_empty() {
+            let eth_calls_path = self.eth_calls_parquet_path(range.start, range.end);
+            self.write_eth_calls_parquet(&all_eth_calls, &eth_calls_path)?;
+            tracing::info!(
+                "Wrote {} eth_calls to {} in range {}-{}",
+                all_eth_calls.len(),
+                eth_calls_path.display(),
+                range.start,
+                range.end
+            );
+        }
+
         // Compact decoded logs
         // Note: Full decoded data compaction requires schema information from the event
         // parser. For now, we just delete the decoded bincode files when compacting.
@@ -342,11 +362,12 @@ impl CompactionService {
         }
 
         tracing::info!(
-            "Successfully compacted range {}-{} ({} blocks, {} logs)",
+            "Successfully compacted range {}-{} ({} blocks, {} logs, {} eth_calls)",
             range.start,
             range.end,
             blocks.len(),
-            all_logs.len()
+            all_logs.len(),
+            all_eth_calls.len()
         );
 
         Ok(())
@@ -421,6 +442,74 @@ impl CompactionService {
         let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
         writer.write(&batch)?;
         writer.close()?;
+
+        Ok(())
+    }
+
+    /// Get path for eth_calls parquet file.
+    fn eth_calls_parquet_path(&self, start: u64, end: u64) -> PathBuf {
+        PathBuf::from(format!(
+            "data/raw/{}/eth_calls/{}_{}.parquet",
+            self.chain_name, start, end
+        ))
+    }
+
+    /// Write eth_calls to parquet file.
+    fn write_eth_calls_parquet(
+        &self,
+        calls: &[super::types::LiveEthCall],
+        path: &PathBuf,
+    ) -> Result<(), CompactionError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("contract_name", DataType::Utf8, false),
+            Field::new("contract_address", DataType::FixedSizeBinary(20), false),
+            Field::new("function_name", DataType::Utf8, false),
+            Field::new("result", DataType::Binary, false),
+        ]));
+
+        let mut block_numbers = UInt64Builder::new();
+        let mut timestamps = UInt64Builder::new();
+        let mut contract_names = StringBuilder::new();
+        let mut addresses = FixedSizeBinaryBuilder::new(20);
+        let mut function_names = StringBuilder::new();
+        let mut results = BinaryBuilder::new();
+
+        for call in calls {
+            block_numbers.append_value(call.block_number);
+            timestamps.append_value(call.block_timestamp);
+            contract_names.append_value(&call.contract_name);
+            addresses.append_value(&call.contract_address)?;
+            function_names.append_value(&call.function_name);
+            results.append_value(&call.result);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(block_numbers.finish()) as ArrayRef,
+                Arc::new(timestamps.finish()) as ArrayRef,
+                Arc::new(contract_names.finish()) as ArrayRef,
+                Arc::new(addresses.finish()) as ArrayRef,
+                Arc::new(function_names.finish()) as ArrayRef,
+                Arc::new(results.finish()) as ArrayRef,
+            ],
+        )?;
+
+        let file = std::fs::File::create(path)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        tracing::debug!("Wrote {} eth_calls to {}", calls.len(), path.display());
 
         Ok(())
     }

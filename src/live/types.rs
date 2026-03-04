@@ -115,6 +115,7 @@ pub struct LiveLog {
 pub struct LiveEthCall {
     pub block_number: u64,
     pub block_timestamp: u64,
+    pub contract_name: String,
     pub contract_address: [u8; 20],
     pub function_name: String,
     pub result: Vec<u8>,

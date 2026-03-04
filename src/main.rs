@@ -25,7 +25,7 @@ use raw_data::historical::factories::{build_factory_matchers, FactoryMessage, Re
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use live::{CompactionService, LiveCollector, LiveMessage, LiveModeConfig, LiveProgressTracker};
+use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker};
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
@@ -280,8 +280,23 @@ async fn process_chain_live_only(
                 .is_some_and(|f| f.iter().any(|fc| has_items(&fc.events)))
     });
 
-    // Setup decoder channel
+    // Check if eth_calls are configured
+    let has_calls = chain.contracts.values().any(|c| {
+        has_items(&c.calls)
+            || c.factories
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.calls)))
+    });
+
+    // Setup decoder channels
     let (log_decoder_tx, log_decoder_rx) = if has_events {
+        let (tx, rx) = mpsc::channel(1000);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let (eth_call_decoder_tx, eth_call_decoder_rx) = if has_calls {
         let (tx, rx) = mpsc::channel(1000);
         (Some(tx), Some(rx))
     } else {
@@ -301,6 +316,17 @@ async fn process_chain_live_only(
         });
     }
 
+    // Spawn eth_call decoder task for live mode (if calls are configured)
+    if let Some(rx) = eth_call_decoder_rx {
+        let chain = Arc::new(chain.clone());
+        let cfg = config.raw_data_collection.clone();
+        tasks.spawn(async move {
+            decode_eth_calls(&chain, &cfg, rx, None, None, None)
+                .await
+                .context("eth_call decoding failed")
+        });
+    }
+
     // Spawn live mode directly (no historical processing)
     // Note: In live-only mode, transformation engine is not running, so no reorg channel
     spawn_live_mode(
@@ -309,6 +335,7 @@ async fn process_chain_live_only(
         http_client,
         db_pool,
         log_decoder_tx,
+        eth_call_decoder_tx,
         None, // No transform_reorg_tx in live-only mode
         None, // No progress tracker in live-only mode (no handlers)
         &mut tasks,
@@ -569,6 +596,12 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     // Clone for live mode transition (before originals are moved)
     let log_decoder_tx_for_live = if has_events && should_enable_live_mode(config, &chain) {
         log_decoder_tx.clone()
+    } else {
+        None
+    };
+
+    let eth_call_decoder_tx_for_live = if has_calls && should_enable_live_mode(config, &chain) {
+        call_decoder_tx.clone()
     } else {
         None
     };
@@ -836,6 +869,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             http_client_for_live.unwrap(),
             db_pool_for_live,
             log_decoder_tx_for_live,
+            eth_call_decoder_tx_for_live,
             transform_reorg_tx,
             progress_tracker,
             &mut tasks,
@@ -904,6 +938,7 @@ async fn spawn_live_mode(
     http_client: Arc<UnifiedRpcClient>,
     db_pool: Option<Arc<DbPool>>,
     log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+    eth_call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -983,6 +1018,31 @@ async fn spawn_live_mode(
             .map_err(|e| anyhow::anyhow!("WebSocket error: {}", e))
     });
 
+    // Build eth_call collector if eth_calls are configured
+    let eth_call_collector = if eth_call_decoder_tx.is_some() {
+        // Get multicall3 address from contracts if available
+        let multicall3_address = chain.contracts.get("Multicall3").and_then(|c| {
+            use crate::types::config::contract::AddressOrAddresses;
+            match &c.address {
+                AddressOrAddresses::Single(addr) => Some(*addr),
+                AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
+            }
+        });
+        let collector = LiveEthCallCollector::new(
+            &chain,
+            http_client.clone(),
+            multicall3_address,
+            config.raw_data_collection.rpc_batch_size.unwrap_or(100) as usize,
+        );
+        if collector.has_calls() {
+            Some(collector)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Start live collector
     let collector = LiveCollector::new(
         chain.clone(),
@@ -990,10 +1050,11 @@ async fn spawn_live_mode(
         live_config.clone(),
         Some(progress_tracker.clone()),
         factory_matchers,
+        eth_call_collector,
     );
     tasks.spawn(async move {
         collector
-            .run(ws_event_rx, live_msg_tx, log_decoder_tx, transform_reorg_tx)
+            .run(ws_event_rx, live_msg_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx)
             .await
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
     });
