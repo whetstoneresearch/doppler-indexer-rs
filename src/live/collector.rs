@@ -20,6 +20,7 @@ use super::reorg::{ReorgDetector, ReorgEvent};
 use super::storage::{LiveStorage, StorageError};
 use super::types::{LiveBlock, LiveBlockStatus, LiveLog, LiveMessage, LiveModeConfig, LiveReceipt};
 use crate::decoding::DecoderMessage;
+use crate::raw_data::historical::factories::FactoryMatcher;
 use crate::raw_data::historical::receipts::LogData;
 use crate::rpc::{RpcError, UnifiedRpcClient, WsEvent};
 use crate::transformations::ReorgMessage;
@@ -50,6 +51,8 @@ pub struct LiveCollector {
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     /// Expected starting block from historical processing or previous live session.
     expected_start_block: Option<u64>,
+    /// Factory matchers for extracting new contract addresses from factory events.
+    factory_matchers: Arc<Vec<FactoryMatcher>>,
 }
 
 impl LiveCollector {
@@ -59,6 +62,7 @@ impl LiveCollector {
         http_client: Arc<UnifiedRpcClient>,
         config: LiveModeConfig,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+        factory_matchers: Arc<Vec<FactoryMatcher>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
@@ -98,6 +102,13 @@ impl LiveCollector {
             _ => {}
         }
 
+        if !factory_matchers.is_empty() {
+            tracing::info!(
+                "Live collector initialized with {} factory matchers",
+                factory_matchers.len()
+            );
+        }
+
         Self {
             chain,
             http_client,
@@ -107,6 +118,7 @@ impl LiveCollector {
             buffer: VecDeque::new(),
             progress_tracker,
             expected_start_block,
+            factory_matchers,
         }
     }
 
@@ -301,6 +313,7 @@ impl LiveCollector {
                         range_end: block_number + 1, // Exclusive end for single block
                         logs: log_data,
                         live_mode: true, // Live mode: write to bincode
+                    has_factory_matchers: !self.factory_matchers.is_empty(),
                     })
                     .await
                 {

@@ -137,6 +137,7 @@ pub(crate) async fn process_completed_range(
             range_end,
             logs: logs.clone(),
             live_mode: false, // Historical mode: write to parquet
+            has_factory_matchers: false, // Factory addresses handled separately in historical mode
         }).await;
     }
 

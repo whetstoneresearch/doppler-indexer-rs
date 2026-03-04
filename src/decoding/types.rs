@@ -43,6 +43,9 @@ pub enum DecoderMessage {
         logs: Vec<LogData>,
         /// If true, write to live bincode storage instead of parquet
         live_mode: bool,
+        /// If true, decoder should wait for FactoryAddresses before processing
+        #[allow(dead_code)]
+        has_factory_matchers: bool,
     },
     /// Regular eth_call results ready for decoding
     EthCallsReady {

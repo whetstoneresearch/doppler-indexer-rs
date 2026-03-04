@@ -37,6 +37,7 @@ pub async fn decode_logs_live(
                 range_end,
                 logs,
                 live_mode,
+                has_factory_matchers: _,
             }) => {
                 // Get factory addresses for this range
                 let factory_addrs = factory_addresses.remove(&range_start).unwrap_or_default();
