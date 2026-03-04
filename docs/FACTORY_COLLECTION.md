@@ -326,7 +326,7 @@ Factory addresses are written to `data/derived/{chain}/factories/{collection_nam
 {start_block}-{end_block}.parquet
 ```
 
-Example: `data/derived/base/factories/DERC20/0-9999.parquet`
+Example: `data/derived/base/factories/DERC20/0-999.parquet`
 
 ### Parquet Schema
 
@@ -436,7 +436,16 @@ Factory addresses are also sent to the log and call decoders via `DecoderMessage
 1. Log decoder to decode events from factory-created contracts using their ABIs
 2. Call decoder to decode eth_call results from factory contracts
 
-The decoder messages include the block range and a map of collection names to addresses discovered in that range.
+The decoder messages include the block range and a map of collection names to addresses discovered in that range:
+
+```rust
+DecoderMessage::FactoryAddresses {
+    range_start: u64,
+    range_end: u64,
+    /// collection_name -> addresses discovered in this range
+    addresses: HashMap<String, Vec<Address>>,
+}
+```
 
 ## Helper Functions
 

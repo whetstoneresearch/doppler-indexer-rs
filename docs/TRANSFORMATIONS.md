@@ -10,7 +10,8 @@ Transformations extend the indexer's capabilities beyond Parquet file storage:
 - **PostgreSQL Output** - Transform and store data in relational database tables
 - **Historical Queries** - Access previously decoded data from Parquet files within handlers
 - **Ad-hoc RPC Calls** - Make additional eth_calls with data from events
-- **Per-Block Atomicity** - All database writes for a block range succeed or fail together
+- **Per-Handler Transactions** - Each handler's database writes for a block range succeed or fail independently
+- **Reorg Handling** - Handlers can declare tables that need rollback during chain reorganizations
 
 ## Architecture
 
@@ -151,6 +152,11 @@ pub trait TransformationHandler: Send + Sync + 'static {
     /// - `vec!["migrations/handlers/pools/create_table.sql"]` — run one file
     /// - `vec!["migrations/handlers/pools", "migrations/handlers/swaps"]` — multiple dirs
     fn migration_paths(&self) -> Vec<&'static str> { vec![] }
+
+    /// Declare tables that should be rolled back during a chain reorganization.
+    /// Used in live mode to clean up orphaned data when blocks are reverted.
+    /// Returns table names that have reorg-sensitive data keyed by block_number.
+    fn reorg_tables(&self) -> Vec<&'static str> { vec![] }
 
     /// Process decoded data for a block range.
     ///
@@ -421,14 +427,21 @@ ctx.events
 // All calls in current range (Arc<Vec<DecodedCall>>)
 ctx.calls
 
-// Filter by type
+// Filter by type (automatically respects contract start_block configuration)
 for event in ctx.events_of_type("Contract", "EventName") { ... }
 for call in ctx.calls_of_type("Contract", "functionName") { ... }
 
-// Filter by address
+// Filter by address (automatically respects contract start_block configuration)
 for event in ctx.events_for_address(address) { ... }
 for call in ctx.calls_for_address(address) { ... }
+
+// Get contract start_block from configuration
+if let Some(start_block) = ctx.get_contract_start_block("MyContract") {
+    // start_block is the configured start block for this contract
+}
 ```
+
+**Note:** The filtering methods (`events_of_type`, `events_for_address`, etc.) automatically filter out events/calls that occur before a contract's configured `start_block`. This prevents processing events from before the contract was deployed.
 
 ### Transaction Address Lookup
 
@@ -599,6 +612,32 @@ value.as_bytes()        // Option<&[u8]>
 value.to_numeric_string() // Option<String> (for database storage)
 value.get_field("name") // Option<&DecodedValue> (for named tuples)
 ```
+
+## FieldExtractor Trait
+
+Both `DecodedEvent` and `DecodedCall` implement the `FieldExtractor` trait, providing convenient typed extraction methods with contextual error messages:
+
+```rust
+pub trait FieldExtractor {
+    fn extract_address(&self, field: &str) -> Result<[u8; 20], TransformationError>;
+    fn extract_uint256(&self, field: &str) -> Result<U256, TransformationError>;
+    fn extract_int256(&self, field: &str) -> Result<I256, TransformationError>;
+    fn extract_u64(&self, field: &str) -> Result<u64, TransformationError>;
+    fn extract_u64_flexible(&self, field: &str) -> Result<u64, TransformationError>;
+    fn extract_i32(&self, field: &str) -> Result<i32, TransformationError>;
+    fn extract_u32(&self, field: &str) -> Result<u32, TransformationError>;
+    fn extract_bytes32(&self, field: &str) -> Result<[u8; 32], TransformationError>;
+    fn extract_bool(&self, field: &str) -> Result<bool, TransformationError>;
+    fn extract_string(&self, field: &str) -> Result<String, TransformationError>;
+}
+
+// Usage example:
+let from = event.extract_address("from")?;
+let amount = event.extract_uint256("value")?;
+let tick = call.extract_i32("tick")?;
+```
+
+The `extract_u64_flexible` method handles conversion from various uint sizes (u8, u32, u64, u128, U256) to u64, useful when the exact type varies.
 
 ## Database Operations
 

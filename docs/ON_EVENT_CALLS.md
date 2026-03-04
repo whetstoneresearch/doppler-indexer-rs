@@ -169,7 +169,7 @@ Event field references:
 
 Supported types for `from_event`:
 - `address` - Ethereum address (20 bytes, right-aligned in 32-byte word)
-- `uint256`, `uint128`, `uint80`, `uint64`, `uint32`, `uint24`, `uint16`, `uint8`
+- `uint256`, `uint160`, `uint128`, `uint96`, `uint80`, `uint64`, `uint32`, `uint24`, `uint16`, `uint8`
 - `int256`, `int128`, `int64`, `int32`, `int24`, `int16`, `int8`
 - `bool` - Boolean (last byte of 32-byte word)
 - `bytes32` - Fixed 32-byte value
@@ -450,12 +450,15 @@ Event-triggered calls include `trigger_log_index: Some(log_index)` to correlate 
 
 | File | Changes |
 |------|---------|
-| `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, `EventTriggerConfigs` (single/multiple support), extended `ParamConfig` with `FromEvent` and `SelfAddress` variants; added `Int24`, `Int16`, `Uint24` types; `CallTarget` for target address overrides |
+| `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, `EventTriggerConfigs` (single/multiple support), extended `ParamConfig` with `FromEvent` and `SelfAddress` variants; added `Int24`, `Int16`, `Uint24`, `Uint160`, `Uint96` types; `CallTarget` for target address overrides |
 | `src/raw_data/historical/receipts.rs` | Added `EventTriggerData`, `EventTriggerMessage`, `EventTriggerMatcher` types; `build_event_trigger_matchers()`, `extract_event_triggers()` functions with deduplication; channel sending; `send_range_complete()` |
 | `src/raw_data/historical/eth_calls.rs` | Added event processing: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `extract_value_from_32_bytes()`, `build_event_call_params()`, `process_event_triggers()`, `process_event_triggers_multicall()`, `write_event_call_results_to_parquet()`, `write_empty_event_call_file()`, `build_event_call_schema()`; catchup: `load_historical_factory_addresses()`, `read_factory_addresses_from_parquet()` |
-| `src/raw_data/decoding/types.rs` | Added `EventCallResult` type and `EventCallsReady` variant to `DecoderMessage` |
-| `src/raw_data/decoding/eth_calls.rs` | Added `EventCallDecodeConfig`, `DecodedEventCallRecord` types; `process_event_calls()`, `build_decode_configs()` includes event configs; support for all int/uint types in decoding |
-| `src/raw_data/decoding/mod.rs` | Exported `EventCallResult` |
+| `src/decoding/types.rs` | Added `EventCallResult` type and `EventCallsReady` variant to `DecoderMessage` |
+| `src/decoding/eth_calls.rs` | Added `EventCallDecodeConfig`, `DecodedEventCallRecord` types; `process_event_calls()`, `build_decode_configs()` includes event configs; support for all int/uint types in decoding |
+| `src/decoding/catchup/eth_calls.rs` | Catchup phase eth_call decoding |
+| `src/decoding/current/eth_calls.rs` | Current/streaming phase eth_call decoding |
+| `src/decoding/mod.rs` | Exported `EventCallResult` |
+| `src/live/eth_calls.rs` | Live mode eth_call collector with event-triggered call support |
 | `src/main.rs` | Added channel creation, event matchers building, and wiring |
 
 ## Design Decisions
@@ -534,7 +537,7 @@ Run config parsing tests specifically:
 cargo test types::config::eth_call
 ```
 
-Key tests (44 total):
+Key tests (55 total):
 - `test_frequency_deserialize_on_events` - Deserialize single `on_events` frequency
 - `test_frequency_deserialize_on_events_array` - Deserialize array of events
 - `test_frequency_deserialize_on_events_single_still_works` - Backward compatibility

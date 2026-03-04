@@ -4,13 +4,14 @@ This module provides a generic Ethereum RPC client with support for rate limitin
 
 ## Overview
 
-The RPC module consists of three main clients:
+The RPC module consists of four main clients:
 
 - **`RpcClient`** - A generic RPC client with optional request-based rate limiting (uses governor token bucket)
 - **`AlchemyClient`** - An Alchemy-specific client with compute unit (CU) based rate limiting (uses sliding window)
 - **`UnifiedRpcClient`** - A unified enum that automatically selects the appropriate client based on URL
+- **`WsClient`** - A WebSocket client for `eth_subscribe("newHeads")` with auto-reconnection
 
-All three clients implement the **`RpcProvider`** trait, enabling polymorphic usage.
+All HTTP clients implement the **`RpcProvider`** trait, enabling polymorphic usage.
 
 The clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying RPC operations. `RpcClient` uses [governor](https://github.com/bheisler/governor) for token bucket rate limiting, while `AlchemyClient` uses a custom `SlidingWindowRateLimiter` that accurately models Alchemy's 10-second window rate limiting.
 
@@ -18,10 +19,11 @@ The clients use [alloy](https://github.com/alloy-rs/alloy) for the underlying RP
 
 ```
 src/rpc/
-├── mod.rs      # Module exports
-├── rpc.rs      # Generic RPC client, RpcProvider trait, retry logic
-├── alchemy.rs  # Alchemy-specific client with CU rate limiting, SlidingWindowRateLimiter
-└── unified.rs  # Unified client that auto-selects based on URL
+├── mod.rs       # Module exports
+├── rpc.rs       # Generic RPC client, RpcProvider trait, retry logic
+├── alchemy.rs   # Alchemy-specific client with CU rate limiting, SlidingWindowRateLimiter
+├── unified.rs   # Unified client that auto-selects based on URL
+└── websocket.rs # WebSocket client for newHeads subscription with auto-reconnection
 ```
 
 ### Public Exports
@@ -31,6 +33,7 @@ src/rpc/
 pub use alchemy::{AlchemyClient, AlchemyConfig, ComputeUnitCost, SlidingWindowRateLimiter};
 pub use rpc::{RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider};
 pub use unified::UnifiedRpcClient;
+pub use websocket::{BlockHeader, ReconnectConfig, WsClient, WsError, WsEvent};
 ```
 
 Note: `RateLimitConfig` (for governor-based rate limiting in `RpcClient`) is defined in `rpc.rs` but not re-exported from the module root. To use it, either add it to the `pub use` in `mod.rs` or import directly from the submodule.
@@ -718,6 +721,92 @@ for handle in handles {
 
 ## Dependencies
 
+## WebSocket Client
+
+The `WsClient` provides WebSocket-based block header subscriptions for live mode with automatic reconnection.
+
+### Basic Usage
+
+```rust
+use doppler_indexer_rs::rpc::{WsClient, ReconnectConfig, WsEvent};
+
+let ws_url = "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY";
+let client = WsClient::connect(ws_url, ReconnectConfig::default()).await?;
+
+// Subscribe and receive events
+while let Some(event) = client.recv().await {
+    match event {
+        WsEvent::NewBlock(header) => {
+            println!("New block: {} hash: {:?}", header.number, header.hash);
+        }
+        WsEvent::Disconnected => {
+            println!("WebSocket disconnected, reconnecting...");
+        }
+        WsEvent::Reconnected => {
+            println!("WebSocket reconnected");
+        }
+    }
+}
+```
+
+### ReconnectConfig
+
+Configuration for exponential backoff reconnection:
+
+```rust
+pub struct ReconnectConfig {
+    pub initial_delay: Duration,  // Default: 100ms
+    pub max_delay: Duration,      // Default: 30s
+    pub backoff_multiplier: f64,  // Default: 2.0
+}
+```
+
+### WsEvent Enum
+
+| Variant | Description |
+|---------|-------------|
+| `NewBlock(BlockHeader)` | A new block header was received |
+| `Disconnected` | WebSocket connection was lost |
+| `Reconnected` | Successfully reconnected after disconnect |
+
+### WsError Types
+
+| Error | Description |
+|-------|-------------|
+| `ConnectionFailed` | Failed to establish WebSocket connection |
+| `SubscribeFailed` | Failed to subscribe to newHeads |
+| `ParseError` | Failed to parse block header from message |
+| `Closed` | WebSocket closed by server |
+
+### Gap Detection
+
+On reconnection, the client detects gaps between the last received block and the first new block. The caller is responsible for backfilling missing blocks via HTTP.
+
+## Metrics Integration
+
+All `AlchemyClient` operations are instrumented with metrics via `with_metrics()`:
+
+- Request counts per method
+- Success/failure rates
+- Latency histograms (labeled by chain and RPC method)
+
+Metrics are exposed via the metrics HTTP server configured in your config file.
+
+## ConcurrentExecutor Helper
+
+The `AlchemyClient` uses an internal `ConcurrentExecutor` helper struct that encapsulates semaphore + rate limiter concurrency control. This is used by both `execute_concurrent_ordered()` and `execute_streaming()` methods.
+
+```rust
+// Internal structure (not public API)
+struct ConcurrentExecutor {
+    semaphore: Arc<Semaphore>,
+    rate_limiter: Arc<SlidingWindowRateLimiter>,
+    rpc_concurrency: u32,
+}
+```
+
+## Dependencies
+
 The RPC module requires these dependencies in `Cargo.toml`:
 
 ```toml
@@ -727,6 +816,7 @@ async-trait = "0.1"
 governor = "0.10"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
 url = "2.5"
 thiserror = "2.0"
 ```

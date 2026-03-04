@@ -456,6 +456,21 @@ RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
 4. **Track catchup duration** - Long catchup suggests many ranges need re-processing
 5. **Handler execution time** - If handlers are slow, consider increasing `handler_concurrency`
 
+### ConcurrentExecutor Helper
+
+The `AlchemyClient` uses a `ConcurrentExecutor` helper struct that encapsulates semaphore + rate limiter concurrency control:
+
+```rust
+// Internal structure (not public API)
+struct ConcurrentExecutor {
+    semaphore: Arc<Semaphore>,
+    rate_limiter: Arc<SlidingWindowRateLimiter>,
+    rpc_concurrency: u32,
+}
+```
+
+This abstraction is used by both ordered and streaming execution methods.
+
 ### Concurrent Execution Methods
 
 The codebase uses two main patterns for concurrent execution:
@@ -505,6 +520,26 @@ for request in requests {
 ```
 
 Results are sent immediately as they complete, enabling pipeline parallelism.
+
+**3. Semaphore-bounded JoinSet for Decoding**
+
+The catchup decoders (`src/decoding/catchup/logs.rs` and `src/decoding/catchup/eth_calls.rs`) use semaphore-bounded JoinSet for parallel parquet file processing:
+
+```rust
+let semaphore = Arc::new(Semaphore::new(decoding_concurrency));
+let mut join_set: JoinSet<Result<...>> = JoinSet::new();
+
+for file in files_to_process {
+    let permit = semaphore.clone().acquire_owned().await?;
+    join_set.spawn(async move {
+        let result = decode_file(file).await;
+        drop(permit);
+        result
+    });
+}
+```
+
+This ensures bounded memory usage during catchup while maximizing parallelism.
 
 ## Retry and Error Handling
 

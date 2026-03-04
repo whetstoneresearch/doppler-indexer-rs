@@ -162,6 +162,60 @@ Each `LogData` contains:
 - `topics: Vec<[u8; 32]>`
 - `data: Vec<u8>`
 
+### Event Trigger Types
+
+When event-triggered eth_calls are configured, the receipt collector extracts matching events and sends them via the `event_trigger_tx` channel.
+
+#### EventTriggerMessage
+
+```rust
+pub enum EventTriggerMessage {
+    /// Batch of event triggers from a range
+    Triggers(Vec<EventTriggerData>),
+    /// A block range is complete
+    RangeComplete { range_start: u64, range_end: u64 },
+    /// All ranges are complete
+    AllComplete,
+}
+```
+
+#### EventTriggerData
+
+```rust
+pub struct EventTriggerData {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    /// Address that emitted the event
+    pub emitter_address: [u8; 20],
+    /// Matched source name (contract or factory collection)
+    pub source_name: String,
+    /// Event signature hash (topic[0])
+    pub event_signature: [u8; 32],
+    /// All topics including topic0
+    pub topics: Vec<[u8; 32]>,
+    /// ABI-encoded event data
+    pub data: Vec<u8>,
+}
+```
+
+#### EventTriggerMatcher
+
+```rust
+pub struct EventTriggerMatcher {
+    /// Source name (contract name or factory collection name)
+    pub source_name: String,
+    /// Addresses to match (empty for factory collections - matched dynamically)
+    pub addresses: HashSet<[u8; 20]>,
+    /// Whether this is a factory collection (addresses discovered dynamically)
+    pub is_factory: bool,
+    /// Event signature hash (keccak256 of signature)
+    pub event_topic0: [u8; 32],
+}
+```
+
+Matchers are built from contract configurations via `build_event_trigger_matchers()`. For factory collections, `addresses` is empty and matching is done dynamically against discovered factory addresses.
+
 ## Output
 
 Receipts are written to `data/raw/<CHAIN_NAME>/receipts/` as Parquet files named by block range:

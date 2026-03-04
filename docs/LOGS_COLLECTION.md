@@ -139,7 +139,12 @@ When `decoder_tx` is provided, the collector sends `DecoderMessage` for each com
 
 ```rust
 pub enum DecoderMessage {
-    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData>, live_mode: bool },
+    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData>, live_mode: bool, has_factory_matchers: bool },
+    EthCallsReady { range_start: u64, range_end: u64, ... },
+    OnceCallsReady { range_start: u64, range_end: u64, ... },
+    EventCallsReady { range_start: u64, range_end: u64, ... },
+    FactoryAddresses { range_start: u64, range_end: u64, addresses: HashMap<String, Vec<Address>> },
+    OnceFileBackfilled { contract_name: String, file_name: String },
     Reorg { common_ancestor: u64, orphaned: Vec<u64> },
     AllComplete,
 }
@@ -148,6 +153,12 @@ pub enum DecoderMessage {
 - **`LogsReady`** - Sends the filtered logs for a completed range to the decoder
   - `live_mode: false` for historical collection (writes parquet)
   - `live_mode: true` for live WebSocket collection (writes bincode)
+  - `has_factory_matchers: bool` indicates if factory matchers exist for this range
+- **`EthCallsReady`** - Regular eth_call results ready for decoding
+- **`OnceCallsReady`** - One-time eth_call results ready for decoding
+- **`EventCallsReady`** - Event-triggered eth_call results ready for decoding
+- **`FactoryAddresses`** - Factory-discovered addresses for a range (needed for factory event matching)
+- **`OnceFileBackfilled`** - A once-call file was backfilled with new columns - decoder should re-check it
 - **`Reorg`** - Signals a chain reorganization for cleanup of orphaned blocks
 - **`AllComplete`** - Signals that all log collection is finished
 

@@ -116,6 +116,8 @@ data/live/{chain}/
 ├── receipts/{block_number}.bin     # Transaction receipts
 ├── logs/{block_number}.bin         # Raw logs
 ├── eth_calls/{block_number}.bin    # ETH call results
+├── factories/{block_number}.bin    # Factory addresses discovered in block
+├── snapshots/{block_number}.bin    # Upsert snapshots for reorg rollback
 ├── status/{block_number}.json      # Processing status (JSON for debugging)
 └── decoded/
     ├── logs/{block_number}/{contract}/{event}.bin
@@ -439,6 +441,17 @@ impl LiveStorage {
     fn delete_block(&self, block_number: u64) -> Result<()>;
     fn list_blocks(&self) -> Result<Vec<u64>>;
 
+    // Factory operations
+    fn write_factories(&self, block_number: u64, addresses: &LiveFactoryAddresses) -> Result<()>;
+    fn read_factories(&self, block_number: u64) -> Result<LiveFactoryAddresses>;
+    fn delete_factories(&self, block_number: u64) -> Result<()>;
+    fn list_factory_blocks(&self) -> Result<Vec<u64>>;
+
+    // Snapshot operations (for reorg rollback)
+    fn write_snapshots(&self, block_number: u64, snapshots: &[LiveUpsertSnapshot]) -> Result<()>;
+    fn read_snapshots(&self, block_number: u64) -> Result<Vec<LiveUpsertSnapshot>>;
+    fn delete_snapshots(&self, block_number: u64) -> Result<()>;
+
     // Decoded log operations
     fn write_decoded_logs(&self, block_number: u64, contract: &str, event: &str, logs: &[LiveDecodedLog]) -> Result<()>;
     fn read_decoded_logs(&self, block_number: u64, contract: &str, event: &str) -> Result<Vec<LiveDecodedLog>>;
@@ -459,6 +472,7 @@ impl LiveStorage {
 
     // Bulk operations
     fn delete_all(&self, block_number: u64) -> Result<()>;  // Deletes all data for a block
+    fn delete_range(&self, start: u64, end: u64) -> Result<()>;  // Deletes all data for a range
 }
 ```
 
@@ -550,77 +564,24 @@ match self.storage.read_block(block_number) {
 
 ## Outstanding Issues
 
-> **Warning**: Live mode is not fully implemented. The following critical issues must be addressed before live mode can function correctly.
+> **Note**: Most critical issues have been resolved. The following items remain.
 
-### Critical Issues
+### Resolved Issues
 
-#### 3. Transformation Engine Not Running in Live Mode
+The following issues from earlier versions have been fixed:
 
-In `spawn_live_mode()`, the `live_msg_rx` channel is simply drained:
+- **Issue 4 (LiveBlockStatus Never Set to Complete):** Now fixed - `status.decoded = true` is set in multiple places in the log decoder and eth_call decoder. The `status.transformed = true` is set in `progress.rs` when all handlers complete.
+- **Issue 8 (Logs Parquet Missing transaction_hash):** Fixed - `compaction.rs` now includes `transaction_hash` field in the logs parquet schema.
+- **Issue 9 (Progress Tracker Handlers Never Registered):** Fixed - Handlers are registered in `main.rs` during initialization.
 
-```rust
-// Drain live messages (prevents channel from filling up and blocking collector)
-tasks.spawn(async move {
-    while live_msg_rx.recv().await.is_some() {}
-    Ok(())
-});
-```
+### Remaining Issues
 
-The transformation engine is only spawned during historical mode. Consequences:
+#### 3. Transformation Engine in Live-Only Mode
 
-- Decoded events don't get processed by handlers
-- No database writes from handlers in live mode
-- `transform_reorg_tx` is passed but no engine receives reorg messages
-- Handler `reorg_tables()` cleanup won't occur
+When using `--live-only` mode, the transformation engine is NOT running (the engine only continues into live mode after completing historical processing). This means:
 
-#### 4. LiveBlockStatus Never Set to Complete
-
-The `LiveBlockStatus` tracks processing stages, but `decoded` and `transformed` are never set:
-
-```rust
-pub struct LiveBlockStatus {
-    pub collected: bool,        // Set ✓
-    pub block_fetched: true,    // Set ✓
-    pub receipts_collected: true, // Set ✓
-    pub logs_collected: true,   // Set ✓
-    pub decoded: false,         // NEVER SET
-    pub transformed: false,     // NEVER SET
-}
-```
-
-Since `is_complete()` requires all flags to be `true`:
-
-- Compaction will **never** find any compactable ranges
-- Blocks will accumulate indefinitely in `data/live/`
-
-#### 8. Logs Parquet Missing transaction_hash
-
-In `CompactionService::write_logs_parquet()`, the schema omits `transaction_hash`:
-
-```rust
-let schema = Arc::new(Schema::new(vec![
-    Field::new("block_number", ...),
-    Field::new("block_timestamp", ...),
-    Field::new("log_index", ...),
-    Field::new("transaction_index", ...),
-    Field::new("address", ...),
-    Field::new("topic0", ...),
-    // ... topics 1-3
-    Field::new("data", ...),
-    // MISSING: transaction_hash
-]));
-```
-
-The `LiveLog` struct has `transaction_hash`, but it's not written to the compacted parquet.
-
-### Minor Issues
-
-#### 9. Progress Tracker Handlers Never Registered
-
-In `spawn_live_mode()`, the `LiveProgressTracker` is created but `register_handler()` is never called. With no registered handlers:
-
-- `is_block_complete()` returns `true` for any block (empty handler set)
-- This is currently moot since `decoded`/`transformed` flags are never set anyway
+- In normal mode (historical → live transition): transformation engine DOES continue running in live mode
+- In `--live-only` mode: transformation engine is not started
 
 #### 10. Decoded Data Discarded During Compaction
 
@@ -633,19 +594,56 @@ Per the TODO in `compact_range()`:
 
 Decoded bincode files are deleted during compaction without being converted to parquet. The data must be re-decoded from raw parquet later, which is inefficient.
 
-### Summary: What's Needed for Working Live Mode
+## New Live Mode Types
 
-3. **Spawn transformation engine** in live mode:
-   - Create and run engine after live collector starts
-   - Connect decoded events/calls channels
-   - Handle `ReorgMessage` for database cleanup
+### LiveUpsertSnapshot and LiveDbValue
 
-4. **Set decoded/transformed status**:
-   - After log decoding completes, set `status.decoded = true`
-   - After transformation completes, set `status.transformed = true`
+For reorg rollback support, live mode captures snapshots of database state before upserts:
 
-6. **Include transaction_hash in compacted logs parquet**
+```rust
+pub struct LiveUpsertSnapshot {
+    pub table: String,
+    pub key_columns: Vec<String>,
+    pub key_values: Vec<LiveDbValue>,
+    pub previous_row: Option<HashMap<String, LiveDbValue>>,
+}
 
-7. **Register handlers with progress tracker** in live mode
+pub enum LiveDbValue {
+    Null,
+    Bool(bool),
+    Int32(i32),
+    Int64(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+    Numeric(String),
+    Json(String),
+}
+```
 
-8. **Optionally**: Implement `_reorg_` shadow tables for proper state restoration
+### LiveFactoryAddresses
+
+Tracks factory addresses discovered in each block:
+
+```rust
+pub struct LiveFactoryAddresses {
+    pub addresses: HashMap<String, Vec<[u8; 20]>>,  // collection_name -> addresses
+}
+```
+
+## Unified Error Type
+
+Live mode uses a unified `LiveError` type that consolidates errors from various modules:
+
+```rust
+pub enum LiveError {
+    Storage(StorageError),
+    Rpc(RpcError),
+    Channel(String),
+    Decode(String),
+    Io(std::io::Error),
+    Database(DbError),
+    Progress(String),
+}
+```
+
+`ProgressError` and `LiveEthCallError` are now type aliases to `LiveError`.

@@ -19,15 +19,42 @@ config/
     └── base.json            # Chain-specific factory collection types
 ```
 
+## Command Line Arguments
+
+The indexer supports the following command line arguments:
+
+| Argument | Description |
+|----------|-------------|
+| `--decode-only` | Runs decoders on existing raw parquet files without collection or transformations |
+| `--live-only` | Skips historical processing and starts directly in live mode |
+
+Example:
+```bash
+./doppler-indexer --live-only
+```
+
+## Environment Variables
+
+The following environment variables control indexer behavior:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RPC_CONCURRENCY` | 100 | Maximum concurrent RPC requests |
+| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second rate limit |
+| `RPC_BATCH_SIZE` | (from config) | Override for `rpc_batch_size` config value |
+| `DB_POOL_SIZE` | 16 | PostgreSQL connection pool size |
+| `RUST_LOG` | info | Log level filter (standard tracing crate) |
+
 ## Main Configuration
 
-The root configuration file has three top-level sections:
+The root configuration file has four top-level sections:
 
 ```json
 {
     "chains": [...],
     "raw_data_collection": {...},
-    "transformations": {...}
+    "transformations": {...},
+    "metrics": {...}
 }
 ```
 
@@ -198,6 +225,7 @@ Events specify which contract events to decode:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `signature` | string | Yes | Full ABI signature string including parameter names and types |
+| `name` | string | No | Optional custom name for output directory (defaults to event name from signature) |
 
 ### Multiple Addresses
 
@@ -575,8 +603,27 @@ Tokens define assets to track, optionally with associated liquidity pools for pr
 | `type` | string | Yes | Pool type: `v2`, `v3`, or `v4` |
 | `address` | string | Yes | Pool address (or pool ID for v4) |
 | `quote_token` | string | Yes | Reference to another token key for price quotes |
+| `calls` | array | No | eth_call configurations to execute on the pool (see eth_call Configuration) |
 
 For Uniswap V4 pools, the `address` field accepts a 32-byte pool ID instead of a standard address.
+
+**Pool Calls Example:**
+
+```json
+{
+    "Eurc": {
+        "address": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+        "pool": {
+            "type": "v4",
+            "address": "0xb18fad93e3c5a5f932d901f0c22c5639a832d6f29a4392fff3393fb734dd0720",
+            "quote_token": "Usdc",
+            "calls": [
+                {"function": "liquidity()", "output_type": "uint128"}
+            ]
+        }
+    }
+}
+```
 
 ## Path Resolution
 
@@ -630,3 +677,21 @@ The optional `transformations` section configures the transformation system that
 When `batch_for_catchup` is enabled, the transformation system processes historical data in larger batches for improved throughput. This uses more memory but significantly speeds up initial synchronization.
 
 Transformations are enabled when this config section is present AND there are registered handlers in the transformation registry.
+
+## Metrics Configuration
+
+The optional `metrics` section configures the Prometheus metrics HTTP server:
+
+```json
+{
+    "metrics": {
+        "addr": "0.0.0.0:9090"
+    }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `addr` | string | Yes | Address to bind the metrics HTTP server (e.g., "0.0.0.0:9090") |
+
+When configured, the indexer exposes Prometheus metrics at the specified address for monitoring RPC latency, request counts, and other operational metrics.

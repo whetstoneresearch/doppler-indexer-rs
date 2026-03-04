@@ -196,6 +196,7 @@ The `UnifiedRpcClient::get_blocks_streaming()` method behaves differently based 
 |----------|---------|-------------|
 | `RPC_CONCURRENCY` | 100 | Max concurrent in-flight block requests |
 | `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second |
+| `RPC_BATCH_SIZE` | (from config) | Override for `rpc_batch_size` config value |
 
 **Example for high throughput:**
 ```bash

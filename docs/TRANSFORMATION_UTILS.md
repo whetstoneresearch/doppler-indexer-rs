@@ -545,6 +545,67 @@ Enum representing decoded values from events or eth_calls. Located in `src/trans
 
 ---
 
+## FieldExtractor Trait
+
+The `FieldExtractor` trait provides ergonomic typed field extraction from decoded events and calls. Implemented by both `DecodedEvent` and `DecodedCall`, it reduces boilerplate when extracting fields.
+
+### Why Use FieldExtractor
+
+**Before (verbose):**
+```rust
+let asset = event.params.get("asset")
+    .ok_or_else(|| TransformationError::MissingField("asset".to_string()))?
+    .as_address()
+    .ok_or_else(|| TransformationError::TypeConversion("asset is not address".to_string()))?;
+```
+
+**After (concise):**
+```rust
+let asset = event.extract_address("asset")?;
+```
+
+### Required Trait Methods
+
+| Method | Description |
+|--------|-------------|
+| `field_values()` | Returns the underlying `HashMap<String, DecodedValue>` |
+| `context_info()` | Returns contextual info for error messages (e.g., event name, block number) |
+
+### Extraction Methods
+
+| Method | Return Type | Description |
+|--------|-------------|-------------|
+| `get_field(name)` | `Result<&DecodedValue, TransformationError>` | Get field by name, error if missing |
+| `try_get_field(name)` | `Option<&DecodedValue>` | Get field by name, None if missing |
+| `extract_address(name)` | `Result<[u8; 20], TransformationError>` | Extract as address |
+| `extract_uint256(name)` | `Result<U256, TransformationError>` | Extract as U256 |
+| `extract_int256(name)` | `Result<I256, TransformationError>` | Extract as I256 |
+| `extract_u64(name)` | `Result<u64, TransformationError>` | Extract as u64 |
+| `extract_i64(name)` | `Result<i64, TransformationError>` | Extract as i64 |
+| `extract_u32(name)` | `Result<u32, TransformationError>` | Extract as u32 |
+| `extract_i32(name)` | `Result<i32, TransformationError>` | Extract as i32 |
+| `extract_u8(name)` | `Result<u8, TransformationError>` | Extract as u8 |
+| `extract_bool(name)` | `Result<bool, TransformationError>` | Extract as bool |
+| `extract_string(name)` | `Result<&str, TransformationError>` | Extract as string reference |
+| `extract_bytes32(name)` | `Result<[u8; 32], TransformationError>` | Extract as bytes32 |
+| `extract_bytes(name)` | `Result<&[u8], TransformationError>` | Extract as byte slice |
+| `extract_u64_flexible(name)` | `Result<u64, TransformationError>` | Extract u64 with flexible parsing (handles i64, u64, or numeric strings) |
+| `extract_i32_flexible(name)` | `Result<i32, TransformationError>` | Extract i32 with flexible parsing (handles i32, u32, or numeric strings) |
+
+### Error Messages
+
+All extraction methods provide context-rich error messages:
+
+```rust
+// MissingField error includes context
+TransformationError::MissingField("asset in Swap event at block 12345")
+
+// TypeConversion error includes field name and context
+TransformationError::TypeConversion("'amount' is not a uint256 in Swap event at block 12345")
+```
+
+---
+
 ## DecodedEvent
 
 Represents a decoded blockchain event.
