@@ -7,6 +7,8 @@ use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
+use crate::types::config::generic::SingleOrMultiple;
+
 #[derive(Debug, Error)]
 pub enum ParamError {
     #[error("Invalid address format: {0}")]
@@ -47,44 +49,41 @@ pub struct EventTriggerConfig {
     pub event: String,
 }
 
-/// Wrapper for event trigger configurations supporting single or multiple events
+/// Wrapper for event trigger configurations supporting single or multiple events.
+/// Uses the generic SingleOrMultiple<T> type but with validation that rejects empty arrays.
 #[derive(Debug, Clone, PartialEq)]
-pub enum EventTriggerConfigs {
-    Single(EventTriggerConfig),
-    Multiple(Vec<EventTriggerConfig>),
-}
+pub struct EventTriggerConfigs(SingleOrMultiple<EventTriggerConfig>);
 
 impl EventTriggerConfigs {
-    /// Iterate over all event trigger configurations
-    pub fn iter(&self) -> Box<dyn Iterator<Item = &EventTriggerConfig> + '_> {
-        match self {
-            EventTriggerConfigs::Single(config) => Box::new(std::iter::once(config)),
-            EventTriggerConfigs::Multiple(configs) => Box::new(configs.iter()),
-        }
+    /// Create from a single config
+    pub fn single(config: EventTriggerConfig) -> Self {
+        Self(SingleOrMultiple::Single(config))
     }
 
-    /// Get all configurations as a slice-like iterator
+    /// Create from multiple configs (panics if empty)
+    pub fn multiple(configs: Vec<EventTriggerConfig>) -> Self {
+        assert!(!configs.is_empty(), "on_events array cannot be empty");
+        Self(SingleOrMultiple::Multiple(configs))
+    }
+
+    /// Iterate over all event trigger configurations
+    pub fn iter(&self) -> impl Iterator<Item = &EventTriggerConfig> {
+        self.0.iter()
+    }
+
+    /// Get all configurations as references (for compatibility)
     pub fn configs(&self) -> Vec<&EventTriggerConfig> {
-        match self {
-            EventTriggerConfigs::Single(config) => vec![config],
-            EventTriggerConfigs::Multiple(configs) => configs.iter().collect(),
-        }
+        self.0.as_slice()
     }
 
     /// Get the number of event configurations
     pub fn len(&self) -> usize {
-        match self {
-            EventTriggerConfigs::Single(_) => 1,
-            EventTriggerConfigs::Multiple(configs) => configs.len(),
-        }
+        self.0.len()
     }
 
-    /// Check if empty (only possible for Multiple with empty vec, which we prevent)
+    /// Check if empty (should never be true due to validation)
     pub fn is_empty(&self) -> bool {
-        match self {
-            EventTriggerConfigs::Single(_) => false,
-            EventTriggerConfigs::Multiple(configs) => configs.is_empty(),
-        }
+        self.0.is_empty()
     }
 }
 
@@ -93,40 +92,15 @@ impl<'de> Deserialize<'de> for EventTriggerConfigs {
     where
         D: serde::Deserializer<'de>,
     {
-        struct EventTriggerConfigsVisitor;
+        // Deserialize using the generic type
+        let inner = SingleOrMultiple::<EventTriggerConfig>::deserialize(deserializer)?;
 
-        impl<'de> Visitor<'de> for EventTriggerConfigsVisitor {
-            type Value = EventTriggerConfigs;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a single event trigger config object or an array of event trigger configs")
-            }
-
-            fn visit_map<M>(self, map: M) -> Result<EventTriggerConfigs, M::Error>
-            where
-                M: de::MapAccess<'de>,
-            {
-                // Deserialize as a single EventTriggerConfig
-                let config = EventTriggerConfig::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                Ok(EventTriggerConfigs::Single(config))
-            }
-
-            fn visit_seq<S>(self, mut seq: S) -> Result<EventTriggerConfigs, S::Error>
-            where
-                S: de::SeqAccess<'de>,
-            {
-                let mut configs = Vec::new();
-                while let Some(config) = seq.next_element::<EventTriggerConfig>()? {
-                    configs.push(config);
-                }
-                if configs.is_empty() {
-                    return Err(de::Error::custom("on_events array cannot be empty"));
-                }
-                Ok(EventTriggerConfigs::Multiple(configs))
-            }
+        // Validate that array is not empty
+        if inner.is_empty() {
+            return Err(de::Error::custom("on_events array cannot be empty"));
         }
 
-        deserializer.deserialize_any(EventTriggerConfigsVisitor)
+        Ok(EventTriggerConfigs(inner))
     }
 }
 
@@ -1189,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_frequency_on_events_helpers() {
-        let freq = Frequency::OnEvents(EventTriggerConfigs::Single(EventTriggerConfig {
+        let freq = Frequency::OnEvents(EventTriggerConfigs::single(EventTriggerConfig {
             source: "Pool".to_string(),
             event: "Swap(address,address,int256,int256,uint160,uint128,int24)".to_string(),
         }));
@@ -1526,7 +1500,7 @@ mod tests {
     #[test]
     fn test_event_trigger_configs_iter() {
         // Test Single variant
-        let single = EventTriggerConfigs::Single(EventTriggerConfig {
+        let single = EventTriggerConfigs::single(EventTriggerConfig {
             source: "Token".to_string(),
             event: "Transfer(address,address,uint256)".to_string(),
         });
@@ -1535,7 +1509,7 @@ mod tests {
         assert_eq!(configs[0].source, "Token");
 
         // Test Multiple variant
-        let multiple = EventTriggerConfigs::Multiple(vec![
+        let multiple = EventTriggerConfigs::multiple(vec![
             EventTriggerConfig {
                 source: "Pool".to_string(),
                 event: "Swap(...)".to_string(),
@@ -1553,14 +1527,14 @@ mod tests {
 
     #[test]
     fn test_event_trigger_configs_len_and_is_empty() {
-        let single = EventTriggerConfigs::Single(EventTriggerConfig {
+        let single = EventTriggerConfigs::single(EventTriggerConfig {
             source: "Token".to_string(),
             event: "Transfer(...)".to_string(),
         });
         assert_eq!(single.len(), 1);
         assert!(!single.is_empty());
 
-        let multiple = EventTriggerConfigs::Multiple(vec![
+        let multiple = EventTriggerConfigs::multiple(vec![
             EventTriggerConfig {
                 source: "Pool".to_string(),
                 event: "Swap(...)".to_string(),
