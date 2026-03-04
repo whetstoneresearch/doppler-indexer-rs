@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::config::defaults::raw_data as defaults;
+
 /// A block in live mode, stored as bincode for fast serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveBlock {
@@ -142,8 +144,8 @@ pub struct LiveModeConfig {
 impl Default for LiveModeConfig {
     fn default() -> Self {
         Self {
-            reorg_depth: 128,
-            compaction_interval_secs: 10,
+            reorg_depth: defaults::REORG_DEPTH,
+            compaction_interval_secs: defaults::COMPACTION_INTERVAL_SECS,
             range_size: 1000,
         }
     }

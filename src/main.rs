@@ -32,6 +32,7 @@ use transformations::{
     RangeCompleteMessage, ReorgMessage, TransformationEngine,
 };
 use types::config::chain::ChainConfig;
+use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use types::config::eth_call::Frequency;
 use types::config::indexer::IndexerConfig;
 
@@ -446,11 +447,14 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     );
 
     // Channel setup
-    let channel_cap = config.raw_data_collection.channel_capacity.unwrap_or(1000);
+    let channel_cap = config
+        .raw_data_collection
+        .channel_capacity
+        .unwrap_or(raw_data_defaults::CHANNEL_CAPACITY);
     let factory_cap = config
         .raw_data_collection
         .factory_channel_capacity
-        .unwrap_or(1000);
+        .unwrap_or(raw_data_defaults::FACTORY_CHANNEL_CAPACITY);
 
     let (block_tx, block_rx) = mpsc::channel(channel_cap);
     let (log_tx, log_rx) = mpsc::channel::<LogMessage>(channel_cap);
@@ -547,12 +551,12 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
     let rpc_concurrency: usize = env::var("RPC_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(rpc_defaults::CONCURRENCY);
 
     let alchemy_cu_per_second: u32 = env::var("ALCHEMY_CU_PER_SECOND")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(7500);
+        .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
     // Allow overriding batch size via env var for larger concurrent fetches
     let rpc_batch_size: Option<u32> = env::var("RPC_BATCH_SIZE")
@@ -570,7 +574,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         "RPC config: concurrency={}, alchemy_cu_per_second={}, batch_size={}",
         rpc_concurrency,
         alchemy_cu_per_second,
-        raw_config.rpc_batch_size.unwrap_or(100)
+        raw_config.rpc_batch_size.unwrap_or(rpc_defaults::MAX_BATCH_SIZE)
     );
 
     // Create shared rate limiter for account-level rate limiting across all clients
@@ -995,11 +999,11 @@ async fn spawn_live_mode(
         reorg_depth: config
             .raw_data_collection
             .reorg_depth
-            .unwrap_or(128),
+            .unwrap_or(raw_data_defaults::REORG_DEPTH),
         compaction_interval_secs: config
             .raw_data_collection
             .compaction_interval_secs
-            .unwrap_or(10),
+            .unwrap_or(raw_data_defaults::COMPACTION_INTERVAL_SECS),
         range_size: config
             .raw_data_collection
             .parquet_block_range
@@ -1073,7 +1077,7 @@ async fn spawn_live_mode(
             &chain,
             http_client.clone(),
             multicall3_address,
-            config.raw_data_collection.rpc_batch_size.unwrap_or(100) as usize,
+            config.raw_data_collection.rpc_batch_size.unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize,
         );
         if collector.has_calls() {
             Some(collector)

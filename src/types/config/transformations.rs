@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use super::defaults::{database, transformations as defaults};
+
 /// Configuration for the transformation system.
 ///
 /// Transformations are enabled when this config is present AND there are
@@ -38,23 +40,23 @@ pub struct TransformationModeConfig {
 }
 
 fn default_database_url_env_var() -> String {
-    "DATABASE_URL".to_string()
+    database::URL_ENV_VAR.to_string()
 }
 
 fn default_handler_concurrency() -> usize {
-    4
+    defaults::HANDLER_CONCURRENCY
 }
 
 fn default_batch_size() -> usize {
-    1000
+    defaults::BATCH_SIZE
 }
 
 fn default_batch_for_catchup() -> bool {
-    true
+    defaults::BATCH_FOR_CATCHUP
 }
 
 fn default_catchup_batch_size() -> usize {
-    10000
+    defaults::CATCHUP_BATCH_SIZE
 }
 
 impl Default for TransformationConfig {
