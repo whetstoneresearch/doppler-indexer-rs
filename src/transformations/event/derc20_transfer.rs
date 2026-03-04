@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::db::{DbOperation, DbPool};
-use crate::transformations::context::TransformationContext;
+use crate::transformations::context::{FieldExtractor, TransformationContext};
 use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
@@ -42,21 +42,14 @@ impl TransformationHandler for DERC20TransferHandler {
         let mut ops = Vec::new();
 
         for event in ctx.events_of_type("DERC20", "Transfer") {
-            let from_address = event.get("from")?.as_address().ok_or_else(|| {
-                TransformationError::TypeConversion("from is not an address".to_string())
-            })?;
+            let from_address = event.extract_address("from")?;
 
-            if is_precompile_address(from_address.into()) == true {
+            if is_precompile_address(from_address.into()) {
                 continue;
             };
 
-            let to_address = event.get("to")?.as_address().ok_or_else(|| {
-                TransformationError::TypeConversion("to is not an address".to_string())
-            })?;
-            
-            let value = event.get("value")?.as_uint256().ok_or_else(|| {
-                TransformationError::TypeConversion("value is not a uint256".to_string())
-            })?;
+            let to_address = event.extract_address("to")?;
+            let value = event.extract_uint256("value")?;
 
             ops.push(upsert_user(&from_address, &event.block_timestamp, &ctx));
             ops.push(upsert_user(&to_address, &event.block_timestamp, &ctx));
