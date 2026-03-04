@@ -206,15 +206,10 @@ impl TransformationEngine {
         // Check which migrations have already been applied
         let pool = self.db_pool.inner();
         let applied: HashSet<String> = {
-            let client = pool.get().await.map_err(|e| {
-                TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
-            })?;
+            let client = pool.get().await?;
             let rows = client
                 .query("SELECT name FROM _migrations", &[])
-                .await
-                .map_err(|e| {
-                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-                })?;
+                .await?;
             rows.iter().map(|r| r.get(0)).collect()
         };
 
@@ -264,34 +259,23 @@ impl TransformationEngine {
 
             let sql = std::fs::read_to_string(file_path)?;
 
-            let mut client = pool.get().await.map_err(|e| {
-                TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
-            })?;
-            let tx = client.transaction().await.map_err(|e| {
-                TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-            })?;
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
 
             tx.batch_execute(&sql).await.map_err(|e| {
-                TransformationError::DatabaseError(crate::db::DbError::MigrationError(
-                    format!(
-                        "Handler migration {} failed: {}",
-                        migration_name, e
-                    ),
-                ))
+                TransformationError::DatabaseError(crate::db::DbError::MigrationError(format!(
+                    "Handler migration {} failed: {}",
+                    migration_name, e
+                )))
             })?;
 
             tx.execute(
                 "INSERT INTO _migrations (name) VALUES ($1)",
                 &[&migration_name],
             )
-            .await
-            .map_err(|e| {
-                TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-            })?;
+            .await?;
 
-            tx.commit().await.map_err(|e| {
-                TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-            })?;
+            tx.commit().await?;
 
             tracing::info!("Applied handler migration: {}", migration_name);
         }
@@ -306,9 +290,7 @@ impl TransformationEngine {
     /// For existing sources with a different version, logs a warning.
     async fn register_handler_sources(&self) -> Result<(), TransformationError> {
         let pool = self.db_pool.inner();
-        let client = pool.get().await.map_err(|e| {
-            TransformationError::DatabaseError(crate::db::DbError::PoolError(e))
-        })?;
+        let client = pool.get().await?;
 
         for handler in self.registry.all_handlers() {
             let source = handler.name().to_string();
@@ -319,10 +301,7 @@ impl TransformationEngine {
                     "SELECT active_version FROM active_versions WHERE source = $1",
                     &[&source],
                 )
-                .await
-                .map_err(|e| {
-                    TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-                })?;
+                .await?;
 
             if rows.is_empty() {
                 // New source — insert with current version
@@ -331,10 +310,7 @@ impl TransformationEngine {
                         "INSERT INTO active_versions (source, active_version) VALUES ($1, $2)",
                         &[&source, &version],
                     )
-                    .await
-                    .map_err(|e| {
-                        TransformationError::DatabaseError(crate::db::DbError::PostgresError(e))
-                    })?;
+                    .await?;
                 tracing::info!(
                     "Registered new source: {} with active_version={}",
                     source,

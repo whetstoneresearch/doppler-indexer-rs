@@ -64,3 +64,18 @@ impl TransformationError {
         }
     }
 }
+
+// Direct conversions for pool operations to avoid verbose map_err chains.
+// These allow using `?` directly on pool.get() and client.query() calls.
+
+impl From<deadpool_postgres::PoolError> for TransformationError {
+    fn from(e: deadpool_postgres::PoolError) -> Self {
+        Self::DatabaseError(DbError::PoolError(e))
+    }
+}
+
+impl From<tokio_postgres::Error> for TransformationError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::DatabaseError(DbError::PostgresError(e))
+    }
+}
