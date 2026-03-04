@@ -296,6 +296,11 @@ impl LiveStorage {
         Ok(())
     }
 
+    /// List all block numbers with factory address files.
+    pub fn list_factory_blocks(&self) -> Result<Vec<u64>, StorageError> {
+        list_block_numbers(&self.base_dir.join("factories"))
+    }
+
     // =========================================================================
     // Status operations
     // =========================================================================
