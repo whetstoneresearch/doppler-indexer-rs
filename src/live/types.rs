@@ -1,5 +1,7 @@
 //! Types for live mode block processing.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A block in live mode, stored as bincode for fast serialization.
@@ -116,6 +118,13 @@ pub struct LiveEthCall {
     pub contract_address: [u8; 20],
     pub function_name: String,
     pub result: Vec<u8>,
+}
+
+/// Factory addresses discovered in a live block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LiveFactoryAddresses {
+    /// collection_name -> list of (timestamp, address) discovered
+    pub addresses_by_collection: HashMap<String, Vec<(u64, [u8; 20])>>,
 }
 
 /// Configuration for live mode.
