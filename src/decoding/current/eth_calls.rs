@@ -10,13 +10,13 @@ use crate::decoding::catchup::eth_calls::{
     read_raw_parquet_function_names,
 };
 use crate::decoding::eth_calls::{
-    decode_value, CallDecodeConfig, DecodedValue, EthCallDecodingError, EventCallDecodeConfig,
-    process_event_calls, process_once_calls, process_regular_calls,
+    build_result_map, decode_value, CallDecodeConfig, DecodedValue, EthCallDecodingError,
+    EventCallDecodeConfig, process_event_calls, process_once_calls, process_regular_calls,
 };
 use crate::decoding::types::DecoderMessage;
 use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
 use crate::live::LiveStorage;
-use crate::transformations::DecodedCallsMessage;
+use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 use super::super::catchup;
@@ -88,9 +88,23 @@ pub async fn decode_eth_calls_live(
                     if live_mode {
                         // Live mode: decode and write to bincode storage
                         let mut decoded_calls: Vec<LiveDecodedCall> = Vec::with_capacity(results.len());
+                        let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
+
                         for result in &results {
                             match decode_value(&result.value, &config.output_type) {
                                 Ok(decoded) => {
+                                    // Build transform call for transformation engine
+                                    transform_calls.push(TransformDecodedCall {
+                                        block_number: result.block_number,
+                                        block_timestamp: result.block_timestamp,
+                                        contract_address: result.contract_address,
+                                        source_name: contract_name.clone(),
+                                        function_name: function_name.clone(),
+                                        trigger_log_index: None,
+                                        result: build_result_map(&decoded, &config.output_type, &function_name),
+                                    });
+
+                                    // Build live call for bincode storage
                                     decoded_calls.push(LiveDecodedCall {
                                         block_number: result.block_number,
                                         block_timestamp: result.block_timestamp,
@@ -118,6 +132,20 @@ pub async fn decode_eth_calls_live(
                                     "Failed to write decoded eth_calls for {}/{} at block {}: {}",
                                     contract_name, function_name, range_start, e
                                 );
+                            }
+                        }
+
+                        // Send to transformation engine
+                        if let Some(tx) = transform_tx {
+                            if !transform_calls.is_empty() {
+                                let msg = DecodedCallsMessage {
+                                    range_start,
+                                    range_end,
+                                    source_name: contract_name.clone(),
+                                    function_name: function_name.clone(),
+                                    calls: transform_calls,
+                                };
+                                let _ = tx.send(msg).await;
                             }
                         }
                     } else {
@@ -151,6 +179,9 @@ pub async fn decode_eth_calls_live(
                     if live_mode {
                         // Live mode: decode and write to bincode storage
                         let mut decoded_once_calls: Vec<LiveDecodedOnceCall> = Vec::with_capacity(results.len());
+                        // Group transform calls by function name
+                        let mut transform_calls_by_fn: std::collections::HashMap<String, Vec<TransformDecodedCall>> =
+                            std::collections::HashMap::new();
 
                         for result in &results {
                             let mut decoded_values: Vec<(String, LiveDecodedValue)> = Vec::new();
@@ -159,6 +190,22 @@ pub async fn decode_eth_calls_live(
                                 if let Some(raw_value) = result.results.get(&config.function_name) {
                                     match decode_value(raw_value, &config.output_type) {
                                         Ok(decoded) => {
+                                            // Build transform call for transformation engine
+                                            let transform_call = TransformDecodedCall {
+                                                block_number: result.block_number,
+                                                block_timestamp: result.block_timestamp,
+                                                contract_address: result.contract_address,
+                                                source_name: contract_name.clone(),
+                                                function_name: config.function_name.clone(),
+                                                trigger_log_index: None,
+                                                result: build_result_map(&decoded, &config.output_type, &config.function_name),
+                                            };
+                                            transform_calls_by_fn
+                                                .entry(config.function_name.clone())
+                                                .or_default()
+                                                .push(transform_call);
+
+                                            // Build live value for bincode storage
                                             decoded_values.push((
                                                 config.function_name.clone(),
                                                 to_live_value(&decoded),
@@ -196,6 +243,22 @@ pub async fn decode_eth_calls_live(
                                 );
                             }
                         }
+
+                        // Send to transformation engine (one message per function)
+                        if let Some(tx) = transform_tx {
+                            for (function_name, calls) in transform_calls_by_fn {
+                                if !calls.is_empty() {
+                                    let msg = DecodedCallsMessage {
+                                        range_start,
+                                        range_end,
+                                        source_name: contract_name.clone(),
+                                        function_name,
+                                        calls,
+                                    };
+                                    let _ = tx.send(msg).await;
+                                }
+                            }
+                        }
                     } else {
                         // Historical mode: write to parquet
                         process_once_calls(
@@ -228,10 +291,23 @@ pub async fn decode_eth_calls_live(
                     if live_mode {
                         // Live mode: decode and write to bincode storage
                         let mut decoded_event_calls: Vec<LiveDecodedEventCall> = Vec::with_capacity(results.len());
+                        let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
 
                         for result in &results {
                             match decode_value(&result.value, &config.output_type) {
                                 Ok(decoded) => {
+                                    // Build transform call for transformation engine
+                                    transform_calls.push(TransformDecodedCall {
+                                        block_number: result.block_number,
+                                        block_timestamp: result.block_timestamp,
+                                        contract_address: result.target_address,
+                                        source_name: contract_name.clone(),
+                                        function_name: function_name.clone(),
+                                        trigger_log_index: Some(result.log_index),
+                                        result: build_result_map(&decoded, &config.output_type, &function_name),
+                                    });
+
+                                    // Build live call for bincode storage
                                     decoded_event_calls.push(LiveDecodedEventCall {
                                         block_number: result.block_number,
                                         block_timestamp: result.block_timestamp,
@@ -260,6 +336,20 @@ pub async fn decode_eth_calls_live(
                                     "Failed to write decoded event_calls for {}/{} at block {}: {}",
                                     contract_name, function_name, range_start, e
                                 );
+                            }
+                        }
+
+                        // Send to transformation engine
+                        if let Some(tx) = transform_tx {
+                            if !transform_calls.is_empty() {
+                                let msg = DecodedCallsMessage {
+                                    range_start,
+                                    range_end,
+                                    source_name: contract_name.clone(),
+                                    function_name: function_name.clone(),
+                                    calls: transform_calls,
+                                };
+                                let _ = tx.send(msg).await;
                             }
                         }
                     } else {

@@ -1781,6 +1781,36 @@ impl TransformationEngine {
             msg.range_end
         );
 
+        // Update block status for live mode compaction (single-block ranges only)
+        if msg.range_end - msg.range_start == 1 {
+            let storage = LiveStorage::new(&self.chain_name);
+            match storage.read_status(msg.range_start) {
+                Ok(mut status) => {
+                    status.transformed = true;
+                    if let Err(e) = storage.write_status(msg.range_start, &status) {
+                        tracing::warn!(
+                            "Failed to set transformed=true for block {}: {}",
+                            msg.range_start, e
+                        );
+                    }
+                }
+                Err(StorageError::NotFound(_)) => {
+                    // Status file doesn't exist yet - this can happen if transformations
+                    // complete before the collector writes the status file
+                    tracing::debug!(
+                        "Status file not found for block {}, skipping transformed=true",
+                        msg.range_start
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read status for block {}: {}",
+                        msg.range_start, e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
