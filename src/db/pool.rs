@@ -10,6 +10,9 @@ pub struct DbPool {
     pool: Pool,
 }
 
+/// Default pool size if DB_POOL_SIZE is not set.
+const DEFAULT_POOL_SIZE: usize = 16;
+
 impl DbPool {
     pub async fn new(database_url: &str) -> Result<Self, DbError> {
         let config = database_url
@@ -22,14 +25,22 @@ impl DbPool {
 
         let manager = Manager::from_config(config, NoTls, manager_config);
 
+        let pool_size = std::env::var("DB_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_POOL_SIZE);
+
         let pool = Pool::builder(manager)
-            .max_size(16)
+            .max_size(pool_size)
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(DbError::BuildError)?;
 
         let _conn = pool.get().await?;
-        tracing::info!("Database connection pool created successfully");
+        tracing::info!(
+            "Database connection pool created successfully (size={})",
+            pool_size
+        );
 
         Ok(Self { pool })
     }
@@ -369,19 +380,92 @@ fn quote_cols(columns: &[String]) -> String {
     columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ")
 }
 
+/// Builder for SQL queries that manages parameter indexing automatically.
+///
+/// This eliminates the need to manually track `param_idx` across multiple
+/// calls and provides a unified interface for adding parameters.
+struct QueryBuilder {
+    params: Vec<SqlParam>,
+}
+
+impl QueryBuilder {
+    fn new() -> Self {
+        Self { params: Vec::new() }
+    }
+
+    /// Returns the next parameter index (1-based).
+    fn next_idx(&self) -> usize {
+        self.params.len() + 1
+    }
+
+    /// Add a value and return its placeholder string.
+    fn add(&mut self, value: &DbValue) -> String {
+        let idx = self.next_idx();
+        let placeholder = placeholder_for(value, idx);
+        self.params.push(convert_db_value(value));
+        placeholder
+    }
+
+    /// Add multiple values and return their placeholder strings joined by separator.
+    fn add_values(&mut self, values: &[DbValue], sep: &str) -> String {
+        values
+            .iter()
+            .map(|v| self.add(v))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    /// Build a SET clause for UPDATE statements.
+    fn add_set_clause(&mut self, columns: &[(String, DbValue)]) -> String {
+        columns
+            .iter()
+            .map(|(col, val)| {
+                let ph = self.add(val);
+                format!("{} = {}", quote_ident(col), ph)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Build a WHERE clause, adding parameters as needed.
+    fn add_where_clause(&mut self, where_clause: &WhereClause) -> String {
+        match where_clause {
+            WhereClause::Eq(col, val) => {
+                let ph = self.add(val);
+                format!("{} = {}", quote_ident(col), ph)
+            }
+            WhereClause::And(conditions) => {
+                conditions
+                    .iter()
+                    .map(|(col, val)| {
+                        let ph = self.add(val);
+                        format!("{} = {}", quote_ident(col), ph)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            }
+            WhereClause::Raw { condition, params: raw_params } => {
+                for p in raw_params {
+                    self.params.push(convert_db_value(p));
+                }
+                condition.clone()
+            }
+        }
+    }
+
+    /// Consume the builder and return the collected parameters.
+    fn finish(self) -> Vec<SqlParam> {
+        self.params
+    }
+}
+
 fn build_insert_sql(table: &str, columns: &[String], values: &[DbValue]) -> (String, Vec<SqlParam>) {
+    let mut builder = QueryBuilder::new();
     let cols = quote_cols(columns);
-    let placeholders: Vec<String> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| placeholder_for(v, i + 1))
-        .collect();
-    let placeholders_str = placeholders.join(", ");
+    let placeholders_str = builder.add_values(values, ", ");
 
     let sql = format!("INSERT INTO {} ({}) VALUES ({})", table, cols, placeholders_str);
-    let params = convert_values_to_params(values);
-
-    (sql, params)
+    (sql, builder.finish())
 }
 
 fn build_upsert_sql(
@@ -391,20 +475,16 @@ fn build_upsert_sql(
     conflict_columns: &[String],
     update_columns: &[String],
 ) -> (String, Vec<SqlParam>) {
+    let mut builder = QueryBuilder::new();
     let cols = quote_cols(columns);
-    let placeholders: Vec<String> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| placeholder_for(v, i + 1))
-        .collect();
-    let placeholders_str = placeholders.join(", ");
+    let placeholders_str = builder.add_values(values, ", ");
 
     let conflict_cols = quote_cols(conflict_columns);
-    let updates: Vec<String> = update_columns
+    let updates_str = update_columns
         .iter()
         .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
-        .collect();
-    let updates_str = updates.join(", ");
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let sql = if update_columns.is_empty() {
         format!(
@@ -418,8 +498,7 @@ fn build_upsert_sql(
         )
     };
 
-    let params = convert_values_to_params(values);
-    (sql, params)
+    (sql, builder.finish())
 }
 
 fn build_update_sql(
@@ -427,67 +506,19 @@ fn build_update_sql(
     set_columns: &[(String, DbValue)],
     where_clause: &WhereClause,
 ) -> (String, Vec<SqlParam>) {
-    let mut params = Vec::new();
-    let mut param_idx = 1;
-
-    let sets: Vec<String> = set_columns
-        .iter()
-        .map(|(col, val)| {
-            let ph = placeholder_for(val, param_idx);
-            params.push(convert_db_value(val));
-            let s = format!("{} = {}", quote_ident(col), ph);
-            param_idx += 1;
-            s
-        })
-        .collect();
-    let sets_str = sets.join(", ");
-
-    let where_str = build_where_sql(where_clause, &mut params, &mut param_idx);
+    let mut builder = QueryBuilder::new();
+    let sets_str = builder.add_set_clause(set_columns);
+    let where_str = builder.add_where_clause(where_clause);
 
     let sql = format!("UPDATE {} SET {} WHERE {}", table, sets_str, where_str);
-    (sql, params)
+    (sql, builder.finish())
 }
 
 fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<SqlParam>) {
-    let mut params = Vec::new();
-    let mut param_idx = 1;
-
-    let where_str = build_where_sql(where_clause, &mut params, &mut param_idx);
+    let mut builder = QueryBuilder::new();
+    let where_str = builder.add_where_clause(where_clause);
 
     let sql = format!("DELETE FROM {} WHERE {}", table, where_str);
-    (sql, params)
+    (sql, builder.finish())
 }
 
-fn build_where_sql(
-    where_clause: &WhereClause,
-    params: &mut Vec<SqlParam>,
-    param_idx: &mut usize,
-) -> String {
-    match where_clause {
-        WhereClause::Eq(col, val) => {
-            let ph = placeholder_for(val, *param_idx);
-            params.push(convert_db_value(val));
-            *param_idx += 1;
-            format!("{} = {}", quote_ident(col), ph)
-        }
-        WhereClause::And(conditions) => {
-            let parts: Vec<String> = conditions
-                .iter()
-                .map(|(col, val)| {
-                    let ph = placeholder_for(val, *param_idx);
-                    params.push(convert_db_value(val));
-                    let s = format!("{} = {}", quote_ident(col), ph);
-                    *param_idx += 1;
-                    s
-                })
-                .collect();
-            parts.join(" AND ")
-        }
-        WhereClause::Raw { condition, params: raw_params } => {
-            for p in raw_params {
-                params.push(convert_db_value(p));
-            }
-            condition.clone()
-        }
-    }
-}
