@@ -9,6 +9,28 @@ use super::traits::{
     EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler,
 };
 
+/// Generic helper to deduplicate handlers by their `handler_key()`.
+///
+/// Takes an iterator of (handler, triggers) pairs and returns a Vec of unique HandlerInfo
+/// structs, where each handler appears exactly once (keyed by `handler_key()`).
+fn deduplicate_handlers<H, T, I, F>(handlers: I, get_triggers: F) -> Vec<(Arc<H>, Vec<T>)>
+where
+    H: TransformationHandler + ?Sized,
+    T: Clone,
+    I: IntoIterator<Item = Arc<H>>,
+    F: Fn(&H) -> Vec<T>,
+{
+    let mut seen: HashMap<String, (Arc<H>, Vec<T>)> = HashMap::new();
+    for handler in handlers {
+        let key = handler.handler_key();
+        seen.entry(key).or_insert_with(|| {
+            let triggers = get_triggers(&*handler);
+            (handler, triggers)
+        });
+    }
+    seen.into_values().collect()
+}
+
 /// An event handler with its associated trigger information.
 pub struct EventHandlerInfo {
     pub handler: Arc<dyn EventHandler>,
@@ -125,33 +147,25 @@ impl TransformationRegistry {
     /// Get all unique event handlers with their triggers grouped.
     /// Each handler appears exactly once, deduplicated by `handler_key()`.
     pub fn unique_event_handlers(&self) -> Vec<EventHandlerInfo> {
-        let mut seen: HashMap<String, EventHandlerInfo> = HashMap::new();
-        for handlers in self.event_handlers.values() {
-            for handler in handlers {
-                let key = handler.handler_key();
-                seen.entry(key).or_insert_with(|| EventHandlerInfo {
-                    handler: handler.clone(),
-                    triggers: handler.triggers(),
-                });
-            }
-        }
-        seen.into_values().collect()
+        deduplicate_handlers(
+            self.event_handlers.values().flatten().cloned(),
+            |h| h.triggers(),
+        )
+        .into_iter()
+        .map(|(handler, triggers)| EventHandlerInfo { handler, triggers })
+        .collect()
     }
 
     /// Get all unique call handlers with their triggers grouped.
     /// Each handler appears exactly once, deduplicated by `handler_key()`.
     pub fn unique_call_handlers(&self) -> Vec<CallHandlerInfo> {
-        let mut seen: HashMap<String, CallHandlerInfo> = HashMap::new();
-        for handlers in self.call_handlers.values() {
-            for handler in handlers {
-                let key = handler.handler_key();
-                seen.entry(key).or_insert_with(|| CallHandlerInfo {
-                    handler: handler.clone(),
-                    triggers: handler.triggers(),
-                });
-            }
-        }
-        seen.into_values().collect()
+        deduplicate_handlers(
+            self.call_handlers.values().flatten().cloned(),
+            |h| h.triggers(),
+        )
+        .into_iter()
+        .map(|(handler, triggers)| CallHandlerInfo { handler, triggers })
+        .collect()
     }
 }
 
