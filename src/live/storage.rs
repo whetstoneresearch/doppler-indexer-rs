@@ -25,6 +25,7 @@ use super::types::{
     LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall,
     LiveDecodedLog, LiveDecodedOnceCall, LiveEthCall, LiveFactoryAddresses,
     LiveLog, LiveReceipt,
+    LiveUpsertSnapshot,
 };
 
 #[derive(Debug, Error)]
@@ -73,6 +74,7 @@ impl LiveStorage {
             "status",
             "decoded/logs",
             "decoded/eth_calls",
+            "snapshots",
         ];
 
         for subdir in &subdirs {
@@ -604,6 +606,42 @@ impl LiveStorage {
     }
 
     // =========================================================================
+    // Snapshot operations (for reorg rollback)
+    // =========================================================================
+
+    fn snapshots_path(&self, block_number: u64) -> PathBuf {
+        self.base_dir.join(format!("snapshots/{}.bin", block_number))
+    }
+
+    /// Write upsert snapshots for a block.
+    pub fn write_snapshots(
+        &self,
+        block_number: u64,
+        snapshots: &[LiveUpsertSnapshot],
+    ) -> Result<(), StorageError> {
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+        let path = self.snapshots_path(block_number);
+        write_bincode_slice(&path, snapshots)
+    }
+
+    /// Read upsert snapshots for a block.
+    pub fn read_snapshots(&self, block_number: u64) -> Result<Vec<LiveUpsertSnapshot>, StorageError> {
+        let path = self.snapshots_path(block_number);
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
+    }
+
+    /// Delete upsert snapshots for a block.
+    pub fn delete_snapshots(&self, block_number: u64) -> Result<(), StorageError> {
+        let path = self.snapshots_path(block_number);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    // =========================================================================
     // Reorg detection helpers
     // =========================================================================
 
@@ -633,7 +671,7 @@ impl LiveStorage {
     // Bulk operations
     // =========================================================================
 
-    /// Delete all data for a block (including decoded data).
+    /// Delete all data for a block (including decoded data and snapshots).
     pub fn delete_all(&self, block_number: u64) -> Result<(), StorageError> {
         self.delete_block(block_number)?;
         self.delete_receipts(block_number)?;
@@ -643,6 +681,7 @@ impl LiveStorage {
         self.delete_status(block_number)?;
         self.delete_all_decoded_logs(block_number)?;
         self.delete_all_decoded_calls(block_number)?;
+        self.delete_snapshots(block_number)?;
         Ok(())
     }
 

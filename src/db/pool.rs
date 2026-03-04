@@ -100,6 +100,167 @@ impl DbPool {
         let rows = client.query(query, params).await?;
         Ok(rows)
     }
+
+    /// Query a single row by key columns.
+    /// Returns the row as a list of (column_name, value) pairs if found.
+    pub async fn query_row(
+        &self,
+        table: &str,
+        key_columns: &[(String, DbValue)],
+    ) -> Result<Option<Vec<(String, DbValue)>>, DbError> {
+        if key_columns.is_empty() {
+            return Ok(None);
+        }
+
+        // Build WHERE clause
+        let mut where_parts = Vec::new();
+        let mut params = Vec::new();
+        for (i, (col, val)) in key_columns.iter().enumerate() {
+            let placeholder = placeholder_for(val, i + 1);
+            where_parts.push(format!("{} = {}", quote_ident(col), placeholder));
+            params.push(convert_db_value(val));
+        }
+
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} LIMIT 1",
+            table,
+            where_parts.join(" AND ")
+        );
+
+        let params_refs: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+
+        let client = self.pool.get().await?;
+        let rows = client.query(&sql, &params_refs[..]).await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let row = &rows[0];
+        let mut result = Vec::new();
+
+        // Extract column names and values from the row
+        for col in row.columns() {
+            let col_name = col.name().to_string();
+            let db_value = extract_db_value_from_row(row, col)?;
+            result.push((col_name, db_value));
+        }
+
+        Ok(Some(result))
+    }
+}
+
+/// Extract a DbValue from a tokio_postgres row column.
+fn extract_db_value_from_row(
+    row: &tokio_postgres::Row,
+    col: &tokio_postgres::Column,
+) -> Result<DbValue, DbError> {
+    use tokio_postgres::types::Type;
+
+    let col_name = col.name();
+    let col_type = col.type_();
+
+    // Handle NULL values first
+    let is_null: bool = row.try_get::<_, Option<bool>>(col_name).map(|v| v.is_none()).unwrap_or(false)
+        || row.try_get::<_, Option<i64>>(col_name).map(|v| v.is_none()).unwrap_or(false)
+        || row.try_get::<_, Option<String>>(col_name).map(|v| v.is_none()).unwrap_or(false);
+
+    match *col_type {
+        Type::BOOL => {
+            match row.try_get::<_, Option<bool>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Bool(v)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::INT8 => {
+            match row.try_get::<_, Option<i64>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Int64(v)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::INT4 => {
+            match row.try_get::<_, Option<i32>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Int32(v)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::INT2 => {
+            match row.try_get::<_, Option<i16>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Int2(v as u8)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::FLOAT8 => {
+            match row.try_get::<_, Option<f64>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Timestamp(v as i64)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::TEXT | Type::VARCHAR => {
+            match row.try_get::<_, Option<String>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Text(v)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::BYTEA => {
+            match row.try_get::<_, Option<Vec<u8>>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Bytes(v)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::NUMERIC => {
+            // NUMERIC comes back as a rust_decimal::Decimal
+            match row.try_get::<_, Option<rust_decimal::Decimal>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::Numeric(v.to_string())),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => {
+                    // Fallback: try as string
+                    match row.try_get::<_, Option<String>>(col_name) {
+                        Ok(Some(v)) => Ok(DbValue::Numeric(v)),
+                        _ => Ok(DbValue::Null),
+                    }
+                }
+            }
+        }
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+            // Try to get as system time and convert to unix timestamp
+            match row.try_get::<_, Option<std::time::SystemTime>>(col_name) {
+                Ok(Some(v)) => {
+                    let unix = v.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    Ok(DbValue::Timestamp(unix))
+                }
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        Type::JSON | Type::JSONB => {
+            match row.try_get::<_, Option<serde_json::Value>>(col_name) {
+                Ok(Some(v)) => Ok(DbValue::JsonB(v)),
+                Ok(None) => Ok(DbValue::Null),
+                Err(_) => Ok(DbValue::Null),
+            }
+        }
+        _ => {
+            // Unknown type - try as bytes, then text, then null
+            if let Ok(Some(v)) = row.try_get::<_, Option<Vec<u8>>>(col_name) {
+                Ok(DbValue::Bytes(v))
+            } else if let Ok(Some(v)) = row.try_get::<_, Option<String>>(col_name) {
+                Ok(DbValue::Text(v))
+            } else {
+                Ok(DbValue::Null)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

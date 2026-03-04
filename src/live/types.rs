@@ -231,3 +231,96 @@ pub struct DecodedFileMetadata {
     /// Number of records in this file
     pub record_count: usize,
 }
+
+// =========================================================================
+// Upsert snapshot types for reorg rollback
+// =========================================================================
+
+/// Serializable database value for snapshot storage.
+/// Mirrors DbValue but designed for bincode serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LiveDbValue {
+    Null,
+    Bool(bool),
+    Int64(i64),
+    Int32(i32),
+    Int2(u8),
+    Uint64(u64),
+    Text(String),
+    VarChar(String),
+    Bytes(Vec<u8>),
+    Address([u8; 20]),
+    Bytes32([u8; 32]),
+    Numeric(String),
+    Timestamp(i64),
+    Json(String),    // JSON stored as string for bincode
+    JsonB(String),   // JSONB stored as string for bincode
+}
+
+/// Snapshot of a row before modification, for reorg rollback.
+/// Stored per-block and read during reorg to restore previous state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveUpsertSnapshot {
+    /// Table name
+    pub table: String,
+    /// Handler source name (for scoped restoration)
+    pub source: String,
+    /// Handler source version
+    pub source_version: u32,
+    /// Key columns with their values (used for DELETE or identifying the row)
+    pub key_columns: Vec<(String, LiveDbValue)>,
+    /// Previous row state, if row existed before the upsert.
+    /// None means the row didn't exist (INSERT case), so reorg should DELETE.
+    /// Some means the row existed (UPDATE case), so reorg should restore.
+    pub previous_row: Option<Vec<(String, LiveDbValue)>>,
+}
+
+impl LiveDbValue {
+    /// Convert from crate::db::DbValue
+    pub fn from_db_value(value: &crate::db::DbValue) -> Self {
+        use crate::db::DbValue;
+        match value {
+            DbValue::Null => LiveDbValue::Null,
+            DbValue::Bool(v) => LiveDbValue::Bool(*v),
+            DbValue::Int64(v) => LiveDbValue::Int64(*v),
+            DbValue::Int32(v) => LiveDbValue::Int32(*v),
+            DbValue::Int2(v) => LiveDbValue::Int2(*v),
+            DbValue::Uint64(v) => LiveDbValue::Uint64(*v),
+            DbValue::Text(v) => LiveDbValue::Text(v.clone()),
+            DbValue::VarChar(v) => LiveDbValue::VarChar(v.clone()),
+            DbValue::Bytes(v) => LiveDbValue::Bytes(v.clone()),
+            DbValue::Address(v) => LiveDbValue::Address(*v),
+            DbValue::Bytes32(v) => LiveDbValue::Bytes32(*v),
+            DbValue::Numeric(v) => LiveDbValue::Numeric(v.clone()),
+            DbValue::Timestamp(v) => LiveDbValue::Timestamp(*v),
+            DbValue::Json(v) => LiveDbValue::Json(v.to_string()),
+            DbValue::JsonB(v) => LiveDbValue::JsonB(v.to_string()),
+        }
+    }
+
+    /// Convert to crate::db::DbValue
+    pub fn to_db_value(&self) -> crate::db::DbValue {
+        use crate::db::DbValue;
+        match self {
+            LiveDbValue::Null => DbValue::Null,
+            LiveDbValue::Bool(v) => DbValue::Bool(*v),
+            LiveDbValue::Int64(v) => DbValue::Int64(*v),
+            LiveDbValue::Int32(v) => DbValue::Int32(*v),
+            LiveDbValue::Int2(v) => DbValue::Int2(*v),
+            LiveDbValue::Uint64(v) => DbValue::Uint64(*v),
+            LiveDbValue::Text(v) => DbValue::Text(v.clone()),
+            LiveDbValue::VarChar(v) => DbValue::VarChar(v.clone()),
+            LiveDbValue::Bytes(v) => DbValue::Bytes(v.clone()),
+            LiveDbValue::Address(v) => DbValue::Address(*v),
+            LiveDbValue::Bytes32(v) => DbValue::Bytes32(*v),
+            LiveDbValue::Numeric(v) => DbValue::Numeric(v.clone()),
+            LiveDbValue::Timestamp(v) => DbValue::Timestamp(*v),
+            LiveDbValue::Json(v) => {
+                DbValue::Json(serde_json::from_str(v).unwrap_or(serde_json::Value::Null))
+            }
+            LiveDbValue::JsonB(v) => {
+                DbValue::JsonB(serde_json::from_str(v).unwrap_or(serde_json::Value::Null))
+            }
+        }
+    }
+}
