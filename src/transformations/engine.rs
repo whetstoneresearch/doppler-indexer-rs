@@ -19,7 +19,7 @@ use super::historical::HistoricalDataReader;
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::traits::EventHandler;
 use crate::db::{DbPool, DbValue, DbOperation, WhereClause};
-use crate::live::LiveProgressTracker;
+use crate::live::{LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, LiveDbValue, StorageError};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::Contracts;
 
@@ -86,26 +86,6 @@ struct PendingEventData {
     required_calls: Vec<(String, String)>,
 }
 
-/// Tracks the state of a row before an UPSERT modification (for reorg restoration).
-///
-/// When a reorg occurs, we need to restore rows to their pre-modification state.
-/// For rows that existed before the orphaned block modified them, we re-INSERT
-/// the previous values. For rows that didn't exist, the DELETE by block_number
-/// is sufficient.
-#[derive(Debug, Clone)]
-struct UpsertSnapshot {
-    /// Table name
-    table: String,
-    /// Handler source name (for scoped restoration)
-    source: String,
-    /// Handler version (for scoped restoration)
-    source_version: u32,
-    /// Primary key columns and their values
-    key_columns: Vec<(String, DbValue)>,
-    /// Full row data before modification (None if row didn't exist)
-    previous_row: Option<HashMap<String, DbValue>>,
-}
-
 /// Live processing state for buffering events with call dependencies.
 #[derive(Default)]
 struct LiveProcessingState {
@@ -117,9 +97,6 @@ struct LiveProcessingState {
     calls_buffer: HashMap<(u64, u64), Vec<DecodedCall>>,
     /// Buffer events waiting for calls, keyed by handler_key.
     pending_events: HashMap<String, Vec<PendingEventData>>,
-    /// Pre-modification snapshots per block (for reorg rollback).
-    /// Key: block_number, Value: list of snapshots for that block
-    upsert_snapshots: HashMap<u64, Vec<UpsertSnapshot>>,
 }
 
 /// The transformation engine processes decoded data and invokes handlers.
@@ -1797,11 +1774,6 @@ impl TransformationEngine {
             }
         }
 
-        // Clean up old upsert snapshots beyond reorg depth
-        // Typical reorg depth is 128 blocks for Ethereum
-        const REORG_DEPTH: u64 = 128;
-        self.cleanup_old_snapshots(msg.range_end, REORG_DEPTH).await;
-
         tracing::debug!(
             "Recorded progress for {} handlers on range {}-{}",
             handlers.len(),
@@ -1810,23 +1782,6 @@ impl TransformationEngine {
         );
 
         Ok(())
-    }
-
-    /// Clean up upsert snapshots older than reorg_depth blocks.
-    /// Called after processing each range to keep memory bounded.
-    async fn cleanup_old_snapshots(&self, current_block: u64, reorg_depth: u64) {
-        let cutoff = current_block.saturating_sub(reorg_depth);
-        let mut state = self.live_state.lock().await;
-        let before = state.upsert_snapshots.len();
-        state.upsert_snapshots.retain(|&block, _| block > cutoff);
-        let removed = before - state.upsert_snapshots.len();
-        if removed > 0 {
-            tracing::debug!(
-                "Cleaned up {} old upsert snapshots (blocks <= {})",
-                removed,
-                cutoff
-            );
-        }
     }
 
     /// Process a reorg notification by:
@@ -1863,14 +1818,6 @@ impl TransformationEngine {
 
         // Phase 3: Clean up _live_progress entries
         self.cleanup_live_progress(&msg.orphaned).await?;
-
-        // Phase 4: Clean up upsert snapshots for orphaned blocks
-        {
-            let mut state = self.live_state.lock().await;
-            for &orphaned_block in &msg.orphaned {
-                state.upsert_snapshots.remove(&orphaned_block);
-            }
-        }
 
         Ok(())
     }
@@ -1918,7 +1865,14 @@ impl TransformationEngine {
         total_removed
     }
 
-    /// Delete committed rows from handler-declared reorg tables for orphaned blocks.
+    /// Rollback committed rows for orphaned blocks using snapshots.
+    ///
+    /// Phase 2a: Read snapshots from storage and restore previous state:
+    /// - Rows with previous_row = Some are restored via upsert
+    /// - Rows with previous_row = None are deleted by key
+    ///
+    /// Phase 2b: Delete remaining rows without snapshots (fallback for rows
+    /// that were INSERTed without update_columns, where we have no prior state).
     async fn cleanup_reorg_tables(&self, orphaned: &[u64]) -> Result<(), TransformationError> {
         // Collect all unique reorg tables from all handlers
         let mut tables_to_clean: HashSet<&str> = HashSet::new();
@@ -1931,17 +1885,96 @@ impl TransformationEngine {
             return Ok(());
         }
 
-        // Build the block_number IN clause
+        let storage = LiveStorage::new(&self.chain_name);
+        let mut restore_ops = Vec::new();
+        let mut tables_with_snapshots: HashSet<String> = HashSet::new();
+
+        // Phase 2a: Read snapshots and generate restore operations
+        for &block_number in orphaned {
+            match storage.read_snapshots(block_number) {
+                Ok(snapshots) => {
+                    for snapshot in snapshots {
+                        tables_with_snapshots.insert(snapshot.table.clone());
+
+                        match snapshot.previous_row {
+                            Some(previous) => {
+                                // Row existed before - restore via upsert
+                                let columns: Vec<String> = previous.iter().map(|(k, _)| k.clone()).collect();
+                                let values: Vec<DbValue> = previous.iter().map(|(_, v)| v.to_db_value()).collect();
+                                let conflict_cols: Vec<String> = snapshot.key_columns.iter().map(|(k, _)| k.clone()).collect();
+
+                                // Update all non-key columns
+                                let update_cols: Vec<String> = columns
+                                    .iter()
+                                    .filter(|c| !conflict_cols.contains(c))
+                                    .cloned()
+                                    .collect();
+
+                                restore_ops.push(DbOperation::Upsert {
+                                    table: snapshot.table,
+                                    columns,
+                                    values,
+                                    conflict_columns: conflict_cols,
+                                    update_columns: update_cols,
+                                });
+                            }
+                            None => {
+                                // Row didn't exist before - delete by key
+                                let key_conditions: Vec<(String, DbValue)> = snapshot
+                                    .key_columns
+                                    .into_iter()
+                                    .map(|(k, v)| (k, v.to_db_value()))
+                                    .collect();
+
+                                restore_ops.push(DbOperation::Delete {
+                                    table: snapshot.table,
+                                    where_clause: WhereClause::And(key_conditions),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(StorageError::NotFound(_)) => {
+                    // No snapshots for this block - will use fallback DELETE
+                    tracing::debug!(
+                        "No snapshots found for block {}, will use fallback delete",
+                        block_number
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read snapshots for block {}: {}, using fallback delete",
+                        block_number, e
+                    );
+                }
+            }
+        }
+
+        // Execute restore operations if any
+        if !restore_ops.is_empty() {
+            tracing::info!(
+                "Reorg rollback: executing {} restore operations from snapshots",
+                restore_ops.len()
+            );
+            self.db_pool.execute_transaction(restore_ops).await?;
+        }
+
+        // Phase 2b: Delete remaining rows without snapshots
+        // Only delete from tables that didn't have snapshots (pure INSERTs)
         let block_list = orphaned
             .iter()
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(",");
 
-        // Generate DELETE operations for each table
-        let mut ops = Vec::new();
+        let mut fallback_ops = Vec::new();
         for table in &tables_to_clean {
-            ops.push(DbOperation::Delete {
+            // Skip tables that had snapshot-based restoration
+            if tables_with_snapshots.contains(*table) {
+                continue;
+            }
+
+            fallback_ops.push(DbOperation::Delete {
                 table: table.to_string(),
                 where_clause: WhereClause::Raw {
                     condition: format!(
@@ -1953,14 +1986,21 @@ impl TransformationEngine {
             });
         }
 
-        // Execute all deletes in single transaction
-        tracing::info!(
-            "Reorg cleanup: deleting from {} tables ({:?}) for {} orphaned blocks",
-            ops.len(),
-            tables_to_clean,
-            orphaned.len()
-        );
-        self.db_pool.execute_transaction(ops).await?;
+        if !fallback_ops.is_empty() {
+            tracing::info!(
+                "Reorg cleanup: fallback deleting from {} tables for {} orphaned blocks",
+                fallback_ops.len(),
+                orphaned.len()
+            );
+            self.db_pool.execute_transaction(fallback_ops).await?;
+        }
+
+        // Delete snapshot files for orphaned blocks
+        for &block_number in orphaned {
+            if let Err(e) = storage.delete_snapshots(block_number) {
+                tracing::warn!("Failed to delete snapshots for block {}: {}", block_number, e);
+            }
+        }
 
         Ok(())
     }
@@ -2045,6 +2085,10 @@ impl TransformationEngine {
         let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> = JoinSet::new();
 
         // Spawn event handlers concurrently
+        // For live mode (single-block ranges), we capture snapshots for rollback
+        let is_live_mode = range_end - range_start == 1;
+        let chain_name_for_storage = self.chain_name.clone();
+
         for (source, event_name) in &event_triggers {
             for handler in self.registry.handlers_for_event(source, event_name) {
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -2055,6 +2099,7 @@ impl TransformationEngine {
                 let handler_key = handler.handler_key();
                 let source = source.clone();
                 let event_name = event_name.clone();
+                let chain_name = chain_name_for_storage.clone();
 
                 join_set.spawn(async move {
                     let _permit = permit;
@@ -2071,7 +2116,24 @@ impl TransformationEngine {
                                     handler_key, ops.len()
                                 );
                                 let ops = Self::inject_source_version(ops, handler_name, handler_version);
-                                if let Err(e) = db_pool.execute_transaction(ops).await {
+
+                                // Use snapshot-capturing execution for live mode
+                                let storage = if is_live_mode {
+                                    Some(LiveStorage::new(&chain_name))
+                                } else {
+                                    None
+                                };
+
+                                let result = execute_with_snapshot_capture(
+                                    ops,
+                                    &db_pool,
+                                    storage.as_ref(),
+                                    range_start,
+                                    handler_name,
+                                    handler_version,
+                                ).await;
+
+                                if let Err(e) = result {
                                     tracing::error!(
                                         "Handler {} transaction failed for range {}-{}: {:?}",
                                         handler_key, range_start, range_end, e
@@ -2104,6 +2166,7 @@ impl TransformationEngine {
                 let handler_key = handler.handler_key();
                 let source = source.clone();
                 let function_name = function_name.clone();
+                let chain_name = chain_name_for_storage.clone();
 
                 join_set.spawn(async move {
                     let _permit = permit;
@@ -2120,7 +2183,24 @@ impl TransformationEngine {
                                     handler_key, ops.len()
                                 );
                                 let ops = Self::inject_source_version(ops, handler_name, handler_version);
-                                if let Err(e) = db_pool.execute_transaction(ops).await {
+
+                                // Use snapshot-capturing execution for live mode
+                                let storage = if is_live_mode {
+                                    Some(LiveStorage::new(&chain_name))
+                                } else {
+                                    None
+                                };
+
+                                let result = execute_with_snapshot_capture(
+                                    ops,
+                                    &db_pool,
+                                    storage.as_ref(),
+                                    range_start,
+                                    handler_name,
+                                    handler_version,
+                                ).await;
+
+                                if let Err(e) = result {
                                     tracing::error!(
                                         "Handler {} transaction failed for range {}-{}: {:?}",
                                         handler_key, range_start, range_end, e
@@ -2209,4 +2289,96 @@ impl TransformationEngine {
             })
             .collect()
     }
+}
+
+/// Execute a transaction with optional snapshot capture for reorg rollback.
+///
+/// For live mode (single-block ranges), this function:
+/// 1. Queries current row state for upserts with update_columns
+/// 2. Executes the transaction
+/// 3. Writes snapshots to storage for later rollback
+async fn execute_with_snapshot_capture(
+    ops: Vec<DbOperation>,
+    db_pool: &DbPool,
+    storage: Option<&LiveStorage>,
+    block_number: u64,
+    handler_source: &str,
+    handler_version: u32,
+) -> Result<(), crate::db::DbError> {
+    // If no storage provided, just execute directly (historical mode)
+    let storage = match storage {
+        Some(s) => s,
+        None => return db_pool.execute_transaction(ops).await,
+    };
+
+    // Collect snapshots for upserts with update_columns (these modify existing rows)
+    let mut snapshots = Vec::new();
+
+    for op in &ops {
+        if let DbOperation::Upsert {
+            table,
+            columns,
+            values,
+            conflict_columns,
+            update_columns,
+        } = op
+        {
+            // Only capture snapshots for upserts that update existing rows
+            if update_columns.is_empty() {
+                continue;
+            }
+
+            // Build key columns from conflict_columns
+            let mut key_columns: Vec<(String, DbValue)> = Vec::new();
+            for conflict_col in conflict_columns {
+                // Find the value for this conflict column
+                if let Some(idx) = columns.iter().position(|c| c == conflict_col) {
+                    key_columns.push((conflict_col.clone(), values[idx].clone()));
+                }
+            }
+
+            // Query current row state
+            let previous_row = db_pool.query_row(table, &key_columns).await?;
+
+            // Convert to LiveDbValue
+            let live_key_columns: Vec<(String, LiveDbValue)> = key_columns
+                .into_iter()
+                .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
+                .collect();
+
+            let live_previous_row = previous_row.map(|row| {
+                row.into_iter()
+                    .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
+                    .collect()
+            });
+
+            snapshots.push(LiveUpsertSnapshot {
+                table: table.clone(),
+                source: handler_source.to_string(),
+                source_version: handler_version,
+                key_columns: live_key_columns,
+                previous_row: live_previous_row,
+            });
+        }
+    }
+
+    // Execute the transaction
+    db_pool.execute_transaction(ops).await?;
+
+    // Write snapshots to storage (after successful transaction)
+    if !snapshots.is_empty() {
+        // Read existing snapshots and append new ones
+        let mut all_snapshots = storage.read_snapshots(block_number).unwrap_or_default();
+        all_snapshots.extend(snapshots);
+
+        if let Err(e) = storage.write_snapshots(block_number, &all_snapshots) {
+            tracing::warn!(
+                "Failed to write upsert snapshots for block {}: {}",
+                block_number, e
+            );
+            // Don't fail the transaction for snapshot write errors
+        }
+    }
+
+    Ok(())
 }

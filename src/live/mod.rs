@@ -17,9 +17,9 @@ pub use collector::LiveCollector;
 pub use compaction::CompactionService;
 pub use progress::LiveProgressTracker;
 pub use reorg::{ReorgDetector, ReorgEvent};
-pub use storage::LiveStorage;
+pub use storage::{LiveStorage, StorageError};
 pub use types::{
     DecodedFileMetadata, LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall,
-    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue, LiveEthCall, LiveLog, LiveMessage,
-    LiveModeConfig, LiveProgress, LiveReceipt,
+    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue, LiveDbValue, LiveEthCall, LiveLog,
+    LiveMessage, LiveModeConfig, LiveProgress, LiveReceipt, LiveUpsertSnapshot,
 };
