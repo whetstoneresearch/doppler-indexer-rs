@@ -579,6 +579,7 @@ impl CompactionService {
             Field::new("block_timestamp", DataType::UInt64, false),
             Field::new("log_index", DataType::UInt32, false),
             Field::new("transaction_index", DataType::UInt32, false),
+            Field::new("transaction_hash", DataType::FixedSizeBinary(32), false),
             Field::new("address", DataType::Binary, false),
             Field::new("topic0", DataType::Binary, true),
             Field::new("topic1", DataType::Binary, true),
@@ -591,6 +592,7 @@ impl CompactionService {
         let mut timestamps = UInt64Builder::new();
         let mut log_indices = UInt32Builder::new();
         let mut tx_indices = UInt32Builder::new();
+        let mut tx_hashes = FixedSizeBinaryBuilder::new(32);
         let mut addresses = BinaryBuilder::new();
         let mut topic0s = BinaryBuilder::new();
         let mut topic1s = BinaryBuilder::new();
@@ -603,6 +605,7 @@ impl CompactionService {
             timestamps.append_value(*timestamp);
             log_indices.append_value(log.log_index);
             tx_indices.append_value(log.transaction_index);
+            tx_hashes.append_value(&log.transaction_hash)?;
             addresses.append_value(&log.address);
 
             // Handle topics (up to 4)
@@ -637,6 +640,7 @@ impl CompactionService {
                 Arc::new(timestamps.finish()) as ArrayRef,
                 Arc::new(log_indices.finish()) as ArrayRef,
                 Arc::new(tx_indices.finish()) as ArrayRef,
+                Arc::new(tx_hashes.finish()) as ArrayRef,
                 Arc::new(addresses.finish()) as ArrayRef,
                 Arc::new(topic0s.finish()) as ArrayRef,
                 Arc::new(topic1s.finish()) as ArrayRef,
