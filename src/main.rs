@@ -830,6 +830,9 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         );
     }
 
+    // Create separate JoinSet for tasks that continue into live mode (transformation engine)
+    let mut live_tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+
     if transformations_enabled {
         let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
         let tc = config.transformations.as_ref().unwrap();
@@ -867,7 +870,8 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             handler_count
         );
 
-        tasks.spawn(async move {
+        // Spawn into live_tasks so engine continues running into live mode
+        live_tasks.spawn(async move {
             engine
                 .run(
                     transform_events_rx.unwrap(),
@@ -899,16 +903,20 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             eth_call_decoder_tx_for_live,
             transform_reorg_tx,
             progress_tracker,
-            &mut tasks,
+            &mut live_tasks,
         )
         .await?;
 
-        // Wait for live mode tasks (run indefinitely until shutdown)
-        while let Some(result) = tasks.join_next().await {
+        // Wait for live mode tasks including the transformation engine
+        while let Some(result) = live_tasks.join_next().await {
             result.context("live mode task panicked")??;
         }
     } else {
         tracing::info!("Live mode not enabled, exiting after historical processing");
+        // If not entering live mode, wait for the transformation engine to finish
+        while let Some(result) = live_tasks.join_next().await {
+            result.context("transformation engine task panicked")??;
+        }
     }
 
     Ok(())
@@ -959,6 +967,9 @@ fn should_enable_live_mode(config: &IndexerConfig, chain: &ChainConfig) -> bool 
 /// - WebSocket client subscription
 /// - Live block collector
 /// - Compaction service
+///
+/// Note: The transformation engine is NOT spawned here - it continues running from
+/// historical mode via the live_tasks JoinSet, receiving messages via the same channels.
 async fn spawn_live_mode(
     chain: Arc<ChainConfig>,
     config: &IndexerConfig,
@@ -1013,7 +1024,9 @@ async fn spawn_live_mode(
     let (live_msg_tx, mut live_msg_rx) = mpsc::channel::<LiveMessage>(1000);
     let (compaction_shutdown_tx, compaction_shutdown_rx) = oneshot::channel();
 
-    // Drain live messages (prevents channel from filling up and blocking collector)
+    // Drain LiveMessage channel to prevent backpressure on the collector.
+    // Note: Transformations are handled via the transformation engine's channels
+    // (transform_events_tx, transform_calls_tx, etc.), not via LiveMessage.
     tasks.spawn(async move {
         while live_msg_rx.recv().await.is_some() {}
         Ok(())

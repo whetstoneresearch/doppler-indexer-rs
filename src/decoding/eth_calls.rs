@@ -4308,7 +4308,7 @@ fn extract_once_tuple_bytes<'a>(
 }
 
 /// Convert internal DecodedValue to transformation DecodedValue
-fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
+pub(crate) fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
     match value {
         DecodedValue::Address(a) => TransformDecodedValue::Address(*a),
         DecodedValue::Uint256(v) => TransformDecodedValue::Uint256(*v),
@@ -4346,7 +4346,7 @@ fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
 }
 
 /// Build result HashMap based on output type
-fn build_result_map(
+pub(crate) fn build_result_map(
     value: &DecodedValue,
     output_type: &EvmType,
     function_name: &str,
