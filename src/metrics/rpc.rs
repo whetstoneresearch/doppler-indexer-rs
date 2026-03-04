@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Instant;
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -214,6 +215,33 @@ impl Drop for RpcMetricsGuard {
             .decrement(1.0);
         }
     }
+}
+
+/// Execute an async operation with metrics tracking.
+///
+/// This is a convenience wrapper that eliminates the repetitive pattern of:
+/// 1. Creating an RpcMetricsGuard
+/// 2. Executing the operation
+/// 3. Calling guard.success() or guard.failure() based on result
+///
+/// # Example
+/// ```ignore
+/// let result = with_metrics(RpcMethod::GetBlock, &chain, || async {
+///     // your async operation
+/// }).await;
+/// ```
+pub async fn with_metrics<T, F, Fut>(method: RpcMethod, chain: &str, operation: F) -> Result<T, RpcError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, RpcError>>,
+{
+    let guard = RpcMetricsGuard::new(method, chain);
+    let result = operation().await;
+    match &result {
+        Ok(_) => guard.success(),
+        Err(e) => guard.failure(e),
+    }
+    result
 }
 
 #[cfg(test)]
