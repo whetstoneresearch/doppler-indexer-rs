@@ -7,13 +7,14 @@
 //! 4. Updates progress tables
 //! 5. Cleans up live storage
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, Int64Builder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
+    ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, Int64Builder, ListBuilder, StringBuilder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -266,6 +267,34 @@ impl CompactionService {
             self.write_logs_parquet(&all_logs, &logs_path)?;
         }
 
+        // Read and write factory addresses parquet
+        // Factory records: (block_number, block_timestamp, address)
+        let mut factory_records: HashMap<String, Vec<(u64, u64, [u8; 20])>> = HashMap::new();
+        for block_number in range.start..=range.end {
+            if let Ok(factories) = self.storage.read_factories(block_number) {
+                for (collection_name, addresses) in factories.addresses_by_collection {
+                    let records = factory_records.entry(collection_name).or_default();
+                    for (timestamp, addr) in addresses {
+                        records.push((block_number, timestamp, addr));
+                    }
+                }
+            }
+        }
+
+        if !factory_records.is_empty() {
+            for (collection_name, records) in &factory_records {
+                let factory_path =
+                    self.factories_parquet_path(range.start, range.end, collection_name);
+                self.write_factories_parquet(records, &factory_path)?;
+            }
+            tracing::info!(
+                "Wrote factory addresses for {} collections in range {}-{}",
+                factory_records.len(),
+                range.start,
+                range.end
+            );
+        }
+
         // Compact decoded logs
         // Note: Full decoded data compaction requires schema information from the event
         // parser. For now, we just delete the decoded bincode files when compacting.
@@ -325,6 +354,63 @@ impl CompactionService {
             "data/raw/{}/logs/{}_{}.parquet",
             self.chain_name, start, end
         ))
+    }
+
+    /// Get path for factory parquet file.
+    fn factories_parquet_path(&self, start: u64, end: u64, collection_name: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "data/derived/{}/factories/{}/{}-{}.parquet",
+            self.chain_name,
+            collection_name,
+            start,
+            end - 1 // Use inclusive end for file naming
+        ))
+    }
+
+    /// Write factory addresses to parquet file.
+    fn write_factories_parquet(
+        &self,
+        records: &[(u64, u64, [u8; 20])],
+        path: &PathBuf,
+    ) -> Result<(), CompactionError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("factory_address", DataType::FixedSizeBinary(20), false),
+        ]));
+
+        let mut block_numbers = UInt64Builder::new();
+        let mut timestamps = UInt64Builder::new();
+        let mut addresses = FixedSizeBinaryBuilder::new(20);
+
+        for (block_number, timestamp, addr) in records {
+            block_numbers.append_value(*block_number);
+            timestamps.append_value(*timestamp);
+            addresses.append_value(addr)?;
+        }
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(block_numbers.finish()) as ArrayRef,
+                Arc::new(timestamps.finish()) as ArrayRef,
+                Arc::new(addresses.finish()) as ArrayRef,
+            ],
+        )?;
+
+        let file = std::fs::File::create(path)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+        writer.write(&batch)?;
+        writer.close()?;
+
+        Ok(())
     }
 
     /// Write blocks to parquet file.
