@@ -6,17 +6,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
 use crate::db::DbPool;
+use super::error::LiveError;
 use super::storage::LiveStorage;
 
-#[derive(Debug, Error)]
-pub enum ProgressError {
-    #[error("Database error: {0}")]
-    Database(String),
-}
+// Re-export LiveError as ProgressError for backwards compatibility
+pub use super::error::ProgressError;
 
 /// Tracks per-block progress for all handlers.
 pub struct LiveProgressTracker {
@@ -58,7 +55,7 @@ impl LiveProgressTracker {
         &mut self,
         block_number: u64,
         handler_key: &str,
-    ) -> Result<(), ProgressError> {
+    ) -> Result<(), LiveError> {
         // Update in-memory state
         self.completed
             .entry(block_number)
@@ -81,8 +78,7 @@ impl LiveProgressTracker {
                         &block_num as &(dyn ToSql + Sync),
                     ],
                 )
-                .await
-                .map_err(|e| ProgressError::Database(e.to_string()))?;
+                .await?;
         }
 
         // Check if all handlers are now complete for this block
@@ -136,7 +132,7 @@ impl LiveProgressTracker {
     }
 
     /// Load progress from database for a range of blocks.
-    pub async fn load_from_db(&mut self, from: u64, to: u64) -> Result<(), ProgressError> {
+    pub async fn load_from_db(&mut self, from: u64, to: u64) -> Result<(), LiveError> {
         let Some(ref db_pool) = self.db_pool else {
             return Ok(());
         };
@@ -154,8 +150,7 @@ impl LiveProgressTracker {
                     &to_i64 as &(dyn ToSql + Sync),
                 ],
             )
-            .await
-            .map_err(|e| ProgressError::Database(e.to_string()))?;
+            .await?;
 
         for row in rows {
             let block_number: i64 = row.get(0);

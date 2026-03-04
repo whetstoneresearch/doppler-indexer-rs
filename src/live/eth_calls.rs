@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use thiserror::Error;
 use tokio::sync::mpsc;
 
+use super::error::LiveError;
 use super::storage::LiveStorage;
 use super::types::{LiveEthCall, LiveFactoryAddresses, LiveLog};
 use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
@@ -23,17 +23,12 @@ use crate::raw_data::historical::eth_calls::{
     OnceCallConfig,
 };
 use crate::raw_data::historical::factories::get_factory_call_configs;
-use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::eth_call::{EthCallConfig, Frequency, ParamConfig};
 
-#[derive(Debug, Error)]
-pub enum LiveEthCallError {
-    #[error("RPC error: {0}")]
-    Rpc(#[from] RpcError),
-    #[error("Channel closed")]
-    ChannelClosed,
-}
+// Re-export LiveError as LiveEthCallError for backwards compatibility
+pub use super::error::LiveEthCallError;
 
 /// Collects eth_calls for live mode blocks.
 pub struct LiveEthCallCollector {
@@ -131,7 +126,7 @@ impl LiveEthCallCollector {
         logs: &[LiveLog],
         factory_addrs: &LiveFactoryAddresses,
         decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveEthCallError> {
+    ) -> Result<Vec<LiveEthCall>, LiveError> {
         let mut all_calls = Vec::new();
 
         // 1. Regular frequency-based calls
@@ -175,7 +170,7 @@ impl LiveEthCallCollector {
         block_number: u64,
         block_timestamp: u64,
         decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveEthCallError> {
+    ) -> Result<Vec<LiveEthCall>, LiveError> {
         if self.call_configs.is_empty() {
             return Ok(Vec::new());
         }
@@ -295,7 +290,7 @@ impl LiveEthCallCollector {
         block_number: u64,
         block_timestamp: u64,
         decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveEthCallError> {
+    ) -> Result<Vec<LiveEthCall>, LiveError> {
         if self.factory_call_configs.is_empty() || self.factory_addresses.is_empty() {
             return Ok(Vec::new());
         }
@@ -405,7 +400,7 @@ impl LiveEthCallCollector {
         block_timestamp: u64,
         factory_addrs: &LiveFactoryAddresses,
         decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveEthCallError> {
+    ) -> Result<Vec<LiveEthCall>, LiveError> {
         let mut results = Vec::new();
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
@@ -525,7 +520,7 @@ impl LiveEthCallCollector {
         block_timestamp: u64,
         logs: &[LiveLog],
         decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveEthCallError> {
+    ) -> Result<Vec<LiveEthCall>, LiveError> {
         if self.event_call_configs.is_empty() || logs.is_empty() {
             return Ok(Vec::new());
         }
