@@ -148,6 +148,14 @@ pub async fn decode_eth_calls_live(
                                 let _ = tx.send(msg).await;
                             }
                         }
+
+                        // Update block status to mark decoding complete
+                        if let Ok(mut status) = live_storage.read_status(range_start) {
+                            status.decoded = true;
+                            if let Err(e) = live_storage.write_status(range_start, &status) {
+                                tracing::warn!("Failed to update block status after eth_call decoding: {}", e);
+                            }
+                        }
                     } else {
                         // Historical mode: write to parquet
                         process_regular_calls(
@@ -259,6 +267,14 @@ pub async fn decode_eth_calls_live(
                                 }
                             }
                         }
+
+                        // Update block status to mark decoding complete
+                        if let Ok(mut status) = live_storage.read_status(range_start) {
+                            status.decoded = true;
+                            if let Err(e) = live_storage.write_status(range_start, &status) {
+                                tracing::warn!("Failed to update block status after once_call decoding: {}", e);
+                            }
+                        }
                     } else {
                         // Historical mode: write to parquet
                         process_once_calls(
@@ -350,6 +366,14 @@ pub async fn decode_eth_calls_live(
                                     calls: transform_calls,
                                 };
                                 let _ = tx.send(msg).await;
+                            }
+                        }
+
+                        // Update block status to mark decoding complete
+                        if let Ok(mut status) = live_storage.read_status(range_start) {
+                            status.decoded = true;
+                            if let Err(e) = live_storage.write_status(range_start, &status) {
+                                tracing::warn!("Failed to update block status after event_call decoding: {}", e);
                             }
                         }
                     } else {
