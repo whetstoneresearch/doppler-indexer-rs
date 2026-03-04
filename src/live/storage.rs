@@ -150,11 +150,7 @@ impl LiveStorage {
 
     /// Delete a live block from storage.
     pub fn delete_block(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.block_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.block_path(block_number))
     }
 
     /// Check if a block exists in storage.
@@ -183,7 +179,7 @@ impl LiveStorage {
         receipts: &[LiveReceipt],
     ) -> Result<(), StorageError> {
         let path = self.receipts_path(block_number);
-        write_bincode_slice(&path, receipts)
+        write_bincode(&path, receipts)
     }
 
     /// Read receipts for a block.
@@ -194,11 +190,7 @@ impl LiveStorage {
 
     /// Delete receipts for a block.
     pub fn delete_receipts(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.receipts_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.receipts_path(block_number))
     }
 
     // =========================================================================
@@ -212,7 +204,7 @@ impl LiveStorage {
     /// Write logs for a block.
     pub fn write_logs(&self, block_number: u64, logs: &[LiveLog]) -> Result<(), StorageError> {
         let path = self.logs_path(block_number);
-        write_bincode_slice(&path, logs)
+        write_bincode(&path, logs)
     }
 
     /// Read logs for a block.
@@ -223,11 +215,7 @@ impl LiveStorage {
 
     /// Delete logs for a block.
     pub fn delete_logs(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.logs_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.logs_path(block_number))
     }
 
     // =========================================================================
@@ -246,7 +234,7 @@ impl LiveStorage {
         calls: &[LiveEthCall],
     ) -> Result<(), StorageError> {
         let path = self.eth_calls_path(block_number);
-        write_bincode_slice(&path, calls)
+        write_bincode(&path, calls)
     }
 
     /// Read eth call results for a block.
@@ -257,11 +245,7 @@ impl LiveStorage {
 
     /// Delete eth call results for a block.
     pub fn delete_eth_calls(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.eth_calls_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.eth_calls_path(block_number))
     }
 
     // =========================================================================
@@ -291,11 +275,7 @@ impl LiveStorage {
 
     /// Delete factory addresses for a block.
     pub fn delete_factories(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.factories_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.factories_path(block_number))
     }
 
     /// List all block numbers with factory address files.
@@ -349,11 +329,7 @@ impl LiveStorage {
 
     /// Delete status for a block.
     pub fn delete_status(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.status_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.status_path(block_number))
     }
 
     // =========================================================================
@@ -384,7 +360,7 @@ impl LiveStorage {
         logs: &[LiveDecodedLog],
     ) -> Result<(), StorageError> {
         let path = self.decoded_logs_path(block_number, contract_name, event_name);
-        write_bincode_slice(&path, logs)
+        write_bincode(&path, logs)
     }
 
     /// Read decoded logs for a specific event type.
@@ -405,20 +381,12 @@ impl LiveStorage {
         contract_name: &str,
         event_name: &str,
     ) -> Result<(), StorageError> {
-        let path = self.decoded_logs_path(block_number, contract_name, event_name);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.decoded_logs_path(block_number, contract_name, event_name))
     }
 
     /// Delete all decoded logs for a block.
     pub fn delete_all_decoded_logs(&self, block_number: u64) -> Result<(), StorageError> {
-        let dir = self.base_dir.join(format!("decoded/logs/{}", block_number));
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
-        Ok(())
+        safe_delete_dir_all(&self.base_dir.join(format!("decoded/logs/{}", block_number)))
     }
 
     /// List all (contract_name, event_name) pairs with decoded logs for a block.
@@ -481,7 +449,7 @@ impl LiveStorage {
         calls: &[LiveDecodedCall],
     ) -> Result<(), StorageError> {
         let path = self.decoded_calls_path(block_number, contract_name, function_name);
-        write_bincode_slice(&path, calls)
+        write_bincode(&path, calls)
     }
 
     /// Read decoded eth_calls for a specific function.
@@ -502,20 +470,12 @@ impl LiveStorage {
         contract_name: &str,
         function_name: &str,
     ) -> Result<(), StorageError> {
-        let path = self.decoded_calls_path(block_number, contract_name, function_name);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.decoded_calls_path(block_number, contract_name, function_name))
     }
 
     /// Delete all decoded eth_calls for a block.
     pub fn delete_all_decoded_calls(&self, block_number: u64) -> Result<(), StorageError> {
-        let dir = self.base_dir.join(format!("decoded/eth_calls/{}", block_number));
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
-        Ok(())
+        safe_delete_dir_all(&self.base_dir.join(format!("decoded/eth_calls/{}", block_number)))
     }
 
     /// Write decoded event-triggered eth_calls.
@@ -529,7 +489,7 @@ impl LiveStorage {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join(format!("{}_event.bin", function_name));
-        write_bincode_slice(&path, calls)
+        write_bincode(&path, calls)
     }
 
     /// Read decoded event-triggered eth_calls.
@@ -555,7 +515,7 @@ impl LiveStorage {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join("_once.bin");
-        write_bincode_slice(&path, calls)
+        write_bincode(&path, calls)
     }
 
     /// Read decoded "once" calls.
@@ -623,7 +583,7 @@ impl LiveStorage {
             return Ok(());
         }
         let path = self.snapshots_path(block_number);
-        write_bincode_slice(&path, snapshots)
+        write_bincode(&path, snapshots)
     }
 
     /// Read upsert snapshots for a block.
@@ -634,11 +594,7 @@ impl LiveStorage {
 
     /// Delete upsert snapshots for a block.
     pub fn delete_snapshots(&self, block_number: u64) -> Result<(), StorageError> {
-        let path = self.snapshots_path(block_number);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        safe_delete(&self.snapshots_path(block_number))
     }
 
     // =========================================================================
@@ -715,28 +671,11 @@ impl LiveStorage {
 // Helper functions
 // =========================================================================
 
-fn write_bincode<T: Serialize>(path: &Path, data: &T) -> Result<(), StorageError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Write to temp file, flush, sync, then atomic rename
-    let temp_path = path.with_extension("tmp");
-    let file = fs::File::create(&temp_path)?;
-    let mut writer = BufWriter::new(file);
-    bincode::serialize_into(&mut writer, data)?;
-
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-        .sync_all()?;
-
-    fs::rename(&temp_path, path)?;
-    Ok(())
-}
-
-fn write_bincode_slice<T: Serialize>(path: &Path, data: &[T]) -> Result<(), StorageError> {
+/// Atomically write bincode-serialized data to a file.
+///
+/// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
+/// Works with any serializable type including slices.
+fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -802,6 +741,26 @@ fn list_block_numbers(dir: &Path) -> Result<Vec<u64>, StorageError> {
     }
     blocks.sort_unstable();
     Ok(blocks)
+}
+
+/// TOCTOU-safe file deletion. Ignores NotFound errors since the file
+/// may have been deleted between check and remove (or never existed).
+fn safe_delete(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
+/// TOCTOU-safe directory deletion. Ignores NotFound errors since the directory
+/// may have been deleted between check and remove (or never existed).
+fn safe_delete_dir_all(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(e)),
+    }
 }
 
 #[cfg(test)]
