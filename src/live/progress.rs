@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio_postgres::types::ToSql;
 
 use crate::db::DbPool;
+use super::storage::LiveStorage;
 
 #[derive(Debug, Error)]
 pub enum ProgressError {
@@ -20,6 +21,8 @@ pub enum ProgressError {
 /// Tracks per-block progress for all handlers.
 pub struct LiveProgressTracker {
     chain_id: i64,
+    /// Chain name for LiveStorage access.
+    chain_name: String,
     /// Set of (block_number, handler_key) pairs that are complete.
     completed: HashMap<u64, HashSet<String>>,
     /// All known handler keys.
@@ -30,9 +33,10 @@ pub struct LiveProgressTracker {
 
 impl LiveProgressTracker {
     /// Create a new progress tracker.
-    pub fn new(chain_id: i64, db_pool: Option<Arc<DbPool>>) -> Self {
+    pub fn new(chain_id: i64, db_pool: Option<Arc<DbPool>>, chain_name: String) -> Self {
         Self {
             chain_id,
+            chain_name,
             completed: HashMap::new(),
             handler_keys: HashSet::new(),
             db_pool,
@@ -79,6 +83,17 @@ impl LiveProgressTracker {
                 )
                 .await
                 .map_err(|e| ProgressError::Database(e.to_string()))?;
+        }
+
+        // Check if all handlers are now complete for this block
+        if self.is_block_complete(block_number) {
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Ok(mut status) = storage.read_status(block_number) {
+                status.transformed = true;
+                if let Err(e) = storage.write_status(block_number, &status) {
+                    tracing::warn!("Failed to update block status after transformation: {}", e);
+                }
+            }
         }
 
         Ok(())
@@ -222,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_basic() {
-        let mut tracker = LiveProgressTracker::new(1, None);
+        let mut tracker = LiveProgressTracker::new(1, None, "test_chain".to_string());
         tracker.register_handler("handler_a");
         tracker.register_handler("handler_b");
 
@@ -240,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_pending_handlers() {
-        let mut tracker = LiveProgressTracker::new(1, None);
+        let mut tracker = LiveProgressTracker::new(1, None, "test_chain".to_string());
         tracker.register_handler("a");
         tracker.register_handler("b");
         tracker.register_handler("c");
@@ -255,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_clear_block() {
-        let mut tracker = LiveProgressTracker::new(1, None);
+        let mut tracker = LiveProgressTracker::new(1, None, "test_chain".to_string());
         tracker.register_handler("handler");
 
         tokio_test::block_on(tracker.mark_complete(200, "handler")).unwrap();
@@ -267,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_empty_handlers() {
-        let tracker = LiveProgressTracker::new(1, None);
+        let tracker = LiveProgressTracker::new(1, None, "test_chain".to_string());
         // With no handlers, all blocks are "complete"
         assert!(tracker.is_block_complete(100));
     }

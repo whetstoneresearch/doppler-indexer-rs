@@ -272,6 +272,32 @@ async fn process_chain_live_only(
         None
     };
 
+    // Build transformation registry and progress tracker if transformations enabled
+    let progress_tracker = if config.transformations.is_some() {
+        let registry = build_registry();
+        let tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
+            chain.chain_id as i64,
+            db_pool.clone(),
+            chain.name.clone(),
+        )));
+
+        // Register all handlers
+        {
+            let mut t = tracker.lock().await;
+            for handler in registry.all_handlers() {
+                t.register_handler(&handler.handler_key());
+            }
+        }
+        tracing::info!(
+            "Registered {} handlers with live progress tracker",
+            registry.all_handlers().len()
+        );
+
+        Some(tracker)
+    } else {
+        None
+    };
+
     // Check if decoding is needed
     let has_events = chain.contracts.values().any(|c| {
         has_items(&c.events)
@@ -337,7 +363,7 @@ async fn process_chain_live_only(
         log_decoder_tx,
         eth_call_decoder_tx,
         None, // No transform_reorg_tx in live-only mode
-        None, // No progress tracker in live-only mode (no handlers)
+        progress_tracker,
         &mut tasks,
     )
     .await?;
@@ -786,6 +812,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
         Some(Arc::new(Mutex::new(LiveProgressTracker::new(
             chain.chain_id as i64,
             db_pool.clone(),
+            chain.name.clone(),
         ))))
     } else {
         None
@@ -997,6 +1024,7 @@ async fn spawn_live_mode(
         Arc::new(Mutex::new(LiveProgressTracker::new(
             chain.chain_id as i64,
             db_pool.clone(),
+            chain.name.clone(),
         )))
     });
 
