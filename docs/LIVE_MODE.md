@@ -14,35 +14,97 @@ After historical catchup completes, the indexer transitions to live mode for rea
 ## Architecture
 
 ```
-WebSocket (eth_subscribe)
-         │
-         ▼
-┌─────────────────────┐
-│   LiveCollector     │ ───► ReorgDetector
-│   (block headers)   │            │
-└─────────────────────┘            │ reorg detected?
-         │                         ▼
-         │                  Delete orphaned data
-         │                  Send Reorg message
-         ▼
-┌─────────────────────┐
-│  HTTP RPC Backfill  │ (receipts, full block data)
-│                     │
-└─────────────────────┘
-         │
-         ├────────────────────────────────────┐
-         ▼                                    ▼
-┌─────────────────────┐              ┌─────────────────────┐
-│    LiveStorage      │              │     Decoder         │
-│  (bincode files)    │              │  (live_mode=true)   │
-└─────────────────────┘              └─────────────────────┘
-         │                                    │
-         ▼                                    ▼
-┌─────────────────────┐              ┌─────────────────────┐
-│  CompactionService  │              │  LiveStorage        │
-│ (bincode → parquet) │              │  (decoded bincode)  │
-└─────────────────────┘              └─────────────────────┘
+                            WebSocket (eth_subscribe "newHeads")
+                                          │
+                                          ▼
+                            ┌───────────────────────────┐
+                            │      LiveCollector        │◄────── ReorgDetector
+                            │     (block headers)       │             │
+                            └───────────────────────────┘             │
+                                          │                           │ reorg?
+                    ┌─────────────────────┼─────────────────────┐     ▼
+                    │                     │                     │  Delete orphaned
+                    ▼                     ▼                     │  Notify all stages
+        ┌───────────────────┐   ┌───────────────────┐          │
+        │   HTTP: Receipts  │   │  HTTP: eth_calls  │          │
+        │   & Logs          │   │  (configured)     │◄─────────┤
+        └───────────────────┘   └───────────────────┘          │
+                    │                     │                     │
+                    │                     │ ◄── wait for        │
+                    ▼                     │     factory addrs   │
+        ┌───────────────────┐             │                     │
+        │  FactoryParser    │─────────────┤                     │
+        │  (from logs)      │             │                     │
+        └───────────────────┘             │                     │
+                    │                     │                     │
+                    │ new factory         ▼                     │
+                    │ addresses   ┌───────────────────┐         │
+                    └────────────►│  HTTP: eth_calls  │         │
+                                  │  (factory pools)  │         │
+                                  └───────────────────┘         │
+                                          │                     │
+        ┌─────────────────────────────────┴─────────────────────┤
+        │                                                       │
+        ▼                                                       │
+┌───────────────────┐                                           │
+│   LiveStorage     │  blocks/, receipts/, logs/, eth_calls/    │
+│  (bincode files)  │                                           │
+└───────────────────┘                                           │
+        │                                                       │
+        ├───────────────────────────────────────┐               │
+        ▼                                       ▼               │
+┌───────────────────┐                   ┌───────────────────┐   │
+│   Log Decoder     │                   │  EthCall Decoder  │   │
+│  (live_mode=true) │                   │  (live_mode=true) │   │
+└───────────────────┘                   └───────────────────┘   │
+        │                                       │               │
+        │         ┌─────────────────────────────┘               │
+        ▼         ▼                                             │
+┌─────────────────────────────────────┐                         │
+│        LiveStorage (decoded)        │                         │
+│  decoded/logs/, decoded/eth_calls/  │                         │
+└─────────────────────────────────────┘                         │
+                    │                                           │
+                    ▼                                           │
+┌─────────────────────────────────────┐                         │
+│     TransformationEngine            │◄────────────────────────┘
+│  (handlers with call dependencies)  │      ReorgMessage
+└─────────────────────────────────────┘
+                    │
+                    │ mark block complete
+                    ▼
+┌─────────────────────────────────────┐
+│       LiveProgressTracker           │
+│  (per-block, per-handler tracking)  │
+└─────────────────────────────────────┘
+                    │
+                    │ all handlers complete?
+                    │ range_end < tip - reorg_depth?
+                    ▼
+┌─────────────────────────────────────┐
+│        CompactionService            │
+│  (bincode → parquet at range_size)  │
+└─────────────────────────────────────┘
+                    │
+                    ▼
+            data/raw/{chain}/
+            data/derived/{chain}/decoded/
 ```
+
+### Data Flow Summary
+
+1. **Block Header**: WebSocket delivers new block header
+2. **Reorg Check**: Verify parent hash matches; if not, trigger reorg cleanup
+3. **Parallel Collection**:
+   - Fetch receipts and extract logs
+   - Fetch configured eth_calls for non-factory contracts
+4. **Factory Parsing**: Parse factory events from logs to discover new addresses
+5. **Factory Calls**: Fetch eth_calls for newly discovered factory addresses
+6. **Storage**: Write raw data to bincode files
+7. **Decoding**: Decode logs and eth_calls, write to decoded bincode
+8. **Transformation**: Run handlers (waiting for call dependencies)
+9. **Progress**: Mark block complete per handler
+10. **Compaction**: When range complete AND beyond reorg depth, compact to parquet
 
 ## Storage Structure
 
@@ -486,6 +548,182 @@ match self.storage.read_block(block_number) {
 }
 ```
 
-## Current Limitations
+## Outstanding Issues
 
-- Decoded data compaction relies on re-decoding from compacted raw parquet (avoids schema synchronization complexity)
+> **Warning**: Live mode is not fully implemented. The following critical issues must be addressed before live mode can function correctly.
+
+### Critical Issues
+
+#### 1. No eth_call Collection in Live Mode
+
+The `LiveCollector` only collects blocks, receipts, and logs. It does **not** collect eth_calls:
+
+- No `eth_call_tx` channel passed to `LiveCollector::run()`
+- No RPC calls made for configured eth_calls (regular, once, or event-triggered)
+- The `LiveEthCall` type exists but is never populated
+- The decoder receives log data but never eth_call data in live mode
+
+**Impact**: Handlers depending on eth_call data (e.g., `slot0()` for Uniswap pools) will not receive data in live mode.
+
+#### 2. No Factory Address Parsing in Live Mode
+
+Factory-related functionality is entirely missing from live mode:
+
+- Logs are sent directly to the decoder without factory filtering
+- No `logs_factory_tx` or `eth_calls_factory_tx` channels in live mode
+- New pool/contract addresses discovered via factory events are not tracked
+- Factory-triggered eth_calls (e.g., calling `slot0()` on newly created pools) won't happen
+
+**Impact**: Factory-dependent configurations (common for Uniswap V3/V4 style indexers) won't work in live mode.
+
+#### 3. Transformation Engine Not Running in Live Mode
+
+In `spawn_live_mode()`, the `live_msg_rx` channel is simply drained:
+
+```rust
+// Drain live messages (prevents channel from filling up and blocking collector)
+tasks.spawn(async move {
+    while live_msg_rx.recv().await.is_some() {}
+    Ok(())
+});
+```
+
+The transformation engine is only spawned during historical mode. Consequences:
+
+- Decoded events don't get processed by handlers
+- No database writes from handlers in live mode
+- `transform_reorg_tx` is passed but no engine receives reorg messages
+- Handler `reorg_tables()` cleanup won't occur
+
+#### 4. LiveBlockStatus Never Set to Complete
+
+The `LiveBlockStatus` tracks processing stages, but `decoded` and `transformed` are never set:
+
+```rust
+pub struct LiveBlockStatus {
+    pub collected: bool,        // Set ✓
+    pub block_fetched: true,    // Set ✓
+    pub receipts_collected: true, // Set ✓
+    pub logs_collected: true,   // Set ✓
+    pub decoded: false,         // NEVER SET
+    pub transformed: false,     // NEVER SET
+}
+```
+
+Since `is_complete()` requires all flags to be `true`:
+
+- Compaction will **never** find any compactable ranges
+- Blocks will accumulate indefinitely in `data/live/`
+
+#### 5. Compaction Doesn't Respect Reorg Depth
+
+The expected behavior is: *"compact at range_size PLUS reorg_depth"* to ensure reorgs can't affect already-compacted data.
+
+Current implementation (`find_compactable_ranges`) compacts any complete range immediately without considering proximity to chain tip:
+
+- A range could be compacted while still within the reorg window
+- A reorg affecting compacted blocks would require re-processing from parquet
+
+**Required fix**: Only compact ranges where `range_end < (latest_block - reorg_depth)`.
+
+### Medium Issues
+
+#### 6. Reorg Tables Use Direct Deletion, Not Shadow Tables
+
+The expected design mentions `_reorg_{table_name}` shadow tables for storing row state before modification. Current implementation:
+
+- `handler.reorg_tables()` returns actual table names (e.g., `["v3_pools_v1"]`)
+- Cleanup deletes directly using `DELETE WHERE chain_id = X AND block_number IN (...)`
+- No shadow tables store pre-modification state
+
+**Consequence**: Modified rows are deleted entirely rather than rolled back to previous values. For example, if block N updates a pool's `liquidity` value that was originally set in block M, a reorg of block N will delete the row entirely instead of restoring the block M value.
+
+#### 7. UpsertSnapshot Not Fully Implemented
+
+`UpsertSnapshot` exists in `LiveProcessingState` to track pre-modification row state:
+
+```rust
+struct UpsertSnapshot {
+    table: String,
+    source: String,
+    source_version: u32,
+    key_columns: Vec<(String, DbValue)>,
+    previous_row: Option<HashMap<String, DbValue>>,  // Row state before modification
+}
+```
+
+However:
+- No code captures snapshots before writes
+- `upsert_snapshots` HashMap is cleared on reorg but values are never restored
+- The restoration logic is not implemented
+
+#### 8. Logs Parquet Missing transaction_hash
+
+In `CompactionService::write_logs_parquet()`, the schema omits `transaction_hash`:
+
+```rust
+let schema = Arc::new(Schema::new(vec![
+    Field::new("block_number", ...),
+    Field::new("block_timestamp", ...),
+    Field::new("log_index", ...),
+    Field::new("transaction_index", ...),
+    Field::new("address", ...),
+    Field::new("topic0", ...),
+    // ... topics 1-3
+    Field::new("data", ...),
+    // MISSING: transaction_hash
+]));
+```
+
+The `LiveLog` struct has `transaction_hash`, but it's not written to the compacted parquet.
+
+### Minor Issues
+
+#### 9. Progress Tracker Handlers Never Registered
+
+In `spawn_live_mode()`, the `LiveProgressTracker` is created but `register_handler()` is never called. With no registered handlers:
+
+- `is_block_complete()` returns `true` for any block (empty handler set)
+- This is currently moot since `decoded`/`transformed` flags are never set anyway
+
+#### 10. Decoded Data Discarded During Compaction
+
+Per the TODO in `compact_range()`:
+
+```rust
+// TODO: Implement full decoded data compaction in Phase 7.
+// The historical decoder will re-decode from the raw parquet files as needed.
+```
+
+Decoded bincode files are deleted during compaction without being converted to parquet. The data must be re-decoded from raw parquet later, which is inefficient.
+
+### Summary: What's Needed for Working Live Mode
+
+1. **Wire up eth_call collection** in live mode:
+   - Add eth_call channel to `LiveCollector`
+   - Make RPC calls for configured contracts at each block
+   - Coordinate factory calls with receipt collection
+
+2. **Implement factory address parsing** in live mode:
+   - Parse factory events from logs
+   - Track new addresses per factory collection
+   - Trigger eth_calls for newly discovered addresses
+
+3. **Spawn transformation engine** in live mode:
+   - Create and run engine after live collector starts
+   - Connect decoded events/calls channels
+   - Handle `ReorgMessage` for database cleanup
+
+4. **Set decoded/transformed status**:
+   - After log decoding completes, set `status.decoded = true`
+   - After transformation completes, set `status.transformed = true`
+
+5. **Add reorg depth buffer to compaction**:
+   - Track latest block number
+   - Only compact ranges where `range_end < latest_block - reorg_depth`
+
+6. **Include transaction_hash in compacted logs parquet**
+
+7. **Register handlers with progress tracker** in live mode
+
+8. **Optionally**: Implement `_reorg_` shadow tables for proper state restoration

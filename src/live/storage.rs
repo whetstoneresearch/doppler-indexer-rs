@@ -23,7 +23,8 @@ use thiserror::Error;
 
 use super::types::{
     LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall,
-    LiveDecodedLog, LiveDecodedOnceCall, LiveEthCall, LiveLog, LiveReceipt,
+    LiveDecodedLog, LiveDecodedOnceCall, LiveEthCall, LiveFactoryAddresses,
+    LiveLog, LiveReceipt,
     LiveUpsertSnapshot,
 };
 
@@ -69,6 +70,7 @@ impl LiveStorage {
             "receipts",
             "logs",
             "eth_calls",
+            "factories",
             "status",
             "decoded/logs",
             "decoded/eth_calls",
@@ -260,6 +262,45 @@ impl LiveStorage {
             fs::remove_file(&path)?;
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Factory address operations
+    // =========================================================================
+
+    fn factories_path(&self, block_number: u64) -> PathBuf {
+        self.base_dir
+            .join(format!("factories/{}.bin", block_number))
+    }
+
+    /// Write factory addresses for a block.
+    pub fn write_factories(
+        &self,
+        block_number: u64,
+        factories: &LiveFactoryAddresses,
+    ) -> Result<(), StorageError> {
+        let path = self.factories_path(block_number);
+        write_bincode(&path, factories)
+    }
+
+    /// Read factory addresses for a block.
+    pub fn read_factories(&self, block_number: u64) -> Result<LiveFactoryAddresses, StorageError> {
+        let path = self.factories_path(block_number);
+        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
+    }
+
+    /// Delete factory addresses for a block.
+    pub fn delete_factories(&self, block_number: u64) -> Result<(), StorageError> {
+        let path = self.factories_path(block_number);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// List all block numbers with factory address files.
+    pub fn list_factory_blocks(&self) -> Result<Vec<u64>, StorageError> {
+        list_block_numbers(&self.base_dir.join("factories"))
     }
 
     // =========================================================================
@@ -636,6 +677,7 @@ impl LiveStorage {
         self.delete_receipts(block_number)?;
         self.delete_logs(block_number)?;
         self.delete_eth_calls(block_number)?;
+        self.delete_factories(block_number)?;
         self.delete_status(block_number)?;
         self.delete_all_decoded_logs(block_number)?;
         self.delete_all_decoded_calls(block_number)?;

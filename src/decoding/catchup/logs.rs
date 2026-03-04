@@ -382,7 +382,7 @@ fn load_factory_addresses_for_catchup(
 }
 
 /// Read factory addresses from a factory parquet file
-fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, LogDecodingError> {
+pub fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, LogDecodingError> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let reader = builder.build()?;

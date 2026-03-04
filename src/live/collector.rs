@@ -7,10 +7,11 @@
 //! 4. Stores data in live storage format
 //! 5. Forwards to decoder channels
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use alloy::primitives::B256;
+use alloy::dyn_abi::{DynSolType, DynSolValue};
+use alloy::primitives::{Address, B256};
 use alloy::rpc::types::BlockNumberOrTag;
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
@@ -18,12 +19,17 @@ use tokio::sync::{mpsc, Mutex};
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
 use super::storage::{LiveStorage, StorageError};
-use super::types::{LiveBlock, LiveBlockStatus, LiveLog, LiveMessage, LiveModeConfig, LiveReceipt};
+use super::types::{
+    LiveBlock, LiveBlockStatus, LiveFactoryAddresses, LiveLog, LiveMessage, LiveModeConfig,
+    LiveReceipt,
+};
 use crate::decoding::DecoderMessage;
+use crate::raw_data::historical::factories::FactoryMatcher;
 use crate::raw_data::historical::receipts::LogData;
 use crate::rpc::{RpcError, UnifiedRpcClient, WsEvent};
 use crate::transformations::ReorgMessage;
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::contract::FactoryParameterLocation;
 
 #[derive(Debug, Error)]
 pub enum CollectorError {
@@ -50,6 +56,8 @@ pub struct LiveCollector {
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     /// Expected starting block from historical processing or previous live session.
     expected_start_block: Option<u64>,
+    /// Factory matchers for extracting new contract addresses from factory events.
+    factory_matchers: Arc<Vec<FactoryMatcher>>,
 }
 
 impl LiveCollector {
@@ -59,6 +67,7 @@ impl LiveCollector {
         http_client: Arc<UnifiedRpcClient>,
         config: LiveModeConfig,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+        factory_matchers: Arc<Vec<FactoryMatcher>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
@@ -98,6 +107,13 @@ impl LiveCollector {
             _ => {}
         }
 
+        if !factory_matchers.is_empty() {
+            tracing::info!(
+                "Live collector initialized with {} factory matchers",
+                factory_matchers.len()
+            );
+        }
+
         Self {
             chain,
             http_client,
@@ -107,6 +123,7 @@ impl LiveCollector {
             buffer: VecDeque::new(),
             progress_tracker,
             expected_start_block,
+            factory_matchers,
         }
     }
 
@@ -267,6 +284,23 @@ impl LiveCollector {
         self.storage.write_receipts(block_number, &receipts)?;
         self.storage.write_logs(block_number, &logs)?;
 
+        // Extract factory addresses if we have matchers configured
+        let factory_addresses = self.extract_factory_addresses(&logs, updated_block.timestamp);
+        let has_factory_addresses = !factory_addresses.addresses_by_collection.is_empty();
+
+        if has_factory_addresses {
+            self.storage.write_factories(block_number, &factory_addresses)?;
+            tracing::debug!(
+                "Extracted {} factory addresses from block {}",
+                factory_addresses
+                    .addresses_by_collection
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>(),
+                block_number
+            );
+        }
+
         // Update status
         let mut status = self.storage.read_status(block_number)?;
         status.receipts_collected = true;
@@ -281,31 +315,60 @@ impl LiveCollector {
 
         // Send logs to decoder if configured
         if let Some(decoder_tx) = log_decoder_tx {
-            if !logs.is_empty() {
-                let log_data: Vec<LogData> = logs
+            // Send factory addresses first so decoder can use them when processing logs
+            if has_factory_addresses {
+                let factory_addrs: HashMap<String, Vec<Address>> = factory_addresses
+                    .addresses_by_collection
                     .iter()
-                    .map(|log| LogData {
-                        block_number,
-                        block_timestamp: updated_block.timestamp,
-                        transaction_hash: B256::from(log.transaction_hash),
-                        log_index: log.log_index,
-                        address: log.address,
-                        topics: log.topics.clone(),
-                        data: log.data.clone(),
+                    .map(|(name, addrs)| {
+                        (
+                            name.clone(),
+                            addrs.iter().map(|(_, addr)| Address::from(*addr)).collect(),
+                        )
                     })
                     .collect();
 
                 if let Err(e) = decoder_tx
-                    .send(DecoderMessage::LogsReady {
+                    .send(DecoderMessage::FactoryAddresses {
                         range_start: block_number,
-                        range_end: block_number + 1, // Exclusive end for single block
-                        logs: log_data,
-                        live_mode: true, // Live mode: write to bincode
+                        range_end: block_number + 1,
+                        addresses: factory_addrs,
                     })
                     .await
                 {
-                    tracing::warn!("Failed to send logs for block {} to decoder: {}", block_number, e);
+                    tracing::warn!(
+                        "Failed to send factory addresses for block {} to decoder: {}",
+                        block_number,
+                        e
+                    );
                 }
+            }
+
+            // Send logs (even if empty, for consistency)
+            let log_data: Vec<LogData> = logs
+                .iter()
+                .map(|log| LogData {
+                    block_number,
+                    block_timestamp: updated_block.timestamp,
+                    transaction_hash: B256::from(log.transaction_hash),
+                    log_index: log.log_index,
+                    address: log.address,
+                    topics: log.topics.clone(),
+                    data: log.data.clone(),
+                })
+                .collect();
+
+            if let Err(e) = decoder_tx
+                .send(DecoderMessage::LogsReady {
+                    range_start: block_number,
+                    range_end: block_number + 1, // Exclusive end for single block
+                    logs: log_data,
+                    live_mode: true, // Live mode: write to bincode
+                    has_factory_matchers: !self.factory_matchers.is_empty(),
+                })
+                .await
+            {
+                tracing::warn!("Failed to send logs for block {} to decoder: {}", block_number, e);
             }
         }
 
@@ -479,6 +542,112 @@ impl LiveCollector {
         }
 
         Ok((live_receipts, all_logs))
+    }
+
+    /// Extract factory addresses from logs using configured matchers.
+    fn extract_factory_addresses(
+        &self,
+        logs: &[LiveLog],
+        block_timestamp: u64,
+    ) -> LiveFactoryAddresses {
+        let mut addresses_by_collection: HashMap<String, Vec<(u64, [u8; 20])>> = HashMap::new();
+
+        if self.factory_matchers.is_empty() {
+            return LiveFactoryAddresses::default();
+        }
+
+        for log in logs {
+            for matcher in self.factory_matchers.iter() {
+                // Check if log address matches factory contract
+                if log.address != matcher.factory_contract_address {
+                    continue;
+                }
+
+                // Check if topic0 matches the event signature
+                if log.topics.is_empty() || log.topics[0] != matcher.event_topic0 {
+                    continue;
+                }
+
+                // Extract address based on parameter location
+                let extracted_address = match &matcher.param_location {
+                    FactoryParameterLocation::Topic(idx) => {
+                        if *idx < log.topics.len() {
+                            let topic = &log.topics[*idx];
+                            let mut addr = [0u8; 20];
+                            addr.copy_from_slice(&topic[12..32]);
+                            Some(addr)
+                        } else {
+                            None
+                        }
+                    }
+                    FactoryParameterLocation::Data(indices) => {
+                        decode_address_from_data(&log.data, &matcher.data_types, indices)
+                    }
+                };
+
+                if let Some(addr) = extracted_address {
+                    addresses_by_collection
+                        .entry(matcher.collection_name.clone())
+                        .or_default()
+                        .push((block_timestamp, addr));
+                }
+            }
+        }
+
+        LiveFactoryAddresses {
+            addresses_by_collection,
+        }
+    }
+}
+
+/// Decode an address from ABI-encoded log data.
+fn decode_address_from_data(
+    data: &[u8],
+    types: &[DynSolType],
+    indices: &[usize],
+) -> Option<[u8; 20]> {
+    if types.is_empty() || indices.is_empty() || data.is_empty() {
+        return None;
+    }
+
+    let tuple_type = DynSolType::Tuple(types.to_vec());
+
+    match tuple_type.abi_decode_params(data) {
+        Ok(DynSolValue::Tuple(values)) => extract_address_recursive(&values, indices),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("Failed to decode factory event data: {}", e);
+            None
+        }
+    }
+}
+
+/// Recursively extract an address from nested tuple values.
+fn extract_address_recursive(values: &[DynSolValue], indices: &[usize]) -> Option<[u8; 20]> {
+    if indices.is_empty() {
+        return None;
+    }
+
+    let first_idx = indices[0];
+    if first_idx >= values.len() {
+        return None;
+    }
+
+    let value = &values[first_idx];
+
+    if indices.len() == 1 {
+        // Last index - extract address
+        if let DynSolValue::Address(addr) = value {
+            return Some(addr.0 .0);
+        }
+        None
+    } else {
+        // More indices to traverse - must be a tuple
+        if let DynSolValue::Tuple(inner_values) = value {
+            extract_address_recursive(inner_values, &indices[1..])
+        } else {
+            None
+        }
     }
 }
 

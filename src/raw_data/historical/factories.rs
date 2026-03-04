@@ -83,12 +83,12 @@ pub(crate) struct FactoryRecord {
     pub(crate) collection_name: String,
 }
 
-pub(crate) struct FactoryMatcher {
-    pub(crate) factory_contract_address: [u8; 20],
-    pub(crate) event_topic0: [u8; 32],
-    pub(crate) param_location: FactoryParameterLocation,
-    pub(crate) data_types: Vec<DynSolType>,
-    pub(crate) collection_name: String,
+pub struct FactoryMatcher {
+    pub factory_contract_address: [u8; 20],
+    pub event_topic0: [u8; 32],
+    pub param_location: FactoryParameterLocation,
+    pub data_types: Vec<DynSolType>,
+    pub collection_name: String,
 }
 
 /// State computed during factory catchup, passed to current/streaming phase
@@ -98,7 +98,7 @@ pub(crate) struct FactoryCatchupState {
     pub(crate) output_dir: Arc<PathBuf>,
 }
 
-pub(crate) fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
+pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
     let mut matchers = Vec::new();
 
     for (contract_name, contract) in contracts {

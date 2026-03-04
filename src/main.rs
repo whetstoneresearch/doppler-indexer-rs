@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 use db::DbPool;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use raw_data::historical::catchup::blocks::collect_blocks;
-use raw_data::historical::factories::{FactoryMessage, RecollectRequest};
+use raw_data::historical::factories::{build_factory_matchers, FactoryMessage, RecollectRequest};
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
@@ -965,6 +965,15 @@ async fn spawn_live_mode(
         )))
     });
 
+    // Build factory matchers for live mode factory address extraction
+    let factory_matchers = Arc::new(build_factory_matchers(&chain.contracts));
+    if !factory_matchers.is_empty() {
+        tracing::info!(
+            "Built {} factory matchers for live mode",
+            factory_matchers.len()
+        );
+    }
+
     // Start WebSocket subscription
     let ws_handle = ws_client.clone().subscribe(ws_event_tx);
     tasks.spawn(async move {
@@ -980,6 +989,7 @@ async fn spawn_live_mode(
         http_client.clone(),
         live_config.clone(),
         Some(progress_tracker.clone()),
+        factory_matchers,
     );
     tasks.spawn(async move {
         collector

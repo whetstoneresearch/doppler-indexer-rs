@@ -20,6 +20,6 @@ pub use reorg::{ReorgDetector, ReorgEvent};
 pub use storage::{LiveStorage, StorageError};
 pub use types::{
     DecodedFileMetadata, LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall,
-    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue, LiveDbValue, LiveEthCall, LiveLog,
-    LiveMessage, LiveModeConfig, LiveProgress, LiveReceipt, LiveUpsertSnapshot,
+    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue, LiveEthCall, LiveFactoryAddresses,
+    LiveLog, LiveMessage, LiveModeConfig, LiveProgress, LiveReceipt, LiveDbValue, LiveUpsertSnapshot,
 };
