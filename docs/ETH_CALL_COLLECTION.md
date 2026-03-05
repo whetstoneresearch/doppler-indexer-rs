@@ -388,7 +388,7 @@ For full documentation, see [On-Events ETH Calls](./ON_EVENT_CALLS.md).
 
 Functions with `frequency: "once"` are stored differently from regular calls:
 
-**Path:** `data/raw/{chain}/eth_calls/{contract}/once/{start}-{end}.parquet`
+**Path:** `data/{chain}/historical/raw/eth_calls/{contract}/once/{start}-{end}.parquet` (or `data/{chain}/live/raw/eth_calls/...` for live mode)
 
 **Schema:**
 
@@ -403,7 +403,7 @@ All "once" functions for a contract/collection are combined into columns in the 
 
 Example for a factory with `name()`, `symbol()`, `decimals()` as "once" calls:
 ```
-data/raw/base/eth_calls/DERC20/once/0-9999.parquet
+data/base/historical/raw/eth_calls/DERC20/once/0-9999.parquet
   - block_number
   - block_timestamp
   - address
@@ -416,7 +416,7 @@ data/raw/base/eth_calls/DERC20/once/0-9999.parquet
 
 Each `once/` directory contains a `column_index.json` sidecar file that tracks which function result columns exist in each parquet file:
 
-**Path:** `data/raw/{chain}/eth_calls/{contract}/once/column_index.json`
+**Path:** `data/{chain}/historical/raw/eth_calls/{contract}/once/column_index.json` (or `data/{chain}/live/raw/eth_calls/...` for live mode)
 
 **Format:**
 ```json
@@ -448,10 +448,10 @@ Existing log parquet files ──> [Event Trigger Extraction] ──> event-trig
 Factory parquet files ──> [Load Addresses] ──> factory eth_calls
 ```
 
-1. **Regular calls catchup**: Scans `data/raw/{chain}/blocks/` for existing block ranges, checks if eth_call parquet files exist for all configured contract/function pairs, and re-processes missing ranges
+1. **Regular calls catchup**: Scans `data/{chain}/historical/raw/blocks/` for existing block ranges, checks if eth_call parquet files exist for all configured contract/function pairs, and re-processes missing ranges
 2. **Once calls catchup**: Column-aware - checks `column_index.json` to detect newly added "once" functions and merges new columns into existing parquet files
 3. **Factory once calls catchup**: Waits for factory catchup to complete, then processes "once" calls for factory-created contracts
-4. **Event-triggered calls catchup**: Reads from existing log parquet files in `data/raw/{chain}/logs/`, extracts event triggers, and processes them through the same pipeline as live mode
+4. **Event-triggered calls catchup**: Reads from existing log parquet files in `data/{chain}/historical/raw/logs/`, extracts event triggers, and processes them through the same pipeline as live mode
 
 ### Live Phase
 
@@ -474,23 +474,23 @@ Blocks → (block_number, timestamp) → ETH Calls Collector → RPC Calls → P
 
 ### File Naming
 
-Files are written to `data/raw/{chain}/eth_calls/{contract_name}/{function_name}/` with the naming convention:
+Files are written to `data/{chain}/historical/raw/eth_calls/{contract_name}/{function_name}/` (or `data/{chain}/live/raw/eth_calls/...` for live mode) with the naming convention:
 
 ```
 {start_block}-{end_block}.parquet
 ```
 
-Example: `data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet`
+Example: `data/base/historical/raw/eth_calls/USDC/totalSupply/0-9999.parquet`
 
 ### Event-Triggered Calls Output
 
 Event-triggered call results are written to a separate `on_events/` subdirectory:
 
 ```
-data/raw/{chain}/eth_calls/{contract_name}/{function_name}/on_events/{start_block}-{end_block}.parquet
+data/{chain}/historical/raw/eth_calls/{contract_name}/{function_name}/on_events/{start_block}-{end_block}.parquet
 ```
 
-Example: `data/raw/base/eth_calls/V3Pool/slot0/on_events/0-9999.parquet`
+Example: `data/base/historical/raw/eth_calls/V3Pool/slot0/on_events/0-9999.parquet`
 
 **Empty files:** When no events match the configured triggers for a range, an empty parquet file is written. This prevents the catchup phase from re-processing the range on subsequent runs.
 
@@ -534,7 +534,7 @@ Example in Python:
 ```python
 import pandas as pd
 
-df = pd.read_parquet("data/raw/base/eth_calls/USDC/totalSupply/0-9999.parquet")
+df = pd.read_parquet("data/base/historical/raw/eth_calls/USDC/totalSupply/0-9999.parquet")
 
 # Decode uint256
 df['decoded_value'] = df['value'].apply(
@@ -687,10 +687,10 @@ Factory calls are defined within the `factories` array of a contract:
 Factory eth_call results are written to the same directory structure as regular eth_calls, using the collection name in place of the contract name:
 
 ```
-data/raw/{chain}/eth_calls/{collection}/{function}/{start}-{end}.parquet
+data/{chain}/historical/raw/eth_calls/{collection}/{function}/{start}-{end}.parquet
 ```
 
-Example: `data/raw/base/eth_calls/DERC20/totalSupply/0-9999.parquet`
+Example: `data/base/historical/raw/eth_calls/DERC20/totalSupply/0-9999.parquet`
 
 ### Processing Flow
 
@@ -778,10 +778,10 @@ For v4 pools, the `pool.address` field should contain the pool ID (bytes32), and
 Token pool eth_call results are written to:
 
 ```
-data/raw/{chain}/eth_calls/{token_name}_pool/{function_name}/{start}-{end}.parquet
+data/{chain}/historical/raw/eth_calls/{token_name}_pool/{function_name}/{start}-{end}.parquet
 ```
 
-Example: `data/raw/base/eth_calls/Fxh_pool/slot0/0-9999.parquet`
+Example: `data/base/historical/raw/eth_calls/Fxh_pool/slot0/0-9999.parquet`
 
 ### Decoded Output Schema
 
@@ -814,7 +814,7 @@ The catchup phases are executed in a specific order to ensure dependencies are s
 
 On startup, the eth_call collector performs a catchup phase for regular (non-factory) calls:
 
-1. **Scans existing block files** - Reads `data/raw/{chain}/blocks/` to find all available block ranges
+1. **Scans existing block files** - Reads `data/{chain}/historical/raw/blocks/` to find all available block ranges
 2. **Checks existing eth_call files** - For each block range, checks if eth_call parquet files exist for all configured contract/function pairs
 3. **Re-processes missing ranges** - If any eth_call files are missing, reads block info from the existing block parquet file and executes the calls
 
@@ -836,7 +836,7 @@ Factory eth_calls are processed in two ways:
 
 **During catchup:**
 - Factory "once" calls wait for factory catchup to complete before processing
-- Factory addresses are loaded from existing factory parquet files in `data/derived/{chain}/factories/`
+- Factory addresses are loaded from existing factory parquet files in `data/{chain}/historical/factories/`
 
 **During live collection:**
 - Factory addresses arrive via channel from the factory collector
@@ -847,8 +847,8 @@ Factory eth_calls are processed in two ways:
 
 For `on_events` frequency calls, the catchup phase:
 
-1. **Loads historical factory addresses** - Reads from `data/derived/{chain}/factories/` parquet files to know which addresses are valid factory-created contracts
-2. **Scans log parquet files** - Reads `data/raw/{chain}/logs/` to find existing log ranges
+1. **Loads historical factory addresses** - Reads from `data/{chain}/historical/factories/` parquet files to know which addresses are valid factory-created contracts
+2. **Scans log parquet files** - Reads `data/{chain}/historical/raw/logs/` to find existing log ranges
 3. **Checks for existing output** - For each log range, checks if output already exists in `{contract}/{function}/on_events/` subdirectory
 4. **Extracts event triggers** - Reads logs from parquet and extracts matching event triggers using configured matchers
 5. **Filters factory events** - For factory collections, only processes events from known factory addresses
@@ -858,11 +858,11 @@ For `on_events` frequency calls, the catchup phase:
 
 ### Manual Re-collection
 
-**Regular calls:** Delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/`.
+**Regular calls:** Delete the corresponding file from `data/{chain}/historical/raw/eth_calls/{contract}/{function}/`.
 
 **Once calls:** Remove the function name from the `column_index.json` for that file, or delete the entire parquet file to recollect all columns.
 
-**Event-triggered calls:** Delete the corresponding file from `data/raw/{chain}/eth_calls/{contract}/{function}/on_events/`.
+**Event-triggered calls:** Delete the corresponding file from `data/{chain}/historical/raw/eth_calls/{contract}/{function}/on_events/`.
 
 ### Column Merging
 
@@ -885,8 +885,10 @@ For `frequency: "once"` calls, the collector maintains a `column_index.json` sid
 ### Index File Location
 
 ```
-data/raw/{chain}/eth_calls/{contract_or_collection}/once/column_index.json
+data/{chain}/historical/raw/eth_calls/{contract_or_collection}/once/column_index.json
 ```
+
+(For live mode: `data/{chain}/live/raw/eth_calls/{contract_or_collection}/once/column_index.json`)
 
 ### Index Format
 
@@ -927,7 +929,7 @@ To force recollection of a specific column (e.g., after fixing a bug):
 
 Alternatively, use the helper script:
 ```bash
-python scripts/remove_parquet_column.py data/raw/base/eth_calls/DERC20/once getAssetData_result
+python scripts/remove_parquet_column.py data/base/historical/raw/eth_calls/DERC20/once getAssetData_result
 ```
 
 ## Limitations

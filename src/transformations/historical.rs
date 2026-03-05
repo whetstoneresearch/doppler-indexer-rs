@@ -30,7 +30,7 @@ pub struct HistoricalDataReader {
 impl HistoricalDataReader {
     /// Create a new historical data reader for a chain.
     pub fn new(chain_name: &str) -> Result<Self, TransformationError> {
-        let decoded_base = PathBuf::from(format!("data/derived/{}/decoded", chain_name));
+        let decoded_base = PathBuf::from(format!("data/{}/historical/decoded", chain_name));
 
         let reader = Self {
             chain_name: chain_name.to_string(),
@@ -51,13 +51,13 @@ impl HistoricalDataReader {
         let mut index = self.file_index.write().unwrap();
         index.clear();
 
-        // Index log files: data/derived/{chain}/decoded/logs/{source}/{event}/
+        // Index log files: data/{chain}/historical/decoded/logs/{source}/{event}/
         let logs_dir = self.decoded_base.join("logs");
         if logs_dir.exists() {
             self.index_directory(&logs_dir, &mut index)?;
         }
 
-        // Index eth_call files: data/derived/{chain}/decoded/eth_calls/{source}/{function}/
+        // Index eth_call files: data/{chain}/historical/decoded/eth_calls/{source}/{function}/
         let calls_dir = self.decoded_base.join("eth_calls");
         if calls_dir.exists() {
             self.index_directory(&calls_dir, &mut index)?;

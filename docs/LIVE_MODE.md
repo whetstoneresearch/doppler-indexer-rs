@@ -47,7 +47,7 @@ After historical catchup completes, the indexer transitions to live mode for rea
         │                                                       │
         ▼                                                       │
 ┌───────────────────┐                                           │
-│   LiveStorage     │  blocks/, receipts/, logs/, eth_calls/    │
+│   LiveStorage     │  raw/{blocks,receipts,logs,eth_calls}/     │
 │  (bincode files)  │                                           │
 └───────────────────┘                                           │
         │                                                       │
@@ -87,8 +87,8 @@ After historical catchup completes, the indexer transitions to live mode for rea
 └─────────────────────────────────────┘
                     │
                     ▼
-            data/raw/{chain}/
-            data/derived/{chain}/decoded/
+            data/{chain}/historical/raw/
+            data/{chain}/historical/decoded/
 ```
 
 ### Data Flow Summary
@@ -111,17 +111,18 @@ After historical catchup completes, the indexer transitions to live mode for rea
 Live mode uses a dedicated storage directory with bincode format for fast serialization:
 
 ```
-data/live/{chain}/
-├── blocks/{block_number}.bin       # Block headers
-├── receipts/{block_number}.bin     # Transaction receipts
-├── logs/{block_number}.bin         # Raw logs
-├── eth_calls/{block_number}.bin    # ETH call results
+data/{chain}/live/
+├── decoded/
+│   ├── eth_calls/{block_number}/{contract}/{function}.bin
+│   └── logs/{block_number}/{contract}/{event}.bin
 ├── factories/{block_number}.bin    # Factory addresses discovered in block
+├── raw/
+│   ├── blocks/{block_number}.bin   # Block headers
+│   ├── eth_calls/{block_number}.bin # ETH call results
+│   ├── logs/{block_number}.bin     # Raw logs
+│   └── receipts/{block_number}.bin # Transaction receipts
 ├── snapshots/{block_number}.bin    # Upsert snapshots for reorg rollback
-├── status/{block_number}.json      # Processing status (JSON for debugging)
-└── decoded/
-    ├── logs/{block_number}/{contract}/{event}.bin
-    └── eth_calls/{block_number}/{contract}/{function}.bin
+└── status/{block_number}.json      # Processing status (JSON for debugging)
 ```
 
 ### Block Status Tracking
@@ -172,12 +173,12 @@ DecoderMessage::LogsReady {
 ```
 
 When `live_mode: true`:
-- Decoded data is written to bincode files in `data/live/{chain}/decoded/`
+- Decoded data is written to bincode files in `data/{chain}/live/decoded/`
 - Block status is updated to mark decoding complete
 - Data is later compacted to parquet by the CompactionService
 
 When `live_mode: false`:
-- Decoded data is written directly to parquet in `data/derived/{chain}/decoded/`
+- Decoded data is written directly to parquet in `data/{chain}/historical/decoded/`
 
 ## Live Decoded Data Types
 
@@ -258,7 +259,7 @@ When the LiveCollector detects a chain reorganization (parent hash mismatch):
 1. **Detection**: ReorgDetector compares incoming block's parent_hash with stored hash
 2. **Orphan Identification**: Walk back to find the common ancestor
 3. **Cleanup**:
-   - Delete raw data for orphaned blocks from `data/live/{chain}/`
+   - Delete raw data for orphaned blocks from `data/{chain}/live/`
    - Delete decoded data for orphaned blocks
    - Send `DecoderMessage::Reorg` to decoder for additional cleanup
    - Send `LiveMessage::Reorg` downstream
@@ -302,7 +303,7 @@ if has_gap {
 
 1. Read all bincode files for the range
 2. Convert to Arrow arrays
-3. Write parquet to `data/raw/{chain}/` and `data/derived/{chain}/decoded/`
+3. Write parquet to `data/{chain}/historical/raw/` and `data/{chain}/historical/decoded/`
 4. Migrate progress from `_live_progress` to `_handler_progress`
 5. Delete bincode files and status files
 

@@ -35,7 +35,7 @@ pub async fn collect_eth_calls(
     factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
     eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
 ) -> Result<EthCallCatchupState, EthCallCollectionError> {
-    let base_output_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
+    let base_output_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
     std::fs::create_dir_all(&base_output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;

@@ -210,7 +210,7 @@ Factory Parquet Files → [Load Addresses] ────────────�
 Existing Log Parquet Files → [Read Logs] → [Event Trigger Extraction] → ETH Calls Collector → RPC Calls → Parquet + Decoder
 ```
 
-**Catchup ordering:** Factory addresses are loaded from `data/derived/{chain}/factories/` before processing event triggers. This ensures factory collection events are properly filtered.
+**Catchup ordering:** Factory addresses are loaded from `data/{chain}/historical/factories/` before processing event triggers. This ensures factory collection events are properly filtered.
 
 ### Processing Steps
 
@@ -232,8 +232,8 @@ Existing Log Parquet Files → [Read Logs] → [Event Trigger Extraction] → ET
 
 On startup, the eth_calls collector runs a catchup phase that:
 
-1. **Loads historical factory addresses** from `data/derived/{chain}/factories/` parquet files (for factory collections only) via `load_historical_factory_addresses()`
-2. Scans `data/raw/{chain}/logs/` for existing parquet files
+1. **Loads historical factory addresses** from `data/{chain}/historical/factories/` parquet files (for factory collections only) via `load_historical_factory_addresses()`
+2. Scans `data/{chain}/historical/raw/logs/` for existing parquet files
 3. For each log file, checks if output already exists in the `on_events/` subdirectory
 4. If output doesn't exist:
    - Reads logs from the parquet file
@@ -251,12 +251,12 @@ This ensures that historical data is processed even if the indexer was started a
 
 ### Raw File Location
 ```
-data/raw/{chain}/eth_calls/{contract}/{function}/on_events/{start_block}-{end_block}.parquet
+data/{chain}/historical/raw/eth_calls/{contract}/{function}/on_events/{start_block}-{end_block}.parquet
 ```
 
 ### Decoded File Location
 ```
-data/derived/{chain}/decoded/eth_calls/{contract}/{function}/on_events/{start_block}-{end_block}.parquet
+data/{chain}/historical/decoded/eth_calls/{contract}/{function}/on_events/{start_block}-{end_block}.parquet
 ```
 
 ### Raw Schema

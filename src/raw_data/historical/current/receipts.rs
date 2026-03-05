@@ -28,7 +28,7 @@ pub async fn collect_receipts(
     event_matchers: Vec<EventTriggerMatcher>,
     mut recollect_rx: Option<Receiver<RecollectRequest>>,
 ) -> Result<(), ReceiptCollectionError> {
-    let output_dir = PathBuf::from(format!("data/raw/{}/receipts", chain.name));
+    let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
@@ -324,7 +324,7 @@ pub async fn collect_receipts(
 
                     // Find the corresponding block file and read block info
                     let block_file_path = PathBuf::from(format!(
-                        "data/raw/{}/blocks/blocks_{}-{}.parquet",
+                        "data/{}/historical/raw/blocks/blocks_{}-{}.parquet",
                         chain.name,
                         request.range_start,
                         request.range_end - 1

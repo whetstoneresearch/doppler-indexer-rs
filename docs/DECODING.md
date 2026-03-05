@@ -9,7 +9,7 @@ Decoding works in two phases:
 1. **Catchup Phase**: Processes existing raw parquet files that haven't been decoded yet
 2. **Live Phase**: Processes new data as it arrives through channels
 
-Decoded data is written to `data/derived/{chain}/decoded/` organized by data type, contract, and event/function name.
+Decoded data is written to `data/{chain}/historical/decoded/` (for historical mode) or `data/{chain}/live/decoded/` (for live mode), organized by data type, contract, and event/function name.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ Decoded data is written to `data/derived/{chain}/decoded/` organized by data typ
                             └───────────────────────┘
                                       │
                                       ▼
-                               data/derived/{chain}/decoded/
+                               data/{chain}/historical/decoded/
                                ├── logs/{contract}/{event}/{range}.parquet
                                └── eth_calls/{contract}/
                                    ├── {function}/{range}.parquet
@@ -53,8 +53,8 @@ The `DecoderMessage` enum coordinates communication between collectors and decod
 
 The `LogsReady`, `EthCallsReady`, `OnceCallsReady`, and `EventCallsReady` variants include a `live_mode: bool` field that determines the output format:
 
-- **`live_mode: false`** (Historical mode): Decoded data is written to parquet files in `data/derived/{chain}/decoded/`
-- **`live_mode: true`** (Live mode): Decoded data is written to bincode files in `data/live/{chain}/decoded/` for fast per-block storage
+- **`live_mode: false`** (Historical mode): Decoded data is written to parquet files in `data/{chain}/historical/decoded/`
+- **`live_mode: true`** (Live mode): Decoded data is written to bincode files in `data/{chain}/live/decoded/` for fast per-block storage
 
 Live mode is used when processing blocks from WebSocket subscriptions, where data arrives one block at a time. The compact bincode format is later compacted into parquet ranges by the CompactionService.
 
@@ -177,7 +177,7 @@ The optional `name` field allows you to customize the directory name used for de
 ### Output Location
 
 ```
-data/derived/{chain}/decoded/logs/{contract_name}/{event_name}/{start}-{end}.parquet
+data/{chain}/historical/decoded/logs/{contract_name}/{event_name}/{start}-{end}.parquet
 ```
 
 Where `{event_name}` is either the custom `name` from config, or the event name parsed from the signature.
@@ -198,7 +198,7 @@ For a config like:
 
 Output:
 ```
-data/derived/base/decoded/logs/UniswapV4PoolManager/Swap/1000000-1000999.parquet
+data/base/historical/decoded/logs/UniswapV4PoolManager/Swap/1000000-1000999.parquet
 ```
 
 **Example with custom name:**
@@ -219,7 +219,7 @@ data/derived/base/decoded/logs/UniswapV4PoolManager/Swap/1000000-1000999.parquet
 
 Output:
 ```
-data/derived/base/decoded/logs/UniswapV4PoolManager/PoolSwap/1000000-1000999.parquet
+data/base/historical/decoded/logs/UniswapV4PoolManager/PoolSwap/1000000-1000999.parquet
 ```
 
 With columns: `block_number`, `block_timestamp`, `transaction_hash`, `log_index`, `contract_address`, `id`, `sender`, `amount0`, `amount1`, `sqrtPriceX96`, `liquidity`, `tick`, `fee`
@@ -337,13 +337,13 @@ This encodes the call with the target contract address as the parameter, useful 
 
 ```
 # Regular calls
-data/derived/{chain}/decoded/eth_calls/{contract_name}/{function_name}/{start}-{end}.parquet
+data/{chain}/historical/decoded/eth_calls/{contract_name}/{function_name}/{start}-{end}.parquet
 
 # Once calls
-data/derived/{chain}/decoded/eth_calls/{contract_name}/once/{start}-{end}.parquet
+data/{chain}/historical/decoded/eth_calls/{contract_name}/once/{start}-{end}.parquet
 
 # Event-triggered calls
-data/derived/{chain}/decoded/eth_calls/{contract_name}/{function_name}/on_events/{start}-{end}.parquet
+data/{chain}/historical/decoded/eth_calls/{contract_name}/{function_name}/on_events/{start}-{end}.parquet
 ```
 
 ## Supported Types
@@ -392,13 +392,13 @@ For factory-created contracts, the decoder:
 
 On startup, the decoder:
 
-1. Scans `data/derived/{chain}/decoded/` for existing decoded files
-2. Scans `data/raw/{chain}/logs/` and `data/raw/{chain}/eth_calls/` for raw files
+1. Scans `data/{chain}/historical/decoded/` for existing decoded files
+2. Scans `data/{chain}/historical/raw/logs/` and `data/{chain}/historical/raw/eth_calls/` for raw files
 3. Skips ranges that are already fully decoded
 4. For partially decoded ranges, **only decodes missing events** (incremental catchup)
 5. Processes any missing ranges **concurrently** (configurable parallelism)
 
-For factory events during catchup, the decoder loads factory addresses from `data/derived/{chain}/factories/` parquet files.
+For factory events during catchup, the decoder loads factory addresses from `data/{chain}/historical/factories/` parquet files.
 
 ### Re-Catchup on Completion
 
@@ -438,7 +438,7 @@ For "once" calls, incremental decoding works at the column level:
 During the catchup phase, if the log decoder encounters a corrupted raw log file, it automatically handles recovery:
 
 1. **Detection**: When reading a raw log parquet file fails with a parse error
-2. **Deletion**: The corrupted file is deleted from `data/raw/{chain}/logs/`
+2. **Deletion**: The corrupted file is deleted from `data/{chain}/historical/raw/logs/`
 3. **Recollection Request**: A `RecollectRequest` is sent to the receipt collector
 4. **Re-fetching**: The receipt collector re-fetches receipts from RPC and sends logs through the normal channel flow
 5. **Processing**: The logs collector writes a new parquet file, and the log decoder processes it during the live phase
@@ -455,7 +455,7 @@ Log Decoder Catchup                          Receipt Collector
      │                                              │
      ▼                                              │
   Delete corrupted file                             │
-  (data/raw/{chain}/logs/logs_X-Y.parquet)          │
+  (data/{chain}/historical/raw/logs/X-Y.parquet)    │
      │                                              │
      │───────── RecollectRequest ──────────────────►│
      │          {range_start, range_end}            │

@@ -386,7 +386,7 @@ pub struct ExistingBlockRange {
 }
 
 pub fn get_existing_block_ranges(chain_name: &str) -> Vec<ExistingBlockRange> {
-    let blocks_dir = PathBuf::from(format!("data/raw/{}/blocks", chain_name));
+    let blocks_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain_name));
     let mut ranges = Vec::new();
 
     let entries = match std::fs::read_dir(&blocks_dir) {

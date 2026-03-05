@@ -5,11 +5,17 @@
 //!
 //! Directory structure:
 //! ```text
-//! data/live/{chain}/
-//! ├── blocks/{block_number}.bin
-//! ├── receipts/{block_number}.bin
-//! ├── logs/{block_number}.bin
-//! ├── eth_calls/{block_number}.bin
+//! data/{chain}/live/
+//! ├── raw/
+//! │   ├── blocks/{block_number}.bin
+//! │   ├── receipts/{block_number}.bin
+//! │   ├── logs/{block_number}.bin
+//! │   └── eth_calls/{block_number}.bin
+//! ├── decoded/
+//! │   ├── logs/{block_number}/{contract}/{event}.bin
+//! │   └── eth_calls/{block_number}/{contract}/{function}.bin
+//! ├── factories/{block_number}.bin
+//! ├── snapshots/{block_number}.bin
 //! └── status/{block_number}.json
 //! ```
 
@@ -49,7 +55,7 @@ pub struct LiveStorage {
 impl LiveStorage {
     /// Create a new LiveStorage for the given chain.
     pub fn new(chain_name: &str) -> Self {
-        let base_dir = PathBuf::from(format!("data/live/{}", chain_name));
+        let base_dir = PathBuf::from(format!("data/{}/live", chain_name));
         Self { base_dir }
     }
 
@@ -66,10 +72,10 @@ impl LiveStorage {
     /// Ensure all subdirectories exist and clean up leftover .tmp files.
     pub fn ensure_dirs(&self) -> Result<(), StorageError> {
         let subdirs = [
-            "blocks",
-            "receipts",
-            "logs",
-            "eth_calls",
+            "raw/blocks",
+            "raw/receipts",
+            "raw/logs",
+            "raw/eth_calls",
             "factories",
             "status",
             "decoded/logs",
@@ -133,7 +139,7 @@ impl LiveStorage {
     // =========================================================================
 
     fn block_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir.join(format!("blocks/{}.bin", block_number))
+        self.base_dir.join(format!("raw/blocks/{}.bin", block_number))
     }
 
     /// Write a live block to storage.
@@ -160,7 +166,7 @@ impl LiveStorage {
 
     /// List all block numbers in storage.
     pub fn list_blocks(&self) -> Result<Vec<u64>, StorageError> {
-        list_block_numbers(&self.base_dir.join("blocks"))
+        list_block_numbers(&self.base_dir.join("raw/blocks"))
     }
 
     // =========================================================================
@@ -169,7 +175,7 @@ impl LiveStorage {
 
     fn receipts_path(&self, block_number: u64) -> PathBuf {
         self.base_dir
-            .join(format!("receipts/{}.bin", block_number))
+            .join(format!("raw/receipts/{}.bin", block_number))
     }
 
     /// Write receipts for a block.
@@ -198,7 +204,7 @@ impl LiveStorage {
     // =========================================================================
 
     fn logs_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir.join(format!("logs/{}.bin", block_number))
+        self.base_dir.join(format!("raw/logs/{}.bin", block_number))
     }
 
     /// Write logs for a block.
@@ -224,7 +230,7 @@ impl LiveStorage {
 
     fn eth_calls_path(&self, block_number: u64) -> PathBuf {
         self.base_dir
-            .join(format!("eth_calls/{}.bin", block_number))
+            .join(format!("raw/eth_calls/{}.bin", block_number))
     }
 
     /// Write eth call results for a block.

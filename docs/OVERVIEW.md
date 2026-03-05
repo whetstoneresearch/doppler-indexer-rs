@@ -141,7 +141,7 @@ After historical catchup completes, the indexer transitions to live mode for rea
                     ▼                     ▼                       ▼
         ┌─────────────────────────────────────────────────────────────────────┐
         │                        LiveStorage (bincode)                         │
-        │            blocks/, receipts/, logs/, eth_calls/, decoded/           │
+        │         raw/{blocks,receipts,logs,eth_calls}/, decoded/, factories/  │
         └─────────────────────────────────────────────────────────────────────┘
                                           │
                                           ▼
@@ -162,36 +162,38 @@ Live mode uses bincode format for fast per-block writes, later compacted to parq
 ## Output Structure
 
 ```
-data/
-├── raw/{chain}/
-│   ├── blocks/           # Block headers
-│   ├── receipts/         # Transaction receipts
-│   ├── logs/             # Raw event logs
-│   └── eth_calls/        # Raw eth_call results
-│       ├── {contract}/
-│       │   ├── {function}/
-│       │   ├── once/     # One-time calls (name, symbol, etc.)
-│       │   └── {function}/on_events/  # Event-triggered calls
-│       └── {collection}/ # Factory contract calls
-│
-├── derived/{chain}/
-│   ├── factories/        # Discovered factory addresses
+data/{chain}/
+├── historical/
+│   ├── decoded/              # Decoded parquet files
+│   │   ├── eth_calls/        # Decoded call results
+│   │   │   └── {contract}/{function}/
+│   │   └── logs/             # Decoded events
+│   │       └── {contract}/{event}/
+│   ├── factories/            # Discovered factory addresses
 │   │   └── {collection}/
-│   └── decoded/
-│       ├── logs/         # Decoded events
-│       │   └── {contract}/{event}/
-│       └── eth_calls/    # Decoded call results
-│           └── {contract}/{function}/
+│   └── raw/                  # Raw blockchain data
+│       ├── blocks/           # Block headers
+│       ├── eth_calls/        # Raw eth_call results
+│       │   ├── {contract}/
+│       │   │   ├── {function}/
+│       │   │   ├── once/     # One-time calls (name, symbol, etc.)
+│       │   │   └── {function}/on_events/  # Event-triggered calls
+│       │   └── {collection}/ # Factory contract calls
+│       ├── logs/             # Raw event logs
+│       └── receipts/         # Transaction receipts
 │
-└── live/{chain}/         # Live mode bincode storage
-    ├── blocks/
-    ├── receipts/
-    ├── logs/
-    ├── eth_calls/
+└── live/                     # Live mode bincode storage
+    ├── decoded/
+    │   ├── eth_calls/
+    │   └── logs/
     ├── factories/
-    ├── snapshots/        # Upsert snapshots for reorg rollback
-    ├── status/           # Per-block processing status
-    └── decoded/
+    ├── raw/
+    │   ├── blocks/
+    │   ├── eth_calls/
+    │   ├── logs/
+    │   └── receipts/
+    ├── snapshots/            # Upsert snapshots for reorg rollback
+    └── status/               # Per-block processing status
 
 migrations/
 ├── tables/              # Core table migrations
@@ -486,7 +488,7 @@ SELECT
     amount0,
     amount1,
     sqrtPriceX96
-FROM read_parquet('data/derived/base/decoded/logs/UniswapV4PoolManager/Swap/*.parquet')
+FROM read_parquet('data/base/historical/decoded/logs/UniswapV4PoolManager/Swap/*.parquet')
 WHERE block_timestamp > 1700000000
 ORDER BY block_number DESC
 LIMIT 100;

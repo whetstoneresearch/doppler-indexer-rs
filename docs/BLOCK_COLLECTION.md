@@ -63,13 +63,18 @@ When `eth_call_sender` is provided, each block sends a tuple:
 
 ## Output
 
-Blocks are written to `data/raw/<CHAIN_NAME>/blocks/` as Parquet files named by block range:
+Historical blocks are written to `data/{chain}/historical/raw/blocks/` as Parquet files named by block range. Live blocks are stored in `data/{chain}/live/raw/blocks/`.
 
 ```
-data/raw/ethereum/blocks/
+data/ethereum/historical/raw/blocks/
 ├── blocks_0-999.parquet
 ├── blocks_1000-1999.parquet
 ├── blocks_2000-2999.parquet
+└── ...
+
+data/ethereum/live/raw/blocks/
+├── 20000000.bin
+├── 20000001.bin
 └── ...
 ```
 

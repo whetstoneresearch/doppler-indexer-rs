@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
-    if !decode_only && !live_only {
+    if !decode_only {
         load_required_env_vars(&config)?;
     }
 
@@ -116,13 +116,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ensures all required RPC URL env vars are set, loading .env if needed.
+/// Ensures all required RPC/WS URL env vars are set, loading .env if needed.
 fn load_required_env_vars(config: &IndexerConfig) -> anyhow::Result<()> {
-    let required: Vec<&str> = config
+    let mut required: Vec<&str> = config
         .chains
         .iter()
         .map(|c| c.rpc_url_env_var.as_str())
         .collect();
+
+    // Also include WS URL vars when configured
+    for chain in &config.chains {
+        if let Some(ref ws_var) = chain.ws_url_env_var {
+            required.push(ws_var.as_str());
+        }
+    }
 
     let missing: Vec<&&str> = required
         .iter()

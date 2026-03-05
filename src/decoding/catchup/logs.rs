@@ -317,7 +317,7 @@ fn load_factory_addresses_for_catchup(
     let mut result: HashMap<u64, HashMap<String, HashSet<[u8; 20]>>> = HashMap::new();
 
     // Look for factory parquet files
-    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain.name));
+    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
     if !factories_dir.exists() {
         return Ok(result);
     }

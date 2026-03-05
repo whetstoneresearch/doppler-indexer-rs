@@ -28,7 +28,7 @@ pub async fn collect_factories(
     recollect_tx: &Option<Sender<RecollectRequest>>,
     factory_catchup_done_tx: Option<oneshot::Sender<()>>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
-    let output_dir = PathBuf::from(format!("data/derived/{}/factories", chain.name));
+    let output_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
     std::fs::create_dir_all(&output_dir)?;
 
     let existing_factory_data = load_factory_addresses_from_parquet(&output_dir)?;

@@ -1,7 +1,7 @@
 //! Price fetcher for reading token prices from decoded eth_call parquet files.
 //!
 //! Reads price oracle data (Chainlink, Uniswap V3/V4 pool slot0) from decoded
-//! parquet files at `data/derived/{chain}/decoded/eth_calls/`. Caches one block
+//! parquet files at `data/{chain}/historical/decoded/eth_calls/`. Caches one block
 //! range per source for efficiency during sequential block processing.
 
 use std::collections::HashMap;
@@ -170,7 +170,7 @@ pub struct PriceFetcher {
 
 impl PriceFetcher {
     pub fn new(chain_name: &str) -> Result<Self, TransformationError> {
-        let base = PathBuf::from(format!("data/derived/{}/decoded/eth_calls", chain_name));
+        let base = PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain_name));
         let mut file_index = HashMap::new();
 
         if base.exists() {

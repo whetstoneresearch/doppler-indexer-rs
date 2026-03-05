@@ -218,10 +218,13 @@ Matchers are built from contract configurations via `build_event_trigger_matcher
 
 ## Output
 
-Receipts are written to `data/raw/<CHAIN_NAME>/receipts/` as Parquet files named by block range:
+Receipts are written to Parquet files named by block range:
+
+- **Historical mode**: `data/{chain}/historical/raw/receipts/`
+- **Live mode**: `data/{chain}/live/raw/receipts/`
 
 ```
-data/raw/ethereum/receipts/
+data/ethereum/historical/raw/receipts/
 ├── receipts_0-999.parquet
 ├── receipts_1000-1999.parquet
 ├── receipts_2000-2999.parquet
@@ -232,7 +235,7 @@ data/raw/ethereum/receipts/
 
 ### Catchup Phase
 
-1. Scans existing block parquet files in `data/raw/{chain}/blocks/`
+1. Scans existing block parquet files in `data/{chain}/historical/raw/blocks/`
 2. For each block range, checks if receipts and logs parquet files exist
 3. If missing, reads block info from existing block parquet file
 4. Fetches receipts via RPC and processes them
@@ -309,7 +312,7 @@ Collection is fully resumable with comprehensive catchup logic. The catchup and 
 
 The catchup phase runs first as a separate function (`catchup::receipts::collect_receipts`):
 
-1. **Scans existing block files** - Reads `data/raw/{chain}/blocks/` to find all available block ranges
+1. **Scans existing block files** - Reads `data/{chain}/historical/raw/blocks/` to find all available block ranges
 2. **Checks downstream files** - For each block range, checks if:
    - Receipt parquet file exists
    - Logs parquet file exists (if log collection is enabled)
@@ -335,7 +338,7 @@ If a block range contains no transactions, the collector writes an empty parquet
 
 ### Manual Re-collection
 
-To re-collect a range, delete the corresponding file from `data/raw/{chain}/receipts/`. Note that you may also need to delete the corresponding logs and factory files if you want those to be regenerated.
+To re-collect a range, delete the corresponding file from `data/{chain}/historical/raw/receipts/`. Note that you may also need to delete the corresponding logs and factory files if you want those to be regenerated.
 
 ## Automatic Recollection (Corrupted File Recovery)
 

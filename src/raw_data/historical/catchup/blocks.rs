@@ -34,7 +34,7 @@ pub async fn collect_blocks(
     tx_sender: Option<Sender<(u64, u64, Vec<B256>)>>,
     eth_call_sender: Option<Sender<(u64, u64)>>,
 ) -> Result<(), BlockCollectionError> {
-    let output_dir = PathBuf::from(format!("data/raw/{}/blocks", chain.name));
+    let output_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain.name));
     std::fs::create_dir_all(&output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;

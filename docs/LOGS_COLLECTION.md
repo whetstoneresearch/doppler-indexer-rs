@@ -164,10 +164,10 @@ pub enum DecoderMessage {
 
 ## Output
 
-Logs are written to `data/raw/<CHAIN_NAME>/logs/` as Parquet files named by block range:
+Logs are written to `data/{chain}/historical/raw/logs/` as Parquet files named by block range (or `data/{chain}/live/raw/logs/` for live mode):
 
 ```
-data/raw/ethereum/logs/
+data/{chain}/historical/raw/logs/
 ├── logs_0-999.parquet
 ├── logs_1000-1999.parquet
 ├── logs_2000-2999.parquet
@@ -178,7 +178,7 @@ data/raw/ethereum/logs/
 
 ### Catchup Phase
 
-1. Creates the output directory (`data/raw/{chain}/logs/`) if it doesn't exist
+1. Creates the output directory (`data/{chain}/historical/raw/logs/`) if it doesn't exist
 2. Builds the Arrow schema based on configured log fields
 3. If `contract_logs_only` is enabled, extracts all configured contract addresses
 4. Scans existing parquet files to determine which ranges are already processed
@@ -287,7 +287,7 @@ Parquet files are written even for ranges with no logs (either because no events
 
 ### Manual Re-collection
 
-To re-collect logs for a range, delete the corresponding file from `data/raw/{chain}/logs/`. You may also need to delete the corresponding receipts file to trigger the receipt collector's catchup logic.
+To re-collect logs for a range, delete the corresponding file from `data/{chain}/historical/raw/logs/`. You may also need to delete the corresponding receipts file to trigger the receipt collector's catchup logic.
 
 ### Automatic Recollection (Corrupted Files)
 
@@ -469,7 +469,7 @@ SELECT
     topics[2] as from_address,
     topics[3] as to_address,
     data
-FROM read_parquet('data/raw/ethereum/logs/*.parquet')
+FROM read_parquet('data/{chain}/historical/raw/logs/*.parquet')
 WHERE address = '\x...'  -- contract address
   AND topics[1] = '\xa9059cbb...'  -- Transfer event signature
 ORDER BY block_number, log_index;

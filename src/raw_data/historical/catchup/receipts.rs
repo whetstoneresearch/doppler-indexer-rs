@@ -21,7 +21,7 @@ pub async fn collect_receipts(
     event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
     event_matchers: &[EventTriggerMatcher],
 ) -> Result<(), ReceiptCollectionError> {
-    let output_dir = PathBuf::from(format!("data/raw/{}/receipts", chain.name));
+    let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
 
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
@@ -48,7 +48,7 @@ pub async fn collect_receipts(
     let mut catchup_count = 0;
 
     // Check existing logs files
-    let logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
+    let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
     let existing_logs_files = scan_existing_logs_files(&logs_dir);
 
     // Note: Factory catchup is handled by the factories module reading from logs files directly.

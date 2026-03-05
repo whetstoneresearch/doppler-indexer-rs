@@ -12,7 +12,7 @@ pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
 ) -> Result<LogsCatchupState, LogCollectionError> {
-    let output_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
+    let output_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
     std::fs::create_dir_all(&output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;

@@ -137,10 +137,10 @@ impl TransformationEngine {
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
-        let decoded_logs_dir = PathBuf::from(format!("data/derived/{}/decoded/logs", chain_name));
+        let decoded_logs_dir = PathBuf::from(format!("data/{}/historical/decoded/logs", chain_name));
         let decoded_calls_dir =
-            PathBuf::from(format!("data/derived/{}/decoded/eth_calls", chain_name));
-        let raw_receipts_dir = PathBuf::from(format!("data/raw/{}/receipts", chain_name));
+            PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain_name));
+        let raw_receipts_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain_name));
 
         Ok(Self {
             registry,

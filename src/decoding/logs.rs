@@ -108,7 +108,7 @@ pub async fn decode_logs(
     recollect_tx: Option<Sender<RecollectRequest>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
 ) -> Result<(), LogDecodingError> {
-    let output_base = PathBuf::from(format!("data/derived/{}/decoded/logs", chain.name));
+    let output_base = PathBuf::from(format!("data/{}/historical/decoded/logs", chain.name));
     std::fs::create_dir_all(&output_base)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
@@ -144,7 +144,7 @@ pub async fn decode_logs(
     // =========================================================================
     // Catchup phase: Process existing raw log files
     // =========================================================================
-    let raw_logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain.name));
+    let raw_logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
     if raw_logs_dir.exists() {
         super::catchup::catchup_decode_logs(
             &raw_logs_dir,

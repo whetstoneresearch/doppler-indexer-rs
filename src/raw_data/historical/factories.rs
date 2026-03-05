@@ -876,7 +876,7 @@ pub struct RecollectRequest {
 
 /// Scan existing logs parquet files and return their ranges
 pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
-    let logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain_name));
+    let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain_name));
     let mut ranges = Vec::new();
 
     let entries = match std::fs::read_dir(&logs_dir) {

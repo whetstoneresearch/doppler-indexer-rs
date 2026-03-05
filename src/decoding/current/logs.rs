@@ -23,8 +23,8 @@ fn load_accumulated_factory_addresses(
 ) -> Result<HashMap<String, HashSet<[u8; 20]>>, LogDecodingError> {
     let mut result: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
 
-    // 1. Load from compacted parquet files: data/derived/{chain}/factories/{collection}/*.parquet
-    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain_name));
+    // 1. Load from compacted parquet files: data/{chain}/historical/factories/{collection}/*.parquet
+    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
     if factories_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&factories_dir) {
             for entry in entries.flatten() {
@@ -64,7 +64,7 @@ fn load_accumulated_factory_addresses(
         }
     }
 
-    // 2. Load from uncompacted bincode files: data/live/{chain}/factories/{block}.bin
+    // 2. Load from uncompacted bincode files: data/{chain}/live/factories/{block}.bin
     let live_storage = LiveStorage::new(chain_name);
     if let Ok(factory_blocks) = live_storage.list_factory_blocks() {
         for block_number in factory_blocks {

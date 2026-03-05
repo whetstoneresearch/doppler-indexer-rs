@@ -137,7 +137,7 @@ pub async fn decode_eth_calls(
     eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
 ) -> Result<(), EthCallDecodingError> {
-    let output_base = PathBuf::from(format!("data/derived/{}/decoded/eth_calls", chain.name));
+    let output_base = PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain.name));
     std::fs::create_dir_all(&output_base)?;
 
     // Build decode configs from contract configurations
@@ -178,7 +178,7 @@ pub async fn decode_eth_calls(
     // =========================================================================
     // Catchup phase: Process existing raw eth_call files
     // =========================================================================
-    let raw_calls_dir = PathBuf::from(format!("data/raw/{}/eth_calls", chain.name));
+    let raw_calls_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
     if raw_calls_dir.exists() {
         // Pass None for transform_tx during catchup to avoid deadlock:
         // the engine is blocked waiting for our barrier signal and won't read

@@ -320,13 +320,17 @@ This incremental forwarding allows eth_calls to begin RPC fetching for factory c
 
 ### Parquet Files
 
-Factory addresses are written to `data/derived/{chain}/factories/{collection_name}/` with the naming convention:
+Factory addresses are written to:
+- **Historical mode**: `data/{chain}/historical/factories/{collection_name}/`
+- **Live mode**: `data/{chain}/live/factories/{collection_name}/`
+
+With the naming convention:
 
 ```
 {start_block}-{end_block}.parquet
 ```
 
-Example: `data/derived/base/factories/DERC20/0-999.parquet`
+Example: `data/base/historical/factories/DERC20/0-999.parquet`
 
 ### Parquet Schema
 
@@ -403,8 +407,8 @@ The `addresses_by_block` map contains `(timestamp, address, collection_name)` tu
               │                 ┌──────────────────┐
               │                 │    parquet       │
               │                 │                  │
-              └────────────────▶│ data/derived/    │
-                                │ {chain}/         │
+              └────────────────▶│ data/{chain}/    │
+                                │ historical/      │
                                 │ factories/       │
                                 └──────────────────┘
 ```
@@ -661,22 +665,26 @@ ABI decode errors are logged but don't stop collection. This allows the indexer 
 Example using DuckDB to query discovered factory contracts:
 
 ```sql
--- Find all tokens created in a time range
+-- Find all tokens created in a time range (historical data)
 SELECT
     block_number,
     block_timestamp,
     encode(factory_address, 'hex') as token_address,
     collection_name
-FROM read_parquet('data/derived/base/factories/**/*.parquet')
+FROM read_parquet('data/base/historical/factories/**/*.parquet')
 WHERE collection_name = 'DERC20'
   AND block_timestamp BETWEEN 1700000000 AND 1700100000
 ORDER BY block_number;
 
--- Count contracts per collection
+-- Count contracts per collection (combine historical and live data)
 SELECT
     collection_name,
     COUNT(*) as contract_count
-FROM read_parquet('data/derived/base/factories/**/*.parquet')
+FROM (
+    SELECT * FROM read_parquet('data/base/historical/factories/**/*.parquet')
+    UNION ALL
+    SELECT * FROM read_parquet('data/base/live/factories/**/*.parquet')
+)
 GROUP BY collection_name;
 ```
 
@@ -726,7 +734,7 @@ Existing parquet files are scanned on startup and their ranges are skipped durin
 On startup, before processing new logs from the channel, the factory collector performs a catchup phase:
 
 1. **Load existing factory data**: Reads all existing factory parquet files and sends addresses to downstream collectors (logs, eth_calls, decoders)
-2. **Scan for gaps**: Scans `data/raw/{chain}/logs/` for existing log parquet files
+2. **Scan for gaps**: Scans `data/{chain}/historical/raw/logs/` for existing log parquet files
 3. **Check completeness**: For each log file, checks if corresponding factory files exist for all configured collections
 4. **Process gaps concurrently**: If any factory files are missing, reads logs from the existing parquet file and processes them using semaphore-bounded concurrency (controlled by `factory_concurrency` config)
 5. **Signal completion**: Sends `factory_catchup_done_tx` oneshot to unblock dependent catchup phases (e.g., eth_calls)
@@ -745,7 +753,7 @@ The eth_calls catchup phase waits for `factory_catchup_done_rx` before processin
 During catchup, if a log parquet file is corrupted (fails to parse), the factory collector automatically handles recovery:
 
 1. **Detection**: When `read_log_batches_from_parquet` fails with a parse error
-2. **Deletion**: The corrupted file is deleted from `data/raw/{chain}/logs/`
+2. **Deletion**: The corrupted file is deleted from `data/{chain}/historical/raw/logs/`
 3. **Recollection Request**: A `RecollectRequest` is sent via the `recollect_tx` channel to the receipt collector
 4. **Re-fetching**: The receipt collector reads block info from the corresponding block file, re-fetches receipts via RPC, and sends logs through the normal `factory_log_tx` channel
 5. **Processing**: The factory collector receives the re-fetched logs through its normal channel and processes them
@@ -772,7 +780,7 @@ Factory Catchup                           Receipt Collector
      │                                           │
      ▼                                           │
   Delete corrupted file                          │
-  (data/raw/{chain}/logs/logs_X-Y.parquet)       │
+  (data/{chain}/historical/raw/logs/X-Y.parquet) │
      │                                           │
      │─────── RecollectRequest ─────────────────►│
      │        {range_start, range_end}           │
@@ -817,4 +825,4 @@ On the next run, the receipt collector will detect the missing factory files and
 
 ### Manual Re-collection
 
-To re-collect a factory range, delete the corresponding file from `data/derived/{chain}/factories/{collection}/`. Note that you may also need to delete the corresponding receipts file to trigger re-processing.
+To re-collect a factory range, delete the corresponding file from `data/{chain}/historical/factories/{collection}/` (or `data/{chain}/live/factories/{collection}/` for live data). Note that you may also need to delete the corresponding receipts file to trigger re-processing.

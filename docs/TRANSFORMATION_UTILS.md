@@ -137,7 +137,7 @@ Uses `amount_in` if non-zero, otherwise `amount_out`. Returns zero when both are
 
 ## `price_fetch.rs` — PriceFetcher
 
-Reads token prices from decoded `eth_call` parquet files at `data/derived/{chain}/decoded/eth_calls/`.
+Reads token prices from decoded `eth_call` parquet files at `data/{chain}/historical/decoded/eth_calls/`.
 
 ### Token enum
 
@@ -163,7 +163,7 @@ let eth_price = fetcher.fetch_price(Token::Eth, block_number)?;
 
 ### How it works
 
-1. **Index**: On construction, scans `data/derived/{chain}/decoded/eth_calls/{source}/{function}/` for parquet files. File names follow `decoded_{start}-{end}.parquet`.
+1. **Index**: On construction, scans `data/{chain}/historical/decoded/eth_calls/{source}/{function}/` for parquet files. File names follow `decoded_{start}-{end}.parquet`.
 2. **Lookup**: For a given block, finds the parquet file whose range contains the block, reads the target column, and returns the value at or before the requested block via binary search.
 3. **Cache**: Caches one file's entries per (source, function) pair. Sequential block processing means lookups cluster in the same file range, so a single-entry cache is effective.
 4. **Chain gating**: Tokens tied to a specific chain (e.g. Zora on Base) return a default value when the fetcher is initialized for a different chain.

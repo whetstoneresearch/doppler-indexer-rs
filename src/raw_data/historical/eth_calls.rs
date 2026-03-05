@@ -1288,7 +1288,7 @@ pub(crate) fn load_historical_factory_addresses(
         return result;
     }
 
-    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain_name));
+    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
     if !factories_dir.exists() {
         tracing::debug!(
             "No factories directory found at {}, skipping historical factory address loading",
@@ -1361,7 +1361,7 @@ pub(crate) fn load_factory_addresses_for_once_catchup(
         return result;
     }
 
-    let factories_dir = PathBuf::from(format!("data/derived/{}/factories", chain_name));
+    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
     if !factories_dir.exists() {
         tracing::debug!(
             "No factories directory at {}, skipping factory once catchup",
@@ -1550,7 +1550,7 @@ pub(crate) struct ExistingLogRange {
 
 /// Get existing log file ranges for catchup
 pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
-    let logs_dir = PathBuf::from(format!("data/raw/{}/logs", chain_name));
+    let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain_name));
     let mut ranges = Vec::new();
 
     let entries = match std::fs::read_dir(&logs_dir) {
