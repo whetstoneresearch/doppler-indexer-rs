@@ -18,10 +18,12 @@ use super::storage::LiveStorage;
 use super::types::{LiveEthCall, LiveFactoryAddresses, LiveLog};
 use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
 use crate::raw_data::historical::eth_calls::{
-    build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
-    build_once_call_configs, CallConfig, EventCallKey, EventTriggeredCallConfig, FrequencyState,
-    OnceCallConfig,
+    build_call_configs, build_event_call_params, build_event_triggered_call_configs,
+    build_factory_once_call_configs, build_once_call_configs, encode_once_call_params, CallConfig,
+    EventCallKey, EventTriggeredCallConfig, FrequencyState, OnceCallConfig,
 };
+use crate::raw_data::historical::receipts::EventTriggerData;
+use crate::types::config::eth_call::encode_call_with_params;
 use crate::raw_data::historical::factories::get_factory_call_configs;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
@@ -725,23 +727,42 @@ fn encode_call_simple(function_name: &str, params: &Vec<crate::types::config::et
 /// Encode calldata with self-address parameter.
 fn encode_call_with_self_address(
     selector: &[u8; 4],
-    _params: &[ParamConfig],
-    _address: &[u8; 20],
+    params: &[ParamConfig],
+    address: &[u8; 20],
 ) -> Bytes {
-    // Simplified - just return selector for now
-    // Full implementation would encode params with self-address substitution
-    Bytes::copy_from_slice(selector)
+    match encode_once_call_params(*selector, params, Address::from(*address)) {
+        Ok(calldata) => calldata,
+        Err(e) => {
+            tracing::warn!("Failed to encode once call params: {}", e);
+            Bytes::copy_from_slice(selector)
+        }
+    }
 }
 
 /// Build calldata from event parameters.
 fn build_calldata_from_event(
     selector: &[u8; 4],
-    _params: &[ParamConfig],
-    _log: &LiveLog,
+    params: &[ParamConfig],
+    log: &LiveLog,
 ) -> Bytes {
-    // Simplified - just return selector for now
-    // Full implementation would extract params from log topics/data
-    Bytes::copy_from_slice(selector)
+    let trigger = EventTriggerData {
+        block_number: 0,
+        block_timestamp: 0,
+        log_index: log.log_index,
+        emitter_address: log.address,
+        source_name: String::new(),
+        event_signature: log.topics.first().copied().unwrap_or([0u8; 32]),
+        topics: log.topics.clone(),
+        data: log.data.clone(),
+    };
+
+    match build_event_call_params(&trigger, params) {
+        Ok((dyn_vals, _)) => encode_call_with_params(*selector, &dyn_vals),
+        Err(e) => {
+            tracing::warn!("Failed to build event call params: {}", e);
+            Bytes::copy_from_slice(selector)
+        }
+    }
 }
 
 impl std::fmt::Debug for LiveEthCallCollector {

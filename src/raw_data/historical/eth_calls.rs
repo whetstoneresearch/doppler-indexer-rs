@@ -524,7 +524,7 @@ pub(crate) fn extract_value_from_32_bytes(
 
 /// Build parameters for an event-triggered call
 /// Encode calldata for "once" calls that have self-address params
-pub(crate) fn encode_once_call_params(
+pub fn encode_once_call_params(
     function_selector: [u8; 4],
     param_configs: &[ParamConfig],
     self_address: Address,
@@ -573,7 +573,7 @@ pub(crate) fn encode_once_call_params(
     Ok(encode_call_with_params(function_selector, &params))
 }
 
-pub(crate) fn build_event_call_params(
+pub fn build_event_call_params(
     trigger: &EventTriggerData,
     param_configs: &[ParamConfig],
 ) -> Result<(Vec<DynSolValue>, Vec<Vec<u8>>), EthCallCollectionError> {
