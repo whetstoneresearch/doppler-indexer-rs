@@ -6,11 +6,12 @@ mod metrics;
 mod raw_data;
 mod rpc;
 mod decoding;
+mod storage;
 mod transformations;
 mod types;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -27,6 +28,7 @@ use raw_data::historical::receipts::{
 };
 use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker};
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
+use storage::StorageManager;
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
     RangeCompleteMessage, ReorgMessage, TransformationEngine,
@@ -90,6 +92,24 @@ async fn main() -> anyhow::Result<()> {
         metrics::describe_rpc_metrics();
     }
 
+    // Initialize storage manager
+    let storage_manager = StorageManager::new(
+        config.storage.as_ref(),
+        PathBuf::from("data"),
+    )
+    .await
+    .context("failed to initialize storage manager")?;
+
+    if storage_manager.is_s3_enabled() {
+        tracing::info!("S3 storage enabled, refreshing manifest...");
+        storage_manager
+            .refresh_manifest()
+            .await
+            .context("failed to refresh S3 manifest")?;
+    }
+
+    let storage_manager = Arc::new(storage_manager);
+
     if decode_only {
         tracing::info!(
             "Running in decode-only mode (no collection, no transformations)"
@@ -108,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         } else if decode_only {
             decode_only_chain(&config, chain).await?;
         } else {
-            process_chain(&config, chain).await?;
+            process_chain(&config, chain, storage_manager.clone()).await?;
         }
     }
 
@@ -361,6 +381,15 @@ async fn process_chain_live_only(
         });
     }
 
+    // Initialize storage manager for live-only mode
+    let storage_manager = StorageManager::new(
+        config.storage.as_ref(),
+        PathBuf::from("data"),
+    )
+    .await
+    .context("failed to initialize storage manager")?;
+    let storage_manager = Arc::new(storage_manager);
+
     // Spawn live mode directly (no historical processing)
     // Note: In live-only mode, transformation engine is not running, so no reorg channel
     spawn_live_mode(
@@ -372,6 +401,7 @@ async fn process_chain_live_only(
         eth_call_decoder_tx,
         None, // No transform_reorg_tx in live-only mode
         progress_tracker,
+        Some(storage_manager),
         &mut tasks,
     )
     .await?;
@@ -385,7 +415,11 @@ async fn process_chain_live_only(
     Ok(())
 }
 
-async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::Result<()> {
+async fn process_chain(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+    storage_manager: Arc<StorageManager>,
+) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
 
     let rpc_url = env::var(&chain.rpc_url_env_var).with_context(|| {
@@ -654,8 +688,9 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
+        let s3_manifest = storage_manager.manifest();
         async move {
-            collect_blocks(&chain, &blocks_client, &cfg, Some(block_tx), Some(eth_call_tx))
+            collect_blocks(&chain, &blocks_client, &cfg, Some(block_tx), Some(eth_call_tx), s3_manifest.as_ref())
                 .await
                 .context("block collection failed")
         }
@@ -914,6 +949,7 @@ async fn process_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::R
             eth_call_decoder_tx_for_live,
             transform_reorg_tx,
             progress_tracker,
+            Some(storage_manager.clone()),
             &mut live_tasks,
         )
         .await?;
@@ -990,6 +1026,7 @@ async fn spawn_live_mode(
     eth_call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    storage_manager: Option<Arc<StorageManager>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let ws_env_var = chain
@@ -1118,6 +1155,7 @@ async fn spawn_live_mode(
         live_config,
         db_pool,
         progress_tracker,
+        storage_manager,
     );
     tasks.spawn(async move {
         compaction.run(compaction_shutdown_rx).await;

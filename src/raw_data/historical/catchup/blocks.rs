@@ -12,6 +12,7 @@ use crate::raw_data::historical::blocks::{
     write_minimal_blocks_to_parquet, BlockCollectionError, FullBlockRecord, MinimalBlockRecord,
 };
 use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::S3Manifest;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{BlockField, RawDataCollectionConfig};
 
@@ -33,6 +34,7 @@ pub async fn collect_blocks(
     raw_data_config: &RawDataCollectionConfig,
     tx_sender: Option<Sender<(u64, u64, Vec<B256>)>>,
     eth_call_sender: Option<Sender<(u64, u64)>>,
+    s3_manifest: Option<&S3Manifest>,
 ) -> Result<(), BlockCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -49,7 +51,7 @@ pub async fn collect_blocks(
         start_block
     );
 
-    let ranges = compute_ranges_to_fetch(start_block, chain_head, range_size, &output_dir);
+    let ranges = compute_ranges_to_fetch(start_block, chain_head, range_size, &output_dir, s3_manifest);
 
     if ranges.is_empty() {
         tracing::info!(
@@ -276,6 +278,7 @@ fn compute_ranges_to_fetch(
     chain_head: u64,
     range_size: u64,
     output_dir: &Path,
+    s3_manifest: Option<&S3Manifest>,
 ) -> Vec<BlockRange> {
     let aligned_start = (start_block / range_size) * range_size;
 
@@ -294,7 +297,24 @@ fn compute_ranges_to_fetch(
 
     all_ranges
         .into_iter()
-        .filter(|range| !existing_files.contains(&range.file_name()))
+        .filter(|range| {
+            // Skip if file exists locally
+            if existing_files.contains(&range.file_name()) {
+                return false;
+            }
+            // Skip if range exists in S3 manifest
+            if let Some(manifest) = s3_manifest {
+                if manifest.has_raw_blocks(range.start, range.end - 1) {
+                    tracing::debug!(
+                        "Skipping blocks range {}-{}: exists in S3 manifest",
+                        range.start,
+                        range.end - 1
+                    );
+                    return false;
+                }
+            }
+            true
+        })
         .collect()
 }
 

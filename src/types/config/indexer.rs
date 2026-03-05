@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::types::config::chain::{ChainConfig, ChainConfigRaw, resolve_chain_config};
 use crate::types::config::metrics::MetricsConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::config::storage::StorageConfig;
 use crate::types::config::transformations::TransformationConfig;
 
 #[derive(Debug, Deserialize)]
@@ -15,6 +16,8 @@ pub struct IndexerConfigRaw {
     pub transformations: Option<TransformationConfig>,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
 }
 
 #[derive(Debug)]
@@ -23,6 +26,7 @@ pub struct IndexerConfig {
     pub raw_data_collection: RawDataCollectionConfig,
     pub transformations: Option<TransformationConfig>,
     pub metrics: Option<MetricsConfig>,
+    pub storage: Option<StorageConfig>,
 }
 
 impl IndexerConfig {
@@ -50,6 +54,7 @@ impl IndexerConfig {
                             raw_data_collection: raw_config.raw_data_collection,
                             transformations: raw_config.transformations,
                             metrics: raw_config.metrics,
+                            storage: raw_config.storage,
                         })
                     }
                     Err(e) => {
