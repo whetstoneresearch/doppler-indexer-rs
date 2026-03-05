@@ -231,13 +231,15 @@ impl LiveEthCallCollector {
                     Ok(bytes) => bytes.to_vec(),
                     Err(e) => {
                         tracing::warn!(
-                            "eth_call failed for {}.{} at block {}: {}",
+                            "eth_call failed for {}.{} at {} block {}: calldata=0x{}, error={}",
                             contract_name,
                             function_name,
+                            config.address,
                             block_number,
+                            hex::encode(&config.encoded_calldata),
                             e
                         );
-                        Vec::new()
+                        continue; // Skip reverted calls
                     }
                 };
 
@@ -342,15 +344,17 @@ impl LiveEthCallCollector {
                         let result_bytes = match result {
                             Ok(bytes) => bytes.to_vec(),
                             Err(e) => {
+                                let encoded = encode_call_simple(&call_config.function, &call_config.params);
                                 tracing::warn!(
-                                    "Factory eth_call failed for {}.{} at {} block {}: {}",
+                                    "Factory eth_call failed for {}.{} at {} block {}: calldata=0x{}, error={}",
                                     collection_name,
                                     function_name,
                                     address,
                                     block_number,
+                                    hex::encode(&encoded),
                                     e
                                 );
-                                Vec::new()
+                                continue; // Skip reverted calls
                             }
                         };
 
@@ -425,6 +429,8 @@ impl LiveEthCallCollector {
                 // Build calls for all once functions
                 let mut calls = Vec::new();
                 let mut function_names = Vec::new();
+                let mut calldatas = Vec::new();
+                let mut targets = Vec::new();
 
                 for config in once_configs {
                     let calldata = if let Some(ref preencoded) = config.preencoded_calldata {
@@ -434,18 +440,20 @@ impl LiveEthCallCollector {
                         encode_call_with_self_address(&config.function_selector, &config.params, address)
                     };
 
-                    let target = if let Some(ref targets) = config.target_addresses {
+                    let target = if let Some(ref target_addrs) = config.target_addresses {
                         // Use configured target address
-                        targets.first().copied().unwrap_or(Address::from(*address))
+                        target_addrs.first().copied().unwrap_or(Address::from(*address))
                     } else {
                         Address::from(*address)
                     };
 
                     let tx = TransactionRequest::default()
                         .to(target)
-                        .input(calldata.into());
+                        .input(calldata.clone().into());
                     calls.push((tx, block_id));
                     function_names.push(config.function_name.clone());
+                    calldatas.push(calldata);
+                    targets.push(target);
                 }
 
                 if calls.is_empty() {
@@ -462,14 +470,16 @@ impl LiveEthCallCollector {
                         Ok(bytes) => bytes.to_vec(),
                         Err(e) => {
                             tracing::warn!(
-                                "Once call failed for {}.{} at {} block {}: {}",
+                                "Once call failed for {}.{} at {} block {}: calldata=0x{}, target={}, error={}",
                                 collection_name,
                                 function_name,
                                 Address::from(*address),
                                 block_number,
+                                hex::encode(&calldatas[i]),
+                                targets[i],
                                 e
                             );
-                            Vec::new()
+                            continue; // Skip reverted calls
                         }
                     };
 
@@ -614,19 +624,21 @@ impl LiveEthCallCollector {
                 let rpc_results = self.http_client.call_batch(chunk).await?;
 
                 for (i, result) in rpc_results.into_iter().enumerate() {
-                    let (target_address, log_index, _, _) = &pending_calls[chunk_start + i];
+                    let (target_address, log_index, calldata, _) = &pending_calls[chunk_start + i];
                     let result_bytes = match result {
                         Ok(bytes) => bytes.to_vec(),
                         Err(e) => {
                             tracing::warn!(
-                                "Event-triggered call failed for {}.{} at {} block {}: {}",
+                                "Event-triggered call failed for {}.{} at {} block {}: calldata=0x{}, log_index={}, error={}",
                                 contract_name,
                                 function_name,
                                 target_address,
                                 block_number,
+                                hex::encode(calldata),
+                                log_index,
                                 e
                             );
-                            Vec::new()
+                            continue; // Skip reverted calls
                         }
                     };
 

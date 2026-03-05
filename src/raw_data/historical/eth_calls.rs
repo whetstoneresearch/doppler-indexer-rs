@@ -821,15 +821,7 @@ pub(crate) async fn process_event_triggers(
                                     params_hex,
                                     e
                                 );
-                                // Store empty result to maintain consistency
-                                chunk_results.push(EventCallResult {
-                                    block_number: trigger.block_number,
-                                    block_timestamp: trigger.block_timestamp,
-                                    log_index: trigger.log_index,
-                                    target_address: target_address.0.0,
-                                    value_bytes: Vec::new(),
-                                    param_values: encoded_params.clone(),
-                                });
+                                // Skip reverted calls - don't store empty results
                             }
                         }
                     }
@@ -1919,13 +1911,7 @@ pub(crate) async fn process_factory_range(
                                 params_hex,
                                 e
                             );
-                            all_results.push(CallResult {
-                                block_number: block.block_number,
-                                block_timestamp: block.timestamp,
-                                contract_address: config.address.0.0,
-                                value_bytes: Vec::new(),
-                                param_values: config.param_values.clone(),
-                            });
+                            // Skip reverted calls - don't store empty results
                         }
                     }
                 }
@@ -2918,7 +2904,7 @@ pub(crate) async fn process_once_calls_regular(
                         calldata,
                         e
                     );
-                    function_results.insert(function_name.clone(), Vec::new());
+                    // Skip reverted calls - don't insert empty results
                 }
             }
         }
@@ -4374,13 +4360,7 @@ pub(crate) async fn process_range(
                             params_hex,
                             e
                         );
-                        all_results.push(CallResult {
-                            block_number: block.block_number,
-                            block_timestamp: block.timestamp,
-                            contract_address: config.address.0 .0,
-                            value_bytes: Vec::new(),
-                            param_values: config.param_values.clone(),
-                        });
+                        // Skip reverted calls - don't store empty results
                     }
                 }
             }
@@ -5231,17 +5211,16 @@ pub(crate) async fn process_token_range_multicall(
                         Ok(decoded) => {
                             for (j, (success, return_data)) in decoded.into_iter().enumerate() {
                                 let slot = &pm.slots[j];
-                                let value_bytes = if success {
-                                    return_data
-                                } else {
-                                    Vec::new()
-                                };
+                                // Skip failed sub-calls - don't store empty results
+                                if !success {
+                                    continue;
+                                }
                                 if let Some(results) = group_results.get_mut(&slot.group_key) {
                                     results.push(CallResult {
                                         block_number: slot.block.block_number,
                                         block_timestamp: slot.block.timestamp,
                                         contract_address: slot.config.target_address.0 .0,
-                                        value_bytes,
+                                        value_bytes: return_data,
                                         param_values: Vec::new(),
                                     });
                                 }
@@ -5253,18 +5232,7 @@ pub(crate) async fn process_token_range_multicall(
                                 pm.block_number,
                                 e
                             );
-                            // Treat all sub-calls as failed
-                            for slot in &pm.slots {
-                                if let Some(results) = group_results.get_mut(&slot.group_key) {
-                                    results.push(CallResult {
-                                        block_number: slot.block.block_number,
-                                        block_timestamp: slot.block.timestamp,
-                                        contract_address: slot.config.target_address.0 .0,
-                                        value_bytes: Vec::new(),
-                                        param_values: Vec::new(),
-                                    });
-                                }
-                            }
+                            // Skip all sub-calls - don't store empty results
                         }
                     }
                 }
@@ -5274,18 +5242,7 @@ pub(crate) async fn process_token_range_multicall(
                         pm.block_number,
                         e
                     );
-                    // Treat all sub-calls as failed
-                    for slot in &pm.slots {
-                        if let Some(results) = group_results.get_mut(&slot.group_key) {
-                            results.push(CallResult {
-                                block_number: slot.block.block_number,
-                                block_timestamp: slot.block.timestamp,
-                                contract_address: slot.config.target_address.0 .0,
-                                value_bytes: Vec::new(),
-                                param_values: Vec::new(),
-                            });
-                        }
-                    }
+                    // Skip all sub-calls - don't store empty results
                 }
             }
         }
@@ -5458,13 +5415,7 @@ pub(crate) async fn process_token_range(
                             block.block_number,
                             e
                         );
-                        all_results.push(CallResult {
-                            block_number: block.block_number,
-                            block_timestamp: block.timestamp,
-                            contract_address: config.target_address.0 .0,
-                            value_bytes: Vec::new(),
-                            param_values: Vec::new(),
-                        });
+                        // Skip reverted calls - don't store empty results
                     }
                 }
             }

@@ -114,8 +114,11 @@ pub async fn decode_eth_calls_live(
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        "Failed to decode eth_call {}/{} at block {}: {}",
-                                        contract_name, function_name, result.block_number, e
+                                        "Failed to decode eth_call {}/{} at block {}: address={}, raw_bytes=0x{}, error={}",
+                                        contract_name, function_name, result.block_number,
+                                        alloy::primitives::Address::from(result.contract_address),
+                                        hex::encode(&result.value),
+                                        e
                                     );
                                 }
                             }
@@ -221,8 +224,11 @@ pub async fn decode_eth_calls_live(
                                         }
                                         Err(e) => {
                                             tracing::warn!(
-                                                "Failed to decode once_call {}/{} at block {}: {}",
-                                                contract_name, config.function_name, result.block_number, e
+                                                "Failed to decode once_call {}/{} at block {}: address={}, raw_bytes=0x{}, error={}",
+                                                contract_name, config.function_name, result.block_number,
+                                                alloy::primitives::Address::from(result.contract_address),
+                                                hex::encode(raw_value),
+                                                e
                                             );
                                         }
                                     }
@@ -334,8 +340,12 @@ pub async fn decode_eth_calls_live(
                                 }
                                 Err(e) => {
                                     tracing::warn!(
-                                        "Failed to decode event_call {}/{} at block {}: {}",
-                                        contract_name, function_name, result.block_number, e
+                                        "Failed to decode event_call {}/{} at block {}: address={}, log_index={}, raw_bytes=0x{}, error={}",
+                                        contract_name, function_name, result.block_number,
+                                        alloy::primitives::Address::from(result.target_address),
+                                        result.log_index,
+                                        hex::encode(&result.value),
+                                        e
                                     );
                                 }
                             }

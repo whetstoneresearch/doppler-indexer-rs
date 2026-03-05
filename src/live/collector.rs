@@ -516,9 +516,12 @@ impl LiveCollector {
 
     /// Fetch full block data via HTTP.
     async fn fetch_full_block(&self, block_number: u64) -> Result<LiveBlock, CollectorError> {
+        // Use full_transactions=false to only fetch tx hashes, not full transaction objects.
+        // This avoids deserialization errors for L2-specific transaction types (e.g., OP deposit
+        // transactions with type 0x7e) that alloy's default types don't support.
         let block = self
             .http_client
-            .get_block_by_number(BlockNumberOrTag::Number(block_number), true)
+            .get_block_by_number(BlockNumberOrTag::Number(block_number), false)
             .await?
             .ok_or(CollectorError::BlockNotFound(block_number))?;
 
