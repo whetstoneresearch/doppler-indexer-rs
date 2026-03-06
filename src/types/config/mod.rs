@@ -7,6 +7,7 @@ pub mod indexer;
 pub mod loader;
 pub mod metrics;
 pub mod raw_data;
+pub mod storage;
 pub mod tokens;
 pub mod transformations;
 

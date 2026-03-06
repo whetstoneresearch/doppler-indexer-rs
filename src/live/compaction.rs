@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, Int64Builder, ListBuilder, StringBuilder,
+    ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder,
     UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
@@ -28,6 +28,7 @@ use super::progress::LiveProgressTracker;
 use super::storage::{LiveStorage, StorageError};
 use super::types::LiveModeConfig;
 use crate::db::DbPool;
+use crate::storage::{StorageBackend, StorageManager};
 
 #[derive(Debug, Error)]
 pub enum CompactionError {
@@ -41,6 +42,8 @@ pub enum CompactionError {
     Io(#[from] std::io::Error),
     #[error("Database error: {0}")]
     Database(String),
+    #[error("S3 storage error: {0}")]
+    S3Storage(#[from] crate::storage::StorageError),
 }
 
 /// A range of blocks that can be compacted.
@@ -59,6 +62,8 @@ pub struct CompactionService {
     config: LiveModeConfig,
     db_pool: Option<Arc<DbPool>>,
     progress_tracker: Arc<Mutex<LiveProgressTracker>>,
+    /// Optional S3 storage manager for uploading compacted parquet files
+    storage_manager: Option<Arc<StorageManager>>,
 }
 
 impl CompactionService {
@@ -69,6 +74,7 @@ impl CompactionService {
         config: LiveModeConfig,
         db_pool: Option<Arc<DbPool>>,
         progress_tracker: Arc<Mutex<LiveProgressTracker>>,
+        storage_manager: Option<Arc<StorageManager>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain_name);
 
@@ -79,6 +85,7 @@ impl CompactionService {
             config,
             db_pool,
             progress_tracker,
+            storage_manager,
         }
     }
 
@@ -257,6 +264,7 @@ impl CompactionService {
         // Write blocks parquet
         let blocks_path = self.blocks_parquet_path(range.start, range.end);
         self.write_blocks_parquet(&blocks, &blocks_path)?;
+        self.upload_to_s3(&blocks_path, "raw/blocks", range.start, range.end).await?;
 
         // Read and write logs parquet
         let mut all_logs = Vec::new();
@@ -272,6 +280,7 @@ impl CompactionService {
         if !all_logs.is_empty() {
             let logs_path = self.logs_parquet_path(range.start, range.end);
             self.write_logs_parquet(&all_logs, &logs_path)?;
+            self.upload_to_s3(&logs_path, "raw/logs", range.start, range.end).await?;
         }
 
         // Read and write factory addresses parquet
@@ -293,6 +302,12 @@ impl CompactionService {
                 let factory_path =
                     self.factories_parquet_path(range.start, range.end, collection_name);
                 self.write_factories_parquet(records, &factory_path)?;
+                self.upload_to_s3(
+                    &factory_path,
+                    &format!("factories/{}", collection_name),
+                    range.start,
+                    range.end,
+                ).await?;
             }
             tracing::info!(
                 "Wrote factory addresses for {} collections in range {}-{}",
@@ -313,6 +328,7 @@ impl CompactionService {
         if !all_eth_calls.is_empty() {
             let eth_calls_path = self.eth_calls_parquet_path(range.start, range.end);
             self.write_eth_calls_parquet(&all_eth_calls, &eth_calls_path)?;
+            self.upload_to_s3(&eth_calls_path, "raw/eth_calls", range.start, range.end).await?;
             tracing::info!(
                 "Wrote {} eth_calls to {} in range {}-{}",
                 all_eth_calls.len(),
@@ -742,6 +758,67 @@ impl CompactionService {
         }
 
         Ok(all_types.into_iter().collect())
+    }
+
+    /// Upload a local file to S3 and write a marker.
+    ///
+    /// If S3 is not configured, this is a no-op.
+    async fn upload_to_s3(
+        &self,
+        local_path: &PathBuf,
+        data_type: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(), CompactionError> {
+        let Some(ref storage_manager) = self.storage_manager else {
+            return Ok(()); // S3 not configured
+        };
+
+        if !storage_manager.is_s3_enabled() {
+            return Ok(());
+        }
+
+        // Read local file
+        let data = tokio::fs::read(local_path).await?;
+
+        // Compute S3 key from local path (strip "data/" prefix)
+        let data_dir = PathBuf::from("data");
+        let s3_key = match local_path.strip_prefix(&data_dir) {
+            Ok(relative) => relative.to_string_lossy().to_string(),
+            Err(_) => {
+                // Fallback for paths not under data/ - use filename
+                local_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| local_path.to_string_lossy().to_string())
+            }
+        };
+
+        // Upload to S3
+        storage_manager.backend().write(&s3_key, &data).await?;
+
+        // Write marker
+        if let Some(manifest_manager) = storage_manager.manifest_manager() {
+            manifest_manager
+                .write_marker(
+                    &self.chain_name,
+                    data_type,
+                    start,
+                    end,
+                    &s3_key,
+                    "compaction",
+                )
+                .await?;
+        }
+
+        tracing::debug!(
+            "Uploaded {} to S3 and wrote marker for range {}-{}",
+            s3_key,
+            start,
+            end
+        );
+
+        Ok(())
     }
 }
 
