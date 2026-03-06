@@ -184,9 +184,16 @@ impl LiveCollector {
                     parent_hash,
                     timestamp,
                 } => {
+                    tracing::debug!(
+                        "WebSocket: new block {} (hash={:.8}..)",
+                        number,
+                        hex::encode(&hash.0[..4])
+                    );
+
                     // Check for gap on first block
                     if !first_block_seen {
                         first_block_seen = true;
+                        tracing::info!("First live block received: {}", number);
                         if let Some(expected) = expected_start_block {
                             if number > expected + 1 {
                                 tracing::warn!(
@@ -304,11 +311,23 @@ impl LiveCollector {
         status.block_fetched = true;
         self.storage.write_status(block_number, &status)?;
 
+        tracing::info!(
+            "Block {} collected: {} txs",
+            block_number,
+            updated_block.tx_hashes.len()
+        );
+
         // Fetch receipts and logs
         let (receipts, logs) = self.fetch_receipts_and_logs(block_number).await?;
 
         self.storage.write_receipts(block_number, &receipts)?;
         self.storage.write_logs(block_number, &logs)?;
+
+        tracing::info!(
+            "Block {} receipts collected: {} logs",
+            block_number,
+            logs.len()
+        );
 
         // Extract factory addresses if we have matchers configured
         let factory_addresses = self.extract_factory_addresses(&logs, updated_block.timestamp);
@@ -427,8 +446,10 @@ impl LiveCollector {
                     let count = calls.len();
                     if !calls.is_empty() {
                         self.storage.write_eth_calls(block_number, &calls)?;
-                    }
-                    count
+                        tracing::info!(
+                            "Block {} eth_calls collected: {}",
+                            block_number,
+                            count
                         );
                     }
 
@@ -443,7 +464,6 @@ impl LiveCollector {
                         block_number,
                         e
                     );
-                    0
                 }
             }
         } else {

@@ -1191,15 +1191,6 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    tracing::info!(
-                        "Processing {} events for {}/{} in range {}-{}",
-                        msg.events.len(),
-                        msg.source_name,
-                        msg.event_name,
-                        msg.range_start,
-                        msg.range_end
-                    );
-
                     // Process events, handling call dependencies
                     self.process_events_message(msg).await?;
                 }
@@ -1208,15 +1199,6 @@ impl TransformationEngine {
                     if msg.calls.is_empty() {
                         continue;
                     }
-
-                    tracing::info!(
-                        "Processing {} calls for {}/{} in range {}-{}",
-                        msg.calls.len(),
-                        msg.source_name,
-                        msg.function_name,
-                        msg.range_start,
-                        msg.range_end
-                    );
 
                     // Process calls and check if any pending events can now be processed
                     self.process_calls_message(msg).await?;
@@ -1256,10 +1238,6 @@ impl TransformationEngine {
         &self,
         msg: DecodedEventsMessage,
     ) -> Result<(), TransformationError> {
-        tracing::info!(
-            "process_events_message: source={}, event={}, range=({}, {}), {} events",
-            msg.source_name, msg.event_name, msg.range_start, msg.range_end, msg.events.len()
-        );
         let handlers = self.registry.handlers_for_event(&msg.source_name, &msg.event_name);
         if handlers.is_empty() {
             tracing::debug!(
@@ -1267,10 +1245,9 @@ impl TransformationEngine {
                 msg.source_name, msg.event_name
             );
         } else {
-            let handler_names: Vec<_> = handlers.iter().map(|h| h.handler_key()).collect();
-            tracing::info!(
-                "Found {} handlers for {}/{}: {:?}",
-                handlers.len(), msg.source_name, msg.event_name, handler_names
+            tracing::debug!(
+                "Processing {} events for {}/{} block {} with {} handlers",
+                msg.events.len(), msg.source_name, msg.event_name, msg.range_start, handlers.len()
             );
         }
 
@@ -1310,15 +1287,15 @@ impl TransformationEngine {
                                 start_block.map_or(true, |sb| c.block_number >= sb)
                             })
                             .collect();
-                        tracing::info!(
-                            "Handler {} deps ready for range {:?}, {} calls in buffer",
-                            handler_key, range_key, calls.len()
+                        tracing::debug!(
+                            "Handler {} deps ready for block {}, {} calls",
+                            handler_key, msg.range_start, calls.len()
                         );
                         ready_handlers.push((handler.clone(), Arc::new(calls)));
                     } else {
-                        tracing::info!(
-                            "Handler {} BUFFERING events for range {}-{}: waiting for call dependencies {:?}",
-                            handler_key, msg.range_start, msg.range_end, call_deps
+                        tracing::warn!(
+                            "Handler {} buffering block {}: waiting for eth_call deps {:?}",
+                            handler_key, msg.range_start, call_deps
                         );
                         let pending = PendingEventData {
                             range_start: msg.range_start,
@@ -1440,9 +1417,9 @@ impl TransformationEngine {
         let range_key = (msg.range_start, msg.range_end);
         let call_key = (msg.source_name.clone(), msg.function_name.clone());
 
-        tracing::info!(
-            "Registering call key {:?} for range {:?} ({} calls)",
-            call_key, range_key, msg.calls.len()
+        tracing::debug!(
+            "Received {} eth_calls for {}/{} block {}",
+            msg.calls.len(), msg.source_name, msg.function_name, msg.range_start
         );
 
         // Mark this call type as received for this range and buffer the calls
@@ -1456,13 +1433,6 @@ impl TransformationEngine {
                 .entry(range_key)
                 .or_default()
                 .extend(msg.calls.clone());
-
-            // Log current state
-            let pending_handlers: Vec<_> = state.pending_events.keys().cloned().collect();
-            tracing::info!(
-                "After registering {:?}: {} pending handlers with buffered events: {:?}",
-                call_key, pending_handlers.len(), pending_handlers
-            );
         }
 
         // Process call handlers (existing behavior) - filter calls by start_block
@@ -1485,26 +1455,12 @@ impl TransformationEngine {
         &self,
         range_key: (u64, u64),
     ) -> Result<(), TransformationError> {
-        tracing::info!("try_process_pending_events for range {:?}", range_key);
-
         // Collect ready events under lock, then process outside lock
         let ready_events: Vec<(String, PendingEventData, Arc<dyn EventHandler>)> = {
             let mut state = self.live_state.lock().await;
             let mut ready = Vec::new();
 
-            // Log current received calls state
-            let received_keys: Vec<_> = state.received_calls.keys().cloned().collect();
-            tracing::info!(
-                "  Current received_calls keys: {:?}",
-                received_keys
-            );
-
-            // Check each handler's pending events
             let handler_keys: Vec<_> = state.pending_events.keys().cloned().collect();
-            tracing::info!(
-                "  Handlers with pending events: {:?}",
-                handler_keys
-            );
 
             for handler_key in handler_keys {
                 // First pass: identify ready indices without holding mutable borrow
@@ -1531,6 +1487,10 @@ impl TransformationEngine {
 
                 // Second pass: extract ready events
                 if !ready_indices.is_empty() {
+                    tracing::info!(
+                        "Handler {} unblocked for block {}: call deps now available",
+                        handler_key, range_key.0
+                    );
                     let pending = state.pending_events.get_mut(&handler_key).unwrap();
                     // Extract in reverse order to preserve indices
                     for i in ready_indices.into_iter().rev() {

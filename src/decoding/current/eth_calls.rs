@@ -157,6 +157,8 @@ pub async fn decode_eth_calls_live(
                             status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
                                 tracing::warn!("Failed to update block status after eth_call decoding: {}", e);
+                            } else {
+                                tracing::debug!("Block {} eth_calls decoded", range_start);
                             }
                         }
                     } else {
