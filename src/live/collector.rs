@@ -444,6 +444,9 @@ impl LiveCollector {
             {
                 Ok(calls) => {
                     let count = calls.len();
+                    let mut status = self.storage.read_status(block_number)?;
+                    status.eth_calls_collected = true;
+
                     if !calls.is_empty() {
                         self.storage.write_eth_calls(block_number, &calls)?;
                         tracing::info!(
@@ -451,11 +454,11 @@ impl LiveCollector {
                             block_number,
                             count
                         );
+                    } else {
+                        // No calls to decode for this block - mark as decoded
+                        status.eth_calls_decoded = true;
                     }
 
-                    // Mark eth_calls as collected
-                    let mut status = self.storage.read_status(block_number)?;
-                    status.eth_calls_collected = true;
                     self.storage.write_status(block_number, &status)?;
                 }
                 Err(e) => {

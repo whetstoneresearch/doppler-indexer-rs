@@ -173,15 +173,18 @@ impl LiveCatchupService {
             status.logs_decoded = true;
         }
 
-        // For eth_calls: if we collected them, check if decoded data exists
-        if eth_calls_exist {
-            status.eth_calls_collected = true;
-            if decoded_calls_exist {
-                status.eth_calls_decoded = true;
-            }
+        // Check if raw eth_calls are empty (no calls to decode)
+        let eth_calls_empty = if eth_calls_exist {
+            self.storage.read_eth_calls(block_number).map(|c| c.is_empty()).unwrap_or(false)
         } else {
-            // No eth_calls collected means no eth_calls configured
-            status.eth_calls_collected = true;
+            true
+        };
+
+        // For eth_calls: mark as collected/decoded appropriately
+        // If decoded data exists, mark as decoded
+        // If no eth_calls or eth_calls are empty, no decoding needed
+        status.eth_calls_collected = eth_calls_exist;
+        if decoded_calls_exist || !eth_calls_exist || eth_calls_empty {
             status.eth_calls_decoded = true;
         }
 
