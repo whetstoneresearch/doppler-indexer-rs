@@ -28,7 +28,7 @@ use super::progress::LiveProgressTracker;
 use super::storage::{LiveStorage, StorageError};
 use super::types::LiveModeConfig;
 use crate::db::DbPool;
-use crate::storage::{StorageBackend, StorageManager, ManifestManager};
+use crate::storage::{StorageBackend, StorageManager};
 
 #[derive(Debug, Error)]
 pub enum CompactionError {
@@ -782,10 +782,17 @@ impl CompactionService {
         let data = tokio::fs::read(local_path).await?;
 
         // Compute S3 key from local path (strip "data/" prefix)
-        let s3_key = local_path
-            .to_string_lossy()
-            .trim_start_matches("data/")
-            .to_string();
+        let data_dir = PathBuf::from("data");
+        let s3_key = match local_path.strip_prefix(&data_dir) {
+            Ok(relative) => relative.to_string_lossy().to_string(),
+            Err(_) => {
+                // Fallback for paths not under data/ - use filename
+                local_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| local_path.to_string_lossy().to_string())
+            }
+        };
 
         // Upload to S3
         storage_manager.backend().write(&s3_key, &data).await?;

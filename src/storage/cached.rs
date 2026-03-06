@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::local::LocalBackend;
@@ -25,6 +25,22 @@ struct CacheEntry {
     pinned: bool,
 }
 
+/// Persisted cache entry for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCacheEntry {
+    size: u64,
+    last_access_secs: u64,
+    pinned: bool,
+}
+
+/// Persisted cache index for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCacheIndex {
+    entries: HashMap<String, PersistedCacheEntry>,
+    total_size: u64,
+    saved_at: u64,
+}
+
 /// Cached storage backend combining local filesystem and S3.
 ///
 /// Write-through: All writes go to both local and S3 (synchronously).
@@ -35,6 +51,8 @@ pub struct CachedBackend {
     s3: S3Backend,
     config: CacheConfig,
     local_base: PathBuf,
+    /// Path to cache index file
+    index_path: PathBuf,
     /// Cache index tracking entries
     entries: RwLock<HashMap<String, CacheEntry>>,
     /// Total cache size in bytes
@@ -49,11 +67,13 @@ impl CachedBackend {
         config: CacheConfig,
         local_base: PathBuf,
     ) -> Self {
+        let index_path = local_base.join(".cache_index.json");
         Self {
             local,
             s3,
             config,
             local_base,
+            index_path,
             entries: RwLock::new(HashMap::new()),
             total_size: AtomicU64::new(0),
         }
@@ -110,9 +130,9 @@ impl CachedBackend {
 
     /// Get the cache size threshold in bytes.
     fn eviction_threshold_bytes(&self) -> u64 {
-        (self.config.max_size_gb * 1024 * 1024 * 1024) as u64
-            * (self.config.eviction_threshold * 100.0) as u64
-            / 100
+        let size_bytes = self.config.max_size_gb.saturating_mul(1024 * 1024 * 1024);
+        let threshold_pct = (self.config.eviction_threshold * 100.0) as u64;
+        size_bytes.saturating_mul(threshold_pct) / 100
     }
 
     /// Evict entries if cache exceeds threshold.
@@ -163,6 +183,9 @@ impl CachedBackend {
             tracing::debug!("Evicted {} ({} bytes)", key, entry.size);
         }
 
+        // Persist the updated index
+        let _ = self.save_index().await;
+
         Ok(())
     }
 
@@ -205,6 +228,94 @@ impl CachedBackend {
             "Rebuilt cache index: {} entries, {} GB",
             entries.len(),
             total_size as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+
+        Ok(())
+    }
+
+    /// Save the cache index to disk.
+    pub async fn save_index(&self) -> Result<(), StorageError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let entries = self.entries.read().await;
+        let persisted_entries: HashMap<String, PersistedCacheEntry> = entries
+            .iter()
+            .map(|(k, v)| {
+                // Convert Instant to approximate unix timestamp
+                let elapsed = v.last_access.elapsed().as_secs();
+                let last_access_secs = now.saturating_sub(elapsed);
+                (
+                    k.clone(),
+                    PersistedCacheEntry {
+                        size: v.size,
+                        last_access_secs,
+                        pinned: v.pinned,
+                    },
+                )
+            })
+            .collect();
+
+        let index = PersistedCacheIndex {
+            entries: persisted_entries,
+            total_size: self.total_size.load(Ordering::Relaxed),
+            saved_at: now,
+        };
+
+        let data = serde_json::to_vec_pretty(&index)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        // Atomic write using tmp + rename
+        let tmp_path = self.index_path.with_extension("tmp");
+        tokio::fs::write(&tmp_path, &data).await?;
+        tokio::fs::rename(&tmp_path, &self.index_path).await?;
+
+        tracing::debug!("Saved cache index with {} entries", entries.len());
+        Ok(())
+    }
+
+    /// Load the cache index from disk.
+    pub async fn load_index(&self) -> Result<(), StorageError> {
+        let data = match tokio::fs::read(&self.index_path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+
+        let index: PersistedCacheIndex = serde_json::from_slice(&data)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut entries = self.entries.write().await;
+        entries.clear();
+
+        for (key, persisted) in index.entries {
+            // Convert unix timestamp back to Instant (approximate)
+            let age_secs = now.saturating_sub(persisted.last_access_secs);
+            let last_access = Instant::now() - std::time::Duration::from_secs(age_secs);
+
+            entries.insert(
+                key,
+                CacheEntry {
+                    size: persisted.size,
+                    last_access,
+                    pinned: persisted.pinned,
+                },
+            );
+        }
+
+        self.total_size.store(index.total_size, Ordering::Relaxed);
+
+        tracing::info!(
+            "Loaded cache index: {} entries, {} GB",
+            entries.len(),
+            index.total_size as f64 / (1024.0 * 1024.0 * 1024.0)
         );
 
         Ok(())
@@ -285,6 +396,7 @@ impl StorageBackend for CachedBackend {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use std::sync::Arc;
 
     fn create_test_backend(temp_dir: &std::path::Path) -> CachedBackend {
         let local = LocalBackend::new(temp_dir.to_path_buf());

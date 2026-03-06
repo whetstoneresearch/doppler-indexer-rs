@@ -39,8 +39,7 @@ mod s3;
 pub use cached::CachedBackend;
 pub use error::StorageError;
 pub use local::LocalBackend;
-pub use manifest::{Marker, S3Manifest, ManifestManager};
-pub use retry::RetryQueue;
+pub use manifest::{S3Manifest, ManifestManager};
 pub use s3::S3Backend;
 
 use std::path::PathBuf;

@@ -221,6 +221,21 @@ impl ManifestManager {
         }
     }
 
+    /// Get access to the underlying S3 backend.
+    pub fn s3_backend(&self) -> &S3Backend {
+        &self.s3
+    }
+
+    /// Get the sync configuration.
+    pub fn config(&self) -> &SyncConfig {
+        &self.config
+    }
+
+    /// Get the local base path.
+    pub fn local_base(&self) -> &PathBuf {
+        &self.local_base
+    }
+
     /// Get the marker key for a data file.
     ///
     /// Example: "ethereum/historical/raw/blocks/blocks_0-999.parquet"
@@ -282,11 +297,31 @@ impl ManifestManager {
     }
 
     /// Refresh the manifest from S3.
+    ///
+    /// Accepts an optional chain name. If provided, refreshes only that chain.
+    /// If None, this is a no-op (caller should use `refresh_for_chain` directly).
     pub async fn refresh(&self) -> Result<(), StorageError> {
-        // This is a placeholder - in production, we'd aggregate markers or fetch manifest
-        // For now, just update the timestamp
+        // Without knowing which chain to refresh, we can only update the timestamp.
+        // Callers should use refresh_for_chain() with a specific chain name.
         let mut last = self.last_refresh.write().unwrap();
         *last = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Refresh manifest for a chain by listing and aggregating markers.
+    pub async fn refresh_from_markers(&self, chain: &str) -> Result<(), StorageError> {
+        let manifest = self.aggregate_markers(chain).await?;
+
+        // Update cache
+        let mut cached = self.cached.write().unwrap();
+        *cached = Some(manifest.clone());
+
+        let mut last = self.last_refresh.write().unwrap();
+        *last = Some(Instant::now());
+
+        // Save to S3 for other services
+        self.save_manifest(chain, &manifest).await?;
+
         Ok(())
     }
 

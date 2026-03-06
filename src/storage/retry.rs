@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -101,11 +101,12 @@ impl RetryQueue {
 
     /// Load the queue from disk.
     pub async fn load(&self) -> Result<(), StorageError> {
-        if !self.persistence_path.exists() {
-            return Ok(());
-        }
+        let data = match tokio::fs::read(&self.persistence_path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
 
-        let data = tokio::fs::read(&self.persistence_path).await?;
         let items: Vec<PendingUpload> = serde_json::from_slice(&data)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
