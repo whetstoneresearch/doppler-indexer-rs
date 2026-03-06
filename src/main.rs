@@ -28,7 +28,7 @@ use raw_data::historical::receipts::{
 };
 use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker};
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
-use storage::StorageManager;
+use storage::{RetryQueue, StorageManager};
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
     RangeCompleteMessage, ReorgMessage, TransformationEngine,
@@ -109,6 +109,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let storage_manager = Arc::new(storage_manager);
+
+    // Start retry queue service if S3 is enabled
+    if storage_manager.is_s3_enabled() {
+        if let Some(manifest_manager) = storage_manager.manifest_manager() {
+            let retry_queue = Arc::new(RetryQueue::new(
+                storage_manager.local_base().clone(),
+                manifest_manager.config().clone(),
+                manifest_manager.s3_backend().clone(),
+            ));
+
+            if let Err(e) = retry_queue.load().await {
+                tracing::warn!("Failed to load retry queue: {}", e);
+            }
+
+            // Spawn background task (no shutdown coordination needed -
+            // process exit will terminate it, and it saves on each cycle)
+            let retry_queue_handle = retry_queue.clone();
+            tokio::spawn(async move {
+                // Create a never-completing receiver for infinite run
+                let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                retry_queue_handle.run(rx).await;
+            });
+
+            tracing::info!("Retry queue service started");
+        }
+    }
 
     if decode_only {
         tracing::info!(
