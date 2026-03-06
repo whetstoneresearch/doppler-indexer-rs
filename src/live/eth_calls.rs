@@ -18,10 +18,12 @@ use super::storage::LiveStorage;
 use super::types::{LiveEthCall, LiveFactoryAddresses, LiveLog};
 use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
 use crate::raw_data::historical::eth_calls::{
-    build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
-    build_once_call_configs, CallConfig, EventCallKey, EventTriggeredCallConfig, FrequencyState,
-    OnceCallConfig,
+    build_call_configs, build_event_call_params, build_event_triggered_call_configs,
+    build_factory_once_call_configs, build_once_call_configs, encode_once_call_params, CallConfig,
+    EventCallKey, EventTriggeredCallConfig, FrequencyState, OnceCallConfig,
 };
+use crate::raw_data::historical::receipts::EventTriggerData;
+use crate::types::config::eth_call::encode_call_with_params;
 use crate::raw_data::historical::factories::get_factory_call_configs;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
@@ -231,13 +233,15 @@ impl LiveEthCallCollector {
                     Ok(bytes) => bytes.to_vec(),
                     Err(e) => {
                         tracing::warn!(
-                            "eth_call failed for {}.{} at block {}: {}",
+                            "eth_call failed for {}.{} at {} block {}: calldata=0x{}, error={}",
                             contract_name,
                             function_name,
+                            config.address,
                             block_number,
+                            hex::encode(&config.encoded_calldata),
                             e
                         );
-                        Vec::new()
+                        continue; // Skip reverted calls
                     }
                 };
 
@@ -342,15 +346,17 @@ impl LiveEthCallCollector {
                         let result_bytes = match result {
                             Ok(bytes) => bytes.to_vec(),
                             Err(e) => {
+                                let encoded = encode_call_simple(&call_config.function, &call_config.params);
                                 tracing::warn!(
-                                    "Factory eth_call failed for {}.{} at {} block {}: {}",
+                                    "Factory eth_call failed for {}.{} at {} block {}: calldata=0x{}, error={}",
                                     collection_name,
                                     function_name,
                                     address,
                                     block_number,
+                                    hex::encode(&encoded),
                                     e
                                 );
-                                Vec::new()
+                                continue; // Skip reverted calls
                             }
                         };
 
@@ -425,6 +431,8 @@ impl LiveEthCallCollector {
                 // Build calls for all once functions
                 let mut calls = Vec::new();
                 let mut function_names = Vec::new();
+                let mut calldatas = Vec::new();
+                let mut targets = Vec::new();
 
                 for config in once_configs {
                     let calldata = if let Some(ref preencoded) = config.preencoded_calldata {
@@ -434,18 +442,20 @@ impl LiveEthCallCollector {
                         encode_call_with_self_address(&config.function_selector, &config.params, address)
                     };
 
-                    let target = if let Some(ref targets) = config.target_addresses {
+                    let target = if let Some(ref target_addrs) = config.target_addresses {
                         // Use configured target address
-                        targets.first().copied().unwrap_or(Address::from(*address))
+                        target_addrs.first().copied().unwrap_or(Address::from(*address))
                     } else {
                         Address::from(*address)
                     };
 
                     let tx = TransactionRequest::default()
                         .to(target)
-                        .input(calldata.into());
+                        .input(calldata.clone().into());
                     calls.push((tx, block_id));
                     function_names.push(config.function_name.clone());
+                    calldatas.push(calldata);
+                    targets.push(target);
                 }
 
                 if calls.is_empty() {
@@ -462,14 +472,16 @@ impl LiveEthCallCollector {
                         Ok(bytes) => bytes.to_vec(),
                         Err(e) => {
                             tracing::warn!(
-                                "Once call failed for {}.{} at {} block {}: {}",
+                                "Once call failed for {}.{} at {} block {}: calldata=0x{}, target={}, error={}",
                                 collection_name,
                                 function_name,
                                 Address::from(*address),
                                 block_number,
+                                hex::encode(&calldatas[i]),
+                                targets[i],
                                 e
                             );
-                            Vec::new()
+                            continue; // Skip reverted calls
                         }
                     };
 
@@ -614,19 +626,21 @@ impl LiveEthCallCollector {
                 let rpc_results = self.http_client.call_batch(chunk).await?;
 
                 for (i, result) in rpc_results.into_iter().enumerate() {
-                    let (target_address, log_index, _, _) = &pending_calls[chunk_start + i];
+                    let (target_address, log_index, calldata, _) = &pending_calls[chunk_start + i];
                     let result_bytes = match result {
                         Ok(bytes) => bytes.to_vec(),
                         Err(e) => {
                             tracing::warn!(
-                                "Event-triggered call failed for {}.{} at {} block {}: {}",
+                                "Event-triggered call failed for {}.{} at {} block {}: calldata=0x{}, log_index={}, error={}",
                                 contract_name,
                                 function_name,
                                 target_address,
                                 block_number,
+                                hex::encode(calldata),
+                                log_index,
                                 e
                             );
-                            Vec::new()
+                            continue; // Skip reverted calls
                         }
                     };
 
@@ -713,23 +727,42 @@ fn encode_call_simple(function_name: &str, params: &Vec<crate::types::config::et
 /// Encode calldata with self-address parameter.
 fn encode_call_with_self_address(
     selector: &[u8; 4],
-    _params: &[ParamConfig],
-    _address: &[u8; 20],
+    params: &[ParamConfig],
+    address: &[u8; 20],
 ) -> Bytes {
-    // Simplified - just return selector for now
-    // Full implementation would encode params with self-address substitution
-    Bytes::copy_from_slice(selector)
+    match encode_once_call_params(*selector, params, Address::from(*address)) {
+        Ok(calldata) => calldata,
+        Err(e) => {
+            tracing::warn!("Failed to encode once call params: {}", e);
+            Bytes::copy_from_slice(selector)
+        }
+    }
 }
 
 /// Build calldata from event parameters.
 fn build_calldata_from_event(
     selector: &[u8; 4],
-    _params: &[ParamConfig],
-    _log: &LiveLog,
+    params: &[ParamConfig],
+    log: &LiveLog,
 ) -> Bytes {
-    // Simplified - just return selector for now
-    // Full implementation would extract params from log topics/data
-    Bytes::copy_from_slice(selector)
+    let trigger = EventTriggerData {
+        block_number: 0,
+        block_timestamp: 0,
+        log_index: log.log_index,
+        emitter_address: log.address,
+        source_name: String::new(),
+        event_signature: log.topics.first().copied().unwrap_or([0u8; 32]),
+        topics: log.topics.clone(),
+        data: log.data.clone(),
+    };
+
+    match build_event_call_params(&trigger, params) {
+        Ok((dyn_vals, _)) => encode_call_with_params(*selector, &dyn_vals),
+        Err(e) => {
+            tracing::warn!("Failed to build event call params: {}", e);
+            Bytes::copy_from_slice(selector)
+        }
+    }
 }
 
 impl std::fmt::Debug for LiveEthCallCollector {

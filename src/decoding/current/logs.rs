@@ -109,6 +109,8 @@ pub async fn decode_logs_live(
     // Live storage for live_mode=true messages
     let live_storage = LiveStorage::new(chain_name);
 
+    tracing::info!("Log decoder live phase started, waiting for messages");
+
     loop {
         match decoder_rx.recv().await {
             Some(DecoderMessage::LogsReady {
@@ -118,6 +120,10 @@ pub async fn decode_logs_live(
                 live_mode,
                 has_factory_matchers: _,
             }) => {
+                tracing::debug!(
+                    "Log decoder received {} logs for block {} (live_mode={})",
+                    logs.len(), range_start, live_mode
+                );
                 if live_mode {
                     // Live mode: write to bincode storage
                     // For live mode, range_start == range_end (single block)

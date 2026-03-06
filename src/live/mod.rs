@@ -5,7 +5,9 @@
 //! - Per-block storage using bincode for fast serialization
 //! - Reorg detection and recovery
 //! - Compaction to merge live blocks into parquet ranges
+//! - Catchup for incomplete blocks on restart
 
+mod catchup;
 mod collector;
 mod compaction;
 mod error;
@@ -15,6 +17,7 @@ mod reorg;
 mod storage;
 mod types;
 
+pub use catchup::{CatchupScanResult, LiveCatchupService};
 pub use collector::LiveCollector;
 pub use compaction::CompactionService;
 pub use error::{LiveError, LiveEthCallError, ProgressError};

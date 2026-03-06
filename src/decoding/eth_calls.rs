@@ -136,6 +136,7 @@ pub async fn decode_eth_calls(
     transform_tx: Option<Sender<DecodedCallsMessage>>,
     eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
+    skip_catchup: bool,
 ) -> Result<(), EthCallDecodingError> {
     let output_base = PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain.name));
     std::fs::create_dir_all(&output_base)?;
@@ -166,43 +167,46 @@ pub async fn decode_eth_calls(
         event_configs.len()
     );
 
-    // =========================================================================
-    // Wait for eth_call collection catchup before decoding
-    // =========================================================================
-    if let Some(rx) = eth_calls_catchup_done_rx {
-        tracing::info!("Waiting for eth_call collection catchup to complete before decoding...");
-        let _ = rx.await;
-        tracing::info!("Eth_call collection catchup complete, proceeding with decoding");
-    }
-
-    // =========================================================================
-    // Catchup phase: Process existing raw eth_call files
-    // =========================================================================
     let raw_calls_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
-    if raw_calls_dir.exists() {
-        // Pass None for transform_tx during catchup to avoid deadlock:
-        // the engine is blocked waiting for our barrier signal and won't read
-        // from the channel, so sends could block forever. The engine will read
-        // decoded parquet files during its own catchup instead.
-        catchup::catchup_decode_eth_calls(
-            &raw_calls_dir,
-            &output_base,
-            &regular_configs,
-            &once_configs,
-            &event_configs,
-            raw_data_config,
-            None,
-        )
-        .await?;
-    }
 
-    tracing::info!(
-        "Eth_call decoding catchup complete for chain {}",
-        chain.name
-    );
+    if !skip_catchup {
+        // =========================================================================
+        // Wait for eth_call collection catchup before decoding
+        // =========================================================================
+        if let Some(rx) = eth_calls_catchup_done_rx {
+            tracing::info!("Waiting for eth_call collection catchup to complete before decoding...");
+            let _ = rx.await;
+            tracing::info!("Eth_call collection catchup complete, proceeding with decoding");
+        }
 
-    if let Some(tx) = decode_catchup_done_tx {
-        let _ = tx.send(());
+        // =========================================================================
+        // Catchup phase: Process existing raw eth_call files
+        // =========================================================================
+        if raw_calls_dir.exists() {
+            // Pass None for transform_tx during catchup to avoid deadlock:
+            // the engine is blocked waiting for our barrier signal and won't read
+            // from the channel, so sends could block forever. The engine will read
+            // decoded parquet files during its own catchup instead.
+            catchup::catchup_decode_eth_calls(
+                &raw_calls_dir,
+                &output_base,
+                &regular_configs,
+                &once_configs,
+                &event_configs,
+                raw_data_config,
+                None,
+            )
+            .await?;
+        }
+
+        tracing::info!(
+            "Eth_call decoding catchup complete for chain {}",
+            chain.name
+        );
+
+        if let Some(tx) = decode_catchup_done_tx {
+            let _ = tx.send(());
+        }
     }
 
     // =========================================================================

@@ -51,6 +51,8 @@ impl LiveProgressTracker {
     }
 
     /// Mark a handler as complete for a block.
+    ///
+    /// Updates both in-memory state and persists to the status file for catchup.
     pub async fn mark_complete(
         &mut self,
         block_number: u64,
@@ -81,14 +83,33 @@ impl LiveProgressTracker {
                 .await?;
         }
 
-        // Check if all handlers are now complete for this block
-        if self.is_block_complete(block_number) {
-            let storage = LiveStorage::new(&self.chain_name);
-            if let Ok(mut status) = storage.read_status(block_number) {
+        // Persist handler completion to status file for catchup on restart
+        let storage = LiveStorage::new(&self.chain_name);
+        if let Ok(mut status) = storage.read_status(block_number) {
+            status.completed_handlers.insert(handler_key.to_string());
+
+            // Check if all handlers are now complete for this block
+            let all_complete = self.is_block_complete(block_number);
+            if all_complete {
                 status.transformed = true;
-                if let Err(e) = storage.write_status(block_number, &status) {
-                    tracing::warn!("Failed to update block status after transformation: {}", e);
-                }
+                tracing::info!(
+                    "Block {} fully transformed ({} handlers complete)",
+                    block_number,
+                    self.handler_keys.len()
+                );
+            } else {
+                let pending = self.get_pending_handlers(block_number);
+                tracing::debug!(
+                    "Block {} handler '{}' complete, {} remaining: {:?}",
+                    block_number,
+                    handler_key,
+                    pending.len(),
+                    pending
+                );
+            }
+
+            if let Err(e) = storage.write_status(block_number, &status) {
+                tracing::warn!("Failed to update block status after handler completion: {}", e);
             }
         }
 
@@ -106,6 +127,22 @@ impl LiveProgressTracker {
                 && self.handler_keys.iter().all(|k| completed.contains(k))
         } else {
             false
+        }
+    }
+
+    /// Mark a block as transformed when no handlers are registered.
+    /// This should be called after all collection/decoding is done.
+    pub fn mark_transformed_if_no_handlers(&self, block_number: u64) {
+        if !self.handler_keys.is_empty() {
+            return;
+        }
+
+        let storage = LiveStorage::new(&self.chain_name);
+        if let Ok(mut status) = storage.read_status(block_number) {
+            status.transformed = true;
+            if let Err(e) = storage.write_status(block_number, &status) {
+                tracing::warn!("Failed to update block status (no handlers): {}", e);
+            }
         }
     }
 
@@ -161,6 +198,45 @@ impl LiveProgressTracker {
                 .or_default()
                 .insert(handler_key);
         }
+
+        Ok(())
+    }
+
+    /// Load progress from storage status files.
+    ///
+    /// Reads completed_handlers from each block's status file to seed the
+    /// in-memory state on restart. This enables catchup without database queries.
+    pub fn load_from_storage(&mut self, storage: &LiveStorage) -> Result<(), LiveError> {
+        let blocks = storage.list_blocks()?;
+
+        for block_number in blocks {
+            match storage.read_status(block_number) {
+                Ok(status) => {
+                    if !status.completed_handlers.is_empty() {
+                        self.completed
+                            .entry(block_number)
+                            .or_default()
+                            .extend(status.completed_handlers);
+                    }
+                }
+                Err(super::storage::StorageError::NotFound(_)) => {
+                    // Status file doesn't exist, skip
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read status for block {} during load_from_storage: {}",
+                        block_number,
+                        e
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded progress from storage: {} blocks with handler completions",
+            self.completed.len()
+        );
 
         Ok(())
     }

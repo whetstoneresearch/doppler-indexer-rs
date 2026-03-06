@@ -90,7 +90,9 @@ impl CompactionService {
     }
 
     /// Run the compaction service loop.
-    pub async fn run(self, mut shutdown: tokio::sync::oneshot::Receiver<()>) {
+    ///
+    /// Runs until cancelled (when the containing task is dropped/aborted).
+    pub async fn run(self) {
         let interval = Duration::from_secs(self.config.compaction_interval_secs);
 
         tracing::info!(
@@ -100,16 +102,9 @@ impl CompactionService {
         );
 
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    if let Err(e) = self.run_compaction_cycle().await {
-                        tracing::error!("Compaction cycle error: {}", e);
-                    }
-                }
-                _ = &mut shutdown => {
-                    tracing::info!("Compaction service shutting down");
-                    break;
-                }
+            tokio::time::sleep(interval).await;
+            if let Err(e) = self.run_compaction_cycle().await {
+                tracing::error!("Compaction cycle error: {}", e);
             }
         }
     }

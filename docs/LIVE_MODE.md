@@ -471,6 +471,9 @@ impl LiveStorage {
     fn get_recent_blocks_for_reorg(&self, count: u64) -> Result<Vec<(u64, [u8; 32])>>;
     fn max_block_number(&self) -> Result<Option<u64>>;
 
+    // Gap detection
+    fn find_gaps(&self) -> Result<Vec<(u64, u64)>>;  // Returns (start, end) ranges of missing blocks
+
     // Bulk operations
     fn delete_all(&self, block_number: u64) -> Result<()>;  // Deletes all data for a block
     fn delete_range(&self, start: u64, end: u64) -> Result<()>;  // Deletes all data for a range
@@ -534,13 +537,52 @@ match storage.get_recent_blocks_for_reorg(config.reorg_depth) {
 
 ### Gap Detection
 
-On transition to live mode, gaps between historical and live blocks are detected and backfilled:
+Live mode has multiple layers of gap detection to ensure no blocks are missed:
+
+#### 1. Storage Gap Detection (on startup)
+
+On startup, before processing new blocks, gaps within existing storage are detected and backfilled:
+
+```rust
+// In LiveStorage
+pub fn find_gaps(&self) -> Result<Vec<(u64, u64)>, StorageError> {
+    let blocks = self.list_blocks()?;
+    let mut gaps = Vec::new();
+    for window in blocks.windows(2) {
+        if window[1] > window[0] + 1 {
+            gaps.push((window[0] + 1, window[1] - 1));
+        }
+    }
+    Ok(gaps)
+}
+```
+
+This catches incomplete backfills from previous sessions. For example, if blocks 100-110 exist but 103-107 are missing:
+
+```
+INFO  Found 1 gaps (5 missing blocks) in storage, backfilling
+INFO  Backfilling 5 blocks (103 to 107)
+```
+
+#### 2. Transition Gap Detection (on first WS block)
+
+On the first WebSocket block received, gaps between storage and the new block are detected:
 
 ```rust
 // On first block received
 if block_number > expected_start_block + 1 {
     tracing::warn!("Gap detected, backfilling...");
     backfill_blocks(expected_start + 1, block_number - 1).await?;
+}
+```
+
+#### 3. Reconnection Gap Detection
+
+When WebSocket reconnects after a disconnect, missed blocks are backfilled:
+
+```rust
+WsEvent::Reconnected { missed_from, missed_to } => {
+    backfill_blocks(missed_from, missed_to, ...).await?;
 }
 ```
 
@@ -648,3 +690,133 @@ pub enum LiveError {
 ```
 
 `ProgressError` and `LiveEthCallError` are now type aliases to `LiveError`.
+
+## Recovery and Catchup
+
+### Catchup for Incomplete Blocks
+
+Live mode now includes a catchup mechanism for blocks that were partially processed in a previous session:
+
+#### Problem
+
+On restart, live mode previously had no way to recover from:
+1. Blocks collected but not decoded (decoder crashed)
+2. Blocks decoded but not transformed (engine crashed)
+3. Blocks partially transformed (some handlers ran, others didn't)
+
+#### Solution
+
+**Enhanced LiveBlockStatus with Handler Tracking**
+
+The status file now tracks which handlers have completed:
+
+```json
+{
+  "collected": true,
+  "block_fetched": true,
+  "receipts_collected": true,
+  "logs_collected": true,
+  "factories_extracted": true,
+  "eth_calls_collected": true,
+  "logs_decoded": true,
+  "eth_calls_decoded": true,
+  "transformed": true,
+  "completed_handlers": ["v3_handler_v1", "v4_handler_v1"]
+}
+```
+
+The `completed_handlers` field (with `#[serde(default)]` for backwards compatibility) enables catchup to determine exactly which handlers still need to run without querying the database.
+
+**LiveCatchupService**
+
+New service (`src/live/catchup.rs`) that:
+- **Reconstructs missing status files** from local data and database
+- Scans storage for incomplete blocks on startup
+- Replays raw logs to decoder channel for blocks needing decode
+- Replays raw eth_calls to decoder channel for blocks needing decode
+- Identifies blocks needing transformation with specific missing handlers
+
+**Status File Reconstruction**
+
+If status files are missing but block data exists, the catchup service reconstructs them:
+
+```rust
+// Check what data exists for the block
+let block_exists = storage.read_block(block_number).is_ok();
+let logs_exist = storage.read_logs(block_number).is_ok();
+let decoded_logs_exist = !storage.list_decoded_log_types(block_number)?.is_empty();
+
+// Query database for completed handlers
+let completed_handlers = db_pool.query(
+    "SELECT handler_key FROM _live_progress WHERE chain_id = $1 AND block_number = $2",
+    &[&chain_id, &block_number]
+).await?;
+
+// Reconstruct status
+status.collected = block_exists;
+status.logs_decoded = decoded_logs_exist || logs_empty;
+status.completed_handlers = completed_handlers;
+status.transformed = all_handlers_complete;
+```
+
+This enables recovery from:
+- Accidentally deleted status files
+- Status files corrupted during a crash
+- Migration from older versions without certain status fields
+
+**Catchup Flow**
+
+```
+Startup:
+  1. LiveCollector::run() starts
+  2. run_catchup_phase()
+     ├── Reconstruct missing status files from data + database
+     ├── Load progress from storage status files
+     ├── scan_incomplete_blocks()
+     ├── replay_logs_for_decode() → log_decoder channel
+     └── replay_calls_for_decode() → eth_call_decoder channel
+  3. backfill_storage_gaps()
+     ├── Find gaps in block number sequence
+     └── Backfill missing blocks via HTTP
+  4. Catchup complete
+  5. Start WebSocket subscription (normal live mode)
+```
+
+**Progress Tracker Updates**
+
+- `mark_complete()` now persists handler key to status file alongside database
+- `load_from_storage()` seeds in-memory state from status files on restart
+
+### Improved Logging
+
+Live mode now has clearer logging to understand pipeline progress:
+
+| Log Message | Meaning |
+|-------------|---------|
+| `Reconstructed status file for block X` | Missing status rebuilt from data |
+| `Reconstructed N missing status files` | Status recovery complete |
+| `Found N gaps (M missing blocks) in storage, backfilling` | Gap detection found missing blocks |
+| `Backfilling N blocks (X to Y)` | Gap backfill in progress |
+| `Block X collected: Y txs` | Block header and transactions fetched |
+| `Block X receipts collected: Y logs` | Receipts fetched, logs extracted |
+| `Block X eth_calls collected: Y` | Eth calls collected (only if any) |
+| `Block X logs decoded` | Log decoder finished |
+| `Block X eth_calls decoded` | Eth call decoder finished |
+| `Block X fully transformed (N handlers)` | All handlers complete |
+| `Handler X buffering block Y: waiting for eth_call deps` | Handler waiting for call dependencies |
+| `Handler X unblocked for block Y` | Buffered events now processing |
+| `Log decoder live phase started` | Decoder task running |
+| `No incomplete blocks found, skipping catchup phase` | Clean startup |
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/live/types.rs` | Added `completed_handlers: HashSet<String>` to `LiveBlockStatus` |
+| `src/live/progress.rs` | Updated `mark_complete()` to persist handlers, added `load_from_storage()` |
+| `src/live/collector.rs` | Added `run_catchup_phase()`, `backfill_storage_gaps()`, accepts `db_pool` |
+| `src/live/catchup.rs` | **NEW** - `LiveCatchupService` with `reconstruct_missing_status_files()` |
+| `src/live/storage.rs` | Added `find_gaps()` for detecting missing blocks in storage |
+| `src/live/mod.rs` | Export catchup module |
+| `src/decoding/current/logs.rs` | Added decoder startup and completion logging |
+| `src/transformations/engine.rs` | Cleaned up verbose call dependency logging |

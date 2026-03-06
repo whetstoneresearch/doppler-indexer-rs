@@ -1,6 +1,6 @@
 //! Types for live mode block processing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,10 +47,20 @@ pub struct LiveBlockStatus {
     pub receipts_collected: bool,
     /// Logs extracted from receipts.
     pub logs_collected: bool,
-    /// Logs and calls decoded.
-    pub decoded: bool,
-    /// All transformation handlers complete.
+    /// Factory addresses extracted from logs (or no factories configured).
+    pub factories_extracted: bool,
+    /// Eth calls collected for this block (or no eth_calls configured).
+    pub eth_calls_collected: bool,
+    /// Logs decoded (or no events configured).
+    pub logs_decoded: bool,
+    /// Eth calls decoded (or no eth_calls configured).
+    pub eth_calls_decoded: bool,
+    /// All transformation handlers complete (or no handlers configured).
     pub transformed: bool,
+    /// Handler keys that have completed processing for this block.
+    /// Used for catchup on restart to determine which handlers still need to run.
+    #[serde(default)]
+    pub completed_handlers: HashSet<String>,
 }
 
 impl LiveBlockStatus {
@@ -68,7 +78,10 @@ impl LiveBlockStatus {
             && self.block_fetched
             && self.receipts_collected
             && self.logs_collected
-            && self.decoded
+            && self.factories_extracted
+            && self.eth_calls_collected
+            && self.logs_decoded
+            && self.eth_calls_decoded
             && self.transformed
     }
 }

@@ -93,7 +93,8 @@ impl LiveStorage {
         Ok(())
     }
 
-    /// Clean up leftover .tmp files from interrupted writes.
+    /// Clean up leftover temp files from interrupted writes.
+    /// Matches files with `.tmp.{random}` suffix pattern.
     fn cleanup_temp_files(&self, subdirs: &[&str]) -> Result<(), StorageError> {
         for subdir in subdirs {
             let dir = self.base_dir.join(subdir);
@@ -104,7 +105,7 @@ impl LiveStorage {
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "tmp") {
+                    if is_temp_file(&path) {
                         tracing::debug!("Cleaning up leftover temp file: {:?}", path);
                         let _ = fs::remove_file(&path);
                     }
@@ -118,14 +119,14 @@ impl LiveStorage {
         Ok(())
     }
 
-    /// Recursively clean up .tmp files in nested directories.
+    /// Recursively clean up temp files in nested directories.
     fn cleanup_temp_files_recursive(&self, dir: &Path) -> Result<(), StorageError> {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     self.cleanup_temp_files_recursive(&path)?;
-                } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                } else if is_temp_file(&path) {
                     tracing::debug!("Cleaning up leftover temp file: {:?}", path);
                     let _ = fs::remove_file(&path);
                 }
@@ -308,8 +309,16 @@ impl LiveStorage {
             fs::create_dir_all(parent)?;
         }
 
-        // Write to temp file, flush, sync, then atomic rename
-        let temp_path = path.with_extension("tmp");
+        // Write to temp file with unique suffix to avoid race conditions
+        // when multiple writers (collector + decoder) write status for the same block
+        let random_suffix: u32 = rand::random();
+        let temp_name = format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            random_suffix
+        );
+        let temp_path = path.with_file_name(temp_name);
+
         let file = fs::File::create(&temp_path)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer_pretty(&mut writer, status)?;
@@ -629,6 +638,26 @@ impl LiveStorage {
         Ok(self.list_blocks()?.into_iter().max())
     }
 
+    /// Find gaps (missing block numbers) in storage.
+    /// Returns ranges of missing blocks as (start, end) tuples (inclusive).
+    pub fn find_gaps(&self) -> Result<Vec<(u64, u64)>, StorageError> {
+        let blocks = self.list_blocks()?;
+        if blocks.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let mut gaps = Vec::new();
+        for window in blocks.windows(2) {
+            let current = window[0];
+            let next = window[1];
+            if next > current + 1 {
+                // Gap found: blocks from current+1 to next-1 are missing
+                gaps.push((current + 1, next - 1));
+            }
+        }
+        Ok(gaps)
+    }
+
     // =========================================================================
     // Bulk operations
     // =========================================================================
@@ -681,13 +710,21 @@ impl LiveStorage {
 ///
 /// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
 /// Works with any serializable type including slices.
+/// Uses unique temp file names to avoid race conditions between concurrent writers.
 fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Write to temp file, flush, sync, then atomic rename
-    let temp_path = path.with_extension("tmp");
+    // Write to temp file with unique suffix to avoid race conditions
+    let random_suffix: u32 = rand::random();
+    let temp_name = format!(
+        "{}.tmp.{}",
+        path.file_name().unwrap().to_string_lossy(),
+        random_suffix
+    );
+    let temp_path = path.with_file_name(temp_name);
+
     let file = fs::File::create(&temp_path)?;
     let mut writer = BufWriter::new(file);
     bincode::serialize_into(&mut writer, data)?;
@@ -726,6 +763,13 @@ fn map_io_not_found(err: std::io::Error, block_number: u64) -> StorageError {
     } else {
         StorageError::Io(err)
     }
+}
+
+/// Check if a file is a temp file (has `.tmp.{random}` suffix).
+fn is_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map_or(false, |name| name.contains(".tmp."))
 }
 
 fn list_block_numbers(dir: &Path) -> Result<Vec<u64>, StorageError> {
@@ -805,14 +849,12 @@ mod tests {
     fn test_status_roundtrip() {
         let (storage, _tmp) = test_storage();
 
-        let status = LiveBlockStatus {
-            collected: true,
-            block_fetched: true,
-            receipts_collected: true,
-            logs_collected: false,
-            decoded: false,
-            transformed: false,
-        };
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = false;
+        status.completed_handlers.insert("handler_a".to_string());
 
         storage.write_status(100, &status).unwrap();
         let read_status = storage.read_status(100).unwrap();
@@ -820,6 +862,7 @@ mod tests {
         assert!(read_status.collected);
         assert!(read_status.block_fetched);
         assert!(!read_status.logs_collected);
+        assert!(read_status.completed_handlers.contains("handler_a"));
     }
 
     #[test]
@@ -858,6 +901,71 @@ mod tests {
         assert!(storage.block_exists(999));
         storage.delete_all(999).unwrap();
         assert!(!storage.block_exists(999));
+    }
+
+    #[test]
+    fn test_find_gaps() {
+        let (storage, _tmp) = test_storage();
+
+        // Create blocks with gaps: 100, 101, 105, 106, 110
+        for num in [100, 101, 105, 106, 110] {
+            let block = LiveBlock {
+                number: num,
+                hash: [0u8; 32],
+                parent_hash: [0u8; 32],
+                timestamp: 0,
+                tx_hashes: vec![],
+            };
+            storage.write_block(&block).unwrap();
+        }
+
+        let gaps = storage.find_gaps().unwrap();
+        // Gap 1: 102-104, Gap 2: 107-109
+        assert_eq!(gaps, vec![(102, 104), (107, 109)]);
+    }
+
+    #[test]
+    fn test_find_gaps_no_gaps() {
+        let (storage, _tmp) = test_storage();
+
+        // Create consecutive blocks
+        for num in 100..=105 {
+            let block = LiveBlock {
+                number: num,
+                hash: [0u8; 32],
+                parent_hash: [0u8; 32],
+                timestamp: 0,
+                tx_hashes: vec![],
+            };
+            storage.write_block(&block).unwrap();
+        }
+
+        let gaps = storage.find_gaps().unwrap();
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn test_find_gaps_empty_storage() {
+        let (storage, _tmp) = test_storage();
+        let gaps = storage.find_gaps().unwrap();
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn test_find_gaps_single_block() {
+        let (storage, _tmp) = test_storage();
+
+        let block = LiveBlock {
+            number: 100,
+            hash: [0u8; 32],
+            parent_hash: [0u8; 32],
+            timestamp: 0,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+
+        let gaps = storage.find_gaps().unwrap();
+        assert!(gaps.is_empty());
     }
 
     #[test]
