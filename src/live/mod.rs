@@ -19,7 +19,7 @@ mod types;
 
 pub use catchup::{CatchupScanResult, LiveCatchupService};
 pub use collector::LiveCollector;
-pub use compaction::CompactionService;
+pub use compaction::{CompactionService, TransformRetryRequest};
 pub use error::{LiveError, LiveEthCallError, ProgressError};
 pub use eth_calls::LiveEthCallCollector;
 pub use progress::LiveProgressTracker;

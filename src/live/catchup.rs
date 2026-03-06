@@ -517,6 +517,47 @@ impl LiveCatchupService {
         Ok(replayed)
     }
 
+    /// Replay logs for blocks that need transformation retry.
+    ///
+    /// This clears the logs_decoded flag and replays through the decoder,
+    /// which will re-send to the transform engine.
+    pub async fn replay_for_transform(
+        &self,
+        blocks: &[(u64, HashSet<String>)],
+        decoder_tx: &mpsc::Sender<DecoderMessage>,
+    ) -> Result<usize, StorageError> {
+        if blocks.is_empty() {
+            return Ok(0);
+        }
+
+        let block_numbers: Vec<u64> = blocks.iter().map(|(b, _)| *b).collect();
+
+        tracing::info!(
+            "Catchup: retrying transformation for {} blocks ({} to {})",
+            block_numbers.len(),
+            block_numbers.first().unwrap_or(&0),
+            block_numbers.last().unwrap_or(&0)
+        );
+
+        // Clear logs_decoded flag so decoder will re-process and send to transform engine
+        for &block_number in &block_numbers {
+            if let Ok(mut status) = self.storage.read_status(block_number) {
+                status.logs_decoded = false;
+                status.transformed = false;
+                if let Err(e) = self.storage.write_status(block_number, &status) {
+                    tracing::warn!(
+                        "Failed to clear logs_decoded for block {} during transform retry: {}",
+                        block_number,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Replay through decoder - it will re-decode and send to transform engine
+        self.replay_logs_for_decode(&block_numbers, decoder_tx).await
+    }
+
     /// Get the storage reference for external use.
     pub fn storage(&self) -> &LiveStorage {
         &self.storage

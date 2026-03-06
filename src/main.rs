@@ -26,7 +26,8 @@ use raw_data::historical::factories::{build_factory_matchers, FactoryMessage, Re
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker};
+use decoding::handle_transform_retries;
+use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker, TransformRetryRequest};
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
 use storage::{RetryQueue, StorageManager};
 use transformations::{
@@ -1222,6 +1223,9 @@ async fn spawn_live_mode(
         None
     };
 
+    // Clone log_decoder_tx for retry handler before it's moved to collector
+    let log_decoder_tx_for_retry = log_decoder_tx.clone();
+
     // Start live collector
     let collector = LiveCollector::new(
         chain.clone(),
@@ -1239,7 +1243,10 @@ async fn spawn_live_mode(
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
     });
 
-    // Start compaction service
+    // Create retry channel for transformation retries
+    let (retry_tx, retry_rx) = tokio::sync::mpsc::channel::<TransformRetryRequest>(100);
+
+    // Start compaction service with retry channel
     let compaction = CompactionService::new(
         chain.name.clone(),
         chain.chain_id,
@@ -1247,11 +1254,20 @@ async fn spawn_live_mode(
         db_pool,
         progress_tracker,
         storage_manager,
-    );
+    ).with_retry_tx(retry_tx);
     tasks.spawn(async move {
         compaction.run().await;
         Ok(())
     });
+
+    // Start transform retry handler (replays logs for stuck blocks)
+    if let Some(decoder_tx) = log_decoder_tx_for_retry {
+        let chain_name = chain.name.clone();
+        tasks.spawn(async move {
+            handle_transform_retries(retry_rx, decoder_tx, chain_name).await;
+            Ok(())
+        });
+    }
 
     Ok(())
 }

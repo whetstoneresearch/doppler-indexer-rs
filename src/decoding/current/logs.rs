@@ -10,8 +10,12 @@ use crate::decoding::logs::{
     delete_decoded_logs_for_blocks, process_logs, process_logs_live, EventMatcher,
     LogDecodingError,
 };
+use alloy::primitives::Address;
+use alloy::primitives::B256;
+
 use crate::decoding::types::DecoderMessage;
-use crate::live::LiveStorage;
+use crate::live::{LiveStorage, TransformRetryRequest};
+use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::{DecodedEventsMessage, RangeCompleteMessage};
 
 /// Load accumulated factory addresses from both compacted parquet and uncompacted bincode files.
@@ -197,4 +201,105 @@ pub async fn decode_logs_live(
     }
 
     Ok(())
+}
+
+/// Handle transformation retry requests by replaying logs through the decoder.
+///
+/// This function listens for retry requests and sends the raw logs back through
+/// the decoder channel so they get re-processed and sent to the transform engine.
+pub async fn handle_transform_retries(
+    mut retry_rx: tokio::sync::mpsc::Receiver<TransformRetryRequest>,
+    decoder_tx: Sender<DecoderMessage>,
+    chain_name: String,
+) {
+    let storage = LiveStorage::new(&chain_name);
+
+    tracing::info!("Transform retry handler started for chain {}", chain_name);
+
+    while let Some(request) = retry_rx.recv().await {
+        let block_number = request.block_number;
+
+        // Read raw logs from storage
+        let logs = match storage.read_logs(block_number) {
+            Ok(logs) => logs,
+            Err(e) => {
+                tracing::warn!("Failed to read logs for retry block {}: {}", block_number, e);
+                continue;
+            }
+        };
+
+        // Read block for timestamp
+        let block = match storage.read_block(block_number) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Failed to read block {} for retry: {}", block_number, e);
+                continue;
+            }
+        };
+
+        // Convert to LogData format
+        let log_data: Vec<LogData> = logs
+            .iter()
+            .map(|log| LogData {
+                block_number,
+                block_timestamp: block.timestamp,
+                transaction_hash: B256::from(log.transaction_hash),
+                log_index: log.log_index,
+                address: log.address,
+                topics: log.topics.clone(),
+                data: log.data.clone(),
+            })
+            .collect();
+
+        // Check for factory addresses
+        let factory_addresses = storage.read_factories(block_number).unwrap_or_default();
+
+        // Send factory addresses first if present
+        if !factory_addresses.addresses_by_collection.is_empty() {
+            let factory_addrs: std::collections::HashMap<String, Vec<Address>> = factory_addresses
+                .addresses_by_collection
+                .iter()
+                .map(|(name, addrs)| {
+                    (
+                        name.clone(),
+                        addrs.iter().map(|(_, addr)| Address::from(*addr)).collect(),
+                    )
+                })
+                .collect();
+
+            if let Err(e) = decoder_tx
+                .send(DecoderMessage::FactoryAddresses {
+                    range_start: block_number,
+                    range_end: block_number + 1,
+                    addresses: factory_addrs,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send factory addresses for retry block {}: {}",
+                    block_number,
+                    e
+                );
+            }
+        }
+
+        // Send logs to decoder
+        if let Err(e) = decoder_tx
+            .send(DecoderMessage::LogsReady {
+                range_start: block_number,
+                range_end: block_number + 1,
+                logs: log_data,
+                live_mode: true,
+                has_factory_matchers: !factory_addresses.addresses_by_collection.is_empty(),
+            })
+            .await
+        {
+            tracing::warn!("Failed to send logs for retry block {}: {}", block_number, e);
+            continue;
+        }
+
+        tracing::info!("Replayed {} logs for transformation retry of block {}", logs.len(), block_number);
+    }
+
+    tracing::info!("Transform retry handler stopped for chain {}", chain_name);
 }

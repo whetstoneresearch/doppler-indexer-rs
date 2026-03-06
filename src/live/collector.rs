@@ -857,30 +857,28 @@ impl LiveCollector {
             }
         }
 
-        // Log blocks needing transformation (actual replay happens via decoder -> transform pipeline)
+        // Replay blocks needing transformation retry
         if !scan_result.blocks_needing_transform.is_empty() {
-            for (block_num, missing_handlers) in &scan_result.blocks_needing_transform {
-                tracing::info!(
-                    "Catchup: block {} needs transformation by handlers: {:?}",
-                    block_num,
-                    missing_handlers
+            if let Some(decoder_tx) = log_decoder_tx {
+                match catchup_service
+                    .replay_for_transform(&scan_result.blocks_needing_transform, decoder_tx)
+                    .await
+                {
+                    Ok(count) => {
+                        tracing::info!(
+                            "Catchup: replayed {} blocks for transformation retry",
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to replay for transform catchup: {}", e);
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Blocks need transformation but no log decoder configured, skipping"
                 );
             }
-            // Note: Transformation catchup is handled implicitly - once decoded data is replayed
-            // to the decoder, it will flow through to the transform engine. The engine reads
-            // decoded data from storage and sends to handlers. The missing_handlers info is
-            // useful for logging but the actual catchup mechanism relies on:
-            // 1. Decoder marks logs_decoded/eth_calls_decoded when done
-            // 2. Transform engine receives decoded data and processes with all handlers
-            // 3. Progress tracker marks completed_handlers as each handler finishes
-            //
-            // For blocks that are already decoded but not transformed, we need to trigger
-            // the transform engine to re-read the decoded data. This happens automatically
-            // when the decoder sends its completion messages, but for blocks that are
-            // ALREADY decoded (logs_decoded=true, eth_calls_decoded=true), we need to
-            // replay the decoded data directly to the transform channels.
-            //
-            // TODO: Implement replay_decoded_for_transform() if needed for pure transform catchup
         }
 
         tracing::info!("Catchup phase complete");

@@ -54,6 +54,12 @@ pub struct CompactableRange {
     pub block_count: usize,
 }
 
+/// Request to retry transformation for a block.
+#[derive(Debug, Clone)]
+pub struct TransformRetryRequest {
+    pub block_number: u64,
+}
+
 /// Service for compacting live blocks into parquet ranges.
 pub struct CompactionService {
     chain_name: String,
@@ -64,6 +70,8 @@ pub struct CompactionService {
     progress_tracker: Arc<Mutex<LiveProgressTracker>>,
     /// Optional S3 storage manager for uploading compacted parquet files
     storage_manager: Option<Arc<StorageManager>>,
+    /// Channel to request transformation retries
+    retry_tx: Option<tokio::sync::mpsc::Sender<TransformRetryRequest>>,
 }
 
 impl CompactionService {
@@ -86,7 +94,14 @@ impl CompactionService {
             db_pool,
             progress_tracker,
             storage_manager,
+            retry_tx: None,
         }
+    }
+
+    /// Set the retry channel for transformation retries.
+    pub fn with_retry_tx(mut self, retry_tx: tokio::sync::mpsc::Sender<TransformRetryRequest>) -> Self {
+        self.retry_tx = Some(retry_tx);
+        self
     }
 
     /// Run the compaction service loop.
@@ -111,6 +126,9 @@ impl CompactionService {
 
     /// Run a single compaction cycle.
     pub async fn run_compaction_cycle(&self) -> Result<(), CompactionError> {
+        // Check for stuck blocks needing transformation retry
+        self.check_for_stuck_blocks().await;
+
         let ranges = self.find_compactable_ranges().await?;
 
         if ranges.is_empty() {
@@ -137,6 +155,49 @@ impl CompactionService {
         }
 
         Ok(())
+    }
+
+    /// Check for blocks that are stuck (decoded but not transformed) and request retries.
+    async fn check_for_stuck_blocks(&self) {
+        let Some(ref retry_tx) = self.retry_tx else {
+            return;
+        };
+
+        let blocks = match self.storage.list_blocks() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        for block_number in blocks {
+            let status = match self.storage.read_status(block_number) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Block is decoded but not transformed - needs retry
+            if status.logs_decoded && status.eth_calls_decoded && !status.transformed {
+                // Check if this block has been stuck for a while by checking progress tracker
+                let progress = self.progress_tracker.lock().await;
+                if !progress.is_block_complete(block_number) {
+                    drop(progress);
+
+                    // Clear logs_decoded so decoder will re-process
+                    let mut updated_status = status;
+                    updated_status.logs_decoded = false;
+                    if let Err(e) = self.storage.write_status(block_number, &updated_status) {
+                        tracing::warn!("Failed to clear logs_decoded for stuck block {}: {}", block_number, e);
+                        continue;
+                    }
+
+                    // Request retry
+                    if let Err(e) = retry_tx.try_send(TransformRetryRequest { block_number }) {
+                        tracing::debug!("Retry channel full for block {}: {}", block_number, e);
+                    } else {
+                        tracing::info!("Requested transformation retry for stuck block {}", block_number);
+                    }
+                }
+            }
+        }
     }
 
     /// Find ranges that are ready for compaction.
