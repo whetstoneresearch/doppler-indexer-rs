@@ -1290,23 +1290,11 @@ impl TransformationEngine {
                 if call_deps.is_empty() {
                     ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
                 } else {
-                    // Log what we're checking
-                    let received_keys: Vec<_> = state.received_calls.keys().cloned().collect();
-                    tracing::info!(
-                        "Handler {} checking call deps {:?} for range {:?}. Currently received call keys: {:?}",
-                        handler_key, call_deps, range_key, received_keys
-                    );
-
                     let deps_ready = call_deps.iter().all(|dep| {
-                        let found = state.received_calls
+                        state.received_calls
                             .get(dep)
                             .map(|ranges| ranges.contains(&range_key))
-                            .unwrap_or(false);
-                        tracing::info!(
-                            "  Dep {:?} for range {:?}: {}",
-                            dep, range_key, if found { "FOUND" } else { "NOT FOUND" }
-                        );
-                        found
+                            .unwrap_or(false)
                     });
 
                     if deps_ready {

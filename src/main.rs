@@ -280,9 +280,12 @@ async fn process_chain_live_only(
         None
     };
 
-    // Build transformation registry and progress tracker if transformations enabled
-    let progress_tracker = if config.transformations.is_some() {
-        let registry = build_registry();
+    // Build transformation registry
+    let registry = build_registry();
+    let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
+
+    // Create progress tracker if transformations enabled
+    let progress_tracker = if transformations_enabled {
         let tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
             chain.chain_id as i64,
             db_pool.clone(),
@@ -322,6 +325,21 @@ async fn process_chain_live_only(
                 .is_some_and(|f| f.iter().any(|fc| has_items(&fc.calls)))
     });
 
+    // Setup transformation channels
+    let channel_cap = config
+        .raw_data_collection
+        .channel_capacity
+        .unwrap_or(raw_data_defaults::CHANNEL_CAPACITY);
+
+    let (transform_events_tx, transform_events_rx) =
+        optional_channel::<DecodedEventsMessage>(transformations_enabled, channel_cap);
+    let (transform_calls_tx, transform_calls_rx) =
+        optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
+    let (transform_complete_tx, transform_complete_rx) =
+        optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
+    let (transform_reorg_tx, transform_reorg_rx) =
+        optional_channel::<ReorgMessage>(transformations_enabled, channel_cap);
+
     // Setup decoder channels
     let (log_decoder_tx, log_decoder_rx) = if has_events {
         let (tx, rx) = mpsc::channel(1000);
@@ -339,12 +357,59 @@ async fn process_chain_live_only(
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
+    // Spawn transformation engine if enabled
+    if transformations_enabled {
+        let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
+        let tc = config.transformations.as_ref().unwrap();
+
+        let handler_count = registry.handler_count();
+        let engine = TransformationEngine::new(
+            Arc::new(registry),
+            db_pool.clone().unwrap(),
+            rpc_client,
+            chain.name.clone(),
+            chain.chain_id,
+            ExecutionMode::Streaming, // Live-only mode always uses streaming
+            chain.contracts.clone(),
+            tc.handler_concurrency,
+            progress_tracker.clone(),
+        )
+        .await
+        .context("failed to create transformation engine")?;
+
+        engine
+            .initialize()
+            .await
+            .context("failed to initialize transformation handlers")?;
+
+        tracing::info!(
+            "Transformation engine initialized for chain {} with {} handlers",
+            chain.name,
+            handler_count
+        );
+
+        tasks.spawn(async move {
+            engine
+                .run(
+                    transform_events_rx.unwrap(),
+                    transform_calls_rx.unwrap(),
+                    transform_complete_rx.unwrap(),
+                    transform_reorg_rx,
+                    None, // No decode catchup signal in live-only mode
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))
+        });
+    }
+
     // Spawn decoder task for live mode (if events are configured)
     if let Some(rx) = log_decoder_rx {
         let chain = Arc::new(chain.clone());
         let cfg = config.raw_data_collection.clone();
+        let transform_events_tx = transform_events_tx.clone();
+        let transform_complete_tx = transform_complete_tx.clone();
         tasks.spawn(async move {
-            decode_logs(&chain, &cfg, rx, None, None, None)
+            decode_logs(&chain, &cfg, rx, transform_events_tx, None, transform_complete_tx, true)
                 .await
                 .context("log decoding failed")
         });
@@ -354,15 +419,15 @@ async fn process_chain_live_only(
     if let Some(rx) = eth_call_decoder_rx {
         let chain = Arc::new(chain.clone());
         let cfg = config.raw_data_collection.clone();
+        let transform_calls_tx = transform_calls_tx.clone();
         tasks.spawn(async move {
-            decode_eth_calls(&chain, &cfg, rx, None, None, None)
+            decode_eth_calls(&chain, &cfg, rx, transform_calls_tx, None, None, true)
                 .await
                 .context("eth_call decoding failed")
         });
     }
 
     // Spawn live mode directly (no historical processing)
-    // Note: In live-only mode, transformation engine is not running, so no reorg channel
     spawn_live_mode(
         Arc::new(chain.clone()),
         config,
@@ -370,7 +435,7 @@ async fn process_chain_live_only(
         db_pool,
         log_decoder_tx,
         eth_call_decoder_tx,
-        None, // No transform_reorg_tx in live-only mode
+        transform_reorg_tx,
         progress_tracker,
         &mut tasks,
     )
@@ -1033,7 +1098,6 @@ async fn spawn_live_mode(
     // Create channels
     let (ws_event_tx, ws_event_rx) = mpsc::unbounded_channel();
     let (live_msg_tx, mut live_msg_rx) = mpsc::channel::<LiveMessage>(1000);
-    let (compaction_shutdown_tx, compaction_shutdown_rx) = oneshot::channel();
 
     // Drain LiveMessage channel to prevent backpressure on the collector.
     // Note: Transformations are handled via the transformation engine's channels
@@ -1121,7 +1185,7 @@ async fn spawn_live_mode(
         progress_tracker,
     );
     tasks.spawn(async move {
-        compaction.run(compaction_shutdown_rx).await;
+        compaction.run().await;
         Ok(())
     });
 
