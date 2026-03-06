@@ -16,6 +16,7 @@ use alloy::rpc::types::BlockNumberOrTag;
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 
+use super::catchup::LiveCatchupService;
 use super::eth_calls::LiveEthCallCollector;
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
@@ -24,6 +25,7 @@ use super::types::{
     LiveBlock, LiveBlockStatus, LiveFactoryAddresses, LiveLog, LiveMessage, LiveModeConfig,
     LiveReceipt,
 };
+use crate::db::DbPool;
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryMatcher;
 use crate::raw_data::historical::receipts::LogData;
@@ -61,6 +63,8 @@ pub struct LiveCollector {
     factory_matchers: Arc<Vec<FactoryMatcher>>,
     /// Optional eth_call collector for live mode.
     eth_call_collector: Option<LiveEthCallCollector>,
+    /// Database pool for status file reconstruction during catchup.
+    db_pool: Option<Arc<DbPool>>,
 }
 
 impl LiveCollector {
@@ -72,6 +76,7 @@ impl LiveCollector {
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
         factory_matchers: Arc<Vec<FactoryMatcher>>,
         eth_call_collector: Option<LiveEthCallCollector>,
+        db_pool: Option<Arc<DbPool>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
@@ -133,6 +138,7 @@ impl LiveCollector {
             expected_start_block,
             factory_matchers,
             eth_call_collector,
+            db_pool,
         }
     }
 
@@ -157,6 +163,14 @@ impl LiveCollector {
             self.chain.name,
             self.config.reorg_depth
         );
+
+        // Run catchup phase for incomplete blocks from previous session
+        self.run_catchup_phase(&log_decoder_tx, &eth_call_decoder_tx)
+            .await?;
+
+        // Backfill gaps from incomplete previous backfills
+        self.backfill_storage_gaps(&live_tx, &log_decoder_tx, &eth_call_decoder_tx, &transform_reorg_tx)
+            .await?;
 
         // Gap detection and backfill happen on first block
         let mut first_block_seen = false;
@@ -394,7 +408,7 @@ impl LiveCollector {
         }
 
         // Collect eth_calls if configured
-        let eth_call_count = if let Some(ref mut eth_collector) = self.eth_call_collector {
+        if let Some(ref mut eth_collector) = self.eth_call_collector {
             // Update factory addresses in collector
             eth_collector.update_factory_addresses(&factory_addresses);
 
@@ -539,6 +553,34 @@ impl LiveCollector {
         Ok(())
     }
 
+    /// Backfill gaps in storage from incomplete previous backfills.
+    async fn backfill_storage_gaps(
+        &mut self,
+        live_tx: &mpsc::Sender<LiveMessage>,
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
+    ) -> Result<(), CollectorError> {
+        let gaps = self.storage.find_gaps()?;
+        if gaps.is_empty() {
+            return Ok(());
+        }
+
+        let total_missing: u64 = gaps.iter().map(|(s, e)| e - s + 1).sum();
+        tracing::info!(
+            "Found {} gaps ({} missing blocks) in storage, backfilling",
+            gaps.len(),
+            total_missing
+        );
+
+        for (start, end) in gaps {
+            self.backfill_blocks(start, end, live_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     /// Fetch full block data via HTTP.
     async fn fetch_full_block(&self, block_number: u64) -> Result<LiveBlock, CollectorError> {
         // Use full_transactions=false to only fetch tx hashes, not full transaction objects.
@@ -672,6 +714,154 @@ impl LiveCollector {
         LiveFactoryAddresses {
             addresses_by_collection,
         }
+    }
+
+    /// Run catchup phase for incomplete blocks from previous session.
+    ///
+    /// Scans storage for blocks that were partially processed and replays
+    /// them through the appropriate pipeline stages before starting live mode.
+    async fn run_catchup_phase(
+        &mut self,
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) -> Result<(), CollectorError> {
+        // Get registered handler keys from progress tracker
+        let registered_handlers = if let Some(ref tracker) = self.progress_tracker {
+            let tracker = tracker.lock().await;
+            tracker.handler_keys().clone()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Create catchup service with database access if available
+        let catchup_service = if let Some(ref db_pool) = self.db_pool {
+            LiveCatchupService::with_db(
+                &self.chain.name,
+                self.chain.chain_id as i64,
+                registered_handlers.clone(),
+                db_pool.clone(),
+            )
+        } else {
+            LiveCatchupService::new(&self.chain.name, registered_handlers.clone())
+        };
+
+        // Reconstruct missing status files before scanning for incomplete blocks
+        match catchup_service.reconstruct_missing_status_files().await {
+            Ok(count) if count > 0 => {
+                tracing::info!("Reconstructed {} missing status files", count);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reconstruct missing status files: {}", e);
+            }
+            _ => {}
+        }
+
+        // Load progress from storage files for accurate catchup detection
+        if let Some(ref tracker) = self.progress_tracker {
+            let mut tracker = tracker.lock().await;
+            if let Err(e) = tracker.load_from_storage(&self.storage) {
+                tracing::warn!("Failed to load progress from storage: {}", e);
+            }
+        }
+
+        // Scan for incomplete blocks
+        let scan_result = match catchup_service.scan_incomplete_blocks() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Failed to scan for incomplete blocks: {}", e);
+                return Ok(()); // Continue with live mode even if catchup scan fails
+            }
+        };
+
+        if scan_result.is_empty() {
+            tracing::info!("No incomplete blocks found, skipping catchup phase");
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Catchup phase: {} blocks need processing ({} log decode, {} call decode, {} transform)",
+            scan_result.total_blocks(),
+            scan_result.blocks_needing_log_decode.len(),
+            scan_result.blocks_needing_call_decode.len(),
+            scan_result.blocks_needing_transform.len()
+        );
+
+        // Replay logs for decoding
+        if !scan_result.blocks_needing_log_decode.is_empty() {
+            if let Some(decoder_tx) = log_decoder_tx {
+                match catchup_service
+                    .replay_logs_for_decode(&scan_result.blocks_needing_log_decode, decoder_tx)
+                    .await
+                {
+                    Ok(count) => {
+                        tracing::info!(
+                            "Catchup: replayed logs for {} blocks to decoder",
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to replay logs for catchup: {}", e);
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Blocks need log decoding but no log decoder configured, skipping"
+                );
+            }
+        }
+
+        // Replay eth_calls for decoding
+        if !scan_result.blocks_needing_call_decode.is_empty() {
+            if let Some(decoder_tx) = eth_call_decoder_tx {
+                match catchup_service
+                    .replay_calls_for_decode(&scan_result.blocks_needing_call_decode, decoder_tx)
+                    .await
+                {
+                    Ok(count) => {
+                        tracing::info!(
+                            "Catchup: replayed eth_calls for {} blocks to decoder",
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to replay eth_calls for catchup: {}", e);
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Blocks need eth_call decoding but no eth_call decoder configured, skipping"
+                );
+            }
+        }
+
+        // Log blocks needing transformation (actual replay happens via decoder -> transform pipeline)
+        if !scan_result.blocks_needing_transform.is_empty() {
+            for (block_num, missing_handlers) in &scan_result.blocks_needing_transform {
+                tracing::info!(
+                    "Catchup: block {} needs transformation by handlers: {:?}",
+                    block_num,
+                    missing_handlers
+                );
+            }
+            // Note: Transformation catchup is handled implicitly - once decoded data is replayed
+            // to the decoder, it will flow through to the transform engine. The engine reads
+            // decoded data from storage and sends to handlers. The missing_handlers info is
+            // useful for logging but the actual catchup mechanism relies on:
+            // 1. Decoder marks logs_decoded/eth_calls_decoded when done
+            // 2. Transform engine receives decoded data and processes with all handlers
+            // 3. Progress tracker marks completed_handlers as each handler finishes
+            //
+            // For blocks that are already decoded but not transformed, we need to trigger
+            // the transform engine to re-read the decoded data. This happens automatically
+            // when the decoder sends its completion messages, but for blocks that are
+            // ALREADY decoded (logs_decoded=true, eth_calls_decoded=true), we need to
+            // replay the decoded data directly to the transform channels.
+            //
+            // TODO: Implement replay_decoded_for_transform() if needed for pure transform catchup
+        }
+
+        tracing::info!("Catchup phase complete");
+        Ok(())
     }
 }
 

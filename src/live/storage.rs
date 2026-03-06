@@ -629,6 +629,26 @@ impl LiveStorage {
         Ok(self.list_blocks()?.into_iter().max())
     }
 
+    /// Find gaps (missing block numbers) in storage.
+    /// Returns ranges of missing blocks as (start, end) tuples (inclusive).
+    pub fn find_gaps(&self) -> Result<Vec<(u64, u64)>, StorageError> {
+        let blocks = self.list_blocks()?;
+        if blocks.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let mut gaps = Vec::new();
+        for window in blocks.windows(2) {
+            let current = window[0];
+            let next = window[1];
+            if next > current + 1 {
+                // Gap found: blocks from current+1 to next-1 are missing
+                gaps.push((current + 1, next - 1));
+            }
+        }
+        Ok(gaps)
+    }
+
     // =========================================================================
     // Bulk operations
     // =========================================================================
@@ -857,6 +877,71 @@ mod tests {
         assert!(storage.block_exists(999));
         storage.delete_all(999).unwrap();
         assert!(!storage.block_exists(999));
+    }
+
+    #[test]
+    fn test_find_gaps() {
+        let (storage, _tmp) = test_storage();
+
+        // Create blocks with gaps: 100, 101, 105, 106, 110
+        for num in [100, 101, 105, 106, 110] {
+            let block = LiveBlock {
+                number: num,
+                hash: [0u8; 32],
+                parent_hash: [0u8; 32],
+                timestamp: 0,
+                tx_hashes: vec![],
+            };
+            storage.write_block(&block).unwrap();
+        }
+
+        let gaps = storage.find_gaps().unwrap();
+        // Gap 1: 102-104, Gap 2: 107-109
+        assert_eq!(gaps, vec![(102, 104), (107, 109)]);
+    }
+
+    #[test]
+    fn test_find_gaps_no_gaps() {
+        let (storage, _tmp) = test_storage();
+
+        // Create consecutive blocks
+        for num in 100..=105 {
+            let block = LiveBlock {
+                number: num,
+                hash: [0u8; 32],
+                parent_hash: [0u8; 32],
+                timestamp: 0,
+                tx_hashes: vec![],
+            };
+            storage.write_block(&block).unwrap();
+        }
+
+        let gaps = storage.find_gaps().unwrap();
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn test_find_gaps_empty_storage() {
+        let (storage, _tmp) = test_storage();
+        let gaps = storage.find_gaps().unwrap();
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn test_find_gaps_single_block() {
+        let (storage, _tmp) = test_storage();
+
+        let block = LiveBlock {
+            number: 100,
+            hash: [0u8; 32],
+            parent_hash: [0u8; 32],
+            timestamp: 0,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+
+        let gaps = storage.find_gaps().unwrap();
+        assert!(gaps.is_empty());
     }
 
     #[test]

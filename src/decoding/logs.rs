@@ -107,6 +107,7 @@ pub async fn decode_logs(
     transform_tx: Option<Sender<DecodedEventsMessage>>,
     recollect_tx: Option<Sender<RecollectRequest>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
+    skip_catchup: bool,
 ) -> Result<(), LogDecodingError> {
     let output_base = PathBuf::from(format!("data/{}/historical/decoded/logs", chain.name));
     std::fs::create_dir_all(&output_base)?;
@@ -144,23 +145,25 @@ pub async fn decode_logs(
     // =========================================================================
     // Catchup phase: Process existing raw log files
     // =========================================================================
-    let raw_logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
-    if raw_logs_dir.exists() {
-        super::catchup::catchup_decode_logs(
-            &raw_logs_dir,
-            &output_base,
-            range_size,
-            &regular_matchers,
-            &factory_matchers,
-            chain,
-            raw_data_config,
-            transform_tx.as_ref(),
-            recollect_tx.as_ref(),
-        )
-        .await?;
-    }
+    if !skip_catchup {
+        let raw_logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
+        if raw_logs_dir.exists() {
+            super::catchup::catchup_decode_logs(
+                &raw_logs_dir,
+                &output_base,
+                range_size,
+                &regular_matchers,
+                &factory_matchers,
+                chain,
+                raw_data_config,
+                transform_tx.as_ref(),
+                recollect_tx.as_ref(),
+            )
+            .await?;
+        }
 
-    tracing::info!("Log decoding catchup complete for chain {}", chain.name);
+        tracing::info!("Log decoding catchup complete for chain {}", chain.name);
+    }
 
     // =========================================================================
     // Live phase: Process new data as it arrives
@@ -1248,8 +1251,12 @@ pub(crate) async fn process_logs_live(
     if let Ok(mut status) = storage.read_status(block_number) {
         status.logs_decoded = true;
         if let Err(e) = storage.write_status(block_number, &status) {
-            tracing::warn!("Failed to update block status after decoding: {}", e);
+            tracing::warn!("Failed to update block status after log decoding: {}", e);
+        } else {
+            tracing::info!("Block {} logs decoded", block_number);
         }
+    } else {
+        tracing::warn!("Block {} status file not found for log decode completion", block_number);
     }
 
     // Signal that all events for this block have been sent
