@@ -156,6 +156,15 @@ When cache exceeds `max_size_gb * eviction_threshold`:
 2. Oldest entries are evicted until cache is at 80% of threshold
 3. Evicted data can be re-fetched from S3 on demand
 
+### Cache Index Persistence
+
+The cache index is persisted to `data/.cache_index.json` for crash recovery:
+
+- Index is saved after each eviction cycle
+- On restart, the index is loaded to restore cache metadata
+- Access times are approximated from timestamps (slight drift is acceptable for LRU)
+- Atomic writes via tmp file + rename ensure crash safety
+
 ## Distributed Coordination
 
 ### Marker Files
@@ -207,6 +216,17 @@ To run without S3, simply omit the `storage` section from config.
 
 ## Failure Handling
 
+### Automatic Retry Service
+
+When S3 is enabled, the indexer automatically starts a background retry service on startup:
+
+1. Loads any pending uploads from `data/.upload_queue.json`
+2. Processes failed uploads with exponential backoff
+3. Saves queue state after each retry cycle (crash-safe)
+4. Runs until process exit
+
+The service requires no configuration - it starts automatically when S3 storage is configured.
+
 ### Upload Failures
 
 Failed uploads are queued for retry:
@@ -215,6 +235,7 @@ Failed uploads are queued for retry:
 2. S3 upload is attempted synchronously
 3. On failure, upload is queued with exponential backoff
 4. Queue is persisted to `data/.upload_queue.json` for crash recovery
+5. Background retry service processes the queue automatically
 
 ### Network Partitions
 
