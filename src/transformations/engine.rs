@@ -1522,36 +1522,20 @@ impl TransformationEngine {
                 // First pass: identify ready indices without holding mutable borrow
                 let ready_indices: Vec<usize> = {
                     let pending = state.pending_events.get(&handler_key).unwrap();
-                    tracing::info!(
-                        "  Handler {} has {} pending event batches",
-                        handler_key, pending.len()
-                    );
 
                     pending
                         .iter()
                         .enumerate()
-                        .filter(|(idx, event_data)| {
-                            let matches_range = (event_data.range_start, event_data.range_end) == range_key;
-                            tracing::info!(
-                                "    Pending[{}] range ({}, {}) vs {:?}: {}",
-                                idx, event_data.range_start, event_data.range_end, range_key,
-                                if matches_range { "MATCHES" } else { "no match" }
-                            );
-                            matches_range
+                        .filter(|(_, event_data)| {
+                            (event_data.range_start, event_data.range_end) == range_key
                         })
-                        .filter(|(idx, event_data)| {
-                            let all_deps_ready = event_data.required_calls.iter().all(|dep| {
-                                let found = state.received_calls
+                        .filter(|(_, event_data)| {
+                            event_data.required_calls.iter().all(|dep| {
+                                state.received_calls
                                     .get(dep)
                                     .map(|ranges| ranges.contains(&range_key))
-                                    .unwrap_or(false);
-                                tracing::info!(
-                                    "    Pending[{}] dep {:?} for range {:?}: {}",
-                                    idx, dep, range_key, if found { "READY" } else { "NOT READY" }
-                                );
-                                found
-                            });
-                            all_deps_ready
+                                    .unwrap_or(false)
+                            })
                         })
                         .map(|(i, _)| i)
                         .collect()
@@ -1688,19 +1672,17 @@ impl TransformationEngine {
     }
 
     /// Process range completion signal.
-    /// Records progress for all handlers even when no events matched their triggers.
+    /// Records progress for ALL handlers (event + call) even when no events/calls matched their triggers.
     /// This ensures handlers don't unnecessarily re-process empty ranges on restart.
     async fn process_range_complete(
         &self,
         msg: RangeCompleteMessage,
     ) -> Result<(), TransformationError> {
-        // Get all unique event handlers
-        let handlers = self.registry.unique_event_handlers();
-
-        for info in &handlers {
-            let handler_key = info.handler.handler_key();
+        // Mark ALL handlers as complete for this range (event + call handlers)
+        for handler in self.registry.all_handlers() {
+            let handler_key = handler.handler_key();
             // UPSERT handles duplicates gracefully - if a handler already recorded
-            // progress for this range (because it had events), this is a no-op
+            // progress for this range (because it had events/calls), this is a no-op
             self.record_completed_range_for_handler(
                 &handler_key,
                 msg.range_start,
@@ -1752,7 +1734,7 @@ impl TransformationEngine {
 
         tracing::debug!(
             "Recorded progress for {} handlers on range {}-{}",
-            handlers.len(),
+            self.registry.all_handlers().len(),
             msg.range_start,
             msg.range_end
         );

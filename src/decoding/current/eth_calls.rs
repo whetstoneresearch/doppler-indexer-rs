@@ -154,7 +154,7 @@ pub async fn decode_eth_calls_live(
 
                         // Update block status to mark decoding complete
                         if let Ok(mut status) = live_storage.read_status(range_start) {
-                            status.decoded = true;
+                            status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
                                 tracing::warn!("Failed to update block status after eth_call decoding: {}", e);
                             }
@@ -276,7 +276,7 @@ pub async fn decode_eth_calls_live(
 
                         // Update block status to mark decoding complete
                         if let Ok(mut status) = live_storage.read_status(range_start) {
-                            status.decoded = true;
+                            status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
                                 tracing::warn!("Failed to update block status after once_call decoding: {}", e);
                             }
@@ -381,7 +381,7 @@ pub async fn decode_eth_calls_live(
 
                         // Update block status to mark decoding complete
                         if let Ok(mut status) = live_storage.read_status(range_start) {
-                            status.decoded = true;
+                            status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
                                 tracing::warn!("Failed to update block status after event_call decoding: {}", e);
                             }

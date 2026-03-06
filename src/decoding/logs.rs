@@ -1244,9 +1244,9 @@ pub(crate) async fn process_logs_live(
         }
     }
 
-    // Update block status to mark decoding complete
+    // Update block status to mark log decoding complete
     if let Ok(mut status) = storage.read_status(block_number) {
-        status.decoded = true;
+        status.logs_decoded = true;
         if let Err(e) = storage.write_status(block_number, &status) {
             tracing::warn!("Failed to update block status after decoding: {}", e);
         }

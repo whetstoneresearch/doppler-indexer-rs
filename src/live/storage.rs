@@ -805,14 +805,12 @@ mod tests {
     fn test_status_roundtrip() {
         let (storage, _tmp) = test_storage();
 
-        let status = LiveBlockStatus {
-            collected: true,
-            block_fetched: true,
-            receipts_collected: true,
-            logs_collected: false,
-            decoded: false,
-            transformed: false,
-        };
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = false;
+        status.completed_handlers.insert("handler_a".to_string());
 
         storage.write_status(100, &status).unwrap();
         let read_status = storage.read_status(100).unwrap();
@@ -820,6 +818,7 @@ mod tests {
         assert!(read_status.collected);
         assert!(read_status.block_fetched);
         assert!(!read_status.logs_collected);
+        assert!(read_status.completed_handlers.contains("handler_a"));
     }
 
     #[test]

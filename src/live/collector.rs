@@ -317,6 +317,8 @@ impl LiveCollector {
         let mut status = self.storage.read_status(block_number)?;
         status.receipts_collected = true;
         status.logs_collected = true;
+        // Factory extraction is always done at this point (even if no factories found)
+        status.factories_extracted = true;
         self.storage.write_status(block_number, &status)?;
 
         // Send to live message channel
@@ -384,6 +386,13 @@ impl LiveCollector {
             }
         }
 
+        // If no log decoder is configured, mark logs as decoded
+        if log_decoder_tx.is_none() {
+            let mut status = self.storage.read_status(block_number)?;
+            status.logs_decoded = true;
+            self.storage.write_status(block_number, &status)?;
+        }
+
         // Collect eth_calls if configured
         let eth_call_count = if let Some(ref mut eth_collector) = self.eth_call_collector {
             // Update factory addresses in collector
@@ -406,6 +415,13 @@ impl LiveCollector {
                         self.storage.write_eth_calls(block_number, &calls)?;
                     }
                     count
+                        );
+                    }
+
+                    // Mark eth_calls as collected
+                    let mut status = self.storage.read_status(block_number)?;
+                    status.eth_calls_collected = true;
+                    self.storage.write_status(block_number, &status)?;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -417,16 +433,25 @@ impl LiveCollector {
                 }
             }
         } else {
-            0
+            // No eth_call collector configured - mark as collected and decoded
+            let mut status = self.storage.read_status(block_number)?;
+            status.eth_calls_collected = true;
+            status.eth_calls_decoded = true;
+            self.storage.write_status(block_number, &status)?;
         };
 
-        tracing::debug!(
-            "Processed live block {} with {} receipts, {} logs, {} eth_calls",
-            block_number,
-            receipts.len(),
-            logs.len(),
-            eth_call_count
-        );
+        // If no eth_call decoder is configured, mark eth_calls as decoded
+        if eth_call_decoder_tx.is_none() && self.eth_call_collector.is_some() {
+            let mut status = self.storage.read_status(block_number)?;
+            status.eth_calls_decoded = true;
+            self.storage.write_status(block_number, &status)?;
+        }
+
+        // If no handlers are registered, mark transformed=true
+        // (decoders will still set logs_decoded/eth_calls_decoded as they finish)
+        if let Some(ref tracker) = self.progress_tracker {
+            tracker.lock().await.mark_transformed_if_no_handlers(block_number);
+        }
 
         Ok(())
     }
