@@ -93,7 +93,8 @@ impl LiveStorage {
         Ok(())
     }
 
-    /// Clean up leftover .tmp files from interrupted writes.
+    /// Clean up leftover temp files from interrupted writes.
+    /// Matches files with `.tmp.{random}` suffix pattern.
     fn cleanup_temp_files(&self, subdirs: &[&str]) -> Result<(), StorageError> {
         for subdir in subdirs {
             let dir = self.base_dir.join(subdir);
@@ -104,7 +105,7 @@ impl LiveStorage {
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "tmp") {
+                    if is_temp_file(&path) {
                         tracing::debug!("Cleaning up leftover temp file: {:?}", path);
                         let _ = fs::remove_file(&path);
                     }
@@ -118,14 +119,14 @@ impl LiveStorage {
         Ok(())
     }
 
-    /// Recursively clean up .tmp files in nested directories.
+    /// Recursively clean up temp files in nested directories.
     fn cleanup_temp_files_recursive(&self, dir: &Path) -> Result<(), StorageError> {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     self.cleanup_temp_files_recursive(&path)?;
-                } else if path.extension().map_or(false, |ext| ext == "tmp") {
+                } else if is_temp_file(&path) {
                     tracing::debug!("Cleaning up leftover temp file: {:?}", path);
                     let _ = fs::remove_file(&path);
                 }
@@ -308,8 +309,16 @@ impl LiveStorage {
             fs::create_dir_all(parent)?;
         }
 
-        // Write to temp file, flush, sync, then atomic rename
-        let temp_path = path.with_extension("tmp");
+        // Write to temp file with unique suffix to avoid race conditions
+        // when multiple writers (collector + decoder) write status for the same block
+        let random_suffix: u32 = rand::random();
+        let temp_name = format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            random_suffix
+        );
+        let temp_path = path.with_file_name(temp_name);
+
         let file = fs::File::create(&temp_path)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer_pretty(&mut writer, status)?;
@@ -701,13 +710,21 @@ impl LiveStorage {
 ///
 /// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
 /// Works with any serializable type including slices.
+/// Uses unique temp file names to avoid race conditions between concurrent writers.
 fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Write to temp file, flush, sync, then atomic rename
-    let temp_path = path.with_extension("tmp");
+    // Write to temp file with unique suffix to avoid race conditions
+    let random_suffix: u32 = rand::random();
+    let temp_name = format!(
+        "{}.tmp.{}",
+        path.file_name().unwrap().to_string_lossy(),
+        random_suffix
+    );
+    let temp_path = path.with_file_name(temp_name);
+
     let file = fs::File::create(&temp_path)?;
     let mut writer = BufWriter::new(file);
     bincode::serialize_into(&mut writer, data)?;
@@ -746,6 +763,13 @@ fn map_io_not_found(err: std::io::Error, block_number: u64) -> StorageError {
     } else {
         StorageError::Io(err)
     }
+}
+
+/// Check if a file is a temp file (has `.tmp.{random}` suffix).
+fn is_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map_or(false, |name| name.contains(".tmp."))
 }
 
 fn list_block_numbers(dir: &Path) -> Result<Vec<u64>, StorageError> {
