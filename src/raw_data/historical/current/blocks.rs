@@ -6,7 +6,7 @@ use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
-pub async fn collect_blocks(
+pub async fn _collect_blocks(
     _chain: &ChainConfig,
     _client: &UnifiedRpcClient,
     _raw_data_config: &RawDataCollectionConfig,

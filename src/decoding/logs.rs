@@ -64,7 +64,7 @@ pub(crate) struct EventMatcher {
     /// Addresses to match (for regular contracts)
     pub addresses: HashSet<[u8; 20]>,
     /// If true, this is a factory event (addresses come from factory discovery)
-    pub is_factory: bool,
+    pub _is_factory: bool,
     /// Start block for this contract (events before this block are skipped)
     pub start_block: Option<u64>,
 }
@@ -222,7 +222,7 @@ pub(crate) fn build_event_matchers(
                     event_name,
                     event: parsed,
                     addresses: addresses.clone(),
-                    is_factory: false,
+                    _is_factory: false,
                     start_block,
                 });
             }
@@ -247,7 +247,7 @@ pub(crate) fn build_event_matchers(
                                     event_name,
                                     event: parsed,
                                     addresses: HashSet::new(),
-                                    is_factory: true,
+                                    _is_factory: true,
                                     // Factory events use discovery block, not start_block
                                     start_block: None,
                                 });

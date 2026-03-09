@@ -2395,6 +2395,7 @@ pub fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthC
 
 /// Configuration for a token pool call
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct TokenCallConfig {
     /// Token name (used for output directory naming as {token_name}_pool)
     pub(crate) token_name: String,
@@ -3471,13 +3472,6 @@ pub(crate) async fn process_once_calls_multicall(
         Some(b) => b,
         None => return Ok(()),
     };
-
-    // Collect all calls across all contracts into one multicall
-    struct OnceCallPending {
-        contract_name: String,
-        function_name: String,
-        address: Address,
-    }
 
     let mut all_slots: Vec<MulticallSlotGeneric<OnceCallMeta>> = Vec::new();
     // (contract_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file)
@@ -4770,6 +4764,7 @@ pub(crate) struct MulticallSlot<'a> {
 
 /// Generic slot for tracking call metadata through multicall execution
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct MulticallSlotGeneric<M> {
     pub(crate) block_number: u64,
     pub(crate) block_timestamp: u64,
@@ -5156,7 +5151,7 @@ pub(crate) async fn process_token_range_multicall(
 
         if !sub_calls.is_empty() {
             let multicall_data = build_multicall_calldata(&sub_calls);
-            let tx = TransactionRequest::default()
+            let _tx = TransactionRequest::default()
                 .to(multicall3_address)
                 .input(multicall_data.into());
             let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));

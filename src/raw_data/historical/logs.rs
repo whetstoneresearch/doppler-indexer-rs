@@ -89,7 +89,7 @@ pub(crate) async fn process_completed_range(
     log_fields: &Option<Vec<LogField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
-    existing_files: &HashSet<String>,
+    _existing_files: &HashSet<String>,
     decoder_tx: &Option<Sender<DecoderMessage>>,
 ) -> Result<(), LogCollectionError> {
     let range = BlockRange {

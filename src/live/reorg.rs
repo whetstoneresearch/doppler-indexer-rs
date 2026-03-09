@@ -15,7 +15,7 @@ pub struct ReorgEvent {
     /// Block numbers that were orphaned by the reorg.
     pub orphaned: Vec<u64>,
     /// The new block that triggered the reorg detection.
-    pub new_block_number: u64,
+    pub _new_block_number: u64,
     /// How many blocks deep the reorg was.
     pub depth: u64,
 }
@@ -97,7 +97,7 @@ impl ReorgDetector {
         Some(ReorgEvent {
             common_ancestor,
             orphaned,
-            new_block_number: block.number,
+            _new_block_number: block.number,
             depth,
         })
     }
@@ -110,7 +110,7 @@ impl ReorgDetector {
         let mut current_number = new_block.number.saturating_sub(1);
 
         // Walk back through our tracked blocks
-        while let Some(&tracked_hash) = self.recent_blocks.get(&current_number) {
+        while let Some(_) = self.recent_blocks.get(&current_number) {
             // Check if this tracked block's hash matches the new chain
             // Since we only have the new block's parent_hash, we can only check immediate parent
             // For deeper reorgs, we assume all blocks since parent_hash mismatch are orphaned
@@ -144,21 +144,25 @@ impl ReorgDetector {
         self.recent_blocks = self.recent_blocks.split_off(&min_block);
     }
 
+    #[allow(dead_code)]
     /// Get the most recent block number we're tracking.
     pub fn latest_block(&self) -> Option<u64> {
         self.recent_blocks.keys().next_back().copied()
     }
 
+    #[allow(dead_code)]
     /// Get the hash of a specific block if we're tracking it.
     pub fn get_block_hash(&self, block_number: u64) -> Option<[u8; 32]> {
         self.recent_blocks.get(&block_number).copied()
     }
 
+    #[allow(dead_code)]
     /// Get the number of blocks currently being tracked.
     pub fn tracked_count(&self) -> usize {
         self.recent_blocks.len()
     }
 
+    #[allow(dead_code)]
     /// Clear all tracked blocks (e.g., after a deep reorg recovery).
     pub fn clear(&mut self) {
         self.recent_blocks.clear();

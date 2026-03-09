@@ -116,6 +116,7 @@ pub struct EthCallTrigger {
 }
 
 impl EthCallTrigger {
+    #[allow(dead_code)]
     pub fn new(source: impl Into<String>, function_name: impl Into<String>) -> Self {
         Self {
             source: source.into(),

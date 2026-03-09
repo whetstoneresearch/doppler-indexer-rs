@@ -138,7 +138,7 @@ impl LiveCatchupService {
         let receipts_exist = self.storage.read_receipts(block_number).is_ok();
         let logs_exist = self.storage.read_logs(block_number).is_ok();
         let eth_calls_exist = self.storage.read_eth_calls(block_number).is_ok();
-        let factories_exist = self.storage.read_factories(block_number).is_ok();
+        let _factories_exist = self.storage.read_factories(block_number).is_ok();
 
         // If we have the block, mark collection phases as complete
         if block_exists {
@@ -559,6 +559,7 @@ impl LiveCatchupService {
     }
 
     /// Get the storage reference for external use.
+    #[allow(dead_code)]
     pub fn storage(&self) -> &LiveStorage {
         &self.storage
     }

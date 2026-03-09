@@ -8,6 +8,7 @@ use crate::rpc::RpcError;
 
 /// RPC method names for metric labels
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum RpcMethod {
     GetBlockNumber,
     GetBlock,

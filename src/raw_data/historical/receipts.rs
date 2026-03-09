@@ -18,6 +18,7 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::ReceiptField;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum ReceiptCollectionError {
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError),
@@ -303,6 +304,7 @@ pub(crate) struct BlockInfo {
 /// State for batch-based receipt fetching within a range
 /// Enables early RPC fetching before the full range is complete
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct ReceiptBatchState {
     pub(crate) range_start: u64,
     pub(crate) range_end: u64,
@@ -502,6 +504,7 @@ pub(crate) async fn send_logs_to_channels(
 }
 
 /// Results from fetching receipts for a batch of blocks
+#[allow(dead_code)]
 pub(crate) struct BatchFetchResult {
     pub(crate) minimal_records: Vec<MinimalReceiptRecord>,
     pub(crate) full_records: Vec<FullReceiptRecord>,

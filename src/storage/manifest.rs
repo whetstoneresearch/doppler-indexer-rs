@@ -50,6 +50,7 @@ impl Marker {
     }
 
     /// Deserialize from JSON bytes.
+    #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
         serde_json::from_slice(bytes)
             .map_err(|e| StorageError::Serialization(e.to_string()))
@@ -80,6 +81,7 @@ pub struct S3Manifest {
     pub factories: HashMap<String, Vec<(u64, u64)>>,
 }
 
+#[allow(dead_code)]
 impl S3Manifest {
     /// Create a new empty manifest.
     pub fn new() -> Self {
@@ -199,6 +201,7 @@ impl S3Manifest {
 /// - Reading/writing marker files
 /// - Manifest aggregation from markers
 /// - Caching and periodic refresh
+#[allow(dead_code)]
 pub struct ManifestManager {
     s3: S3Backend,
     local_base: PathBuf,
@@ -209,6 +212,7 @@ pub struct ManifestManager {
     last_refresh: RwLock<Option<Instant>>,
 }
 
+#[allow(dead_code)]
 impl ManifestManager {
     /// Create a new ManifestManager.
     pub fn new(s3: S3Backend, local_base: PathBuf, config: SyncConfig) -> Self {

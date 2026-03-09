@@ -11,6 +11,7 @@ pub enum DbError {
     #[error("Build error: {0}")]
     BuildError(#[from] deadpool_postgres::BuildError),
 
+    #[allow(dead_code)]
     #[error("Configuration error: {0}")]
     ConfigError(String),
 

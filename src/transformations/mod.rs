@@ -63,16 +63,12 @@ pub mod registry;
 pub mod traits;
 pub mod util;
 
-// Re-exports for convenience
 pub use context::{
-    DecodedCall, DecodedEvent, DecodedValue, EthCallRequest, FieldExtractor, HistoricalCallQuery,
-    HistoricalEventQuery, TransactionAddresses, TransformationContext,
+    DecodedCall, DecodedEvent, DecodedValue, TransformationContext,
 };
 pub use engine::{
     DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteMessage,
     ReorgMessage, TransformationEngine,
 };
 pub use error::TransformationError;
-pub use historical::HistoricalDataReader;
-pub use registry::{build_registry, TransformationRegistry};
-pub use traits::{EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler};
+pub use registry::build_registry;

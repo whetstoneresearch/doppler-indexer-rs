@@ -25,6 +25,7 @@ pub mod transformations {
     pub const CATCHUP_BATCH_SIZE: usize = 10000;
 }
 
+#[allow(dead_code)]
 /// Raw data collection defaults
 pub mod raw_data {
     /// Default capacity for main channels (blocks, logs, eth_calls)
@@ -62,6 +63,7 @@ pub mod rpc {
 }
 
 /// Database pool defaults
+#[allow(dead_code)]
 pub mod db_pool {
     /// Default maximum pool size
     pub const MAX_SIZE: usize = 16;

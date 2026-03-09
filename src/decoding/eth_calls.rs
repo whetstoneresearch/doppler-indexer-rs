@@ -56,7 +56,7 @@ pub(crate) struct CallDecodeConfig {
     pub contract_name: String,
     pub function_name: String,
     pub output_type: EvmType,
-    pub is_once: bool,
+    pub _is_once: bool,
     /// Start block for this contract (calls before this block are skipped)
     pub start_block: Option<u64>,
 }
@@ -254,7 +254,7 @@ pub(crate) fn build_decode_configs(
                         contract_name: contract_name.clone(),
                         function_name,
                         output_type: call.output_type.clone(),
-                        is_once: true,
+                        _is_once: true,
                         start_block,
                     });
                 } else if call.frequency.is_on_events() {
@@ -269,7 +269,7 @@ pub(crate) fn build_decode_configs(
                         contract_name: contract_name.clone(),
                         function_name,
                         output_type: call.output_type.clone(),
-                        is_once: false,
+                        _is_once: false,
                         start_block,
                     });
                 }
@@ -293,7 +293,7 @@ pub(crate) fn build_decode_configs(
                                 contract_name: factory.collection.clone(),
                                 function_name,
                                 output_type: call.output_type.clone(),
-                                is_once: true,
+                                _is_once: true,
                                 start_block: None,
                             });
                         } else if call.frequency.is_on_events() {
@@ -308,7 +308,7 @@ pub(crate) fn build_decode_configs(
                                 contract_name: factory.collection.clone(),
                                 function_name,
                                 output_type: call.output_type.clone(),
-                                is_once: false,
+                                _is_once: false,
                                 start_block: None,
                             });
                         }
@@ -3111,7 +3111,7 @@ fn build_array_value_array(
     records: &[DecodedCallRecord],
     inner_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
-    use arrow::array::{GenericListBuilder, ListBuilder, StructArray, StringBuilder, StructBuilder};
+    use arrow::array::{ListBuilder, StructArray, StringBuilder};
     use arrow::datatypes::Fields;
 
     // Extract array elements from each record
@@ -4392,25 +4392,6 @@ fn convert_to_transform_call(
         function_name: function_name.to_string(),
         trigger_log_index: None,
         result: build_result_map(&record.decoded_value, output_type, function_name),
-    }
-}
-
-/// Convert a DecodedOnceRecord entry to a TransformDecodedCall
-fn convert_once_to_transform_call(
-    record: &DecodedOnceRecord,
-    source_name: &str,
-    function_name: &str,
-    decoded_value: &DecodedValue,
-    output_type: &EvmType,
-) -> TransformDecodedCall {
-    TransformDecodedCall {
-        block_number: record.block_number,
-        block_timestamp: record.block_timestamp,
-        contract_address: record.contract_address,
-        source_name: source_name.to_string(),
-        function_name: function_name.to_string(),
-        trigger_log_index: None,
-        result: build_result_map(decoded_value, output_type, function_name),
     }
 }
 

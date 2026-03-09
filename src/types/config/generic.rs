@@ -26,6 +26,7 @@ pub enum InlineOrPath<T> {
     Path(String),
 }
 
+#[allow(dead_code)]
 impl<T> InlineOrPath<T> {
     /// Returns true if this is an inline value
     pub fn is_inline(&self) -> bool {

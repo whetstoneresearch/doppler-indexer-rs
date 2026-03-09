@@ -86,6 +86,7 @@ pub struct RetryQueue {
     s3: S3Backend,
 }
 
+#[allow(dead_code)]
 impl RetryQueue {
     /// Create a new RetryQueue.
     pub fn new(local_base: PathBuf, config: SyncConfig, s3: S3Backend) -> Self {

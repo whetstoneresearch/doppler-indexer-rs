@@ -29,14 +29,11 @@ use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::eth_call::{EthCallConfig, Frequency, ParamConfig};
 
-// Re-export LiveError as LiveEthCallError for backwards compatibility
-pub use super::error::LiveEthCallError;
-
 /// Collects eth_calls for live mode blocks.
 pub struct LiveEthCallCollector {
     chain_name: String,
     http_client: Arc<UnifiedRpcClient>,
-    storage: LiveStorage,
+    _storage: LiveStorage,
     // Call configurations
     call_configs: Vec<CallConfig>,
     once_configs: HashMap<String, Vec<OnceCallConfig>>,
@@ -47,7 +44,7 @@ pub struct LiveEthCallCollector {
     factory_addresses: HashMap<String, HashSet<Address>>,
     once_called_addresses: HashSet<[u8; 20]>,
     frequency_state: FrequencyState,
-    multicall3_address: Option<Address>,
+    _multicall3_address: Option<Address>,
     rpc_batch_size: usize,
 }
 
@@ -81,7 +78,7 @@ impl LiveEthCallCollector {
         Self {
             chain_name: chain.name.clone(),
             http_client,
-            storage,
+            _storage: storage,
             call_configs,
             once_configs,
             factory_call_configs,
@@ -92,7 +89,7 @@ impl LiveEthCallCollector {
             frequency_state: FrequencyState {
                 last_call_times: HashMap::new(),
             },
-            multicall3_address,
+            _multicall3_address: multicall3_address,
             rpc_batch_size,
         }
     }

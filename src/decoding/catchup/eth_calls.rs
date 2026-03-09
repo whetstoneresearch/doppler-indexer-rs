@@ -44,14 +44,6 @@ pub(crate) enum CatchupWorkItem {
     },
 }
 
-/// Result of processing once calls, used to batch update column indexes after all tasks complete.
-/// This avoids race conditions when multiple concurrent tasks try to read/modify/write the same index.
-pub(crate) struct OnceCallsResult {
-    pub contract_name: String,
-    pub file_name: String,
-    pub columns: Vec<String>,
-}
-
 /// Catchup phase: decode existing raw eth_call files
 pub async fn catchup_decode_eth_calls(
     raw_calls_dir: &Path,

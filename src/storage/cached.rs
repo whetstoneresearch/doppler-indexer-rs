@@ -46,6 +46,7 @@ struct PersistedCacheIndex {
 /// Write-through: All writes go to both local and S3 (synchronously).
 /// Read: Try local first, on miss fetch from S3 and cache locally.
 /// Eviction: LRU eviction of non-pinned entries when cache exceeds threshold.
+#[allow(dead_code)]
 pub struct CachedBackend {
     local: LocalBackend,
     s3: S3Backend,
@@ -59,6 +60,7 @@ pub struct CachedBackend {
     total_size: AtomicU64,
 }
 
+#[allow(dead_code)]
 impl CachedBackend {
     /// Create a new CachedBackend.
     pub fn new(

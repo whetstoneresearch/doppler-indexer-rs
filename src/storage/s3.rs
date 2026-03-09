@@ -17,6 +17,7 @@ use crate::types::config::storage::S3Config;
 ///
 /// Uses the `object_store` crate which supports AWS S3, MinIO, Cloudflare R2,
 /// and other S3-compatible services.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct S3Backend {
     store: Arc<dyn ObjectStore>,
@@ -82,6 +83,7 @@ impl S3Backend {
     }
 
     /// Get the bucket name.
+    #[allow(dead_code)]
     pub fn bucket(&self) -> &str {
         &self.bucket
     }

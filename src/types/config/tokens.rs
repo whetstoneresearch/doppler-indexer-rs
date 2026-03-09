@@ -5,10 +5,10 @@ use alloy_primitives::{Address, FixedBytes};
 use serde::Deserialize;
 
 use crate::types::config::eth_call::EthCallConfig;
-use crate::types::config::generic::InlineOrPath;
-use crate::types::config::loader::{load_config_from_path, ConfigLoadError};
+use crate::types::config::loader::load_config_from_path;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct TokenConfig {
     pub address: Address,
     pub pool: Option<PoolConfig>,
@@ -30,6 +30,7 @@ pub enum AddressOrPoolId {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct PoolConfig {
     #[serde(rename = "type")]
     pub pool_type: PoolType,
@@ -41,9 +42,6 @@ pub struct PoolConfig {
 
 pub type Tokens = HashMap<String, TokenConfig>;
 
-/// Tokens config: inline or path to file/directory
-pub type TokensOrPath = InlineOrPath<Tokens>;
-
 /// Load tokens from a path (file or directory).
 ///
 /// Uses the generic config loader with duplicate key detection.
@@ -53,10 +51,3 @@ pub fn load_tokens_from_path(base_dir: &Path, path: &str) -> anyhow::Result<Toke
         .map_err(|e| panic!("Failed to load tokens: {}", e))
 }
 
-/// Load tokens with proper error handling (no panics).
-pub fn try_load_tokens_from_path(
-    base_dir: &Path,
-    path: &str,
-) -> Result<Tokens, ConfigLoadError> {
-    load_config_from_path(base_dir, path)
-}

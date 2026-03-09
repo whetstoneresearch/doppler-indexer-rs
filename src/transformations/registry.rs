@@ -84,6 +84,7 @@ impl TransformationRegistry {
     /// Register an eth_call handler.
     ///
     /// The handler will be invoked for all call results matching its triggers.
+    #[allow(dead_code)]
     pub fn register_call_handler<H: EthCallHandler + 'static>(&mut self, handler: H) {
         let handler = Arc::new(handler);
         let triggers = handler.triggers();

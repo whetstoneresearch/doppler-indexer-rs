@@ -28,7 +28,7 @@ use super::progress::LiveProgressTracker;
 use super::storage::{LiveStorage, StorageError};
 use super::types::LiveModeConfig;
 use crate::db::DbPool;
-use crate::storage::{StorageBackend, StorageManager};
+use crate::storage::StorageManager;
 
 #[derive(Debug, Error)]
 pub enum CompactionError {
@@ -766,7 +766,7 @@ impl CompactionService {
 
             // range_start in _handler_progress means "next range to process starts at"
             // After compacting range 0-999, the next range starts at 1000
-            let next_range_start = end + 1;
+            let nextrange_start = end + 1;
 
             // Insert or update _handler_progress using raw SQL via query
             db_pool
@@ -778,7 +778,7 @@ impl CompactionService {
                     &[
                         &chain_id as &(dyn ToSql + Sync),
                         &handler_key as &(dyn ToSql + Sync),
-                        &next_range_start as &(dyn ToSql + Sync),
+                        &nextrange_start as &(dyn ToSql + Sync),
                     ],
                 )
                 .await
@@ -979,16 +979,16 @@ mod tests {
     #[test]
     fn test_progress_migration_value() {
         // After compacting range 0-999, the next range starts at 1000
-        let range_start: i64 = 0;
+        let _range_start: i64 = 0;
         let range_end: i64 = 999;
-        let next_range_start = range_end + 1;
+        let nextrange_start = range_end + 1;
 
-        assert_eq!(next_range_start, 1000);
+        assert_eq!(nextrange_start, 1000);
 
         // After compacting range 1000-1999, the next range starts at 2000
         let range_end_2: i64 = 1999;
-        let next_range_start_2 = range_end_2 + 1;
+        let nextrange_start_2 = range_end_2 + 1;
 
-        assert_eq!(next_range_start_2, 2000);
+        assert_eq!(nextrange_start_2, 2000);
     }
 }

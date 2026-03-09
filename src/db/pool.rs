@@ -173,7 +173,7 @@ fn extract_db_value_from_row(
     let col_type = col.type_();
 
     // Handle NULL values first
-    let is_null: bool = row.try_get::<_, Option<bool>>(col_name).map(|v| v.is_none()).unwrap_or(false)
+    let _is_null: bool = row.try_get::<_, Option<bool>>(col_name).map(|v| v.is_none()).unwrap_or(false)
         || row.try_get::<_, Option<i64>>(col_name).map(|v| v.is_none()).unwrap_or(false)
         || row.try_get::<_, Option<String>>(col_name).map(|v| v.is_none()).unwrap_or(false);
 
@@ -275,6 +275,7 @@ fn extract_db_value_from_row(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum SqlParam {
     Null,
     Bool(bool),

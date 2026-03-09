@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::db::DbError;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum TransformationError {
     #[error("Handler '{handler_name}' failed: {message}")]
     HandlerError {
@@ -55,6 +56,7 @@ pub enum TransformationError {
     IncludesPrecompileError(String)
 }
 
+#[allow(dead_code)]
 impl TransformationError {
     /// Create a handler error with context.
     pub fn handler(name: &str, message: impl Into<String>) -> Self {

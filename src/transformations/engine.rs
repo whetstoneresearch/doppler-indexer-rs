@@ -61,6 +61,7 @@ pub struct ReorgMessage {
 
 /// Execution mode for the transformation engine.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum ExecutionMode {
     /// Process data as it arrives (for live/real-time data).
     Streaming,

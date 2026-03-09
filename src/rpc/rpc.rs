@@ -21,6 +21,7 @@ use url::Url;
 /// This abstracts over different client implementations (standard, Alchemy, etc.)
 /// and allows unified usage while each implementation handles rate limiting differently.
 #[async_trait]
+#[allow(dead_code)]
 pub trait RpcProvider: Send + Sync {
     /// Get the current block number
     async fn get_block_number(&self) -> Result<BlockNumber, RpcError>;
@@ -119,6 +120,7 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
 }
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum RpcError {
     #[error("RPC transport error: {0}")]
     Transport(String),
@@ -206,6 +208,7 @@ impl Default for RetryConfig {
     }
 }
 
+#[allow(dead_code)]
 impl RetryConfig {
     pub fn new(max_retries: u32) -> Self {
         Self {
@@ -356,6 +359,7 @@ impl Default for RateLimitConfig {
     }
 }
 
+#[allow(dead_code)]
 impl RpcClientConfig {
     pub fn new(url: Url) -> Self {
         Self {
@@ -395,6 +399,7 @@ pub struct RpcClient {
     jitter: Option<Jitter>,
 }
 
+#[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
         let provider = RootProvider::<Ethereum>::new_http(config.url.clone());

@@ -38,6 +38,7 @@ pub enum DbValue {
 
 impl DbValue {
     /// Check if the value is null
+    #[allow(dead_code)]
     pub fn is_null(&self) -> bool {
         matches!(self, DbValue::Null)
     }
@@ -48,12 +49,14 @@ impl DbValue {
     }
 
     /// Create a JSON value from any serializable type
+    #[allow(dead_code)]
     pub fn json<T: Serialize>(value: T) -> Self {
         DbValue::Json(serde_json::to_value(value).expect("Failed to serialize to JSON"))
     }
 }
 
 /// Database operation returned by handlers.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum DbOperation {
     /// INSERT with ON CONFLICT DO UPDATE (upsert)
@@ -92,6 +95,7 @@ pub enum DbOperation {
 
 /// WHERE clause for UPDATE and DELETE operations.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum WhereClause {
     /// column = value
     Eq(String, DbValue),

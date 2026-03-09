@@ -20,6 +20,7 @@ use crate::types::config::contract::{
 };
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum FactoryCollectionError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -62,6 +63,7 @@ pub enum FactoryMessage {
 /// State for batch-based factory processing within a range
 /// Enables early address forwarding before full range is complete
 #[derive(Debug)]
+#[allow(dead_code)]
 struct FactoryBatchState {
     range_start: u64,
     range_end: u64,
@@ -797,6 +799,7 @@ pub fn get_factory_call_configs(
     configs
 }
 
+#[allow(dead_code)]
 pub fn get_factory_collection_names(
     contracts: &Contracts,
     factory_collections: &FactoryCollections,
@@ -871,7 +874,7 @@ pub struct ExistingLogRange {
 pub struct RecollectRequest {
     pub range_start: u64,
     pub range_end: u64,
-    pub file_path: PathBuf,
+    pub _file_path: PathBuf,
 }
 
 /// Scan existing logs parquet files and return their ranges

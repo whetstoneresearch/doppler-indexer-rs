@@ -54,6 +54,7 @@ pub struct EventTriggerConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventTriggerConfigs(SingleOrMultiple<EventTriggerConfig>);
 
+#[allow(dead_code)]
 impl EventTriggerConfigs {
     /// Create from a single config
     pub fn single(config: EventTriggerConfig) -> Self {
@@ -125,6 +126,7 @@ impl Default for Frequency {
     }
 }
 
+#[allow(dead_code)]
 impl Frequency {
     pub fn is_once(&self) -> bool {
         matches!(self, Frequency::Once)
@@ -398,6 +400,7 @@ impl ParamConfig {
     }
 
     /// Get the event field reference if this is a FromEvent param config
+    #[allow(dead_code)]
     pub fn from_event(&self) -> Option<&str> {
         match self {
             ParamConfig::FromEvent { from_event, .. } => Some(from_event),
@@ -447,6 +450,7 @@ impl ParamValue {
 /// EVM type representation for eth_call output types
 /// Supports simple types, named single values, and named tuples
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub enum EvmType {
     // Simple types (unnamed)
     Int256,
@@ -484,6 +488,7 @@ pub enum EvmType {
     Array(Box<EvmType>),
 }
 
+#[allow(dead_code)]
 impl EvmType {
     /// Parse a simple type string (no name) into EvmType
     fn parse_simple(s: &str) -> Result<EvmType, EvmTypeParseError> {
@@ -980,6 +985,7 @@ impl EvmType {
     }
 
     /// Get Arrow types for each field in a named tuple
+    #[allow(dead_code)]
     pub fn field_arrow_types(&self) -> Option<Vec<(&str, DataType)>> {
         match self {
             EvmType::NamedTuple(fields) => Some(

@@ -19,6 +19,7 @@ pub struct LiveBlock {
 
 impl LiveBlock {
     /// Create a new LiveBlock from raw data.
+    #[allow(dead_code)]
     pub fn new(
         number: u64,
         hash: [u8; 32],
@@ -88,6 +89,7 @@ impl LiveBlockStatus {
 
 /// Messages for live mode processing.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum LiveMessage {
     /// A new block was received.
     Block(LiveBlock),
@@ -166,6 +168,7 @@ impl Default for LiveModeConfig {
 
 /// Progress entry for live mode per-block tracking.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LiveProgress {
     pub chain_id: i64,
     pub handler_key: String,
@@ -241,6 +244,7 @@ pub struct LiveDecodedOnceCall {
 
 /// Metadata for a decoded data file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DecodedFileMetadata {
     /// Schema version for the decoded data
     pub schema_version: u32,

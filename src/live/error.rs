@@ -28,22 +28,15 @@ pub enum LiveError {
     Database(#[from] DbError),
 
     /// Channel closed (sender or receiver dropped)
+    #[allow(dead_code)]
     #[error("Channel closed")]
     ChannelClosed,
 
     /// Block not found
+    #[allow(dead_code)]
     #[error("Block not found: {0}")]
     BlockNotFound(u64),
 }
-
-// Backwards compatibility: Allow converting from the old error types
-
-/// Legacy ProgressError alias for backwards compatibility.
-pub type ProgressError = LiveError;
-
-/// Legacy LiveEthCallError alias for backwards compatibility.
-/// New code should use LiveError directly.
-pub type LiveEthCallError = LiveError;
 
 #[cfg(test)]
 mod tests {

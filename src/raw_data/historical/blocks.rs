@@ -18,6 +18,7 @@ use crate::rpc::RpcError;
 use crate::types::config::raw_data::BlockField;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum BlockCollectionError {
     #[error("RPC error: {0}")]
     Rpc(#[from] RpcError),

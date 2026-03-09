@@ -2,7 +2,6 @@
 //!
 //! The TransformationContext provides handlers with all the data and utilities
 //! they need: decoded events/calls, chain info, historical queries, and RPC access.
-
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
 /// A decoded value from an event parameter or eth_call result.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum DecodedValue {
     Address([u8; 20]),
     Uint256(U256),
@@ -41,6 +41,7 @@ pub enum DecodedValue {
     Array(Vec<DecodedValue>),
 }
 
+#[allow(dead_code)]
 impl DecodedValue {
     /// Try to get as an address.
     pub fn as_address(&self) -> Option<[u8; 20]> {
@@ -220,6 +221,7 @@ impl DecodedValue {
 /// // After (concise):
 /// let asset = event.extract_address("asset")?;
 /// ```
+#[allow(dead_code)]
 pub trait FieldExtractor {
     /// Returns the underlying field values map.
     fn field_values(&self) -> &HashMap<String, DecodedValue>;
@@ -388,6 +390,7 @@ pub trait FieldExtractor {
 
 /// A decoded event ready for transformation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DecodedEvent {
     pub block_number: u64,
     pub block_timestamp: u64,
@@ -405,6 +408,7 @@ pub struct DecodedEvent {
     pub params: HashMap<String, DecodedValue>,
 }
 
+#[allow(dead_code)]
 impl DecodedEvent {
     /// Get a parameter by name, returning an error if missing.
     pub fn get(&self, name: &str) -> Result<&DecodedValue, TransformationError> {
@@ -434,6 +438,7 @@ impl FieldExtractor for DecodedEvent {
 
 /// A decoded eth_call result ready for transformation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DecodedCall {
     pub block_number: u64,
     pub block_timestamp: u64,
@@ -450,6 +455,7 @@ pub struct DecodedCall {
     pub result: HashMap<String, DecodedValue>,
 }
 
+#[allow(dead_code)]
 impl DecodedCall {
     /// Get a result field by name, returning an error if missing.
     pub fn get(&self, name: &str) -> Result<&DecodedValue, TransformationError> {
@@ -488,7 +494,7 @@ pub struct HistoricalEventQuery {
     pub contract_address: Option<[u8; 20]>,
     /// Start block (inclusive)
     pub from_block: u64,
-    /// End block (exclusive) - cannot exceed current block_range_end
+    /// End block (exclusive) - cannot exceed current blockrange_end
     pub to_block: u64,
     /// Maximum results to return
     pub limit: Option<usize>,
@@ -513,6 +519,7 @@ pub struct HistoricalCallQuery {
 
 /// Request for an ad-hoc eth_call.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EthCallRequest {
     pub contract_address: [u8; 20],
     /// Function signature with parameter types and return type.
@@ -526,6 +533,7 @@ pub struct EthCallRequest {
 
 /// Transaction from/to addresses from receipt data.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TransactionAddresses {
     pub from_address: [u8; 20],
     pub to_address: Option<[u8; 20]>,
@@ -535,14 +543,15 @@ pub struct TransactionAddresses {
 ///
 /// Contains all decoded data for the current block range plus utilities
 /// for querying historical data and making additional RPC calls.
+#[allow(dead_code)]
 pub struct TransformationContext {
     // ===== Chain Information =====
     pub chain_name: String,
     pub chain_id: u64,
 
     // ===== Block Range =====
-    pub block_range_start: u64,
-    pub block_range_end: u64,
+    pub blockrange_start: u64,
+    pub blockrange_end: u64,
 
     // ===== Decoded Data for Current Block Range =====
     /// All decoded events in this range
@@ -565,13 +574,14 @@ pub struct TransformationContext {
     pub(crate) contracts: Arc<Contracts>,
 }
 
+#[allow(dead_code)]
 impl TransformationContext {
     /// Create a new transformation context.
     pub fn new(
         chain_name: String,
         chain_id: u64,
-        block_range_start: u64,
-        block_range_end: u64,
+        blockrange_start: u64,
+        blockrange_end: u64,
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
@@ -582,8 +592,8 @@ impl TransformationContext {
         Self {
             chain_name,
             chain_id,
-            block_range_start,
-            block_range_end,
+            blockrange_start,
+            blockrange_end,
             events,
             calls,
             tx_addresses,
@@ -713,21 +723,21 @@ impl TransformationContext {
     // ===== Historical Data Access =====
 
     /// Query decoded events from current or past blocks.
-    /// The query's to_block cannot exceed the current block_range_end.
+    /// The query's to_block cannot exceed the current blockrange_end.
     pub async fn query_events(
         &self,
         mut query: HistoricalEventQuery,
     ) -> Result<Vec<DecodedEvent>, TransformationError> {
         // Enforce: cannot query future blocks
-        if query.to_block > self.block_range_end {
+        if query.to_block > self.blockrange_end {
             return Err(TransformationError::FutureBlockAccess {
                 requested: query.to_block,
-                current_max: self.block_range_end,
+                current_max: self.blockrange_end,
             });
         }
 
         // Clamp to_block to current range
-        query.to_block = query.to_block.min(self.block_range_end);
+        query.to_block = query.to_block.min(self.blockrange_end);
 
         self.historical.query_events(query).await
     }
@@ -738,14 +748,14 @@ impl TransformationContext {
         mut query: HistoricalCallQuery,
     ) -> Result<Vec<DecodedCall>, TransformationError> {
         // Enforce: cannot query future blocks
-        if query.to_block > self.block_range_end {
+        if query.to_block > self.blockrange_end {
             return Err(TransformationError::FutureBlockAccess {
                 requested: query.to_block,
-                current_max: self.block_range_end,
+                current_max: self.blockrange_end,
             });
         }
 
-        query.to_block = query.to_block.min(self.block_range_end);
+        query.to_block = query.to_block.min(self.blockrange_end);
 
         self.historical.query_calls(query).await
     }
@@ -765,10 +775,10 @@ impl TransformationContext {
         block_number: u64,
     ) -> Result<DynSolValue, TransformationError> {
         // Validate block number doesn't exceed current range
-        if block_number > self.block_range_end {
+        if block_number > self.blockrange_end {
             return Err(TransformationError::FutureBlockAccess {
                 requested: block_number,
-                current_max: self.block_range_end,
+                current_max: self.blockrange_end,
             });
         }
 
@@ -804,10 +814,10 @@ impl TransformationContext {
     ) -> Result<Vec<Result<DynSolValue, TransformationError>>, TransformationError> {
         // Validate all block numbers
         for req in &requests {
-            if req.block_number > self.block_range_end {
+            if req.block_number > self.blockrange_end {
                 return Err(TransformationError::FutureBlockAccess {
                     requested: req.block_number,
-                    current_max: self.block_range_end,
+                    current_max: self.blockrange_end,
                 });
             }
         }

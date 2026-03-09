@@ -3,7 +3,7 @@ mod rpc;
 mod unified;
 mod websocket;
 
-pub use alchemy::{AlchemyClient, AlchemyConfig, ComputeUnitCost, SlidingWindowRateLimiter};
-pub use rpc::{RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider};
+pub use alchemy::SlidingWindowRateLimiter;
+pub use rpc::RpcError;
 pub use unified::UnifiedRpcClient;
-pub use websocket::{BlockHeader, ReconnectConfig, WsClient, WsError, WsEvent};
+pub use websocket::{WsClient, WsEvent};

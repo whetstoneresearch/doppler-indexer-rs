@@ -949,7 +949,7 @@ async fn broadcast_reorg_to_decoders(
 ) {
     if let Some(decoder_tx) = log_decoder_tx {
         let msg = DecoderMessage::Reorg {
-            common_ancestor,
+            _common_ancestor: common_ancestor,
             orphaned: orphaned.to_vec(),
         };
         if let Err(e) = decoder_tx.send(msg).await {
@@ -959,7 +959,7 @@ async fn broadcast_reorg_to_decoders(
 
     if let Some(decoder_tx) = eth_call_decoder_tx {
         let msg = DecoderMessage::Reorg {
-            common_ancestor,
+            _common_ancestor: common_ancestor,
             orphaned: orphaned.to_vec(),
         };
         if let Err(e) = decoder_tx.send(msg).await {

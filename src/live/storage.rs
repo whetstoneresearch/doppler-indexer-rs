@@ -60,11 +60,13 @@ impl LiveStorage {
     }
 
     /// Create a new LiveStorage with a custom base directory.
+    #[allow(dead_code)]
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self { base_dir }
     }
 
     /// Get the base directory for this storage.
+    #[allow(dead_code)]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
     }
@@ -161,6 +163,7 @@ impl LiveStorage {
     }
 
     /// Check if a block exists in storage.
+    #[allow(dead_code)]
     pub fn block_exists(&self, block_number: u64) -> bool {
         self.block_path(block_number).exists()
     }
@@ -379,6 +382,7 @@ impl LiveStorage {
     }
 
     /// Read decoded logs for a specific event type.
+    #[allow(dead_code)]
     pub fn read_decoded_logs(
         &self,
         block_number: u64,
@@ -390,6 +394,7 @@ impl LiveStorage {
     }
 
     /// Delete decoded logs for a specific event type.
+    #[allow(dead_code)]
     pub fn delete_decoded_logs(
         &self,
         block_number: u64,
@@ -468,6 +473,7 @@ impl LiveStorage {
     }
 
     /// Read decoded eth_calls for a specific function.
+    #[allow(dead_code)]
     pub fn read_decoded_calls(
         &self,
         block_number: u64,
@@ -479,6 +485,7 @@ impl LiveStorage {
     }
 
     /// Delete decoded eth_calls for a specific function.
+    #[allow(dead_code)]
     pub fn delete_decoded_calls(
         &self,
         block_number: u64,
@@ -508,6 +515,7 @@ impl LiveStorage {
     }
 
     /// Read decoded event-triggered eth_calls.
+    #[allow(dead_code)]
     pub fn read_decoded_event_calls(
         &self,
         block_number: u64,
@@ -534,6 +542,7 @@ impl LiveStorage {
     }
 
     /// Read decoded "once" calls.
+    #[allow(dead_code)]
     pub fn read_decoded_once_calls(
         &self,
         block_number: u64,
@@ -677,6 +686,7 @@ impl LiveStorage {
     }
 
     /// Delete all data for a range of blocks.
+    #[allow(dead_code)]
     pub fn delete_range(&self, start: u64, end: u64) -> Result<(), StorageError> {
         for block_number in start..=end {
             self.delete_all(block_number)?;
@@ -685,6 +695,7 @@ impl LiveStorage {
     }
 
     /// Get all blocks in a range that have complete status.
+    #[allow(dead_code)]
     pub fn get_complete_blocks_in_range(
         &self,
         start: u64,

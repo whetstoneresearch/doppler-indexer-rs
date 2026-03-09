@@ -119,7 +119,7 @@ async fn collect_blocks_streaming(
     let fetch_handle = client.get_blocks_streaming(block_numbers, false, result_tx);
 
     // Process blocks as they arrive, using BTreeMap for ordered parquet output
-    let mut received_count = 0usize;
+    let mut _received_count = 0usize;
     let mut errors: Vec<(u64, RpcError)> = Vec::new();
 
     match block_fields {
@@ -132,7 +132,7 @@ async fn collect_blocks_streaming(
                     _ => continue,
                 };
 
-                received_count += 1;
+                _received_count += 1;
 
                 match result {
                     Ok(Some(block)) => {
@@ -213,7 +213,7 @@ async fn collect_blocks_streaming(
                     _ => continue,
                 };
 
-                received_count += 1;
+                _received_count += 1;
 
                 match result {
                     Ok(Some(block)) => {

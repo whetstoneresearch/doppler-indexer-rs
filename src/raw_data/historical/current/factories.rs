@@ -190,8 +190,8 @@ pub async fn collect_factories(
                 if let Some(ref tx) = log_decoder_tx {
                     let _ = tx
                         .send(DecoderMessage::FactoryAddresses {
-                            range_start: factory_data.range_start,
-                            range_end: factory_data.range_end,
+                            range_start,
+                            range_end,
                             addresses: addresses.clone(),
                         })
                         .await;

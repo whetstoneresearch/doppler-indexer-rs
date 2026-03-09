@@ -77,6 +77,7 @@ pub enum DecoderMessage {
         live_mode: bool,
     },
     /// Factory addresses discovered for a range (needed for factory log/call decoding)
+    #[allow(dead_code)]
     FactoryAddresses {
         range_start: u64,
         range_end: u64,
@@ -92,7 +93,7 @@ pub enum DecoderMessage {
     /// A reorg was detected - decoder should clean up orphaned data
     Reorg {
         /// The common ancestor block number (last valid block)
-        common_ancestor: u64,
+        _common_ancestor: u64,
         /// Block numbers that were orphaned and need cleanup
         orphaned: Vec<u64>,
     },

@@ -17,16 +17,13 @@ mod reorg;
 mod storage;
 mod types;
 
-pub use catchup::{CatchupScanResult, LiveCatchupService};
 pub use collector::LiveCollector;
 pub use compaction::{CompactionService, TransformRetryRequest};
-pub use error::{LiveError, LiveEthCallError, ProgressError};
 pub use eth_calls::LiveEthCallCollector;
 pub use progress::LiveProgressTracker;
-pub use reorg::{ReorgDetector, ReorgEvent};
 pub use storage::{LiveStorage, StorageError};
 pub use types::{
-    DecodedFileMetadata, LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall,
-    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue, LiveEthCall, LiveFactoryAddresses,
-    LiveLog, LiveMessage, LiveModeConfig, LiveProgress, LiveReceipt, LiveDbValue, LiveUpsertSnapshot,
+    LiveDecodedCall, LiveDecodedEventCall,
+    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue,
+    LiveMessage, LiveModeConfig, LiveDbValue, LiveUpsertSnapshot,
 };

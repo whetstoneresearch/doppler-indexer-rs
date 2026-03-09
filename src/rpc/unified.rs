@@ -26,6 +26,7 @@ macro_rules! delegate_to_inner {
     };
 }
 
+#[allow(dead_code)]
 impl UnifiedRpcClient {
     pub fn from_url(url: &str) -> Result<Self, RpcError> {
         if url.contains("alchemy") {

@@ -9,6 +9,7 @@ use super::defaults::{database, transformations as defaults};
 /// Transformations are enabled when this config is present AND there are
 /// registered handlers. No explicit "enabled" field is needed.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct TransformationConfig {
     /// PostgreSQL connection string environment variable.
     #[serde(default = "default_database_url_env_var")]

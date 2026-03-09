@@ -181,7 +181,7 @@ pub async fn catchup_decode_logs(
                         let request = RecollectRequest {
                             range_start,
                             range_end,
-                            file_path: file_path.clone(),
+                            _file_path: file_path.clone(),
                         };
                         if let Err(send_err) = tx.send(request).await {
                             tracing::error!(

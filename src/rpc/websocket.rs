@@ -112,6 +112,7 @@ struct SubscriptionResponse {
 }
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum WsError {
     #[error("WebSocket connection error: {0}")]
     Connection(String),
@@ -135,6 +136,7 @@ pub struct WsClient {
     is_alchemy: bool,
 }
 
+#[allow(dead_code)]
 impl WsClient {
     /// Create a new WebSocket client.
     pub fn new(
@@ -262,7 +264,7 @@ impl WsClient {
             .map_err(|e| WsError::Protocol(e.to_string()))?;
 
         // Wait for subscription confirmation
-        let subscription_id = loop {
+        let _subscription_id = loop {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(response) = serde_json::from_str::<SubscriptionResponse>(&text) {
@@ -286,7 +288,7 @@ impl WsClient {
         };
 
         // Get current block to detect gaps after reconnection
-        let reconnect_block = if let Some(last) = *last_block {
+        let _reconnect_block = if let Some(last) = *last_block {
             let current = self
                 .http_client
                 .get_block_number()

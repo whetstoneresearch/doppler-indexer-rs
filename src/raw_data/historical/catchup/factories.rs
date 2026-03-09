@@ -194,7 +194,7 @@ pub async fn collect_factories(
                             let request = RecollectRequest {
                                 range_start: start,
                                 range_end: end,
-                                file_path: file_path.clone(),
+                                _file_path: file_path.clone(),
                             };
                             if let Err(send_err) = tx.send(request).await {
                                 tracing::error!(

@@ -4,7 +4,7 @@ use std::path::Path;
 use alloy_primitives::{keccak256, Address, U256};
 use serde::Deserialize;
 use crate::types::config::eth_call::EthCallConfig;
-use crate::types::config::generic::{InlineOrPath, SingleOrMultiple};
+use crate::types::config::generic::{SingleOrMultiple};
 use crate::types::config::loader::{load_config_from_path, ConfigLoadError};
 
 /// Configuration for an event to decode
@@ -57,14 +57,11 @@ pub struct FactoryCollectionType {
 /// Map of collection name to shared collection type config
 pub type FactoryCollections = HashMap<String, FactoryCollectionType>;
 
-/// Factory collections config: inline or path to file/directory
-pub type FactoryCollectionsOrPath = InlineOrPath<FactoryCollections>;
-
 /// Resolved factory config with collection type merged in
 #[derive(Debug, Clone)]
 pub struct ResolvedFactoryConfig {
     pub collection_name: String,
-    pub factory_events: Vec<FactoryEventConfig>,
+    pub _factory_events: Vec<FactoryEventConfig>,
     pub calls: Vec<EthCallConfig>,
     pub events: Option<Vec<EventConfig>>,
 }
@@ -98,7 +95,7 @@ pub fn resolve_factory_config(
 
     ResolvedFactoryConfig {
         collection_name: factory.collection.clone(),
-        factory_events: factory.factory_events.clone().into_vec(),
+        _factory_events: factory.factory_events.clone().into_vec(),
         calls,
         events,
     }
@@ -201,9 +198,6 @@ pub enum AddressOrAddresses {
 
 pub type Contracts = HashMap<String, ContractConfig>;
 
-/// Contracts config: inline or path to file/directory
-pub type ContractsOrPath = InlineOrPath<Contracts>;
-
 /// Load contracts from a path (file or directory).
 ///
 /// Uses the generic config loader with duplicate key detection.
@@ -211,14 +205,6 @@ pub type ContractsOrPath = InlineOrPath<Contracts>;
 pub fn load_contracts_from_path(base_dir: &Path, path: &str) -> anyhow::Result<Contracts> {
     load_config_from_path::<Contracts>(base_dir, path)
         .map_err(|e| panic_on_load_error("contracts", e))
-}
-
-/// Load contracts with proper error handling (no panics).
-pub fn try_load_contracts_from_path(
-    base_dir: &Path,
-    path: &str,
-) -> Result<Contracts, ConfigLoadError> {
-    load_config_from_path(base_dir, path)
 }
 
 /// Load factory collections from a path (file or directory).
@@ -231,14 +217,6 @@ pub fn load_factory_collections_from_path(
 ) -> anyhow::Result<FactoryCollections> {
     load_config_from_path::<FactoryCollections>(base_dir, path)
         .map_err(|e| panic_on_load_error("factory collections", e))
-}
-
-/// Load factory collections with proper error handling (no panics).
-pub fn try_load_factory_collections_from_path(
-    base_dir: &Path,
-    path: &str,
-) -> Result<FactoryCollections, ConfigLoadError> {
-    load_config_from_path(base_dir, path)
 }
 
 /// Helper to panic with a formatted error message (for backwards compatibility).

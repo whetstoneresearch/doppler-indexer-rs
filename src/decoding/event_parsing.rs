@@ -28,6 +28,7 @@ pub enum TupleFieldInfo {
 
 /// A flattened field for parquet output
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FlattenedField {
     /// Full path name like "key.currency0", "deployer", or "poolKey.hash"
     pub full_name: String,
@@ -38,7 +39,7 @@ pub struct FlattenedField {
     /// Whether this field comes from an indexed parameter
     pub from_indexed: bool,
     /// True if this is a hash of an indexed tuple (cannot be decoded)
-    pub is_indexed_tuple_hash: bool,
+    pub _isindexed_tuple_hash: bool,
 }
 
 /// Parsed event parameter
@@ -59,7 +60,7 @@ pub struct EventParam {
 pub struct ParsedEvent {
     pub name: String,
     pub signature: String,
-    pub canonical_signature: String,
+    pub _canonical_signature: String,
     pub topic0: [u8; 32],
     pub params: Vec<EventParam>,
     /// Flattened fields for parquet output (derived from params)
@@ -103,7 +104,7 @@ impl ParsedEvent {
         let mut event = ParsedEvent {
             name,
             signature: signature.to_string(),
-            canonical_signature,
+            _canonical_signature: canonical_signature,
             topic0,
             params,
             flattened_fields: Vec::new(),
@@ -159,7 +160,7 @@ fn flatten_param_into(param: &EventParam, prefix: &str, output: &mut Vec<Flatten
                 leaf_type: DynSolType::FixedBytes(32),
                 arrow_type: DataType::FixedSizeBinary(32),
                 from_indexed: true,
-                is_indexed_tuple_hash: true,
+                _isindexed_tuple_hash: true,
             });
             return;
         }
@@ -173,7 +174,7 @@ fn flatten_param_into(param: &EventParam, prefix: &str, output: &mut Vec<Flatten
                 leaf_type: param.param_type.clone(),
                 arrow_type: param_type_to_arrow(&param.param_type),
                 from_indexed: param.indexed,
-                is_indexed_tuple_hash: false,
+                _isindexed_tuple_hash: false,
             });
         }
         Some(TupleFieldInfo::Tuple(fields)) => {
@@ -530,7 +531,7 @@ mod tests {
 
         assert_eq!(parsed.name, "Transfer");
         assert_eq!(
-            parsed.canonical_signature,
+            parsed._canonical_signature,
             "Transfer(address,address,uint256)"
         );
         assert_eq!(parsed.params.len(), 3);
@@ -574,7 +575,7 @@ mod tests {
 
         assert_eq!(parsed.name, "Paused");
         assert_eq!(parsed.params.len(), 0);
-        assert_eq!(parsed.canonical_signature, "Paused()");
+        assert_eq!(parsed._canonical_signature, "Paused()");
         assert_eq!(parsed.flattened_fields.len(), 0);
     }
 
@@ -620,7 +621,7 @@ mod tests {
 
         // Check canonical signature
         assert_eq!(
-            parsed.canonical_signature,
+            parsed._canonical_signature,
             "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))"
         );
 
@@ -656,10 +657,10 @@ mod tests {
         // Check flattened fields - indexed tuple should be a hash
         assert_eq!(parsed.flattened_fields.len(), 3);
         assert_eq!(parsed.flattened_fields[0].full_name, "sender");
-        assert!(!parsed.flattened_fields[0].is_indexed_tuple_hash);
+        assert!(!parsed.flattened_fields[0]._isindexed_tuple_hash);
 
         assert_eq!(parsed.flattened_fields[1].full_name, "poolKey.hash");
-        assert!(parsed.flattened_fields[1].is_indexed_tuple_hash);
+        assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
         assert!(parsed.flattened_fields[1].from_indexed);
 
         assert_eq!(parsed.flattened_fields[2].full_name, "poolId");
@@ -672,7 +673,7 @@ mod tests {
 
         assert_eq!(parsed.name, "Test");
         assert_eq!(parsed.params.len(), 2);
-        assert_eq!(parsed.canonical_signature, "Test((address,uint256),address)");
+        assert_eq!(parsed._canonical_signature, "Test((address,uint256),address)");
 
         // Check flattened fields
         assert_eq!(parsed.flattened_fields.len(), 3);
@@ -691,7 +692,7 @@ mod tests {
 
         // Check canonical signature
         assert_eq!(
-            parsed.canonical_signature,
+            parsed._canonical_signature,
             "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
         );
 
@@ -700,7 +701,7 @@ mod tests {
         assert_eq!(parsed.flattened_fields.len(), 9);
         assert_eq!(parsed.flattened_fields[0].full_name, "sender");
         assert_eq!(parsed.flattened_fields[1].full_name, "poolKey.hash");
-        assert!(parsed.flattened_fields[1].is_indexed_tuple_hash);
+        assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
         assert_eq!(parsed.flattened_fields[2].full_name, "poolId");
         assert_eq!(parsed.flattened_fields[3].full_name, "params.zeroForOne");
         assert_eq!(parsed.flattened_fields[4].full_name, "params.amountSpecified");

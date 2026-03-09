@@ -21,6 +21,7 @@ use crate::rpc::rpc::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComputeUnitCost(pub u32);
 
+#[allow(dead_code)]
 impl ComputeUnitCost {
     pub const BLOCK_NUMBER: Self = Self(10);
     pub const GET_BLOCK_BY_NUMBER: Self = Self(16);
@@ -136,6 +137,7 @@ impl SlidingWindowRateLimiter {
     }
 
     /// Get current usage (for debugging/metrics)
+    #[allow(dead_code)]
     pub async fn current_usage_async(&self) -> u32 {
         let history = self.history.lock().await;
         Self::current_usage(&history, Instant::now(), self.window)
@@ -153,6 +155,7 @@ pub struct AlchemyConfig {
     pub rpc_concurrency: usize,
 }
 
+#[allow(dead_code)]
 impl AlchemyConfig {
     pub fn new(url: Url, compute_units_per_second: u32) -> Self {
         Self {
@@ -278,6 +281,7 @@ impl ConcurrentExecutor {
     }
 }
 
+#[allow(dead_code)]
 impl AlchemyClient {
     pub fn new(config: AlchemyConfig) -> Result<Self, RpcError> {
         Self::new_with_limiter(config, None)

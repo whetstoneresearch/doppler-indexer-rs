@@ -86,6 +86,7 @@ fn default_eviction_threshold() -> f64 {
 
 /// Synchronization configuration for S3.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SyncConfig {
     /// Number of recent ranges to check markers directly (vs relying on manifest)
     /// Used for freshness: manifest may be slightly stale, so recent ranges are checked

@@ -12,9 +12,6 @@ use crate::db::DbPool;
 use super::error::LiveError;
 use super::storage::LiveStorage;
 
-// Re-export LiveError as ProgressError for backwards compatibility
-pub use super::error::ProgressError;
-
 /// Tracks per-block progress for all handlers.
 pub struct LiveProgressTracker {
     chain_id: i64,
@@ -169,6 +166,7 @@ impl LiveProgressTracker {
     }
 
     /// Load progress from database for a range of blocks.
+    #[allow(dead_code)]
     pub async fn load_from_db(&mut self, from: u64, to: u64) -> Result<(), LiveError> {
         let Some(ref db_pool) = self.db_pool else {
             return Ok(());
@@ -242,6 +240,7 @@ impl LiveProgressTracker {
     }
 
     /// Get blocks that are complete within a range.
+    #[allow(dead_code)]
     pub fn get_complete_blocks_in_range(&self, from: u64, to: u64) -> Vec<u64> {
         (from..=to)
             .filter(|&n| self.is_block_complete(n))
@@ -249,6 +248,7 @@ impl LiveProgressTracker {
     }
 
     /// Get the lowest block number that is not complete.
+    #[allow(dead_code)]
     pub fn lowest_incomplete_block(&self, from: u64) -> Option<u64> {
         let mut block = from;
         loop {
@@ -268,6 +268,7 @@ impl LiveProgressTracker {
     }
 
     /// Get statistics about tracked progress.
+    #[allow(dead_code)]
     pub fn stats(&self) -> ProgressStats {
         let total_blocks = self.completed.len();
         let complete_blocks = self
@@ -277,9 +278,9 @@ impl LiveProgressTracker {
             .count();
 
         ProgressStats {
-            total_blocks,
-            complete_blocks,
-            handler_count: self.handler_keys.len(),
+            _total_blocks: total_blocks,
+            _complete_blocks: complete_blocks,
+            _handler_count: self.handler_keys.len(),
         }
     }
 }
@@ -297,9 +298,9 @@ impl std::fmt::Debug for LiveProgressTracker {
 /// Statistics about progress tracking.
 #[derive(Debug, Clone)]
 pub struct ProgressStats {
-    pub total_blocks: usize,
-    pub complete_blocks: usize,
-    pub handler_count: usize,
+    pub _total_blocks: usize,
+    pub _complete_blocks: usize,
+    pub _handler_count: usize,
 }
 
 #[cfg(test)]
