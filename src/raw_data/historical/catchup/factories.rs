@@ -15,6 +15,7 @@ use crate::raw_data::historical::factories::{
     FactoryAddressData, FactoryCatchupState, FactoryCollectionError, FactoryMessage,
     RecollectRequest,
 };
+use crate::storage::S3Manifest;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -27,6 +28,7 @@ pub async fn collect_factories(
     call_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
     factory_catchup_done_tx: Option<oneshot::Sender<()>>,
+    s3_manifest: Option<S3Manifest>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -108,6 +110,7 @@ pub async fn collect_factories(
             matchers: Arc::new(matchers),
             existing_files: Arc::new(HashSet::new()),
             output_dir: Arc::new(output_dir),
+            s3_manifest,
         });
     }
 
@@ -128,6 +131,7 @@ pub async fn collect_factories(
     let matchers = Arc::new(matchers);
     let existing_files = Arc::new(existing_files);
     let output_dir = Arc::new(output_dir);
+    let s3_manifest = Arc::new(s3_manifest);
 
     {
         let semaphore = Arc::new(Semaphore::new(factory_concurrency));
@@ -143,6 +147,9 @@ pub async fn collect_factories(
                     log_range.end - 1
                 );
                 existing_files.contains(&rel_path)
+                    || s3_manifest.as_ref().as_ref().map_or(false, |m| {
+                        m.has_factories(collection, log_range.start, log_range.end - 1)
+                    })
             });
 
             if all_factory_files_exist {
@@ -153,6 +160,7 @@ pub async fn collect_factories(
             let matchers = matchers.clone();
             let existing_files = existing_files.clone();
             let output_dir = output_dir.clone();
+            let s3_manifest = s3_manifest.clone();
             let file_path = log_range.file_path.clone();
             let start = log_range.start;
             let end = log_range.end;
@@ -221,7 +229,7 @@ pub async fn collect_factories(
                     total_rows
                 );
 
-                process_range_batches(start, end, batches, &matchers, &output_dir, &existing_files)
+                process_range_batches(start, end, batches, &matchers, &output_dir, &existing_files, s3_manifest.as_ref().as_ref())
                     .await
                     .map(Some)
             });
@@ -316,9 +324,13 @@ pub async fn collect_factories(
         let _ = tx.send(());
     }
 
+    // Extract from Arc - at this point all tasks are done so we're the only owner
+    let s3_manifest = Arc::try_unwrap(s3_manifest).unwrap_or_else(|arc| (*arc).clone());
+
     Ok(FactoryCatchupState {
         matchers,
         existing_files,
         output_dir,
+        s3_manifest,
     })
 }

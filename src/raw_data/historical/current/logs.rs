@@ -58,6 +58,7 @@ pub async fn collect_logs(
                                         &state.output_dir,
                                         &state.existing_files,
                                         &decoder_tx,
+                                        state.s3_manifest.as_ref(),
                                     )
                                     .await?;
                                     factory_ready.remove(&range_start);
@@ -120,6 +121,7 @@ pub async fn collect_logs(
                                 &state.output_dir,
                                 &state.existing_files,
                                 &decoder_tx,
+                                state.s3_manifest.as_ref(),
                             )
                             .await?;
                         } else {

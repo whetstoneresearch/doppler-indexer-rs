@@ -16,6 +16,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::S3Manifest;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::LogField;
 
@@ -43,6 +44,7 @@ pub(crate) struct LogsCatchupState {
     pub(crate) contract_logs_only: bool,
     pub(crate) needs_factory_wait: bool,
     pub(crate) log_fields: Option<Vec<LogField>>,
+    pub(crate) s3_manifest: Option<S3Manifest>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,7 @@ pub(crate) async fn process_completed_range(
     output_dir: &Path,
     _existing_files: &HashSet<String>,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    s3_manifest: Option<&S3Manifest>,
 ) -> Result<(), LogCollectionError> {
     let range = BlockRange {
         start: range_start,
@@ -102,6 +105,18 @@ pub(crate) async fn process_completed_range(
     if output_path.exists() {
         tracing::debug!(
             "Skipping logs for blocks {}-{} (already exists)",
+            range.start,
+            range.end - 1
+        );
+        range_data.remove(&range_start);
+        range_factory_addresses.remove(&range_start);
+        return Ok(());
+    }
+
+    // Check if range exists in S3 manifest
+    if s3_manifest.map_or(false, |m| m.has_raw_logs(range.start, range.end - 1)) {
+        tracing::debug!(
+            "Skipping logs range {}-{}: exists in S3 manifest",
             range.start,
             range.end - 1
         );

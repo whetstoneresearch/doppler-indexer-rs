@@ -21,6 +21,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::S3Manifest;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::AddressOrAddresses;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -34,6 +35,7 @@ pub async fn collect_eth_calls(
     has_event_trigger_rx: bool,
     factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
     eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
+    s3_manifest: Option<S3Manifest>,
 ) -> Result<EthCallCatchupState, EthCallCollectionError> {
     let base_output_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
     std::fs::create_dir_all(&base_output_dir)?;
@@ -103,6 +105,7 @@ pub async fn collect_eth_calls(
             max_params: 0,
             factory_max_params: 0,
             existing_files: HashSet::new(),
+            s3_manifest,
             factory_addresses: HashMap::new(),
             frequency_state: FrequencyState {
                 last_call_times: HashMap::new(),
@@ -321,6 +324,7 @@ pub async fn collect_eth_calls(
                         &call_configs,
                         &base_output_dir,
                         &existing_files,
+                        &s3_manifest,
                         rpc_batch_size,
                         max_params,
                         &mut frequency_state,
@@ -336,6 +340,7 @@ pub async fn collect_eth_calls(
                         &call_configs,
                         &base_output_dir,
                         &existing_files,
+                        &s3_manifest,
                         rpc_batch_size,
                         max_params,
                         &mut frequency_state,
@@ -679,6 +684,7 @@ pub async fn collect_eth_calls(
         max_params,
         factory_max_params,
         existing_files,
+        s3_manifest,
         factory_addresses,
         frequency_state,
         range_data,

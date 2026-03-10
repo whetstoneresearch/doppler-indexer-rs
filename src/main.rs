@@ -844,9 +844,10 @@ async fn process_chain(
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
         let log_tx = Some(log_tx);
+        let s3_manifest = storage_manager.manifest();
         async move {
             // Catchup: process existing block ranges missing receipts
-            raw_data::historical::catchup::receipts::collect_receipts(
+            let catchup_state = raw_data::historical::catchup::receipts::collect_receipts(
                 &chain,
                 &receipts_client,
                 &cfg,
@@ -854,6 +855,7 @@ async fn process_chain(
                 &factory_log_tx,
                 &event_trigger_tx,
                 &event_matchers,
+                s3_manifest,
             )
             .await
             .context("receipt catchup failed")?;
@@ -869,6 +871,7 @@ async fn process_chain(
                 event_trigger_tx,
                 event_matchers,
                 recollect_rx,
+                catchup_state,
             )
             .await
             .context("receipt collection failed")
@@ -877,9 +880,10 @@ async fn process_chain(
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
+        let s3_manifest = storage_manager.manifest();
         async move {
             let catchup_state =
-                raw_data::historical::catchup::logs::collect_logs(&chain, &cfg)
+                raw_data::historical::catchup::logs::collect_logs(&chain, &cfg, s3_manifest)
                     .await
                     .context("log catchup failed")?;
 
@@ -897,6 +901,7 @@ async fn process_chain(
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
+        let s3_manifest = storage_manager.manifest();
         async move {
             // Catchup: process existing block/log ranges
             let catchup_state =
@@ -909,6 +914,7 @@ async fn process_chain(
                     event_trigger_rx.is_some(),
                     factory_catchup_done_rx,
                     eth_calls_catchup_done_tx,
+                    s3_manifest,
                 )
                 .await
                 .context("eth_calls catchup failed")?;
@@ -931,6 +937,7 @@ async fn process_chain(
     if has_factories {
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
+            let s3_manifest = storage_manager.manifest();
             async move {
                 // Catchup: load existing factory data and process gaps
                 let catchup_state =
@@ -943,6 +950,7 @@ async fn process_chain(
                         &call_decoder_tx_for_factories,
                         &recollect_tx_for_factories,
                         factory_catchup_done_tx,
+                        s3_manifest,
                     )
                     .await
                     .context("factory catchup failed")?;
@@ -959,6 +967,7 @@ async fn process_chain(
                     catchup_state.matchers,
                     catchup_state.existing_files,
                     catchup_state.output_dir,
+                    catchup_state.s3_manifest,
                 )
                 .await
                 .context("factory collection failed")

@@ -20,6 +20,7 @@ use tokio::sync::mpsc::Sender;
 use crate::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult, EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::{EventTriggerData, LogData};
+use crate::storage::S3Manifest;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue};
@@ -171,6 +172,8 @@ pub(crate) struct EthCallCatchupState {
     pub(crate) max_params: usize,
     pub(crate) factory_max_params: usize,
     pub(crate) existing_files: HashSet<String>,
+    // S3 manifest for checking remote files
+    pub(crate) s3_manifest: Option<S3Manifest>,
     // Mutable state carried from catchup
     pub(crate) factory_addresses: HashMap<String, HashSet<Address>>,
     pub(crate) frequency_state: FrequencyState,
@@ -4231,6 +4234,7 @@ pub(crate) async fn process_range(
     call_configs: &[CallConfig],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: &Option<S3Manifest>,
     rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
@@ -4251,7 +4255,11 @@ pub(crate) async fn process_range(
         let file_name = range.file_name();
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
-        if existing_files.contains(&rel_path) {
+        if existing_files.contains(&rel_path)
+            || s3_manifest
+                .as_ref()
+                .map_or(false, |m| m.has_raw_eth_calls(range.start, range.end - 1))
+        {
             tracing::debug!(
                 "Skipping eth_calls for {}.{} blocks {}-{} (already exists)",
                 contract_name,
@@ -4443,6 +4451,7 @@ pub(crate) async fn process_range_multicall(
     call_configs: &[CallConfig],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: &Option<S3Manifest>,
     rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
@@ -4473,7 +4482,11 @@ pub(crate) async fn process_range_multicall(
         let file_name = range.file_name();
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
-        if existing_files.contains(&rel_path) {
+        if existing_files.contains(&rel_path)
+            || s3_manifest
+                .as_ref()
+                .map_or(false, |m| m.has_raw_eth_calls(range.start, range.end - 1))
+        {
             tracing::debug!(
                 "Skipping eth_calls for {}.{} blocks {}-{} (already exists)",
                 contract_name,

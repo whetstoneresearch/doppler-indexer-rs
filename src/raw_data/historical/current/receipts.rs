@@ -5,13 +5,13 @@ use alloy::primitives::B256;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::raw_data::historical::blocks::read_block_info_from_parquet;
+use crate::raw_data::historical::catchup::receipts::ReceiptsCatchupState;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, extract_event_triggers, fetch_receipts_for_blocks, process_range,
-    scan_existing_parquet_files, send_logs_to_channels, send_range_complete,
-    write_full_receipts_to_parquet, write_minimal_receipts_to_parquet, BlockInfo, BlockRange,
-    ChannelMetrics, EventTriggerMatcher, EventTriggerMessage, LogMessage, ReceiptBatchState,
-    ReceiptCollectionError,
+    send_logs_to_channels, send_range_complete, write_full_receipts_to_parquet,
+    write_minimal_receipts_to_parquet, BlockInfo, BlockRange, ChannelMetrics, EventTriggerMatcher,
+    EventTriggerMessage, LogMessage, ReceiptBatchState, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
@@ -27,6 +27,7 @@ pub async fn collect_receipts(
     event_trigger_tx: Option<Sender<EventTriggerMessage>>,
     event_matchers: Vec<EventTriggerMatcher>,
     mut recollect_rx: Option<Receiver<RecollectRequest>>,
+    catchup_state: ReceiptsCatchupState,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -37,7 +38,9 @@ pub async fn collect_receipts(
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
 
-    let existing_files = scan_existing_parquet_files(&output_dir);
+    // Use the existing files from catchup state (already scanned)
+    let existing_files = catchup_state.existing_files;
+    let s3_manifest = catchup_state.s3_manifest;
 
     // Batch states for early RPC fetching - track blocks received vs fetched
     let mut batch_states: HashMap<u64, ReceiptBatchState> = HashMap::new();
@@ -93,9 +96,12 @@ pub async fn collect_receipts(
                             tx_hashes,
                         });
 
-                        // Check if we should skip this range (file already exists)
+                        // Check if we should skip this range (file already exists locally or in S3)
                         let range = BlockRange { start: range_start, end: range_end };
-                        if existing_files.contains(&range.file_name()) {
+                        let exists_in_s3 = s3_manifest
+                            .as_ref()
+                            .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
+                        if existing_files.contains(&range.file_name()) || exists_in_s3 {
                             // Check if range is now complete
                             let expected: HashSet<u64> = (range_start..range_end).collect();
                             let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
@@ -427,7 +433,10 @@ pub async fn collect_receipts(
             end: max_block + 1,
         };
 
-        if existing_files.contains(&range.file_name()) {
+        let exists_in_s3 = s3_manifest
+            .as_ref()
+            .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
+        if existing_files.contains(&range.file_name()) || exists_in_s3 {
             tracing::info!(
                 "Skipping receipts for blocks {}-{} (already exists)",
                 range.start,

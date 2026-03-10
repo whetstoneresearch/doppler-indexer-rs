@@ -14,6 +14,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::S3Manifest;
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
     FactoryParameterLocation,
@@ -98,6 +99,7 @@ pub(crate) struct FactoryCatchupState {
     pub(crate) matchers: Arc<Vec<FactoryMatcher>>,
     pub(crate) existing_files: Arc<HashSet<String>>,
     pub(crate) output_dir: Arc<PathBuf>,
+    pub(crate) s3_manifest: Option<S3Manifest>,
 }
 
 pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
@@ -194,6 +196,7 @@ pub(crate) async fn process_range(
     matchers: &[FactoryMatcher],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
 ) -> Result<FactoryAddressData, FactoryCollectionError> {
     let mut records: Vec<FactoryRecord> = Vec::new();
     let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
@@ -258,7 +261,7 @@ pub(crate) async fn process_range(
         }
     }
 
-    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files).await?;
+    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest).await?;
 
     Ok(FactoryAddressData {
         range_start,
@@ -300,6 +303,7 @@ pub(crate) async fn process_range_batches(
     matchers: &[FactoryMatcher],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
 ) -> Result<FactoryAddressData, FactoryCollectionError> {
     let mut records: Vec<FactoryRecord> = Vec::new();
     let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
@@ -430,7 +434,7 @@ pub(crate) async fn process_range_batches(
         }
     }
 
-    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files).await?;
+    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest).await?;
 
     Ok(FactoryAddressData {
         range_start,
@@ -448,6 +452,7 @@ async fn write_factory_parquet_files(
     matchers: &[FactoryMatcher],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
 ) -> Result<(), FactoryCollectionError> {
     let mut by_collection: HashMap<String, Vec<FactoryRecord>> = HashMap::new();
     for record in records {
@@ -463,7 +468,11 @@ async fn write_factory_parquet_files(
         let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
         let rel_path = format!("{}/{}", collection_name, file_name);
 
-        if existing_files.contains(&rel_path) {
+        if existing_files.contains(&rel_path)
+            || s3_manifest.map_or(false, |m| {
+                m.has_factories(&collection_name, range_start, range_end - 1)
+            })
+        {
             tracing::debug!(
                 "Skipping factory parquet for {} blocks {}-{} (already exists)",
                 collection_name,
@@ -497,7 +506,11 @@ async fn write_factory_parquet_files(
             let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
             let rel_path = format!("{}/{}", collection_name, file_name);
 
-            if !existing_files.contains(&rel_path) {
+            if !existing_files.contains(&rel_path)
+                && !s3_manifest.map_or(false, |m| {
+                    m.has_factories(collection_name, range_start, range_end - 1)
+                })
+            {
                 let sub_dir = output_dir.join(collection_name);
                 std::fs::create_dir_all(&sub_dir)?;
                 let output_path = sub_dir.join(&file_name);

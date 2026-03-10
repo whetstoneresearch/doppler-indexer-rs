@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use tokio::sync::mpsc::Sender;
@@ -9,8 +10,20 @@ use crate::raw_data::historical::receipts::{
     EventTriggerMessage, LogMessage, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::S3Manifest;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
+
+/// State passed from catchup phase to current phase for receipt collection.
+pub struct ReceiptsCatchupState {
+    /// Set of existing receipt files (local filesystem)
+    pub existing_files: HashSet<String>,
+    /// Set of existing log files (local filesystem)
+    #[allow(dead_code)]
+    pub existing_logs_files: HashSet<String>,
+    /// Optional S3 manifest for checking remote availability
+    pub s3_manifest: Option<S3Manifest>,
+}
 
 pub async fn collect_receipts(
     chain: &ChainConfig,
@@ -20,7 +33,8 @@ pub async fn collect_receipts(
     factory_log_tx: &Option<Sender<LogMessage>>,
     event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
     event_matchers: &[EventTriggerMatcher],
-) -> Result<(), ReceiptCollectionError> {
+    s3_manifest: Option<S3Manifest>,
+) -> Result<ReceiptsCatchupState, ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
 
@@ -60,9 +74,15 @@ pub async fn collect_receipts(
             end: block_range.end,
         };
 
-        let receipts_exist = existing_files.contains(&range.file_name());
+        let receipts_exist = existing_files.contains(&range.file_name())
+            || s3_manifest
+                .as_ref()
+                .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
         let logs_file_name = format!("logs_{}-{}.parquet", range.start, range.end - 1);
-        let logs_exist = existing_logs_files.contains(&logs_file_name);
+        let logs_exist = existing_logs_files.contains(&logs_file_name)
+            || s3_manifest
+                .as_ref()
+                .map_or(false, |m| m.has_raw_logs(range.start, range.end - 1));
 
         // Skip if receipts and logs both exist (or logs aren't needed)
         // Factory catchup is handled separately by factories.rs reading from logs files
@@ -148,5 +168,9 @@ pub async fn collect_receipts(
         factory_log_tx_metrics.log_summary("factory_log_tx (catchup)");
     }
 
-    Ok(())
+    Ok(ReceiptsCatchupState {
+        existing_files,
+        existing_logs_files,
+        s3_manifest,
+    })
 }
