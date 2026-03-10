@@ -95,6 +95,7 @@ pub struct FactoryMatcher {
 }
 
 /// State computed during factory catchup, passed to current/streaming phase
+#[allow(dead_code)]
 pub(crate) struct FactoryCatchupState {
     pub(crate) matchers: Arc<Vec<FactoryMatcher>>,
     pub(crate) existing_files: Arc<HashSet<String>>,

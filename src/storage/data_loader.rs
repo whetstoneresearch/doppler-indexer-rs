@@ -6,12 +6,14 @@ use std::sync::Arc;
 use crate::storage::{S3Manifest, StorageError, StorageManager};
 
 /// Loader that ensures data is available locally, downloading from S3 if needed.
+#[allow(dead_code)]
 pub struct DataLoader {
     storage_manager: Option<Arc<StorageManager>>,
     chain_name: String,
     local_base: PathBuf,
 }
 
+#[allow(dead_code)]
 impl DataLoader {
     /// Create a new DataLoader.
     pub fn new(
