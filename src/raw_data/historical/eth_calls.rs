@@ -1320,11 +1320,10 @@ pub(crate) async fn load_historical_factory_addresses(
     }
 
     let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
-    let local_base = PathBuf::from(format!("data/{}", chain_name));
     let data_loader = DataLoader::new(
         storage_manager.map(|sm| sm.clone()),
         chain_name,
-        local_base,
+        PathBuf::from("data"),
     );
 
     // Collect files to process: local files + S3 manifest ranges
@@ -1450,11 +1449,10 @@ pub(crate) async fn load_factory_addresses_for_once_catchup(
     }
 
     let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
-    let local_base = PathBuf::from(format!("data/{}", chain_name));
     let data_loader = DataLoader::new(
         storage_manager.map(|sm| sm.clone()),
         chain_name,
-        local_base,
+        PathBuf::from("data"),
     );
 
     // Collect files to process: local files + S3 manifest ranges
@@ -1881,44 +1879,55 @@ pub(crate) fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, E
     Ok(logs)
 }
 
-/// Check if on_events output already exists for a range
+/// Check if on_events output already exists for a range (locally or in S3)
 pub(crate) fn event_output_exists(
     output_dir: &Path,
     contract_name: &str,
     function_name: &str,
     range_start: u64,
     range_end: u64,
+    s3_manifest: Option<&S3Manifest>,
 ) -> bool {
+    // Check local first
     let sub_dir = output_dir.join(contract_name).join(function_name).join("on_events");
-    if !sub_dir.exists() {
-        return false;
-    }
+    if sub_dir.exists() {
+        // Check for any file that overlaps with this range
+        // Note: range_end is EXCLUSIVE (e.g., 200 means up to block 199)
+        // Output files are named {min_block}-{max_block} where both are INCLUSIVE
+        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                    continue;
+                }
 
-    // Check for any file that overlaps with this range
-    // Note: range_end is EXCLUSIVE (e.g., 200 means up to block 199)
-    // Output files are named {min_block}-{max_block} where both are INCLUSIVE
-    if let Ok(entries) = std::fs::read_dir(&sub_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                continue;
-            }
-
-            if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let parts: Vec<&str> = file_stem.split('-').collect();
-                if parts.len() == 2 {
-                    if let (Ok(file_start), Ok(file_end_inclusive)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-                        // Convert to exclusive end for consistent comparison
-                        // Ranges overlap if: start1 < end2 AND start2 < end1 (using exclusive ends)
-                        let file_end_exclusive = file_end_inclusive + 1;
-                        if range_start < file_end_exclusive && file_start < range_end {
-                            return true;
+                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    let parts: Vec<&str> = file_stem.split('-').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(file_start), Ok(file_end_inclusive)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                            // Convert to exclusive end for consistent comparison
+                            // Ranges overlap if: start1 < end2 AND start2 < end1 (using exclusive ends)
+                            let file_end_exclusive = file_end_inclusive + 1;
+                            if range_start < file_end_exclusive && file_start < range_end {
+                                return true;
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    // Check S3 manifest
+    // The S3 manifest uses key format "contract/function/on_events" for event-triggered calls
+    // range_end is exclusive but S3 manifest stores inclusive end
+    if let Some(manifest) = s3_manifest {
+        let func_key = format!("{}/on_events", function_name);
+        if manifest.has_raw_eth_calls_granular(contract_name, &func_key, range_start, range_end - 1) {
+            return true;
+        }
+    }
+
     false
 }
 

@@ -11,7 +11,7 @@ use crate::raw_data::historical::receipts::{
     EventTriggerMessage, LogMessage, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
-use crate::storage::{S3Manifest, StorageManager};
+use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -60,7 +60,7 @@ pub async fn collect_receipts(
     // Also check for missing logs files - if receipts exist but logs don't, we
     // need to re-process to regenerate the logs data
     // =========================================================================
-    let block_ranges = get_existing_block_ranges(&chain.name);
+    let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
     let mut catchup_count = 0;
 
     // Check existing logs files
@@ -95,6 +95,47 @@ pub async fn collect_receipts(
                 send_range_complete(factory_log_tx, log_tx, event_trigger_tx, range.start, range.end).await?;
             }
             continue;
+        }
+
+        // Ensure block file is available locally (download from S3 if needed)
+        if !block_range.file_path.exists() {
+            if let Some(ref sm) = storage_manager {
+                let data_loader = DataLoader::new(
+                    Some(sm.clone()),
+                    &chain.name,
+                    PathBuf::from("data"),
+                );
+                match data_loader.ensure_local(&block_range.file_path).await {
+                    Ok(true) => {
+                        tracing::debug!("Downloaded block file from S3: {}", block_range.file_path.display());
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            "Block file not found locally or in S3: {} for range {}-{}",
+                            block_range.file_path.display(),
+                            range.start,
+                            range.end - 1
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to download block file from S3: {} - {}",
+                            block_range.file_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Block file not found locally and no S3 configured: {} for range {}-{}",
+                    block_range.file_path.display(),
+                    range.start,
+                    range.end - 1
+                );
+                continue;
+            }
         }
 
         // Read block info from the existing parquet file

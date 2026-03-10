@@ -22,7 +22,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
-use crate::storage::{S3Manifest, StorageManager};
+use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::AddressOrAddresses;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -157,7 +157,7 @@ pub async fn collect_eth_calls(
     let range_factory_done: HashSet<u64> = HashSet::new();
 
     if has_regular_calls || has_token_calls || has_once_calls {
-        let block_ranges = get_existing_block_ranges(&chain.name);
+        let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
         tracing::info!(
             "eth_calls catchup: checking {} block ranges (regular={}, token={}, once={})",
             block_ranges.len(),
@@ -283,6 +283,47 @@ pub async fn collect_eth_calls(
             if regular_calls_done && token_calls_done && once_calls_done {
                 range_regular_done.insert(range.start);
                 continue;
+            }
+
+            // Ensure block file is available locally (download from S3 if needed)
+            if !block_range.file_path.exists() {
+                if let Some(ref sm) = storage_manager {
+                    let data_loader = DataLoader::new(
+                        Some(sm.clone()),
+                        &chain.name,
+                        PathBuf::from("data"),
+                    );
+                    match data_loader.ensure_local(&block_range.file_path).await {
+                        Ok(true) => {
+                            tracing::debug!("Downloaded block file from S3: {}", block_range.file_path.display());
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                "Block file not found locally or in S3: {} for range {}-{}",
+                                block_range.file_path.display(),
+                                range.start,
+                                range.end - 1
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to download block file from S3: {} - {}",
+                                block_range.file_path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Block file not found locally and no S3 configured: {} for range {}-{}",
+                        block_range.file_path.display(),
+                        range.start,
+                        range.end - 1
+                    );
+                    continue;
+                }
             }
 
             let block_infos = match read_block_info_from_parquet(&block_range.file_path) {
@@ -480,7 +521,7 @@ pub async fn collect_eth_calls(
             .await;
 
         if !factory_catchup_data.is_empty() {
-            let block_ranges = get_existing_block_ranges(&chain.name);
+            let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
             let mut factory_once_catchup_count = 0;
 
             for block_range in &block_ranges {
@@ -587,6 +628,7 @@ pub async fn collect_eth_calls(
                         &config.function_name,
                         log_range.start,
                         log_range.end,
+                        s3_manifest.as_ref(),
                     ) {
                         needs_processing = true;
                         break;

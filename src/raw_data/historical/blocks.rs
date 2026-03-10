@@ -15,6 +15,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
 use crate::rpc::RpcError;
+use crate::storage::S3Manifest;
 use crate::types::config::raw_data::BlockField;
 
 #[derive(Debug, Error)]
@@ -386,13 +387,34 @@ pub struct ExistingBlockRange {
     pub file_path: PathBuf,
 }
 
-pub fn get_existing_block_ranges(chain_name: &str) -> Vec<ExistingBlockRange> {
+pub fn get_existing_block_ranges(
+    chain_name: &str,
+    s3_manifest: Option<&S3Manifest>,
+) -> Vec<ExistingBlockRange> {
+    use std::collections::HashSet;
+
     let blocks_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain_name));
     let mut ranges = Vec::new();
+    let mut local_ranges: HashSet<(u64, u64)> = HashSet::new();
 
     let entries = match std::fs::read_dir(&blocks_dir) {
         Ok(entries) => entries,
-        Err(_) => return ranges,
+        Err(_) => {
+            // No local directory - just use S3 ranges if available
+            if let Some(manifest) = s3_manifest {
+                for &(start, end) in &manifest.raw_blocks {
+                    let file_name = format!("blocks_{}-{}.parquet", start, end);
+                    let file_path = blocks_dir.join(&file_name);
+                    ranges.push(ExistingBlockRange {
+                        start,
+                        end: end + 1, // Convert inclusive end to exclusive
+                        file_path,
+                    });
+                }
+                ranges.sort_by_key(|r| r.start);
+            }
+            return ranges;
+        }
     };
 
     for entry in entries.flatten() {
@@ -426,11 +448,28 @@ pub fn get_existing_block_ranges(chain_name: &str) -> Vec<ExistingBlockRange> {
             Err(_) => continue,
         };
 
+        local_ranges.insert((start, end));
         ranges.push(ExistingBlockRange {
             start,
             end,
             file_path: path,
         });
+    }
+
+    // Add S3-only ranges that aren't present locally
+    if let Some(manifest) = s3_manifest {
+        for &(start, end) in &manifest.raw_blocks {
+            let exclusive_end = end + 1; // S3 manifest uses inclusive end
+            if !local_ranges.contains(&(start, exclusive_end)) {
+                let file_name = format!("blocks_{}-{}.parquet", start, end);
+                let file_path = blocks_dir.join(&file_name);
+                ranges.push(ExistingBlockRange {
+                    start,
+                    end: exclusive_end,
+                    file_path,
+                });
+            }
+        }
     }
 
     ranges.sort_by_key(|r| r.start);

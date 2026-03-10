@@ -485,8 +485,9 @@ impl ManifestManager {
         .await?;
 
         // Aggregate raw eth_calls: {chain}/markers/raw/eth_calls/{contract}/{function}/
+        // Also handles on_events: {chain}/markers/raw/eth_calls/{contract}/{function}/on_events/
         let prefix = format!("{}/markers/raw/eth_calls", chain);
-        self.aggregate_nested_markers(&prefix, &mut |contract, func, start, end| {
+        self.aggregate_eth_call_markers(&prefix, &mut |contract, func, start, end| {
             manifest.add_raw_eth_calls_granular(contract, func, start, end);
         })
         .await?;
@@ -593,6 +594,66 @@ impl ManifestManager {
             for marker in markers {
                 if let Some((start, end)) = parse_marker_filename(&marker) {
                     add_fn(name, start, end);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper to aggregate eth_call markers with up to 3 levels of nesting.
+    ///
+    /// Handles both:
+    /// - Regular: {prefix}/{contract}/{function}/{start}_{end}.marker
+    /// - On events: {prefix}/{contract}/{function}/on_events/{start}_{end}.marker
+    ///
+    /// Keys are formatted as "contract/function" or "contract/function/on_events".
+    async fn aggregate_eth_call_markers<F>(
+        &self,
+        prefix: &str,
+        add_fn: &mut F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnMut(&str, &str, u64, u64),
+    {
+        let contracts = self.s3.list(prefix).await.unwrap_or_default();
+        for contract in contracts {
+            let contract_name = contract.trim_end_matches('/');
+            if contract_name.ends_with(".marker") {
+                continue;
+            }
+
+            let contract_prefix = format!("{}/{}", prefix, contract_name);
+            let functions = self.s3.list(&contract_prefix).await.unwrap_or_default();
+
+            for function in functions {
+                let function_name = function.trim_end_matches('/');
+                if function_name.ends_with(".marker") {
+                    continue;
+                }
+
+                let function_prefix = format!("{}/{}", contract_prefix, function_name);
+                let items = self.s3.list(&function_prefix).await.unwrap_or_default();
+
+                for item in items {
+                    let item_name = item.trim_end_matches('/');
+
+                    if item_name.ends_with(".marker") {
+                        // Direct marker at function level: contract/function/{start}_{end}.marker
+                        if let Some((start, end)) = parse_marker_filename(item_name) {
+                            add_fn(contract_name, function_name, start, end);
+                        }
+                    } else if item_name == "on_events" {
+                        // Sub-directory for on_events: contract/function/on_events/{start}_{end}.marker
+                        let on_events_prefix = format!("{}/{}", function_prefix, item_name);
+                        let markers = self.s3.list(&on_events_prefix).await.unwrap_or_default();
+
+                        let combined_func = format!("{}/on_events", function_name);
+                        for marker in markers {
+                            if let Some((start, end)) = parse_marker_filename(&marker) {
+                                add_fn(contract_name, &combined_func, start, end);
+                            }
+                        }
+                    }
                 }
             }
         }
