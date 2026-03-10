@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use super::local::LocalBackend;
+use super::retry::RetryQueue;
 use super::s3::S3Backend;
 use super::{StorageBackend, StorageError};
 use crate::types::config::storage::CacheConfig;
@@ -58,19 +60,22 @@ pub struct CachedBackend {
     entries: RwLock<HashMap<String, CacheEntry>>,
     /// Total cache size in bytes
     total_size: AtomicU64,
+    /// Retry queue for failed S3 uploads
+    retry_queue: Option<Arc<RetryQueue>>,
 }
 
 #[allow(dead_code)]
 impl CachedBackend {
-    /// Create a new CachedBackend.
-    pub fn new(
+    /// Create a new CachedBackend and load existing cache index.
+    pub async fn new(
         local: LocalBackend,
         s3: S3Backend,
         config: CacheConfig,
         local_base: PathBuf,
-    ) -> Self {
+        retry_queue: Option<Arc<RetryQueue>>,
+    ) -> Result<Self, StorageError> {
         let index_path = local_base.join(".cache_index.json");
-        Self {
+        let backend = Self {
             local,
             s3,
             config,
@@ -78,7 +83,15 @@ impl CachedBackend {
             index_path,
             entries: RwLock::new(HashMap::new()),
             total_size: AtomicU64::new(0),
+            retry_queue,
+        };
+
+        // Load existing index (ignore errors - start fresh if missing/corrupt)
+        if let Err(e) = backend.load_index().await {
+            tracing::debug!("No cache index loaded: {}", e);
         }
+
+        Ok(backend)
     }
 
     /// Get access to the underlying S3 backend.
@@ -357,8 +370,17 @@ impl StorageBackend for CachedBackend {
         self.local.write(key, data).await?;
         self.record_entry(key, data.len() as u64).await;
 
-        // Write to S3 (synchronous for consistency)
-        self.s3.write(key, data).await?;
+        // Write to S3 with retry fallback
+        if let Err(e) = self.s3.write(key, data).await {
+            if let Some(ref queue) = self.retry_queue {
+                tracing::warn!("S3 write failed for {}, queueing for retry: {}", key, e);
+                let local_path = self.local_base.join(key);
+                queue.enqueue(key.to_string(), local_path).await;
+                // Return Ok - local succeeded, S3 will retry
+            } else {
+                return Err(e);
+            }
+        }
 
         // Trigger eviction check
         let _ = self.evict_if_needed().await;
@@ -400,7 +422,7 @@ mod tests {
     use object_store::memory::InMemory;
     use std::sync::Arc;
 
-    fn create_test_backend(temp_dir: &std::path::Path) -> CachedBackend {
+    async fn create_test_backend(temp_dir: &std::path::Path) -> CachedBackend {
         let local = LocalBackend::new(temp_dir.to_path_buf());
         let s3_store = Arc::new(InMemory::new());
         let s3 = S3Backend::from_store(s3_store, "test-bucket".to_string());
@@ -410,13 +432,13 @@ mod tests {
             eviction_threshold: 0.8,
         };
 
-        CachedBackend::new(local, s3, config, temp_dir.to_path_buf())
+        CachedBackend::new(local, s3, config, temp_dir.to_path_buf(), None).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_cached_backend_write_through() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let backend = create_test_backend(temp_dir.path());
+        let backend = create_test_backend(temp_dir.path()).await;
 
         // Write through both
         backend.write("test/file.parquet", b"data").await.unwrap();
@@ -429,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn test_cached_backend_read_local_first() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let backend = create_test_backend(temp_dir.path());
+        let backend = create_test_backend(temp_dir.path()).await;
 
         // Write to local only
         backend.local.write("local/file.txt", b"local data").await.unwrap();
@@ -442,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn test_cached_backend_read_from_s3_on_miss() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let backend = create_test_backend(temp_dir.path());
+        let backend = create_test_backend(temp_dir.path()).await;
 
         // Write to S3 only
         backend.s3.write("s3/file.txt", b"s3 data").await.unwrap();
@@ -461,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_cached_backend_pinned() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let backend = create_test_backend(temp_dir.path());
+        let backend = create_test_backend(temp_dir.path()).await;
 
         assert!(backend.is_pinned("chain/decoded/logs/event.parquet"));
         assert!(!backend.is_pinned("chain/raw/blocks/blocks.parquet"));

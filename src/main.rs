@@ -29,7 +29,7 @@ use raw_data::historical::receipts::{
 use decoding::handle_transform_retries;
 use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker, TransformRetryRequest};
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
-use storage::{RetryQueue, StorageManager};
+use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
 use transformations::{
     build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
     RangeCompleteMessage, ReorgMessage, TransformationEngine,
@@ -93,15 +93,43 @@ async fn main() -> anyhow::Result<()> {
         metrics::describe_rpc_metrics();
     }
 
-    // Initialize storage manager
+    // Create retry queue before StorageManager if S3 is configured
+    let retry_queue = if let Some(s3_config) = config.storage.as_ref().and_then(|s| s.s3.as_ref()) {
+        let sync_config = config
+            .storage
+            .as_ref()
+            .and_then(|s| s.sync.clone())
+            .unwrap_or_default();
+        let s3_backend = S3Backend::from_config(s3_config)
+            .context("failed to create S3 backend for retry queue")?;
+        let queue = Arc::new(RetryQueue::new(
+            PathBuf::from("data"),
+            sync_config,
+            s3_backend,
+        ));
+        if let Err(e) = queue.load().await {
+            tracing::warn!("Failed to load retry queue: {}", e);
+        }
+        Some(queue)
+    } else {
+        None
+    };
+
+    // Initialize storage manager with retry queue
     let storage_manager = StorageManager::new(
         config.storage.as_ref(),
         PathBuf::from("data"),
+        retry_queue.clone(),
     )
     .await
     .context("failed to initialize storage manager")?;
 
     if storage_manager.is_s3_enabled() {
+        // Register all chains with manifest manager before refresh
+        for chain in &config.chains {
+            storage_manager.register_chain(&chain.name);
+        }
+
         tracing::info!("S3 storage enabled, refreshing manifest...");
         storage_manager
             .refresh_manifest()
@@ -111,29 +139,53 @@ async fn main() -> anyhow::Result<()> {
 
     let storage_manager = Arc::new(storage_manager);
 
-    // Start retry queue service if S3 is enabled
+    // Start retry queue and initial sync services if S3 is enabled
     if storage_manager.is_s3_enabled() {
+        // Spawn retry queue background task
+        if let Some(queue) = retry_queue {
+            let queue_handle = queue.clone();
+            tokio::spawn(async move {
+                let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                queue_handle.run(rx).await;
+            });
+            tracing::info!("Retry queue service started");
+        }
+
+        // Start initial sync service to upload existing local data to S3.
+        // This ensures data collected before S3 was configured gets synced.
         if let Some(manifest_manager) = storage_manager.manifest_manager() {
-            let retry_queue = Arc::new(RetryQueue::new(
-                storage_manager.local_base().clone(),
-                manifest_manager.config().clone(),
+            // Scan correct paths matching actual data layout
+            let prefixes: Vec<String> = config
+                .chains
+                .iter()
+                .flat_map(|chain| {
+                    vec![
+                        // Historical data: data/{chain}/historical/...
+                        format!("{}/historical/raw", chain.name),
+                        format!("{}/historical/decoded", chain.name),
+                        format!("{}/historical/factories", chain.name),
+                        // Live compacted data
+                        format!("raw/{}", chain.name),
+                        format!("derived/{}", chain.name),
+                    ]
+                })
+                .collect();
+
+            let initial_sync = Arc::new(InitialSyncService::with_manifest_manager(
+                LocalBackend::new(storage_manager.local_base().clone()),
                 manifest_manager.s3_backend().clone(),
+                prefixes,
+                manifest_manager,
             ));
 
-            if let Err(e) = retry_queue.load().await {
-                tracing::warn!("Failed to load retry queue: {}", e);
-            }
-
-            // Spawn background task (no shutdown coordination needed -
-            // process exit will terminate it, and it saves on each cycle)
-            let retry_queue_handle = retry_queue.clone();
             tokio::spawn(async move {
-                // Create a never-completing receiver for infinite run
                 let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-                retry_queue_handle.run(rx).await;
+                if let Err(e) = initial_sync.run(rx).await {
+                    tracing::error!("Initial S3 sync failed: {}", e);
+                }
             });
 
-            tracing::info!("Retry queue service started");
+            tracing::info!("Initial S3 sync service started");
         }
     }
 
@@ -474,10 +526,11 @@ async fn process_chain_live_only(
         });
     }
 
-    // Initialize storage manager for live-only mode
+    // Initialize storage manager for live-only mode (no retry queue needed)
     let storage_manager = StorageManager::new(
         config.storage.as_ref(),
         PathBuf::from("data"),
+        None,
     )
     .await
     .context("failed to initialize storage manager")?;

@@ -31,6 +31,7 @@
 
 mod cached;
 mod error;
+mod initial_sync;
 mod local;
 mod manifest;
 mod retry;
@@ -38,8 +39,9 @@ mod s3;
 
 pub use cached::CachedBackend;
 pub use error::StorageError;
+pub use initial_sync::InitialSyncService;
 pub use local::LocalBackend;
-pub use manifest::{S3Manifest, ManifestManager};
+pub use manifest::{ManifestManager, S3Manifest};
 pub use retry::RetryQueue;
 pub use s3::S3Backend;
 
@@ -87,7 +89,7 @@ pub struct StorageManager {
     /// The active storage backend (local-only or cached with S3)
     backend: Arc<dyn StorageBackend>,
     /// Manifest manager for S3 coordination (None if local-only)
-    manifest_manager: Option<ManifestManager>,
+    manifest_manager: Option<Arc<ManifestManager>>,
     /// Base path for local storage
     local_base: PathBuf,
     /// Whether S3 is enabled
@@ -98,9 +100,11 @@ impl StorageManager {
     /// Create a new StorageManager from configuration.
     ///
     /// If `config` is None or S3 is not configured, uses local-only mode.
+    /// The optional `retry_queue` is passed to the cached backend for S3 failure handling.
     pub async fn new(
         config: Option<&StorageConfig>,
         local_base: PathBuf,
+        retry_queue: Option<Arc<RetryQueue>>,
     ) -> Result<Self, StorageError> {
         match config.and_then(|c| c.s3.as_ref()) {
             Some(s3_config) => {
@@ -123,13 +127,14 @@ impl StorageManager {
                     s3_backend,
                     cache_config,
                     local_base.clone(),
-                );
+                    retry_queue,
+                ).await?;
 
-                let manifest_manager = ManifestManager::new(
+                let manifest_manager = Arc::new(ManifestManager::new(
                     cached_backend.s3_backend().clone(),
                     local_base.clone(),
                     sync_config,
-                );
+                ));
 
                 tracing::info!("Storage initialized with S3 backend");
 
@@ -162,8 +167,8 @@ impl StorageManager {
     }
 
     /// Get the manifest manager (if S3 is enabled).
-    pub fn manifest_manager(&self) -> Option<&ManifestManager> {
-        self.manifest_manager.as_ref()
+    pub fn manifest_manager(&self) -> Option<Arc<ManifestManager>> {
+        self.manifest_manager.clone()
     }
 
     /// Whether S3 storage is enabled.
@@ -176,11 +181,20 @@ impl StorageManager {
         &self.local_base
     }
 
+    /// Register a chain with the manifest manager.
+    ///
+    /// This must be called before refresh_manifest() to enable per-chain manifest loading.
+    pub fn register_chain(&self, chain: &str) {
+        if let Some(manager) = &self.manifest_manager {
+            manager.register_chain(chain);
+        }
+    }
+
     /// Refresh the manifest from S3.
     ///
     /// No-op if S3 is not enabled.
     pub async fn refresh_manifest(&self) -> Result<(), StorageError> {
-        if let Some(ref manager) = self.manifest_manager {
+        if let Some(manager) = &self.manifest_manager {
             manager.refresh().await?;
         }
         Ok(())
@@ -188,7 +202,9 @@ impl StorageManager {
 
     /// Get cached manifest (if available).
     pub fn manifest(&self) -> Option<S3Manifest> {
-        self.manifest_manager.as_ref().and_then(|m| m.cached_manifest())
+        self.manifest_manager
+            .as_ref()
+            .and_then(|m| m.cached_manifest())
     }
 }
 
@@ -199,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_manager_local_only() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let manager = StorageManager::new(None, temp_dir.path().to_path_buf())
+        let manager = StorageManager::new(None, temp_dir.path().to_path_buf(), None)
             .await
             .unwrap();
 

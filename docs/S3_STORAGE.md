@@ -214,6 +214,41 @@ If S3 is not configured, the indexer operates in local-only mode:
 
 To run without S3, simply omit the `storage` section from config.
 
+## Initial Sync
+
+When S3 storage is first configured on a node that already has local data, the indexer automatically uploads existing data to S3.
+
+### How It Works
+
+On startup, if S3 is enabled:
+
+1. Scans all `{chain}/historical/` and `{chain}/live/` directories
+2. Identifies `.parquet` files (skips bincode live data)
+3. Checks if each file exists in S3
+4. Uploads missing files with bounded concurrency (10 parallel uploads)
+5. Logs a summary when complete
+
+### What Gets Synced
+
+| Data Type | Synced to S3 |
+|-----------|--------------|
+| Historical parquet files | Yes |
+| Compacted live parquet files | Yes |
+| Live bincode files (`.bin`) | No (ephemeral) |
+| Temporary files (`.tmp`) | No |
+
+### Progress Logging
+
+The service logs progress on completion:
+
+```
+Initial sync complete: scanned=1234, already_synced=1000, uploaded=234 (5.67 GB), failed=0
+```
+
+### No Configuration Required
+
+The initial sync service starts automatically when S3 is configured. It runs in the background and does not block indexer startup.
+
 ## Failure Handling
 
 ### Automatic Retry Service

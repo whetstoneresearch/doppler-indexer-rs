@@ -143,6 +143,15 @@ impl S3Manifest {
             .unwrap_or(false)
     }
 
+    /// Check if a decoded eth_calls range exists for a source/function.
+    pub fn has_decoded_eth_calls(&self, source: &str, func: &str, start: u64, end: u64) -> bool {
+        let key = format!("{}/{}", source, func);
+        self.decoded_eth_calls
+            .get(&key)
+            .map(|ranges| ranges.iter().any(|(s, e)| *s == start && *e == end))
+            .unwrap_or(false)
+    }
+
     /// Add a raw blocks range.
     pub fn add_raw_blocks(&mut self, start: u64, end: u64) {
         if !self.has_raw_blocks(start, end) {
@@ -193,6 +202,16 @@ impl S3Manifest {
             ranges.sort_by_key(|(s, _)| *s);
         }
     }
+
+    /// Add a decoded eth_calls range.
+    pub fn add_decoded_eth_calls(&mut self, source: &str, func: &str, start: u64, end: u64) {
+        let key = format!("{}/{}", source, func);
+        let ranges = self.decoded_eth_calls.entry(key).or_default();
+        if !ranges.iter().any(|(s, e)| *s == start && *e == end) {
+            ranges.push((start, end));
+            ranges.sort_by_key(|(s, _)| *s);
+        }
+    }
 }
 
 /// Manager for S3 manifest operations.
@@ -206,10 +225,12 @@ pub struct ManifestManager {
     s3: S3Backend,
     local_base: PathBuf,
     config: SyncConfig,
-    /// Cached manifest
-    cached: RwLock<Option<S3Manifest>>,
-    /// Last refresh time
-    last_refresh: RwLock<Option<Instant>>,
+    /// Registered chains to refresh
+    chains: RwLock<Vec<String>>,
+    /// Per-chain cached manifests
+    cached: RwLock<HashMap<String, S3Manifest>>,
+    /// Last refresh time per chain
+    last_refresh: RwLock<HashMap<String, Instant>>,
 }
 
 #[allow(dead_code)]
@@ -220,8 +241,18 @@ impl ManifestManager {
             s3,
             local_base,
             config,
-            cached: RwLock::new(None),
-            last_refresh: RwLock::new(None),
+            chains: RwLock::new(Vec::new()),
+            cached: RwLock::new(HashMap::new()),
+            last_refresh: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a chain for manifest refresh.
+    pub fn register_chain(&self, chain: &str) {
+        let mut chains = self.chains.write().unwrap();
+        if !chains.contains(&chain.to_string()) {
+            chains.push(chain.to_string());
+            tracing::debug!("Registered chain {} for manifest refresh", chain);
         }
     }
 
@@ -285,30 +316,42 @@ impl ManifestManager {
         self.s3.exists(&key).await
     }
 
-    /// Get the cached manifest (if available).
+    /// Get the cached manifest for the first registered chain (if available).
     pub fn cached_manifest(&self) -> Option<S3Manifest> {
-        self.cached.read().unwrap().clone()
+        self.cached.read().unwrap().values().next().cloned()
     }
 
-    /// Check if the cached manifest is stale.
+    /// Get the cached manifest for a specific chain.
+    pub fn cached_manifest_for(&self, chain: &str) -> Option<S3Manifest> {
+        self.cached.read().unwrap().get(chain).cloned()
+    }
+
+    /// Check if the cached manifest is stale for any registered chain.
     pub fn is_stale(&self) -> bool {
         let refresh_interval = Duration::from_secs(self.config.manifest_refresh_secs);
-        let last = self.last_refresh.read().unwrap();
-        match *last {
-            Some(t) => t.elapsed() > refresh_interval,
-            None => true,
+        let chains = self.chains.read().unwrap();
+        let last_refresh = self.last_refresh.read().unwrap();
+
+        for chain in chains.iter() {
+            match last_refresh.get(chain) {
+                Some(t) if t.elapsed() <= refresh_interval => continue,
+                _ => return true,
+            }
         }
+        false
     }
 
-    /// Refresh the manifest from S3.
-    ///
-    /// Accepts an optional chain name. If provided, refreshes only that chain.
-    /// If None, this is a no-op (caller should use `refresh_for_chain` directly).
+    /// Refresh manifests for all registered chains.
     pub async fn refresh(&self) -> Result<(), StorageError> {
-        // Without knowing which chain to refresh, we can only update the timestamp.
-        // Callers should use refresh_for_chain() with a specific chain name.
-        let mut last = self.last_refresh.write().unwrap();
-        *last = Some(Instant::now());
+        let chains = self.chains.read().unwrap().clone();
+        if chains.is_empty() {
+            tracing::debug!("No chains registered for manifest refresh");
+            return Ok(());
+        }
+
+        for chain in chains {
+            self.refresh_for_chain(&chain).await?;
+        }
         Ok(())
     }
 
@@ -317,11 +360,15 @@ impl ManifestManager {
         let manifest = self.aggregate_markers(chain).await?;
 
         // Update cache
-        let mut cached = self.cached.write().unwrap();
-        *cached = Some(manifest.clone());
+        {
+            let mut cached = self.cached.write().unwrap();
+            cached.insert(chain.to_string(), manifest.clone());
+        }
 
-        let mut last = self.last_refresh.write().unwrap();
-        *last = Some(Instant::now());
+        {
+            let mut last = self.last_refresh.write().unwrap();
+            last.insert(chain.to_string(), Instant::now());
+        }
 
         // Save to S3 for other services
         self.save_manifest(chain, &manifest).await?;
@@ -333,38 +380,60 @@ impl ManifestManager {
     pub async fn refresh_for_chain(&self, chain: &str) -> Result<(), StorageError> {
         let key = Self::manifest_key(chain);
 
-        match self.s3.read(&key).await {
+        let manifest = match self.s3.read(&key).await {
             Ok(data) => {
                 let manifest = S3Manifest::from_bytes(&data)?;
-                let mut cached = self.cached.write().unwrap();
-                *cached = Some(manifest);
+                tracing::info!(
+                    "Loaded manifest for chain {}: {} blocks, {} logs, {} receipts",
+                    chain,
+                    manifest.raw_blocks.len(),
+                    manifest.raw_logs.len(),
+                    manifest.raw_receipts.len()
+                );
+                manifest
             }
             Err(StorageError::NotFound(_)) => {
                 // No manifest yet - start with empty
-                let mut cached = self.cached.write().unwrap();
-                *cached = Some(S3Manifest::new());
+                tracing::debug!("No manifest found for chain {}, starting empty", chain);
+                S3Manifest::new()
             }
             Err(e) => return Err(e),
+        };
+
+        {
+            let mut cached = self.cached.write().unwrap();
+            cached.insert(chain.to_string(), manifest);
         }
 
-        let mut last = self.last_refresh.write().unwrap();
-        *last = Some(Instant::now());
+        {
+            let mut last = self.last_refresh.write().unwrap();
+            last.insert(chain.to_string(), Instant::now());
+        }
 
         Ok(())
     }
 
     /// Save the manifest to S3.
-    pub async fn save_manifest(&self, chain: &str, manifest: &S3Manifest) -> Result<(), StorageError> {
+    pub async fn save_manifest(
+        &self,
+        chain: &str,
+        manifest: &S3Manifest,
+    ) -> Result<(), StorageError> {
         let key = Self::manifest_key(chain);
         let data = manifest.to_bytes()?;
         self.s3.write(&key, &data).await?;
 
         // Update cache
-        let mut cached = self.cached.write().unwrap();
-        *cached = Some(manifest.clone());
+        {
+            let mut cached = self.cached.write().unwrap();
+            cached.insert(chain.to_string(), manifest.clone());
+        }
 
-        tracing::info!("Saved manifest for chain {} ({} ranges total)", chain,
-            manifest.raw_blocks.len() + manifest.raw_logs.len() + manifest.raw_receipts.len());
+        tracing::info!(
+            "Saved manifest for chain {} ({} ranges total)",
+            chain,
+            manifest.raw_blocks.len() + manifest.raw_logs.len() + manifest.raw_receipts.len()
+        );
 
         Ok(())
     }
@@ -379,25 +448,50 @@ impl ManifestManager {
         let marker_prefix = format!("{}/markers/raw/blocks", chain);
         self.aggregate_raw_markers(&marker_prefix, |start, end| {
             manifest.add_raw_blocks(start, end);
-        }).await?;
+        })
+        .await?;
 
         // List and parse raw log markers
         let marker_prefix = format!("{}/markers/raw/logs", chain);
         self.aggregate_raw_markers(&marker_prefix, |start, end| {
             manifest.add_raw_logs(start, end);
-        }).await?;
+        })
+        .await?;
 
         // List and parse raw receipt markers
         let marker_prefix = format!("{}/markers/raw/receipts", chain);
         self.aggregate_raw_markers(&marker_prefix, |start, end| {
             manifest.add_raw_receipts(start, end);
-        }).await?;
+        })
+        .await?;
 
         // List and parse raw eth_calls markers
         let marker_prefix = format!("{}/markers/raw/eth_calls", chain);
         self.aggregate_raw_markers(&marker_prefix, |start, end| {
             manifest.add_raw_eth_calls(start, end);
-        }).await?;
+        })
+        .await?;
+
+        // Aggregate decoded logs: {chain}/markers/decoded/logs/{source}/{event}/
+        let prefix = format!("{}/markers/decoded/logs", chain);
+        self.aggregate_nested_markers(&prefix, &mut |source, event, start, end| {
+            manifest.add_decoded_logs(source, event, start, end);
+        })
+        .await?;
+
+        // Aggregate decoded eth_calls: {chain}/markers/decoded/eth_calls/{source}/{fn}/
+        let prefix = format!("{}/markers/decoded/eth_calls", chain);
+        self.aggregate_nested_markers(&prefix, &mut |source, func, start, end| {
+            manifest.add_decoded_eth_calls(source, func, start, end);
+        })
+        .await?;
+
+        // Aggregate factories: {chain}/markers/factories/{collection}/
+        let prefix = format!("{}/markers/factories", chain);
+        self.aggregate_factory_markers(&prefix, &mut |collection, start, end| {
+            manifest.add_factories(collection, start, end);
+        })
+        .await?;
 
         Ok(manifest)
     }
@@ -407,7 +501,7 @@ impl ManifestManager {
     where
         F: FnMut(u64, u64),
     {
-        let markers = self.s3.list(prefix).await?;
+        let markers = self.s3.list(prefix).await.unwrap_or_default();
 
         for marker_file in markers {
             // Parse range from filename like "0_999.marker"
@@ -416,6 +510,73 @@ impl ManifestManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// Helper to aggregate nested markers (source/item structure like decoded logs).
+    async fn aggregate_nested_markers<F>(
+        &self,
+        prefix: &str,
+        add_fn: &mut F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnMut(&str, &str, u64, u64),
+    {
+        let sources = self.s3.list(prefix).await.unwrap_or_default();
+        for source in sources {
+            let source_name = source.trim_end_matches('/');
+            // Skip if it looks like a marker file itself
+            if source_name.ends_with(".marker") {
+                continue;
+            }
+
+            let source_prefix = format!("{}/{}", prefix, source_name);
+            let items = self.s3.list(&source_prefix).await.unwrap_or_default();
+
+            for item in items {
+                let item_name = item.trim_end_matches('/');
+                if item_name.ends_with(".marker") {
+                    continue;
+                }
+
+                let item_prefix = format!("{}/{}", source_prefix, item_name);
+                let markers = self.s3.list(&item_prefix).await.unwrap_or_default();
+
+                for marker in markers {
+                    if let Some((start, end)) = parse_marker_filename(&marker) {
+                        add_fn(source_name, item_name, start, end);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper to aggregate factory markers (collection structure).
+    async fn aggregate_factory_markers<F>(
+        &self,
+        prefix: &str,
+        add_fn: &mut F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnMut(&str, u64, u64),
+    {
+        let collections = self.s3.list(prefix).await.unwrap_or_default();
+        for collection in collections {
+            let name = collection.trim_end_matches('/');
+            if name.ends_with(".marker") {
+                continue;
+            }
+
+            let collection_prefix = format!("{}/{}", prefix, name);
+            let markers = self.s3.list(&collection_prefix).await.unwrap_or_default();
+
+            for marker in markers {
+                if let Some((start, end)) = parse_marker_filename(&marker) {
+                    add_fn(name, start, end);
+                }
+            }
+        }
         Ok(())
     }
 }
