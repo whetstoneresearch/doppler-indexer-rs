@@ -58,6 +58,17 @@
             "access_key_env_var": "S3_ACCESS_KEY_ID",
             "secret_key_env_var": "S3_SECRET_ACCESS_KEY",
             "bucket_env_var": "S3_BUCKET"
+        },
+        "cache": {
+            "max_size_gb": 100,
+            "pinned_prefixes": ["factories", "decoded"],
+            "eviction_threshold": 0.8
+        },
+        "sync": {
+            "marker_freshness_ranges": 10,
+            "manifest_refresh_secs": 60,
+            "retry_interval_secs": 30,
+            "max_retries": 10
         }
     }
 }

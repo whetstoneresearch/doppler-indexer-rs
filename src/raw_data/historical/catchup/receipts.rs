@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::mpsc::Sender;
 
@@ -10,7 +11,7 @@ use crate::raw_data::historical::receipts::{
     EventTriggerMessage, LogMessage, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
-use crate::storage::S3Manifest;
+use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -34,6 +35,7 @@ pub async fn collect_receipts(
     event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
     event_matchers: &[EventTriggerMatcher],
     s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<ReceiptsCatchupState, ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -145,6 +147,8 @@ pub async fn collect_receipts(
             factory_log_tx_capacity,
             chain.block_receipts_method.as_deref(),
             block_receipt_concurrency,
+            storage_manager.as_ref(),
+            &chain.name,
         )
         .await?;
 

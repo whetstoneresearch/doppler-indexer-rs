@@ -30,20 +30,24 @@
 //! ```
 
 mod cached;
+mod data_loader;
 mod error;
 mod initial_sync;
 mod local;
 mod manifest;
 mod retry;
 mod s3;
+mod upload;
 
 pub use cached::CachedBackend;
+pub use data_loader::DataLoader;
 pub use error::StorageError;
 pub use initial_sync::InitialSyncService;
 pub use local::LocalBackend;
 pub use manifest::{ManifestManager, S3Manifest};
 pub use retry::RetryQueue;
 pub use s3::S3Backend;
+pub use upload::upload_parquet_to_s3;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -201,10 +205,21 @@ impl StorageManager {
     }
 
     /// Get cached manifest (if available).
+    ///
+    /// DEPRECATED: Use `manifest_for(chain)` for multi-chain deployments.
+    /// This returns the first cached manifest regardless of chain.
+    #[allow(dead_code)]
     pub fn manifest(&self) -> Option<S3Manifest> {
         self.manifest_manager
             .as_ref()
             .and_then(|m| m.cached_manifest())
+    }
+
+    /// Get cached manifest for a specific chain.
+    pub fn manifest_for(&self, chain: &str) -> Option<S3Manifest> {
+        self.manifest_manager
+            .as_ref()
+            .and_then(|m| m.cached_manifest_for(chain))
     }
 }
 

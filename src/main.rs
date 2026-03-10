@@ -139,6 +139,30 @@ async fn main() -> anyhow::Result<()> {
 
     let storage_manager = Arc::new(storage_manager);
 
+    // Start periodic manifest refresh and other S3 services if enabled
+    if storage_manager.is_s3_enabled() {
+        // Periodic manifest refresh task
+        let sm = storage_manager.clone();
+        let refresh_secs = config.storage.as_ref()
+            .and_then(|s| s.sync.as_ref())
+            .map(|s| s.manifest_refresh_secs)
+            .unwrap_or(60);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+            loop {
+                interval.tick().await;
+                if let Err(e) = sm.refresh_manifest().await {
+                    tracing::warn!("Periodic manifest refresh failed: {}", e);
+                } else {
+                    tracing::debug!("Periodic manifest refresh completed");
+                }
+            }
+        });
+
+        tracing::info!("Periodic manifest refresh enabled (every {}s)", refresh_secs);
+    }
+
     // Start retry queue and initial sync services if S3 is enabled
     if storage_manager.is_s3_enabled() {
         // Spawn retry queue background task
@@ -833,9 +857,10 @@ async fn process_chain(
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
-        let s3_manifest = storage_manager.manifest();
+        let s3_manifest = storage_manager.manifest_for(&chain.name);
+        let sm = storage_manager.clone();
         async move {
-            collect_blocks(&chain, &blocks_client, &cfg, Some(block_tx), Some(eth_call_tx), s3_manifest.as_ref())
+            collect_blocks(&chain, &blocks_client, &cfg, Some(block_tx), Some(eth_call_tx), s3_manifest.as_ref(), Some(sm))
                 .await
                 .context("block collection failed")
         }
@@ -844,7 +869,8 @@ async fn process_chain(
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
         let log_tx = Some(log_tx);
-        let s3_manifest = storage_manager.manifest();
+        let s3_manifest = storage_manager.manifest_for(&chain.name);
+        let sm = storage_manager.clone();
         async move {
             // Catchup: process existing block ranges missing receipts
             let catchup_state = raw_data::historical::catchup::receipts::collect_receipts(
@@ -856,6 +882,7 @@ async fn process_chain(
                 &event_trigger_tx,
                 &event_matchers,
                 s3_manifest,
+                Some(sm.clone()),
             )
             .await
             .context("receipt catchup failed")?;
@@ -872,6 +899,7 @@ async fn process_chain(
                 event_matchers,
                 recollect_rx,
                 catchup_state,
+                Some(sm),
             )
             .await
             .context("receipt collection failed")
@@ -880,10 +908,11 @@ async fn process_chain(
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
-        let s3_manifest = storage_manager.manifest();
+        let s3_manifest = storage_manager.manifest_for(&chain.name);
+        let sm = storage_manager.clone();
         async move {
             let catchup_state =
-                raw_data::historical::catchup::logs::collect_logs(&chain, &cfg, s3_manifest)
+                raw_data::historical::catchup::logs::collect_logs(&chain, &cfg, s3_manifest, Some(sm))
                     .await
                     .context("log catchup failed")?;
 
@@ -901,7 +930,8 @@ async fn process_chain(
 
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
-        let s3_manifest = storage_manager.manifest();
+        let s3_manifest = storage_manager.manifest_for(&chain.name);
+        let sm = storage_manager.clone();
         async move {
             // Catchup: process existing block/log ranges
             let catchup_state =
@@ -915,6 +945,7 @@ async fn process_chain(
                     factory_catchup_done_rx,
                     eth_calls_catchup_done_tx,
                     s3_manifest,
+                    Some(sm.clone()),
                 )
                 .await
                 .context("eth_calls catchup failed")?;
@@ -928,6 +959,7 @@ async fn process_chain(
                 event_trigger_rx,
                 call_decoder_tx,
                 catchup_state,
+                Some(sm),
             )
             .await
             .context("eth_calls collection failed")
@@ -937,7 +969,8 @@ async fn process_chain(
     if has_factories {
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
-            let s3_manifest = storage_manager.manifest();
+            let s3_manifest = storage_manager.manifest_for(&chain.name);
+            let sm = storage_manager.clone();
             async move {
                 // Catchup: load existing factory data and process gaps
                 let catchup_state =
@@ -951,6 +984,7 @@ async fn process_chain(
                         &recollect_tx_for_factories,
                         factory_catchup_done_tx,
                         s3_manifest,
+                        Some(sm),
                     )
                     .await
                     .context("factory catchup failed")?;
@@ -968,6 +1002,7 @@ async fn process_chain(
                     catchup_state.existing_files,
                     catchup_state.output_dir,
                     catchup_state.s3_manifest,
+                    catchup_state.storage_manager,
                 )
                 .await
                 .context("factory collection failed")

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use alloy::primitives::Address;
 use tokio::sync::mpsc::Sender;
@@ -21,7 +22,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
-use crate::storage::S3Manifest;
+use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::AddressOrAddresses;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -36,6 +37,7 @@ pub async fn collect_eth_calls(
     factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
     eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
     s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<EthCallCatchupState, EthCallCollectionError> {
     let base_output_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
     std::fs::create_dir_all(&base_output_dir)?;
@@ -330,6 +332,8 @@ pub async fn collect_eth_calls(
                         &mut frequency_state,
                         multicall_addr,
                         &None,
+                        &chain.name,
+                        storage_manager.as_ref(),
                     )
                     .await?;
                 } else {
@@ -345,6 +349,8 @@ pub async fn collect_eth_calls(
                         max_params,
                         &mut frequency_state,
                         &None,
+                        &chain.name,
+                        storage_manager.as_ref(),
                     )
                     .await?;
                 }
@@ -363,6 +369,8 @@ pub async fn collect_eth_calls(
                         &mut frequency_state,
                         multicall_addr,
                         &None,
+                        &chain.name,
+                        storage_manager.as_ref(),
                     )
                     .await?;
                 } else {
@@ -376,6 +384,8 @@ pub async fn collect_eth_calls(
                         rpc_batch_size,
                         &mut frequency_state,
                         &None,
+                        &chain.name,
+                        storage_manager.as_ref(),
                     )
                     .await?;
                 }
@@ -394,6 +404,8 @@ pub async fn collect_eth_calls(
                         multicall_addr,
                         rpc_batch_size,
                         &None,
+                        &chain.name,
+                        storage_manager.as_ref(),
                     )
                     .await?;
                 } else {
@@ -406,6 +418,8 @@ pub async fn collect_eth_calls(
                         &base_output_dir,
                         &existing_files,
                         &None,
+                        &chain.name,
+                        storage_manager.as_ref(),
                     )
                     .await?;
                 }
@@ -457,7 +471,13 @@ pub async fn collect_eth_calls(
 
         // Load factory address data from existing parquet files
         let factory_catchup_data =
-            load_factory_addresses_for_once_catchup(&chain.name, &factory_once_configs);
+            load_factory_addresses_for_once_catchup(
+                &chain.name,
+                &factory_once_configs,
+                s3_manifest.as_ref(),
+                storage_manager.as_ref(),
+            )
+            .await;
 
         if !factory_catchup_data.is_empty() {
             let block_ranges = get_existing_block_ranges(&chain.name);
@@ -502,6 +522,8 @@ pub async fn collect_eth_calls(
                     &existing_files,
                     &factory_once_column_indexes,
                     decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
 
@@ -525,7 +547,13 @@ pub async fn collect_eth_calls(
         // CRITICAL: Load historical factory addresses BEFORE processing event triggers
         // This ensures we can properly filter events from factory-created contracts
         let historical_factory_addrs =
-            load_historical_factory_addresses(&chain.name, &event_call_configs);
+            load_historical_factory_addresses(
+                &chain.name,
+                &event_call_configs,
+                s3_manifest.as_ref(),
+                storage_manager.as_ref(),
+            )
+            .await;
         for (collection_name, addrs) in historical_factory_addrs {
             tracing::info!(
                 "Loaded {} historical factory addresses for collection {}",
@@ -538,7 +566,7 @@ pub async fn collect_eth_calls(
                 .extend(addrs);
         }
 
-        let log_ranges = get_existing_log_ranges(&chain.name);
+        let log_ranges = get_existing_log_ranges(&chain.name, s3_manifest.as_ref());
         let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let mut event_catchup_count = 0;
 
@@ -630,6 +658,8 @@ pub async fn collect_eth_calls(
                     multicall_addr,
                     range_start,
                     range_end,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             } else {
@@ -643,6 +673,8 @@ pub async fn collect_eth_calls(
                     decoder_tx,
                     range_start,
                     range_end,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             }

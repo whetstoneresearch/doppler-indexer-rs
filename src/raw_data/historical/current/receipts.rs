@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use alloy::primitives::B256;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -14,6 +15,7 @@ use crate::raw_data::historical::receipts::{
     EventTriggerMessage, LogMessage, ReceiptBatchState, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::{upload_parquet_to_s3, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -28,6 +30,7 @@ pub async fn collect_receipts(
     event_matchers: Vec<EventTriggerMatcher>,
     mut recollect_rx: Option<Receiver<RecollectRequest>>,
     catchup_state: ReceiptsCatchupState,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -273,14 +276,15 @@ pub async fn collect_receipts(
                             minimal_records.sort_by_key(|r| r.block_number);
                             full_records.sort_by_key(|r| r.block_number);
 
+                            let output_path = output_dir.join(range.file_name());
                             let total_receipts = match receipt_fields {
                                 Some(fields) => {
                                     let count = minimal_records.len();
                                     let schema_clone = schema.clone();
                                     let fields_vec = fields.to_vec();
-                                    let output_path = output_dir.join(range.file_name());
+                                    let output_path_clone = output_path.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path)
+                                        write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path_clone)
                                     })
                                     .await
                                     .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -289,9 +293,9 @@ pub async fn collect_receipts(
                                 None => {
                                     let count = full_records.len();
                                     let schema_clone = schema.clone();
-                                    let output_path = output_dir.join(range.file_name());
+                                    let output_path_clone = output_path.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path)
+                                        write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path_clone)
                                     })
                                     .await
                                     .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -305,6 +309,20 @@ pub async fn collect_receipts(
                                 range.end - 1,
                                 total_receipts
                             );
+
+                            // Upload to S3 if configured
+                            if let Some(ref sm) = storage_manager {
+                                upload_parquet_to_s3(
+                                    sm,
+                                    &output_path,
+                                    &chain.name,
+                                    "raw/receipts",
+                                    range.start,
+                                    range.end - 1,
+                                )
+                                .await
+                                .map_err(|e| ReceiptCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                            }
 
                             send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
                         }
@@ -390,6 +408,8 @@ pub async fn collect_receipts(
                         factory_log_tx_capacity,
                         chain.block_receipts_method.as_deref(),
                         block_receipt_concurrency,
+                        storage_manager.as_ref(),
+                        &chain.name,
                     )
                     .await?;
 
@@ -508,15 +528,16 @@ pub async fn collect_receipts(
         state.minimal_records.sort_by_key(|r| r.block_number);
         state.full_records.sort_by_key(|r| r.block_number);
 
+        let output_path = output_dir.join(range.file_name());
         let total_receipts = match receipt_fields {
             Some(fields) => {
                 let count = state.minimal_records.len();
                 let schema_clone = schema.clone();
                 let fields_vec = fields.to_vec();
-                let output_path = output_dir.join(range.file_name());
+                let output_path_clone = output_path.clone();
                 let minimal_records = state.minimal_records;
                 tokio::task::spawn_blocking(move || {
-                    write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path)
+                    write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path_clone)
                 })
                 .await
                 .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -525,10 +546,10 @@ pub async fn collect_receipts(
             None => {
                 let count = state.full_records.len();
                 let schema_clone = schema.clone();
-                let output_path = output_dir.join(range.file_name());
+                let output_path_clone = output_path.clone();
                 let full_records = state.full_records;
                 tokio::task::spawn_blocking(move || {
-                    write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path)
+                    write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path_clone)
                 })
                 .await
                 .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -542,6 +563,20 @@ pub async fn collect_receipts(
             range.end - 1,
             total_receipts
         );
+
+        // Upload to S3 if configured
+        if let Some(ref sm) = storage_manager {
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                &chain.name,
+                "raw/receipts",
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| ReceiptCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        }
 
         send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
     }

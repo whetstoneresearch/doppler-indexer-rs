@@ -10,7 +10,7 @@ use crate::raw_data::historical::factories::{
     process_range, FactoryAddressData, FactoryCollectionError, FactoryMatcher, FactoryMessage,
 };
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
-use crate::storage::S3Manifest;
+use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -26,6 +26,7 @@ pub async fn collect_factories(
     existing_files: Arc<HashSet<String>>,
     output_dir: Arc<PathBuf>,
     s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), FactoryCollectionError> {
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
 
@@ -138,6 +139,8 @@ pub async fn collect_factories(
                     &output_dir,
                     &existing_files,
                     s3_manifest.as_ref(),
+                    storage_manager.as_ref(),
+                    &chain.name,
                 )
                 .await
                 {

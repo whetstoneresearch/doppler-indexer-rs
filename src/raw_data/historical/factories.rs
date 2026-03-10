@@ -14,7 +14,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
 use crate::raw_data::historical::receipts::LogData;
-use crate::storage::S3Manifest;
+use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
     FactoryParameterLocation,
@@ -100,6 +100,8 @@ pub(crate) struct FactoryCatchupState {
     pub(crate) existing_files: Arc<HashSet<String>>,
     pub(crate) output_dir: Arc<PathBuf>,
     pub(crate) s3_manifest: Option<S3Manifest>,
+    pub(crate) storage_manager: Option<Arc<StorageManager>>,
+    pub(crate) chain_name: String,
 }
 
 pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
@@ -197,6 +199,8 @@ pub(crate) async fn process_range(
     output_dir: &Path,
     existing_files: &HashSet<String>,
     s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<FactoryAddressData, FactoryCollectionError> {
     let mut records: Vec<FactoryRecord> = Vec::new();
     let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
@@ -261,7 +265,7 @@ pub(crate) async fn process_range(
         }
     }
 
-    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest).await?;
+    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest, storage_manager, chain_name).await?;
 
     Ok(FactoryAddressData {
         range_start,
@@ -304,6 +308,8 @@ pub(crate) async fn process_range_batches(
     output_dir: &Path,
     existing_files: &HashSet<String>,
     s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<FactoryAddressData, FactoryCollectionError> {
     let mut records: Vec<FactoryRecord> = Vec::new();
     let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
@@ -434,7 +440,7 @@ pub(crate) async fn process_range_batches(
         }
     }
 
-    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest).await?;
+    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest, storage_manager, chain_name).await?;
 
     Ok(FactoryAddressData {
         range_start,
@@ -453,6 +459,8 @@ async fn write_factory_parquet_files(
     output_dir: &Path,
     existing_files: &HashSet<String>,
     s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<(), FactoryCollectionError> {
     let mut by_collection: HashMap<String, Vec<FactoryRecord>> = HashMap::new();
     for record in records {
@@ -486,8 +494,9 @@ async fn write_factory_parquet_files(
         let sub_dir = output_dir.join(&collection_name);
         std::fs::create_dir_all(&sub_dir)?;
         let output_path = sub_dir.join(&file_name);
+        let output_path_clone = output_path.clone();
         tokio::task::spawn_blocking(move || {
-            write_factory_records_to_parquet(&collection_records, &output_path)
+            write_factory_records_to_parquet(&collection_records, &output_path_clone)
         })
         .await
         .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
@@ -496,8 +505,23 @@ async fn write_factory_parquet_files(
             "Wrote {} factory addresses for {} to {}",
             record_count,
             collection_name,
-            sub_dir.join(&file_name).display()
+            output_path.display()
         );
+
+        // Upload to S3 if configured
+        if let Some(sm) = storage_manager {
+            let data_type = format!("factories/{}", collection_name);
+            crate::storage::upload_parquet_to_s3(
+                sm,
+                &output_path,
+                chain_name,
+                &data_type,
+                range_start,
+                range_end - 1,
+            )
+            .await
+            .map_err(|e| FactoryCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
     }
 
     for matcher in matchers {
@@ -514,7 +538,8 @@ async fn write_factory_parquet_files(
                 let sub_dir = output_dir.join(collection_name);
                 std::fs::create_dir_all(&sub_dir)?;
                 let output_path = sub_dir.join(&file_name);
-                tokio::task::spawn_blocking(move || write_empty_factory_parquet(&output_path))
+                let output_path_clone = output_path.clone();
+                tokio::task::spawn_blocking(move || write_empty_factory_parquet(&output_path_clone))
                     .await
                     .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
 
@@ -524,6 +549,21 @@ async fn write_factory_parquet_files(
                     range_start,
                     range_end - 1
                 );
+
+                // Upload to S3 if configured
+                if let Some(sm) = storage_manager {
+                    let data_type = format!("factories/{}", collection_name);
+                    crate::storage::upload_parquet_to_s3(
+                        sm,
+                        &output_path,
+                        chain_name,
+                        &data_type,
+                        range_start,
+                        range_end - 1,
+                    )
+                    .await
+                    .map_err(|e| FactoryCollectionError::Io(std::io::Error::other(e.to_string())))?;
+                }
             }
         }
     }
@@ -890,14 +930,34 @@ pub struct RecollectRequest {
     pub _file_path: PathBuf,
 }
 
-/// Scan existing logs parquet files and return their ranges
-pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
+/// Scan existing logs parquet files and return their ranges.
+/// Also includes ranges from S3 manifest that aren't present locally.
+pub(crate) fn get_existing_log_ranges(
+    chain_name: &str,
+    s3_manifest: Option<&S3Manifest>,
+) -> Vec<ExistingLogRange> {
     let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain_name));
     let mut ranges = Vec::new();
+    let mut local_ranges: HashSet<(u64, u64)> = HashSet::new();
 
     let entries = match std::fs::read_dir(&logs_dir) {
         Ok(entries) => entries,
-        Err(_) => return ranges,
+        Err(_) => {
+            // No local directory - just use S3 ranges if available
+            if let Some(manifest) = s3_manifest {
+                for &(start, end) in &manifest.raw_logs {
+                    let file_name = format!("logs_{}-{}.parquet", start, end);
+                    let file_path = logs_dir.join(&file_name);
+                    ranges.push(ExistingLogRange {
+                        start,
+                        end: end + 1, // Convert inclusive end to exclusive
+                        file_path,
+                    });
+                }
+                ranges.sort_by_key(|r| r.start);
+            }
+            return ranges;
+        }
     };
 
     for entry in entries.flatten() {
@@ -931,11 +991,28 @@ pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange>
             Err(_) => continue,
         };
 
+        local_ranges.insert((start, end));
         ranges.push(ExistingLogRange {
             start,
             end,
             file_path: path,
         });
+    }
+
+    // Add S3-only ranges that aren't present locally
+    if let Some(manifest) = s3_manifest {
+        for &(start, end) in &manifest.raw_logs {
+            let exclusive_end = end + 1; // S3 manifest uses inclusive end
+            if !local_ranges.contains(&(start, exclusive_end)) {
+                let file_name = format!("logs_{}-{}.parquet", start, end);
+                let file_path = logs_dir.join(&file_name);
+                ranges.push(ExistingLogRange {
+                    start,
+                    end: exclusive_end,
+                    file_path,
+                });
+            }
+        }
     }
 
     ranges.sort_by_key(|r| r.start);

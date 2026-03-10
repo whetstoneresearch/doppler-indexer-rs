@@ -12,7 +12,7 @@ use crate::raw_data::historical::blocks::{
     write_minimal_blocks_to_parquet, BlockCollectionError, FullBlockRecord, MinimalBlockRecord,
 };
 use crate::rpc::{RpcError, UnifiedRpcClient};
-use crate::storage::S3Manifest;
+use crate::storage::{upload_parquet_to_s3, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{BlockField, RawDataCollectionConfig};
 
@@ -35,6 +35,7 @@ pub async fn collect_blocks(
     tx_sender: Option<Sender<(u64, u64, Vec<B256>)>>,
     eth_call_sender: Option<Sender<(u64, u64)>>,
     s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), BlockCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -86,11 +87,26 @@ pub async fn collect_blocks(
         )
         .await?;
 
+        let output_path = output_dir.join(range.file_name());
         tracing::info!(
             "Wrote {} blocks to {}",
             record_count,
-            output_dir.join(range.file_name()).display()
+            output_path.display()
         );
+
+        // Upload to S3 if configured
+        if let Some(ref sm) = storage_manager {
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                &chain.name,
+                "raw/blocks",
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| BlockCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        }
     }
 
     Ok(())

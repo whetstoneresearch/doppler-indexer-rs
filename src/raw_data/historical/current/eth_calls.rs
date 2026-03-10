@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -13,6 +14,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{FactoryAddressData, FactoryMessage};
 use crate::raw_data::historical::receipts::EventTriggerMessage;
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::StorageManager;
 use crate::types::config::chain::ChainConfig;
 
 pub async fn collect_eth_calls(
@@ -23,6 +25,7 @@ pub async fn collect_eth_calls(
     mut event_trigger_rx: Option<Receiver<EventTriggerMessage>>,
     decoder_tx: Option<Sender<DecoderMessage>>,
     mut state: EthCallCatchupState,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // If nothing configured, drain block_rx and return
     if !state.has_regular_calls
@@ -106,6 +109,8 @@ pub async fn collect_eth_calls(
                                                 &mut state.frequency_state,
                                                 multicall_addr,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         } else {
@@ -121,6 +126,8 @@ pub async fn collect_eth_calls(
                                                 state.factory_max_params,
                                                 &mut state.frequency_state,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         }
@@ -139,6 +146,8 @@ pub async fn collect_eth_calls(
                                                     multicall_addr,
                                                     state.rpc_batch_size,
                                                     &decoder_tx,
+                                                    &chain.name,
+                                                    storage_manager.as_ref(),
                                                 )
                                                 .await?;
                                             } else {
@@ -151,6 +160,8 @@ pub async fn collect_eth_calls(
                                                     &state.existing_files,
                                                     &empty_index,
                                                     &decoder_tx,
+                                                    &chain.name,
+                                                    storage_manager.as_ref(),
                                                 )
                                                 .await?;
                                             }
@@ -198,6 +209,8 @@ pub async fn collect_eth_calls(
                                     multicall_addr,
                                     range_start,
                                     range_end,
+                                    &chain.name,
+                                    storage_manager.as_ref(),
                                 )
                                 .await?;
                             } else {
@@ -211,6 +224,8 @@ pub async fn collect_eth_calls(
                                     &decoder_tx,
                                     range_start,
                                     range_end,
+                                    &chain.name,
+                                    storage_manager.as_ref(),
                                 )
                                 .await?;
                             }
@@ -294,6 +309,8 @@ pub async fn collect_eth_calls(
                                             &mut state.frequency_state,
                                             multicall_addr,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     } else {
@@ -309,6 +326,8 @@ pub async fn collect_eth_calls(
                                             state.max_params,
                                             &mut state.frequency_state,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     }
@@ -327,6 +346,8 @@ pub async fn collect_eth_calls(
                                             &mut state.frequency_state,
                                             multicall_addr,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     } else {
@@ -340,6 +361,8 @@ pub async fn collect_eth_calls(
                                             state.rpc_batch_size,
                                             &mut state.frequency_state,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     }
@@ -358,6 +381,8 @@ pub async fn collect_eth_calls(
                                             multicall_addr,
                                             state.rpc_batch_size,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     } else {
@@ -370,6 +395,8 @@ pub async fn collect_eth_calls(
                                             &state.base_output_dir,
                                             &state.existing_files,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     }
@@ -392,6 +419,8 @@ pub async fn collect_eth_calls(
                                                 &mut state.frequency_state,
                                                 multicall_addr,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         } else {
@@ -407,6 +436,8 @@ pub async fn collect_eth_calls(
                                                 state.factory_max_params,
                                                 &mut state.frequency_state,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         }
@@ -426,6 +457,8 @@ pub async fn collect_eth_calls(
                                                 multicall_addr,
                                                 state.rpc_batch_size,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         } else {
@@ -438,6 +471,8 @@ pub async fn collect_eth_calls(
                                                 &state.existing_files,
                                                 &empty_index,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         }
@@ -515,6 +550,8 @@ pub async fn collect_eth_calls(
                                             &mut state.frequency_state,
                                             multicall_addr,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     } else {
@@ -530,6 +567,8 @@ pub async fn collect_eth_calls(
                                             state.factory_max_params,
                                             &mut state.frequency_state,
                                             &decoder_tx,
+                                            &chain.name,
+                                            storage_manager.as_ref(),
                                         )
                                         .await?;
                                     }
@@ -548,6 +587,8 @@ pub async fn collect_eth_calls(
                                                 multicall_addr,
                                                 state.rpc_batch_size,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         } else {
@@ -560,6 +601,8 @@ pub async fn collect_eth_calls(
                                                 &state.existing_files,
                                                 &empty_index,
                                                 &decoder_tx,
+                                                &chain.name,
+                                                storage_manager.as_ref(),
                                             )
                                             .await?;
                                         }
@@ -606,6 +649,8 @@ pub async fn collect_eth_calls(
                                 multicall_addr,
                                 range_start,
                                 range_end,
+                                &chain.name,
+                                storage_manager.as_ref(),
                             )
                             .await?;
                         } else {
@@ -619,6 +664,8 @@ pub async fn collect_eth_calls(
                                 &decoder_tx,
                                 range_start,
                                 range_end,
+                                &chain.name,
+                                storage_manager.as_ref(),
                             )
                             .await?;
                         }
@@ -689,6 +736,8 @@ pub async fn collect_eth_calls(
                     &mut state.frequency_state,
                     multicall_addr,
                     &decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             } else {
@@ -704,6 +753,8 @@ pub async fn collect_eth_calls(
                     state.max_params,
                     &mut state.frequency_state,
                     &decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             }
@@ -722,6 +773,8 @@ pub async fn collect_eth_calls(
                     &mut state.frequency_state,
                     multicall_addr,
                     &decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             } else {
@@ -735,6 +788,8 @@ pub async fn collect_eth_calls(
                     state.rpc_batch_size,
                     &mut state.frequency_state,
                     &decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             }
@@ -753,6 +808,8 @@ pub async fn collect_eth_calls(
                     multicall_addr,
                     state.rpc_batch_size,
                     &decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             } else {
@@ -765,6 +822,8 @@ pub async fn collect_eth_calls(
                     &state.base_output_dir,
                     &state.existing_files,
                     &decoder_tx,
+                    &chain.name,
+                    storage_manager.as_ref(),
                 )
                 .await?;
             }
@@ -787,6 +846,8 @@ pub async fn collect_eth_calls(
                             &mut state.frequency_state,
                             multicall_addr,
                             &decoder_tx,
+                            &chain.name,
+                            storage_manager.as_ref(),
                         )
                         .await?;
                     } else {
@@ -802,6 +863,8 @@ pub async fn collect_eth_calls(
                             state.factory_max_params,
                             &mut state.frequency_state,
                             &decoder_tx,
+                            &chain.name,
+                            storage_manager.as_ref(),
                         )
                         .await?;
                     }
@@ -820,6 +883,8 @@ pub async fn collect_eth_calls(
                                 multicall_addr,
                                 state.rpc_batch_size,
                                 &decoder_tx,
+                                &chain.name,
+                                storage_manager.as_ref(),
                             )
                             .await?;
                         } else {
@@ -832,6 +897,8 @@ pub async fn collect_eth_calls(
                                 &state.existing_files,
                                 &empty_index,
                                 &decoder_tx,
+                                &chain.name,
+                                storage_manager.as_ref(),
                             )
                             .await?;
                         }

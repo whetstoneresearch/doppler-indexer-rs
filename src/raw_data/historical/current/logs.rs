@@ -59,6 +59,8 @@ pub async fn collect_logs(
                                         &state.existing_files,
                                         &decoder_tx,
                                         state.s3_manifest.as_ref(),
+                                        state.storage_manager.as_ref(),
+                                        &state.chain_name,
                                     )
                                     .await?;
                                     factory_ready.remove(&range_start);
@@ -122,6 +124,8 @@ pub async fn collect_logs(
                                 &state.existing_files,
                                 &decoder_tx,
                                 state.s3_manifest.as_ref(),
+                                state.storage_manager.as_ref(),
+                                &state.chain_name,
                             )
                             .await?;
                         } else {

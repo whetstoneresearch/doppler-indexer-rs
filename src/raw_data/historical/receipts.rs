@@ -14,6 +14,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::{upload_parquet_to_s3, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::ReceiptField;
 
@@ -629,6 +630,8 @@ pub(crate) async fn process_range(
     factory_log_tx_capacity: usize,
     block_receipts_method: Option<&str>,
     block_receipt_concurrency: usize,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<(), ReceiptCollectionError> {
     let range_start_time = Instant::now();
 
@@ -885,14 +888,15 @@ pub(crate) async fn process_range(
     }
 
     let write_start = Instant::now();
+    let output_path = output_dir.join(range.file_name());
     let total_receipts = match receipt_fields {
         Some(fields) => {
             let count = all_minimal_records.len();
             let schema_clone = schema.clone();
             let fields_vec = fields.to_vec();
-            let output_path = output_dir.join(range.file_name());
+            let output_path_clone = output_path.clone();
             tokio::task::spawn_blocking(move || {
-                write_minimal_receipts_to_parquet(&all_minimal_records, &schema_clone, &fields_vec, &output_path)
+                write_minimal_receipts_to_parquet(&all_minimal_records, &schema_clone, &fields_vec, &output_path_clone)
             })
             .await
             .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -901,9 +905,9 @@ pub(crate) async fn process_range(
         None => {
             let count = all_full_records.len();
             let schema_clone = schema.clone();
-            let output_path = output_dir.join(range.file_name());
+            let output_path_clone = output_path.clone();
             tokio::task::spawn_blocking(move || {
-                write_full_receipts_to_parquet(&all_full_records, &schema_clone, &output_path)
+                write_full_receipts_to_parquet(&all_full_records, &schema_clone, &output_path_clone)
             })
             .await
             .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -911,6 +915,20 @@ pub(crate) async fn process_range(
         }
     };
     let total_write_time = write_start.elapsed();
+
+    // Upload to S3 if configured
+    if let Some(sm) = storage_manager {
+        upload_parquet_to_s3(
+            sm,
+            &output_path,
+            chain_name,
+            "raw/receipts",
+            range.start,
+            range.end - 1,
+        )
+        .await
+        .map_err(|e| ReceiptCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    }
 
     #[cfg(feature = "bench")]
     {

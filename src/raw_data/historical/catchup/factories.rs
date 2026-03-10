@@ -15,7 +15,7 @@ use crate::raw_data::historical::factories::{
     FactoryAddressData, FactoryCatchupState, FactoryCollectionError, FactoryMessage,
     RecollectRequest,
 };
-use crate::storage::S3Manifest;
+use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -29,6 +29,7 @@ pub async fn collect_factories(
     recollect_tx: &Option<Sender<RecollectRequest>>,
     factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -111,6 +112,8 @@ pub async fn collect_factories(
             existing_files: Arc::new(HashSet::new()),
             output_dir: Arc::new(output_dir),
             s3_manifest,
+            storage_manager,
+            chain_name: chain.name.clone(),
         });
     }
 
@@ -124,7 +127,7 @@ pub async fn collect_factories(
     // Catchup phase: Process existing logs files where factory files are missing
     // This avoids re-fetching receipts when logs already exist
     // =========================================================================
-    let log_ranges = get_existing_log_ranges(&chain.name);
+    let log_ranges = get_existing_log_ranges(&chain.name, s3_manifest.as_ref());
     let mut catchup_count = 0;
 
     let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(4);
@@ -132,6 +135,8 @@ pub async fn collect_factories(
     let existing_files = Arc::new(existing_files);
     let output_dir = Arc::new(output_dir);
     let s3_manifest = Arc::new(s3_manifest);
+    let storage_manager = Arc::new(storage_manager);
+    let chain_name = Arc::new(chain.name.clone());
 
     {
         let semaphore = Arc::new(Semaphore::new(factory_concurrency));
@@ -161,6 +166,8 @@ pub async fn collect_factories(
             let existing_files = existing_files.clone();
             let output_dir = output_dir.clone();
             let s3_manifest = s3_manifest.clone();
+            let storage_manager = storage_manager.clone();
+            let chain_name = chain_name.clone();
             let file_path = log_range.file_path.clone();
             let start = log_range.start;
             let end = log_range.end;
@@ -168,6 +175,47 @@ pub async fn collect_factories(
             let recollect_tx = recollect_tx.clone();
             join_set.spawn(async move {
                 let _permit = permit;
+
+                // Ensure file is available locally (download from S3 if needed)
+                if !file_path.exists() {
+                    if let Some(ref sm) = storage_manager.as_ref() {
+                        let data_loader = DataLoader::new(
+                            Some((*sm).clone()),
+                            &chain_name,
+                            PathBuf::from("data"),
+                        );
+                        match data_loader.ensure_local(&file_path).await {
+                            Ok(true) => {
+                                tracing::debug!("Downloaded log file from S3: {}", file_path.display());
+                            }
+                            Ok(false) => {
+                                tracing::warn!(
+                                    "Log file not found locally or in S3: {} for range {}-{}",
+                                    file_path.display(),
+                                    start,
+                                    end - 1
+                                );
+                                return Ok(None);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to download log file from S3: {} - {}",
+                                    file_path.display(),
+                                    e
+                                );
+                                return Ok(None);
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Log file not found locally and no S3 configured: {} for range {}-{}",
+                            file_path.display(),
+                            start,
+                            end - 1
+                        );
+                        return Ok(None);
+                    }
+                }
 
                 let file_path_for_read = file_path.clone();
                 let file_path_display = file_path.display().to_string();
@@ -229,7 +277,7 @@ pub async fn collect_factories(
                     total_rows
                 );
 
-                process_range_batches(start, end, batches, &matchers, &output_dir, &existing_files, s3_manifest.as_ref().as_ref())
+                process_range_batches(start, end, batches, &matchers, &output_dir, &existing_files, s3_manifest.as_ref().as_ref(), storage_manager.as_ref().as_ref(), &chain_name)
                     .await
                     .map(Some)
             });
@@ -326,11 +374,15 @@ pub async fn collect_factories(
 
     // Extract from Arc - at this point all tasks are done so we're the only owner
     let s3_manifest = Arc::try_unwrap(s3_manifest).unwrap_or_else(|arc| (*arc).clone());
+    let storage_manager = Arc::try_unwrap(storage_manager).unwrap_or_else(|arc| (*arc).clone());
+    let chain_name = Arc::try_unwrap(chain_name).unwrap_or_else(|arc| (*arc).clone());
 
     Ok(FactoryCatchupState {
         matchers,
         existing_files,
         output_dir,
         s3_manifest,
+        storage_manager,
+        chain_name,
     })
 }

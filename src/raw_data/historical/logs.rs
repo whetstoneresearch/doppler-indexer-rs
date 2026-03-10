@@ -16,7 +16,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
-use crate::storage::S3Manifest;
+use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::LogField;
 
@@ -45,6 +45,8 @@ pub(crate) struct LogsCatchupState {
     pub(crate) needs_factory_wait: bool,
     pub(crate) log_fields: Option<Vec<LogField>>,
     pub(crate) s3_manifest: Option<S3Manifest>,
+    pub(crate) storage_manager: Option<Arc<StorageManager>>,
+    pub(crate) chain_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +96,8 @@ pub(crate) async fn process_completed_range(
     _existing_files: &HashSet<String>,
     decoder_tx: &Option<Sender<DecoderMessage>>,
     s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<(), LogCollectionError> {
     let range = BlockRange {
         start: range_start,
@@ -156,7 +160,7 @@ pub(crate) async fn process_completed_range(
         }).await;
     }
 
-    process_range(&range, logs, log_fields, schema, output_dir).await
+    process_range(&range, logs, log_fields, schema, output_dir, storage_manager, chain_name).await
 }
 
 pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
@@ -182,6 +186,8 @@ pub(crate) async fn process_range(
     log_fields: &Option<Vec<LogField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<(), LogCollectionError> {
     tracing::info!(
         "Writing {} logs for blocks {}-{}",
@@ -236,10 +242,25 @@ pub(crate) async fn process_range(
         }
     }
 
+    let output_path = output_dir.join(range.file_name());
     tracing::info!(
         "Wrote logs to {}",
-        output_dir.join(range.file_name()).display()
+        output_path.display()
     );
+
+    // Upload to S3 if configured
+    if let Some(sm) = storage_manager {
+        crate::storage::upload_parquet_to_s3(
+            sm,
+            &output_path,
+            chain_name,
+            "raw/logs",
+            range.start,
+            range.end - 1,
+        )
+        .await
+        .map_err(|e| LogCollectionError::Io(std::io::Error::other(e.to_string())))?;
+    }
 
     Ok(())
 }

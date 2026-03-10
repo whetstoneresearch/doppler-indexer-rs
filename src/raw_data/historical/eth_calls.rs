@@ -20,7 +20,7 @@ use tokio::sync::mpsc::Sender;
 use crate::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult, EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::{EventTriggerData, LogData};
-use crate::storage::S3Manifest;
+use crate::storage::{upload_parquet_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue};
@@ -643,6 +643,8 @@ pub(crate) async fn process_event_triggers(
     decoder_tx: &Option<Sender<DecoderMessage>>,
     range_start: u64,
     range_end: u64,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all configured (contract_name, function_name) pairs so we can write empty files
     // for pairs with no matching events (prevents catchup from retrying)
@@ -858,6 +860,21 @@ pub(crate) async fn process_event_triggers(
                 output_path.display()
             );
 
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/{}/on_events", contract_name, function_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path,
+                    chain_name,
+                    &data_type,
+                    min_block,
+                    max_block,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
+
             // Send to decoder for decoding
             if let Some(tx) = decoder_tx {
                 let decoder_results: Vec<DecoderEventCallResult> = all_results
@@ -930,6 +947,8 @@ pub(crate) async fn process_event_triggers_multicall(
     multicall3_address: Address,
     range_start: u64,
     range_end: u64,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all configured (contract_name, function_name) pairs so we can write empty files
     // for pairs with no matching events (prevents catchup from retrying)
@@ -1150,6 +1169,21 @@ pub(crate) async fn process_event_triggers_multicall(
             output_path.display()
         );
 
+        // Upload to S3 if configured
+        if let Some(sm) = storage_manager {
+            let data_type = format!("raw/eth_calls/{}/{}/on_events", contract_name, function_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                chain_name,
+                &data_type,
+                min_block,
+                max_block,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
         // Send to decoder
         if let Some(tx) = decoder_tx {
             let decoder_results: Vec<DecoderEventCallResult> = results
@@ -1265,9 +1299,11 @@ pub(crate) fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
 
 /// Load historical factory addresses from parquet files for event trigger catchup
 /// This ensures factory addresses are known before processing historical event triggers
-pub(crate) fn load_historical_factory_addresses(
+pub(crate) async fn load_historical_factory_addresses(
     chain_name: &str,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
+    s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> HashMap<String, HashSet<Address>> {
     let mut result: HashMap<String, HashSet<Address>> = HashMap::new();
 
@@ -1284,15 +1320,17 @@ pub(crate) fn load_historical_factory_addresses(
     }
 
     let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
-    if !factories_dir.exists() {
-        tracing::debug!(
-            "No factories directory found at {}, skipping historical factory address loading",
-            factories_dir.display()
-        );
-        return result;
-    }
+    let local_base = PathBuf::from(format!("data/{}", chain_name));
+    let data_loader = DataLoader::new(
+        storage_manager.map(|sm| sm.clone()),
+        chain_name,
+        local_base,
+    );
 
-    // Scan factory directories
+    // Collect files to process: local files + S3 manifest ranges
+    let mut files_to_process: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+    // First, scan local factory directories
     if let Ok(entries) = std::fs::read_dir(&factories_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1318,13 +1356,66 @@ pub(crate) fn load_historical_factory_addresses(
                     if !file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
                         continue;
                     }
+                    files_to_process
+                        .entry(collection_name.clone())
+                        .or_default()
+                        .push(file_path);
+                }
+            }
+        }
+    }
 
+    // Add S3 manifest factory ranges that aren't already local
+    if let Some(manifest) = s3_manifest {
+        for collection_name in &factory_collections {
+            if let Some(ranges) = manifest.factories.get(collection_name) {
+                let collection_dir = factories_dir.join(collection_name);
+                for &(start, end) in ranges {
+                    let file_name = format!("{}-{}.parquet", start, end);
+                    let file_path = collection_dir.join(&file_name);
+
+                    // Only add if not already in the list
+                    let already_present = files_to_process
+                        .get(collection_name)
+                        .map(|files| files.iter().any(|f| f == &file_path))
+                        .unwrap_or(false);
+
+                    if !already_present {
+                        files_to_process
+                            .entry(collection_name.clone())
+                            .or_default()
+                            .push(file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Process all files, downloading from S3 if needed
+    for (collection_name, file_paths) in files_to_process {
+        for file_path in file_paths {
+            // Ensure file is local (download from S3 if needed)
+            match data_loader.ensure_local(&file_path).await {
+                Ok(true) => {
                     if let Ok(addresses) = read_factory_addresses_from_parquet(&file_path) {
                         result
                             .entry(collection_name.clone())
                             .or_default()
                             .extend(addresses.into_iter().map(Address::from));
                     }
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        "Factory file {} not available locally or in S3",
+                        file_path.display()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to ensure factory file {} is local: {}",
+                        file_path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -1345,26 +1436,31 @@ pub(crate) fn load_historical_factory_addresses(
 
 /// Load factory addresses with block numbers and timestamps for once-call catchup.
 /// Returns a map of collection_name -> Vec<(address, block_number, timestamp)>
-pub(crate) fn load_factory_addresses_for_once_catchup(
+pub(crate) async fn load_factory_addresses_for_once_catchup(
     chain_name: &str,
     factory_once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> HashMap<String, Vec<(Address, u64, u64)>> {
     let mut result: HashMap<String, Vec<(Address, u64, u64)>> = HashMap::new();
 
-    let collections_needed: HashSet<&String> = factory_once_configs.keys().collect();
+    let collections_needed: HashSet<String> = factory_once_configs.keys().cloned().collect();
     if collections_needed.is_empty() {
         return result;
     }
 
     let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
-    if !factories_dir.exists() {
-        tracing::debug!(
-            "No factories directory at {}, skipping factory once catchup",
-            factories_dir.display()
-        );
-        return result;
-    }
+    let local_base = PathBuf::from(format!("data/{}", chain_name));
+    let data_loader = DataLoader::new(
+        storage_manager.map(|sm| sm.clone()),
+        chain_name,
+        local_base,
+    );
 
+    // Collect files to process: local files + S3 manifest ranges
+    let mut files_to_process: HashMap<String, Vec<PathBuf>> = HashMap::new();
+
+    // First, scan local factory directories
     if let Ok(entries) = std::fs::read_dir(&factories_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1389,13 +1485,66 @@ pub(crate) fn load_factory_addresses_for_once_catchup(
                     if !file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
                         continue;
                     }
+                    files_to_process
+                        .entry(collection_name.clone())
+                        .or_default()
+                        .push(file_path);
+                }
+            }
+        }
+    }
 
+    // Add S3 manifest factory ranges that aren't already local
+    if let Some(manifest) = s3_manifest {
+        for collection_name in &collections_needed {
+            if let Some(ranges) = manifest.factories.get(collection_name) {
+                let collection_dir = factories_dir.join(collection_name);
+                for &(start, end) in ranges {
+                    let file_name = format!("{}-{}.parquet", start, end);
+                    let file_path = collection_dir.join(&file_name);
+
+                    // Only add if not already in the list
+                    let already_present = files_to_process
+                        .get(collection_name)
+                        .map(|files| files.iter().any(|f| f == &file_path))
+                        .unwrap_or(false);
+
+                    if !already_present {
+                        files_to_process
+                            .entry(collection_name.clone())
+                            .or_default()
+                            .push(file_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Process all files, downloading from S3 if needed
+    for (collection_name, file_paths) in files_to_process {
+        for file_path in file_paths {
+            // Ensure file is local (download from S3 if needed)
+            match data_loader.ensure_local(&file_path).await {
+                Ok(true) => {
                     if let Ok(addresses) = read_factory_addresses_with_blocks(&file_path) {
                         result
                             .entry(collection_name.clone())
                             .or_default()
                             .extend(addresses);
                     }
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        "Factory file {} not available locally or in S3",
+                        file_path.display()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to ensure factory file {} is local: {}",
+                        file_path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -1543,14 +1692,34 @@ pub(crate) struct ExistingLogRange {
     pub(crate) file_path: PathBuf,
 }
 
-/// Get existing log file ranges for catchup
-pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange> {
+/// Get existing log file ranges for catchup.
+/// Also includes ranges from S3 manifest that aren't present locally.
+pub(crate) fn get_existing_log_ranges(
+    chain_name: &str,
+    s3_manifest: Option<&S3Manifest>,
+) -> Vec<ExistingLogRange> {
     let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain_name));
     let mut ranges = Vec::new();
+    let mut local_ranges: HashSet<(u64, u64)> = HashSet::new();
 
     let entries = match std::fs::read_dir(&logs_dir) {
         Ok(entries) => entries,
-        Err(_) => return ranges,
+        Err(_) => {
+            // No local directory - just use S3 ranges if available
+            if let Some(manifest) = s3_manifest {
+                for &(start, end) in &manifest.raw_logs {
+                    let file_name = format!("logs_{}-{}.parquet", start, end);
+                    let file_path = logs_dir.join(&file_name);
+                    ranges.push(ExistingLogRange {
+                        start,
+                        end: end + 1, // Convert inclusive end to exclusive
+                        file_path,
+                    });
+                }
+                ranges.sort_by_key(|r| r.start);
+            }
+            return ranges;
+        }
     };
 
     for entry in entries.flatten() {
@@ -1584,11 +1753,28 @@ pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange>
             Err(_) => continue,
         };
 
+        local_ranges.insert((start, end));
         ranges.push(ExistingLogRange {
             start,
             end,
             file_path: path,
         });
+    }
+
+    // Add S3-only ranges that aren't present locally
+    if let Some(manifest) = s3_manifest {
+        for &(start, end) in &manifest.raw_logs {
+            let exclusive_end = end + 1; // S3 manifest uses inclusive end
+            if !local_ranges.contains(&(start, exclusive_end)) {
+                let file_name = format!("logs_{}-{}.parquet", start, end);
+                let file_path = logs_dir.join(&file_name);
+                ranges.push(ExistingLogRange {
+                    start,
+                    end: exclusive_end,
+                    file_path,
+                });
+            }
+        }
     }
 
     ranges.sort_by_key(|r| r.start);
@@ -1748,6 +1934,8 @@ pub(crate) async fn process_factory_range(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for (_block, addrs) in &factory_data.addresses_by_block {
@@ -1964,11 +2152,27 @@ pub(crate) async fn process_factory_range(
                 );
             }
 
+            let output_path_for_upload = sub_dir.join(&file_name);
             tracing::info!(
                 "Wrote {} factory eth_call results to {}",
                 result_count,
-                sub_dir.join(&file_name).display()
+                output_path_for_upload.display()
             );
+
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/{}", collection_name, function_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path_for_upload,
+                    chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
@@ -2011,6 +2215,8 @@ pub(crate) async fn process_factory_range_multicall(
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -2253,11 +2459,27 @@ pub(crate) async fn process_factory_range_multicall(
             .await
             .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
 
+            let output_path_for_upload = sub_dir.join(&file_name);
             tracing::info!(
                 "Wrote {} multicall factory eth_call results to {}",
                 result_count,
-                sub_dir.join(&file_name).display()
+                output_path_for_upload.display()
             );
+
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/{}", group.collection_name, group.function_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path_for_upload,
+                    chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
@@ -2713,6 +2935,8 @@ pub(crate) async fn process_once_calls_regular(
     output_dir: &Path,
     existing_files: &HashSet<String>,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let first_block = match blocks.first() {
         Some(b) => b,
@@ -2992,6 +3216,21 @@ pub(crate) async fn process_once_calls_regular(
             }
         }
 
+        // Upload to S3 if configured
+        if let Some(sm) = storage_manager {
+            let data_type = format!("raw/eth_calls/{}/once", contract_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                chain_name,
+                &data_type,
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
         // Update the column index with all columns present in the file
         let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
             .into_iter()
@@ -3032,6 +3271,8 @@ pub(crate) async fn process_factory_once_calls(
     existing_files: &HashSet<String>,
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -3428,6 +3669,21 @@ pub(crate) async fn process_factory_once_calls(
             }
         }
 
+        // Upload to S3 if configured
+        if let Some(sm) = storage_manager {
+            let data_type = format!("raw/eth_calls/{}/once", collection_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                chain_name,
+                &data_type,
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
         // Update the column index with all columns present in the file
         let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
             .into_iter()
@@ -3470,6 +3726,8 @@ pub(crate) async fn process_once_calls_multicall(
     multicall3_address: Address,
     rpc_batch_size: usize,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let first_block = match blocks.first() {
         Some(b) => b,
@@ -3737,6 +3995,21 @@ pub(crate) async fn process_once_calls_multicall(
                 }
             }
 
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/once", contract_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path,
+                    chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
+
             // Update column index with all columns present in the file
             let file_name = output_path.file_name().unwrap().to_string_lossy().to_string();
             let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
@@ -3775,6 +4048,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
     multicall3_address: Address,
     rpc_batch_size: usize,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all calls across all collections into one multicall
     #[derive(Clone)]
@@ -4197,6 +4472,21 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 }
             }
 
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/once", collection_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path,
+                    chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
+
             // Update column index with all columns present in the file
             let file_name = output_path.file_name().unwrap().to_string_lossy().to_string();
             let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
@@ -4239,6 +4529,8 @@ pub(crate) async fn process_range(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -4256,9 +4548,9 @@ pub(crate) async fn process_range(
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
-            || s3_manifest
-                .as_ref()
-                .map_or(false, |m| m.has_raw_eth_calls(range.start, range.end - 1))
+            || s3_manifest.as_ref().map_or(false, |m| {
+                m.has_raw_eth_calls_granular(contract_name, function_name, range.start, range.end - 1)
+            })
         {
             tracing::debug!(
                 "Skipping eth_calls for {}.{} blocks {}-{} (already exists)",
@@ -4411,11 +4703,27 @@ pub(crate) async fn process_range(
             );
         }
 
+        let output_path_for_upload = sub_dir.join(&file_name);
         tracing::info!(
             "Wrote {} eth_call results to {}",
             result_count,
-            sub_dir.join(&file_name).display()
+            output_path_for_upload.display()
         );
+
+        // Upload to S3 if configured
+        if let Some(sm) = storage_manager {
+            let data_type = format!("raw/eth_calls/{}/{}", contract_name, function_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path_for_upload,
+                chain_name,
+                &data_type,
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
 
         if let Some(tx) = decoder_tx {
             if let Some(results) = decoder_results {
@@ -4457,6 +4765,8 @@ pub(crate) async fn process_range_multicall(
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (contract_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
@@ -4483,9 +4793,9 @@ pub(crate) async fn process_range_multicall(
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
-            || s3_manifest
-                .as_ref()
-                .map_or(false, |m| m.has_raw_eth_calls(range.start, range.end - 1))
+            || s3_manifest.as_ref().map_or(false, |m| {
+                m.has_raw_eth_calls_granular(contract_name, function_name, range.start, range.end - 1)
+            })
         {
             tracing::debug!(
                 "Skipping eth_calls for {}.{} blocks {}-{} (already exists)",
@@ -4658,11 +4968,27 @@ pub(crate) async fn process_range_multicall(
             .await
             .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
 
+            let output_path_for_upload = sub_dir.join(&file_name);
             tracing::info!(
                 "Wrote {} multicall eth_call results to {}",
                 result_count,
-                sub_dir.join(&file_name).display()
+                output_path_for_upload.display()
             );
+
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/{}", group.contract_name, group.function_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path_for_upload,
+                    chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
@@ -5048,6 +5374,8 @@ pub(crate) async fn process_token_range_multicall(
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (token_name, function_name) — same as process_token_range
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
@@ -5286,11 +5614,27 @@ pub(crate) async fn process_token_range_multicall(
             .await
             .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
 
+            let output_path_for_upload = sub_dir.join(&file_name);
             tracing::info!(
                 "Wrote {} multicall token results to {}",
                 result_count,
-                sub_dir.join(&file_name).display()
+                output_path_for_upload.display()
             );
+
+            // Upload to S3 if configured
+            if let Some(sm) = storage_manager {
+                let data_type = format!("raw/eth_calls/{}/{}", group.output_name, group.function_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path_for_upload,
+                    chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
@@ -5329,6 +5673,8 @@ pub(crate) async fn process_token_range(
     rpc_batch_size: usize,
     frequency_state: &mut FrequencyState,
     decoder_tx: &Option<Sender<DecoderMessage>>,
+    chain_name: &str,
+    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (token_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
@@ -5453,11 +5799,27 @@ pub(crate) async fn process_token_range(
         .await
         .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
 
+        let output_path_for_upload = sub_dir.join(&file_name);
         tracing::info!(
             "Wrote {} token call results to {}",
             result_count,
-            sub_dir.join(&file_name).display()
+            output_path_for_upload.display()
         );
+
+        // Upload to S3 if configured
+        if let Some(sm) = storage_manager {
+            let data_type = format!("raw/eth_calls/{}/{}", output_name, function_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path_for_upload,
+                chain_name,
+                &data_type,
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
 
         if let Some(tx) = decoder_tx {
             if let Some(results) = decoder_results {
