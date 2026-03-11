@@ -274,8 +274,8 @@ impl HistoricalDataReader {
 
             // Find files that overlap with the requested range
             for (range_start, range_end, path) in file_list {
-                // Check for overlap: range intersects if range_end > from_block AND range_start < to_block
-                if *range_end > from_block && *range_start < to_block {
+                // Filenames store inclusive end blocks, while queries are half-open.
+                if *range_end >= from_block && *range_start < to_block {
                     files.push((
                         source.clone(),
                         name.clone(),
