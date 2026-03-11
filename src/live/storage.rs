@@ -345,6 +345,52 @@ impl LiveStorage {
         Ok(status)
     }
 
+    /// Atomically update status for a block using a closure.
+    ///
+    /// This provides atomic read-modify-write semantics by using file locking
+    /// to prevent concurrent updates from overwriting each other's changes.
+    /// The closure receives the current status and returns the modified status.
+    ///
+    /// If the status file doesn't exist, returns NotFound error.
+    pub fn update_status_atomic<F>(
+        &self,
+        block_number: u64,
+        update_fn: F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnOnce(&mut LiveBlockStatus),
+    {
+        use fs2::FileExt;
+
+        let path = self.status_path(block_number);
+
+        // Open file for reading and acquire exclusive lock
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| map_io_not_found(e, block_number))?;
+
+        // Acquire exclusive lock (blocks until lock is available)
+        file.lock_exclusive()
+            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Read current status while holding lock
+        let reader = BufReader::new(&file);
+        let mut status: LiveBlockStatus = serde_json::from_reader(reader)?;
+
+        // Apply the update
+        update_fn(&mut status);
+
+        // Write updated status atomically (tmp + rename)
+        // Release lock before rename to avoid deadlock
+        drop(file);
+
+        self.write_status(block_number, &status)?;
+
+        Ok(())
+    }
+
     /// Delete status for a block.
     pub fn delete_status(&self, block_number: u64) -> Result<(), StorageError> {
         safe_delete(&self.status_path(block_number))

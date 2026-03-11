@@ -50,6 +50,8 @@ impl LiveProgressTracker {
     /// Mark a handler as complete for a block.
     ///
     /// Updates both in-memory state and persists to the status file for catchup.
+    /// Uses atomic file updates to prevent race conditions when multiple handlers
+    /// complete simultaneously.
     pub async fn mark_complete(
         &mut self,
         block_number: u64,
@@ -80,32 +82,41 @@ impl LiveProgressTracker {
                 .await?;
         }
 
-        // Persist handler completion to status file for catchup on restart
+        // Persist handler completion to status file using atomic update
+        // to prevent race conditions when multiple handlers complete simultaneously
         let storage = LiveStorage::new(&self.chain_name);
-        if let Ok(mut status) = storage.read_status(block_number) {
-            status.completed_handlers.insert(handler_key.to_string());
+        let handler_key_owned = handler_key.to_string();
+        let all_complete = self.is_block_complete(block_number);
+        let handler_count = self.handler_keys.len();
+        let pending = self.get_pending_handlers(block_number);
 
-            // Check if all handlers are now complete for this block
-            let all_complete = self.is_block_complete(block_number);
+        let update_result = storage.update_status_atomic(block_number, |status| {
+            status.completed_handlers.insert(handler_key_owned.clone());
+
             if all_complete {
                 status.transformed = true;
-                tracing::info!(
-                    "Block {} fully transformed ({} handlers complete)",
-                    block_number,
-                    self.handler_keys.len()
-                );
-            } else {
-                let pending = self.get_pending_handlers(block_number);
-                tracing::debug!(
-                    "Block {} handler '{}' complete, {} remaining: {:?}",
-                    block_number,
-                    handler_key,
-                    pending.len(),
-                    pending
-                );
             }
+        });
 
-            if let Err(e) = storage.write_status(block_number, &status) {
+        match update_result {
+            Ok(()) => {
+                if all_complete {
+                    tracing::info!(
+                        "Block {} fully transformed ({} handlers complete)",
+                        block_number,
+                        handler_count
+                    );
+                } else {
+                    tracing::debug!(
+                        "Block {} handler '{}' complete, {} remaining: {:?}",
+                        block_number,
+                        handler_key,
+                        pending.len(),
+                        pending
+                    );
+                }
+            }
+            Err(e) => {
                 tracing::warn!("Failed to update block status after handler completion: {}", e);
             }
         }

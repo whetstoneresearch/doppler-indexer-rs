@@ -118,8 +118,15 @@ impl ReorgDetector {
     }
 
     /// Remove blocks older than retention_depth.
+    ///
+    /// After pruning, exactly `retention_depth` blocks are kept (including the current block).
+    /// For example, with retention_depth=5 and current_block=10, keeps blocks 6-10.
     fn prune_old_blocks(&mut self, current_block: u64) {
-        let min_block = current_block.saturating_sub(self.retention_depth);
+        // To keep exactly retention_depth blocks, we need min_block such that
+        // the range [min_block, current_block] has retention_depth elements.
+        // That means: current_block - min_block + 1 = retention_depth
+        // So: min_block = current_block - retention_depth + 1
+        let min_block = current_block.saturating_sub(self.retention_depth.saturating_sub(1));
 
         // Remove all blocks before min_block
         self.recent_blocks = self.recent_blocks.split_off(&min_block);
@@ -256,6 +263,51 @@ mod tests {
         assert!(detector.tracked_count() <= 6);
         assert!(detector.get_block_hash(1).is_none());
         assert!(detector.get_block_hash(10).is_some());
+    }
+
+    #[test]
+    fn test_pruning_exact_retention_depth() {
+        // Test that pruning keeps exactly retention_depth blocks
+        let mut detector = ReorgDetector::new(5);
+
+        // Add 20 blocks to ensure pruning happens multiple times
+        for i in 1..=20 {
+            let parent = if i == 1 { 0 } else { i - 1 };
+            detector.process_block(&make_block(i, i as u8, parent as u8));
+        }
+
+        // Should keep exactly 5 blocks: 16, 17, 18, 19, 20
+        assert_eq!(detector.tracked_count(), 5);
+        assert!(detector.get_block_hash(15).is_none());
+        assert!(detector.get_block_hash(16).is_some());
+        assert!(detector.get_block_hash(17).is_some());
+        assert!(detector.get_block_hash(18).is_some());
+        assert!(detector.get_block_hash(19).is_some());
+        assert!(detector.get_block_hash(20).is_some());
+    }
+
+    #[test]
+    fn test_pruning_retention_depth_boundary() {
+        // Test edge cases for retention depth
+        let mut detector = ReorgDetector::new(3);
+
+        // Add exactly 3 blocks
+        detector.process_block(&make_block(1, 1, 0));
+        detector.process_block(&make_block(2, 2, 1));
+        detector.process_block(&make_block(3, 3, 2));
+
+        // All 3 should be present
+        assert_eq!(detector.tracked_count(), 3);
+
+        // Add one more
+        detector.process_block(&make_block(4, 4, 3));
+
+        // Should now have exactly 3: blocks 2, 3, 4
+        assert_eq!(detector.tracked_count(), 3);
+        assert!(detector.get_block_hash(1).is_none());
+        assert!(detector.get_block_hash(2).is_some());
+        assert!(detector.get_block_hash(3).is_some());
+        assert!(detector.get_block_hash(4).is_some());
     }
 
     #[test]
