@@ -64,7 +64,16 @@ impl SlidingWindowRateLimiter {
         }
     }
 
-    /// Calculate current usage within the sliding window
+    /// Calculate current usage within the sliding window.
+    ///
+    /// This counts entries strictly within the window (timestamp > cutoff).
+    /// An entry exactly at the cutoff (i.e., exactly `window` duration old) is NOT counted
+    /// because it is considered expired. This is consistent with `cleanup()` which removes
+    /// entries at `timestamp <= cutoff`.
+    ///
+    /// Example with a 10-second window:
+    /// - Entry at T=0, current time T=10: cutoff=0, entry is NOT counted (0 > 0 is false)
+    /// - Entry at T=1, current time T=10: cutoff=0, entry IS counted (1 > 0 is true)
     fn current_usage(history: &VecDeque<(Instant, u32)>, now: Instant, window: Duration) -> u32 {
         let cutoff = now.checked_sub(window).unwrap_or(now);
         history
@@ -74,7 +83,18 @@ impl SlidingWindowRateLimiter {
             .sum()
     }
 
-    /// Remove expired entries from history
+    /// Remove expired entries from history.
+    ///
+    /// This removes entries at or before the cutoff (timestamp <= cutoff).
+    /// An entry exactly at the cutoff (i.e., exactly `window` duration old) IS removed
+    /// because it is considered expired. This is consistent with `current_usage()` which
+    /// only counts entries with `timestamp > cutoff`.
+    ///
+    /// The boundary semantics are:
+    /// - `cleanup()` removes entries where `timestamp <= cutoff` (expired)
+    /// - `current_usage()` counts entries where `timestamp > cutoff` (active)
+    /// - These are complementary: no entry is both removed and counted, and every entry
+    ///   is either removed or counted.
     fn cleanup(history: &mut VecDeque<(Instant, u32)>, now: Instant, window: Duration) {
         let cutoff = now.checked_sub(window).unwrap_or(now);
         while let Some((ts, _)) = history.front() {
@@ -1104,5 +1124,127 @@ impl std::fmt::Debug for AlchemyClient {
         f.debug_struct("AlchemyClient")
             .field("config", &self.config)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that an entry exactly at the window boundary is considered expired.
+    ///
+    /// This test verifies the boundary semantics of SlidingWindowRateLimiter:
+    /// - An entry exactly at the cutoff (timestamp == cutoff) should be expired
+    /// - cleanup() removes entries at timestamp <= cutoff
+    /// - current_usage() counts entries at timestamp > cutoff
+    /// - Both methods agree: boundary entries are expired and not counted
+    ///
+    /// Note: This test directly tests the static methods to avoid needing real-time sleeps,
+    /// since SlidingWindowRateLimiter uses std::time::Instant which is not affected by
+    /// tokio's time mocking.
+    #[test]
+    fn test_boundary_entry_is_expired() {
+        let now = Instant::now();
+        let window = Duration::from_secs(10);
+
+        // Create history with an entry exactly at the cutoff boundary
+        // If now = T+10 and window = 10s, then cutoff = T+0
+        // An entry at T+0 should NOT be counted (0 > 0 is false)
+        let mut history: VecDeque<(Instant, u32)> = VecDeque::new();
+
+        // Entry exactly at the cutoff (now - window)
+        let entry_time = now.checked_sub(window).unwrap();
+        history.push_back((entry_time, 500));
+
+        // current_usage should return 0 (entry at boundary is expired)
+        let usage = SlidingWindowRateLimiter::current_usage(&history, now, window);
+        assert_eq!(
+            usage, 0,
+            "Entry at exactly the window boundary (timestamp == cutoff) should NOT be counted"
+        );
+
+        // cleanup should remove the entry
+        SlidingWindowRateLimiter::cleanup(&mut history, now, window);
+        assert!(
+            history.is_empty(),
+            "Entry at exactly the window boundary should be removed by cleanup"
+        );
+    }
+
+    /// Test that an entry just inside the window (1ms after cutoff) is still counted.
+    #[test]
+    fn test_entry_inside_window_is_counted() {
+        let now = Instant::now();
+        let window = Duration::from_secs(10);
+
+        let mut history: VecDeque<(Instant, u32)> = VecDeque::new();
+
+        // Entry 1ms after the cutoff (still within window)
+        let entry_time = now
+            .checked_sub(window)
+            .unwrap()
+            .checked_add(Duration::from_millis(1))
+            .unwrap();
+        history.push_back((entry_time, 500));
+
+        // current_usage should return 500 (entry just inside window)
+        let usage = SlidingWindowRateLimiter::current_usage(&history, now, window);
+        assert_eq!(
+            usage, 500,
+            "Entry 1ms inside the window should be counted"
+        );
+
+        // cleanup should NOT remove the entry
+        SlidingWindowRateLimiter::cleanup(&mut history, now, window);
+        assert_eq!(
+            history.len(),
+            1,
+            "Entry inside the window should NOT be removed by cleanup"
+        );
+    }
+
+    /// Test that cleanup and current_usage are consistent - every entry is either
+    /// removed by cleanup or counted by current_usage, never both, never neither.
+    #[test]
+    fn test_cleanup_and_usage_consistency() {
+        let now = Instant::now();
+        let window = Duration::from_secs(10);
+
+        let mut history: VecDeque<(Instant, u32)> = VecDeque::new();
+
+        // Add entries at various times relative to the cutoff
+        let cutoff = now.checked_sub(window).unwrap();
+
+        // Entry 1: 5 seconds before cutoff (should be removed, not counted)
+        history.push_back((cutoff.checked_sub(Duration::from_secs(5)).unwrap(), 100));
+        // Entry 2: exactly at cutoff (should be removed, not counted)
+        history.push_back((cutoff, 200));
+        // Entry 3: 1ms after cutoff (should NOT be removed, SHOULD be counted)
+        history.push_back((cutoff.checked_add(Duration::from_millis(1)).unwrap(), 300));
+        // Entry 4: 5 seconds after cutoff (should NOT be removed, SHOULD be counted)
+        history.push_back((cutoff.checked_add(Duration::from_secs(5)).unwrap(), 400));
+
+        // current_usage should only count entries 3 and 4
+        let usage = SlidingWindowRateLimiter::current_usage(&history, now, window);
+        assert_eq!(
+            usage,
+            300 + 400,
+            "Only entries strictly after cutoff should be counted"
+        );
+
+        // cleanup should remove entries 1 and 2
+        SlidingWindowRateLimiter::cleanup(&mut history, now, window);
+        assert_eq!(
+            history.len(),
+            2,
+            "Cleanup should remove entries at or before cutoff"
+        );
+
+        // After cleanup, current_usage should still return the same value
+        let usage_after = SlidingWindowRateLimiter::current_usage(&history, now, window);
+        assert_eq!(
+            usage_after, usage,
+            "Usage should be the same before and after cleanup"
+        );
     }
 }
