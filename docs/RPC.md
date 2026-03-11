@@ -728,22 +728,41 @@ The `WsClient` provides WebSocket-based block header subscriptions for live mode
 ### Basic Usage
 
 ```rust
-use doppler_indexer_rs::rpc::{WsClient, ReconnectConfig, WsEvent};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use doppler_indexer_rs::rpc::{WsClient, UnifiedRpcClient, ReconnectConfig, WsEvent};
 
 let ws_url = "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY";
-let client = WsClient::connect(ws_url, ReconnectConfig::default()).await?;
+let http_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY";
 
-// Subscribe and receive events
-while let Some(event) = client.recv().await {
+// Create HTTP client for backfill operations
+let http_client = Arc::new(UnifiedRpcClient::from_url(http_url)?);
+
+// Create WebSocket client (requires Arc<UnifiedRpcClient> for gap backfilling)
+let ws_client = Arc::new(WsClient::new(
+    ws_url,
+    http_client,
+    ReconnectConfig::default(),
+)?);
+
+// Create channel for receiving events
+let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+// Start subscription - returns a JoinHandle for the background task
+let handle = ws_client.subscribe(event_tx);
+
+// Receive events from the channel
+while let Some(event) = event_rx.recv().await {
     match event {
-        WsEvent::NewBlock(header) => {
-            println!("New block: {} hash: {:?}", header.number, header.hash);
+        WsEvent::NewBlock { number, hash, parent_hash, timestamp } => {
+            println!("New block: {} hash: {:?}", number, hash);
         }
-        WsEvent::Disconnected => {
-            println!("WebSocket disconnected, reconnecting...");
+        WsEvent::Disconnected { last_block } => {
+            println!("WebSocket disconnected, last block: {:?}", last_block);
         }
-        WsEvent::Reconnected => {
-            println!("WebSocket reconnected");
+        WsEvent::Reconnected { missed_from, missed_to } => {
+            println!("Reconnected - backfill blocks {} to {}", missed_from, missed_to);
+            // Use ws_client.http_client() to fetch missed blocks
         }
     }
 }
@@ -758,6 +777,7 @@ pub struct ReconnectConfig {
     pub initial_delay: Duration,  // Default: 100ms
     pub max_delay: Duration,      // Default: 30s
     pub backoff_multiplier: f64,  // Default: 2.0
+    pub max_attempts: u32,        // Default: 0 (infinite retries)
 }
 ```
 
@@ -765,22 +785,24 @@ pub struct ReconnectConfig {
 
 | Variant | Description |
 |---------|-------------|
-| `NewBlock(BlockHeader)` | A new block header was received |
-| `Disconnected` | WebSocket connection was lost |
-| `Reconnected` | Successfully reconnected after disconnect |
+| `NewBlock { number, hash, parent_hash, timestamp }` | A new block header was received |
+| `Disconnected { last_block }` | WebSocket connection was lost, includes last known block |
+| `Reconnected { missed_from, missed_to }` | Gap detected after reconnection, caller should backfill |
 
 ### WsError Types
 
 | Error | Description |
 |-------|-------------|
-| `ConnectionFailed` | Failed to establish WebSocket connection |
-| `SubscribeFailed` | Failed to subscribe to newHeads |
-| `ParseError` | Failed to parse block header from message |
-| `Closed` | WebSocket closed by server |
+| `Connection` | WebSocket connection error |
+| `Protocol` | WebSocket protocol error |
+| `Json` | JSON parsing error |
+| `InvalidUrl` | Invalid WebSocket URL |
+| `SubscriptionFailed` | Failed to subscribe to newHeads |
+| `ChannelClosed` | Event channel was closed |
 
 ### Gap Detection
 
-On reconnection, the client detects gaps between the last received block and the first new block. The caller is responsible for backfilling missing blocks via HTTP.
+On reconnection, the client uses the HTTP client to get the current block number and compares it with the last received block. If a gap is detected, a `WsEvent::Reconnected { missed_from, missed_to }` event is sent, allowing the caller to backfill missing blocks using `ws_client.http_client()`.
 
 ## Metrics Integration
 
