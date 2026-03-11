@@ -44,6 +44,8 @@ pub enum CollectorError {
     ChannelClosed,
     #[error("Block not found: {0}")]
     BlockNotFound(u64),
+    #[error("Reorg cleanup failed for blocks: {0:?}")]
+    ReorgCleanupFailed(Vec<u64>),
 }
 
 /// Collects live blocks from WebSocket and processes them.
@@ -522,13 +524,20 @@ impl LiveCollector {
         );
 
         // Delete orphaned blocks from storage (including decoded data)
+        // Only clear progress for blocks that were successfully deleted
+        let mut failed_deletions: Vec<u64> = Vec::new();
         for &orphaned_number in &event.orphaned {
-            if let Err(e) = self.storage.delete_all(orphaned_number) {
-                tracing::warn!("Failed to delete orphaned block {}: {}", orphaned_number, e);
-            }
-            // Clear progress for orphaned blocks to prevent compaction race
-            if let Some(ref tracker) = self.progress_tracker {
-                tracker.lock().await.clear_block(orphaned_number);
+            match self.storage.delete_all(orphaned_number) {
+                Ok(()) => {
+                    // Only clear progress if deletion succeeded
+                    if let Some(ref tracker) = self.progress_tracker {
+                        tracker.lock().await.clear_block(orphaned_number);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to delete orphaned block {}: {}", orphaned_number, e);
+                    failed_deletions.push(orphaned_number);
+                }
             }
         }
 
@@ -562,6 +571,11 @@ impl LiveCollector {
             })
             .await
             .map_err(|_| CollectorError::ChannelClosed)?;
+
+        // Return error if any deletions failed
+        if !failed_deletions.is_empty() {
+            return Err(CollectorError::ReorgCleanupFailed(failed_deletions));
+        }
 
         Ok(())
     }
