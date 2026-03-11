@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
@@ -95,8 +96,10 @@ struct PendingEventData {
     required_calls: Vec<(String, String)>,
 }
 
+/// Default timeout for stuck pending events (5 minutes).
+const PENDING_EVENT_TIMEOUT_SECS: u64 = 300;
+
 /// Live processing state for buffering events with call dependencies.
-#[derive(Default)]
 struct LiveProcessingState {
     /// Track which (source, function) calls have arrived for which ranges.
     /// Key: (source_name, function_name), Value: set of (range_start, range_end)
@@ -108,6 +111,24 @@ struct LiveProcessingState {
     pending_events: HashMap<String, Vec<PendingEventData>>,
     /// Tracks which decode streams have completed for a range.
     completion: HashMap<(u64, u64), RangeCompletionState>,
+    /// Track when events first become pending for timeout detection.
+    /// Key: (range_start, range_end, handler_key), Value: when first added
+    pending_event_timestamps: HashMap<(u64, u64, String), Instant>,
+    /// Ranges that have been finalized (to prevent double finalization).
+    finalized_ranges: HashSet<(u64, u64)>,
+}
+
+impl Default for LiveProcessingState {
+    fn default() -> Self {
+        Self {
+            received_calls: HashMap::new(),
+            calls_buffer: HashMap::new(),
+            pending_events: HashMap::new(),
+            completion: HashMap::new(),
+            pending_event_timestamps: HashMap::new(),
+            finalized_ranges: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -386,7 +407,7 @@ impl TransformationEngine {
                     mut columns,
                     mut values,
                     mut conflict_columns,
-                    update_columns,
+                    mut update_columns,
                 } => {
                     columns.push("source".to_string());
                     columns.push("source_version".to_string());
@@ -394,6 +415,8 @@ impl TransformationEngine {
                     values.push(DbValue::Int32(version as i32));
                     conflict_columns.push("source".to_string());
                     conflict_columns.push("source_version".to_string());
+                    // Remove source/source_version from update_columns since they're part of conflict key
+                    update_columns.retain(|c| c != "source" && c != "source_version");
                     DbOperation::Upsert {
                         table,
                         columns,
@@ -1343,6 +1366,9 @@ impl TransformationEngine {
                             events: filtered_events.clone(),
                             required_calls: call_deps.clone(),
                         };
+                        // Track when this pending event was first added for timeout detection
+                        let timestamp_key = (msg.range_start, msg.range_end, handler_key.clone());
+                        state.pending_event_timestamps.entry(timestamp_key).or_insert_with(Instant::now);
                         state.pending_events
                             .entry(handler_key)
                             .or_default()
@@ -1729,10 +1755,16 @@ impl TransformationEngine {
             }
             state.completion.remove(&range_key);
 
+            // Remove from finalized_ranges to allow re-finalization if block is re-processed
+            state.finalized_ranges.remove(&range_key);
+
             // Remove from received_calls
             for ranges in state.received_calls.values_mut() {
                 ranges.remove(&range_key);
             }
+
+            // Remove pending event timestamps for this range
+            state.pending_event_timestamps.retain(|(rs, re, _), _| (*rs, *re) != range_key);
 
             // Remove pending events for this range from all handlers
             for (handler_key, pending_list) in state.pending_events.iter_mut() {
@@ -1901,9 +1933,49 @@ impl TransformationEngine {
         &self,
         range_key: (u64, u64),
     ) -> Result<(), TransformationError> {
-        let should_finalize = {
-            let state = self.live_state.lock().await;
+        let (should_finalize, timed_out_handlers) = {
+            let mut state = self.live_state.lock().await;
             let completion = state.completion.get(&range_key).copied().unwrap_or_default();
+
+            // Check for timed-out pending events
+            let timeout = std::time::Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
+            let now = Instant::now();
+            let mut timed_out: Vec<String> = Vec::new();
+
+            for (handler_key, pending_list) in &state.pending_events {
+                for pending in pending_list {
+                    if (pending.range_start, pending.range_end) == range_key {
+                        let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
+                        if let Some(&first_seen) = state.pending_event_timestamps.get(&timestamp_key) {
+                            if now.duration_since(first_seen) >= timeout {
+                                tracing::error!(
+                                    "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for={:?}. \
+                                     Force-finalizing range to unblock progress.",
+                                    now.duration_since(first_seen),
+                                    handler_key,
+                                    pending.range_start,
+                                    pending.range_end,
+                                    pending.source_name,
+                                    pending.event_name,
+                                    pending.required_calls
+                                );
+                                timed_out.push(handler_key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Remove timed-out pending events
+            for handler_key in &timed_out {
+                if let Some(pending_list) = state.pending_events.get_mut(handler_key) {
+                    pending_list.retain(|pending| (pending.range_start, pending.range_end) != range_key);
+                }
+                let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
+                state.pending_event_timestamps.remove(&timestamp_key);
+            }
+            state.pending_events.retain(|_, v| !v.is_empty());
+
             let has_pending = state.pending_events.values().any(|pending_list| {
                 pending_list
                     .iter()
@@ -1929,12 +2001,22 @@ impl TransformationEngine {
                 }
             }
 
-            !has_pending
+            let ready = !has_pending
                 && completion.is_ready(
                     self.expect_log_completion,
                     self.range_requires_eth_call_completion(range_key),
-                )
+                );
+            (ready, timed_out)
         };
+
+        if !timed_out_handlers.is_empty() {
+            tracing::warn!(
+                "Removed {} timed-out pending event handlers for range {:?}: {:?}",
+                timed_out_handlers.len(),
+                range_key,
+                timed_out_handlers
+            );
+        }
 
         if !should_finalize {
             return Ok(());
@@ -1948,6 +2030,22 @@ impl TransformationEngine {
         range_start: u64,
         range_end: u64,
     ) -> Result<(), TransformationError> {
+        let range_key = (range_start, range_end);
+
+        // Prevent double finalization by checking and marking atomically
+        {
+            let mut state = self.live_state.lock().await;
+            if state.finalized_ranges.contains(&range_key) {
+                tracing::debug!(
+                    "Range {}-{} already finalized, skipping duplicate finalization",
+                    range_start,
+                    range_end
+                );
+                return Ok(());
+            }
+            state.finalized_ranges.insert(range_key);
+        }
+
         // Mark ALL handlers as complete for this range (event + call handlers)
         for handler in self.registry.all_handlers() {
             let handler_key = handler.handler_key();
@@ -1967,7 +2065,6 @@ impl TransformationEngine {
             }
         }
 
-        let range_key = (range_start, range_end);
         {
             let mut state = self.live_state.lock().await;
             state.calls_buffer.remove(&range_key);
@@ -1975,6 +2072,8 @@ impl TransformationEngine {
             for ranges in state.received_calls.values_mut() {
                 ranges.remove(&range_key);
             }
+            // Clean up pending event timestamps for this range
+            state.pending_event_timestamps.retain(|(rs, re, _), _| (*rs, *re) != range_key);
         }
 
         tracing::debug!(
@@ -2014,6 +2113,13 @@ impl TransformationEngine {
         Ok(())
     }
 
+    /// Check if this range requires eth_call completion signal before finalization.
+    ///
+    /// Only single-block ranges (live mode) require waiting for eth_call completion.
+    /// Historical batch ranges don't require this because:
+    /// 1. Historical data is processed in larger batches where calls are pre-fetched
+    /// 2. The batch processing handles call dependencies internally before finalization
+    /// 3. Live mode needs block-by-block coordination since data arrives incrementally
     fn range_requires_eth_call_completion(&self, range_key: (u64, u64)) -> bool {
         self.expect_eth_call_completion && range_key.1.saturating_sub(range_key.0) == 1
     }
