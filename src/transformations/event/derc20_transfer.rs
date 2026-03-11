@@ -6,8 +6,8 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
-use crate::transformations::util::db::users::upsert_user;
 use crate::transformations::util::db::transfers::insert_transfer;
+use crate::transformations::util::db::users::upsert_user;
 use crate::transformations::util::sanitize::is_precompile_address;
 
 pub struct DERC20TransferHandler;
@@ -38,7 +38,7 @@ impl TransformationHandler for DERC20TransferHandler {
     async fn handle(
         &self,
         ctx: &TransformationContext,
-    ) -> Result<Vec<DbOperation>, TransformationError>{
+    ) -> Result<Vec<DbOperation>, TransformationError> {
         let mut ops = Vec::new();
 
         for event in ctx.events_of_type("DERC20", "Transfer") {
@@ -53,7 +53,15 @@ impl TransformationHandler for DERC20TransferHandler {
 
             ops.push(upsert_user(&from_address, &event.block_timestamp, &ctx));
             ops.push(upsert_user(&to_address, &event.block_timestamp, &ctx));
-            ops.push(insert_transfer(event.block_number, event.block_timestamp, &event.contract_address, &from_address, &to_address, &value, ctx))
+            ops.push(insert_transfer(
+                event.block_number,
+                event.block_timestamp,
+                &event.contract_address,
+                &from_address,
+                &to_address,
+                &value,
+                ctx,
+            ))
         }
 
         Ok(ops)
@@ -69,7 +77,7 @@ impl EventHandler for DERC20TransferHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(
             "DERC20",
-            "Transfer(address,address,uint256)"
+            "Transfer(address,address,uint256)",
         )]
     }
 }

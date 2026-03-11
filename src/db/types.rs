@@ -87,10 +87,7 @@ pub enum DbOperation {
         where_clause: WhereClause,
     },
     /// Raw SQL for complex operations (use sparingly)
-    RawSql {
-        query: String,
-        params: Vec<DbValue>,
-    },
+    RawSql { query: String, params: Vec<DbValue> },
 }
 
 /// WHERE clause for UPDATE and DELETE operations.

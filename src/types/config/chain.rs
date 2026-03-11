@@ -4,8 +4,7 @@ use alloy_primitives::U256;
 use serde::Deserialize;
 
 use crate::types::config::contract::{
-    load_contracts_from_path, load_factory_collections_from_path, Contracts,
-    FactoryCollections,
+    load_contracts_from_path, load_factory_collections_from_path, Contracts, FactoryCollections,
 };
 use crate::types::config::generic::InlineOrPath;
 use crate::types::config::tokens::{load_tokens_from_path, Tokens};

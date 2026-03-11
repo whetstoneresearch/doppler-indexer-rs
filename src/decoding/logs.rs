@@ -6,8 +6,8 @@ use std::sync::Arc;
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{I256, U256};
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
-    Int64Array, Int8Array, StringArray, UInt32Array, UInt64Array,
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Int64Array,
+    Int8Array, StringArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -120,16 +120,17 @@ pub async fn decode_logs(
         match build_event_matchers(&chain.contracts, &chain.factory_collections) {
             Ok(matchers) => matchers,
             Err(e) => {
-                tracing::error!("Failed to build event matchers for chain {}: {}", chain.name, e);
+                tracing::error!(
+                    "Failed to build event matchers for chain {}: {}",
+                    chain.name,
+                    e
+                );
                 return Err(e);
             }
         };
 
     if regular_matchers.is_empty() && factory_matchers.is_empty() {
-        tracing::info!(
-            "No events configured for decoding on chain {}",
-            chain.name
-        );
+        tracing::info!("No events configured for decoding on chain {}", chain.name);
         // Drain channel and return
         while decoder_rx.recv().await.is_some() {}
         return Ok(());
@@ -441,7 +442,10 @@ pub(crate) async fn process_logs(
                         &matcher.event_name,
                     );
                     let key = (matcher.name.clone(), matcher.event_name.clone());
-                    transform_events_by_type.entry(key).or_default().push(transform_event);
+                    transform_events_by_type
+                        .entry(key)
+                        .or_default()
+                        .push(transform_event);
                 }
             }
 
@@ -469,7 +473,10 @@ pub(crate) async fn process_logs(
                             &matcher.event_name,
                         );
                         let key = (collection_name.clone(), matcher.event_name.clone());
-                        transform_events_by_type.entry(key).or_default().push(transform_event);
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
                     }
                 }
             }
@@ -488,7 +495,10 @@ pub(crate) async fn process_logs(
                 events,
             };
             if let Err(e) = tx.send(msg).await {
-                tracing::warn!("Failed to send decoded events to transformation channel: {}", e);
+                tracing::warn!(
+                    "Failed to send decoded events to transformation channel: {}",
+                    e
+                );
             }
         }
     }
@@ -543,14 +553,16 @@ fn decode_log(
 
     // Decode non-indexed params from data
     if !data_params.is_empty() {
-        let data_types: Vec<DynSolType> = data_params.iter().map(|p| p.param_type.clone()).collect();
+        let data_types: Vec<DynSolType> =
+            data_params.iter().map(|p| p.param_type.clone()).collect();
 
         let tuple_type = DynSolType::Tuple(data_types);
 
         match tuple_type.abi_decode(&log.data) {
             Ok(DynSolValue::Tuple(values)) => {
                 for (value, param) in values.iter().zip(data_params.iter()) {
-                    let decoded = convert_dyn_sol_value_with_tuple_info(value, &param.tuple_fields)?;
+                    let decoded =
+                        convert_dyn_sol_value_with_tuple_info(value, &param.tuple_fields)?;
                     param_values.push(decoded);
                 }
             }
@@ -693,7 +705,10 @@ fn flatten_single_value(
 }
 
 /// Decode a value from a topic
-fn decode_topic(topic: &[u8; 32], param_type: &DynSolType) -> Result<DecodedValue, LogDecodingError> {
+fn decode_topic(
+    topic: &[u8; 32],
+    param_type: &DynSolType,
+) -> Result<DecodedValue, LogDecodingError> {
     match param_type {
         DynSolType::Address => {
             let mut addr = [0u8; 20];
@@ -735,7 +750,8 @@ fn convert_dyn_sol_value_with_tuple_info(
             // Named tuple - create named values
             let mut named_values = Vec::new();
             for ((field_name, field_info), val) in field_infos.iter().zip(values.iter()) {
-                let decoded = convert_dyn_sol_value_with_tuple_info(val, &Some(field_info.clone()))?;
+                let decoded =
+                    convert_dyn_sol_value_with_tuple_info(val, &Some(field_info.clone()))?;
                 named_values.push((field_name.clone(), decoded));
             }
             Ok(DecodedValue::NamedTuple(named_values))
@@ -1313,7 +1329,10 @@ pub(crate) async fn process_logs_live(
             tracing::info!("Block {} logs decoded", block_number);
         }
     } else {
-        tracing::warn!("Block {} status file not found for log decode completion", block_number);
+        tracing::warn!(
+            "Block {} status file not found for log decode completion",
+            block_number
+        );
     }
 
     // Signal that all events for this block have been sent

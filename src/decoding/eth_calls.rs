@@ -7,8 +7,8 @@ use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{I256, U256};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
-    Int16Array, Int32Array, Int64Array, Int8Array, StringArray, StructArray, UInt16Array, UInt32Array,
-    UInt64Array, UInt8Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, StringArray, StructArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -20,7 +20,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 
 use super::catchup;
-use super::catchup::eth_calls::{read_decoded_column_index, read_decoded_parquet_function_names, write_decoded_column_index};
+use super::catchup::eth_calls::{
+    read_decoded_column_index, read_decoded_parquet_function_names, write_decoded_column_index,
+};
 use super::current;
 use super::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::{
@@ -175,7 +177,9 @@ pub async fn decode_eth_calls(
         // Wait for eth_call collection catchup before decoding
         // =========================================================================
         if let Some(rx) = eth_calls_catchup_done_rx {
-            tracing::info!("Waiting for eth_call collection catchup to complete before decoding...");
+            tracing::info!(
+                "Waiting for eth_call collection catchup to complete before decoding..."
+            );
             let _ = rx.await;
             tracing::info!("Eth_call collection catchup complete, proceeding with decoding");
         }
@@ -234,7 +238,11 @@ pub async fn decode_eth_calls(
 /// Build decode configurations from contracts
 pub(crate) fn build_decode_configs(
     contracts: &Contracts,
-) -> (Vec<CallDecodeConfig>, Vec<CallDecodeConfig>, Vec<EventCallDecodeConfig>) {
+) -> (
+    Vec<CallDecodeConfig>,
+    Vec<CallDecodeConfig>,
+    Vec<EventCallDecodeConfig>,
+) {
     let mut regular = Vec::new();
     let mut once = Vec::new();
     let mut event = Vec::new();
@@ -431,7 +439,14 @@ pub(crate) async fn process_regular_calls(
     if let Some(tx) = transform_tx {
         let transform_calls: Vec<TransformDecodedCall> = decoded_records
             .iter()
-            .map(|r| convert_to_transform_call(r, &config.contract_name, &config.function_name, &config.output_type))
+            .map(|r| {
+                convert_to_transform_call(
+                    r,
+                    &config.contract_name,
+                    &config.function_name,
+                    &config.output_type,
+                )
+            })
             .collect();
 
         if !transform_calls.is_empty() {
@@ -443,7 +458,10 @@ pub(crate) async fn process_regular_calls(
                 calls: transform_calls,
             };
             if let Err(e) = tx.send(msg).await {
-                tracing::warn!("Failed to send decoded calls to transformation channel: {}", e);
+                tracing::warn!(
+                    "Failed to send decoded calls to transformation channel: {}",
+                    e
+                );
             }
         }
     }
@@ -565,11 +583,7 @@ pub(crate) async fn process_once_calls(
             "Merging new decoded columns into existing file {}",
             output_path.display()
         );
-        merge_decoded_once_calls(
-            &output_path,
-            &decoded_records,
-            configs,
-        )?;
+        merge_decoded_once_calls(&output_path, &decoded_records, configs)?;
     } else {
         write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
     }
@@ -619,7 +633,11 @@ pub(crate) async fn process_once_calls(
                 let mut merged_result = HashMap::new();
                 for config in configs {
                     if let Some(decoded_value) = record.decoded_values.get(&config.function_name) {
-                        let partial_result = build_result_map(decoded_value, &config.output_type, &config.function_name);
+                        let partial_result = build_result_map(
+                            decoded_value,
+                            &config.output_type,
+                            &config.function_name,
+                        );
                         merged_result.extend(partial_result);
                     }
                 }
@@ -649,12 +667,17 @@ pub(crate) async fn process_once_calls(
                 calls: transform_calls,
             };
             if let Err(e) = tx.send(msg).await {
-                tracing::warn!("Failed to send decoded calls to transformation channel: {}", e);
+                tracing::warn!(
+                    "Failed to send decoded calls to transformation channel: {}",
+                    e
+                );
             }
         } else {
             tracing::debug!(
                 "No transform_calls to send for {}/once range ({}, {})",
-                contract_name, range_start, range_end
+                contract_name,
+                range_start,
+                range_end
             );
         }
     }
@@ -782,7 +805,14 @@ pub(crate) async fn process_event_calls(
     if let Some(tx) = transform_tx {
         let transform_calls: Vec<TransformDecodedCall> = decoded_records
             .iter()
-            .map(|r| convert_event_call_to_transform_call(r, &config.contract_name, &config.function_name, &config.output_type))
+            .map(|r| {
+                convert_event_call_to_transform_call(
+                    r,
+                    &config.contract_name,
+                    &config.function_name,
+                    &config.output_type,
+                )
+            })
             .collect();
 
         if !transform_calls.is_empty() {
@@ -794,7 +824,10 @@ pub(crate) async fn process_event_calls(
                 calls: transform_calls,
             };
             if let Err(e) = tx.send(msg).await {
-                tracing::warn!("Failed to send decoded event calls to transformation channel: {}", e);
+                tracing::warn!(
+                    "Failed to send decoded event calls to transformation channel: {}",
+                    e
+                );
             }
         }
     }
@@ -842,14 +875,15 @@ fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
                 .collect();
             DynSolType::Tuple(field_types)
         }
-        EvmType::Array(inner) => {
-            DynSolType::Array(Box::new(evm_type_to_dyn_sol_type(inner)))
-        }
+        EvmType::Array(inner) => DynSolType::Array(Box::new(evm_type_to_dyn_sol_type(inner))),
     }
 }
 
 /// Decode a raw value using the specified type
-pub fn decode_value(raw: &[u8], output_type: &EvmType) -> Result<DecodedValue, EthCallDecodingError> {
+pub fn decode_value(
+    raw: &[u8],
+    output_type: &EvmType,
+) -> Result<DecodedValue, EthCallDecodingError> {
     let sol_type = evm_type_to_dyn_sol_type(output_type);
 
     let decoded = sol_type
@@ -992,7 +1026,11 @@ fn write_decoded_calls_to_parquet(
         }
         _ => {
             // Simple type: use "decoded_value"
-            fields.push(Field::new("decoded_value", output_type.to_arrow_type(), true));
+            fields.push(Field::new(
+                "decoded_value",
+                output_type.to_arrow_type(),
+                true,
+            ));
         }
     }
 
@@ -1078,7 +1116,11 @@ fn write_decoded_event_calls_to_parquet(
             }
         }
         _ => {
-            fields.push(Field::new("decoded_value", output_type.to_arrow_type(), true));
+            fields.push(Field::new(
+                "decoded_value",
+                output_type.to_arrow_type(),
+                true,
+            ));
         }
     }
 
@@ -1202,7 +1244,11 @@ fn build_event_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| match &r.decoded_value {
@@ -1318,9 +1364,7 @@ fn build_event_value_array(
         EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
             "UnnamedTuple should use specialized handling".to_string(),
         )),
-        EvmType::Array(inner) => {
-            build_event_array_value_array(records, inner)
-        }
+        EvmType::Array(inner) => build_event_array_value_array(records, inner),
     }
 }
 
@@ -1374,7 +1418,8 @@ fn build_event_array_value_array(
             for arr_opt in &arrays {
                 if let Some(arr) = arr_opt {
                     for elem in arr.iter() {
-                        let struct_arr = build_decoded_value_struct(elem, &field_names, &field_types)?;
+                        let struct_arr =
+                            build_decoded_value_struct(elem, &field_names, &field_types)?;
                         all_struct_arrays.push(struct_arr);
                         current_offset += 1;
                     }
@@ -1394,7 +1439,8 @@ fn build_event_array_value_array(
                 )?;
                 Ok(Arc::new(list_arr))
             } else {
-                let struct_refs: Vec<&dyn Array> = all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
+                let struct_refs: Vec<&dyn Array> =
+                    all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
                 let concatenated = arrow::compute::concat(&struct_refs)?;
                 let list_arr = arrow::array::ListArray::try_new(
                     Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
@@ -1423,13 +1469,19 @@ fn build_event_array_value_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let mut builder = ListBuilder::new(StringBuilder::new());
             for arr_opt in &arrays {
                 if let Some(arr) = arr_opt {
                     for elem in arr.iter() {
                         match elem {
-                            DecodedValue::Uint256(v) => builder.values().append_value(v.to_string()),
+                            DecodedValue::Uint256(v) => {
+                                builder.values().append_value(v.to_string())
+                            }
                             DecodedValue::Uint64(v) => builder.values().append_value(v.to_string()),
                             _ => builder.values().append_null(),
                         }
@@ -1502,7 +1554,11 @@ fn build_event_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| extract_event_tuple_uint256_string(r, field_idx))
@@ -1611,12 +1667,10 @@ fn build_event_nested_struct_array(
     let nested_values: Vec<Option<&Vec<(String, DecodedValue)>>> = records
         .iter()
         .map(|r| match &r.decoded_value {
-            DecodedValue::NamedTuple(fields) => {
-                fields.get(field_idx).and_then(|(_, v)| match v {
-                    DecodedValue::NamedTuple(nested) => Some(nested),
-                    _ => None,
-                })
-            }
+            DecodedValue::NamedTuple(fields) => fields.get(field_idx).and_then(|(_, v)| match v {
+                DecodedValue::NamedTuple(nested) => Some(nested),
+                _ => None,
+            }),
             _ => None,
         })
         .collect();
@@ -1632,7 +1686,11 @@ fn build_event_nested_struct_array(
     }
 
     let struct_fields: Fields = arrow_fields.into();
-    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+    Ok(Arc::new(StructArray::try_new(
+        struct_fields,
+        field_arrays,
+        None,
+    )?))
 }
 
 /// Build a StructArray for a nested UnnamedTuple field in event call records
@@ -1647,12 +1705,10 @@ fn build_event_nested_unnamed_struct_array(
     let nested_values: Vec<Option<&Vec<DecodedValue>>> = records
         .iter()
         .map(|r| match &r.decoded_value {
-            DecodedValue::NamedTuple(fields) => {
-                fields.get(field_idx).and_then(|(_, v)| match v {
-                    DecodedValue::UnnamedTuple(nested) => Some(nested),
-                    _ => None,
-                })
-            }
+            DecodedValue::NamedTuple(fields) => fields.get(field_idx).and_then(|(_, v)| match v {
+                DecodedValue::UnnamedTuple(nested) => Some(nested),
+                _ => None,
+            }),
             _ => None,
         })
         .collect();
@@ -1664,11 +1720,19 @@ fn build_event_nested_unnamed_struct_array(
     for (nested_idx, field_type) in nested_fields.iter().enumerate() {
         let arr = build_unnamed_nested_field_array(&nested_values, nested_idx, field_type)?;
         field_arrays.push(arr);
-        arrow_fields.push(Field::new(nested_idx.to_string(), field_type.to_arrow_type(), true));
+        arrow_fields.push(Field::new(
+            nested_idx.to_string(),
+            field_type.to_arrow_type(),
+            true,
+        ));
     }
 
     let struct_fields: Fields = arrow_fields.into();
-    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+    Ok(Arc::new(StructArray::try_new(
+        struct_fields,
+        field_arrays,
+        None,
+    )?))
 }
 
 /// Build an array for a specific field within nested named tuple values
@@ -1748,7 +1812,11 @@ fn build_nested_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = nested_values
                 .iter()
                 .map(|opt| {
@@ -1971,7 +2039,11 @@ fn build_unnamed_nested_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = nested_values
                 .iter()
                 .map(|opt| {
@@ -2109,7 +2181,9 @@ fn build_unnamed_nested_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Named { inner, .. } => build_unnamed_nested_field_array(nested_values, nested_idx, inner),
+        EvmType::Named { inner, .. } => {
+            build_unnamed_nested_field_array(nested_values, nested_idx, inner)
+        }
         _ => Err(EthCallDecodingError::Decode(format!(
             "Unsupported nested field type: {:?}",
             field_type
@@ -2314,7 +2388,11 @@ fn build_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| extract_tuple_uint256_string(r, field_idx))
@@ -2423,12 +2501,10 @@ fn build_nested_struct_array(
     let nested_values: Vec<Option<&Vec<(String, DecodedValue)>>> = records
         .iter()
         .map(|r| match &r.decoded_value {
-            DecodedValue::NamedTuple(fields) => {
-                fields.get(field_idx).and_then(|(_, v)| match v {
-                    DecodedValue::NamedTuple(nested) => Some(nested),
-                    _ => None,
-                })
-            }
+            DecodedValue::NamedTuple(fields) => fields.get(field_idx).and_then(|(_, v)| match v {
+                DecodedValue::NamedTuple(nested) => Some(nested),
+                _ => None,
+            }),
             _ => None,
         })
         .collect();
@@ -2444,7 +2520,11 @@ fn build_nested_struct_array(
     }
 
     let struct_fields: Fields = arrow_fields.into();
-    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+    Ok(Arc::new(StructArray::try_new(
+        struct_fields,
+        field_arrays,
+        None,
+    )?))
 }
 
 /// Build a StructArray for a nested UnnamedTuple field in regular call records
@@ -2459,12 +2539,10 @@ fn build_nested_unnamed_struct_array(
     let nested_values: Vec<Option<&Vec<DecodedValue>>> = records
         .iter()
         .map(|r| match &r.decoded_value {
-            DecodedValue::NamedTuple(fields) => {
-                fields.get(field_idx).and_then(|(_, v)| match v {
-                    DecodedValue::UnnamedTuple(nested) => Some(nested),
-                    _ => None,
-                })
-            }
+            DecodedValue::NamedTuple(fields) => fields.get(field_idx).and_then(|(_, v)| match v {
+                DecodedValue::UnnamedTuple(nested) => Some(nested),
+                _ => None,
+            }),
             _ => None,
         })
         .collect();
@@ -2476,11 +2554,19 @@ fn build_nested_unnamed_struct_array(
     for (nested_idx, field_type) in nested_fields.iter().enumerate() {
         let arr = build_unnamed_nested_field_array(&nested_values, nested_idx, field_type)?;
         field_arrays.push(arr);
-        arrow_fields.push(Field::new(nested_idx.to_string(), field_type.to_arrow_type(), true));
+        arrow_fields.push(Field::new(
+            nested_idx.to_string(),
+            field_type.to_arrow_type(),
+            true,
+        ));
     }
 
     let struct_fields: Fields = arrow_fields.into();
-    Ok(Arc::new(StructArray::try_new(struct_fields, field_arrays, None)?))
+    Ok(Arc::new(StructArray::try_new(
+        struct_fields,
+        field_arrays,
+        None,
+    )?))
 }
 
 // Helper functions for extracting tuple field values
@@ -2700,10 +2786,8 @@ fn merge_decoded_once_calls(
 
     // Build a lookup from column name -> (config, optional tuple field info)
     // This is used to fill nulls in existing columns from new decoded records.
-    let mut col_config_lookup: HashMap<
-        String,
-        (&CallDecodeConfig, Option<(usize, &EvmType)>),
-    > = HashMap::new();
+    let mut col_config_lookup: HashMap<String, (&CallDecodeConfig, Option<(usize, &EvmType)>)> =
+        HashMap::new();
     for config in new_configs {
         match &config.output_type {
             EvmType::NamedTuple(tuple_fields) => {
@@ -2713,8 +2797,7 @@ fn merge_decoded_once_calls(
                 }
             }
             _ => {
-                col_config_lookup
-                    .insert(config.function_name.clone(), (config, None));
+                col_config_lookup.insert(config.function_name.clone(), (config, None));
             }
         }
     }
@@ -2893,8 +2976,12 @@ fn write_decoded_once_calls_to_parquet(
             EvmType::NamedTuple(tuple_fields) => {
                 // Named tuple: build an array for each field
                 for (idx, (_, field_type)) in tuple_fields.iter().enumerate() {
-                    let arr =
-                        build_once_tuple_field_array(records, &config.function_name, idx, field_type)?;
+                    let arr = build_once_tuple_field_array(
+                        records,
+                        &config.function_name,
+                        idx,
+                        field_type,
+                    )?;
                     arrays.push(arr);
                 }
             }
@@ -2983,7 +3070,11 @@ fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| match &r.decoded_value {
@@ -3102,9 +3193,7 @@ fn build_value_array(
         EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
             "UnnamedTuple should use specialized handling".to_string(),
         )),
-        EvmType::Array(inner) => {
-            build_array_value_array(records, inner)
-        }
+        EvmType::Array(inner) => build_array_value_array(records, inner),
     }
 }
 
@@ -3113,7 +3202,7 @@ fn build_array_value_array(
     records: &[DecodedCallRecord],
     inner_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
-    use arrow::array::{ListBuilder, StructArray, StringBuilder};
+    use arrow::array::{ListBuilder, StringBuilder, StructArray};
     use arrow::datatypes::Fields;
 
     // Extract array elements from each record
@@ -3158,7 +3247,8 @@ fn build_array_value_array(
             for arr_opt in &arrays {
                 if let Some(arr) = arr_opt {
                     for elem in arr.iter() {
-                        let struct_arr = build_decoded_value_struct(elem, &field_names, &field_types)?;
+                        let struct_arr =
+                            build_decoded_value_struct(elem, &field_names, &field_types)?;
                         all_struct_arrays.push(struct_arr);
                         current_offset += 1;
                     }
@@ -3178,7 +3268,8 @@ fn build_array_value_array(
                 )?;
                 Ok(Arc::new(list_arr))
             } else {
-                let struct_refs: Vec<&dyn Array> = all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
+                let struct_refs: Vec<&dyn Array> =
+                    all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
                 let concatenated = arrow::compute::concat(&struct_refs)?;
                 let list_arr = arrow::array::ListArray::try_new(
                     Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
@@ -3207,13 +3298,19 @@ fn build_array_value_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let mut builder = ListBuilder::new(StringBuilder::new());
             for arr_opt in &arrays {
                 if let Some(arr) = arr_opt {
                     for elem in arr.iter() {
                         match elem {
-                            DecodedValue::Uint256(v) => builder.values().append_value(v.to_string()),
+                            DecodedValue::Uint256(v) => {
+                                builder.values().append_value(v.to_string())
+                            }
                             DecodedValue::Uint64(v) => builder.values().append_value(v.to_string()),
                             _ => builder.values().append_null(),
                         }
@@ -3241,20 +3338,16 @@ fn build_decoded_value_struct(
     use arrow::datatypes::Fields;
 
     let fields_vec: Vec<(&DecodedValue, &String, &EvmType)> = match value {
-        DecodedValue::NamedTuple(named_fields) => {
-            named_fields
-                .iter()
-                .zip(field_names.iter().zip(field_types.iter()))
-                .map(|((_, v), (n, t))| (v, n, *t))
-                .collect()
-        }
-        DecodedValue::UnnamedTuple(unnamed_fields) => {
-            unnamed_fields
-                .iter()
-                .zip(field_names.iter().zip(field_types.iter()))
-                .map(|(v, (n, t))| (v, n, *t))
-                .collect()
-        }
+        DecodedValue::NamedTuple(named_fields) => named_fields
+            .iter()
+            .zip(field_names.iter().zip(field_types.iter()))
+            .map(|((_, v), (n, t))| (v, n, *t))
+            .collect(),
+        DecodedValue::UnnamedTuple(unnamed_fields) => unnamed_fields
+            .iter()
+            .zip(field_names.iter().zip(field_types.iter()))
+            .map(|(v, (n, t))| (v, n, *t))
+            .collect(),
         _ => {
             return Err(EthCallDecodingError::Decode(
                 "Expected tuple value for struct building".to_string(),
@@ -3301,7 +3394,14 @@ fn build_single_decoded_value_array(
             let arr: UInt16Array = vec![(*v).try_into().ok()].into_iter().collect();
             Ok(Arc::new(arr))
         }
-        (DecodedValue::Uint256(v), EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80) => {
+        (
+            DecodedValue::Uint256(v),
+            EvmType::Uint256
+            | EvmType::Uint160
+            | EvmType::Uint128
+            | EvmType::Uint96
+            | EvmType::Uint80,
+        ) => {
             let arr: StringArray = vec![Some(v.to_string())].into_iter().collect();
             Ok(Arc::new(arr))
         }
@@ -3411,7 +3511,11 @@ fn build_once_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| match r.decoded_values.get(function_name) {
@@ -3547,19 +3651,17 @@ fn build_once_value_array_aligned(
     let num_rows = address_arr.len();
 
     // Helper to get address at index
-    let get_addr = |i: usize| -> [u8; 20] {
-        address_arr
-            .value(i)
-            .try_into()
-            .unwrap_or([0u8; 20])
-    };
+    let get_addr = |i: usize| -> [u8; 20] { address_arr.value(i).try_into().unwrap_or([0u8; 20]) };
 
     match output_type {
         EvmType::Address => {
             let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 20);
             for i in 0..num_rows {
                 let addr = get_addr(i);
-                match records_by_addr.get(&addr).and_then(|r| r.decoded_values.get(function_name)) {
+                match records_by_addr
+                    .get(&addr)
+                    .and_then(|r| r.decoded_values.get(function_name))
+                {
                     Some(DecodedValue::Address(a)) => builder.append_value(a)?,
                     _ => builder.append_null(),
                 }
@@ -3629,7 +3731,11 @@ fn build_once_value_array_aligned(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = (0..num_rows)
                 .map(|i| {
                     let addr = get_addr(i);
@@ -3743,7 +3849,10 @@ fn build_once_value_array_aligned(
             let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 32);
             for i in 0..num_rows {
                 let addr = get_addr(i);
-                match records_by_addr.get(&addr).and_then(|r| r.decoded_values.get(function_name)) {
+                match records_by_addr
+                    .get(&addr)
+                    .and_then(|r| r.decoded_values.get(function_name))
+                {
                     Some(DecodedValue::Bytes32(b)) => builder.append_value(b)?,
                     _ => builder.append_null(),
                 }
@@ -3807,12 +3916,7 @@ fn build_once_tuple_field_array_aligned(
     let num_rows = address_arr.len();
 
     // Helper to get address at index
-    let get_addr = |i: usize| -> [u8; 20] {
-        address_arr
-            .value(i)
-            .try_into()
-            .unwrap_or([0u8; 20])
-    };
+    let get_addr = |i: usize| -> [u8; 20] { address_arr.value(i).try_into().unwrap_or([0u8; 20]) };
 
     // Helper to extract tuple field value
     let get_tuple_field = |i: usize| -> Option<&DecodedValue> {
@@ -3876,7 +3980,11 @@ fn build_once_tuple_field_array_aligned(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = (0..num_rows)
                 .map(|i| match get_tuple_field(i) {
                     Some(DecodedValue::Uint256(val)) => Some(val.to_string()),
@@ -3973,9 +4081,13 @@ fn build_once_tuple_field_array_aligned(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Named { inner, .. } => {
-            build_once_tuple_field_array_aligned(address_arr, records_by_addr, function_name, field_idx, inner)
-        }
+        EvmType::Named { inner, .. } => build_once_tuple_field_array_aligned(
+            address_arr,
+            records_by_addr,
+            function_name,
+            field_idx,
+            inner,
+        ),
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
             "Nested NamedTuple not supported".to_string(),
         )),
@@ -4000,9 +4112,11 @@ fn build_once_tuple_field_array(
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
             } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    extract_once_tuple_address(r, function_name, field_idx)
-                }))?;
+                let arr = FixedSizeBinaryArray::try_from_iter(
+                    records
+                        .iter()
+                        .map(|r| extract_once_tuple_address(r, function_name, field_idx)),
+                )?;
                 Ok(Arc::new(arr))
             }
         }
@@ -4034,7 +4148,11 @@ fn build_once_tuple_field_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => {
+        EvmType::Uint256
+        | EvmType::Uint160
+        | EvmType::Uint128
+        | EvmType::Uint96
+        | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
                 .map(|r| extract_once_tuple_uint256_string(r, function_name, field_idx))
@@ -4087,9 +4205,11 @@ fn build_once_tuple_field_array(
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
             } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    extract_once_tuple_bytes32(r, function_name, field_idx)
-                }))?;
+                let arr = FixedSizeBinaryArray::try_from_iter(
+                    records
+                        .iter()
+                        .map(|r| extract_once_tuple_bytes32(r, function_name, field_idx)),
+                )?;
                 Ok(Arc::new(arr))
             }
         }
@@ -4151,7 +4271,11 @@ fn extract_once_tuple_uint8(r: &DecodedOnceRecord, function_name: &str, idx: usi
     }
 }
 
-fn extract_once_tuple_uint64(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u64> {
+fn extract_once_tuple_uint64(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<u64> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => Some(*val),
@@ -4162,7 +4286,11 @@ fn extract_once_tuple_uint64(r: &DecodedOnceRecord, function_name: &str, idx: us
     }
 }
 
-fn extract_once_tuple_uint32(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u32> {
+fn extract_once_tuple_uint32(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<u32> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => (*val).try_into().ok(),
@@ -4173,7 +4301,11 @@ fn extract_once_tuple_uint32(r: &DecodedOnceRecord, function_name: &str, idx: us
     }
 }
 
-fn extract_once_tuple_uint16(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u16> {
+fn extract_once_tuple_uint16(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<u16> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => (*val).try_into().ok(),

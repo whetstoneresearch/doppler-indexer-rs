@@ -138,8 +138,7 @@ pub(crate) fn build_block_schema(fields: &Option<Vec<BlockField>>) -> Arc<Schema
                         arrow_fields.push(Field::new("timestamp", DataType::UInt64, false));
                     }
                     BlockField::Transactions => {
-                        arrow_fields
-                            .push(Field::new("transaction_count", DataType::UInt32, false));
+                        arrow_fields.push(Field::new("transaction_count", DataType::UInt32, false));
                         arrow_fields.push(Field::new(
                             "transaction_hashes",
                             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
@@ -154,40 +153,42 @@ pub(crate) fn build_block_schema(fields: &Option<Vec<BlockField>>) -> Arc<Schema
 
             Arc::new(Schema::new(arrow_fields))
         }
-        None => {
-            Arc::new(Schema::new(vec![
-                Field::new("number", DataType::UInt64, false),
-                Field::new("hash", DataType::FixedSizeBinary(32), false),
-                Field::new("parent_hash", DataType::FixedSizeBinary(32), false),
-                Field::new("nonce", DataType::FixedSizeBinary(8), false),
-                Field::new("ommers_hash", DataType::FixedSizeBinary(32), false),
-                Field::new("logs_bloom", DataType::Binary, false),
-                Field::new("transactions_root", DataType::FixedSizeBinary(32), false),
-                Field::new("state_root", DataType::FixedSizeBinary(32), false),
-                Field::new("receipts_root", DataType::FixedSizeBinary(32), false),
-                Field::new("miner", DataType::FixedSizeBinary(20), false),
-                Field::new("difficulty", DataType::Utf8, false),
-                Field::new("total_difficulty", DataType::Utf8, true),
-                Field::new("extra_data", DataType::Binary, false),
-                Field::new("gas_limit", DataType::UInt64, false),
-                Field::new("gas_used", DataType::UInt64, false),
-                Field::new("timestamp", DataType::UInt64, false),
-                Field::new("mix_hash", DataType::FixedSizeBinary(32), false),
-                Field::new("base_fee_per_gas", DataType::UInt64, true),
-                Field::new("withdrawals_root", DataType::FixedSizeBinary(32), true),
-                Field::new("blob_gas_used", DataType::UInt64, true),
-                Field::new("excess_blob_gas", DataType::UInt64, true),
-                Field::new("parent_beacon_block_root", DataType::FixedSizeBinary(32), true),
-                Field::new("transaction_count", DataType::UInt32, false),
-                Field::new(
-                    "transaction_hashes",
-                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                    false,
-                ),
-                Field::new("uncle_count", DataType::UInt32, false),
-                Field::new("size", DataType::UInt64, true),
-            ]))
-        }
+        None => Arc::new(Schema::new(vec![
+            Field::new("number", DataType::UInt64, false),
+            Field::new("hash", DataType::FixedSizeBinary(32), false),
+            Field::new("parent_hash", DataType::FixedSizeBinary(32), false),
+            Field::new("nonce", DataType::FixedSizeBinary(8), false),
+            Field::new("ommers_hash", DataType::FixedSizeBinary(32), false),
+            Field::new("logs_bloom", DataType::Binary, false),
+            Field::new("transactions_root", DataType::FixedSizeBinary(32), false),
+            Field::new("state_root", DataType::FixedSizeBinary(32), false),
+            Field::new("receipts_root", DataType::FixedSizeBinary(32), false),
+            Field::new("miner", DataType::FixedSizeBinary(20), false),
+            Field::new("difficulty", DataType::Utf8, false),
+            Field::new("total_difficulty", DataType::Utf8, true),
+            Field::new("extra_data", DataType::Binary, false),
+            Field::new("gas_limit", DataType::UInt64, false),
+            Field::new("gas_used", DataType::UInt64, false),
+            Field::new("timestamp", DataType::UInt64, false),
+            Field::new("mix_hash", DataType::FixedSizeBinary(32), false),
+            Field::new("base_fee_per_gas", DataType::UInt64, true),
+            Field::new("withdrawals_root", DataType::FixedSizeBinary(32), true),
+            Field::new("blob_gas_used", DataType::UInt64, true),
+            Field::new("excess_blob_gas", DataType::UInt64, true),
+            Field::new(
+                "parent_beacon_block_root",
+                DataType::FixedSizeBinary(32),
+                true,
+            ),
+            Field::new("transaction_count", DataType::UInt32, false),
+            Field::new(
+                "transaction_hashes",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                false,
+            ),
+            Field::new("uncle_count", DataType::UInt32, false),
+            Field::new("size", DataType::UInt64, true),
+        ])),
     }
 }
 
@@ -246,13 +247,15 @@ pub(crate) fn write_full_blocks_to_parquet(
     let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.hash.as_slice()))?;
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.parent_hash.as_slice()))?;
+    let arr =
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.parent_hash.as_slice()))?;
     arrays.push(Arc::new(arr));
 
     let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.nonce.as_slice()))?;
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.ommers_hash.as_slice()))?;
+    let arr =
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.ommers_hash.as_slice()))?;
     arrays.push(Arc::new(arr));
 
     let arr: BinaryArray = records
@@ -269,9 +272,8 @@ pub(crate) fn write_full_blocks_to_parquet(
     let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.state_root.as_slice()))?;
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        records.iter().map(|r| r.receipts_root.as_slice()),
-    )?;
+    let arr =
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.receipts_root.as_slice()))?;
     arrays.push(Arc::new(arr));
 
     let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.miner.as_slice()))?;

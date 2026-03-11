@@ -71,7 +71,10 @@ impl TransformationRegistry {
         let triggers = handler.triggers();
 
         for trigger in triggers {
-            let key = (trigger.source.clone(), extract_event_name(&trigger.event_signature));
+            let key = (
+                trigger.source.clone(),
+                extract_event_name(&trigger.event_signature),
+            );
             self.event_handlers
                 .entry(key)
                 .or_default()
@@ -101,11 +104,7 @@ impl TransformationRegistry {
     }
 
     /// Get handlers for a specific event.
-    pub fn handlers_for_event(
-        &self,
-        source: &str,
-        event_name: &str,
-    ) -> Vec<Arc<dyn EventHandler>> {
+    pub fn handlers_for_event(&self, source: &str, event_name: &str) -> Vec<Arc<dyn EventHandler>> {
         let key = (source.to_string(), event_name.to_string());
         self.event_handlers.get(&key).cloned().unwrap_or_default()
     }
@@ -148,10 +147,9 @@ impl TransformationRegistry {
     /// Get all unique event handlers with their triggers grouped.
     /// Each handler appears exactly once, deduplicated by `handler_key()`.
     pub fn unique_event_handlers(&self) -> Vec<EventHandlerInfo> {
-        deduplicate_handlers(
-            self.event_handlers.values().flatten().cloned(),
-            |h| h.triggers(),
-        )
+        deduplicate_handlers(self.event_handlers.values().flatten().cloned(), |h| {
+            h.triggers()
+        })
         .into_iter()
         .map(|(handler, triggers)| EventHandlerInfo { handler, triggers })
         .collect()
@@ -160,10 +158,9 @@ impl TransformationRegistry {
     /// Get all unique call handlers with their triggers grouped.
     /// Each handler appears exactly once, deduplicated by `handler_key()`.
     pub fn unique_call_handlers(&self) -> Vec<CallHandlerInfo> {
-        deduplicate_handlers(
-            self.call_handlers.values().flatten().cloned(),
-            |h| h.triggers(),
-        )
+        deduplicate_handlers(self.call_handlers.values().flatten().cloned(), |h| {
+            h.triggers()
+        })
         .into_iter()
         .map(|(handler, triggers)| CallHandlerInfo { handler, triggers })
         .collect()
@@ -179,11 +176,7 @@ impl Default for TransformationRegistry {
 /// Extract event name from signature.
 /// e.g., "Swap(bytes32,address,int128)" -> "Swap"
 pub fn extract_event_name(signature: &str) -> String {
-    signature
-        .split('(')
-        .next()
-        .unwrap_or(signature)
-        .to_string()
+    signature.split('(').next().unwrap_or(signature).to_string()
 }
 
 /// Build the transformation registry with all handlers.

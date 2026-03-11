@@ -7,8 +7,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::decoding::catchup::read_factory_addresses_from_parquet;
 use crate::decoding::logs::{
-    delete_decoded_logs_for_blocks, process_logs, process_logs_live, EventMatcher,
-    LogDecodingError,
+    delete_decoded_logs_for_blocks, process_logs, process_logs_live, EventMatcher, LogDecodingError,
 };
 use alloy::primitives::Address;
 use alloy::primitives::B256;
@@ -74,11 +73,9 @@ fn load_accumulated_factory_addresses(
         for block_number in factory_blocks {
             if let Ok(live_factories) = live_storage.read_factories(block_number) {
                 for (collection_name, addresses) in live_factories.addresses_by_collection {
-                    let addrs: HashSet<[u8; 20]> = addresses.into_iter().map(|(_, addr)| addr).collect();
-                    result
-                        .entry(collection_name)
-                        .or_default()
-                        .extend(addrs);
+                    let addrs: HashSet<[u8; 20]> =
+                        addresses.into_iter().map(|(_, addr)| addr).collect();
+                    result.entry(collection_name).or_default().extend(addrs);
                 }
             }
         }
@@ -126,7 +123,9 @@ pub async fn decode_logs_live(
             }) => {
                 tracing::debug!(
                     "Log decoder received {} logs for block {} (live_mode={})",
-                    logs.len(), range_start, live_mode
+                    logs.len(),
+                    range_start,
+                    live_mode
                 );
                 if live_mode {
                     // Live mode: write to bincode storage
@@ -161,10 +160,7 @@ pub async fn decode_logs_live(
                     .await?;
                 }
             }
-            Some(DecoderMessage::FactoryAddresses {
-                addresses,
-                ..
-            }) => {
+            Some(DecoderMessage::FactoryAddresses { addresses, .. }) => {
                 // Accumulate factory addresses - add new addresses to the accumulated set
                 for (collection_name, addrs) in addresses {
                     let addr_set: HashSet<[u8; 20]> = addrs.iter().map(|a| a.0 .0).collect();
@@ -177,7 +173,10 @@ pub async fn decode_logs_live(
                         "Added {} factory addresses for collection '{}', total now: {}",
                         count,
                         collection_name,
-                        accumulated_factory_addresses.get(&collection_name).map(|s| s.len()).unwrap_or(0)
+                        accumulated_factory_addresses
+                            .get(&collection_name)
+                            .map(|s| s.len())
+                            .unwrap_or(0)
                     );
                 }
             }
@@ -187,7 +186,10 @@ pub async fn decode_logs_live(
                 // - Once discovered, an address remains a valid contract
                 // - The canonical chain will eventually include creation events for valid pools
                 // - False positives are harmless (decoding events that don't exist is a no-op)
-                tracing::info!("Handling reorg in log decoder, deleting {} orphaned blocks", orphaned.len());
+                tracing::info!(
+                    "Handling reorg in log decoder, deleting {} orphaned blocks",
+                    orphaned.len()
+                );
                 delete_decoded_logs_for_blocks(&live_storage, &orphaned)?;
             }
             Some(DecoderMessage::AllComplete) => {
@@ -223,7 +225,11 @@ pub async fn handle_transform_retries(
         let logs = match storage.read_logs(block_number) {
             Ok(logs) => logs,
             Err(e) => {
-                tracing::warn!("Failed to read logs for retry block {}: {}", block_number, e);
+                tracing::warn!(
+                    "Failed to read logs for retry block {}: {}",
+                    block_number,
+                    e
+                );
                 continue;
             }
         };
@@ -294,11 +300,19 @@ pub async fn handle_transform_retries(
             })
             .await
         {
-            tracing::warn!("Failed to send logs for retry block {}: {}", block_number, e);
+            tracing::warn!(
+                "Failed to send logs for retry block {}: {}",
+                block_number,
+                e
+            );
             continue;
         }
 
-        tracing::info!("Replayed {} logs for transformation retry of block {}", logs.len(), block_number);
+        tracing::info!(
+            "Replayed {} logs for transformation retry of block {}",
+            logs.len(),
+            block_number
+        );
     }
 
     tracing::info!("Transform retry handler stopped for chain {}", chain_name);

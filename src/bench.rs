@@ -17,7 +17,10 @@ pub fn init(path: &Path) -> std::io::Result<()> {
     *guard = Some(file);
 
     if let Some(f) = guard.as_mut() {
-        writeln!(f, "collector,range_start,range_end,record_count,rpc_ms,process_ms,write_ms")?;
+        writeln!(
+            f,
+            "collector,range_start,range_end,record_count,rpc_ms,process_ms,write_ms"
+        )?;
     }
 
     Ok(())

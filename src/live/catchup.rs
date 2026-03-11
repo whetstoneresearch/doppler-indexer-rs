@@ -157,12 +157,21 @@ impl LiveCatchupService {
         }
 
         // Check for decoded data
-        let decoded_logs_exist = !self.storage.list_decoded_log_types(block_number)?.is_empty();
-        let decoded_calls_exist = !self.storage.list_decoded_call_types(block_number)?.is_empty();
+        let decoded_logs_exist = !self
+            .storage
+            .list_decoded_log_types(block_number)?
+            .is_empty();
+        let decoded_calls_exist = !self
+            .storage
+            .list_decoded_call_types(block_number)?
+            .is_empty();
 
         // Check if raw logs are empty (no events to decode)
         let logs_empty = if logs_exist {
-            self.storage.read_logs(block_number).map(|l| l.is_empty()).unwrap_or(false)
+            self.storage
+                .read_logs(block_number)
+                .map(|l| l.is_empty())
+                .unwrap_or(false)
         } else {
             true
         };
@@ -175,7 +184,10 @@ impl LiveCatchupService {
 
         // Check if raw eth_calls are empty (no calls to decode)
         let eth_calls_empty = if eth_calls_exist {
-            self.storage.read_eth_calls(block_number).map(|c| c.is_empty()).unwrap_or(false)
+            self.storage
+                .read_eth_calls(block_number)
+                .map(|c| c.is_empty())
+                .unwrap_or(false)
         } else {
             true
         };
@@ -569,7 +581,8 @@ impl LiveCatchupService {
         }
 
         // Replay through decoder - it will re-decode and send to transform engine
-        self.replay_logs_for_decode(&block_numbers, decoder_tx).await
+        self.replay_logs_for_decode(&block_numbers, decoder_tx)
+            .await
     }
 
     /// Get the storage reference for external use.
@@ -712,10 +725,7 @@ mod tests {
 
         let service = LiveCatchupService {
             storage,
-            registered_handlers: HashSet::from([
-                "handler_a".to_string(),
-                "handler_b".to_string(),
-            ]),
+            registered_handlers: HashSet::from(["handler_a".to_string(), "handler_b".to_string()]),
             chain_id: 1,
             db_pool: None,
         };

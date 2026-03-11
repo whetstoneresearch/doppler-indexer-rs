@@ -13,7 +13,9 @@ use arrow::array::{
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use super::context::{DecodedCall, DecodedEvent, DecodedValue, HistoricalCallQuery, HistoricalEventQuery};
+use super::context::{
+    DecodedCall, DecodedEvent, DecodedValue, HistoricalCallQuery, HistoricalEventQuery,
+};
 use super::error::TransformationError;
 
 /// Reader for historical decoded data stored in parquet files.
@@ -149,8 +151,9 @@ impl HistoricalDataReader {
 
         let mut results = Vec::new();
         while let Some(result) = read_tasks.join_next().await {
-            let events = result
-                .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
+            let events = result.map_err(|e| {
+                TransformationError::IoError(std::io::Error::other(e.to_string()))
+            })??;
             results.extend(events);
         }
 
@@ -189,8 +192,9 @@ impl HistoricalDataReader {
 
         let mut results = Vec::new();
         while let Some(result) = read_tasks.join_next().await {
-            let calls = result
-                .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
+            let calls = result.map_err(|e| {
+                TransformationError::IoError(std::io::Error::other(e.to_string()))
+            })??;
             results.extend(calls);
         }
 
@@ -300,10 +304,7 @@ fn parse_range_from_filename(path: &Path) -> Option<(u64, u64)> {
     // Try different filename patterns
     // Pattern 1: "decoded_0-9999"
     // Pattern 2: "0-9999"
-    let parts: Vec<&str> = filename
-        .trim_start_matches("decoded_")
-        .split('-')
-        .collect();
+    let parts: Vec<&str> = filename.trim_start_matches("decoded_").split('-').collect();
 
     if parts.len() == 2 {
         let start = parts[0].parse().ok()?;
@@ -521,14 +522,19 @@ fn get_u32_column(batch: &RecordBatch, name: &str) -> Result<Vec<u32>, Transform
     Ok(arr.values().to_vec())
 }
 
-fn get_bytes32_column(batch: &RecordBatch, name: &str) -> Result<Vec<[u8; 32]>, TransformationError> {
+fn get_bytes32_column(
+    batch: &RecordBatch,
+    name: &str,
+) -> Result<Vec<[u8; 32]>, TransformationError> {
     let col = batch
         .column_by_name(name)
         .ok_or_else(|| TransformationError::MissingColumn(name.to_string()))?;
     let arr = col
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| TransformationError::TypeConversion(format!("{} is not FixedSizeBinary", name)))?;
+        .ok_or_else(|| {
+            TransformationError::TypeConversion(format!("{} is not FixedSizeBinary", name))
+        })?;
 
     let mut result = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
@@ -540,14 +546,19 @@ fn get_bytes32_column(batch: &RecordBatch, name: &str) -> Result<Vec<[u8; 32]>, 
     Ok(result)
 }
 
-fn get_address_column(batch: &RecordBatch, name: &str) -> Result<Vec<[u8; 20]>, TransformationError> {
+fn get_address_column(
+    batch: &RecordBatch,
+    name: &str,
+) -> Result<Vec<[u8; 20]>, TransformationError> {
     let col = batch
         .column_by_name(name)
         .ok_or_else(|| TransformationError::MissingColumn(name.to_string()))?;
     let arr = col
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| TransformationError::TypeConversion(format!("{} is not FixedSizeBinary", name)))?;
+        .ok_or_else(|| {
+            TransformationError::TypeConversion(format!("{} is not FixedSizeBinary", name))
+        })?;
 
     let mut result = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
@@ -677,8 +688,7 @@ mod tests {
             Arc::new(UInt64Array::from(vec![42u64])),
         ];
 
-        let batch = RecordBatch::try_new(schema, arrays)
-        .unwrap();
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
 
         let events = batch_to_events(batch, "v3", "Swap").unwrap();
         assert_eq!(events.len(), 1);

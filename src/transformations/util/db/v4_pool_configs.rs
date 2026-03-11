@@ -17,14 +17,11 @@ pub fn insert_pool_config(
     gamma: u32,
     is_token_0: bool,
     num_pd_slugs: U256,
-    ctx: &TransformationContext
+    ctx: &TransformationContext,
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "v4_pool_configs".to_string(),
-        conflict_columns: vec![
-            "chain_id".to_string(),
-            "hook_address".to_string(),
-        ],
+        conflict_columns: vec!["chain_id".to_string(), "hook_address".to_string()],
         update_columns: vec![],
         columns: vec![
             "chain_id".to_string(),
@@ -40,10 +37,10 @@ pub fn insert_pool_config(
             "epoch_length".to_string(),
             "gamma".to_string(),
             "is_token_0".to_string(),
-            "num_pd_slugs".to_string()
-        ], 
+            "num_pd_slugs".to_string(),
+        ],
         values: vec![
-            DbValue::Int64(ctx.chain_id as i64),            
+            DbValue::Int64(ctx.chain_id as i64),
             DbValue::Bytes32(pool_id),
             DbValue::Address(hook_address),
             DbValue::Numeric(num_tokens_to_sell.to_string()),
@@ -56,6 +53,7 @@ pub fn insert_pool_config(
             DbValue::Numeric(epoch_length.to_string()),
             DbValue::Int32(gamma as i32),
             DbValue::Bool(is_token_0),
-            DbValue::Numeric(num_pd_slugs.to_string())
-        ]}
+            DbValue::Numeric(num_pd_slugs.to_string()),
+        ],
+    }
 }

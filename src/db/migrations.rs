@@ -32,12 +32,7 @@ pub async fn run(pool: &Pool) -> Result<(), DbError> {
 
     let mut entries: Vec<_> = std::fs::read_dir(migrations_path)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|x| x == "sql")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().extension().map(|x| x == "sql").unwrap_or(false))
         .collect();
 
     entries.sort_by_key(|e| e.file_name());

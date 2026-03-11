@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::Address;
-use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListArray, StringBuilder, StringArray, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListArray,
+    StringArray, StringBuilder, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -207,7 +210,7 @@ pub(crate) async fn process_range(
     let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> = HashMap::new();
 
     for log in &logs {
-        for matcher in matchers {            
+        for matcher in matchers {
             if log.address != matcher.factory_contract_address {
                 continue;
             }
@@ -215,7 +218,7 @@ pub(crate) async fn process_range(
             if log.topics.is_empty() || log.topics[0] != matcher.event_topic0 {
                 continue;
             }
-            
+
             let extracted_address = match &matcher.param_location {
                 FactoryParameterLocation::Topic(idx) => {
                     if *idx < log.topics.len() {
@@ -266,7 +269,18 @@ pub(crate) async fn process_range(
         }
     }
 
-    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest, storage_manager, chain_name).await?;
+    write_factory_parquet_files(
+        range_start,
+        range_end,
+        records,
+        matchers,
+        output_dir,
+        existing_files,
+        s3_manifest,
+        storage_manager,
+        chain_name,
+    )
+    .await?;
 
     Ok(FactoryAddressData {
         range_start,
@@ -277,12 +291,20 @@ pub(crate) async fn process_range(
 
 /// Read log batches from a parquet file with column projection.
 /// Only reads block_number, block_timestamp, address, topics, data — skips transaction_hash and log_index.
-pub(crate) fn read_log_batches_from_parquet(file_path: &Path) -> Result<Vec<RecordBatch>, FactoryCollectionError> {
+pub(crate) fn read_log_batches_from_parquet(
+    file_path: &Path,
+) -> Result<Vec<RecordBatch>, FactoryCollectionError> {
     let file = File::open(file_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let arrow_schema = builder.schema().clone();
 
-    let needed = ["block_number", "block_timestamp", "address", "topics", "data"];
+    let needed = [
+        "block_number",
+        "block_timestamp",
+        "address",
+        "topics",
+        "data",
+    ];
     let root_indices: Vec<usize> = needed
         .iter()
         .filter_map(|name| arrow_schema.index_of(name).ok())
@@ -343,8 +365,8 @@ pub(crate) async fn process_range_batches(
             .and_then(|c| c.as_any().downcast_ref::<ListArray>());
 
         // Pre-extract inner topics array and offsets for zero-copy access
-        let topics_inner = topics_list
-            .and_then(|l| l.values().as_any().downcast_ref::<FixedSizeBinaryArray>());
+        let topics_inner =
+            topics_list.and_then(|l| l.values().as_any().downcast_ref::<FixedSizeBinaryArray>());
         let topics_offsets = topics_list.map(|l| l.offsets());
 
         let data_col = batch
@@ -380,28 +402,26 @@ pub(crate) async fn process_range_batches(
                 let block_timestamp = timestamps.value(i);
 
                 let extracted_address = match &matcher.param_location {
-                    FactoryParameterLocation::Topic(idx) => {
-                        match (topics_offsets, topics_inner) {
-                            (Some(offsets), Some(inner)) => {
-                                let start = offsets[i] as usize;
-                                let end = offsets[i + 1] as usize;
-                                let num_topics = end - start;
-                                if *idx < num_topics {
-                                    let topic = inner.value(start + *idx);
-                                    if topic.len() == 32 {
-                                        let mut addr = [0u8; 20];
-                                        addr.copy_from_slice(&topic[12..32]);
-                                        Some(addr)
-                                    } else {
-                                        None
-                                    }
+                    FactoryParameterLocation::Topic(idx) => match (topics_offsets, topics_inner) {
+                        (Some(offsets), Some(inner)) => {
+                            let start = offsets[i] as usize;
+                            let end = offsets[i + 1] as usize;
+                            let num_topics = end - start;
+                            if *idx < num_topics {
+                                let topic = inner.value(start + *idx);
+                                if topic.len() == 32 {
+                                    let mut addr = [0u8; 20];
+                                    addr.copy_from_slice(&topic[12..32]);
+                                    Some(addr)
                                 } else {
                                     None
                                 }
+                            } else {
+                                None
                             }
-                            _ => None,
                         }
-                    }
+                        _ => None,
+                    },
                     FactoryParameterLocation::Data(indices) => {
                         let data = data_col.map(|arr| arr.value(i)).unwrap_or(&[]);
                         match decode_address_from_data(data, &matcher.data_types, indices) {
@@ -428,20 +448,28 @@ pub(crate) async fn process_range_batches(
                         collection_name: matcher.collection_name.clone(),
                     });
 
-                    addresses_by_block
-                        .entry(block_number)
-                        .or_default()
-                        .push((
-                            block_timestamp,
-                            Address::from(addr),
-                            matcher.collection_name.clone(),
-                        ));
+                    addresses_by_block.entry(block_number).or_default().push((
+                        block_timestamp,
+                        Address::from(addr),
+                        matcher.collection_name.clone(),
+                    ));
                 }
             }
         }
     }
 
-    write_factory_parquet_files(range_start, range_end, records, matchers, output_dir, existing_files, s3_manifest, storage_manager, chain_name).await?;
+    write_factory_parquet_files(
+        range_start,
+        range_end,
+        records,
+        matchers,
+        output_dir,
+        existing_files,
+        s3_manifest,
+        storage_manager,
+        chain_name,
+    )
+    .await?;
 
     Ok(FactoryAddressData {
         range_start,
@@ -540,9 +568,11 @@ async fn write_factory_parquet_files(
                 std::fs::create_dir_all(&sub_dir)?;
                 let output_path = sub_dir.join(&file_name);
                 let output_path_clone = output_path.clone();
-                tokio::task::spawn_blocking(move || write_empty_factory_parquet(&output_path_clone))
-                    .await
-                    .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+                tokio::task::spawn_blocking(move || {
+                    write_empty_factory_parquet(&output_path_clone)
+                })
+                .await
+                .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
 
                 tracing::debug!(
                     "Wrote empty factory file for {} range {}-{}",
@@ -563,7 +593,9 @@ async fn write_factory_parquet_files(
                         range_end - 1,
                     )
                     .await
-                    .map_err(|e| FactoryCollectionError::Io(std::io::Error::other(e.to_string())))?;
+                    .map_err(|e| {
+                        FactoryCollectionError::Io(std::io::Error::other(e.to_string()))
+                    })?;
                 }
             }
         }
@@ -600,7 +632,11 @@ fn extract_address_recursive(values: &[DynSolValue], indices: &[usize]) -> Optio
     }
 }
 
-fn decode_address_from_data(data: &[u8], types: &[DynSolType], indices: &[usize]) -> Result<Option<[u8; 20]>, alloy::dyn_abi::Error> {
+fn decode_address_from_data(
+    data: &[u8],
+    types: &[DynSolType],
+    indices: &[usize],
+) -> Result<Option<[u8; 20]>, alloy::dyn_abi::Error> {
     if types.is_empty() || indices.is_empty() {
         return Ok(None);
     }
@@ -783,10 +819,9 @@ pub(crate) fn load_factory_addresses_from_parquet(
                     .column_by_name("factory_address")
                     .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
 
-                let collection_names = batch.column_by_name("collection_name").and_then(|c| {
-                    c.as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                });
+                let collection_names = batch
+                    .column_by_name("collection_name")
+                    .and_then(|c| c.as_any().downcast_ref::<arrow::array::StringArray>());
 
                 if let (Some(blocks), Some(times), Some(addrs), Some(names)) =
                     (block_numbers, timestamps, addresses, collection_names)

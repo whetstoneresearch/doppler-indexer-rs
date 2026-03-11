@@ -13,8 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder,
-    UInt32Builder, UInt64Builder,
+    ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -99,7 +98,10 @@ impl CompactionService {
     }
 
     /// Set the retry channel for transformation retries.
-    pub fn with_retry_tx(mut self, retry_tx: tokio::sync::mpsc::Sender<TransformRetryRequest>) -> Self {
+    pub fn with_retry_tx(
+        mut self,
+        retry_tx: tokio::sync::mpsc::Sender<TransformRetryRequest>,
+    ) -> Self {
         self.retry_tx = Some(retry_tx);
         self
     }
@@ -185,7 +187,11 @@ impl CompactionService {
                     let mut updated_status = status;
                     updated_status.logs_decoded = false;
                     if let Err(e) = self.storage.write_status(block_number, &updated_status) {
-                        tracing::warn!("Failed to clear logs_decoded for stuck block {}: {}", block_number, e);
+                        tracing::warn!(
+                            "Failed to clear logs_decoded for stuck block {}: {}",
+                            block_number,
+                            e
+                        );
                         continue;
                     }
 
@@ -193,7 +199,10 @@ impl CompactionService {
                     if let Err(e) = retry_tx.try_send(TransformRetryRequest { block_number }) {
                         tracing::debug!("Retry channel full for block {}: {}", block_number, e);
                     } else {
-                        tracing::info!("Requested transformation retry for stuck block {}", block_number);
+                        tracing::info!(
+                            "Requested transformation retry for stuck block {}",
+                            block_number
+                        );
                     }
                 }
             }
@@ -244,9 +253,7 @@ impl CompactionService {
             }
 
             // Verify no gaps in the sequence
-            let has_gap = block_numbers
-                .windows(2)
-                .any(|w| w[1] != w[0] + 1);
+            let has_gap = block_numbers.windows(2).any(|w| w[1] != w[0] + 1);
             if has_gap {
                 tracing::warn!(
                     "Range {}-{} has gaps in block sequence",
@@ -284,7 +291,10 @@ impl CompactionService {
                     if range_end >= safe_boundary {
                         tracing::debug!(
                             "Skipping range {}-{}: within reorg depth (latest={}, safe={})",
-                            range_start, range_end, latest_block, safe_boundary
+                            range_start,
+                            range_end,
+                            latest_block,
+                            safe_boundary
                         );
                         continue;
                     }
@@ -325,7 +335,8 @@ impl CompactionService {
         // Write blocks parquet
         let blocks_path = self.blocks_parquet_path(range.start, range.end);
         self.write_blocks_parquet(&blocks, &blocks_path)?;
-        self.upload_to_s3(&blocks_path, "raw/blocks", range.start, range.end).await?;
+        self.upload_to_s3(&blocks_path, "raw/blocks", range.start, range.end)
+            .await?;
 
         // Read and write logs parquet
         let mut all_logs = Vec::new();
@@ -341,7 +352,8 @@ impl CompactionService {
         if !all_logs.is_empty() {
             let logs_path = self.logs_parquet_path(range.start, range.end);
             self.write_logs_parquet(&all_logs, &logs_path)?;
-            self.upload_to_s3(&logs_path, "raw/logs", range.start, range.end).await?;
+            self.upload_to_s3(&logs_path, "raw/logs", range.start, range.end)
+                .await?;
         }
 
         // Read and write factory addresses parquet
@@ -368,7 +380,8 @@ impl CompactionService {
                     &format!("factories/{}", collection_name),
                     range.start,
                     range.end,
-                ).await?;
+                )
+                .await?;
             }
             tracing::info!(
                 "Wrote factory addresses for {} collections in range {}-{}",
@@ -389,7 +402,8 @@ impl CompactionService {
         if !all_eth_calls.is_empty() {
             let eth_calls_path = self.eth_calls_parquet_path(range.start, range.end);
             self.write_eth_calls_parquet(&all_eth_calls, &eth_calls_path)?;
-            self.upload_to_s3(&eth_calls_path, "raw/eth_calls", range.start, range.end).await?;
+            self.upload_to_s3(&eth_calls_path, "raw/eth_calls", range.start, range.end)
+                .await?;
             tracing::info!(
                 "Wrote {} eth_calls to {} in range {}-{}",
                 all_eth_calls.len(),
@@ -906,9 +920,7 @@ mod tests {
 
         // Sort and verify blocks are sequential with no gaps
         block_numbers.sort_unstable();
-        if block_numbers.first() != Some(&range_start)
-            || block_numbers.last() != Some(&range_end)
-        {
+        if block_numbers.first() != Some(&range_start) || block_numbers.last() != Some(&range_end) {
             return false;
         }
 

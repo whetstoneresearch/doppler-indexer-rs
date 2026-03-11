@@ -283,7 +283,11 @@ impl RpcProvider for UnifiedRpcClient {
         delegate_to_inner!(self, get_logs, filter)
     }
 
-    async fn get_balance(&self, address: Address, block: Option<BlockId>) -> Result<U256, RpcError> {
+    async fn get_balance(
+        &self,
+        address: Address,
+        block: Option<BlockId>,
+    ) -> Result<U256, RpcError> {
         delegate_to_inner!(self, get_balance, address, block)
     }
 

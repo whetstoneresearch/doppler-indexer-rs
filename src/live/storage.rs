@@ -28,9 +28,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::types::{
-    LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall,
-    LiveDecodedLog, LiveDecodedOnceCall, LiveEthCall, LiveFactoryAddresses,
-    LiveLog, LiveReceipt,
+    LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog,
+    LiveDecodedOnceCall, LiveEthCall, LiveFactoryAddresses, LiveLog, LiveReceipt,
     LiveUpsertSnapshot,
 };
 
@@ -142,7 +141,8 @@ impl LiveStorage {
     // =========================================================================
 
     fn block_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir.join(format!("raw/blocks/{}.bin", block_number))
+        self.base_dir
+            .join(format!("raw/blocks/{}.bin", block_number))
     }
 
     /// Write a live block to storage.
@@ -468,10 +468,7 @@ impl LiveStorage {
         let mut results = Vec::new();
         for contract_entry in fs::read_dir(&block_dir)? {
             let contract_entry = contract_entry?;
-            let contract_name = contract_entry
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
+            let contract_name = contract_entry.file_name().to_string_lossy().into_owned();
 
             if contract_entry.path().is_dir() {
                 for event_entry in fs::read_dir(contract_entry.path())? {
@@ -492,8 +489,10 @@ impl LiveStorage {
     // =========================================================================
 
     fn decoded_calls_dir(&self, block_number: u64, contract_name: &str) -> PathBuf {
-        self.base_dir
-            .join(format!("decoded/eth_calls/{}/{}", block_number, contract_name))
+        self.base_dir.join(format!(
+            "decoded/eth_calls/{}/{}",
+            block_number, contract_name
+        ))
     }
 
     fn decoded_calls_path(
@@ -543,7 +542,11 @@ impl LiveStorage {
 
     /// Delete all decoded eth_calls for a block.
     pub fn delete_all_decoded_calls(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete_dir_all(&self.base_dir.join(format!("decoded/eth_calls/{}", block_number)))
+        safe_delete_dir_all(
+            &self
+                .base_dir
+                .join(format!("decoded/eth_calls/{}", block_number)),
+        )
     }
 
     /// Write decoded event-triggered eth_calls.
@@ -605,7 +608,9 @@ impl LiveStorage {
         &self,
         block_number: u64,
     ) -> Result<Vec<(String, String)>, StorageError> {
-        let block_dir = self.base_dir.join(format!("decoded/eth_calls/{}", block_number));
+        let block_dir = self
+            .base_dir
+            .join(format!("decoded/eth_calls/{}", block_number));
         if !block_dir.exists() {
             return Ok(Vec::new());
         }
@@ -613,10 +618,7 @@ impl LiveStorage {
         let mut results = Vec::new();
         for contract_entry in fs::read_dir(&block_dir)? {
             let contract_entry = contract_entry?;
-            let contract_name = contract_entry
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
+            let contract_name = contract_entry.file_name().to_string_lossy().into_owned();
 
             if contract_entry.path().is_dir() {
                 for func_entry in fs::read_dir(contract_entry.path())? {
@@ -640,7 +642,8 @@ impl LiveStorage {
     // =========================================================================
 
     fn snapshots_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir.join(format!("snapshots/{}.bin", block_number))
+        self.base_dir
+            .join(format!("snapshots/{}.bin", block_number))
     }
 
     /// Write upsert snapshots for a block.
@@ -657,7 +660,10 @@ impl LiveStorage {
     }
 
     /// Read upsert snapshots for a block.
-    pub fn read_snapshots(&self, block_number: u64) -> Result<Vec<LiveUpsertSnapshot>, StorageError> {
+    pub fn read_snapshots(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<LiveUpsertSnapshot>, StorageError> {
         let path = self.snapshots_path(block_number);
         read_bincode(&path).map_err(|e| map_not_found(e, block_number))
     }
@@ -674,7 +680,10 @@ impl LiveStorage {
     /// Get recent blocks for seeding the reorg detector on restart.
     ///
     /// Returns up to `count` most recent (block_number, block_hash) pairs.
-    pub fn get_recent_blocks_for_reorg(&self, count: u64) -> Result<Vec<(u64, [u8; 32])>, StorageError> {
+    pub fn get_recent_blocks_for_reorg(
+        &self,
+        count: u64,
+    ) -> Result<Vec<(u64, [u8; 32])>, StorageError> {
         let blocks = self.list_blocks()?;
         let start = blocks.len().saturating_sub(count as usize);
 
@@ -953,7 +962,9 @@ mod tests {
             tx_hashes: vec![],
         };
         storage.write_block(&block).unwrap();
-        storage.write_status(999, &LiveBlockStatus::default()).unwrap();
+        storage
+            .write_status(999, &LiveBlockStatus::default())
+            .unwrap();
 
         assert!(storage.block_exists(999));
         storage.delete_all(999).unwrap();

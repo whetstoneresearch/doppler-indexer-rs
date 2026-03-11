@@ -614,10 +614,7 @@ mod tests {
 
         // Check second tuple param
         assert_eq!(parsed.params[1].name, "params");
-        assert_eq!(
-            parsed.params[1].type_string,
-            "(int24,int24,int256,bytes32)"
-        );
+        assert_eq!(parsed.params[1].type_string, "(int24,int24,int256,bytes32)");
 
         // Check canonical signature
         assert_eq!(
@@ -634,7 +631,10 @@ mod tests {
         assert_eq!(parsed.flattened_fields[4].full_name, "key.hooks");
         assert_eq!(parsed.flattened_fields[5].full_name, "params.tickLower");
         assert_eq!(parsed.flattened_fields[6].full_name, "params.tickUpper");
-        assert_eq!(parsed.flattened_fields[7].full_name, "params.liquidityDelta");
+        assert_eq!(
+            parsed.flattened_fields[7].full_name,
+            "params.liquidityDelta"
+        );
         assert_eq!(parsed.flattened_fields[8].full_name, "params.salt");
     }
 
@@ -673,7 +673,10 @@ mod tests {
 
         assert_eq!(parsed.name, "Test");
         assert_eq!(parsed.params.len(), 2);
-        assert_eq!(parsed._canonical_signature, "Test((address,uint256),address)");
+        assert_eq!(
+            parsed._canonical_signature,
+            "Test((address,uint256),address)"
+        );
 
         // Check flattened fields
         assert_eq!(parsed.flattened_fields.len(), 3);
@@ -704,8 +707,14 @@ mod tests {
         assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
         assert_eq!(parsed.flattened_fields[2].full_name, "poolId");
         assert_eq!(parsed.flattened_fields[3].full_name, "params.zeroForOne");
-        assert_eq!(parsed.flattened_fields[4].full_name, "params.amountSpecified");
-        assert_eq!(parsed.flattened_fields[5].full_name, "params.sqrtPriceLimitX96");
+        assert_eq!(
+            parsed.flattened_fields[4].full_name,
+            "params.amountSpecified"
+        );
+        assert_eq!(
+            parsed.flattened_fields[5].full_name,
+            "params.sqrtPriceLimitX96"
+        );
         assert_eq!(parsed.flattened_fields[6].full_name, "amount0");
         assert_eq!(parsed.flattened_fields[7].full_name, "amount1");
         assert_eq!(parsed.flattened_fields[8].full_name, "hookData");

@@ -171,8 +171,13 @@ impl LiveCollector {
             .await?;
 
         // Backfill gaps from incomplete previous backfills
-        self.backfill_storage_gaps(&live_tx, &log_decoder_tx, &eth_call_decoder_tx, &transform_reorg_tx)
-            .await?;
+        self.backfill_storage_gaps(
+            &live_tx,
+            &log_decoder_tx,
+            &eth_call_decoder_tx,
+            &transform_reorg_tx,
+        )
+        .await?;
 
         // Gap detection and backfill happen on first block
         let mut first_block_seen = false;
@@ -248,7 +253,13 @@ impl LiveCollector {
                     };
 
                     if let Err(e) = self
-                        .process_block(block, &live_tx, &log_decoder_tx, &eth_call_decoder_tx, &transform_reorg_tx)
+                        .process_block(
+                            block,
+                            &live_tx,
+                            &log_decoder_tx,
+                            &eth_call_decoder_tx,
+                            &transform_reorg_tx,
+                        )
                         .await
                     {
                         tracing::error!("Error processing block {}: {}", number, e);
@@ -273,7 +284,14 @@ impl LiveCollector {
                     );
 
                     if let Err(e) = self
-                        .backfill_blocks(missed_from, missed_to, &live_tx, &log_decoder_tx, &eth_call_decoder_tx, &transform_reorg_tx)
+                        .backfill_blocks(
+                            missed_from,
+                            missed_to,
+                            &live_tx,
+                            &log_decoder_tx,
+                            &eth_call_decoder_tx,
+                            &transform_reorg_tx,
+                        )
                         .await
                     {
                         tracing::error!(
@@ -304,7 +322,14 @@ impl LiveCollector {
 
         // Check for reorg
         if let Some(reorg_event) = self.reorg_detector.process_block(&block) {
-            self.handle_reorg(&reorg_event, live_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx).await?;
+            self.handle_reorg(
+                &reorg_event,
+                live_tx,
+                log_decoder_tx,
+                eth_call_decoder_tx,
+                transform_reorg_tx,
+            )
+            .await?;
         }
 
         // Store the block header
@@ -348,7 +373,8 @@ impl LiveCollector {
         let has_factory_addresses = !factory_addresses.addresses_by_collection.is_empty();
 
         if has_factory_addresses {
-            self.storage.write_factories(block_number, &factory_addresses)?;
+            self.storage
+                .write_factories(block_number, &factory_addresses)?;
             tracing::debug!(
                 "Extracted {} factory addresses from block {}",
                 factory_addresses
@@ -429,7 +455,11 @@ impl LiveCollector {
                 })
                 .await
             {
-                tracing::warn!("Failed to send logs for block {} to decoder: {}", block_number, e);
+                tracing::warn!(
+                    "Failed to send logs for block {} to decoder: {}",
+                    block_number,
+                    e
+                );
             }
         }
 
@@ -463,11 +493,7 @@ impl LiveCollector {
 
                     if !calls.is_empty() {
                         self.storage.write_eth_calls(block_number, &calls)?;
-                        tracing::info!(
-                            "Block {} eth_calls collected: {}",
-                            block_number,
-                            count
-                        );
+                        tracing::info!("Block {} eth_calls collected: {}", block_number, count);
                     } else {
                         // No calls to decode for this block - mark as decoded
                         status.eth_calls_decoded = true;
@@ -501,7 +527,10 @@ impl LiveCollector {
         // If no handlers are registered, mark transformed=true
         // (decoders will still set logs_decoded/eth_calls_decoded as they finish)
         if let Some(ref tracker) = self.progress_tracker {
-            tracker.lock().await.mark_transformed_if_no_handlers(block_number);
+            tracker
+                .lock()
+                .await
+                .mark_transformed_if_no_handlers(block_number);
         }
 
         Ok(())
@@ -559,7 +588,10 @@ impl LiveCollector {
                 })
                 .await
             {
-                tracing::warn!("Failed to send reorg notification to transform engine: {}", e);
+                tracing::warn!(
+                    "Failed to send reorg notification to transform engine: {}",
+                    e
+                );
             }
         }
 
@@ -596,7 +628,14 @@ impl LiveCollector {
             let block = self.fetch_full_block(block_number).await?;
 
             // Process as if it came from WebSocket
-            self.process_block(block, live_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx).await?;
+            self.process_block(
+                block,
+                live_tx,
+                log_decoder_tx,
+                eth_call_decoder_tx,
+                transform_reorg_tx,
+            )
+            .await?;
         }
 
         Ok(())
@@ -623,8 +662,15 @@ impl LiveCollector {
         );
 
         for (start, end) in gaps {
-            self.backfill_blocks(start, end, live_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx)
-                .await?;
+            self.backfill_blocks(
+                start,
+                end,
+                live_tx,
+                log_decoder_tx,
+                eth_call_decoder_tx,
+                transform_reorg_tx,
+            )
+            .await?;
         }
 
         Ok(())
@@ -641,11 +687,7 @@ impl LiveCollector {
             .await?
             .ok_or(CollectorError::BlockNotFound(block_number))?;
 
-        let tx_hashes: Vec<[u8; 32]> = block
-            .transactions
-            .hashes()
-            .map(|h| h.0)
-            .collect();
+        let tx_hashes: Vec<[u8; 32]> = block.transactions.hashes().map(|h| h.0).collect();
 
         Ok(LiveBlock {
             number: block_number,
@@ -843,19 +885,14 @@ impl LiveCollector {
                     .await
                 {
                     Ok(count) => {
-                        tracing::info!(
-                            "Catchup: replayed logs for {} blocks to decoder",
-                            count
-                        );
+                        tracing::info!("Catchup: replayed logs for {} blocks to decoder", count);
                     }
                     Err(e) => {
                         tracing::error!("Failed to replay logs for catchup: {}", e);
                     }
                 }
             } else {
-                tracing::warn!(
-                    "Blocks need log decoding but no log decoder configured, skipping"
-                );
+                tracing::warn!("Blocks need log decoding but no log decoder configured, skipping");
             }
         }
 
@@ -989,7 +1026,10 @@ async fn broadcast_reorg_to_decoders(
             orphaned: orphaned.to_vec(),
         };
         if let Err(e) = decoder_tx.send(msg).await {
-            tracing::warn!("Failed to send reorg notification to eth_call decoder: {}", e);
+            tracing::warn!(
+                "Failed to send reorg notification to eth_call decoder: {}",
+                e
+            );
         }
     }
 }

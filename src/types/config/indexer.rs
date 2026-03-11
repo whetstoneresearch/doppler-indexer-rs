@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::config::chain::{ChainConfig, ChainConfigRaw, resolve_chain_config};
+use crate::types::config::chain::{resolve_chain_config, ChainConfig, ChainConfigRaw};
 use crate::types::config::metrics::MetricsConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::config::storage::StorageConfig;
@@ -41,11 +41,9 @@ impl IndexerConfig {
                         let chains: Vec<ChainConfig> = raw_config
                             .chains
                             .into_iter()
-                            .map(|chain| {
-                                match resolve_chain_config(chain, base_dir) {
-                                    Ok(config) => config,
-                                    Err(e) => panic!("Failed to resolve chain config: {}", e),
-                                }
+                            .map(|chain| match resolve_chain_config(chain, base_dir) {
+                                Ok(config) => config,
+                                Err(e) => panic!("Failed to resolve chain config: {}", e),
                             })
                             .collect();
 

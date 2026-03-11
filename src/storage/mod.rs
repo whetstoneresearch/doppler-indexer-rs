@@ -132,7 +132,8 @@ impl StorageManager {
                     cache_config,
                     local_base.clone(),
                     retry_queue,
-                ).await?;
+                )
+                .await?;
 
                 let manifest_manager = Arc::new(ManifestManager::new(
                     cached_backend.s3_backend().clone(),

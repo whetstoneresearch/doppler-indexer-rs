@@ -7,17 +7,19 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
 use crate::decoding::DecoderMessage;
-use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
+use crate::raw_data::historical::blocks::{
+    get_existing_block_ranges, read_block_info_from_parquet,
+};
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, build_token_call_configs, event_output_exists,
     get_existing_log_ranges, load_factory_addresses_for_once_catchup,
     load_historical_factory_addresses, load_or_build_once_column_index, process_event_triggers,
-    read_once_column_index,
     process_event_triggers_multicall, process_factory_once_calls, process_once_calls_multicall,
     process_once_calls_regular, process_range, process_range_multicall, process_token_range,
-    process_token_range_multicall, read_logs_from_parquet, scan_existing_parquet_files, BlockInfo,
-    BlockRange, EthCallCatchupState, EthCallCollectionError, FrequencyState,
+    process_token_range_multicall, read_logs_from_parquet, read_once_column_index,
+    scan_existing_parquet_files, BlockInfo, BlockRange, EthCallCatchupState,
+    EthCallCollectionError, FrequencyState,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
@@ -52,10 +54,13 @@ pub async fn collect_eth_calls(
     let token_call_configs = build_token_call_configs(&chain.tokens, &chain.contracts)?;
 
     let multicall3_address: Option<Address> =
-        chain.contracts.get("Multicall3").and_then(|c| match &c.address {
-            AddressOrAddresses::Single(addr) => Some(*addr),
-            AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
-        });
+        chain
+            .contracts
+            .get("Multicall3")
+            .and_then(|c| match &c.address {
+                AddressOrAddresses::Single(addr) => Some(*addr),
+                AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
+            });
 
     if multicall3_address.is_some() {
         tracing::info!(
@@ -288,14 +293,14 @@ pub async fn collect_eth_calls(
             // Ensure block file is available locally (download from S3 if needed)
             if !block_range.file_path.exists() {
                 if let Some(ref sm) = storage_manager {
-                    let data_loader = DataLoader::new(
-                        Some(sm.clone()),
-                        &chain.name,
-                        PathBuf::from("data"),
-                    );
+                    let data_loader =
+                        DataLoader::new(Some(sm.clone()), &chain.name, PathBuf::from("data"));
                     match data_loader.ensure_local(&block_range.file_path).await {
                         Ok(true) => {
-                            tracing::debug!("Downloaded block file from S3: {}", block_range.file_path.display());
+                            tracing::debug!(
+                                "Downloaded block file from S3: {}",
+                                block_range.file_path.display()
+                            );
                         }
                         Ok(false) => {
                             tracing::warn!(
@@ -511,14 +516,13 @@ pub async fn collect_eth_calls(
         }
 
         // Load factory address data from existing parquet files
-        let factory_catchup_data =
-            load_factory_addresses_for_once_catchup(
-                &chain.name,
-                &factory_once_configs,
-                s3_manifest.as_ref(),
-                storage_manager.as_ref(),
-            )
-            .await;
+        let factory_catchup_data = load_factory_addresses_for_once_catchup(
+            &chain.name,
+            &factory_once_configs,
+            s3_manifest.as_ref(),
+            storage_manager.as_ref(),
+        )
+        .await;
 
         if !factory_catchup_data.is_empty() {
             let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
@@ -536,10 +540,11 @@ pub async fn collect_eth_calls(
                 for (collection_name, addr_data) in &factory_catchup_data {
                     for (addr, block_num, timestamp) in addr_data {
                         if *block_num >= range.start && *block_num < range.end {
-                            addresses_by_block
-                                .entry(*block_num)
-                                .or_default()
-                                .push((*timestamp, *addr, collection_name.clone()));
+                            addresses_by_block.entry(*block_num).or_default().push((
+                                *timestamp,
+                                *addr,
+                                collection_name.clone(),
+                            ));
                         }
                     }
                 }
@@ -587,14 +592,13 @@ pub async fn collect_eth_calls(
     if has_event_triggered_calls {
         // CRITICAL: Load historical factory addresses BEFORE processing event triggers
         // This ensures we can properly filter events from factory-created contracts
-        let historical_factory_addrs =
-            load_historical_factory_addresses(
-                &chain.name,
-                &event_call_configs,
-                s3_manifest.as_ref(),
-                storage_manager.as_ref(),
-            )
-            .await;
+        let historical_factory_addrs = load_historical_factory_addresses(
+            &chain.name,
+            &event_call_configs,
+            s3_manifest.as_ref(),
+            storage_manager.as_ref(),
+        )
+        .await;
         for (collection_name, addrs) in historical_factory_addrs {
             tracing::info!(
                 "Loaded {} historical factory addresses for collection {}",

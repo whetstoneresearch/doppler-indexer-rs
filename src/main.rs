@@ -1,11 +1,11 @@
 #[cfg(feature = "bench")]
 mod bench;
 mod db;
+mod decoding;
 mod live;
 mod metrics;
 mod raw_data;
 mod rpc;
-mod decoding;
 mod storage;
 mod transformations;
 mod types;
@@ -20,19 +20,22 @@ use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
+use decoding::handle_transform_retries;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
+use live::{
+    CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig,
+    LiveProgressTracker, TransformRetryRequest,
+};
 use raw_data::historical::catchup::blocks::collect_blocks;
 use raw_data::historical::factories::{build_factory_matchers, FactoryMessage, RecollectRequest};
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use decoding::handle_transform_retries;
-use live::{CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig, LiveProgressTracker, TransformRetryRequest};
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
 use transformations::{
-    build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
-    RangeCompleteMessage, ReorgMessage, TransformationEngine,
+    build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteMessage,
+    ReorgMessage, TransformationEngine,
 };
 use types::config::chain::ChainConfig;
 use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
@@ -143,7 +146,9 @@ async fn main() -> anyhow::Result<()> {
     if storage_manager.is_s3_enabled() {
         // Periodic manifest refresh task
         let sm = storage_manager.clone();
-        let refresh_secs = config.storage.as_ref()
+        let refresh_secs = config
+            .storage
+            .as_ref()
             .and_then(|s| s.sync.as_ref())
             .map(|s| s.manifest_refresh_secs)
             .unwrap_or(60);
@@ -160,7 +165,10 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        tracing::info!("Periodic manifest refresh enabled (every {}s)", refresh_secs);
+        tracing::info!(
+            "Periodic manifest refresh enabled (every {}s)",
+            refresh_secs
+        );
     }
 
     // Start retry queue and initial sync services if S3 is enabled
@@ -214,13 +222,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if decode_only {
-        tracing::info!(
-            "Running in decode-only mode (no collection, no transformations)"
-        );
+        tracing::info!("Running in decode-only mode (no collection, no transformations)");
     } else if live_only {
-        tracing::info!(
-            "Running in live-only mode (skips historical processing)"
-        );
+        tracing::info!("Running in live-only mode (skips historical processing)");
     }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
@@ -534,9 +538,17 @@ async fn process_chain_live_only(
         let transform_events_tx = transform_events_tx.clone();
         let transform_complete_tx = transform_complete_tx.clone();
         tasks.spawn(async move {
-            decode_logs(&chain, &cfg, rx, transform_events_tx, None, transform_complete_tx, true)
-                .await
-                .context("log decoding failed")
+            decode_logs(
+                &chain,
+                &cfg,
+                rx,
+                transform_events_tx,
+                None,
+                transform_complete_tx,
+                true,
+            )
+            .await
+            .context("log decoding failed")
         });
     }
 
@@ -557,19 +569,15 @@ async fn process_chain_live_only(
                 None,
                 true,
             )
-                .await
-                .context("eth_call decoding failed")
+            .await
+            .context("eth_call decoding failed")
         });
     }
 
     // Initialize storage manager for live-only mode (no retry queue needed)
-    let storage_manager = StorageManager::new(
-        config.storage.as_ref(),
-        PathBuf::from("data"),
-        None,
-    )
-    .await
-    .context("failed to initialize storage manager")?;
+    let storage_manager = StorageManager::new(config.storage.as_ref(), PathBuf::from("data"), None)
+        .await
+        .context("failed to initialize storage manager")?;
     let storage_manager = Arc::new(storage_manager);
 
     // Spawn live mode directly (no historical processing)
@@ -611,10 +619,7 @@ async fn process_chain(
     })?;
 
     // Feature detection
-    let has_factories = chain
-        .contracts
-        .values()
-        .any(|c| has_items(&c.factories));
+    let has_factories = chain.contracts.values().any(|c| has_items(&c.factories));
 
     let contract_logs_only = config
         .raw_data_collection
@@ -624,9 +629,9 @@ async fn process_chain(
     let needs_factory_filtering = has_factories && contract_logs_only;
 
     let has_factory_calls = chain.contracts.values().any(|c| {
-        c.factories.as_ref().is_some_and(|factories| {
-            factories.iter().any(|f| has_items(&f.calls))
-        })
+        c.factories
+            .as_ref()
+            .is_some_and(|factories| factories.iter().any(|f| has_items(&f.calls)))
     });
 
     let has_event_triggered_calls = chain.contracts.values().any(|c| {
@@ -665,7 +670,9 @@ async fn process_chain(
     );
     tracing::info!(
         "Chain {} - decode_logs: {}, decode_calls: {}",
-        chain.name, has_events, has_calls
+        chain.name,
+        has_events,
+        has_calls
     );
 
     // Channel setup
@@ -684,8 +691,7 @@ async fn process_chain(
 
     let (factory_log_tx, factory_log_rx) =
         optional_channel::<LogMessage>(has_factories, channel_cap);
-    let (logs_factory_tx, logs_factory_rx) =
-        optional_channel(needs_factory_filtering, factory_cap);
+    let (logs_factory_tx, logs_factory_rx) = optional_channel(needs_factory_filtering, factory_cap);
     let (eth_calls_factory_tx, eth_calls_factory_rx) =
         optional_channel::<FactoryMessage>(has_factory_calls, factory_cap);
     let (event_trigger_tx, event_trigger_rx) =
@@ -781,9 +787,7 @@ async fn process_chain(
         .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
     // Allow overriding batch size via env var for larger concurrent fetches
-    let rpc_batch_size: Option<u32> = env::var("RPC_BATCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok());
+    let rpc_batch_size: Option<u32> = env::var("RPC_BATCH_SIZE").ok().and_then(|s| s.parse().ok());
 
     // Apply env var overrides to raw_config
     let mut raw_config = config.raw_data_collection.clone();
@@ -796,7 +800,9 @@ async fn process_chain(
         "RPC config: concurrency={}, alchemy_cu_per_second={}, batch_size={}",
         rpc_concurrency,
         alchemy_cu_per_second,
-        raw_config.rpc_batch_size.unwrap_or(rpc_defaults::MAX_BATCH_SIZE)
+        raw_config
+            .rpc_batch_size
+            .unwrap_or(rpc_defaults::MAX_BATCH_SIZE)
     );
 
     // Create shared rate limiter for account-level rate limiting across all clients
@@ -872,9 +878,17 @@ async fn process_chain(
         let s3_manifest = storage_manager.manifest_for(&chain.name);
         let sm = storage_manager.clone();
         async move {
-            collect_blocks(&chain, &blocks_client, &cfg, Some(block_tx), Some(eth_call_tx), s3_manifest.as_ref(), Some(sm))
-                .await
-                .context("block collection failed")
+            collect_blocks(
+                &chain,
+                &blocks_client,
+                &cfg,
+                Some(block_tx),
+                Some(eth_call_tx),
+                s3_manifest.as_ref(),
+                Some(sm),
+            )
+            .await
+            .context("block collection failed")
         }
     });
 
@@ -923,10 +937,14 @@ async fn process_chain(
         let s3_manifest = storage_manager.manifest_for(&chain.name);
         let sm = storage_manager.clone();
         async move {
-            let catchup_state =
-                raw_data::historical::catchup::logs::collect_logs(&chain, &cfg, s3_manifest, Some(sm))
-                    .await
-                    .context("log catchup failed")?;
+            let catchup_state = raw_data::historical::catchup::logs::collect_logs(
+                &chain,
+                &cfg,
+                s3_manifest,
+                Some(sm),
+            )
+            .await
+            .context("log catchup failed")?;
 
             raw_data::historical::current::logs::collect_logs(
                 &chain,
@@ -946,21 +964,20 @@ async fn process_chain(
         let sm = storage_manager.clone();
         async move {
             // Catchup: process existing block/log ranges
-            let catchup_state =
-                raw_data::historical::catchup::eth_calls::collect_eth_calls(
-                    &chain,
-                    &eth_calls_client,
-                    &cfg,
-                    &call_decoder_tx,
-                    eth_calls_factory_rx.is_some(),
-                    event_trigger_rx.is_some(),
-                    factory_catchup_done_rx,
-                    eth_calls_catchup_done_tx,
-                    s3_manifest,
-                    Some(sm.clone()),
-                )
-                .await
-                .context("eth_calls catchup failed")?;
+            let catchup_state = raw_data::historical::catchup::eth_calls::collect_eth_calls(
+                &chain,
+                &eth_calls_client,
+                &cfg,
+                &call_decoder_tx,
+                eth_calls_factory_rx.is_some(),
+                event_trigger_rx.is_some(),
+                factory_catchup_done_rx,
+                eth_calls_catchup_done_tx,
+                s3_manifest,
+                Some(sm.clone()),
+            )
+            .await
+            .context("eth_calls catchup failed")?;
 
             // Current: process new blocks/factory/event data from channels
             raw_data::historical::current::eth_calls::collect_eth_calls(
@@ -985,21 +1002,20 @@ async fn process_chain(
             let sm = storage_manager.clone();
             async move {
                 // Catchup: load existing factory data and process gaps
-                let catchup_state =
-                    raw_data::historical::catchup::factories::collect_factories(
-                        &chain,
-                        &cfg,
-                        &logs_factory_tx,
-                        &eth_calls_factory_tx,
-                        &log_decoder_tx_for_factories,
-                        &call_decoder_tx_for_factories,
-                        &recollect_tx_for_factories,
-                        factory_catchup_done_tx,
-                        s3_manifest,
-                        Some(sm),
-                    )
-                    .await
-                    .context("factory catchup failed")?;
+                let catchup_state = raw_data::historical::catchup::factories::collect_factories(
+                    &chain,
+                    &cfg,
+                    &logs_factory_tx,
+                    &eth_calls_factory_tx,
+                    &log_decoder_tx_for_factories,
+                    &call_decoder_tx_for_factories,
+                    &recollect_tx_for_factories,
+                    factory_catchup_done_tx,
+                    s3_manifest,
+                    Some(sm),
+                )
+                .await
+                .context("factory catchup failed")?;
 
                 // Current: process new logs from channel
                 raw_data::historical::current::factories::collect_factories(
@@ -1028,9 +1044,17 @@ async fn process_chain(
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
-                decode_logs(&chain, &cfg, log_decoder_rx.unwrap(), transform_events_tx, recollect_tx_for_log_decoder, transform_complete_tx, false)
-                    .await
-                    .context("log decoding failed")
+                decode_logs(
+                    &chain,
+                    &cfg,
+                    log_decoder_rx.unwrap(),
+                    transform_events_tx,
+                    recollect_tx_for_log_decoder,
+                    transform_complete_tx,
+                    false,
+                )
+                .await
+                .context("log decoding failed")
             }
         });
     }
@@ -1051,8 +1075,8 @@ async fn process_chain(
                     decode_catchup_done_tx,
                     false,
                 )
-                    .await
-                    .context("eth call decoding failed")
+                .await
+                .context("eth call decoding failed")
             }
         });
     }
@@ -1190,10 +1214,7 @@ async fn process_chain(
 /// - The WebSocket URL environment variable is not set
 fn should_enable_live_mode(config: &IndexerConfig, chain: &ChainConfig) -> bool {
     // Live mode is enabled by default, only disabled if explicitly set to false
-    let live_mode_enabled = config
-        .raw_data_collection
-        .live_mode
-        .unwrap_or(true);
+    let live_mode_enabled = config.raw_data_collection.live_mode.unwrap_or(true);
 
     if !live_mode_enabled {
         tracing::info!("Live mode explicitly disabled for chain {}", chain.name);
@@ -1247,9 +1268,8 @@ async fn spawn_live_mode(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("ws_url_env_var not set"))?;
 
-    let ws_url = env::var(ws_env_var).with_context(|| {
-        format!("env var {} not set for chain {}", ws_env_var, chain.name)
-    })?;
+    let ws_url = env::var(ws_env_var)
+        .with_context(|| format!("env var {} not set for chain {}", ws_env_var, chain.name))?;
 
     // Build live mode config
     let live_config = LiveModeConfig {
@@ -1333,7 +1353,10 @@ async fn spawn_live_mode(
             &chain,
             http_client.clone(),
             multicall3_address,
-            config.raw_data_collection.rpc_batch_size.unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize,
+            config
+                .raw_data_collection
+                .rpc_batch_size
+                .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize,
         );
         if collector.has_calls() {
             Some(collector)
@@ -1359,7 +1382,13 @@ async fn spawn_live_mode(
     );
     tasks.spawn(async move {
         collector
-            .run(ws_event_rx, live_msg_tx, log_decoder_tx, eth_call_decoder_tx, transform_reorg_tx)
+            .run(
+                ws_event_rx,
+                live_msg_tx,
+                log_decoder_tx,
+                eth_call_decoder_tx,
+                transform_reorg_tx,
+            )
             .await
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
     });
@@ -1375,7 +1404,8 @@ async fn spawn_live_mode(
         db_pool,
         progress_tracker,
         storage_manager,
-    ).with_retry_tx(retry_tx);
+    )
+    .with_retry_tx(retry_tx);
     tasks.spawn(async move {
         compaction.run().await;
         Ok(())

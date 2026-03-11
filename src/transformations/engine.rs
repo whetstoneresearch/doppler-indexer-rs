@@ -19,8 +19,10 @@ use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::traits::EventHandler;
-use crate::db::{DbPool, DbValue, DbOperation, WhereClause};
-use crate::live::{LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, LiveDbValue, StorageError};
+use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
+use crate::live::{
+    LiveDbValue, LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, StorageError,
+};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::Contracts;
 
@@ -194,10 +196,12 @@ impl TransformationEngine {
         expect_eth_call_completion: bool,
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
-        let decoded_logs_dir = PathBuf::from(format!("data/{}/historical/decoded/logs", chain_name));
+        let decoded_logs_dir =
+            PathBuf::from(format!("data/{}/historical/decoded/logs", chain_name));
         let decoded_calls_dir =
             PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain_name));
-        let raw_receipts_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain_name));
+        let raw_receipts_dir =
+            PathBuf::from(format!("data/{}/historical/raw/receipts", chain_name));
 
         Ok(Self {
             registry,
@@ -266,9 +270,7 @@ impl TransformationEngine {
         let pool = self.db_pool.inner();
         let applied: HashSet<String> = {
             let client = pool.get().await?;
-            let rows = client
-                .query("SELECT name FROM _migrations", &[])
-                .await?;
+            let rows = client.query("SELECT name FROM _migrations", &[]).await?;
             rows.iter().map(|r| r.get(0)).collect()
         };
 
@@ -277,10 +279,7 @@ impl TransformationEngine {
 
         for path in &migration_paths {
             if !path.exists() {
-                tracing::warn!(
-                    "Handler migration path does not exist: {}",
-                    path.display()
-                );
+                tracing::warn!("Handler migration path does not exist: {}", path.display());
                 continue;
             }
 
@@ -292,19 +291,13 @@ impl TransformationEngine {
                 // Directory: collect and sort .sql files (flat scan)
                 let mut dir_files: Vec<_> = std::fs::read_dir(path)?
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map(|x| x == "sql")
-                            .unwrap_or(false)
-                    })
+                    .filter(|e| e.path().extension().map(|x| x == "sql").unwrap_or(false))
                     .collect();
                 dir_files.sort_by_key(|e| e.file_name());
 
                 for entry in dir_files {
                     let file_name = entry.file_name().to_string_lossy().to_string();
-                    let migration_name =
-                        format!("{}", path.join(&file_name).display());
+                    let migration_name = format!("{}", path.join(&file_name).display());
                     sql_entries.push((entry.path(), migration_name));
                 }
             }
@@ -399,7 +392,11 @@ impl TransformationEngine {
 
     /// Inject `source` and `source_version` into each DbOperation.
     /// Called after handler.handle() returns ops, before execute_transaction().
-    fn inject_source_version(ops: Vec<DbOperation>, source: &str, version: u32) -> Vec<DbOperation> {
+    fn inject_source_version(
+        ops: Vec<DbOperation>,
+        source: &str,
+        version: u32,
+    ) -> Vec<DbOperation> {
         ops.into_iter()
             .map(|op| match op {
                 DbOperation::Upsert {
@@ -559,7 +556,10 @@ impl TransformationEngine {
     // ─── Range Scanning ──────────────────────────────────────────────
 
     /// Scan decoded parquet files to find available ranges.
-    fn scan_available_ranges(&self, base_dir: &PathBuf) -> Result<Vec<(u64, u64)>, TransformationError> {
+    fn scan_available_ranges(
+        &self,
+        base_dir: &PathBuf,
+    ) -> Result<Vec<(u64, u64)>, TransformationError> {
         let mut ranges = HashSet::new();
 
         if !base_dir.exists() {
@@ -675,14 +675,13 @@ impl TransformationEngine {
             let mut errored = false;
 
             let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-            let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> = JoinSet::new();
+            let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+                JoinSet::new();
 
             for (range_start, range_end) in &to_process {
-                let events = self.read_decoded_events_for_triggers(
-                    *range_start,
-                    *range_end,
-                    &event_triggers,
-                ).await?;
+                let events = self
+                    .read_decoded_events_for_triggers(*range_start, *range_end, &event_triggers)
+                    .await?;
 
                 // Filter events by contract start_block
                 let events = self.filter_events_by_start_block(events);
@@ -707,7 +706,9 @@ impl TransformationEngine {
 
                 // Read call dependencies for this range
                 let calls = if !events.is_empty() && !call_deps.is_empty() {
-                    let calls = self.read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps).await?;
+                    let calls = self
+                        .read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps)
+                        .await?;
                     // Filter calls by contract start_block
                     self.filter_calls_by_start_block(calls)
                 } else {
@@ -735,15 +736,26 @@ impl TransformationEngine {
                     join_set.spawn(async move {
                         let _permit = permit;
                         let ctx = TransformationContext::new(
-                            chain_name, chain_id, rs, re,
-                            Arc::new(events), Arc::new(calls), tx_addresses,
-                            historical, rpc, contracts,
+                            chain_name,
+                            chain_id,
+                            rs,
+                            re,
+                            Arc::new(events),
+                            Arc::new(calls),
+                            tx_addresses,
+                            historical,
+                            rpc,
+                            contracts,
                         );
 
                         match handler.handle(&ctx).await {
                             Ok(ops) => {
                                 if !ops.is_empty() {
-                                    let ops = Self::inject_source_version(ops, handler_name, handler_version);
+                                    let ops = Self::inject_source_version(
+                                        ops,
+                                        handler_name,
+                                        handler_version,
+                                    );
                                     db_pool.execute_transaction(ops).await?;
                                 }
                                 Ok(Some((handler_key, rs, re)))
@@ -858,14 +870,13 @@ impl TransformationEngine {
             let mut errored = false;
 
             let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-            let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> = JoinSet::new();
+            let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+                JoinSet::new();
 
             for (range_start, range_end) in &to_process {
-                let calls = self.read_decoded_calls_for_triggers(
-                    *range_start,
-                    *range_end,
-                    &call_triggers,
-                ).await?;
+                let calls = self
+                    .read_decoded_calls_for_triggers(*range_start, *range_end, &call_triggers)
+                    .await?;
 
                 // Filter calls by contract start_block
                 let calls = self.filter_calls_by_start_block(calls);
@@ -890,15 +901,26 @@ impl TransformationEngine {
                     join_set.spawn(async move {
                         let _permit = permit;
                         let ctx = TransformationContext::new(
-                            chain_name, chain_id, rs, re,
-                            Arc::new(Vec::new()), Arc::new(calls), HashMap::new(),
-                            historical, rpc, contracts,
+                            chain_name,
+                            chain_id,
+                            rs,
+                            re,
+                            Arc::new(Vec::new()),
+                            Arc::new(calls),
+                            HashMap::new(),
+                            historical,
+                            rpc,
+                            contracts,
                         );
 
                         match handler.handle(&ctx).await {
                             Ok(ops) => {
                                 if !ops.is_empty() {
-                                    let ops = Self::inject_source_version(ops, handler_name, handler_version);
+                                    let ops = Self::inject_source_version(
+                                        ops,
+                                        handler_name,
+                                        handler_version,
+                                    );
                                     db_pool.execute_transaction(ops).await?;
                                 }
                                 Ok(Some((handler_key, rs, re)))
@@ -992,7 +1014,11 @@ impl TransformationEngine {
         let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!("Failed to read receipt parquet {}: {}", file_path.display(), e);
+                tracing::warn!(
+                    "Failed to read receipt parquet {}: {}",
+                    file_path.display(),
+                    e
+                );
                 return HashMap::new();
             }
         };
@@ -1000,7 +1026,11 @@ impl TransformationEngine {
         let reader = match builder.build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to build receipt reader {}: {}", file_path.display(), e);
+                tracing::warn!(
+                    "Failed to build receipt reader {}: {}",
+                    file_path.display(),
+                    e
+                );
                 return HashMap::new();
             }
         };
@@ -1011,7 +1041,11 @@ impl TransformationEngine {
             let batch = match batch_result {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!("Failed to read receipt batch from {}: {}", file_path.display(), e);
+                    tracing::warn!(
+                        "Failed to read receipt batch from {}: {}",
+                        file_path.display(),
+                        e
+                    );
                     continue;
                 }
             };
@@ -1040,7 +1074,8 @@ impl TransformationEngine {
             };
 
             // Extract to_address column (nullable)
-            let to_col = batch.column_by_name("to_address")
+            let to_col = batch
+                .column_by_name("to_address")
                 .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>().cloned());
 
             for row in 0..num_rows {
@@ -1062,10 +1097,13 @@ impl TransformationEngine {
                     }
                 });
 
-                addresses.insert(tx_hash, TransactionAddresses {
-                    from_address,
-                    to_address,
-                });
+                addresses.insert(
+                    tx_hash,
+                    TransactionAddresses {
+                        from_address,
+                        to_address,
+                    },
+                );
             }
         }
 
@@ -1135,9 +1173,11 @@ impl TransformationEngine {
             match result {
                 Ok(Ok(events)) => all_events.extend(events),
                 Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(TransformationError::IoError(
-                    std::io::Error::other(e.to_string()),
-                )),
+                Err(e) => {
+                    return Err(TransformationError::IoError(std::io::Error::other(
+                        e.to_string(),
+                    )))
+                }
             }
         }
 
@@ -1175,11 +1215,7 @@ impl TransformationEngine {
                 tracing::debug!("Reading decoded calls from {}", file_path.display());
                 match reader.read_calls_from_file(&file_path, &src, &func) {
                     Ok(calls) => {
-                        tracing::debug!(
-                            "Read {} calls from {}",
-                            calls.len(),
-                            file_path.display()
-                        );
+                        tracing::debug!("Read {} calls from {}", calls.len(), file_path.display());
                         Ok(calls)
                     }
                     Err(e) => {
@@ -1199,9 +1235,11 @@ impl TransformationEngine {
             match result {
                 Ok(Ok(calls)) => all_calls.extend(calls),
                 Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(TransformationError::IoError(
-                    std::io::Error::other(e.to_string()),
-                )),
+                Err(e) => {
+                    return Err(TransformationError::IoError(std::io::Error::other(
+                        e.to_string(),
+                    )))
+                }
             }
         }
 
@@ -1229,9 +1267,13 @@ impl TransformationEngine {
     ) -> Result<(), TransformationError> {
         // Wait for decode catchup to finish so all decoded parquet files exist
         if let Some(rx) = decode_catchup_done_rx {
-            tracing::info!("Waiting for eth_call decode catchup to complete before transformation catchup...");
+            tracing::info!(
+                "Waiting for eth_call decode catchup to complete before transformation catchup..."
+            );
             let _ = rx.await;
-            tracing::info!("Eth_call decode catchup complete, proceeding with transformation catchup");
+            tracing::info!(
+                "Eth_call decode catchup complete, proceeding with transformation catchup"
+            );
         }
 
         // Run catchup first
@@ -1299,16 +1341,23 @@ impl TransformationEngine {
         &self,
         msg: DecodedEventsMessage,
     ) -> Result<(), TransformationError> {
-        let handlers = self.registry.handlers_for_event(&msg.source_name, &msg.event_name);
+        let handlers = self
+            .registry
+            .handlers_for_event(&msg.source_name, &msg.event_name);
         if handlers.is_empty() {
             tracing::debug!(
                 "No handlers registered for {}/{}",
-                msg.source_name, msg.event_name
+                msg.source_name,
+                msg.event_name
             );
         } else {
             tracing::debug!(
                 "Processing {} events for {}/{} block {} with {} handlers",
-                msg.events.len(), msg.source_name, msg.event_name, msg.range_start, handlers.len()
+                msg.events.len(),
+                msg.source_name,
+                msg.event_name,
+                msg.range_start,
+                handlers.len()
             );
         }
 
@@ -1329,14 +1378,19 @@ impl TransformationEngine {
                     ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
                 } else {
                     let deps_ready = call_deps.iter().all(|dep| {
-                        state.received_calls
+                        state
+                            .received_calls
                             .get(dep)
                             .map(|ranges| ranges.contains(&range_key))
                             .unwrap_or(false)
                     });
 
                     if deps_ready {
-                        let calls = state.calls_buffer.get(&range_key).cloned().unwrap_or_default();
+                        let calls = state
+                            .calls_buffer
+                            .get(&range_key)
+                            .cloned()
+                            .unwrap_or_default();
                         // Filter calls by contract start_block (inline to avoid borrowing self inside lock)
                         let calls: Vec<_> = calls
                             .into_iter()
@@ -1350,13 +1404,17 @@ impl TransformationEngine {
                             .collect();
                         tracing::debug!(
                             "Handler {} deps ready for block {}, {} calls",
-                            handler_key, msg.range_start, calls.len()
+                            handler_key,
+                            msg.range_start,
+                            calls.len()
                         );
                         ready_handlers.push((handler.clone(), Arc::new(calls)));
                     } else {
                         tracing::warn!(
                             "Handler {} buffering block {}: waiting for eth_call deps {:?}",
-                            handler_key, msg.range_start, call_deps
+                            handler_key,
+                            msg.range_start,
+                            call_deps
                         );
                         let pending = PendingEventData {
                             range_start: msg.range_start,
@@ -1384,7 +1442,8 @@ impl TransformationEngine {
 
         // Run ready handlers concurrently
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+            JoinSet::new();
         let tx_addresses = self.read_receipt_addresses(msg.range_start, msg.range_end);
         let tx_addresses = Arc::new(tx_addresses);
 
@@ -1410,20 +1469,30 @@ impl TransformationEngine {
                 let _permit = permit;
                 // Each handler gets its own context (shared events, handler-specific calls)
                 let ctx = TransformationContext::new(
-                    chain_name, chain_id, range_start, range_end,
-                    events, calls,
+                    chain_name,
+                    chain_id,
+                    range_start,
+                    range_end,
+                    events,
+                    calls,
                     Arc::try_unwrap(tx_addrs).unwrap_or_else(|arc| (*arc).clone()),
-                    historical, rpc, contracts,
+                    historical,
+                    rpc,
+                    contracts,
                 );
 
                 match handler.handle(&ctx).await {
                     Ok(ops) => {
                         if !ops.is_empty() {
-                            let ops = Self::inject_source_version(ops, handler_name, handler_version);
+                            let ops =
+                                Self::inject_source_version(ops, handler_name, handler_version);
                             if let Err(e) = db_pool.execute_transaction(ops).await {
                                 tracing::error!(
                                     "Handler {} transaction failed for range {}-{}: {:?}",
-                                    handler_key, range_start, range_end, e
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                    e
                                 );
                                 return Ok(None);
                             }
@@ -1433,7 +1502,10 @@ impl TransformationEngine {
                     Err(e) => {
                         tracing::error!(
                             "Handler {} failed for event {}/{}: {}",
-                            handler_key, source_name, event_name, e
+                            handler_key,
+                            source_name,
+                            event_name,
+                            e
                         );
                         Ok(None)
                     }
@@ -1445,7 +1517,8 @@ impl TransformationEngine {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(Some((handler_key, rs, re)))) => {
-                    self.record_completed_range_for_handler(&handler_key, rs, re).await?;
+                    self.record_completed_range_for_handler(&handler_key, rs, re)
+                        .await?;
 
                     // Mark live progress for single-block ranges (live mode)
                     if re - rs == 1 {
@@ -1454,7 +1527,9 @@ impl TransformationEngine {
                             if let Err(e) = t.mark_complete(rs, &handler_key).await {
                                 tracing::warn!(
                                     "Failed to mark live progress for block {} handler {}: {}",
-                                    rs, handler_key, e
+                                    rs,
+                                    handler_key,
+                                    e
                                 );
                             }
                         }
@@ -1483,17 +1558,22 @@ impl TransformationEngine {
 
         tracing::debug!(
             "Received {} eth_calls for {}/{} block {}",
-            msg.calls.len(), msg.source_name, msg.function_name, msg.range_start
+            msg.calls.len(),
+            msg.source_name,
+            msg.function_name,
+            msg.range_start
         );
 
         // Mark this call type as received for this range and buffer the calls
         {
             let mut state = self.live_state.lock().await;
-            state.received_calls
+            state
+                .received_calls
                 .entry(call_key.clone())
                 .or_default()
                 .insert(range_key);
-            state.calls_buffer
+            state
+                .calls_buffer
                 .entry(range_key)
                 .or_default()
                 .extend(msg.calls.clone());
@@ -1501,12 +1581,8 @@ impl TransformationEngine {
 
         // Process call handlers (existing behavior) - filter calls by start_block
         let filtered_calls = self.filter_calls_by_start_block(msg.calls);
-        self.process_range(
-            msg.range_start,
-            msg.range_end,
-            Vec::new(),
-            filtered_calls,
-        ).await?;
+        self.process_range(msg.range_start, msg.range_end, Vec::new(), filtered_calls)
+            .await?;
 
         // Check if any pending events can now be processed
         self.try_process_pending_events(range_key).await?;
@@ -1540,7 +1616,8 @@ impl TransformationEngine {
                         })
                         .filter(|(_, event_data)| {
                             event_data.required_calls.iter().all(|dep| {
-                                state.received_calls
+                                state
+                                    .received_calls
                                     .get(dep)
                                     .map(|ranges| ranges.contains(&range_key))
                                     .unwrap_or(false)
@@ -1554,25 +1631,33 @@ impl TransformationEngine {
                 if !ready_indices.is_empty() {
                     tracing::info!(
                         "Handler {} unblocked for block {}: call deps now available",
-                        handler_key, range_key.0
+                        handler_key,
+                        range_key.0
                     );
                     let pending = state.pending_events.get_mut(&handler_key).unwrap();
                     // Extract in reverse order to preserve indices
                     for i in ready_indices.into_iter().rev() {
                         let event_data = pending.remove(i);
                         // Find the handler
-                        let handlers = self.registry.handlers_for_event(
-                            &event_data.source_name,
-                            &event_data.event_name,
-                        );
-                        if let Some(handler) = handlers.into_iter().find(|h| h.handler_key() == handler_key) {
+                        let handlers = self
+                            .registry
+                            .handlers_for_event(&event_data.source_name, &event_data.event_name);
+                        if let Some(handler) = handlers
+                            .into_iter()
+                            .find(|h| h.handler_key() == handler_key)
+                        {
                             ready.push((handler_key.clone(), event_data, handler));
                         }
                     }
                 }
 
                 // Clean up empty entries
-                if state.pending_events.get(&handler_key).map(|p| p.is_empty()).unwrap_or(true) {
+                if state
+                    .pending_events
+                    .get(&handler_key)
+                    .map(|p| p.is_empty())
+                    .unwrap_or(true)
+                {
                     state.pending_events.remove(&handler_key);
                 }
             }
@@ -1587,13 +1672,18 @@ impl TransformationEngine {
         // Fetch calls once for this range and filter by start_block
         let calls = {
             let state = self.live_state.lock().await;
-            let calls = state.calls_buffer.get(&range_key).cloned().unwrap_or_default();
+            let calls = state
+                .calls_buffer
+                .get(&range_key)
+                .cloned()
+                .unwrap_or_default();
             Arc::new(self.filter_calls_by_start_block(calls))
         };
 
         // Process ready events concurrently
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+            JoinSet::new();
 
         for (handler_key, event_data, handler) in ready_events {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -1606,13 +1696,16 @@ impl TransformationEngine {
             let contracts = self.contracts.clone();
             let handler_name = handler.name();
             let handler_version = handler.version();
-            let tx_addresses = self.read_receipt_addresses(event_data.range_start, event_data.range_end);
+            let tx_addresses =
+                self.read_receipt_addresses(event_data.range_start, event_data.range_end);
 
             join_set.spawn(async move {
                 let _permit = permit;
                 tracing::debug!(
                     "Handler {} processing previously buffered events for range {}-{}",
-                    handler_key, event_data.range_start, event_data.range_end
+                    handler_key,
+                    event_data.range_start,
+                    event_data.range_end
                 );
 
                 let source_name = event_data.source_name.clone();
@@ -1621,20 +1714,32 @@ impl TransformationEngine {
                 let re = event_data.range_end;
 
                 let ctx = TransformationContext::new(
-                    chain_name, chain_id, rs, re,
+                    chain_name,
+                    chain_id,
+                    rs,
+                    re,
                     Arc::new(event_data.events),
-                    Arc::try_unwrap(calls).unwrap_or_else(|arc| (*arc).clone()).into(),
-                    tx_addresses, historical, rpc, contracts,
+                    Arc::try_unwrap(calls)
+                        .unwrap_or_else(|arc| (*arc).clone())
+                        .into(),
+                    tx_addresses,
+                    historical,
+                    rpc,
+                    contracts,
                 );
 
                 match handler.handle(&ctx).await {
                     Ok(ops) => {
                         if !ops.is_empty() {
-                            let ops = Self::inject_source_version(ops, handler_name, handler_version);
+                            let ops =
+                                Self::inject_source_version(ops, handler_name, handler_version);
                             if let Err(e) = db_pool.execute_transaction(ops).await {
                                 tracing::error!(
                                     "Handler {} transaction failed for range {}-{}: {:?}",
-                                    handler_key, rs, re, e
+                                    handler_key,
+                                    rs,
+                                    re,
+                                    e
                                 );
                                 return Ok(None);
                             }
@@ -1644,7 +1749,10 @@ impl TransformationEngine {
                     Err(e) => {
                         tracing::error!(
                             "Handler {} failed for buffered event {}/{}: {}",
-                            handler_key, source_name, event_name, e
+                            handler_key,
+                            source_name,
+                            event_name,
+                            e
                         );
                         Ok(None)
                     }
@@ -1656,7 +1764,8 @@ impl TransformationEngine {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(Some((handler_key, rs, re)))) => {
-                    self.record_completed_range_for_handler(&handler_key, rs, re).await?;
+                    self.record_completed_range_for_handler(&handler_key, rs, re)
+                        .await?;
 
                     // Mark live progress for single-block ranges (live mode)
                     if re - rs == 1 {
@@ -1665,7 +1774,9 @@ impl TransformationEngine {
                             if let Err(e) = t.mark_complete(rs, &handler_key).await {
                                 tracing::warn!(
                                     "Failed to mark live progress for block {} handler {}: {}",
-                                    rs, handler_key, e
+                                    rs,
+                                    handler_key,
+                                    e
                                 );
                             }
                         }
@@ -1694,7 +1805,11 @@ impl TransformationEngine {
         let range_key = (msg.range_start, msg.range_end);
         {
             let mut state = self.live_state.lock().await;
-            state.completion.entry(range_key).or_default().mark(msg.kind);
+            state
+                .completion
+                .entry(range_key)
+                .or_default()
+                .mark(msg.kind);
         }
 
         self.maybe_finalize_range(range_key).await?;
@@ -1774,7 +1889,8 @@ impl TransformationEngine {
                     if matches {
                         tracing::debug!(
                             "Removing pending event for handler {} at orphaned range {:?}",
-                            handler_key, range_key
+                            handler_key,
+                            range_key
                         );
                     }
                     !matches
@@ -1823,9 +1939,15 @@ impl TransformationEngine {
                         match snapshot.previous_row {
                             Some(previous) => {
                                 // Row existed before - restore via upsert
-                                let columns: Vec<String> = previous.iter().map(|(k, _)| k.clone()).collect();
-                                let values: Vec<DbValue> = previous.iter().map(|(_, v)| v.to_db_value()).collect();
-                                let conflict_cols: Vec<String> = snapshot.key_columns.iter().map(|(k, _)| k.clone()).collect();
+                                let columns: Vec<String> =
+                                    previous.iter().map(|(k, _)| k.clone()).collect();
+                                let values: Vec<DbValue> =
+                                    previous.iter().map(|(_, v)| v.to_db_value()).collect();
+                                let conflict_cols: Vec<String> = snapshot
+                                    .key_columns
+                                    .iter()
+                                    .map(|(k, _)| k.clone())
+                                    .collect();
 
                                 // Update all non-key columns
                                 let update_cols: Vec<String> = columns
@@ -1868,7 +1990,8 @@ impl TransformationEngine {
                 Err(e) => {
                     tracing::warn!(
                         "Failed to read snapshots for block {}: {}, using fallback delete",
-                        block_number, e
+                        block_number,
+                        e
                     );
                 }
             }
@@ -1922,7 +2045,11 @@ impl TransformationEngine {
         // Delete snapshot files for orphaned blocks
         for &block_number in orphaned {
             if let Err(e) = storage.delete_snapshots(block_number) {
-                tracing::warn!("Failed to delete snapshots for block {}: {}", block_number, e);
+                tracing::warn!(
+                    "Failed to delete snapshots for block {}: {}",
+                    block_number,
+                    e
+                );
             }
         }
 
@@ -2058,7 +2185,9 @@ impl TransformationEngine {
                     if let Err(e) = t.mark_complete(range_start, &handler_key).await {
                         tracing::warn!(
                             "Failed to mark live progress for block {} handler {}: {}",
-                            range_start, handler_key, e
+                            range_start,
+                            handler_key,
+                            e
                         );
                     }
                 }
@@ -2091,7 +2220,8 @@ impl TransformationEngine {
                     if let Err(e) = storage.write_status(range_start, &status) {
                         tracing::warn!(
                             "Failed to set transformed=true for block {}: {}",
-                            range_start, e
+                            range_start,
+                            e
                         );
                     }
                 }
@@ -2102,10 +2232,7 @@ impl TransformationEngine {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to read status for block {}: {}",
-                        range_start, e
-                    );
+                    tracing::warn!("Failed to read status for block {}: {}", range_start, e);
                 }
             }
         }
@@ -2201,7 +2328,8 @@ impl TransformationEngine {
         ));
 
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+            JoinSet::new();
 
         // Spawn event handlers concurrently
         // For live mode (single-block ranges), we capture snapshots for rollback
@@ -2224,7 +2352,9 @@ impl TransformationEngine {
                     let _permit = permit;
                     tracing::debug!(
                         "Invoking handler {} for event {}/{}",
-                        handler_key, source, event_name
+                        handler_key,
+                        source,
+                        event_name
                     );
 
                     match handler.handle(&ctx).await {
@@ -2232,9 +2362,11 @@ impl TransformationEngine {
                             if !ops.is_empty() {
                                 tracing::debug!(
                                     "Handler {} produced {} operations",
-                                    handler_key, ops.len()
+                                    handler_key,
+                                    ops.len()
                                 );
-                                let ops = Self::inject_source_version(ops, handler_name, handler_version);
+                                let ops =
+                                    Self::inject_source_version(ops, handler_name, handler_version);
 
                                 // Use snapshot-capturing execution for live mode
                                 let storage = if is_live_mode {
@@ -2250,12 +2382,16 @@ impl TransformationEngine {
                                     range_start,
                                     handler_name,
                                     handler_version,
-                                ).await;
+                                )
+                                .await;
 
                                 if let Err(e) = result {
                                     tracing::error!(
                                         "Handler {} transaction failed for range {}-{}: {:?}",
-                                        handler_key, range_start, range_end, e
+                                        handler_key,
+                                        range_start,
+                                        range_end,
+                                        e
                                     );
                                     return Ok(None);
                                 }
@@ -2265,7 +2401,10 @@ impl TransformationEngine {
                         Err(e) => {
                             tracing::error!(
                                 "Handler {} failed for event {}/{}: {}",
-                                handler_key, source, event_name, e
+                                handler_key,
+                                source,
+                                event_name,
+                                e
                             );
                             Ok(None)
                         }
@@ -2291,7 +2430,9 @@ impl TransformationEngine {
                     let _permit = permit;
                     tracing::trace!(
                         "Invoking handler {} for call {}/{}",
-                        handler_key, source, function_name
+                        handler_key,
+                        source,
+                        function_name
                     );
 
                     match handler.handle(&ctx).await {
@@ -2299,9 +2440,11 @@ impl TransformationEngine {
                             if !ops.is_empty() {
                                 tracing::trace!(
                                     "Handler {} produced {} operations",
-                                    handler_key, ops.len()
+                                    handler_key,
+                                    ops.len()
                                 );
-                                let ops = Self::inject_source_version(ops, handler_name, handler_version);
+                                let ops =
+                                    Self::inject_source_version(ops, handler_name, handler_version);
 
                                 // Use snapshot-capturing execution for live mode
                                 let storage = if is_live_mode {
@@ -2317,12 +2460,16 @@ impl TransformationEngine {
                                     range_start,
                                     handler_name,
                                     handler_version,
-                                ).await;
+                                )
+                                .await;
 
                                 if let Err(e) = result {
                                     tracing::error!(
                                         "Handler {} transaction failed for range {}-{}: {:?}",
-                                        handler_key, range_start, range_end, e
+                                        handler_key,
+                                        range_start,
+                                        range_end,
+                                        e
                                     );
                                     return Ok(None);
                                 }
@@ -2332,7 +2479,10 @@ impl TransformationEngine {
                         Err(e) => {
                             tracing::error!(
                                 "Handler {} failed for call {}/{}: {}",
-                                handler_key, source, function_name, e
+                                handler_key,
+                                source,
+                                function_name,
+                                e
                             );
                             Ok(None)
                         }
@@ -2345,7 +2495,8 @@ impl TransformationEngine {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(Some((handler_key, rs, re)))) => {
-                    self.record_completed_range_for_handler(&handler_key, rs, re).await?;
+                    self.record_completed_range_for_handler(&handler_key, rs, re)
+                        .await?;
 
                     // Mark live progress for single-block ranges (live mode)
                     if re - rs == 1 {
@@ -2354,7 +2505,9 @@ impl TransformationEngine {
                             if let Err(e) = t.mark_complete(rs, &handler_key).await {
                                 tracing::warn!(
                                     "Failed to mark live progress for block {} handler {}: {}",
-                                    rs, handler_key, e
+                                    rs,
+                                    handler_key,
+                                    e
                                 );
                             }
                         }
@@ -2524,7 +2677,8 @@ async fn execute_with_snapshot_capture(
         if let Err(e) = storage.write_snapshots(block_number, &all_snapshots) {
             tracing::warn!(
                 "Failed to write upsert snapshots for block {}: {}",
-                block_number, e
+                block_number,
+                e
             );
             // Continue with transaction even if snapshot write fails - fallback DELETE still works
         }

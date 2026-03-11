@@ -24,10 +24,7 @@ pub fn insert_token(
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "tokens".to_string(),
-        conflict_columns: vec![
-            "chain_id".to_string(),
-            "address".to_string(),
-        ],
+        conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
         update_columns: vec![],
         columns: vec![
             "chain_id".to_string(),
@@ -47,7 +44,7 @@ pub fn insert_token(
             "is_creator_coin".to_string(),
             "is_content_coin".to_string(),
             "creator_coin_pool".to_string(),
-            "governance".to_string()
+            "governance".to_string(),
         ],
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
@@ -56,11 +53,11 @@ pub fn insert_token(
             DbValue::Timestamp(block_timestamp as i64),
             match creator_address {
                 Some(creator) => DbValue::Address(*creator),
-                None => DbValue::Null
+                None => DbValue::Null,
             },
             match integrator {
                 Some(int_addr) => DbValue::Address(*int_addr),
-                None => DbValue::Null
+                None => DbValue::Null,
             },
             DbValue::Address(*token_address),
             match pool {
@@ -88,8 +85,8 @@ pub fn insert_token(
             },
             match governance {
                 Some(gov_addr) => DbValue::Address(*gov_addr),
-                None => DbValue::Null
+                None => DbValue::Null,
             },
-        ]
+        ],
     }
 }

@@ -23,7 +23,6 @@ pub use eth_calls::LiveEthCallCollector;
 pub use progress::LiveProgressTracker;
 pub use storage::{LiveStorage, StorageError};
 pub use types::{
-    LiveDecodedCall, LiveDecodedEventCall,
-    LiveDecodedLog, LiveDecodedOnceCall, LiveDecodedValue,
-    LiveMessage, LiveModeConfig, LiveDbValue, LiveUpsertSnapshot,
+    LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog, LiveDecodedOnceCall,
+    LiveDecodedValue, LiveMessage, LiveModeConfig, LiveUpsertSnapshot,
 };

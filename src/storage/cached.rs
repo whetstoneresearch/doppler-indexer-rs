@@ -432,7 +432,9 @@ mod tests {
             eviction_threshold: 0.8,
         };
 
-        CachedBackend::new(local, s3, config, temp_dir.to_path_buf(), None).await.unwrap()
+        CachedBackend::new(local, s3, config, temp_dir.to_path_buf(), None)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -454,7 +456,11 @@ mod tests {
         let backend = create_test_backend(temp_dir.path()).await;
 
         // Write to local only
-        backend.local.write("local/file.txt", b"local data").await.unwrap();
+        backend
+            .local
+            .write("local/file.txt", b"local data")
+            .await
+            .unwrap();
 
         // Should read from local (even though not in S3)
         let data = backend.read("local/file.txt").await.unwrap();

@@ -4,7 +4,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryAddressData;
-use crate::raw_data::historical::logs::{process_completed_range, LogCollectionError, LogsCatchupState};
+use crate::raw_data::historical::logs::{
+    process_completed_range, LogCollectionError, LogsCatchupState,
+};
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::types::config::chain::ChainConfig;
 

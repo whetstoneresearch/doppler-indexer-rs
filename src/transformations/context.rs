@@ -231,11 +231,9 @@ pub trait FieldExtractor {
 
     /// Get a field by name, returning an error with context if missing.
     fn get_field(&self, name: &str) -> Result<&DecodedValue, TransformationError> {
-        self.field_values()
-            .get(name)
-            .ok_or_else(|| TransformationError::MissingField(format!(
-                "{} in {}", name, self.context_info()
-            )))
+        self.field_values().get(name).ok_or_else(|| {
+            TransformationError::MissingField(format!("{} in {}", name, self.context_info()))
+        })
     }
 
     /// Try to get a field by name.
@@ -245,110 +243,134 @@ pub trait FieldExtractor {
 
     /// Extract an address field with a descriptive error on failure.
     fn extract_address(&self, name: &str) -> Result<[u8; 20], TransformationError> {
-        self.get_field(name)?
-            .as_address()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not an address in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_address().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not an address in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a U256 field with a descriptive error on failure.
     fn extract_uint256(&self, name: &str) -> Result<U256, TransformationError> {
-        self.get_field(name)?
-            .as_uint256()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a uint256 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_uint256().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not a uint256 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract an I256 field with a descriptive error on failure.
     fn extract_int256(&self, name: &str) -> Result<I256, TransformationError> {
-        self.get_field(name)?
-            .as_int256()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not an int256 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_int256().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not an int256 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a u64 field with a descriptive error on failure.
     fn extract_u64(&self, name: &str) -> Result<u64, TransformationError> {
-        self.get_field(name)?
-            .as_u64()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a u64 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_u64().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not a u64 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract an i64 field with a descriptive error on failure.
     fn extract_i64(&self, name: &str) -> Result<i64, TransformationError> {
-        self.get_field(name)?
-            .as_i64()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not an i64 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_i64().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not an i64 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a u32 field with a descriptive error on failure.
     fn extract_u32(&self, name: &str) -> Result<u32, TransformationError> {
-        self.get_field(name)?
-            .as_u32()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a u32 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_u32().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not a u32 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract an i32 field with a descriptive error on failure.
     fn extract_i32(&self, name: &str) -> Result<i32, TransformationError> {
-        self.get_field(name)?
-            .as_i32()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not an i32 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_i32().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not an i32 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a u8 field with a descriptive error on failure.
     fn extract_u8(&self, name: &str) -> Result<u8, TransformationError> {
-        self.get_field(name)?
-            .as_u8()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a u8 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_u8().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not a u8 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a bool field with a descriptive error on failure.
     fn extract_bool(&self, name: &str) -> Result<bool, TransformationError> {
-        self.get_field(name)?
-            .as_bool()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a bool in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_bool().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not a bool in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a string field with a descriptive error on failure.
     fn extract_string(&self, name: &str) -> Result<&str, TransformationError> {
-        self.get_field(name)?
-            .as_string()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a string in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_string().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not a string in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a bytes32 field with a descriptive error on failure.
     fn extract_bytes32(&self, name: &str) -> Result<[u8; 32], TransformationError> {
-        self.get_field(name)?
-            .as_bytes32()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not bytes32 in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_bytes32().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not bytes32 in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a bytes field with a descriptive error on failure.
     fn extract_bytes(&self, name: &str) -> Result<&[u8], TransformationError> {
-        self.get_field(name)?
-            .as_bytes()
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not bytes in {}", name, self.context_info()
-            )))
+        self.get_field(name)?.as_bytes().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not bytes in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a u64 field with flexible parsing (handles i64, u64, or numeric strings).
@@ -358,9 +380,13 @@ pub trait FieldExtractor {
         val.as_u64()
             .or_else(|| val.as_i64().and_then(|v| u64::try_from(v).ok()))
             .or_else(|| val.as_string().and_then(|s| s.parse().ok()))
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a u64 or numeric string in {}", name, self.context_info()
-            )))
+            .ok_or_else(|| {
+                TransformationError::TypeConversion(format!(
+                    "'{}' is not a u64 or numeric string in {}",
+                    name,
+                    self.context_info()
+                ))
+            })
     }
 
     /// Extract an i32 field with flexible parsing (handles i32, u32, or numeric strings).
@@ -370,9 +396,13 @@ pub trait FieldExtractor {
         val.as_i32()
             .or_else(|| val.as_u32().and_then(|v| i32::try_from(v).ok()))
             .or_else(|| val.as_string().and_then(|s| s.parse().ok()))
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not an i32 or numeric string in {}", name, self.context_info()
-            )))
+            .ok_or_else(|| {
+                TransformationError::TypeConversion(format!(
+                    "'{}' is not an i32 or numeric string in {}",
+                    name,
+                    self.context_info()
+                ))
+            })
     }
 
     /// Extract a u32 field with flexible parsing (handles u32, i32, or numeric strings).
@@ -382,9 +412,13 @@ pub trait FieldExtractor {
         val.as_u32()
             .or_else(|| val.as_i32().and_then(|v| u32::try_from(v).ok()))
             .or_else(|| val.as_string().and_then(|s| s.parse().ok()))
-            .ok_or_else(|| TransformationError::TypeConversion(format!(
-                "'{}' is not a u32 or numeric string in {}", name, self.context_info()
-            )))
+            .ok_or_else(|| {
+                TransformationError::TypeConversion(format!(
+                    "'{}' is not a u32 or numeric string in {}",
+                    name,
+                    self.context_info()
+                ))
+            })
     }
 }
 
@@ -624,7 +658,10 @@ impl TransformationContext {
 
     /// Get all events for a specific contract address in the current range.
     /// Filters out events before the contract's start_block if configured.
-    pub fn events_for_address(&self, address: [u8; 20]) -> impl Iterator<Item = &DecodedEvent> + '_ {
+    pub fn events_for_address(
+        &self,
+        address: [u8; 20],
+    ) -> impl Iterator<Item = &DecodedEvent> + '_ {
         self.events.iter().filter(move |e| {
             if e.contract_address != address {
                 return false;
@@ -692,7 +729,11 @@ impl TransformationContext {
 
     /// Check if an address matches any of the specified contract names.
     /// Returns the first matching contract name from the provided list.
-    pub fn match_contract_address(&self, address: [u8; 20], contract_names: &[&'static str]) -> Option<&'static str> {
+    pub fn match_contract_address(
+        &self,
+        address: [u8; 20],
+        contract_names: &[&'static str],
+    ) -> Option<&'static str> {
         let addr = Address::from(address);
         for contract_name in contract_names {
             if let Some(config) = self.contracts.get(*contract_name) {
@@ -717,7 +758,9 @@ impl TransformationContext {
 
     /// Look up the to_address for a transaction by its hash.
     pub fn tx_to(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
-        self.tx_addresses.get(tx_hash).and_then(|a| a.to_address.as_ref())
+        self.tx_addresses
+            .get(tx_hash)
+            .and_then(|a| a.to_address.as_ref())
     }
 
     // ===== Historical Data Access =====
@@ -870,14 +913,20 @@ fn parse_function_signature(sig: &str) -> Result<([u8; 4], DynSolType), Transfor
 
     // Parse output type
     let output_type = DynSolType::parse(&format!("({})", output_sig)).map_err(|e| {
-        TransformationError::DecodeError(format!("Failed to parse output type '{}': {}", output_sig, e))
+        TransformationError::DecodeError(format!(
+            "Failed to parse output type '{}': {}",
+            output_sig, e
+        ))
     })?;
 
     Ok((selector, output_type))
 }
 
 /// Encode calldata for an eth_call.
-fn encode_calldata(selector: &[u8; 4], params: &[DynSolValue]) -> Result<Vec<u8>, TransformationError> {
+fn encode_calldata(
+    selector: &[u8; 4],
+    params: &[DynSolValue],
+) -> Result<Vec<u8>, TransformationError> {
     let mut calldata = selector.to_vec();
 
     if !params.is_empty() {
@@ -990,7 +1039,10 @@ mod tests {
 
         // Test with string
         let mut params = HashMap::new();
-        params.insert("timestamp".to_string(), DecodedValue::String("1234567890".to_string()));
+        params.insert(
+            "timestamp".to_string(),
+            DecodedValue::String("1234567890".to_string()),
+        );
         let event = make_test_event(params);
         assert_eq!(event.extract_u64_flexible("timestamp").unwrap(), 1234567890);
     }
@@ -1011,7 +1063,10 @@ mod tests {
 
         // Test with string
         let mut params = HashMap::new();
-        params.insert("tick".to_string(), DecodedValue::String("-12345".to_string()));
+        params.insert(
+            "tick".to_string(),
+            DecodedValue::String("-12345".to_string()),
+        );
         let event = make_test_event(params);
         assert_eq!(event.extract_i32_flexible("tick").unwrap(), -12345);
     }
@@ -1061,7 +1116,10 @@ mod tests {
     #[test]
     fn test_decoded_call_implements_field_extractor() {
         let mut result = HashMap::new();
-        result.insert("poolKey.currency0".to_string(), DecodedValue::Address([10u8; 20]));
+        result.insert(
+            "poolKey.currency0".to_string(),
+            DecodedValue::Address([10u8; 20]),
+        );
         result.insert("poolKey.fee".to_string(), DecodedValue::Uint32(3000));
         let call = make_test_call(result);
 

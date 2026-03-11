@@ -6,16 +6,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array};
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use arrow::record_batch::RecordBatch;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::eth_calls::{
-    CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig, process_event_calls,
-    process_once_calls, process_regular_calls,
+    process_event_calls, process_once_calls, process_regular_calls, CallDecodeConfig,
+    EthCallDecodingError, EventCallDecodeConfig,
 };
 use crate::decoding::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::DecodedCallsMessage;
@@ -96,8 +96,7 @@ pub async fn catchup_decode_eth_calls(
         raw_column_indexes.insert(contract_name.clone(), raw_index);
 
         let decoded_once_dir = output_base.join(contract_name).join("once");
-        let decoded_index =
-            load_or_build_decoded_column_index(&decoded_once_dir, &raw_once_dir);
+        let decoded_index = load_or_build_decoded_column_index(&decoded_once_dir, &raw_once_dir);
         decoded_column_indexes.insert(contract_name.clone(), decoded_index);
     }
 
@@ -308,18 +307,23 @@ pub async fn catchup_decode_eth_calls(
                                             continue;
                                         }
 
-                                        let file_name =
-                                            file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                        let file_name = file_path
+                                            .file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("");
 
                                         // Check if already decoded
-                                        let rel_path =
-                                            format!("{}/{}/on_events/{}", contract_name, function_name, file_name);
+                                        let rel_path = format!(
+                                            "{}/{}/on_events/{}",
+                                            contract_name, function_name, file_name
+                                        );
                                         if existing_decoded.contains(&rel_path) {
                                             continue;
                                         }
 
                                         // Parse range from filename
-                                        let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
+                                        let range_str =
+                                            file_name.strip_suffix(".parquet").unwrap_or("");
                                         let parts: Vec<&str> = range_str.split('-').collect();
                                         if parts.len() != 2 {
                                             continue;
@@ -506,7 +510,9 @@ fn scan_existing_decoded_files(output_base: &Path) -> HashSet<String> {
 }
 
 /// Read regular call results from parquet
-pub fn read_regular_calls_from_parquet(path: &Path) -> Result<Vec<EthCallResult>, EthCallDecodingError> {
+pub fn read_regular_calls_from_parquet(
+    path: &Path,
+) -> Result<Vec<EthCallResult>, EthCallDecodingError> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let reader = builder.build()?;
@@ -585,7 +591,9 @@ pub fn read_regular_calls_from_parquet(path: &Path) -> Result<Vec<EthCallResult>
 }
 
 /// Read event-triggered call results from parquet
-pub fn read_event_calls_from_parquet(path: &Path) -> Result<Vec<EventCallResult>, EthCallDecodingError> {
+pub fn read_event_calls_from_parquet(
+    path: &Path,
+) -> Result<Vec<EventCallResult>, EthCallDecodingError> {
     use arrow::array::UInt32Array;
 
     let file = File::open(path)?;
@@ -694,7 +702,8 @@ pub fn read_once_calls_from_parquet(
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema.index_of("address")
+        let address_idx = schema
+            .index_of("address")
             .or_else(|_| schema.index_of("address"))
             .ok();
 
@@ -752,8 +761,7 @@ pub fn read_once_calls_from_parquet(
                 if let Some(idx) = idx_opt {
                     if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<BinaryArray>() {
                         if !arr.is_null(row) {
-                            function_results
-                                .insert(function_name.clone(), arr.value(row).to_vec());
+                            function_results.insert(function_name.clone(), arr.value(row).to_vec());
                         }
                     }
                 }
@@ -1024,10 +1032,8 @@ pub fn load_or_build_decoded_column_index(
                         file_name,
                         fillable
                     );
-                    let filtered: Vec<String> = cols
-                        .into_iter()
-                        .filter(|c| !fillable.contains(c))
-                        .collect();
+                    let filtered: Vec<String> =
+                        cols.into_iter().filter(|c| !fillable.contains(c)).collect();
                     if !filtered.is_empty() {
                         index.insert(file_name, filtered);
                     }
@@ -1078,10 +1084,9 @@ pub fn read_decoded_parquet_function_names(path: &Path) -> HashSet<String> {
     let mut fn_names = HashSet::new();
 
     // Standard columns to skip
-    let skip_columns: HashSet<&str> =
-        ["block_number", "block_timestamp", "address", "address"]
-            .into_iter()
-            .collect();
+    let skip_columns: HashSet<&str> = ["block_number", "block_timestamp", "address", "address"]
+        .into_iter()
+        .collect();
 
     for field in schema.columns() {
         let name = field.name();

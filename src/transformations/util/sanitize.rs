@@ -23,5 +23,5 @@ pub fn is_precompile_address(addr: Address) -> bool {
 
     let is_precompile: bool = precompile_addresses.contains(&addr);
 
-    return is_precompile
+    return is_precompile;
 }

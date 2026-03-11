@@ -8,12 +8,12 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
+use crate::transformations::util::db::pool::insert_pool;
 use crate::transformations::util::db::token::insert_token;
 use crate::transformations::util::db::v4_pool_configs::insert_pool_config;
-use crate::transformations::util::db::pool::insert_pool;
 use crate::transformations::util::metadata::get_metadata;
 
-use crate::types::uniswap::v4::{PoolKey, V4PoolConfig, PoolAddressOrPoolId};
+use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
 
 pub struct V4CreateHandler;
 
@@ -44,14 +44,14 @@ impl TransformationHandler for V4CreateHandler {
     async fn handle(
         &self,
         ctx: &TransformationContext,
-    ) -> Result<Vec<DbOperation>, TransformationError>{
+    ) -> Result<Vec<DbOperation>, TransformationError> {
         let mut ops = Vec::new();
 
         for event in ctx.events_of_type("UniswapV4Initializer", "Create") {
             let asset = event.extract_address("asset")?;
             let numeraire = event.extract_address("numeraire")?;
             let hook = event.extract_address("poolOrHook")?;
-            
+
             let metadata_result = get_metadata(&asset, &numeraire, event, &ctx);
 
             let asset_metadata;
@@ -61,21 +61,24 @@ impl TransformationHandler for V4CreateHandler {
                     asset_metadata = r.0;
                     numeraire_metadata = r.1;
                 }
-                Err(e) => {
-                    return Err(e)
-                }
+                Err(e) => return Err(e),
             }
 
-            let hook_call = ctx.calls_for_address(hook)
+            let hook_call = ctx
+                .calls_for_address(hook)
                 .filter(|call| call.function_name == "once")
                 .next()
                 .ok_or_else(|| {
-                    let available_calls: Vec<_> = ctx.calls_for_address(hook)
+                    let available_calls: Vec<_> = ctx
+                        .calls_for_address(hook)
                         .map(|c| format!("{}:{}", c.source_name, c.function_name))
                         .collect();
                     TransformationError::MissingData(format!(
                         "No 'once' call found for hook {} at block {} tx {}. Available calls: {:?}",
-                        Address::from(hook), event.block_number, B256::from(event.transaction_hash), available_calls
+                        Address::from(hook),
+                        event.block_number,
+                        B256::from(event.transaction_hash),
+                        available_calls
                     ))
                 })?;
 
@@ -88,7 +91,7 @@ impl TransformationHandler for V4CreateHandler {
             };
 
             let pool_id = pool_key.pool_id();
-            
+
             let pool_config = V4PoolConfig {
                 num_tokens_to_sell: hook_call.extract_uint256("numTokensToSell")?,
                 min_proceeds: hook_call.extract_uint256("minimumProceeds")?,
@@ -109,7 +112,7 @@ impl TransformationHandler for V4CreateHandler {
                 &event.transaction_hash,
                 ctx.tx_from(&event.transaction_hash),
                 Some(&asset_metadata.integrator.into()),
-                &asset, 
+                &asset,
                 Some(&PoolAddressOrPoolId::PoolId(pool_id.0)),
                 &asset_metadata.name,
                 &asset_metadata.symbol,
@@ -121,7 +124,7 @@ impl TransformationHandler for V4CreateHandler {
                 false,
                 None,
                 Some(&asset_metadata.governance),
-                ctx
+                ctx,
             ));
 
             ops.push(insert_token(
@@ -142,10 +145,10 @@ impl TransformationHandler for V4CreateHandler {
                 false,
                 None,
                 None,
-                ctx
-            ));    
+                ctx,
+            ));
 
-            ops.push(insert_pool_config(                
+            ops.push(insert_pool_config(
                 pool_id.into(),
                 hook,
                 pool_config.num_tokens_to_sell,
@@ -159,27 +162,30 @@ impl TransformationHandler for V4CreateHandler {
                 pool_config.gamma,
                 pool_config.is_token_0,
                 pool_config.num_pd_slugs,
-                ctx
+                ctx,
             ));
 
-            let migration_type = ctx.match_contract_address(
-                asset_metadata.migrator.into(),
-                &[
-                    "UniswapV4Migrator",
-                    "UniswapV2Migrator", "NimCustomV2Migrator",
-                    "UniswapV3Migrator", "NimCustomV3Migrator",
-                ],
-            ).map(|contract_name| {
-                match contract_name {
+            let migration_type = ctx
+                .match_contract_address(
+                    asset_metadata.migrator.into(),
+                    &[
+                        "UniswapV4Migrator",
+                        "UniswapV2Migrator",
+                        "NimCustomV2Migrator",
+                        "UniswapV3Migrator",
+                        "NimCustomV3Migrator",
+                    ],
+                )
+                .map(|contract_name| match contract_name {
                     "UniswapV4Migrator" => "v4",
                     "UniswapV2Migrator" | "NimCustomV2Migrator" => "v2",
                     "UniswapV3Migrator" | "NimCustomV3Migrator" => "v3",
                     _ => "unknown",
-                }
-            }).unwrap_or("unknown");
+                })
+                .unwrap_or("unknown");
 
             ops.push(insert_pool(
-                event.block_number, 
+                event.block_number,
                 event.block_timestamp,
                 PoolAddressOrPoolId::PoolId(pool_id.into()),
                 &asset,
@@ -200,7 +206,7 @@ impl TransformationHandler for V4CreateHandler {
                 pool_key,
                 pool_config.starting_time,
                 pool_config.ending_time,
-                ctx
+                ctx,
             ));
         }
 
@@ -217,7 +223,7 @@ impl EventHandler for V4CreateHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(
             "UniswapV4Initializer",
-            "Create(address,address,address)"
+            "Create(address,address,address)",
         )]
     }
 

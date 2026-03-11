@@ -50,7 +50,10 @@ pub async fn collect_receipts(
 
     // Get channel capacities for backpressure monitoring
     let log_tx_capacity = log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
-    let factory_log_tx_capacity = factory_log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
+    let factory_log_tx_capacity = factory_log_tx
+        .as_ref()
+        .map(|s| s.max_capacity())
+        .unwrap_or(0);
 
     // Initialize channel metrics for backpressure tracking
     let mut log_tx_metrics = ChannelMetrics::default();
@@ -447,7 +450,12 @@ pub async fn collect_receipts(
             continue;
         }
 
-        let max_block = state.blocks_received.keys().max().copied().unwrap_or(range_start);
+        let max_block = state
+            .blocks_received
+            .keys()
+            .max()
+            .copied()
+            .unwrap_or(range_start);
         let range = BlockRange {
             start: range_start,
             end: max_block + 1,
@@ -462,12 +470,21 @@ pub async fn collect_receipts(
                 range.start,
                 range.end - 1
             );
-            send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+            send_range_complete(
+                &factory_log_tx,
+                &log_tx,
+                &event_trigger_tx,
+                range.start,
+                range.end,
+            )
+            .await?;
             continue;
         }
 
         // Process any remaining unfetched blocks
-        let remaining_unfetched: Vec<u64> = state.blocks_received.keys()
+        let remaining_unfetched: Vec<u64> = state
+            .blocks_received
+            .keys()
             .filter(|bn| !state.blocks_fetched.contains(bn))
             .copied()
             .collect();
@@ -537,7 +554,12 @@ pub async fn collect_receipts(
                 let output_path_clone = output_path.clone();
                 let minimal_records = state.minimal_records;
                 tokio::task::spawn_blocking(move || {
-                    write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path_clone)
+                    write_minimal_receipts_to_parquet(
+                        &minimal_records,
+                        &schema_clone,
+                        &fields_vec,
+                        &output_path_clone,
+                    )
                 })
                 .await
                 .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -575,15 +597,29 @@ pub async fn collect_receipts(
                 range.end - 1,
             )
             .await
-            .map_err(|e| ReceiptCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| {
+                ReceiptCollectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
         }
 
-        send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+        send_range_complete(
+            &factory_log_tx,
+            &log_tx,
+            &event_trigger_tx,
+            range.start,
+            range.end,
+        )
+        .await?;
     }
 
     if let Some(sender) = &factory_log_tx {
         if sender.send(LogMessage::AllRangesComplete).await.is_err() {
-            tracing::error!("Failed to send AllRangesComplete to factory_log_tx - receiver dropped");
+            tracing::error!(
+                "Failed to send AllRangesComplete to factory_log_tx - receiver dropped"
+            );
             return Err(ReceiptCollectionError::ChannelSend(
                 "factory_log_tx (AllRangesComplete) - receiver dropped".to_string(),
             ));

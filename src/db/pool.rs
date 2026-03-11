@@ -65,7 +65,13 @@ impl DbPool {
                     values,
                     conflict_columns,
                     update_columns,
-                } => build_upsert_sql(&table, &columns, &values, &conflict_columns, &update_columns),
+                } => build_upsert_sql(
+                    &table,
+                    &columns,
+                    &values,
+                    &conflict_columns,
+                    &update_columns,
+                ),
                 DbOperation::Insert {
                     table,
                     columns,
@@ -76,12 +82,11 @@ impl DbPool {
                     set_columns,
                     where_clause,
                 } => build_update_sql(&table, &set_columns, &where_clause),
-                DbOperation::Delete { table, where_clause } => {
-                    build_delete_sql(&table, &where_clause)
-                }
-                DbOperation::RawSql { query, params } => {
-                    (query, convert_values_to_params(&params))
-                }
+                DbOperation::Delete {
+                    table,
+                    where_clause,
+                } => build_delete_sql(&table, &where_clause),
+                DbOperation::RawSql { query, params } => (query, convert_values_to_params(&params)),
             };
 
             let params_refs: Vec<&(dyn ToSql + Sync)> =
@@ -173,60 +178,55 @@ fn extract_db_value_from_row(
     let col_type = col.type_();
 
     // Handle NULL values first
-    let _is_null: bool = row.try_get::<_, Option<bool>>(col_name).map(|v| v.is_none()).unwrap_or(false)
-        || row.try_get::<_, Option<i64>>(col_name).map(|v| v.is_none()).unwrap_or(false)
-        || row.try_get::<_, Option<String>>(col_name).map(|v| v.is_none()).unwrap_or(false);
+    let _is_null: bool = row
+        .try_get::<_, Option<bool>>(col_name)
+        .map(|v| v.is_none())
+        .unwrap_or(false)
+        || row
+            .try_get::<_, Option<i64>>(col_name)
+            .map(|v| v.is_none())
+            .unwrap_or(false)
+        || row
+            .try_get::<_, Option<String>>(col_name)
+            .map(|v| v.is_none())
+            .unwrap_or(false);
 
     match *col_type {
-        Type::BOOL => {
-            match row.try_get::<_, Option<bool>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Bool(v)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
-        Type::INT8 => {
-            match row.try_get::<_, Option<i64>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Int64(v)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
-        Type::INT4 => {
-            match row.try_get::<_, Option<i32>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Int32(v)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
-        Type::INT2 => {
-            match row.try_get::<_, Option<i16>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Int2(v as u8)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
-        Type::FLOAT8 => {
-            match row.try_get::<_, Option<f64>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Timestamp(v as i64)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
-        Type::TEXT | Type::VARCHAR => {
-            match row.try_get::<_, Option<String>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Text(v)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
-        Type::BYTEA => {
-            match row.try_get::<_, Option<Vec<u8>>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::Bytes(v)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
+        Type::BOOL => match row.try_get::<_, Option<bool>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Bool(v)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
+        Type::INT8 => match row.try_get::<_, Option<i64>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Int64(v)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
+        Type::INT4 => match row.try_get::<_, Option<i32>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Int32(v)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
+        Type::INT2 => match row.try_get::<_, Option<i16>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Int2(v as u8)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
+        Type::FLOAT8 => match row.try_get::<_, Option<f64>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Timestamp(v as i64)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
+        Type::TEXT | Type::VARCHAR => match row.try_get::<_, Option<String>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Text(v)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
+        Type::BYTEA => match row.try_get::<_, Option<Vec<u8>>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::Bytes(v)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
         Type::NUMERIC => {
             // NUMERIC comes back as a rust_decimal::Decimal
             match row.try_get::<_, Option<rust_decimal::Decimal>>(col_name) {
@@ -245,7 +245,8 @@ fn extract_db_value_from_row(
             // Try to get as system time and convert to unix timestamp
             match row.try_get::<_, Option<std::time::SystemTime>>(col_name) {
                 Ok(Some(v)) => {
-                    let unix = v.duration_since(std::time::UNIX_EPOCH)
+                    let unix = v
+                        .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     Ok(DbValue::Timestamp(unix))
@@ -254,13 +255,11 @@ fn extract_db_value_from_row(
                 Err(_) => Ok(DbValue::Null),
             }
         }
-        Type::JSON | Type::JSONB => {
-            match row.try_get::<_, Option<serde_json::Value>>(col_name) {
-                Ok(Some(v)) => Ok(DbValue::JsonB(v)),
-                Ok(None) => Ok(DbValue::Null),
-                Err(_) => Ok(DbValue::Null),
-            }
-        }
+        Type::JSON | Type::JSONB => match row.try_get::<_, Option<serde_json::Value>>(col_name) {
+            Ok(Some(v)) => Ok(DbValue::JsonB(v)),
+            Ok(None) => Ok(DbValue::Null),
+            Err(_) => Ok(DbValue::Null),
+        },
         _ => {
             // Unknown type - try as bytes, then text, then null
             if let Ok(Some(v)) = row.try_get::<_, Option<Vec<u8>>>(col_name) {
@@ -378,7 +377,11 @@ fn quote_ident(name: &str) -> String {
 }
 
 fn quote_cols(columns: &[String]) -> String {
-    columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ")
+    columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Builder for SQL queries that manages parameter indexing automatically.
@@ -435,17 +438,18 @@ impl QueryBuilder {
                 let ph = self.add(val);
                 format!("{} = {}", quote_ident(col), ph)
             }
-            WhereClause::And(conditions) => {
-                conditions
-                    .iter()
-                    .map(|(col, val)| {
-                        let ph = self.add(val);
-                        format!("{} = {}", quote_ident(col), ph)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            }
-            WhereClause::Raw { condition, params: raw_params } => {
+            WhereClause::And(conditions) => conditions
+                .iter()
+                .map(|(col, val)| {
+                    let ph = self.add(val);
+                    format!("{} = {}", quote_ident(col), ph)
+                })
+                .collect::<Vec<_>>()
+                .join(" AND "),
+            WhereClause::Raw {
+                condition,
+                params: raw_params,
+            } => {
                 for p in raw_params {
                     self.params.push(convert_db_value(p));
                 }
@@ -460,12 +464,19 @@ impl QueryBuilder {
     }
 }
 
-fn build_insert_sql(table: &str, columns: &[String], values: &[DbValue]) -> (String, Vec<SqlParam>) {
+fn build_insert_sql(
+    table: &str,
+    columns: &[String],
+    values: &[DbValue],
+) -> (String, Vec<SqlParam>) {
     let mut builder = QueryBuilder::new();
     let cols = quote_cols(columns);
     let placeholders_str = builder.add_values(values, ", ");
 
-    let sql = format!("INSERT INTO {} ({}) VALUES ({})", table, cols, placeholders_str);
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        table, cols, placeholders_str
+    );
     (sql, builder.finish())
 }
 
@@ -522,4 +533,3 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
     let sql = format!("DELETE FROM {} WHERE {}", table, where_str);
     (sql, builder.finish())
 }
-

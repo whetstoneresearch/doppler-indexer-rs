@@ -94,8 +94,7 @@ where
             where
                 M: de::MapAccess<'de>,
             {
-                let value =
-                    T::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                let value = T::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 Ok(InlineOrPath::Inline(value))
             }
         }
@@ -290,8 +289,7 @@ mod tests {
         #[test]
         fn test_deserialize_path() {
             let json = r#""./path/to/file.json""#;
-            let result: InlineOrPath<HashMap<String, String>> =
-                serde_json::from_str(json).unwrap();
+            let result: InlineOrPath<HashMap<String, String>> = serde_json::from_str(json).unwrap();
             assert!(result.is_path());
             assert_eq!(result.as_path(), Some("./path/to/file.json"));
         }
@@ -299,8 +297,7 @@ mod tests {
         #[test]
         fn test_deserialize_inline_map() {
             let json = r#"{"key1": "value1", "key2": "value2"}"#;
-            let result: InlineOrPath<HashMap<String, String>> =
-                serde_json::from_str(json).unwrap();
+            let result: InlineOrPath<HashMap<String, String>> = serde_json::from_str(json).unwrap();
             assert!(result.is_inline());
             if let InlineOrPath::Inline(map) = result {
                 assert_eq!(map.get("key1"), Some(&"value1".to_string()));

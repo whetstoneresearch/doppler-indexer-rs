@@ -77,10 +77,7 @@ pub enum DecoderMessage {
         live_mode: bool,
     },
     /// Marker indicating all eth_call decode work for this block/range has been queued.
-    EthCallsBlockComplete {
-        range_start: u64,
-        range_end: u64,
-    },
+    EthCallsBlockComplete { range_start: u64, range_end: u64 },
     /// Factory addresses discovered for a range (needed for factory log/call decoding)
     #[allow(dead_code)]
     FactoryAddresses {

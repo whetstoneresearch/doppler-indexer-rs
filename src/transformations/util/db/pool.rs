@@ -1,10 +1,10 @@
-use serde::Serialize;
 use alloy_primitives::U256;
+use serde::Serialize;
 
 use crate::db::{DbOperation, DbValue};
 use crate::transformations::TransformationContext;
 
-use crate::types::uniswap::v4::{PoolKey, PoolAddressOrPoolId};
+use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
 
 fn serialize_address<S>(address: &[u8; 20], serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -17,7 +17,7 @@ where
 pub struct Beneficiary {
     #[serde(serialize_with = "serialize_address")]
     beneficiary: [u8; 20],
-    shares: u64
+    shares: u64,
 }
 
 pub type BeneficiariesData = Vec<Beneficiary>;
@@ -44,14 +44,11 @@ pub fn insert_pool(
     pool_key: PoolKey,
     starting_time: u64,
     ending_time: u64,
-    ctx: &TransformationContext
+    ctx: &TransformationContext,
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "pools".to_string(),
-        conflict_columns: vec![
-            "chain_id".to_string(),
-            "address".to_string(),
-        ],
+        conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
         update_columns: vec![],
         columns: vec![
             "chain_id".to_string(),
@@ -75,15 +72,15 @@ pub fn insert_pool(
             "beneficiaries".to_string(),
             "pool_key".to_string(),
             "starting_time".to_string(),
-            "ending_time".to_string()
-        ], 
+            "ending_time".to_string(),
+        ],
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
             DbValue::Uint64(block_number),
             DbValue::Timestamp(block_timestamp as i64),
             match address {
                 PoolAddressOrPoolId::Address(address) => DbValue::Address(address),
-                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(pool_id)
+                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(pool_id),
             },
             DbValue::Address(*base_token),
             DbValue::Address(*quote_token),
@@ -97,23 +94,24 @@ pub fn insert_pool(
             DbValue::Address(migrator),
             match migrated_at {
                 Some(timestamp) => DbValue::Timestamp(timestamp as i64),
-                None => DbValue::Null
+                None => DbValue::Null,
             },
             match migration_pool {
                 PoolAddressOrPoolId::Address(address) => DbValue::Address(address),
-                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(pool_id)
+                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(pool_id),
             },
             DbValue::VarChar(migration_type.to_string()),
             match lock_duration {
                 Some(duration) => DbValue::Int32(duration as i32),
-                None => DbValue::Null
+                None => DbValue::Null,
             },
             match beneficiaries {
                 Some(beneficiaries_data) => DbValue::jsonb(beneficiaries_data),
-                None => DbValue::Null
+                None => DbValue::Null,
             },
             DbValue::jsonb(pool_key),
             DbValue::Timestamp(starting_time as i64),
-            DbValue::Timestamp(ending_time as i64)
-        ]}
+            DbValue::Timestamp(ending_time as i64),
+        ],
+    }
 }

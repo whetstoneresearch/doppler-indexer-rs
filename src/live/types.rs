@@ -273,8 +273,8 @@ pub enum LiveDbValue {
     Bytes32([u8; 32]),
     Numeric(String),
     Timestamp(i64),
-    Json(String),    // JSON stored as string for bincode
-    JsonB(String),   // JSONB stored as string for bincode
+    Json(String),  // JSON stored as string for bincode
+    JsonB(String), // JSONB stored as string for bincode
 }
 
 /// Snapshot of a row before modification, for reorg rollback.

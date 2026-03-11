@@ -22,11 +22,11 @@ use crate::raw_data::historical::eth_calls::{
     build_factory_once_call_configs, build_once_call_configs, encode_once_call_params, CallConfig,
     EventCallKey, EventTriggeredCallConfig, FrequencyState, OnceCallConfig,
 };
-use crate::raw_data::historical::receipts::EventTriggerData;
-use crate::types::config::eth_call::encode_call_with_params;
 use crate::raw_data::historical::factories::get_factory_call_configs;
+use crate::raw_data::historical::receipts::EventTriggerData;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::eth_call::encode_call_with_params;
 use crate::types::config::eth_call::{EthCallConfig, Frequency, ParamConfig};
 
 /// Collects eth_calls for live mode blocks.
@@ -352,7 +352,8 @@ impl LiveEthCallCollector {
                         let result_bytes = match result {
                             Ok(bytes) => bytes.to_vec(),
                             Err(e) => {
-                                let encoded = encode_call_simple(&call_config.function, &call_config.params);
+                                let encoded =
+                                    encode_call_simple(&call_config.function, &call_config.params);
                                 tracing::warn!(
                                     "Factory eth_call failed for {}.{} at {} block {}: calldata=0x{}, error={}",
                                     collection_name,
@@ -445,12 +446,19 @@ impl LiveEthCallCollector {
                         preencoded.clone()
                     } else {
                         // Need to encode with self-address param
-                        encode_call_with_self_address(&config.function_selector, &config.params, address)
+                        encode_call_with_self_address(
+                            &config.function_selector,
+                            &config.params,
+                            address,
+                        )
                     };
 
                     let target = if let Some(ref target_addrs) = config.target_addresses {
                         // Use configured target address
-                        target_addrs.first().copied().unwrap_or(Address::from(*address))
+                        target_addrs
+                            .first()
+                            .copied()
+                            .unwrap_or(Address::from(*address))
                     } else {
                         Address::from(*address)
                     };
@@ -591,17 +599,16 @@ impl LiveEthCallCollector {
                     };
 
                     // Build calldata from params
-                    let calldata = build_calldata_from_event(
-                        &config.function_selector,
-                        &config.params,
-                        log,
-                    );
+                    let calldata =
+                        build_calldata_from_event(&config.function_selector, &config.params, log);
 
                     let key = (config.contract_name.clone(), config.function_name.clone());
-                    grouped_calls
-                        .entry(key)
-                        .or_default()
-                        .push((target_address, log.log_index, calldata, config));
+                    grouped_calls.entry(key).or_default().push((
+                        target_address,
+                        log.log_index,
+                        calldata,
+                        config,
+                    ));
                 }
             }
         }
@@ -699,7 +706,7 @@ impl LiveEthCallCollector {
     ) -> bool {
         match frequency {
             Frequency::EveryBlock => true,
-            Frequency::Once => false, // Handled separately
+            Frequency::Once => false,           // Handled separately
             Frequency::EveryNBlocks(_) => true, // Simplified - always call in live mode
             Frequency::Duration(interval) => {
                 let state_key = (contract_name.to_string(), function_name.to_string());
@@ -714,7 +721,10 @@ impl LiveEthCallCollector {
 }
 
 /// Simple call encoding for functions without parameters.
-fn encode_call_simple(function_name: &str, params: &Vec<crate::types::config::eth_call::ParamConfig>) -> Bytes {
+fn encode_call_simple(
+    function_name: &str,
+    params: &Vec<crate::types::config::eth_call::ParamConfig>,
+) -> Bytes {
     use alloy::primitives::keccak256;
 
     // For now, assume simple calls without params - just use function selector
@@ -746,11 +756,7 @@ fn encode_call_with_self_address(
 }
 
 /// Build calldata from event parameters.
-fn build_calldata_from_event(
-    selector: &[u8; 4],
-    params: &[ParamConfig],
-    log: &LiveLog,
-) -> Bytes {
+fn build_calldata_from_event(selector: &[u8; 4], params: &[ParamConfig], log: &LiveLog) -> Bytes {
     let trigger = EventTriggerData {
         block_number: 0,
         block_timestamp: 0,

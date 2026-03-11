@@ -124,7 +124,10 @@ mod tests {
         let backend = LocalBackend::new(temp_dir.path().to_path_buf());
 
         // Write
-        backend.write("test/file.txt", b"hello world").await.unwrap();
+        backend
+            .write("test/file.txt", b"hello world")
+            .await
+            .unwrap();
 
         // Read
         let data = backend.read("test/file.txt").await.unwrap();
@@ -155,9 +158,18 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(temp_dir.path().to_path_buf());
 
-        backend.write("data/blocks/0_999.parquet", b"blocks1").await.unwrap();
-        backend.write("data/blocks/1000_1999.parquet", b"blocks2").await.unwrap();
-        backend.write("data/logs/0_999.parquet", b"logs1").await.unwrap();
+        backend
+            .write("data/blocks/0_999.parquet", b"blocks1")
+            .await
+            .unwrap();
+        backend
+            .write("data/blocks/1000_1999.parquet", b"blocks2")
+            .await
+            .unwrap();
+        backend
+            .write("data/logs/0_999.parquet", b"logs1")
+            .await
+            .unwrap();
 
         let all = backend.list("data").await.unwrap();
         assert_eq!(all.len(), 3);

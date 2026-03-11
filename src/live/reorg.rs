@@ -210,7 +210,7 @@ mod tests {
         // This is a 1-block reorg replacing block 2 and 3
         let reorg_block = LiveBlock {
             number: 3,
-            hash: [33; 32],       // Different hash
+            hash: [33; 32],        // Different hash
             parent_hash: [22; 32], // Parent that doesn't match our tracked block 2
             timestamp: 36,
             tx_hashes: vec![],
@@ -314,11 +314,7 @@ mod tests {
     fn test_seed() {
         let mut detector = ReorgDetector::new(10);
 
-        detector.seed(vec![
-            (100, [100; 32]),
-            (101, [101; 32]),
-            (102, [102; 32]),
-        ]);
+        detector.seed(vec![(100, [100; 32]), (101, [101; 32]), (102, [102; 32])]);
 
         assert_eq!(detector.tracked_count(), 3);
         assert_eq!(detector.get_block_hash(101), Some([101; 32]));

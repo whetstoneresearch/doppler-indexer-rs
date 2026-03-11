@@ -63,14 +63,9 @@ pub enum WsEvent {
         timestamp: u64,
     },
     /// WebSocket disconnected.
-    Disconnected {
-        last_block: Option<u64>,
-    },
+    Disconnected { last_block: Option<u64> },
     /// WebSocket reconnected after a gap. Use HTTP to backfill missed blocks.
-    Reconnected {
-        missed_from: u64,
-        missed_to: u64,
-    },
+    Reconnected { missed_from: u64, missed_to: u64 },
 }
 
 /// Block header from eth_subscribe("newHeads").
@@ -156,10 +151,7 @@ impl WsClient {
     }
 
     /// Create a new WebSocket client with default reconnection config.
-    pub fn from_urls(
-        ws_url: &str,
-        http_client: Arc<UnifiedRpcClient>,
-    ) -> Result<Self, WsError> {
+    pub fn from_urls(ws_url: &str, http_client: Arc<UnifiedRpcClient>) -> Result<Self, WsError> {
         Self::new(ws_url, http_client, ReconnectConfig::default())
     }
 
@@ -204,10 +196,7 @@ impl WsClient {
                     tracing::warn!("WebSocket error: {}", e);
 
                     // Send disconnection event
-                    if event_tx
-                        .send(WsEvent::Disconnected { last_block })
-                        .is_err()
-                    {
+                    if event_tx.send(WsEvent::Disconnected { last_block }).is_err() {
                         return Err(WsError::ChannelClosed);
                     }
 
@@ -268,20 +257,27 @@ impl WsClient {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(response) = serde_json::from_str::<SubscriptionResponse>(&text) {
-                        tracing::info!("Subscribed to newHeads, subscription_id: {}", response.result);
+                        tracing::info!(
+                            "Subscribed to newHeads, subscription_id: {}",
+                            response.result
+                        );
                         break response.result;
                     }
                     // Not a subscription response, might be an error
                     tracing::debug!("Unexpected response during subscription: {}", text);
                 }
                 Some(Ok(Message::Close(_))) => {
-                    return Err(WsError::Connection("Connection closed during subscription".into()));
+                    return Err(WsError::Connection(
+                        "Connection closed during subscription".into(),
+                    ));
                 }
                 Some(Err(e)) => {
                     return Err(WsError::Protocol(e.to_string()));
                 }
                 None => {
-                    return Err(WsError::Connection("Stream ended during subscription".into()));
+                    return Err(WsError::Connection(
+                        "Stream ended during subscription".into(),
+                    ));
                 }
                 _ => continue,
             }
@@ -289,11 +285,10 @@ impl WsClient {
 
         // Get current block to detect gaps after reconnection
         let _reconnect_block = if let Some(last) = *last_block {
-            let current = self
-                .http_client
-                .get_block_number()
-                .await
-                .map_err(|e| WsError::Connection(format!("Failed to get current block: {}", e)))?;
+            let current =
+                self.http_client.get_block_number().await.map_err(|e| {
+                    WsError::Connection(format!("Failed to get current block: {}", e))
+                })?;
 
             if current > last + 1 {
                 // Gap detected, send reconnected event

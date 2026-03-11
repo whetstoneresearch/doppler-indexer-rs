@@ -231,7 +231,11 @@ impl Drop for RpcMetricsGuard {
 ///     // your async operation
 /// }).await;
 /// ```
-pub async fn with_metrics<T, F, Fut>(method: RpcMethod, chain: &str, operation: F) -> Result<T, RpcError>
+pub async fn with_metrics<T, F, Fut>(
+    method: RpcMethod,
+    chain: &str,
+    operation: F,
+) -> Result<T, RpcError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, RpcError>>,

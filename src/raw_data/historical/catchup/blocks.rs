@@ -52,7 +52,13 @@ pub async fn collect_blocks(
         start_block
     );
 
-    let ranges = compute_ranges_to_fetch(start_block, chain_head, range_size, &output_dir, s3_manifest);
+    let ranges = compute_ranges_to_fetch(
+        start_block,
+        chain_head,
+        range_size,
+        &output_dir,
+        s3_manifest,
+    );
 
     if ranges.is_empty() {
         tracing::info!(
@@ -88,11 +94,7 @@ pub async fn collect_blocks(
         .await?;
 
         let output_path = output_dir.join(range.file_name());
-        tracing::info!(
-            "Wrote {} blocks to {}",
-            record_count,
-            output_path.display()
-        );
+        tracing::info!("Wrote {} blocks to {}", record_count, output_path.display());
 
         // Upload to S3 if configured
         if let Some(ref sm) = storage_manager {
@@ -105,7 +107,12 @@ pub async fn collect_blocks(
                 range.end - 1,
             )
             .await
-            .map_err(|e| BlockCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| {
+                BlockCollectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
         }
     }
 
@@ -157,25 +164,39 @@ async fn collect_blocks_streaming(
 
                         // Immediately forward to downstream collectors
                         if let Some(sender) = tx_sender {
-                            if sender.send((block_number, timestamp, tx_hashes.clone())).await.is_err() {
-                                tracing::warn!("Receipts channel closed, continuing block collection");
+                            if sender
+                                .send((block_number, timestamp, tx_hashes.clone()))
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "Receipts channel closed, continuing block collection"
+                                );
                             }
                         }
 
                         if let Some(sender) = eth_call_sender {
                             if sender.send((block_number, timestamp)).await.is_err() {
-                                tracing::warn!("Eth_call channel closed, continuing block collection");
+                                tracing::warn!(
+                                    "Eth_call channel closed, continuing block collection"
+                                );
                             }
                         }
 
                         // Buffer record for parquet (ordered by block number)
-                        records_map.insert(block_number, MinimalBlockRecord {
-                            number: block_number,
-                            timestamp,
-                            transaction_count: tx_hashes.len() as u32,
-                            transaction_hashes: tx_hashes.iter().map(|h| format!("{:?}", h)).collect(),
-                            uncle_count: block.uncles.len() as u32,
-                        });
+                        records_map.insert(
+                            block_number,
+                            MinimalBlockRecord {
+                                number: block_number,
+                                timestamp,
+                                transaction_count: tx_hashes.len() as u32,
+                                transaction_hashes: tx_hashes
+                                    .iter()
+                                    .map(|h| format!("{:?}", h))
+                                    .collect(),
+                                uncle_count: block.uncles.len() as u32,
+                            },
+                        );
                     }
                     Ok(None) => {
                         return Err(BlockCollectionError::BlockNotFound(block_number));
@@ -187,7 +208,9 @@ async fn collect_blocks_streaming(
             }
 
             // Wait for fetch task to complete
-            fetch_handle.await.map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
+            fetch_handle
+                .await
+                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
 
             // Check for errors
             if !errors.is_empty() {
@@ -213,7 +236,12 @@ async fn collect_blocks_streaming(
             let fields_vec = fields.to_vec();
             let output_path = output_dir.join(range.file_name());
             tokio::task::spawn_blocking(move || {
-                write_minimal_blocks_to_parquet(&all_records, &schema_clone, &fields_vec, &output_path)
+                write_minimal_blocks_to_parquet(
+                    &all_records,
+                    &schema_clone,
+                    &fields_vec,
+                    &output_path,
+                )
             })
             .await
             .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
@@ -238,19 +266,30 @@ async fn collect_blocks_streaming(
 
                         // Immediately forward to downstream collectors
                         if let Some(sender) = tx_sender {
-                            if sender.send((block_number, timestamp, tx_hashes.clone())).await.is_err() {
-                                tracing::warn!("Receipts channel closed, continuing block collection");
+                            if sender
+                                .send((block_number, timestamp, tx_hashes.clone()))
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "Receipts channel closed, continuing block collection"
+                                );
                             }
                         }
 
                         if let Some(sender) = eth_call_sender {
                             if sender.send((block_number, timestamp)).await.is_err() {
-                                tracing::warn!("Eth_call channel closed, continuing block collection");
+                                tracing::warn!(
+                                    "Eth_call channel closed, continuing block collection"
+                                );
                             }
                         }
 
                         // Buffer full record for parquet
-                        records_map.insert(block_number, process_single_block_full(&block, block_number)?);
+                        records_map.insert(
+                            block_number,
+                            process_single_block_full(&block, block_number)?,
+                        );
                     }
                     Ok(None) => {
                         return Err(BlockCollectionError::BlockNotFound(block_number));
@@ -262,7 +301,9 @@ async fn collect_blocks_streaming(
             }
 
             // Wait for fetch task to complete
-            fetch_handle.await.map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
+            fetch_handle
+                .await
+                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
 
             // Check for errors
             if !errors.is_empty() {

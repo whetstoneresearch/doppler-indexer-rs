@@ -50,4 +50,3 @@ pub fn load_tokens_from_path(base_dir: &Path, path: &str) -> anyhow::Result<Toke
     load_config_from_path::<Tokens>(base_dir, path)
         .map_err(|e| panic!("Failed to load tokens: {}", e))
 }
-

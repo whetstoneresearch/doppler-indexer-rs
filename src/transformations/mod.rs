@@ -63,9 +63,7 @@ pub mod registry;
 pub mod traits;
 pub mod util;
 
-pub use context::{
-    DecodedCall, DecodedEvent, DecodedValue, TransformationContext,
-};
+pub use context::{DecodedCall, DecodedEvent, DecodedValue, TransformationContext};
 pub use engine::{
     DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteKind,
     RangeCompleteMessage, ReorgMessage, TransformationEngine,

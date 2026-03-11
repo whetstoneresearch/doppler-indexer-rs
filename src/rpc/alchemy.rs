@@ -221,8 +221,7 @@ impl Default for AlchemyConfig {
     fn default() -> Self {
         Self {
             // SAFETY: This is a valid URL literal and will always parse successfully.
-            url: Url::parse("http://localhost:8545")
-                .expect("default URL is a valid literal"),
+            url: Url::parse("http://localhost:8545").expect("default URL is a valid literal"),
             compute_units_per_second: DEFAULT_COMPUTE_UNITS_PER_SECOND,
             max_batch_size: 100,
             batching_enabled: true,
@@ -345,8 +344,8 @@ impl AlchemyClient {
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
     ) -> Result<Self, RpcError> {
         let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
-        let config = AlchemyConfig::new(url, compute_units_per_second)
-            .with_rpc_concurrency(rpc_concurrency);
+        let config =
+            AlchemyConfig::new(url, compute_units_per_second).with_rpc_concurrency(rpc_concurrency);
         Self::new_with_limiter(config, shared_limiter)
     }
 
@@ -424,9 +423,11 @@ impl AlchemyClient {
         // Spawn all tasks immediately - permit acquisition happens inside each task.
         for (idx, request) in requests.into_iter().enumerate() {
             let make_request = make_request.clone();
-            executor.spawn_indexed(&mut join_set, idx, async move {
-                make_request(request).await
-            });
+            executor.spawn_indexed(
+                &mut join_set,
+                idx,
+                async move { make_request(request).await },
+            );
         }
 
         // Collect results and sort by index to preserve order
@@ -587,7 +588,8 @@ impl AlchemyClient {
         let chain = self.chain_label();
         let retry_config = self.config.retry.clone();
         let provider = self.inner.provider().clone();
-        self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER).await;
+        self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
+            .await;
         with_metrics(RpcMethod::GetBlockNumber, &chain, || async {
             with_retry(&retry_config, "get_block_number", || async {
                 provider
@@ -648,7 +650,8 @@ impl AlchemyClient {
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
         let retry_config = self.config.retry.clone();
         let provider = self.inner.provider().clone();
-        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH).await;
+        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
+            .await;
         with_metrics(RpcMethod::GetTransaction, &chain, || async {
             with_retry(&retry_config, &op_name, || async {
                 provider
@@ -669,7 +672,8 @@ impl AlchemyClient {
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
         let retry_config = self.config.retry.clone();
         let provider = self.inner.provider().clone();
-        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT).await;
+        self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
+            .await;
         with_metrics(RpcMethod::GetTransactionReceipt, &chain, || async {
             with_retry(&retry_config, &op_name, || async {
                 provider
@@ -691,7 +695,8 @@ impl AlchemyClient {
         let inner = self.inner.clone();
         let method_name = method_name.to_string();
         // Note: inner.get_block_receipts already has retry logic
-        self.consume_compute_units(ComputeUnitCost::GET_BLOCK_RECEIPTS).await;
+        self.consume_compute_units(ComputeUnitCost::GET_BLOCK_RECEIPTS)
+            .await;
         with_metrics(RpcMethod::GetBlockReceipts, &chain, || async {
             inner.get_block_receipts(&method_name, block_number).await
         })
@@ -766,7 +771,8 @@ impl AlchemyClient {
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
         let retry_config = self.config.retry.clone();
         let provider = self.inner.provider().clone();
-        self.consume_compute_units(ComputeUnitCost::GET_BALANCE).await;
+        self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
+            .await;
         with_metrics(RpcMethod::GetBalance, &chain, || async {
             with_retry(&retry_config, &op_name, || async {
                 provider
@@ -884,33 +890,28 @@ impl AlchemyClient {
         let retry_config = self.config.retry.clone();
         let cost_per_block = ComputeUnitCost::GET_BLOCK_BY_NUMBER.cost();
 
-        self.execute_streaming(
-            block_numbers,
-            cost_per_block,
-            result_tx,
-            move |number| {
-                let provider = provider.clone();
-                let retry_config = retry_config.clone();
-                async move {
-                    let op_name = format!("eth_getBlockByNumber({:?})", number);
-                    let result = with_retry(&retry_config, &op_name, || async {
-                        let builder = provider.get_block(BlockId::Number(number));
-                        if full_transactions {
-                            builder
-                                .full()
-                                .await
-                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                        } else {
-                            builder
-                                .await
-                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                        }
-                    })
-                    .await;
-                    (number, result)
-                }
-            },
-        )
+        self.execute_streaming(block_numbers, cost_per_block, result_tx, move |number| {
+            let provider = provider.clone();
+            let retry_config = retry_config.clone();
+            async move {
+                let op_name = format!("eth_getBlockByNumber({:?})", number);
+                let result = with_retry(&retry_config, &op_name, || async {
+                    let builder = provider.get_block(BlockId::Number(number));
+                    if full_transactions {
+                        builder
+                            .full()
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    } else {
+                        builder
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    }
+                })
+                .await;
+                (number, result)
+            }
+        })
     }
 
     pub async fn get_transaction_receipts_batch(
@@ -1068,11 +1069,7 @@ impl RpcProvider for AlchemyClient {
         AlchemyClient::get_balance(self, address, block).await
     }
 
-    async fn get_code(
-        &self,
-        address: Address,
-        block: Option<BlockId>,
-    ) -> Result<Bytes, RpcError> {
+    async fn get_code(&self, address: Address, block: Option<BlockId>) -> Result<Bytes, RpcError> {
         AlchemyClient::get_code(self, address, block).await
     }
 

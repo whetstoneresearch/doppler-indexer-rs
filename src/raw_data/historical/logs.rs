@@ -130,15 +130,16 @@ pub(crate) async fn process_completed_range(
     }
 
     let mut logs = range_data.remove(&range_start).unwrap_or_default();
-    let factory_addrs = range_factory_addresses.remove(&range_start).unwrap_or_default();
+    let factory_addrs = range_factory_addresses
+        .remove(&range_start)
+        .unwrap_or_default();
 
     if contract_logs_only {
         let before_count = logs.len();
         logs = logs
             .into_iter()
             .filter(|log| {
-                configured_addresses.contains(&log.address)
-                    || factory_addrs.contains(&log.address)
+                configured_addresses.contains(&log.address) || factory_addrs.contains(&log.address)
             })
             .collect();
         tracing::debug!(
@@ -151,16 +152,27 @@ pub(crate) async fn process_completed_range(
 
     // Send logs to decoder before processing (decoder will receive them for live decoding)
     if let Some(tx) = decoder_tx {
-        let _ = tx.send(DecoderMessage::LogsReady {
-            range_start,
-            range_end,
-            logs: logs.clone(),
-            live_mode: false, // Historical mode: write to parquet
-            has_factory_matchers: false, // Factory addresses handled separately in historical mode
-        }).await;
+        let _ = tx
+            .send(DecoderMessage::LogsReady {
+                range_start,
+                range_end,
+                logs: logs.clone(),
+                live_mode: false,            // Historical mode: write to parquet
+                has_factory_matchers: false, // Factory addresses handled separately in historical mode
+            })
+            .await;
     }
 
-    process_range(&range, logs, log_fields, schema, output_dir, storage_manager, chain_name).await
+    process_range(
+        &range,
+        logs,
+        log_fields,
+        schema,
+        output_dir,
+        storage_manager,
+        chain_name,
+    )
+    .await
 }
 
 pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
@@ -168,11 +180,11 @@ pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 
     for (_, contract) in contracts {
         match &contract.address {
             AddressOrAddresses::Single(addr) => {
-                addresses.insert(addr.0.0);
+                addresses.insert(addr.0 .0);
             }
             AddressOrAddresses::Multiple(addrs) => {
                 for addr in addrs {
-                    addresses.insert(addr.0.0);
+                    addresses.insert(addr.0 .0);
                 }
             }
         }
@@ -243,10 +255,7 @@ pub(crate) async fn process_range(
     }
 
     let output_path = output_dir.join(range.file_name());
-    tracing::info!(
-        "Wrote logs to {}",
-        output_path.display()
-    );
+    tracing::info!("Wrote logs to {}", output_path.display());
 
     // Upload to S3 if configured
     if let Some(sm) = storage_manager {
@@ -339,7 +348,7 @@ pub(crate) fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {
                 DataType::List(Arc::new(Field::new(
                     "item",
                     DataType::FixedSizeBinary(32),
-                    true, 
+                    true,
                 ))),
                 false,
             ),
@@ -395,10 +404,7 @@ pub(crate) fn write_minimal_logs_to_parquet(
                 arrays.push(Arc::new(arr));
             }
             LogField::Data => {
-                let arr: BinaryArray = records
-                    .iter()
-                    .map(|r| Some(r.data.as_slice()))
-                    .collect();
+                let arr: BinaryArray = records.iter().map(|r| Some(r.data.as_slice())).collect();
                 arrays.push(Arc::new(arr));
             }
         }
@@ -423,9 +429,7 @@ pub(crate) fn write_full_logs_to_parquet(
     let arr = if records.is_empty() {
         FixedSizeBinaryBuilder::new(32).finish()
     } else {
-        FixedSizeBinaryArray::try_from_iter(
-            records.iter().map(|r| r.transaction_hash.as_slice()),
-        )?
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.transaction_hash.as_slice()))?
     };
     arrays.push(Arc::new(arr));
 
@@ -435,9 +439,7 @@ pub(crate) fn write_full_logs_to_parquet(
     let arr = if records.is_empty() {
         FixedSizeBinaryBuilder::new(20).finish()
     } else {
-        FixedSizeBinaryArray::try_from_iter(
-            records.iter().map(|r| r.address.as_slice()),
-        )?
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.address.as_slice()))?
     };
     arrays.push(Arc::new(arr));
 
@@ -450,16 +452,15 @@ pub(crate) fn write_full_logs_to_parquet(
     }
     arrays.push(Arc::new(list_builder.finish()));
 
-    let arr: BinaryArray = records
-        .iter()
-        .map(|r| Some(r.data.as_slice()))
-        .collect();
+    let arr: BinaryArray = records.iter().map(|r| Some(r.data.as_slice())).collect();
     arrays.push(Arc::new(arr));
 
     write_parquet(arrays, schema, output_path)
 }
 
-pub(crate) fn build_topics_array(records: &[MinimalLogRecord]) -> Result<arrow::array::ListArray, arrow::error::ArrowError> {
+pub(crate) fn build_topics_array(
+    records: &[MinimalLogRecord],
+) -> Result<arrow::array::ListArray, arrow::error::ArrowError> {
     let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
     for record in records {
         for topic in &record.topics {

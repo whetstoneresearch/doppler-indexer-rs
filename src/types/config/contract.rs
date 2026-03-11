@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::types::config::eth_call::EthCallConfig;
+use crate::types::config::generic::SingleOrMultiple;
+use crate::types::config::loader::{load_config_from_path, ConfigLoadError};
 use alloy_primitives::{keccak256, Address, U256};
 use serde::Deserialize;
-use crate::types::config::eth_call::EthCallConfig;
-use crate::types::config::generic::{SingleOrMultiple};
-use crate::types::config::loader::{load_config_from_path, ConfigLoadError};
 
 /// Configuration for an event to decode
 /// Signature format: "Transfer(address indexed from, address indexed to, uint256 value)"

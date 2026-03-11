@@ -56,18 +56,11 @@ pub trait RpcProvider: Send + Sync {
     async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>, RpcError>;
 
     /// Get account balance
-    async fn get_balance(
-        &self,
-        address: Address,
-        block: Option<BlockId>,
-    ) -> Result<U256, RpcError>;
+    async fn get_balance(&self, address: Address, block: Option<BlockId>)
+        -> Result<U256, RpcError>;
 
     /// Get contract code
-    async fn get_code(
-        &self,
-        address: Address,
-        block: Option<BlockId>,
-    ) -> Result<Bytes, RpcError>;
+    async fn get_code(&self, address: Address, block: Option<BlockId>) -> Result<Bytes, RpcError>;
 
     /// Execute an eth_call
     async fn call(
@@ -554,8 +547,8 @@ impl RpcClient {
         let receipts: Vec<Option<TransactionReceipt>> = raw_receipts
             .into_iter()
             .enumerate()
-            .map(|(i, value)| {
-                match serde_json::from_value::<TransactionReceipt>(value) {
+            .map(
+                |(i, value)| match serde_json::from_value::<TransactionReceipt>(value) {
                     Ok(receipt) => Some(receipt),
                     Err(e) => {
                         tracing::debug!(
@@ -566,8 +559,8 @@ impl RpcClient {
                         );
                         None
                     }
-                }
-            })
+                },
+            )
             .collect();
 
         Ok(receipts)
@@ -591,9 +584,7 @@ impl RpcClient {
             let chunk_block_numbers: Vec<_> = chunk.to_vec();
             let futures: Vec<_> = chunk
                 .iter()
-                .map(|&block_number| {
-                    self.get_block_receipts(method_name, block_number)
-                })
+                .map(|&block_number| self.get_block_receipts(method_name, block_number))
                 .collect();
 
             let results = futures::future::join_all(futures).await;
@@ -703,16 +694,20 @@ impl RpcClient {
 
         for (chunk_idx, chunk) in block_numbers.chunks(self.config.max_batch_size).enumerate() {
             let chunk_vec: Vec<BlockNumberOrTag> = chunk.to_vec();
-            let first_block = chunk_vec.first().map(|b| format!("{:?}", b)).unwrap_or_default();
-            let last_block = chunk_vec.last().map(|b| format!("{:?}", b)).unwrap_or_default();
+            let first_block = chunk_vec
+                .first()
+                .map(|b| format!("{:?}", b))
+                .unwrap_or_default();
+            let last_block = chunk_vec
+                .last()
+                .map(|b| format!("{:?}", b))
+                .unwrap_or_default();
             let op_name = format!(
                 "eth_getBlockByNumber[batch {}] blocks {}-{}",
                 chunk_idx, first_block, last_block
             );
-            let chunk_results: Vec<Option<Block>> = with_retry(
-                &self.config.retry,
-                &op_name,
-                || async {
+            let chunk_results: Vec<Option<Block>> =
+                with_retry(&self.config.retry, &op_name, || async {
                     self.wait_for_rate_limit().await;
 
                     let futures: Vec<_> = chunk_vec
@@ -737,9 +732,8 @@ impl RpcClient {
                             .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
                     }
                     Ok(chunk_results)
-                },
-            )
-            .await?;
+                })
+                .await?;
 
             all_results.extend(chunk_results);
         }
@@ -756,7 +750,7 @@ impl RpcClient {
             for hash in hashes {
                 match self.get_transaction_receipt(hash).await {
                     Ok(receipt) => results.push(receipt),
-                    Err(e) => {                        
+                    Err(e) => {
                         tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
                         results.push(None);
                     }
@@ -809,27 +803,23 @@ impl RpcClient {
                 chunk_idx,
                 chunk_vec.len()
             );
-            let chunk_results: Vec<Vec<Log>> = with_retry(
-                &self.config.retry,
-                &op_name,
-                || async {
-                    self.wait_for_rate_limit().await;
+            let chunk_results: Vec<Vec<Log>> = with_retry(&self.config.retry, &op_name, || async {
+                self.wait_for_rate_limit().await;
 
-                    let futures: Vec<_> = chunk_vec
-                        .iter()
-                        .map(|filter| self.provider.get_logs(filter))
-                        .collect();
+                let futures: Vec<_> = chunk_vec
+                    .iter()
+                    .map(|filter| self.provider.get_logs(filter))
+                    .collect();
 
-                    let results = futures::future::join_all(futures).await;
+                let results = futures::future::join_all(futures).await;
 
-                    let mut chunk_results = Vec::with_capacity(results.len());
-                    for result in results {
-                        chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                    }
-                    Ok(chunk_results)
-                },
-            )
+                let mut chunk_results = Vec::with_capacity(results.len());
+                for result in results {
+                    chunk_results
+                        .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
+                }
+                Ok(chunk_results)
+            })
             .await?;
 
             all_results.extend(chunk_results);
@@ -853,19 +843,30 @@ impl RpcClient {
         let mut all_results = Vec::with_capacity(calls.len());
 
         for (chunk_idx, chunk) in calls.chunks(self.config.max_batch_size).enumerate() {
-            let chunk_vec: Vec<(alloy::rpc::types::TransactionRequest, BlockId)> =
-                chunk.to_vec();
-            let first_block = chunk_vec.first().map(|(_, b)| format!("{:?}", b)).unwrap_or_default();
-            let last_block = chunk_vec.last().map(|(_, b)| format!("{:?}", b)).unwrap_or_default();
-            let to_addr = chunk_vec.first().and_then(|(tx, _)| tx.to).map(|a| format!("{:?}", a)).unwrap_or_else(|| "unknown".to_string());
+            let chunk_vec: Vec<(alloy::rpc::types::TransactionRequest, BlockId)> = chunk.to_vec();
+            let first_block = chunk_vec
+                .first()
+                .map(|(_, b)| format!("{:?}", b))
+                .unwrap_or_default();
+            let last_block = chunk_vec
+                .last()
+                .map(|(_, b)| format!("{:?}", b))
+                .unwrap_or_default();
+            let to_addr = chunk_vec
+                .first()
+                .and_then(|(tx, _)| tx.to)
+                .map(|a| format!("{:?}", a))
+                .unwrap_or_else(|| "unknown".to_string());
             let op_name = format!(
                 "eth_call[batch {}] to={} blocks {}-{} ({} calls)",
-                chunk_idx, to_addr, first_block, last_block, chunk_vec.len()
+                chunk_idx,
+                to_addr,
+                first_block,
+                last_block,
+                chunk_vec.len()
             );
-            let chunk_results: Vec<Result<Bytes, RpcError>> = with_retry(
-                &self.config.retry,
-                &op_name,
-                || async {
+            let chunk_results: Vec<Result<Bytes, RpcError>> =
+                with_retry(&self.config.retry, &op_name, || async {
                     self.wait_for_rate_limit().await;
 
                     let futures: Vec<_> = chunk_vec
@@ -881,9 +882,8 @@ impl RpcClient {
                         .into_iter()
                         .map(|r| r.map_err(|e| RpcError::ProviderError(error_chain(&e))))
                         .collect())
-                },
-            )
-            .await?;
+                })
+                .await?;
 
             all_results.extend(chunk_results);
         }
@@ -929,11 +929,7 @@ impl RpcProvider for RpcClient {
         RpcClient::get_balance(self, address, block).await
     }
 
-    async fn get_code(
-        &self,
-        address: Address,
-        block: Option<BlockId>,
-    ) -> Result<Bytes, RpcError> {
+    async fn get_code(&self, address: Address, block: Option<BlockId>) -> Result<Bytes, RpcError> {
         RpcClient::get_code(self, address, block).await
     }
 

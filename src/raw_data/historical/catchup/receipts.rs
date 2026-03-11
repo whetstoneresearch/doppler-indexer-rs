@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::Sender;
 
-use crate::raw_data::historical::blocks::{get_existing_block_ranges, read_block_info_from_parquet};
+use crate::raw_data::historical::blocks::{
+    get_existing_block_ranges, read_block_info_from_parquet,
+};
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, process_range, scan_existing_logs_files, scan_existing_parquet_files,
     send_range_complete, BlockInfo, BlockRange, ChannelMetrics, EventTriggerMatcher,
@@ -50,7 +52,10 @@ pub async fn collect_receipts(
     let has_factories = factory_log_tx.is_some();
 
     let log_tx_capacity = log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
-    let factory_log_tx_capacity = factory_log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
+    let factory_log_tx_capacity = factory_log_tx
+        .as_ref()
+        .map(|s| s.max_capacity())
+        .unwrap_or(0);
 
     let mut log_tx_metrics = ChannelMetrics::default();
     let mut factory_log_tx_metrics = ChannelMetrics::default();
@@ -92,7 +97,14 @@ pub async fn collect_receipts(
             // Still need to signal range complete for downstream collectors
             // when catching up, so they know this range is done
             if has_factories || event_trigger_tx.is_some() {
-                send_range_complete(factory_log_tx, log_tx, event_trigger_tx, range.start, range.end).await?;
+                send_range_complete(
+                    factory_log_tx,
+                    log_tx,
+                    event_trigger_tx,
+                    range.start,
+                    range.end,
+                )
+                .await?;
             }
             continue;
         }
@@ -100,14 +112,14 @@ pub async fn collect_receipts(
         // Ensure block file is available locally (download from S3 if needed)
         if !block_range.file_path.exists() {
             if let Some(ref sm) = storage_manager {
-                let data_loader = DataLoader::new(
-                    Some(sm.clone()),
-                    &chain.name,
-                    PathBuf::from("data"),
-                );
+                let data_loader =
+                    DataLoader::new(Some(sm.clone()), &chain.name, PathBuf::from("data"));
                 match data_loader.ensure_local(&block_range.file_path).await {
                     Ok(true) => {
-                        tracing::debug!("Downloaded block file from S3: {}", block_range.file_path.display());
+                        tracing::debug!(
+                            "Downloaded block file from S3: {}",
+                            block_range.file_path.display()
+                        );
                     }
                     Ok(false) => {
                         tracing::warn!(
@@ -193,7 +205,14 @@ pub async fn collect_receipts(
         )
         .await?;
 
-        send_range_complete(factory_log_tx, log_tx, event_trigger_tx, range.start, range.end).await?;
+        send_range_complete(
+            factory_log_tx,
+            log_tx,
+            event_trigger_tx,
+            range.start,
+            range.end,
+        )
+        .await?;
         catchup_count += 1;
     }
 

@@ -103,10 +103,7 @@ impl InitialSyncService {
     ) -> Result<SyncProgress, StorageError> {
         let progress = Arc::new(SyncProgress::new());
 
-        tracing::info!(
-            "Starting initial S3 sync for prefixes: {:?}",
-            self.prefixes
-        );
+        tracing::info!("Starting initial S3 sync for prefixes: {:?}", self.prefixes);
 
         // Collect all local files across all prefixes
         let mut all_files = Vec::new();
@@ -142,14 +139,12 @@ impl InitialSyncService {
 
         if total == 0 {
             progress.log_summary();
-            return Ok(Arc::try_unwrap(progress).unwrap_or_else(|p| {
-                SyncProgress {
-                    scanned: AtomicU64::new(p.scanned.load(Ordering::Relaxed)),
-                    already_synced: AtomicU64::new(p.already_synced.load(Ordering::Relaxed)),
-                    uploaded: AtomicU64::new(p.uploaded.load(Ordering::Relaxed)),
-                    failed: AtomicU64::new(p.failed.load(Ordering::Relaxed)),
-                    bytes_uploaded: AtomicU64::new(p.bytes_uploaded.load(Ordering::Relaxed)),
-                }
+            return Ok(Arc::try_unwrap(progress).unwrap_or_else(|p| SyncProgress {
+                scanned: AtomicU64::new(p.scanned.load(Ordering::Relaxed)),
+                already_synced: AtomicU64::new(p.already_synced.load(Ordering::Relaxed)),
+                uploaded: AtomicU64::new(p.uploaded.load(Ordering::Relaxed)),
+                failed: AtomicU64::new(p.failed.load(Ordering::Relaxed)),
+                bytes_uploaded: AtomicU64::new(p.bytes_uploaded.load(Ordering::Relaxed)),
             }));
         }
 
@@ -182,14 +177,12 @@ impl InitialSyncService {
 
         progress.log_summary();
 
-        Ok(Arc::try_unwrap(progress).unwrap_or_else(|p| {
-            SyncProgress {
-                scanned: AtomicU64::new(p.scanned.load(Ordering::Relaxed)),
-                already_synced: AtomicU64::new(p.already_synced.load(Ordering::Relaxed)),
-                uploaded: AtomicU64::new(p.uploaded.load(Ordering::Relaxed)),
-                failed: AtomicU64::new(p.failed.load(Ordering::Relaxed)),
-                bytes_uploaded: AtomicU64::new(p.bytes_uploaded.load(Ordering::Relaxed)),
-            }
+        Ok(Arc::try_unwrap(progress).unwrap_or_else(|p| SyncProgress {
+            scanned: AtomicU64::new(p.scanned.load(Ordering::Relaxed)),
+            already_synced: AtomicU64::new(p.already_synced.load(Ordering::Relaxed)),
+            uploaded: AtomicU64::new(p.uploaded.load(Ordering::Relaxed)),
+            failed: AtomicU64::new(p.failed.load(Ordering::Relaxed)),
+            bytes_uploaded: AtomicU64::new(p.bytes_uploaded.load(Ordering::Relaxed)),
         }))
     }
 
@@ -316,10 +309,9 @@ fn parse_range_from_filename(filename: &str) -> Option<(u64, u64)> {
     if let Some(range_part) = filename.split('_').last() {
         let range_parts: Vec<&str> = range_part.split('-').collect();
         if range_parts.len() == 2 {
-            if let (Ok(start), Ok(end)) = (
-                range_parts[0].parse::<u64>(),
-                range_parts[1].parse::<u64>(),
-            ) {
+            if let (Ok(start), Ok(end)) =
+                (range_parts[0].parse::<u64>(), range_parts[1].parse::<u64>())
+            {
                 return Some((start, end));
             }
         }
@@ -342,8 +334,7 @@ mod tests {
 
     #[test]
     fn test_parse_parquet_key_historical_raw() {
-        let result =
-            parse_parquet_key("ethereum/historical/raw/blocks/blocks_0_999.parquet");
+        let result = parse_parquet_key("ethereum/historical/raw/blocks/blocks_0_999.parquet");
         assert_eq!(
             result,
             Some(("ethereum".to_string(), "raw/blocks".to_string(), 0, 999))
@@ -352,8 +343,7 @@ mod tests {
 
     #[test]
     fn test_parse_parquet_key_historical_decoded() {
-        let result =
-            parse_parquet_key("ethereum/historical/decoded/logs/v3/Swap/0_999.parquet");
+        let result = parse_parquet_key("ethereum/historical/decoded/logs/v3/Swap/0_999.parquet");
         assert_eq!(
             result,
             Some((
@@ -392,7 +382,10 @@ mod tests {
 
         // Create local files
         local
-            .write("chain/historical/raw/blocks/blocks_0_999.parquet", b"blocks data")
+            .write(
+                "chain/historical/raw/blocks/blocks_0_999.parquet",
+                b"blocks data",
+            )
             .await
             .unwrap();
         local
@@ -401,7 +394,10 @@ mod tests {
             .unwrap();
 
         // Verify not in S3
-        assert!(!s3.exists("chain/historical/raw/blocks/blocks_0_999.parquet").await.unwrap());
+        assert!(!s3
+            .exists("chain/historical/raw/blocks/blocks_0_999.parquet")
+            .await
+            .unwrap());
 
         // Run sync
         let service = Arc::new(InitialSyncService::new(
@@ -418,8 +414,14 @@ mod tests {
         assert_eq!(progress.already_synced.load(Ordering::Relaxed), 0);
 
         // Verify now in S3
-        assert!(s3.exists("chain/historical/raw/blocks/blocks_0_999.parquet").await.unwrap());
-        assert!(s3.exists("chain/historical/raw/logs/logs_0_999.parquet").await.unwrap());
+        assert!(s3
+            .exists("chain/historical/raw/blocks/blocks_0_999.parquet")
+            .await
+            .unwrap());
+        assert!(s3
+            .exists("chain/historical/raw/logs/logs_0_999.parquet")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -429,14 +431,20 @@ mod tests {
 
         // Create local file
         local
-            .write("chain/historical/raw/blocks/blocks_0_999.parquet", b"blocks data")
+            .write(
+                "chain/historical/raw/blocks/blocks_0_999.parquet",
+                b"blocks data",
+            )
             .await
             .unwrap();
 
         // Also put in S3 (already synced)
-        s3.write("chain/historical/raw/blocks/blocks_0_999.parquet", b"blocks data")
-            .await
-            .unwrap();
+        s3.write(
+            "chain/historical/raw/blocks/blocks_0_999.parquet",
+            b"blocks data",
+        )
+        .await
+        .unwrap();
 
         // Run sync
         let service = Arc::new(InitialSyncService::new(
@@ -464,7 +472,10 @@ mod tests {
             .await
             .unwrap();
         local
-            .write("chain/historical/raw/blocks/blocks_0_999.parquet", b"parquet data")
+            .write(
+                "chain/historical/raw/blocks/blocks_0_999.parquet",
+                b"parquet data",
+            )
             .await
             .unwrap();
 

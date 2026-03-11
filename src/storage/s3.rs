@@ -151,7 +151,9 @@ impl StorageBackend for S3Backend {
                 let full_path = meta.location.to_string();
                 // Strip the prefix to return relative paths
                 if !prefix.is_empty() && full_path.starts_with(prefix) {
-                    full_path[prefix.len()..].trim_start_matches('/').to_string()
+                    full_path[prefix.len()..]
+                        .trim_start_matches('/')
+                        .to_string()
                 } else {
                     full_path
                 }

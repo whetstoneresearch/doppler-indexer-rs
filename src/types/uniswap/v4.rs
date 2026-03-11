@@ -33,7 +33,10 @@ impl PoolKey {
             currency0: self.currency0,
             currency1: self.currency1,
             fee: self.fee.try_into().expect("fee exceeds uint24"),
-            tickSpacing: self.tick_spacing.try_into().expect("tick_spacing exceeds int24"),
+            tickSpacing: self
+                .tick_spacing
+                .try_into()
+                .expect("tick_spacing exceeds int24"),
             hooks: self.hooks,
         };
         keccak256(sol_key.abi_encode())

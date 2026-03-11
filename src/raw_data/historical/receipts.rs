@@ -4,6 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::{upload_parquet_to_s3, StorageManager};
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
+use crate::types::config::raw_data::ReceiptField;
 use alloy::primitives::{keccak256, B256};
 use alloy::rpc::types::Log;
 use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
@@ -13,10 +17,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
-use crate::rpc::{RpcError, UnifiedRpcClient};
-use crate::storage::{upload_parquet_to_s3, StorageManager};
-use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::raw_data::ReceiptField;
 
 #[derive(Debug, Error)]
 #[allow(dead_code)]
@@ -150,13 +150,14 @@ pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMa
             for call in calls {
                 // Iterate over all event configs (supports single or multiple events)
                 for config in call.frequency.event_configs() {
-                    let key = (config.source.clone(), compute_event_signature_hash(&config.event));
+                    let key = (
+                        config.source.clone(),
+                        compute_event_signature_hash(&config.event),
+                    );
                     if !seen.contains(&key) {
-                        if let Some(matcher) = build_matcher_for_source(
-                            &config.source,
-                            &config.event,
-                            contracts,
-                        ) {
+                        if let Some(matcher) =
+                            build_matcher_for_source(&config.source, &config.event, contracts)
+                        {
                             matchers.push(matcher);
                             seen.insert(key);
                         }
@@ -172,7 +173,10 @@ pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMa
                     for call in calls {
                         // Iterate over all event configs (supports single or multiple events)
                         for config in call.frequency.event_configs() {
-                            let key = (config.source.clone(), compute_event_signature_hash(&config.event));
+                            let key = (
+                                config.source.clone(),
+                                compute_event_signature_hash(&config.event),
+                            );
                             if !seen.contains(&key) {
                                 if let Some(matcher) = build_matcher_for_source(
                                     &config.source,
@@ -208,9 +212,7 @@ fn build_matcher_for_source(
                 set.insert(addr.0 .0);
                 set
             }
-            AddressOrAddresses::Multiple(addrs) => {
-                addrs.iter().map(|a| a.0 .0).collect()
-            }
+            AddressOrAddresses::Multiple(addrs) => addrs.iter().map(|a| a.0 .0).collect(),
         };
         return Some(EventTriggerMatcher {
             source_name: source.to_string(),
@@ -339,7 +341,12 @@ pub(crate) struct ChannelMetrics {
 }
 
 impl ChannelMetrics {
-    pub(crate) fn record_send(&mut self, send_time: std::time::Duration, capacity_before: usize, max_capacity: usize) {
+    pub(crate) fn record_send(
+        &mut self,
+        send_time: std::time::Duration,
+        capacity_before: usize,
+        max_capacity: usize,
+    ) {
         self.send_count += 1;
         self.total_send_wait_time += send_time;
 
@@ -415,7 +422,14 @@ pub(crate) async fn send_range_complete(
         }
     }
     if let Some(sender) = event_trigger_tx {
-        if sender.send(EventTriggerMessage::RangeComplete { range_start, range_end }).await.is_err() {
+        if sender
+            .send(EventTriggerMessage::RangeComplete {
+                range_start,
+                range_end,
+            })
+            .await
+            .is_err()
+        {
             tracing::error!(
                 "Failed to send RangeComplete({}-{}) to event_trigger_tx - receiver dropped",
                 range_start,
@@ -455,7 +469,11 @@ pub(crate) async fn send_logs_to_channels(
         }
 
         let send_start = Instant::now();
-        if sender.send(LogMessage::Logs(batch_logs.clone())).await.is_err() {
+        if sender
+            .send(LogMessage::Logs(batch_logs.clone()))
+            .await
+            .is_err()
+        {
             tracing::error!(
                 "Failed to send {} logs to factory_log_tx - receiver dropped",
                 log_count
@@ -532,10 +550,8 @@ pub(crate) async fn fetch_receipts_for_blocks(
 
     if let Some(method) = block_receipts_method {
         // Using block receipts method (e.g., alchemy_getTransactionReceipts)
-        let blocks_with_txs: Vec<&&BlockInfo> = blocks
-            .iter()
-            .filter(|b| !b.tx_hashes.is_empty())
-            .collect();
+        let blocks_with_txs: Vec<&&BlockInfo> =
+            blocks.iter().filter(|b| !b.tx_hashes.is_empty()).collect();
 
         for batch in blocks_with_txs.chunks(block_receipt_concurrency) {
             let block_numbers: Vec<alloy::rpc::types::BlockNumberOrTag> = batch
@@ -561,11 +577,13 @@ pub(crate) async fn fetch_receipts_for_blocks(
 
                 match receipt_fields {
                     Some(_) => {
-                        let records = process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
+                        let records =
+                            process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
                         minimal_records.extend(records);
                     }
                     None => {
-                        let records = process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+                        let records =
+                            process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
                         full_records.extend(records);
                     }
                 }
@@ -649,18 +667,23 @@ pub(crate) async fn process_range(
     let mut process_time = std::time::Duration::ZERO;
 
     if let Some(method) = block_receipts_method {
-        let blocks_with_txs: Vec<&BlockInfo> = blocks
-            .iter()
-            .filter(|b| !b.tx_hashes.is_empty())
-            .collect();
+        let blocks_with_txs: Vec<&BlockInfo> =
+            blocks.iter().filter(|b| !b.tx_hashes.is_empty()).collect();
 
         let total_blocks = blocks_with_txs.len();
         tracing::info!(
             "Fetching receipts for blocks {}-{}: {} blocks with txs using {} (concurrency: {})",
-            range.start, range.end - 1, total_blocks, method, block_receipt_concurrency
+            range.start,
+            range.end - 1,
+            total_blocks,
+            method,
+            block_receipt_concurrency
         );
 
-        for (batch_idx, batch) in blocks_with_txs.chunks(block_receipt_concurrency).enumerate() {
+        for (batch_idx, batch) in blocks_with_txs
+            .chunks(block_receipt_concurrency)
+            .enumerate()
+        {
             let batch_start = batch_idx * block_receipt_concurrency;
             let batch_end = std::cmp::min(batch_start + batch.len(), total_blocks);
 
@@ -714,23 +737,35 @@ pub(crate) async fn process_range(
 
                 match receipt_fields {
                     Some(_) => {
-                        let records = match process_receipts_minimal(&receipts, &tx_block_info, &mut batch_logs) {
+                        let records = match process_receipts_minimal(
+                            &receipts,
+                            &tx_block_info,
+                            &mut batch_logs,
+                        ) {
                             Ok(r) => r,
                             Err(e) => {
-                                tracing::error!("receipts: error processing minimal receipts: {:?}", e);
+                                tracing::error!(
+                                    "receipts: error processing minimal receipts: {:?}",
+                                    e
+                                );
                                 return Err(e);
                             }
                         };
                         all_minimal_records.extend(records);
                     }
                     None => {
-                        let records = match process_receipts_full(&receipts, &tx_block_info, &mut batch_logs) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::error!("receipts: error processing full receipts: {:?}", e);
-                                return Err(e);
-                            }
-                        };
+                        let records =
+                            match process_receipts_full(&receipts, &tx_block_info, &mut batch_logs)
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "receipts: error processing full receipts: {:?}",
+                                        e
+                                    );
+                                    return Err(e);
+                                }
+                            };
                         all_full_records.extend(records);
                     }
                 }
@@ -786,7 +821,10 @@ pub(crate) async fn process_range(
         let total_batches = (total_txs + rpc_batch_size - 1) / rpc_batch_size;
         tracing::info!(
             "Fetching receipts for blocks {}-{}: {} transactions in {} batches",
-            range.start, range.end - 1, total_txs, total_batches
+            range.start,
+            range.end - 1,
+            total_txs,
+            total_batches
         );
 
         if tx_block_info.is_empty() {
@@ -827,7 +865,8 @@ pub(crate) async fn process_range(
 
             match receipt_fields {
                 Some(_) => {
-                    let records = match process_receipts_minimal(&receipts, chunk, &mut batch_logs) {
+                    let records = match process_receipts_minimal(&receipts, chunk, &mut batch_logs)
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!("receipts: error processing minimal receipts: {:?}", e);
@@ -896,7 +935,12 @@ pub(crate) async fn process_range(
             let fields_vec = fields.to_vec();
             let output_path_clone = output_path.clone();
             tokio::task::spawn_blocking(move || {
-                write_minimal_receipts_to_parquet(&all_minimal_records, &schema_clone, &fields_vec, &output_path_clone)
+                write_minimal_receipts_to_parquet(
+                    &all_minimal_records,
+                    &schema_clone,
+                    &fields_vec,
+                    &output_path_clone,
+                )
             })
             .await
             .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
@@ -927,12 +971,25 @@ pub(crate) async fn process_range(
             range.end - 1,
         )
         .await
-        .map_err(|e| ReceiptCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+        .map_err(|e| {
+            ReceiptCollectionError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })?;
     }
 
     #[cfg(feature = "bench")]
     {
-        crate::bench::record("receipts", range.start, range.end, total_receipts, rpc_time, process_time, total_write_time);
+        crate::bench::record(
+            "receipts",
+            range.start,
+            range.end,
+            total_receipts,
+            rpc_time,
+            process_time,
+            total_write_time,
+        );
     }
 
     let total_time = range_start_time.elapsed();
@@ -974,7 +1031,13 @@ fn process_receipts_minimal(
             continue;
         };
 
-        extract_logs(&receipt.inner.logs(), block_number, timestamp, tx_hash, all_logs);
+        extract_logs(
+            &receipt.inner.logs(),
+            block_number,
+            timestamp,
+            tx_hash,
+            all_logs,
+        );
 
         records.push(MinimalReceiptRecord {
             block_number,
@@ -1168,7 +1231,8 @@ pub(crate) fn write_minimal_receipts_to_parquet(
                     .iter()
                     .map(|r| r.to_address.as_ref().map(|a| a.as_slice()))
                     .collect();
-                let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 20)?;
+                let arr =
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 20)?;
                 arrays.push(Arc::new(arr));
             }
             ReceiptField::Logs => {
@@ -1196,17 +1260,15 @@ pub(crate) fn write_full_receipts_to_parquet(
     let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp)).collect();
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        records.iter().map(|r| r.transaction_hash.as_slice()),
-    )?;
+    let arr =
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.transaction_hash.as_slice()))?;
     arrays.push(Arc::new(arr));
 
     let arr: UInt32Array = records.iter().map(|r| Some(r.transaction_index)).collect();
     arrays.push(Arc::new(arr));
 
-    let arr = FixedSizeBinaryArray::try_from_iter(
-        records.iter().map(|r| r.from_address.as_slice()),
-    )?;
+    let arr =
+        FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| r.from_address.as_slice()))?;
     arrays.push(Arc::new(arr));
 
     let values: Vec<Option<&[u8]>> = records
@@ -1216,7 +1278,10 @@ pub(crate) fn write_full_receipts_to_parquet(
     let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 20)?;
     arrays.push(Arc::new(arr));
 
-    let arr: UInt64Array = records.iter().map(|r| Some(r.cumulative_gas_used)).collect();
+    let arr: UInt64Array = records
+        .iter()
+        .map(|r| Some(r.cumulative_gas_used))
+        .collect();
     arrays.push(Arc::new(arr));
 
     let arr: UInt64Array = records.iter().map(|r| Some(r.gas_used)).collect();

@@ -212,7 +212,8 @@ impl<'de> Deserialize<'de> for Frequency {
                     || lower.ends_with('h')
                     || lower.ends_with('d')
                 {
-                    let secs = Frequency::parse_duration_string(value).map_err(de::Error::custom)?;
+                    let secs =
+                        Frequency::parse_duration_string(value).map_err(de::Error::custom)?;
                     return Ok(Frequency::Duration(secs));
                 }
 
@@ -292,7 +293,10 @@ pub enum CallTarget {
 
 impl CallTarget {
     /// Resolve this target to an address, looking up contract names from the provided contracts map.
-    pub fn resolve(&self, contracts: &std::collections::HashMap<std::string::String, super::contract::ContractConfig>) -> Option<Address> {
+    pub fn resolve(
+        &self,
+        contracts: &std::collections::HashMap<std::string::String, super::contract::ContractConfig>,
+    ) -> Option<Address> {
         match self {
             CallTarget::Address(addr) => Some(*addr),
             CallTarget::Name(name) => {
@@ -306,7 +310,10 @@ impl CallTarget {
     }
 
     /// Resolve this target to all addresses (for multi-address contracts).
-    pub fn resolve_all(&self, contracts: &std::collections::HashMap<std::string::String, super::contract::ContractConfig>) -> Option<Vec<Address>> {
+    pub fn resolve_all(
+        &self,
+        contracts: &std::collections::HashMap<std::string::String, super::contract::ContractConfig>,
+    ) -> Option<Vec<Address>> {
         match self {
             CallTarget::Address(addr) => Some(vec![*addr]),
             CallTarget::Name(name) => {
@@ -892,16 +899,13 @@ impl EvmType {
             }
             EvmType::Bytes32 => {
                 let s = value.as_string()?;
-                let bytes = s
-                    .parse::<B256>()
-                    .map_err(|_| ParamError::InvalidHex(s))?;
+                let bytes = s.parse::<B256>().map_err(|_| ParamError::InvalidHex(s))?;
                 Ok(DynSolValue::FixedBytes(bytes, 32))
             }
             EvmType::Bytes => {
                 let s = value.as_string()?;
                 let hex_str = s.strip_prefix("0x").unwrap_or(&s);
-                let bytes =
-                    hex::decode(hex_str).map_err(|_| ParamError::InvalidHex(s))?;
+                let bytes = hex::decode(hex_str).map_err(|_| ParamError::InvalidHex(s))?;
                 Ok(DynSolValue::Bytes(bytes))
             }
             EvmType::String => {
@@ -948,7 +952,11 @@ impl EvmType {
             EvmType::Int16 => DataType::Int16,
             EvmType::Int8 => DataType::Int8,
             // Large unsigned integers stored as strings to preserve precision
-            EvmType::Uint256 | EvmType::Uint160 | EvmType::Uint128 | EvmType::Uint96 | EvmType::Uint80 => DataType::Utf8,
+            EvmType::Uint256
+            | EvmType::Uint160
+            | EvmType::Uint128
+            | EvmType::Uint96
+            | EvmType::Uint80 => DataType::Utf8,
             EvmType::Uint64 => DataType::UInt64,
             EvmType::Uint32 | EvmType::Uint24 => DataType::UInt32,
             EvmType::Uint16 => DataType::UInt16,
@@ -1022,10 +1030,7 @@ fn parse_int256(s: &str) -> Result<I256, ParamError> {
     }
 }
 
-pub fn encode_call_with_params(
-    function_selector: [u8; 4],
-    params: &[DynSolValue],
-) -> Bytes {
+pub fn encode_call_with_params(function_selector: [u8; 4], params: &[DynSolValue]) -> Bytes {
     if params.is_empty() {
         return Bytes::copy_from_slice(&function_selector);
     }
@@ -1158,7 +1163,8 @@ mod tests {
 
     #[test]
     fn test_frequency_deserialize_on_events() {
-        let json = r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
+        let json =
+            r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
         let freq: Frequency = serde_json::from_str(json).unwrap();
         assert!(freq.is_on_events());
         let configs = freq.event_configs();
@@ -1201,7 +1207,8 @@ mod tests {
 
     #[test]
     fn test_param_config_static() {
-        let json = r#"{"type": "address", "values": ["0x1234567890abcdef1234567890abcdef12345678"]}"#;
+        let json =
+            r#"{"type": "address", "values": ["0x1234567890abcdef1234567890abcdef12345678"]}"#;
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
         assert!(param.values().is_some());
@@ -1457,15 +1464,25 @@ mod tests {
         let configs = freq.event_configs();
         assert_eq!(configs.len(), 3);
         assert_eq!(configs[0].source, "V3Pool");
-        assert_eq!(configs[0].event, "Swap(address,address,int256,int256,uint160,uint128,int24)");
-        assert_eq!(configs[1].event, "Mint(address,int24,int24,uint128,uint256,uint256)");
-        assert_eq!(configs[2].event, "Burn(address,int24,int24,uint128,uint256,uint256)");
+        assert_eq!(
+            configs[0].event,
+            "Swap(address,address,int256,int256,uint160,uint128,int24)"
+        );
+        assert_eq!(
+            configs[1].event,
+            "Mint(address,int24,int24,uint128,uint256,uint256)"
+        );
+        assert_eq!(
+            configs[2].event,
+            "Burn(address,int24,int24,uint128,uint256,uint256)"
+        );
     }
 
     #[test]
     fn test_frequency_deserialize_on_events_single_still_works() {
         // Backward compatibility - single object syntax still works
-        let json = r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
+        let json =
+            r#"{"on_events": {"source": "Token", "event": "Transfer(address,address,uint256)"}}"#;
         let freq: Frequency = serde_json::from_str(json).unwrap();
         assert!(freq.is_on_events());
         let configs = freq.event_configs();
@@ -1479,7 +1496,11 @@ mod tests {
         let result: Result<Frequency, _> = serde_json::from_str(json);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "Expected error about empty array, got: {}", err);
+        assert!(
+            err.contains("empty"),
+            "Expected error about empty array, got: {}",
+            err
+        );
     }
 
     #[test]

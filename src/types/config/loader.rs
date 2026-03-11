@@ -202,7 +202,9 @@ mod tests {
 
         let result: Result<HashMap<String, String>, _> = load_config_from_dir(dir.path());
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigLoadError::DuplicateKey { key, .. } if key == "key1"));
+        assert!(
+            matches!(result.unwrap_err(), ConfigLoadError::DuplicateKey { key, .. } if key == "key1")
+        );
     }
 
     #[test]
@@ -233,8 +235,7 @@ mod tests {
         fs::create_dir(&subdir).unwrap();
         fs::write(subdir.join("a.json"), r#"{"key1": "value1"}"#).unwrap();
 
-        let config: HashMap<String, String> =
-            load_config_from_path(dir.path(), "configs").unwrap();
+        let config: HashMap<String, String> = load_config_from_path(dir.path(), "configs").unwrap();
         assert_eq!(config.get("key1"), Some(&"value1".to_string()));
     }
 
@@ -242,7 +243,10 @@ mod tests {
     fn test_read_error() {
         let result: Result<HashMap<String, String>, _> =
             load_config_from_file(Path::new("/nonexistent/path.json"));
-        assert!(matches!(result.unwrap_err(), ConfigLoadError::ReadError { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigLoadError::ReadError { .. }
+        ));
     }
 
     #[test]
@@ -252,6 +256,9 @@ mod tests {
         fs::write(&file_path, "not valid json").unwrap();
 
         let result: Result<HashMap<String, String>, _> = load_config_from_file(&file_path);
-        assert!(matches!(result.unwrap_err(), ConfigLoadError::ParseError { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ConfigLoadError::ParseError { .. }
+        ));
     }
 }

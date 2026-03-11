@@ -11,9 +11,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::decoding::logs::{
-    process_logs, EventMatcher, LogDecodingError,
-};
+use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::DecodedEventsMessage;
@@ -270,8 +268,7 @@ fn get_missing_matchers(
                         }
                     }
                     // Check if output file is missing
-                    let rel_path =
-                        format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
+                    let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
                     !existing.contains(&rel_path)
                 })
                 .cloned()
@@ -349,10 +346,7 @@ fn load_factory_addresses_for_catchup(
                     }
 
                     // Parse range from filename
-                    let file_name = file_path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
+                    let file_name = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                     let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
                     let parts: Vec<&str> = range_str.split('-').collect();
                     if parts.len() != 2 {
@@ -382,7 +376,9 @@ fn load_factory_addresses_for_catchup(
 }
 
 /// Read factory addresses from a factory parquet file
-pub fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, LogDecodingError> {
+pub fn read_factory_addresses_from_parquet(
+    path: &Path,
+) -> Result<HashSet<[u8; 20]>, LogDecodingError> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     let reader = builder.build()?;
@@ -511,10 +507,8 @@ pub fn read_logs_from_parquet(path: &Path) -> Result<Vec<LogData>, LogDecodingEr
                         .downcast_ref::<ListArray>()
                         .and_then(|list| {
                             let values = list.value(row);
-                            values
-                                .as_any()
-                                .downcast_ref::<FixedSizeBinaryArray>()
-                                .map(|topics_arr| {
+                            values.as_any().downcast_ref::<FixedSizeBinaryArray>().map(
+                                |topics_arr| {
                                     (0..topics_arr.len())
                                         .filter_map(|j| {
                                             let bytes = topics_arr.value(j);
@@ -527,7 +521,8 @@ pub fn read_logs_from_parquet(path: &Path) -> Result<Vec<LogData>, LogDecodingEr
                                             }
                                         })
                                         .collect::<Vec<[u8; 32]>>()
-                                })
+                                },
+                            )
                         })
                 })
                 .unwrap_or_default();

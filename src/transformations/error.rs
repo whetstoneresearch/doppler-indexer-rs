@@ -53,7 +53,7 @@ pub enum TransformationError {
     ChannelError(String),
 
     #[error("Includes precompile address: {0}")]
-    IncludesPrecompileError(String)
+    IncludesPrecompileError(String),
 }
 
 #[allow(dead_code)]

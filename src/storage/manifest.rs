@@ -45,15 +45,13 @@ impl Marker {
 
     /// Serialize to JSON bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, StorageError> {
-        serde_json::to_vec(self)
-            .map_err(|e| StorageError::Serialization(e.to_string()))
+        serde_json::to_vec(self).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
     /// Deserialize from JSON bytes.
     #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| StorageError::Serialization(e.to_string()))
+        serde_json::from_slice(bytes).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 }
 
@@ -103,19 +101,19 @@ impl S3Manifest {
 
     /// Serialize to JSON bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, StorageError> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|e| StorageError::Serialization(e.to_string()))
+        serde_json::to_vec_pretty(self).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
     /// Deserialize from JSON bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| StorageError::Serialization(e.to_string()))
+        serde_json::from_slice(bytes).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
     /// Check if a raw blocks range exists in the manifest.
     pub fn has_raw_blocks(&self, start: u64, end: u64) -> bool {
-        self.raw_blocks.iter().any(|(s, e)| *s == start && *e == end)
+        self.raw_blocks
+            .iter()
+            .any(|(s, e)| *s == start && *e == end)
     }
 
     /// Check if a raw logs range exists.
@@ -125,7 +123,9 @@ impl S3Manifest {
 
     /// Check if a raw receipts range exists.
     pub fn has_raw_receipts(&self, start: u64, end: u64) -> bool {
-        self.raw_receipts.iter().any(|(s, e)| *s == start && *e == end)
+        self.raw_receipts
+            .iter()
+            .any(|(s, e)| *s == start && *e == end)
     }
 
     /// Check if a raw eth_calls range exists for a specific contract/function.
@@ -517,7 +517,11 @@ impl ManifestManager {
     }
 
     /// Helper to aggregate markers for a single data type.
-    async fn aggregate_raw_markers<F>(&self, prefix: &str, mut add_fn: F) -> Result<(), StorageError>
+    async fn aggregate_raw_markers<F>(
+        &self,
+        prefix: &str,
+        mut add_fn: F,
+    ) -> Result<(), StorageError>
     where
         F: FnMut(u64, u64),
     {
@@ -726,7 +730,10 @@ mod tests {
     #[test]
     fn test_parse_marker_filename() {
         assert_eq!(parse_marker_filename("0_999.marker"), Some((0, 999)));
-        assert_eq!(parse_marker_filename("1000_1999.marker"), Some((1000, 1999)));
+        assert_eq!(
+            parse_marker_filename("1000_1999.marker"),
+            Some((1000, 1999))
+        );
         assert_eq!(parse_marker_filename("invalid.marker"), None);
     }
 }

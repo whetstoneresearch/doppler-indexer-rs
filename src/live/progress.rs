@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use tokio_postgres::types::ToSql;
 
-use crate::db::DbPool;
 use super::error::LiveError;
 use super::storage::LiveStorage;
+use crate::db::DbPool;
 
 /// Tracks per-block progress for all handlers.
 pub struct LiveProgressTracker {
@@ -165,10 +165,7 @@ impl LiveProgressTracker {
     /// Get the set of handlers that have NOT completed for a block.
     pub fn get_pending_handlers(&self, block_number: u64) -> HashSet<String> {
         let completed = self.get_completed_handlers(block_number);
-        self.handler_keys
-            .difference(&completed)
-            .cloned()
-            .collect()
+        self.handler_keys.difference(&completed).cloned().collect()
     }
 
     /// Clear progress for a block (used after compaction).
@@ -253,9 +250,7 @@ impl LiveProgressTracker {
     /// Get blocks that are complete within a range.
     #[allow(dead_code)]
     pub fn get_complete_blocks_in_range(&self, from: u64, to: u64) -> Vec<u64> {
-        (from..=to)
-            .filter(|&n| self.is_block_complete(n))
-            .collect()
+        (from..=to).filter(|&n| self.is_block_complete(n)).collect()
     }
 
     /// Get the lowest block number that is not complete.

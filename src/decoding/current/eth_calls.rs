@@ -10,12 +10,12 @@ use crate::decoding::catchup::eth_calls::{
     read_raw_parquet_function_names,
 };
 use crate::decoding::eth_calls::{
-    build_result_map, decode_value, CallDecodeConfig, DecodedValue, EthCallDecodingError,
-    EventCallDecodeConfig, process_event_calls, process_once_calls, process_regular_calls,
+    build_result_map, decode_value, process_event_calls, process_once_calls, process_regular_calls,
+    CallDecodeConfig, DecodedValue, EthCallDecodingError, EventCallDecodeConfig,
 };
 use crate::decoding::types::DecoderMessage;
-use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
 use crate::live::LiveStorage;
+use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
 use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteKind,
     RangeCompleteMessage,
@@ -91,8 +91,10 @@ pub async fn decode_eth_calls_live(
                 if let Some(config) = config {
                     if live_mode {
                         // Live mode: decode and write to bincode storage
-                        let mut decoded_calls: Vec<LiveDecodedCall> = Vec::with_capacity(results.len());
-                        let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
+                        let mut decoded_calls: Vec<LiveDecodedCall> =
+                            Vec::with_capacity(results.len());
+                        let mut transform_calls: Vec<TransformDecodedCall> =
+                            Vec::with_capacity(results.len());
 
                         for result in &results {
                             match decode_value(&result.value, &config.output_type) {
@@ -105,7 +107,11 @@ pub async fn decode_eth_calls_live(
                                         source_name: contract_name.clone(),
                                         function_name: function_name.clone(),
                                         trigger_log_index: None,
-                                        result: build_result_map(&decoded, &config.output_type, &function_name),
+                                        result: build_result_map(
+                                            &decoded,
+                                            &config.output_type,
+                                            &function_name,
+                                        ),
                                     });
 
                                     // Build live call for bincode storage
@@ -137,7 +143,10 @@ pub async fn decode_eth_calls_live(
                             ) {
                                 tracing::warn!(
                                     "Failed to write decoded eth_calls for {}/{} at block {}: {}",
-                                    contract_name, function_name, range_start, e
+                                    contract_name,
+                                    function_name,
+                                    range_start,
+                                    e
                                 );
                             }
                         }
@@ -160,7 +169,10 @@ pub async fn decode_eth_calls_live(
                         if let Ok(mut status) = live_storage.read_status(range_start) {
                             status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
-                                tracing::warn!("Failed to update block status after eth_call decoding: {}", e);
+                                tracing::warn!(
+                                    "Failed to update block status after eth_call decoding: {}",
+                                    e
+                                );
                             } else {
                                 tracing::debug!("Block {} eth_calls decoded", range_start);
                             }
@@ -195,10 +207,13 @@ pub async fn decode_eth_calls_live(
                 if !configs.is_empty() {
                     if live_mode {
                         // Live mode: decode and write to bincode storage
-                        let mut decoded_once_calls: Vec<LiveDecodedOnceCall> = Vec::with_capacity(results.len());
+                        let mut decoded_once_calls: Vec<LiveDecodedOnceCall> =
+                            Vec::with_capacity(results.len());
                         // Group transform calls by function name
-                        let mut transform_calls_by_fn: std::collections::HashMap<String, Vec<TransformDecodedCall>> =
-                            std::collections::HashMap::new();
+                        let mut transform_calls_by_fn: std::collections::HashMap<
+                            String,
+                            Vec<TransformDecodedCall>,
+                        > = std::collections::HashMap::new();
 
                         for result in &results {
                             let mut decoded_values: Vec<(String, LiveDecodedValue)> = Vec::new();
@@ -215,7 +230,11 @@ pub async fn decode_eth_calls_live(
                                                 source_name: contract_name.clone(),
                                                 function_name: config.function_name.clone(),
                                                 trigger_log_index: None,
-                                                result: build_result_map(&decoded, &config.output_type, &config.function_name),
+                                                result: build_result_map(
+                                                    &decoded,
+                                                    &config.output_type,
+                                                    &config.function_name,
+                                                ),
                                             };
                                             transform_calls_by_fn
                                                 .entry(config.function_name.clone())
@@ -259,7 +278,9 @@ pub async fn decode_eth_calls_live(
                             ) {
                                 tracing::warn!(
                                     "Failed to write decoded once_calls for {} at block {}: {}",
-                                    contract_name, range_start, e
+                                    contract_name,
+                                    range_start,
+                                    e
                                 );
                             }
                         }
@@ -284,7 +305,10 @@ pub async fn decode_eth_calls_live(
                         if let Ok(mut status) = live_storage.read_status(range_start) {
                             status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
-                                tracing::warn!("Failed to update block status after once_call decoding: {}", e);
+                                tracing::warn!(
+                                    "Failed to update block status after once_call decoding: {}",
+                                    e
+                                );
                             }
                         }
                     } else {
@@ -318,8 +342,10 @@ pub async fn decode_eth_calls_live(
                 {
                     if live_mode {
                         // Live mode: decode and write to bincode storage
-                        let mut decoded_event_calls: Vec<LiveDecodedEventCall> = Vec::with_capacity(results.len());
-                        let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
+                        let mut decoded_event_calls: Vec<LiveDecodedEventCall> =
+                            Vec::with_capacity(results.len());
+                        let mut transform_calls: Vec<TransformDecodedCall> =
+                            Vec::with_capacity(results.len());
 
                         for result in &results {
                             match decode_value(&result.value, &config.output_type) {
@@ -332,7 +358,11 @@ pub async fn decode_eth_calls_live(
                                         source_name: contract_name.clone(),
                                         function_name: function_name.clone(),
                                         trigger_log_index: Some(result.log_index),
-                                        result: build_result_map(&decoded, &config.output_type, &function_name),
+                                        result: build_result_map(
+                                            &decoded,
+                                            &config.output_type,
+                                            &function_name,
+                                        ),
                                     });
 
                                     // Build live call for bincode storage
@@ -366,7 +396,10 @@ pub async fn decode_eth_calls_live(
                             ) {
                                 tracing::warn!(
                                     "Failed to write decoded event_calls for {}/{} at block {}: {}",
-                                    contract_name, function_name, range_start, e
+                                    contract_name,
+                                    function_name,
+                                    range_start,
+                                    e
                                 );
                             }
                         }
@@ -389,7 +422,10 @@ pub async fn decode_eth_calls_live(
                         if let Ok(mut status) = live_storage.read_status(range_start) {
                             status.eth_calls_decoded = true;
                             if let Err(e) = live_storage.write_status(range_start, &status) {
-                                tracing::warn!("Failed to update block status after event_call decoding: {}", e);
+                                tracing::warn!(
+                                    "Failed to update block status after event_call decoding: {}",
+                                    e
+                                );
                             }
                         }
                     } else {
@@ -416,7 +452,10 @@ pub async fn decode_eth_calls_live(
                     let _ = live_storage.delete_all_decoded_calls(block_number);
                 }
             }
-            Some(DecoderMessage::EthCallsBlockComplete { range_start, range_end }) => {
+            Some(DecoderMessage::EthCallsBlockComplete {
+                range_start,
+                range_end,
+            }) => {
                 if let Some(tx) = complete_tx {
                     let msg = RangeCompleteMessage {
                         range_start,
@@ -504,9 +543,7 @@ pub async fn decode_eth_calls_live(
                 // while raw backfill was still adding new columns (e.g., getAssetData).
                 // This second pass picks up the newly added columns with fresh indexes.
                 if raw_calls_dir.exists() {
-                    tracing::info!(
-                        "Raw collection complete, re-running decode catchup"
-                    );
+                    tracing::info!("Raw collection complete, re-running decode catchup");
                     catchup::catchup_decode_eth_calls(
                         raw_calls_dir,
                         output_base,

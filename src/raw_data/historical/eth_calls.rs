@@ -6,24 +6,32 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
-use futures::{stream, StreamExt, TryStreamExt};
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array,
+    UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use futures::{stream, StreamExt, TryStreamExt};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
-use crate::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult, EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult};
+use crate::decoding::{
+    DecoderMessage, EthCallResult as DecoderEthCallResult,
+    EventCallResult as DecoderEventCallResult, OnceCallResult as DecoderOnceCallResult,
+};
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::receipts::{EventTriggerData, LogData};
-use crate::storage::{upload_parquet_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::{upload_parquet_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue};
+use crate::types::config::eth_call::{
+    encode_call_with_params, EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue,
+};
 use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 
 #[derive(Debug, Error)]
@@ -209,7 +217,8 @@ pub fn build_event_triggered_call_configs(
                     let key = (trigger_config.source.clone(), event_hash);
 
                     let selector = compute_function_selector(&call.function);
-                    let function_name = call.function
+                    let function_name = call
+                        .function
                         .split('(')
                         .next()
                         .unwrap_or(&call.function)
@@ -233,15 +242,18 @@ pub fn build_event_triggered_call_configs(
 
                     // For each target address, create a config
                     for address in &target_addrs {
-                        configs.entry(key.clone()).or_default().push(EventTriggeredCallConfig {
-                            contract_name: contract_name.clone(),
-                            target_address: Some(*address),
-                            function_name: function_name.clone(),
-                            function_selector: selector,
-                            params: call.params.clone(),
-                            is_factory: false,
-                            start_block,
-                        });
+                        configs
+                            .entry(key.clone())
+                            .or_default()
+                            .push(EventTriggeredCallConfig {
+                                contract_name: contract_name.clone(),
+                                target_address: Some(*address),
+                                function_name: function_name.clone(),
+                                function_selector: selector,
+                                params: call.params.clone(),
+                                is_factory: false,
+                                start_block,
+                            });
                     }
                 }
             }
@@ -258,7 +270,8 @@ pub fn build_event_triggered_call_configs(
                             let key = (trigger_config.source.clone(), event_hash);
 
                             let selector = compute_function_selector(&call.function);
-                            let function_name = call.function
+                            let function_name = call
+                                .function
                                 .split('(')
                                 .next()
                                 .unwrap_or(&call.function)
@@ -276,16 +289,18 @@ pub fn build_event_triggered_call_configs(
                                 resolved
                             });
 
-                            configs.entry(key.clone()).or_default().push(EventTriggeredCallConfig {
-                                contract_name: factory.collection.clone(),
-                                target_address,
-                                function_name: function_name.clone(),
-                                function_selector: selector,
-                                params: call.params.clone(),
-                                is_factory: true,
-                                // Factory events use discovery block, not start_block
-                                start_block: None,
-                            });
+                            configs.entry(key.clone()).or_default().push(
+                                EventTriggeredCallConfig {
+                                    contract_name: factory.collection.clone(),
+                                    target_address,
+                                    function_name: function_name.clone(),
+                                    function_selector: selector,
+                                    params: call.params.clone(),
+                                    is_factory: true,
+                                    // Factory events use discovery block, not start_block
+                                    start_block: None,
+                                },
+                            );
                         }
                     }
                 }
@@ -358,10 +373,7 @@ pub(crate) fn extract_param_from_event(
             ))
         })?;
         let idx: usize = idx_str.parse().map_err(|_| {
-            EthCallCollectionError::EventParamExtraction(format!(
-                "Invalid data index: {}",
-                idx_str
-            ))
+            EthCallCollectionError::EventParamExtraction(format!("Invalid data index: {}", idx_str))
         })?;
 
         // Data is stored as 32-byte words
@@ -507,21 +519,15 @@ pub(crate) fn extract_value_from_32_bytes(
         // Named types delegate to inner type
         EvmType::Named { inner, .. } => extract_value_from_32_bytes(bytes, inner),
         // NamedTuple not supported for event param extraction
-        EvmType::NamedTuple(_) => {
-            Err(EthCallCollectionError::EventParamExtraction(
-                "NamedTuple cannot be used as a parameter type".to_string(),
-            ))
-        }
-        EvmType::UnnamedTuple(_) => {
-            Err(EthCallCollectionError::EventParamExtraction(
-                "UnnamedTuple cannot be used as a parameter type".to_string(),
-            ))
-        }
-        EvmType::Array(_) => {
-            Err(EthCallCollectionError::EventParamExtraction(
-                "Array cannot be used as a parameter type".to_string(),
-            ))
-        }
+        EvmType::NamedTuple(_) => Err(EthCallCollectionError::EventParamExtraction(
+            "NamedTuple cannot be used as a parameter type".to_string(),
+        )),
+        EvmType::UnnamedTuple(_) => Err(EthCallCollectionError::EventParamExtraction(
+            "UnnamedTuple cannot be used as a parameter type".to_string(),
+        )),
+        EvmType::Array(_) => Err(EthCallCollectionError::EventParamExtraction(
+            "Array cannot be used as a parameter type".to_string(),
+        )),
     }
 }
 
@@ -598,7 +604,10 @@ pub fn build_event_call_params(
                     ));
                 }
             }
-            ParamConfig::FromEvent { param_type, from_event } => {
+            ParamConfig::FromEvent {
+                param_type,
+                from_event,
+            } => {
                 let (dyn_val, encoded) = extract_param_from_event(trigger, from_event, param_type)?;
                 params.push(dyn_val);
                 encoded_params.push(encoded);
@@ -657,14 +666,29 @@ pub(crate) async fn process_event_triggers(
     if triggers.is_empty() {
         // Write empty files for all configured pairs
         for (contract_name, function_name) in &configured_pairs {
-            write_empty_event_call_file(output_dir, contract_name, function_name, range_start, range_end)?;
+            write_empty_event_call_file(
+                output_dir,
+                contract_name,
+                function_name,
+                range_start,
+                range_end,
+            )?;
         }
         return Ok(());
     }
 
     // Group triggers by (source_name, event_signature) and then by (contract_name, function_name)
     // to batch calls together
-    let mut calls_by_output: HashMap<(String, String), Vec<(EventTriggerData, EventTriggeredCallConfig, Address, Vec<DynSolValue>, Vec<Vec<u8>>)>> = HashMap::new();
+    let mut calls_by_output: HashMap<
+        (String, String),
+        Vec<(
+            EventTriggerData,
+            EventTriggeredCallConfig,
+            Address,
+            Vec<DynSolValue>,
+            Vec<Vec<u8>>,
+        )>,
+    > = HashMap::new();
 
     for trigger in triggers {
         let key = (trigger.source_name.clone(), trigger.event_signature);
@@ -711,24 +735,28 @@ pub(crate) async fn process_event_triggers(
                 };
 
                 // Build parameters
-                let (params, encoded_params) = match build_event_call_params(&trigger, &config.params) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to build params for {}.{} from event: {}",
-                            config.contract_name,
-                            config.function_name,
-                            e
-                        );
-                        continue;
-                    }
-                };
+                let (params, encoded_params) =
+                    match build_event_call_params(&trigger, &config.params) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to build params for {}.{} from event: {}",
+                                config.contract_name,
+                                config.function_name,
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
                 let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output
-                    .entry(output_key)
-                    .or_default()
-                    .push((trigger.clone(), config.clone(), target_address, params, encoded_params));
+                calls_by_output.entry(output_key).or_default().push((
+                    trigger.clone(),
+                    config.clone(),
+                    target_address,
+                    params,
+                    encoded_params,
+                ));
             }
         }
     }
@@ -746,8 +774,16 @@ pub(crate) async fn process_event_triggers(
         written_pairs.insert((contract_name.clone(), function_name.clone()));
 
         // Get block range for output file naming
-        let min_block = calls.iter().map(|(t, _, _, _, _)| t.block_number).min().unwrap();
-        let max_block = calls.iter().map(|(t, _, _, _, _)| t.block_number).max().unwrap();
+        let min_block = calls
+            .iter()
+            .map(|(t, _, _, _, _)| t.block_number)
+            .min()
+            .unwrap();
+        let max_block = calls
+            .iter()
+            .map(|(t, _, _, _, _)| t.block_number)
+            .max()
+            .unwrap();
 
         tracing::info!(
             "Processing {} event-triggered eth_calls for {}.{} (blocks {}-{})",
@@ -759,7 +795,13 @@ pub(crate) async fn process_event_triggers(
         );
 
         // Build RPC calls
-        let mut pending_calls: Vec<(TransactionRequest, BlockId, &EventTriggerData, Address, Vec<Vec<u8>>)> = Vec::new();
+        let mut pending_calls: Vec<(
+            TransactionRequest,
+            BlockId,
+            &EventTriggerData,
+            Address,
+            Vec<Vec<u8>>,
+        )> = Vec::new();
 
         for (trigger, config, target_address, params, encoded_params) in &calls {
             let calldata = encode_call_with_params(config.function_selector, params);
@@ -767,26 +809,51 @@ pub(crate) async fn process_event_triggers(
                 .to(*target_address)
                 .input(calldata.into());
             let block_id = BlockId::Number(BlockNumberOrTag::Number(trigger.block_number));
-            pending_calls.push((tx, block_id, trigger, *target_address, encoded_params.clone()));
+            pending_calls.push((
+                tx,
+                block_id,
+                trigger,
+                *target_address,
+                encoded_params.clone(),
+            ));
         }
 
         // Execute calls in batches with concurrent chunk processing
-        let max_params = calls.iter().map(|(_, _, _, _, p)| p.len()).max().unwrap_or(0);
+        let max_params = calls
+            .iter()
+            .map(|(_, _, _, _, p)| p.len())
+            .max()
+            .unwrap_or(0);
 
         // Number of chunks to process concurrently
         let chunk_concurrency = 4;
 
         // Pre-collect chunks into owned data to avoid lifetime issues
-        let owned_chunks: Vec<Vec<(TransactionRequest, BlockId, EventTriggerData, Address, Vec<Vec<u8>>)>> =
-            pending_calls.chunks(rpc_batch_size)
-                .map(|chunk| {
-                    chunk.iter()
-                        .map(|(tx, block_id, trigger, addr, params)| {
-                            (tx.clone(), *block_id, (*trigger).clone(), *addr, params.clone())
-                        })
-                        .collect()
-                })
-                .collect();
+        let owned_chunks: Vec<
+            Vec<(
+                TransactionRequest,
+                BlockId,
+                EventTriggerData,
+                Address,
+                Vec<Vec<u8>>,
+            )>,
+        > = pending_calls
+            .chunks(rpc_batch_size)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|(tx, block_id, trigger, addr, params)| {
+                        (
+                            tx.clone(),
+                            *block_id,
+                            (*trigger).clone(),
+                            *addr,
+                            params.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
 
         let chunk_results: Vec<Vec<EventCallResult>> = stream::iter(owned_chunks)
             .map(|chunk| {
@@ -845,7 +912,10 @@ pub(crate) async fn process_event_triggers(
 
         // Write to parquet and send to decoder
         if !all_results.is_empty() {
-            let sub_dir = output_dir.join(&contract_name).join(&function_name).join("on_events");
+            let sub_dir = output_dir
+                .join(&contract_name)
+                .join(&function_name)
+                .join("on_events");
             std::fs::create_dir_all(&sub_dir)?;
 
             let file_name = format!("{}-{}.parquet", min_block, max_block);
@@ -862,7 +932,10 @@ pub(crate) async fn process_event_triggers(
 
             // Upload to S3 if configured
             if let Some(sm) = storage_manager {
-                let data_type = format!("raw/eth_calls/{}/{}/on_events", contract_name, function_name);
+                let data_type = format!(
+                    "raw/eth_calls/{}/{}/on_events",
+                    contract_name, function_name
+                );
                 upload_parquet_to_s3(
                     sm,
                     &output_path,
@@ -888,14 +961,16 @@ pub(crate) async fn process_event_triggers(
                     })
                     .collect();
 
-                let _ = tx.send(DecoderMessage::EventCallsReady {
-                    range_start: min_block,
-                    range_end: max_block,
-                    contract_name: contract_name.clone(),
-                    function_name: function_name.clone(),
-                    results: decoder_results,
-                    live_mode: false,
-                }).await;
+                let _ = tx
+                    .send(DecoderMessage::EventCallsReady {
+                        range_start: min_block,
+                        range_end: max_block,
+                        contract_name: contract_name.clone(),
+                        function_name: function_name.clone(),
+                        results: decoder_results,
+                        live_mode: false,
+                    })
+                    .await;
             }
         }
     }
@@ -903,7 +978,13 @@ pub(crate) async fn process_event_triggers(
     // Write empty files for configured pairs that didn't have any matching events
     for (contract_name, function_name) in configured_pairs {
         if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
-            write_empty_event_call_file(output_dir, &contract_name, &function_name, range_start, range_end)?;
+            write_empty_event_call_file(
+                output_dir,
+                &contract_name,
+                &function_name,
+                range_start,
+                range_end,
+            )?;
         }
     }
 
@@ -918,7 +999,10 @@ fn write_empty_event_call_file(
     range_start: u64,
     range_end: u64,
 ) -> Result<(), EthCallCollectionError> {
-    let sub_dir = output_dir.join(contract_name).join(function_name).join("on_events");
+    let sub_dir = output_dir
+        .join(contract_name)
+        .join(function_name)
+        .join("on_events");
     std::fs::create_dir_all(&sub_dir)?;
 
     let file_name = format!("{}-{}.parquet", range_start, range_end);
@@ -961,7 +1045,13 @@ pub(crate) async fn process_event_triggers_multicall(
     if triggers.is_empty() {
         // Write empty files for all configured pairs
         for (contract_name, function_name) in &configured_pairs {
-            write_empty_event_call_file(output_dir, contract_name, function_name, range_start, range_end)?;
+            write_empty_event_call_file(
+                output_dir,
+                contract_name,
+                function_name,
+                range_start,
+                range_end,
+            )?;
         }
         return Ok(());
     }
@@ -969,7 +1059,16 @@ pub(crate) async fn process_event_triggers_multicall(
     // Group triggers by (source_name, event_signature) and prepare call info
     // Key: (contract_name, function_name)
     // Value: Vec<(EventTriggerData, EventTriggeredCallConfig, Address, params, encoded_params)>
-    let mut calls_by_output: HashMap<(String, String), Vec<(EventTriggerData, EventTriggeredCallConfig, Address, Vec<DynSolValue>, Vec<Vec<u8>>)>> = HashMap::new();
+    let mut calls_by_output: HashMap<
+        (String, String),
+        Vec<(
+            EventTriggerData,
+            EventTriggeredCallConfig,
+            Address,
+            Vec<DynSolValue>,
+            Vec<Vec<u8>>,
+        )>,
+    > = HashMap::new();
 
     for trigger in triggers {
         let key = (trigger.source_name.clone(), trigger.event_signature);
@@ -1003,24 +1102,28 @@ pub(crate) async fn process_event_triggers_multicall(
                 };
 
                 // Build parameters
-                let (params, encoded_params) = match build_event_call_params(&trigger, &config.params) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to build params for {}.{} from event: {}",
-                            config.contract_name,
-                            config.function_name,
-                            e
-                        );
-                        continue;
-                    }
-                };
+                let (params, encoded_params) =
+                    match build_event_call_params(&trigger, &config.params) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to build params for {}.{} from event: {}",
+                                config.contract_name,
+                                config.function_name,
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
                 let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output
-                    .entry(output_key)
-                    .or_default()
-                    .push((trigger.clone(), config.clone(), target_address, params, encoded_params));
+                calls_by_output.entry(output_key).or_default().push((
+                    trigger.clone(),
+                    config.clone(),
+                    target_address,
+                    params,
+                    encoded_params,
+                ));
             }
         }
     }
@@ -1066,7 +1169,8 @@ pub(crate) async fn process_event_triggers_multicall(
             let mut slots: Vec<MulticallSlotGeneric<(EventCallMeta, u64, u64)>> = Vec::new();
 
             for call_info in calls {
-                let calldata = encode_call_with_params(call_info.config.function_selector, &call_info.params);
+                let calldata =
+                    encode_call_with_params(call_info.config.function_selector, &call_info.params);
                 slots.push(MulticallSlotGeneric {
                     block_number,
                     block_timestamp: call_info.trigger.block_timestamp,
@@ -1101,8 +1205,16 @@ pub(crate) async fn process_event_triggers_multicall(
     }
 
     // Get min/max blocks for logging and file naming
-    let min_block = block_multicalls.iter().map(|bm| bm.block_number).min().unwrap();
-    let max_block = block_multicalls.iter().map(|bm| bm.block_number).max().unwrap();
+    let min_block = block_multicalls
+        .iter()
+        .map(|bm| bm.block_number)
+        .min()
+        .unwrap();
+    let max_block = block_multicalls
+        .iter()
+        .map(|bm| bm.block_number)
+        .max()
+        .unwrap();
 
     tracing::info!(
         "Executing {} multicalls for event-triggered calls in blocks {}-{}",
@@ -1112,30 +1224,23 @@ pub(crate) async fn process_event_triggers_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        client,
-        multicall3_address,
-        block_multicalls,
-        rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+            .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
 
     for ((meta, block_number, block_timestamp), return_data, _success) in results {
         let key = (meta.contract_name.clone(), meta.function_name.clone());
-        group_results
-            .entry(key)
-            .or_default()
-            .push(EventCallResult {
-                block_number,
-                block_timestamp,
-                log_index: meta.log_index,
-                target_address: meta.target_address.0 .0,
-                value_bytes: return_data,
-                param_values: meta.param_values,
-            });
+        group_results.entry(key).or_default().push(EventCallResult {
+            block_number,
+            block_timestamp,
+            log_index: meta.log_index,
+            target_address: meta.target_address.0 .0,
+            value_bytes: return_data,
+            param_values: meta.param_values,
+        });
     }
 
     // Track which (contract_name, function_name) pairs got results
@@ -1153,14 +1258,21 @@ pub(crate) async fn process_event_triggers_multicall(
         // Sort by block number, log index
         results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
 
-        let sub_dir = output_dir.join(&contract_name).join(&function_name).join("on_events");
+        let sub_dir = output_dir
+            .join(&contract_name)
+            .join(&function_name)
+            .join("on_events");
         std::fs::create_dir_all(&sub_dir)?;
 
         let file_name = format!("{}-{}.parquet", min_block, max_block);
         let output_path = sub_dir.join(&file_name);
 
         let result_count = results.len();
-        let max_params = results.iter().map(|r| r.param_values.len()).max().unwrap_or(0);
+        let max_params = results
+            .iter()
+            .map(|r| r.param_values.len())
+            .max()
+            .unwrap_or(0);
         write_event_call_results_to_parquet(&results, &output_path, max_params)?;
 
         tracing::info!(
@@ -1171,7 +1283,10 @@ pub(crate) async fn process_event_triggers_multicall(
 
         // Upload to S3 if configured
         if let Some(sm) = storage_manager {
-            let data_type = format!("raw/eth_calls/{}/{}/on_events", contract_name, function_name);
+            let data_type = format!(
+                "raw/eth_calls/{}/{}/on_events",
+                contract_name, function_name
+            );
             upload_parquet_to_s3(
                 sm,
                 &output_path,
@@ -1197,21 +1312,29 @@ pub(crate) async fn process_event_triggers_multicall(
                 })
                 .collect();
 
-            let _ = tx.send(DecoderMessage::EventCallsReady {
-                range_start: min_block,
-                range_end: max_block,
-                contract_name: contract_name.clone(),
-                function_name: function_name.clone(),
-                results: decoder_results,
-                live_mode: false,
-            }).await;
+            let _ = tx
+                .send(DecoderMessage::EventCallsReady {
+                    range_start: min_block,
+                    range_end: max_block,
+                    contract_name: contract_name.clone(),
+                    function_name: function_name.clone(),
+                    results: decoder_results,
+                    live_mode: false,
+                })
+                .await;
         }
     }
 
     // Write empty files for configured pairs that didn't have any matching events
     for (contract_name, function_name) in configured_pairs {
         if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
-            write_empty_event_call_file(output_dir, &contract_name, &function_name, range_start, range_end)?;
+            write_empty_event_call_file(
+                output_dir,
+                &contract_name,
+                &function_name,
+                range_start,
+                range_end,
+            )?;
         }
     }
 
@@ -1287,11 +1410,7 @@ pub(crate) fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
     ];
 
     for i in 0..num_params {
-        fields.push(Field::new(
-            &format!("param_{}", i),
-            DataType::Binary,
-            true,
-        ));
+        fields.push(Field::new(&format!("param_{}", i), DataType::Binary, true));
     }
 
     Arc::new(Schema::new(fields))
@@ -1352,7 +1471,11 @@ pub(crate) async fn load_historical_factory_addresses(
             if let Ok(files) = std::fs::read_dir(&path) {
                 for file_entry in files.flatten() {
                     let file_path = file_entry.path();
-                    if !file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                    if !file_path
+                        .extension()
+                        .map(|e| e == "parquet")
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     files_to_process
@@ -1480,7 +1603,11 @@ pub(crate) async fn load_factory_addresses_for_once_catchup(
             if let Ok(files) = std::fs::read_dir(&path) {
                 for file_entry in files.flatten() {
                     let file_path = file_entry.path();
-                    if !file_path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                    if !file_path
+                        .extension()
+                        .map(|e| e == "parquet")
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     files_to_process
@@ -1562,7 +1689,9 @@ pub(crate) async fn load_factory_addresses_for_once_catchup(
 }
 
 /// Read factory addresses with block number and timestamp from a parquet file
-pub(crate) fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Address, u64, u64)>, std::io::Error> {
+pub(crate) fn read_factory_addresses_with_blocks(
+    path: &Path,
+) -> Result<Vec<(Address, u64, u64)>, std::io::Error> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = File::open(path)?;
@@ -1570,12 +1699,20 @@ pub(crate) fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Add
         Ok(builder) => match builder.build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to build parquet reader for {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to build parquet reader for {}: {}",
+                    path.display(),
+                    e
+                );
                 return Ok(Vec::new());
             }
         },
         Err(e) => {
-            tracing::warn!("Failed to create parquet reader for {}: {}", path.display(), e);
+            tracing::warn!(
+                "Failed to create parquet reader for {}: {}",
+                path.display(),
+                e
+            );
             return Ok(Vec::new());
         }
     };
@@ -1633,7 +1770,9 @@ pub(crate) fn read_factory_addresses_with_blocks(path: &Path) -> Result<Vec<(Add
 }
 
 /// Read factory addresses from a parquet file
-pub(crate) fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet<[u8; 20]>, std::io::Error> {
+pub(crate) fn read_factory_addresses_from_parquet(
+    path: &Path,
+) -> Result<HashSet<[u8; 20]>, std::io::Error> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     let file = File::open(path)?;
@@ -1641,12 +1780,20 @@ pub(crate) fn read_factory_addresses_from_parquet(path: &Path) -> Result<HashSet
         Ok(builder) => match builder.build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to build parquet reader for {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to build parquet reader for {}: {}",
+                    path.display(),
+                    e
+                );
                 return Ok(HashSet::new());
             }
         },
         Err(e) => {
-            tracing::warn!("Failed to create parquet reader for {}: {}", path.display(), e);
+            tracing::warn!(
+                "Failed to create parquet reader for {}: {}",
+                path.display(),
+                e
+            );
             return Ok(HashSet::new());
         }
     };
@@ -1780,7 +1927,9 @@ pub(crate) fn get_existing_log_ranges(
 }
 
 /// Read logs from a parquet file for catchup
-pub(crate) fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, EthCallCollectionError> {
+pub(crate) fn read_logs_from_parquet(
+    file_path: &Path,
+) -> Result<Vec<LogData>, EthCallCollectionError> {
     use arrow::array::{Array, ListArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -1820,10 +1969,26 @@ pub(crate) fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, E
             .column_by_name("data")
             .and_then(|c| c.as_any().downcast_ref::<BinaryArray>());
 
-        let (Some(block_numbers), Some(block_timestamps), Some(tx_hashes), Some(log_indices), Some(addresses), Some(data_col)) =
-            (block_numbers, block_timestamps, tx_hashes, log_indices, addresses, data_col)
+        let (
+            Some(block_numbers),
+            Some(block_timestamps),
+            Some(tx_hashes),
+            Some(log_indices),
+            Some(addresses),
+            Some(data_col),
+        ) = (
+            block_numbers,
+            block_timestamps,
+            tx_hashes,
+            log_indices,
+            addresses,
+            data_col,
+        )
         else {
-            tracing::warn!("Missing required columns in log parquet file: {:?}", file_path);
+            tracing::warn!(
+                "Missing required columns in log parquet file: {:?}",
+                file_path
+            );
             continue;
         };
 
@@ -1844,7 +2009,9 @@ pub(crate) fn read_logs_from_parquet(file_path: &Path) -> Result<Vec<LogData>, E
             let topics: Vec<[u8; 32]> = if let Some(col) = topics_col {
                 if let Some(list_array) = col.as_any().downcast_ref::<ListArray>() {
                     let values = list_array.value(i);
-                    if let Some(fixed_array) = values.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                    if let Some(fixed_array) =
+                        values.as_any().downcast_ref::<FixedSizeBinaryArray>()
+                    {
                         (0..fixed_array.len())
                             .map(|j| {
                                 let mut topic = [0u8; 32];
@@ -1889,7 +2056,10 @@ pub(crate) fn event_output_exists(
     s3_manifest: Option<&S3Manifest>,
 ) -> bool {
     // Check local first
-    let sub_dir = output_dir.join(contract_name).join(function_name).join("on_events");
+    let sub_dir = output_dir
+        .join(contract_name)
+        .join(function_name)
+        .join("on_events");
     if sub_dir.exists() {
         // Check for any file that overlaps with this range
         // Note: range_end is EXCLUSIVE (e.g., 200 means up to block 199)
@@ -1904,7 +2074,9 @@ pub(crate) fn event_output_exists(
                 if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
                     let parts: Vec<&str> = file_stem.split('-').collect();
                     if parts.len() == 2 {
-                        if let (Ok(file_start), Ok(file_end_inclusive)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                        if let (Ok(file_start), Ok(file_end_inclusive)) =
+                            (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                        {
                             // Convert to exclusive end for consistent comparison
                             // Ranges overlap if: start1 < end2 AND start2 < end1 (using exclusive ends)
                             let file_end_exclusive = file_end_inclusive + 1;
@@ -1923,7 +2095,8 @@ pub(crate) fn event_output_exists(
     // range_end is exclusive but S3 manifest stores inclusive end
     if let Some(manifest) = s3_manifest {
         let func_key = format!("{}/on_events", function_name);
-        if manifest.has_raw_eth_calls_granular(contract_name, &func_key, range_start, range_end - 1) {
+        if manifest.has_raw_eth_calls_granular(contract_name, &func_key, range_start, range_end - 1)
+        {
             return true;
         }
     }
@@ -2000,8 +2173,10 @@ pub(crate) async fn process_factory_range(
                         .collect::<Result<_, _>>()?;
 
                     let encoded_calldata = encode_call_with_params(selector, &dyn_values);
-                    let param_values: Vec<Vec<u8>> =
-                        param_combo.iter().map(|(_, _, encoded)| encoded.clone()).collect();
+                    let param_values: Vec<Vec<u8>> = param_combo
+                        .iter()
+                        .map(|(_, _, encoded)| encoded.clone())
+                        .collect();
 
                     configs.push(CallConfig {
                         contract_name: collection_name.clone(),
@@ -2023,7 +2198,8 @@ pub(crate) async fn process_factory_range(
             let state_key = (collection_name.clone(), function_name.clone());
             let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
 
-            let filtered_blocks = filter_blocks_for_frequency(blocks, &call_config.frequency, last_call_ts);
+            let filtered_blocks =
+                filter_blocks_for_frequency(blocks, &call_config.frequency, last_call_ts);
 
             if filtered_blocks.is_empty() {
                 tracing::debug!(
@@ -2095,13 +2271,17 @@ pub(crate) async fn process_factory_range(
                             all_results.push(CallResult {
                                 block_number: block.block_number,
                                 block_timestamp: block.timestamp,
-                                contract_address: config.address.0.0,
+                                contract_address: config.address.0 .0,
                                 value_bytes: bytes.to_vec(),
                                 param_values: config.param_values.clone(),
                             });
                         }
                         Err(e) => {
-                            let params_hex: Vec<String> = config.param_values.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
+                            let params_hex: Vec<String> = config
+                                .param_values
+                                .iter()
+                                .map(|p| format!("0x{}", hex::encode(p)))
+                                .collect();
                             tracing::warn!(
                                 "Factory eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
                                 collection_name,
@@ -2130,12 +2310,17 @@ pub(crate) async fn process_factory_range(
             let output_path = sub_dir.join(&file_name);
 
             let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
-                Some(all_results.iter().map(|r| DecoderEthCallResult {
-                    block_number: r.block_number,
-                    block_timestamp: r.block_timestamp,
-                    contract_address: r.contract_address,
-                    value: r.value_bytes.clone(),
-                }).collect())
+                Some(
+                    all_results
+                        .iter()
+                        .map(|r| DecoderEthCallResult {
+                            block_number: r.block_number,
+                            block_timestamp: r.block_timestamp,
+                            contract_address: r.contract_address,
+                            value: r.value_bytes.clone(),
+                        })
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -2185,14 +2370,16 @@ pub(crate) async fn process_factory_range(
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
-                    let _ = tx.send(DecoderMessage::EthCallsReady {
-                        range_start: range.start,
-                        range_end: range.end,
-                        contract_name: collection_name.clone(),
-                        function_name: function_name.clone(),
-                        results,
-                        live_mode: false,
-                    }).await;
+                    let _ = tx
+                        .send(DecoderMessage::EthCallsReady {
+                            range_start: range.start,
+                            range_end: range.end,
+                            contract_name: collection_name.clone(),
+                            function_name: function_name.clone(),
+                            results,
+                            live_mode: false,
+                        })
+                        .await;
                 }
             }
 
@@ -2293,8 +2480,10 @@ pub(crate) async fn process_factory_range_multicall(
                         .collect::<Result<_, _>>()?;
 
                     let encoded_calldata = encode_call_with_params(selector, &dyn_values);
-                    let param_values: Vec<Vec<u8>> =
-                        param_combo.iter().map(|(_, _, encoded)| encoded.clone()).collect();
+                    let param_values: Vec<Vec<u8>> = param_combo
+                        .iter()
+                        .map(|(_, _, encoded)| encoded.clone())
+                        .collect();
 
                     configs.push(CallConfig {
                         contract_name: collection_name.clone(),
@@ -2315,7 +2504,8 @@ pub(crate) async fn process_factory_range_multicall(
 
             let state_key = (collection_name.clone(), function_name.clone());
             let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
-            let filtered_blocks = filter_blocks_for_frequency(blocks, &call_config.frequency, last_call_ts);
+            let filtered_blocks =
+                filter_blocks_for_frequency(blocks, &call_config.frequency, last_call_ts);
 
             if filtered_blocks.is_empty() {
                 continue;
@@ -2408,13 +2598,9 @@ pub(crate) async fn process_factory_range_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        client,
-        multicall3_address,
-        block_multicalls,
-        rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+            .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -2446,17 +2632,24 @@ pub(crate) async fn process_factory_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name();
-            let sub_dir = output_dir.join(&group.collection_name).join(&group.function_name);
+            let sub_dir = output_dir
+                .join(&group.collection_name)
+                .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
             let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
-                Some(results.iter().map(|r| DecoderEthCallResult {
-                    block_number: r.block_number,
-                    block_timestamp: r.block_timestamp,
-                    contract_address: r.contract_address,
-                    value: r.value_bytes.clone(),
-                }).collect())
+                Some(
+                    results
+                        .iter()
+                        .map(|r| DecoderEthCallResult {
+                            block_number: r.block_number,
+                            block_timestamp: r.block_timestamp,
+                            contract_address: r.contract_address,
+                            value: r.value_bytes.clone(),
+                        })
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -2477,7 +2670,10 @@ pub(crate) async fn process_factory_range_multicall(
 
             // Upload to S3 if configured
             if let Some(sm) = storage_manager {
-                let data_type = format!("raw/eth_calls/{}/{}", group.collection_name, group.function_name);
+                let data_type = format!(
+                    "raw/eth_calls/{}/{}",
+                    group.collection_name, group.function_name
+                );
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
@@ -2492,14 +2688,16 @@ pub(crate) async fn process_factory_range_multicall(
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
-                    let _ = tx.send(DecoderMessage::EthCallsReady {
-                        range_start: range.start,
-                        range_end: range.end,
-                        contract_name: group.collection_name.clone(),
-                        function_name: group.function_name.clone(),
-                        results,
-                        live_mode: false,
-                    }).await;
+                    let _ = tx
+                        .send(DecoderMessage::EthCallsReady {
+                            range_start: range.start,
+                            range_end: range.end,
+                            contract_name: group.collection_name.clone(),
+                            function_name: group.function_name.clone(),
+                            results,
+                            live_mode: false,
+                        })
+                        .await;
                 }
             }
 
@@ -2516,7 +2714,9 @@ pub(crate) async fn process_factory_range_multicall(
     Ok(())
 }
 
-pub(crate) fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
+pub(crate) fn generate_param_combinations(
+    params: &[ParamConfig],
+) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
     if params.is_empty() {
         return Ok(vec![vec![]]);
     }
@@ -2531,7 +2731,8 @@ pub(crate) fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<
             None => {
                 return Err(ParamError::TypeMismatch {
                     expected: "static param with values".to_string(),
-                    got: "from_event or source param (only valid for on_events frequency)".to_string(),
+                    got: "from_event or source param (only valid for on_events frequency)"
+                        .to_string(),
                 });
             }
         };
@@ -2553,7 +2754,9 @@ pub(crate) fn generate_param_combinations(params: &[ParamConfig]) -> Result<Vec<
     Ok(result)
 }
 
-pub fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthCallCollectionError> {
+pub fn build_call_configs(
+    contracts: &Contracts,
+) -> Result<Vec<CallConfig>, EthCallCollectionError> {
     let mut configs = Vec::new();
 
     for (contract_name, contract) in contracts {
@@ -2577,7 +2780,8 @@ pub fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthC
                         None => {
                             tracing::warn!(
                                 "Could not resolve target for call {} on contract {}, skipping",
-                                call.function, contract_name
+                                call.function,
+                                contract_name
                             );
                             continue;
                         }
@@ -2587,7 +2791,8 @@ pub fn build_call_configs(contracts: &Contracts) -> Result<Vec<CallConfig>, EthC
                 };
 
                 let selector = compute_function_selector(&call.function);
-                let function_name = call.function
+                let function_name = call
+                    .function
                     .split('(')
                     .next()
                     .unwrap_or(&call.function)
@@ -2751,7 +2956,8 @@ pub fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<Onc
             for call in calls {
                 if call.frequency.is_once() {
                     let selector = compute_function_selector(&call.function);
-                    let function_name = call.function
+                    let function_name = call
+                        .function
                         .split('(')
                         .next()
                         .unwrap_or(&call.function)
@@ -2810,14 +3016,17 @@ pub fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<Onc
                         resolved
                     });
 
-                    configs.entry(contract_name.clone()).or_default().push(OnceCallConfig {
-                        function_name,
-                        function_selector: selector,
-                        preencoded_calldata,
-                        params,
-                        target_addresses,
-                        start_block,
-                    });
+                    configs
+                        .entry(contract_name.clone())
+                        .or_default()
+                        .push(OnceCallConfig {
+                            function_name,
+                            function_selector: selector,
+                            preencoded_calldata,
+                            params,
+                            target_addresses,
+                            start_block,
+                        });
                 }
             }
         }
@@ -2836,7 +3045,8 @@ pub fn build_factory_once_call_configs(
         for call in call_configs {
             if call.frequency.is_once() {
                 let selector = compute_function_selector(&call.function);
-                let function_name = call.function
+                let function_name = call
+                    .function
                     .split('(')
                     .next()
                     .unwrap_or(&call.function)
@@ -2895,15 +3105,18 @@ pub fn build_factory_once_call_configs(
                     }
                 };
 
-                configs.entry(collection_name.clone()).or_default().push(OnceCallConfig {
-                    function_name,
-                    function_selector: selector,
-                    preencoded_calldata,
-                    params,
-                    target_addresses,
-                    // Factory calls use discovery block, not start_block
-                    start_block: None,
-                });
+                configs
+                    .entry(collection_name.clone())
+                    .or_default()
+                    .push(OnceCallConfig {
+                        function_name,
+                        function_selector: selector,
+                        preencoded_calldata,
+                        params,
+                        target_addresses,
+                        // Factory calls use discovery block, not start_block
+                        start_block: None,
+                    });
             }
         }
     }
@@ -2918,7 +3131,7 @@ pub(crate) fn filter_blocks_for_frequency<'a>(
 ) -> Vec<&'a BlockInfo> {
     match frequency {
         Frequency::EveryBlock => blocks.iter().collect(),
-        Frequency::Once => vec![], // handled separately
+        Frequency::Once => vec![],        // handled separately
         Frequency::OnEvents(_) => vec![], // handled separately via event triggers
         Frequency::EveryNBlocks(n) => blocks.iter().filter(|b| b.block_number % n == 0).collect(),
         Frequency::Duration(secs) => {
@@ -2968,50 +3181,51 @@ pub(crate) async fn process_once_calls_regular(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
-            let index = read_once_column_index(&sub_dir);
-            let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
-                cols.iter().cloned().collect()
-            } else {
-                tracing::debug!(
-                    "File {} exists but not in index, reading schema from parquet",
-                    output_path.display()
-                );
-                read_parquet_column_names(&output_path)
-            };
-            let missing: Vec<String> = all_fn_names
-                .iter()
-                .filter(|f| !existing_cols.contains(*f))
-                .cloned()
-                .collect();
-            // Find addresses with null values for existing columns
-            let all_null_entries = find_null_entries(&output_path);
-            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
-                .into_iter()
-                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
-                .collect();
-            if missing.is_empty() && null_entries.is_empty() {
-                tracing::debug!(
+        let (missing_fn_names, has_existing_file, null_entries) =
+            if existing_files.contains(&rel_path) {
+                let index = read_once_column_index(&sub_dir);
+                let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
+                    cols.iter().cloned().collect()
+                } else {
+                    tracing::debug!(
+                        "File {} exists but not in index, reading schema from parquet",
+                        output_path.display()
+                    );
+                    read_parquet_column_names(&output_path)
+                };
+                let missing: Vec<String> = all_fn_names
+                    .iter()
+                    .filter(|f| !existing_cols.contains(*f))
+                    .cloned()
+                    .collect();
+                // Find addresses with null values for existing columns
+                let all_null_entries = find_null_entries(&output_path);
+                let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
+                    .into_iter()
+                    .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
+                    .collect();
+                if missing.is_empty() && null_entries.is_empty() {
+                    tracing::debug!(
                     "Skipping once eth_calls for {} blocks {}-{} (all columns present, no nulls)",
                     contract_name,
                     range.start,
                     range.end - 1
                 );
-                continue;
-            }
-            if !missing.is_empty() {
-                tracing::info!(
-                    "Found {} missing once columns for {} blocks {}-{}: {:?}",
-                    missing.len(),
-                    contract_name,
-                    range.start,
-                    range.end - 1,
-                    missing
-                );
-            }
-            if !null_entries.is_empty() {
-                let null_count: usize = null_entries.values().map(|s| s.len()).sum();
-                tracing::info!(
+                    continue;
+                }
+                if !missing.is_empty() {
+                    tracing::info!(
+                        "Found {} missing once columns for {} blocks {}-{}: {:?}",
+                        missing.len(),
+                        contract_name,
+                        range.start,
+                        range.end - 1,
+                        missing
+                    );
+                }
+                if !null_entries.is_empty() {
+                    let null_count: usize = null_entries.values().map(|s| s.len()).sum();
+                    tracing::info!(
                     "Found {} null entries across {} columns for {} blocks {}-{}, will re-fetch",
                     null_count,
                     null_entries.len(),
@@ -3019,11 +3233,11 @@ pub(crate) async fn process_once_calls_regular(
                     range.start,
                     range.end - 1,
                 );
-            }
-            (missing, true, null_entries)
-        } else {
-            (all_fn_names.clone(), false, HashMap::new())
-        };
+                }
+                (missing, true, null_entries)
+            } else {
+                (all_fn_names.clone(), false, HashMap::new())
+            };
 
         // Filter call configs to only missing functions
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
@@ -3058,7 +3272,10 @@ pub(crate) async fn process_once_calls_regular(
                     continue;
                 }
             }
-            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
 
             for address in addresses {
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
@@ -3086,7 +3303,10 @@ pub(crate) async fn process_once_calls_regular(
                 }
             }
             let null_addrs = &null_entries[&call_config.function_name];
-            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
 
             for address in addresses {
                 if !null_addrs.contains(&address.0 .0) {
@@ -3131,7 +3351,12 @@ pub(crate) async fn process_once_calls_regular(
                     function_results.insert(function_name.clone(), bytes.to_vec());
                 }
                 Err(e) => {
-                    let calldata = tx.input.input.as_ref().map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default();
+                    let calldata = tx
+                        .input
+                        .input
+                        .as_ref()
+                        .map(|b| format!("0x{}", hex::encode(b)))
+                        .unwrap_or_default();
                     tracing::warn!(
                         "once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
                         contract_name,
@@ -3149,12 +3374,17 @@ pub(crate) async fn process_once_calls_regular(
         std::fs::create_dir_all(&sub_dir)?;
 
         let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if decoder_tx.is_some() {
-            Some(results_by_address.iter().map(|(addr, function_results)| DecoderOnceCallResult {
-                block_number: first_block.block_number,
-                block_timestamp: first_block.timestamp,
-                contract_address: addr.0.0,
-                results: function_results.clone(),
-            }).collect())
+            Some(
+                results_by_address
+                    .iter()
+                    .map(|(addr, function_results)| DecoderOnceCallResult {
+                        block_number: first_block.block_number,
+                        block_timestamp: first_block.timestamp,
+                        contract_address: addr.0 .0,
+                        results: function_results.clone(),
+                    })
+                    .collect(),
+            )
         } else {
             None
         };
@@ -3163,18 +3393,20 @@ pub(crate) async fn process_once_calls_regular(
             // Merge new columns into existing parquet
             let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                 .into_iter()
-                .map(|(addr, fns)| (addr.0.0, fns))
+                .map(|(addr, fns)| (addr.0 .0, fns))
                 .collect();
 
             let existing_batches = read_existing_once_parquet(&output_path)?;
             if !existing_batches.is_empty() {
                 // Combine missing + patch function names for merge
                 let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
-                let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                let all_new_fn_names: Vec<String> = missing_fn_names
+                    .iter()
                     .chain(patch_fn_names.iter())
                     .cloned()
                     .collect();
-                let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+                let merged =
+                    merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                 let file = File::create(&output_path)?;
                 let props = WriterProperties::builder()
@@ -3203,12 +3435,14 @@ pub(crate) async fn process_once_calls_regular(
             let results: Vec<OnceCallResult> = all_addresses
                 .iter()
                 .filter_map(|addr| {
-                    results_by_address.remove(addr).map(|function_results| OnceCallResult {
-                        block_number: first_block.block_number,
-                        block_timestamp: first_block.timestamp,
-                        contract_address: addr.0.0,
-                        function_results,
-                    })
+                    results_by_address
+                        .remove(addr)
+                        .map(|function_results| OnceCallResult {
+                            block_number: first_block.block_number,
+                            block_timestamp: first_block.timestamp,
+                            contract_address: addr.0 .0,
+                            function_results,
+                        })
                 })
                 .collect();
 
@@ -3257,13 +3491,15 @@ pub(crate) async fn process_once_calls_regular(
 
         if let Some(tx) = decoder_tx {
             if let Some(results) = decoder_once_results {
-                let _ = tx.send(DecoderMessage::OnceCallsReady {
-                    range_start: range.start,
-                    range_end: range.end,
-                    contract_name: contract_name.clone(),
-                    results,
-                    live_mode: false,
-                }).await;
+                let _ = tx
+                    .send(DecoderMessage::OnceCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: contract_name.clone(),
+                        results,
+                        live_mode: false,
+                    })
+                    .await;
             }
         }
     }
@@ -3298,7 +3534,9 @@ pub(crate) async fn process_factory_once_calls(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
+        let (missing_fn_names, has_existing_file, null_entries) = if existing_files
+            .contains(&rel_path)
+        {
             let index = column_indexes.get(collection_name);
             let indexed_cols: HashSet<String> = index
                 .and_then(|idx| idx.get(&file_name))
@@ -3321,7 +3559,8 @@ pub(crate) async fn process_factory_once_calls(
             // 3) the column with nulls is not in the column index for that file
             // If a column IS in the index, nulls are considered permanent.
             let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
-                let unindexed_in_parquet: Vec<&String> = all_fn_names.iter()
+                let unindexed_in_parquet: Vec<&String> = all_fn_names
+                    .iter()
                     .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
                     .collect();
                 if unindexed_in_parquet.is_empty() {
@@ -3386,7 +3625,9 @@ pub(crate) async fn process_factory_once_calls(
         for (block_num, addrs) in &factory_data.addresses_by_block {
             for (timestamp, addr, coll_name) in addrs {
                 if coll_name == collection_name {
-                    address_discovery.entry(*addr).or_insert((*block_num, *timestamp));
+                    address_discovery
+                        .entry(*addr)
+                        .or_insert((*block_num, *timestamp));
                 }
             }
         }
@@ -3399,23 +3640,27 @@ pub(crate) async fn process_factory_once_calls(
             index.insert(file_name.clone(), all_fn_names.clone());
             write_once_column_index(&sub_dir, &index)?;
             if let Some(tx) = decoder_tx {
-                let _ = tx.send(DecoderMessage::OnceFileBackfilled {
-                    range_start: range.start,
-                    range_end: range.end,
-                    contract_name: collection_name.clone(),
-                }).await;
+                let _ = tx
+                    .send(DecoderMessage::OnceFileBackfilled {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: collection_name.clone(),
+                    })
+                    .await;
             }
             continue;
         }
 
-        let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> = Vec::new();
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> =
+            Vec::new();
 
         // Missing columns: call ALL discovered addresses
         for (discovered_address, (block_number, timestamp)) in &address_discovery {
             let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
 
             for call_config in &configs_to_call {
-                let target_address = call_config.target_addresses
+                let target_address = call_config
+                    .target_addresses
                     .as_ref()
                     .and_then(|addrs| addrs.first().copied())
                     .unwrap_or(*discovered_address);
@@ -3452,7 +3697,8 @@ pub(crate) async fn process_factory_once_calls(
                 if !null_addrs.contains(&discovered_address.0 .0) {
                     continue;
                 }
-                let target_address = call_config.target_addresses
+                let target_address = call_config
+                    .target_addresses
                     .as_ref()
                     .and_then(|addrs| addrs.first().copied())
                     .unwrap_or(*discovered_address);
@@ -3495,10 +3741,12 @@ pub(crate) async fn process_factory_once_calls(
 
                 let batch_results = client.call_batch(batch_calls).await?;
 
-                let mut results_map: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> = HashMap::new();
+                let mut results_map: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> =
+                    HashMap::new();
 
                 for (i, result) in batch_results.into_iter().enumerate() {
-                    let (tx, _, address, block_number, timestamp, function_name) = &pending_calls[i];
+                    let (tx, _, address, block_number, timestamp, function_name) =
+                        &pending_calls[i];
 
                     let entry = results_map
                         .entry(*address)
@@ -3509,7 +3757,12 @@ pub(crate) async fn process_factory_once_calls(
                             entry.2.insert(function_name.clone(), bytes.to_vec());
                         }
                         Err(e) => {
-                            let calldata = tx.input.input.as_ref().map(|b| format!("0x{}", hex::encode(b))).unwrap_or_default();
+                            let calldata = tx
+                                .input
+                                .input
+                                .as_ref()
+                                .map(|b| format!("0x{}", hex::encode(b)))
+                                .unwrap_or_default();
                             tracing::warn!(
                                 "factory once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
                                 collection_name,
@@ -3534,20 +3787,22 @@ pub(crate) async fn process_factory_once_calls(
             // Merge new columns into existing parquet
             let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                 .into_iter()
-                .map(|(addr, (_, _, fns))| (addr.0.0, fns))
+                .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
                 .collect();
 
             let existing_batches = read_existing_once_parquet(&output_path)?;
             if !existing_batches.is_empty() {
                 // Check which addresses already have data for the missing functions
-                let existing_results = extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
+                let existing_results =
+                    extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
 
                 // Find addresses in existing parquet that need backfill
                 let existing_addresses = extract_addresses_from_once_parquet(&existing_batches);
 
                 // Build list of (address, block, functions_to_call) for backfill
                 // Only call functions that don't already have data
-                let mut backfill_calls: Vec<(TransactionRequest, BlockId, [u8; 20], String)> = Vec::new();
+                let mut backfill_calls: Vec<(TransactionRequest, BlockId, [u8; 20], String)> =
+                    Vec::new();
 
                 for (addr_bytes, (block_num, _timestamp)) in &existing_addresses {
                     // Skip addresses that are in current batch (already have new results)
@@ -3569,7 +3824,8 @@ pub(crate) async fn process_factory_once_calls(
                             }
                         }
 
-                        let target_address = call_config.target_addresses
+                        let target_address = call_config
+                            .target_addresses
                             .as_ref()
                             .and_then(|addrs| addrs.first().copied())
                             .unwrap_or(discovered_address);
@@ -3586,7 +3842,12 @@ pub(crate) async fn process_factory_once_calls(
                         let tx = TransactionRequest::default()
                             .to(target_address)
                             .input(calldata.into());
-                        backfill_calls.push((tx, block_id, *addr_bytes, call_config.function_name.clone()));
+                        backfill_calls.push((
+                            tx,
+                            block_id,
+                            *addr_bytes,
+                            call_config.function_name.clone(),
+                        ));
                     }
                 }
 
@@ -3634,11 +3895,13 @@ pub(crate) async fn process_factory_once_calls(
 
                 // Combine missing + patch function names for merge
                 let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
-                let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                let all_new_fn_names: Vec<String> = missing_fn_names
+                    .iter()
                     .chain(patch_fn_names.iter())
                     .cloned()
                     .collect();
-                let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+                let merged =
+                    merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                 let file = File::create(&output_path)?;
                 let props = WriterProperties::builder()
@@ -3659,12 +3922,14 @@ pub(crate) async fn process_factory_once_calls(
         } else {
             let results: Vec<OnceCallResult> = results_by_address
                 .into_iter()
-                .map(|(address, (block_number, timestamp, function_results))| OnceCallResult {
-                    block_number,
-                    block_timestamp: timestamp,
-                    contract_address: address.0.0,
-                    function_results,
-                })
+                .map(
+                    |(address, (block_number, timestamp, function_results))| OnceCallResult {
+                        block_number,
+                        block_timestamp: timestamp,
+                        contract_address: address.0 .0,
+                        function_results,
+                    },
+                )
                 .collect();
 
             if !results.is_empty() {
@@ -3745,7 +4010,14 @@ pub(crate) async fn process_once_calls_multicall(
 
     let mut all_slots: Vec<MulticallSlotGeneric<OnceCallMeta>> = Vec::new();
     // (contract_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file)
-    let mut contracts_to_process: Vec<(String, Vec<String>, Vec<String>, Vec<String>, PathBuf, bool)> = Vec::new();
+    let mut contracts_to_process: Vec<(
+        String,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        PathBuf,
+        bool,
+    )> = Vec::new();
 
     for (contract_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -3762,31 +4034,32 @@ pub(crate) async fn process_once_calls_multicall(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
-            let index = read_once_column_index(&sub_dir);
-            let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
-                cols.iter().cloned().collect()
+        let (missing_fn_names, has_existing_file, null_entries) =
+            if existing_files.contains(&rel_path) {
+                let index = read_once_column_index(&sub_dir);
+                let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
+                    cols.iter().cloned().collect()
+                } else {
+                    read_parquet_column_names(&output_path)
+                };
+                let missing: Vec<String> = all_fn_names
+                    .iter()
+                    .filter(|f| !existing_cols.contains(*f))
+                    .cloned()
+                    .collect();
+                // Find addresses with null values for existing columns
+                let all_null_entries = find_null_entries(&output_path);
+                let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
+                    .into_iter()
+                    .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
+                    .collect();
+                if missing.is_empty() && null_entries.is_empty() {
+                    continue;
+                }
+                (missing, true, null_entries)
             } else {
-                read_parquet_column_names(&output_path)
+                (all_fn_names.clone(), false, HashMap::new())
             };
-            let missing: Vec<String> = all_fn_names
-                .iter()
-                .filter(|f| !existing_cols.contains(*f))
-                .cloned()
-                .collect();
-            // Find addresses with null values for existing columns
-            let all_null_entries = find_null_entries(&output_path);
-            let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
-                .into_iter()
-                .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
-                .collect();
-            if missing.is_empty() && null_entries.is_empty() {
-                continue;
-            }
-            (missing, true, null_entries)
-        } else {
-            (all_fn_names.clone(), false, HashMap::new())
-        };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
             .iter()
@@ -3824,7 +4097,10 @@ pub(crate) async fn process_once_calls_multicall(
 
         // Missing columns: slots for ALL addresses
         for call_config in &configs_to_call {
-            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
 
             for address in addresses {
                 let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
@@ -3854,7 +4130,10 @@ pub(crate) async fn process_once_calls_multicall(
         // Partially-null columns: slots only for addresses with null values
         for call_config in &configs_to_patch {
             let null_addrs = &null_entries[&call_config.function_name];
-            let addresses = call_config.target_addresses.as_ref().unwrap_or(&default_addresses);
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
 
             for address in addresses {
                 if !null_addrs.contains(&address.0 .0) {
@@ -3913,13 +4192,9 @@ pub(crate) async fn process_once_calls_multicall(
     );
 
     // Execute multicall
-    let results = execute_multicalls_generic(
-        client,
-        multicall3_address,
-        block_multicalls,
-        rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+            .await?;
 
     // Group results by contract_name -> address -> function_name -> value
     let mut results_by_contract: HashMap<String, HashMap<Address, HashMap<String, Vec<u8>>>> =
@@ -3935,18 +4210,31 @@ pub(crate) async fn process_once_calls_multicall(
     }
 
     // Write parquet for each contract
-    for (contract_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file) in contracts_to_process {
+    for (
+        contract_name,
+        all_fn_names,
+        missing_fn_names,
+        patch_fn_names,
+        output_path,
+        has_existing_file,
+    ) in contracts_to_process
+    {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
         if let Some(results_by_address) = results_by_contract.remove(&contract_name) {
             let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if decoder_tx.is_some() {
-                Some(results_by_address.iter().map(|(addr, function_results)| DecoderOnceCallResult {
-                    block_number: first_block.block_number,
-                    block_timestamp: first_block.timestamp,
-                    contract_address: addr.0.0,
-                    results: function_results.clone(),
-                }).collect())
+                Some(
+                    results_by_address
+                        .iter()
+                        .map(|(addr, function_results)| DecoderOnceCallResult {
+                            block_number: first_block.block_number,
+                            block_timestamp: first_block.timestamp,
+                            contract_address: addr.0 .0,
+                            results: function_results.clone(),
+                        })
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -3960,11 +4248,13 @@ pub(crate) async fn process_once_calls_multicall(
                 let existing_batches = read_existing_once_parquet(&output_path)?;
                 if !existing_batches.is_empty() {
                     // Combine missing + patch function names for merge
-                    let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                    let all_new_fn_names: Vec<String> = missing_fn_names
+                        .iter()
                         .chain(patch_fn_names.iter())
                         .cloned()
                         .collect();
-                    let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+                    let merged =
+                        merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                     let file = File::create(&output_path)?;
                     let props = WriterProperties::builder()
@@ -4020,7 +4310,11 @@ pub(crate) async fn process_once_calls_multicall(
             }
 
             // Update column index with all columns present in the file
-            let file_name = output_path.file_name().unwrap().to_string_lossy().to_string();
+            let file_name = output_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
                 .into_iter()
                 .collect();
@@ -4030,13 +4324,15 @@ pub(crate) async fn process_once_calls_multicall(
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_once_results {
-                    let _ = tx.send(DecoderMessage::OnceCallsReady {
-                        range_start: range.start,
-                        range_end: range.end,
-                        contract_name: contract_name.clone(),
-                        results,
-                        live_mode: false,
-                    }).await;
+                    let _ = tx
+                        .send(DecoderMessage::OnceCallsReady {
+                            range_start: range.start,
+                            range_end: range.end,
+                            contract_name: contract_name.clone(),
+                            results,
+                            live_mode: false,
+                        })
+                        .await;
                 }
             }
         }
@@ -4072,7 +4368,15 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
     let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
     // (collection_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file, configs_to_call)
-    let mut collections_to_process: Vec<(String, Vec<String>, Vec<String>, Vec<String>, PathBuf, bool, Vec<OnceCallConfig>)> = Vec::new();
+    let mut collections_to_process: Vec<(
+        String,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        PathBuf,
+        bool,
+        Vec<OnceCallConfig>,
+    )> = Vec::new();
 
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -4089,50 +4393,52 @@ pub(crate) async fn process_factory_once_calls_multicall(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if existing_files.contains(&rel_path) {
-            let index = column_indexes.get(collection_name);
-            let indexed_cols: HashSet<String> = index
-                .and_then(|idx| idx.get(&file_name))
-                .map(|cols| cols.iter().cloned().collect())
-                .unwrap_or_default();
+        let (missing_fn_names, has_existing_file, null_entries) =
+            if existing_files.contains(&rel_path) {
+                let index = column_indexes.get(collection_name);
+                let indexed_cols: HashSet<String> = index
+                    .and_then(|idx| idx.get(&file_name))
+                    .map(|cols| cols.iter().cloned().collect())
+                    .unwrap_or_default();
 
-            // Check actual parquet schema to determine truly missing columns
-            let parquet_cols = read_parquet_column_names(&output_path);
+                // Check actual parquet schema to determine truly missing columns
+                let parquet_cols = read_parquet_column_names(&output_path);
 
-            // Missing: in config but not in the parquet file
-            let missing: Vec<String> = all_fn_names
-                .iter()
-                .filter(|f| !parquet_cols.contains(*f))
-                .cloned()
-                .collect();
-
-            // Only try to fill null results if:
-            // 1) there is no column index file (indexed_cols is empty)
-            // 2) the block range file is not in the column index
-            // 3) the column with nulls is not in the column index for that file
-            // If a column IS in the index, nulls are considered permanent.
-            let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
-                let unindexed_in_parquet: Vec<&String> = all_fn_names.iter()
-                    .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
+                // Missing: in config but not in the parquet file
+                let missing: Vec<String> = all_fn_names
+                    .iter()
+                    .filter(|f| !parquet_cols.contains(*f))
+                    .cloned()
                     .collect();
-                if unindexed_in_parquet.is_empty() {
-                    HashMap::new()
-                } else {
-                    let all_null_entries = find_null_entries(&output_path);
-                    all_null_entries
-                        .into_iter()
-                        .filter(|(k, _)| !indexed_cols.contains(k))
-                        .collect()
-                }
-            };
 
-            if missing.is_empty() && null_entries.is_empty() {
-                continue;
-            }
-            (missing, true, null_entries)
-        } else {
-            (all_fn_names.clone(), false, HashMap::new())
-        };
+                // Only try to fill null results if:
+                // 1) there is no column index file (indexed_cols is empty)
+                // 2) the block range file is not in the column index
+                // 3) the column with nulls is not in the column index for that file
+                // If a column IS in the index, nulls are considered permanent.
+                let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
+                    let unindexed_in_parquet: Vec<&String> = all_fn_names
+                        .iter()
+                        .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
+                        .collect();
+                    if unindexed_in_parquet.is_empty() {
+                        HashMap::new()
+                    } else {
+                        let all_null_entries = find_null_entries(&output_path);
+                        all_null_entries
+                            .into_iter()
+                            .filter(|(k, _)| !indexed_cols.contains(k))
+                            .collect()
+                    }
+                };
+
+                if missing.is_empty() && null_entries.is_empty() {
+                    continue;
+                }
+                (missing, true, null_entries)
+            } else {
+                (all_fn_names.clone(), false, HashMap::new())
+            };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
             .iter()
@@ -4149,7 +4455,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
         for (block_num, addrs) in &factory_data.addresses_by_block {
             for (timestamp, addr, coll_name) in addrs {
                 if coll_name == collection_name {
-                    address_discovery.entry(*addr).or_insert((*block_num, *timestamp));
+                    address_discovery
+                        .entry(*addr)
+                        .or_insert((*block_num, *timestamp));
                 }
             }
         }
@@ -4167,7 +4475,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
         // Missing columns: slots for ALL discovered addresses
         for call_config in &configs_to_call {
             for (discovered_address, (block_num, timestamp)) in &address_discovery {
-                let target_address = call_config.target_addresses
+                let target_address = call_config
+                    .target_addresses
                     .as_ref()
                     .and_then(|addrs| addrs.first().copied())
                     .unwrap_or(*discovered_address);
@@ -4205,7 +4514,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 if !null_addrs.contains(&discovered_address.0 .0) {
                     continue;
                 }
-                let target_address = call_config.target_addresses
+                let target_address = call_config
+                    .target_addresses
                     .as_ref()
                     .and_then(|addrs| addrs.first().copied())
                     .unwrap_or(*discovered_address);
@@ -4237,10 +4547,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
         }
 
         // Clone configs for use in backfill phase
-        let configs_for_backfill: Vec<OnceCallConfig> = configs_to_call
-            .iter()
-            .map(|c| (*c).clone())
-            .collect();
+        let configs_for_backfill: Vec<OnceCallConfig> =
+            configs_to_call.iter().map(|c| (*c).clone()).collect();
 
         let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
 
@@ -4258,21 +4566,29 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     // Skip multicall execution only if there are no slots AND no collections need backfill
-    let any_need_backfill = collections_to_process.iter().any(|(_, _, _, _, _, has_existing, _)| *has_existing);
+    let any_need_backfill = collections_to_process
+        .iter()
+        .any(|(_, _, _, _, _, has_existing, _)| *has_existing);
     if all_slots.is_empty() && !any_need_backfill {
         return Ok(());
     }
 
     // Group results by collection_name -> address -> (block_num, timestamp, function_results)
-    let mut results_by_collection: HashMap<String, HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)>> =
-        HashMap::new();
+    let mut results_by_collection: HashMap<
+        String,
+        HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)>,
+    > = HashMap::new();
 
     // Execute multicalls only if there are slots to process
     if !all_slots.is_empty() {
         // Group slots by block for multicall batching
-        let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> = HashMap::new();
+        let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> =
+            HashMap::new();
         for slot in all_slots {
-            slots_by_block.entry(slot.block_number).or_default().push(slot);
+            slots_by_block
+                .entry(slot.block_number)
+                .or_default()
+                .push(slot);
         }
 
         let mut block_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> = Vec::new();
@@ -4311,7 +4627,16 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     // Write parquet for each collection
-    for (collection_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file, configs_to_call) in collections_to_process {
+    for (
+        collection_name,
+        all_fn_names,
+        missing_fn_names,
+        patch_fn_names,
+        output_path,
+        has_existing_file,
+        configs_to_call,
+    ) in collections_to_process
+    {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
@@ -4323,21 +4648,24 @@ pub(crate) async fn process_factory_once_calls_multicall(
             let results_by_address = results_by_address.unwrap_or_default();
 
             if has_existing_file {
-                let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
-                    .into_iter()
-                    .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
-                    .collect();
+                let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> =
+                    results_by_address
+                        .into_iter()
+                        .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
+                        .collect();
 
                 let existing_batches = read_existing_once_parquet(&output_path)?;
                 if !existing_batches.is_empty() {
                     // Check which addresses already have data for the missing functions
-                    let existing_results = extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
+                    let existing_results =
+                        extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
 
                     // Find addresses in existing parquet
                     let existing_addresses = extract_addresses_from_once_parquet(&existing_batches);
 
                     // Build backfill slots only for addresses/functions that don't have data
-                    let mut backfill_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
+                    let mut backfill_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> =
+                        Vec::new();
 
                     if !configs_to_call.is_empty() {
                         for (addr_bytes, (block_num, timestamp)) in &existing_addresses {
@@ -4359,20 +4687,22 @@ pub(crate) async fn process_factory_once_calls_multicall(
                                     }
                                 }
 
-                                let target_address = call_config.target_addresses
+                                let target_address = call_config
+                                    .target_addresses
                                     .as_ref()
                                     .and_then(|addrs| addrs.first().copied())
                                     .unwrap_or(discovered_address);
 
-                                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
-                                    preencoded.clone()
-                                } else {
-                                    encode_once_call_params(
-                                        call_config.function_selector,
-                                        &call_config.params,
-                                        discovered_address,
-                                    )?
-                                };
+                                let calldata =
+                                    if let Some(preencoded) = &call_config.preencoded_calldata {
+                                        preencoded.clone()
+                                    } else {
+                                        encode_once_call_params(
+                                            call_config.function_selector,
+                                            &call_config.params,
+                                            discovered_address,
+                                        )?
+                                    };
 
                                 backfill_slots.push(MulticallSlotGeneric {
                                     block_number: *block_num,
@@ -4407,19 +4737,28 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         );
 
                         // Group by block for multicall
-                        let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> = HashMap::new();
+                        let mut slots_by_block: HashMap<
+                            u64,
+                            Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>,
+                        > = HashMap::new();
                         for slot in backfill_slots {
-                            slots_by_block.entry(slot.block_number).or_default().push(slot);
+                            slots_by_block
+                                .entry(slot.block_number)
+                                .or_default()
+                                .push(slot);
                         }
 
-                        let backfill_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> = slots_by_block
-                            .into_iter()
-                            .map(|(block_number, slots)| BlockMulticall {
-                                block_number,
-                                block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
-                                slots,
-                            })
-                            .collect();
+                        let backfill_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> =
+                            slots_by_block
+                                .into_iter()
+                                .map(|(block_number, slots)| BlockMulticall {
+                                    block_number,
+                                    block_id: BlockId::Number(BlockNumberOrTag::Number(
+                                        block_number,
+                                    )),
+                                    slots,
+                                })
+                                .collect();
 
                         let backfill_results = execute_multicalls_generic(
                             client,
@@ -4430,18 +4769,20 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         .await?;
 
                         for (meta, return_data, _success) in backfill_results {
-                            let addr_bytes: [u8; 20] = meta.address.0.0;
+                            let addr_bytes: [u8; 20] = meta.address.0 .0;
                             let entry = new_results.entry(addr_bytes).or_default();
                             entry.insert(meta.function_name, return_data);
                         }
                     }
 
                     // Combine missing + patch function names for merge
-                    let all_new_fn_names: Vec<String> = missing_fn_names.iter()
+                    let all_new_fn_names: Vec<String> = missing_fn_names
+                        .iter()
                         .chain(patch_fn_names.iter())
                         .cloned()
                         .collect();
-                    let merged = merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+                    let merged =
+                        merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
                     let file = File::create(&output_path)?;
                     let props = WriterProperties::builder()
@@ -4462,12 +4803,14 @@ pub(crate) async fn process_factory_once_calls_multicall(
             } else {
                 let results: Vec<OnceCallResult> = results_by_address
                     .into_iter()
-                    .map(|(address, (block_number, timestamp, function_results))| OnceCallResult {
-                        block_number,
-                        block_timestamp: timestamp,
-                        contract_address: address.0 .0,
-                        function_results,
-                    })
+                    .map(
+                        |(address, (block_number, timestamp, function_results))| OnceCallResult {
+                            block_number,
+                            block_timestamp: timestamp,
+                            contract_address: address.0 .0,
+                            function_results,
+                        },
+                    )
                     .collect();
 
                 if !results.is_empty() {
@@ -4497,7 +4840,11 @@ pub(crate) async fn process_factory_once_calls_multicall(
             }
 
             // Update column index with all columns present in the file
-            let file_name = output_path.file_name().unwrap().to_string_lossy().to_string();
+            let file_name = output_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             let actual_cols: Vec<String> = read_parquet_column_names(&output_path)
                 .into_iter()
                 .collect();
@@ -4506,11 +4853,13 @@ pub(crate) async fn process_factory_once_calls_multicall(
             write_once_column_index(sub_dir, &index)?;
 
             if let Some(tx) = decoder_tx {
-                let _ = tx.send(DecoderMessage::OnceFileBackfilled {
-                    range_start: range.start,
-                    range_end: range.end,
-                    contract_name: collection_name.clone(),
-                }).await;
+                let _ = tx
+                    .send(DecoderMessage::OnceFileBackfilled {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: collection_name.clone(),
+                    })
+                    .await;
             }
         }
     }
@@ -4544,10 +4893,7 @@ pub(crate) async fn process_range(
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
         grouped_configs
-            .entry((
-                config.contract_name.clone(),
-                config.function_name.clone(),
-            ))
+            .entry((config.contract_name.clone(), config.function_name.clone()))
             .or_default()
             .push(config);
     }
@@ -4558,7 +4904,12 @@ pub(crate) async fn process_range(
 
         if existing_files.contains(&rel_path)
             || s3_manifest.as_ref().map_or(false, |m| {
-                m.has_raw_eth_calls_granular(contract_name, function_name, range.start, range.end - 1)
+                m.has_raw_eth_calls_granular(
+                    contract_name,
+                    function_name,
+                    range.start,
+                    range.end - 1,
+                )
             })
         {
             tracing::debug!(
@@ -4606,7 +4957,8 @@ pub(crate) async fn process_range(
 
         let mut all_results: Vec<CallResult> = Vec::new();
 
-        let mut pending_calls: Vec<(TransactionRequest, BlockId, &BlockInfo, &CallConfig)> = Vec::new();
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, &BlockInfo, &CallConfig)> =
+            Vec::new();
 
         for block in &filtered_blocks {
             for config in configs {
@@ -4653,7 +5005,11 @@ pub(crate) async fn process_range(
                         });
                     }
                     Err(e) => {
-                        let params_hex: Vec<String> = config.param_values.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
+                        let params_hex: Vec<String> = config
+                            .param_values
+                            .iter()
+                            .map(|p| format!("0x{}", hex::encode(p)))
+                            .collect();
                         tracing::warn!(
                             "eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
                             contract_name,
@@ -4681,12 +5037,17 @@ pub(crate) async fn process_range(
         let output_path = sub_dir.join(&file_name);
 
         let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
-            Some(all_results.iter().map(|r| DecoderEthCallResult {
-                block_number: r.block_number,
-                block_timestamp: r.block_timestamp,
-                contract_address: r.contract_address,
-                value: r.value_bytes.clone(),
-            }).collect())
+            Some(
+                all_results
+                    .iter()
+                    .map(|r| DecoderEthCallResult {
+                        block_number: r.block_number,
+                        block_timestamp: r.block_timestamp,
+                        contract_address: r.contract_address,
+                        value: r.value_bytes.clone(),
+                    })
+                    .collect(),
+            )
         } else {
             None
         };
@@ -4736,14 +5097,16 @@ pub(crate) async fn process_range(
 
         if let Some(tx) = decoder_tx {
             if let Some(results) = decoder_results {
-                let _ = tx.send(DecoderMessage::EthCallsReady {
-                    range_start: range.start,
-                    range_end: range.end,
-                    contract_name: contract_name.clone(),
-                    function_name: function_name.clone(),
-                    results,
-                    live_mode: false,
-                }).await;
+                let _ = tx
+                    .send(DecoderMessage::EthCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: contract_name.clone(),
+                        function_name: function_name.clone(),
+                        results,
+                        live_mode: false,
+                    })
+                    .await;
             }
         }
 
@@ -4803,7 +5166,12 @@ pub(crate) async fn process_range_multicall(
 
         if existing_files.contains(&rel_path)
             || s3_manifest.as_ref().map_or(false, |m| {
-                m.has_raw_eth_calls_granular(contract_name, function_name, range.start, range.end - 1)
+                m.has_raw_eth_calls_granular(
+                    contract_name,
+                    function_name,
+                    range.start,
+                    range.end - 1,
+                )
             })
         {
             tracing::debug!(
@@ -4917,13 +5285,9 @@ pub(crate) async fn process_range_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        client,
-        multicall3_address,
-        block_multicalls,
-        rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+            .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -4955,17 +5319,24 @@ pub(crate) async fn process_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name();
-            let sub_dir = output_dir.join(&group.contract_name).join(&group.function_name);
+            let sub_dir = output_dir
+                .join(&group.contract_name)
+                .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
             let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
-                Some(results.iter().map(|r| DecoderEthCallResult {
-                    block_number: r.block_number,
-                    block_timestamp: r.block_timestamp,
-                    contract_address: r.contract_address,
-                    value: r.value_bytes.clone(),
-                }).collect())
+                Some(
+                    results
+                        .iter()
+                        .map(|r| DecoderEthCallResult {
+                            block_number: r.block_number,
+                            block_timestamp: r.block_timestamp,
+                            contract_address: r.contract_address,
+                            value: r.value_bytes.clone(),
+                        })
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -4986,7 +5357,10 @@ pub(crate) async fn process_range_multicall(
 
             // Upload to S3 if configured
             if let Some(sm) = storage_manager {
-                let data_type = format!("raw/eth_calls/{}/{}", group.contract_name, group.function_name);
+                let data_type = format!(
+                    "raw/eth_calls/{}/{}",
+                    group.contract_name, group.function_name
+                );
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
@@ -5001,14 +5375,16 @@ pub(crate) async fn process_range_multicall(
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
-                    let _ = tx.send(DecoderMessage::EthCallsReady {
-                        range_start: range.start,
-                        range_end: range.end,
-                        contract_name: group.contract_name.clone(),
-                        function_name: group.function_name.clone(),
-                        results,
-                        live_mode: false,
-                    }).await;
+                    let _ = tx
+                        .send(DecoderMessage::EthCallsReady {
+                            range_start: range.start,
+                            range_end: range.end,
+                            contract_name: group.contract_name.clone(),
+                            function_name: group.function_name.clone(),
+                            results,
+                            live_mode: false,
+                        })
+                        .await;
                 }
             }
 
@@ -5174,7 +5550,7 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
 ) -> Result<Vec<(M, Vec<u8>, bool)>, EthCallCollectionError> {
     // Track failed calls with chunk-relative indices
     struct ChunkFailedCall {
-        relative_index: usize,  // Index within the chunk's results
+        relative_index: usize, // Index within the chunk's results
         target_address: Address,
         calldata: Bytes,
         block_number: u64,
@@ -5264,11 +5640,7 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Multicall RPC failed for block {}: {}",
-                            bm.block_number,
-                            e
-                        );
+                        tracing::warn!("Multicall RPC failed for block {}: {}", bm.block_number, e);
                         // Treat all sub-calls as failed
                         for slot in &bm.slots {
                             chunk_results.push((slot.metadata.clone(), Vec::new(), false));
@@ -5582,11 +5954,7 @@ pub(crate) async fn process_token_range_multicall(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Multicall RPC failed for block {}: {}",
-                        pm.block_number,
-                        e
-                    );
+                    tracing::warn!("Multicall RPC failed for block {}: {}", pm.block_number, e);
                     // Skip all sub-calls - don't store empty results
                 }
             }
@@ -5601,17 +5969,24 @@ pub(crate) async fn process_token_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name();
-            let sub_dir = output_dir.join(&group.output_name).join(&group.function_name);
+            let sub_dir = output_dir
+                .join(&group.output_name)
+                .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
             let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
-                Some(results.iter().map(|r| DecoderEthCallResult {
-                    block_number: r.block_number,
-                    block_timestamp: r.block_timestamp,
-                    contract_address: r.contract_address,
-                    value: r.value_bytes.clone(),
-                }).collect())
+                Some(
+                    results
+                        .iter()
+                        .map(|r| DecoderEthCallResult {
+                            block_number: r.block_number,
+                            block_timestamp: r.block_timestamp,
+                            contract_address: r.contract_address,
+                            value: r.value_bytes.clone(),
+                        })
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -5632,7 +6007,10 @@ pub(crate) async fn process_token_range_multicall(
 
             // Upload to S3 if configured
             if let Some(sm) = storage_manager {
-                let data_type = format!("raw/eth_calls/{}/{}", group.output_name, group.function_name);
+                let data_type = format!(
+                    "raw/eth_calls/{}/{}",
+                    group.output_name, group.function_name
+                );
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
@@ -5647,14 +6025,16 @@ pub(crate) async fn process_token_range_multicall(
 
             if let Some(tx) = decoder_tx {
                 if let Some(results) = decoder_results {
-                    let _ = tx.send(DecoderMessage::EthCallsReady {
-                        range_start: range.start,
-                        range_end: range.end,
-                        contract_name: group.output_name.clone(),
-                        function_name: group.function_name.clone(),
-                        results,
-                        live_mode: false,
-                    }).await;
+                    let _ = tx
+                        .send(DecoderMessage::EthCallsReady {
+                            range_start: range.start,
+                            range_end: range.end,
+                            contract_name: group.output_name.clone(),
+                            function_name: group.function_name.clone(),
+                            results,
+                            live_mode: false,
+                        })
+                        .await;
                 }
             }
 
@@ -5792,12 +6172,17 @@ pub(crate) async fn process_token_range(
         let output_path = sub_dir.join(&file_name);
 
         let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
-            Some(all_results.iter().map(|r| DecoderEthCallResult {
-                block_number: r.block_number,
-                block_timestamp: r.block_timestamp,
-                contract_address: r.contract_address,
-                value: r.value_bytes.clone(),
-            }).collect())
+            Some(
+                all_results
+                    .iter()
+                    .map(|r| DecoderEthCallResult {
+                        block_number: r.block_number,
+                        block_timestamp: r.block_timestamp,
+                        contract_address: r.contract_address,
+                        value: r.value_bytes.clone(),
+                    })
+                    .collect(),
+            )
         } else {
             None
         };
@@ -5832,22 +6217,25 @@ pub(crate) async fn process_token_range(
 
         if let Some(tx) = decoder_tx {
             if let Some(results) = decoder_results {
-                let _ = tx.send(DecoderMessage::EthCallsReady {
-                    range_start: range.start,
-                    range_end: range.end,
-                    contract_name: output_name.clone(),
-                    function_name: function_name.clone(),
-                    results,
-                    live_mode: false,
-                }).await;
+                let _ = tx
+                    .send(DecoderMessage::EthCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: output_name.clone(),
+                        function_name: function_name.clone(),
+                        results,
+                        live_mode: false,
+                    })
+                    .await;
             }
         }
 
         if let Frequency::Duration(_) = frequency {
             if let Some(last_block) = filtered_blocks.last() {
-                frequency_state
-                    .last_call_times
-                    .insert((output_name.clone(), function_name.clone()), last_block.timestamp);
+                frequency_state.last_call_times.insert(
+                    (output_name.clone(), function_name.clone()),
+                    last_block.timestamp,
+                );
             }
         }
     }
@@ -5886,7 +6274,10 @@ pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
                             if let Some(name) = file_entry.file_name().to_str() {
                                 if name.ends_with(".parquet") {
                                     // Store as contract/function/filename
-                                    files.insert(format!("{}/{}/{}", contract_name, function_name, name));
+                                    files.insert(format!(
+                                        "{}/{}/{}",
+                                        contract_name, function_name, name
+                                    ));
                                 }
                             }
                         }
@@ -5907,11 +6298,7 @@ pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
     ];
 
     for i in 0..num_params {
-        fields.push(Field::new(
-            &format!("param_{}", i),
-            DataType::Binary,
-            true,
-        ));
+        fields.push(Field::new(&format!("param_{}", i), DataType::Binary, true));
     }
 
     Arc::new(Schema::new(fields))
@@ -5949,11 +6336,7 @@ pub(crate) fn write_results_to_parquet(
     for i in 0..num_params {
         let arr: BinaryArray = results
             .iter()
-            .map(|r| {
-                r.param_values
-                    .get(i)
-                    .map(|v| v.as_slice())
-            })
+            .map(|r| r.param_values.get(i).map(|v| v.as_slice()))
             .collect();
         arrays.push(Arc::new(arr));
     }
@@ -5996,7 +6379,8 @@ pub(crate) fn read_once_column_index(once_dir: &Path) -> HashMap<String, Vec<Str
     let index_path = once_dir.join("column_index.json");
     match std::fs::read_to_string(&index_path) {
         Ok(content) => {
-            let index: HashMap<String, Vec<String>> = serde_json::from_str(&content).unwrap_or_default();
+            let index: HashMap<String, Vec<String>> =
+                serde_json::from_str(&content).unwrap_or_default();
             tracing::debug!(
                 "Read column index from {}: {} files tracked",
                 index_path.display(),
@@ -6027,7 +6411,10 @@ pub(crate) fn write_once_column_index(
         index.len()
     );
     let content = serde_json::to_string_pretty(index).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialize error: {}", e))
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("JSON serialize error: {}", e),
+        )
     })?;
     std::fs::write(&index_path, content)?;
     Ok(())
@@ -6061,7 +6448,12 @@ pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String
     let parquet_files: Vec<_> = match std::fs::read_dir(once_dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "parquet").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "parquet")
+                    .unwrap_or(false)
+            })
             .collect(),
         Err(_) => return HashMap::new(),
     };
@@ -6088,7 +6480,11 @@ pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String
     // Write the newly built index
     if !index.is_empty() {
         if let Err(e) = write_once_column_index(once_dir, &index) {
-            tracing::warn!("Failed to write column index to {}: {}", once_dir.display(), e);
+            tracing::warn!(
+                "Failed to write column index to {}: {}",
+                once_dir.display(),
+                e
+            );
         } else {
             tracing::info!(
                 "Built and saved column index for {}: {} files tracked",
@@ -6189,12 +6585,13 @@ pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]
 }
 
 /// Read an existing once-call parquet file and return all record batches.
-pub(crate) fn read_existing_once_parquet(path: &Path) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
+pub(crate) fn read_existing_once_parquet(
+    path: &Path,
+) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     tracing::debug!("Reading existing once parquet from {}", path.display());
     let file = File::open(path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-        .build()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     let num_cols = batches.first().map(|b| b.num_columns()).unwrap_or(0);
@@ -6240,7 +6637,9 @@ pub(crate) fn extract_addresses_from_once_parquet(
             let block_num = block_arr.map(|a| a.value(i)).unwrap_or(0);
             let timestamp = timestamp_arr.map(|a| a.value(i)).unwrap_or(0);
 
-            addresses.entry(addr_bytes).or_insert((block_num, timestamp));
+            addresses
+                .entry(addr_bytes)
+                .or_insert((block_num, timestamp));
         }
     }
 
@@ -6318,10 +6717,7 @@ pub(crate) fn merge_once_columns(
     );
 
     // Concatenate existing batches into one
-    let existing = arrow::compute::concat_batches(
-        &existing_batches[0].schema(),
-        existing_batches,
-    )?;
+    let existing = arrow::compute::concat_batches(&existing_batches[0].schema(), existing_batches)?;
 
     let num_rows = existing.num_rows();
     let address_col = existing
@@ -6386,9 +6782,13 @@ pub(crate) fn merge_once_columns(
             // Keep existing non-null values, fill nulls with new data
             let existing_col = existing.column(i);
             let new_col = &new_columns[new_idx];
-            let existing_binary = existing_col.as_any().downcast_ref::<BinaryArray>()
+            let existing_binary = existing_col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
                 .expect("existing result column must be Binary");
-            let new_binary = new_col.as_any().downcast_ref::<BinaryArray>()
+            let new_binary = new_col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
                 .expect("new result column must be Binary");
             let merged: BinaryArray = (0..existing_binary.len())
                 .map(|row| {
@@ -6430,7 +6830,11 @@ pub(crate) fn merge_once_columns(
         "Merged result: {} rows, {} columns (schema: {:?})",
         merged.num_rows(),
         merged.num_columns(),
-        merged_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+        merged_schema
+            .fields()
+            .iter()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
     );
     Ok(merged)
 }
