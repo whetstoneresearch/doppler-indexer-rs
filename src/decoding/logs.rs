@@ -23,7 +23,7 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage,
-    DecodedValue as TransformDecodedValue, RangeCompleteMessage,
+    DecodedValue as TransformDecodedValue, RangeCompleteKind, RangeCompleteMessage,
 };
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
@@ -495,7 +495,11 @@ pub(crate) async fn process_logs(
 
     // Signal that all events for this range have been sent
     if let Some(tx) = complete_tx {
-        let msg = RangeCompleteMessage { range_start, range_end };
+        let msg = RangeCompleteMessage {
+            range_start,
+            range_end,
+            kind: RangeCompleteKind::Logs,
+        };
         if let Err(e) = tx.send(msg).await {
             tracing::warn!("Failed to send range complete: {}", e);
         }
@@ -1264,6 +1268,7 @@ pub(crate) async fn process_logs_live(
         let msg = RangeCompleteMessage {
             range_start: block_number,
             range_end: block_number + 1,
+            kind: RangeCompleteKind::Logs,
         };
         if let Err(e) = tx.send(msg).await {
             tracing::warn!("Failed to send range complete: {}", e);

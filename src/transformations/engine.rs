@@ -48,6 +48,14 @@ pub struct DecodedCallsMessage {
 pub struct RangeCompleteMessage {
     pub range_start: u64,
     pub range_end: u64,
+    pub kind: RangeCompleteKind,
+}
+
+/// Which decode stream has completed for a range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeCompleteKind {
+    Logs,
+    EthCalls,
 }
 
 /// Signal that a reorg occurred and orphaned blocks need cleanup.
@@ -98,6 +106,27 @@ struct LiveProcessingState {
     calls_buffer: HashMap<(u64, u64), Vec<DecodedCall>>,
     /// Buffer events waiting for calls, keyed by handler_key.
     pending_events: HashMap<String, Vec<PendingEventData>>,
+    /// Tracks which decode streams have completed for a range.
+    completion: HashMap<(u64, u64), RangeCompletionState>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RangeCompletionState {
+    logs_complete: bool,
+    eth_calls_complete: bool,
+}
+
+impl RangeCompletionState {
+    fn mark(&mut self, kind: RangeCompleteKind) {
+        match kind {
+            RangeCompleteKind::Logs => self.logs_complete = true,
+            RangeCompleteKind::EthCalls => self.eth_calls_complete = true,
+        }
+    }
+
+    fn is_ready(self, expect_logs: bool, expect_eth_calls: bool) -> bool {
+        (!expect_logs || self.logs_complete) && (!expect_eth_calls || self.eth_calls_complete)
+    }
 }
 
 /// The transformation engine processes decoded data and invokes handlers.
@@ -122,6 +151,10 @@ pub struct TransformationEngine {
     live_state: Mutex<LiveProcessingState>,
     /// Live mode progress tracker for marking block completion.
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    /// Whether live ranges require an eth_call completion signal before finalization.
+    expect_eth_call_completion: bool,
+    /// Whether ranges require a log completion signal before finalization.
+    expect_log_completion: bool,
 }
 
 impl TransformationEngine {
@@ -136,6 +169,8 @@ impl TransformationEngine {
         contracts: Contracts,
         handler_concurrency: usize,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+        expect_log_completion: bool,
+        expect_eth_call_completion: bool,
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
         let decoded_logs_dir = PathBuf::from(format!("data/{}/historical/decoded/logs", chain_name));
@@ -158,6 +193,8 @@ impl TransformationEngine {
             handler_concurrency,
             live_state: Mutex::new(LiveProcessingState::default()),
             progress_tracker,
+            expect_eth_call_completion,
+            expect_log_completion,
         })
     }
 
@@ -1447,6 +1484,7 @@ impl TransformationEngine {
 
         // Check if any pending events can now be processed
         self.try_process_pending_events(range_key).await?;
+        self.maybe_finalize_range(range_key).await?;
 
         Ok(())
     }
@@ -1627,97 +1665,13 @@ impl TransformationEngine {
         &self,
         msg: RangeCompleteMessage,
     ) -> Result<(), TransformationError> {
-        // Mark ALL handlers as complete for this range (event + call handlers)
-        for handler in self.registry.all_handlers() {
-            let handler_key = handler.handler_key();
-            // UPSERT handles duplicates gracefully - if a handler already recorded
-            // progress for this range (because it had events/calls), this is a no-op
-            self.record_completed_range_for_handler(
-                &handler_key,
-                msg.range_start,
-                msg.range_end,
-            ).await?;
-
-            // Mark live progress for single-block ranges (live mode)
-            if msg.range_end - msg.range_start == 1 {
-                if let Some(ref tracker) = self.progress_tracker {
-                    let mut t = tracker.lock().await;
-                    if let Err(e) = t.mark_complete(msg.range_start, &handler_key).await {
-                        tracing::warn!(
-                            "Failed to mark live progress for block {} handler {}: {}",
-                            msg.range_start, handler_key, e
-                        );
-                    }
-                }
-            }
-        }
-
-        // Clean up buffered state for this range and warn about stuck events
         let range_key = (msg.range_start, msg.range_end);
         {
             let mut state = self.live_state.lock().await;
-            state.calls_buffer.remove(&range_key);
-            for ranges in state.received_calls.values_mut() {
-                ranges.remove(&range_key);
-            }
-
-            // Check for pending events that are still waiting for this range
-            // This indicates a potential configuration issue or missing call data
-            for (handler_key, pending_list) in state.pending_events.iter() {
-                for pending in pending_list {
-                    if (pending.range_start, pending.range_end) == range_key {
-                        tracing::warn!(
-                            "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for={:?}. \
-                             This may indicate missing eth_call configuration or RPC failure.",
-                            handler_key,
-                            pending.range_start,
-                            pending.range_end,
-                            pending.source_name,
-                            pending.event_name,
-                            pending.required_calls
-                        );
-                    }
-                }
-            }
+            state.completion.entry(range_key).or_default().mark(msg.kind);
         }
 
-        tracing::debug!(
-            "Recorded progress for {} handlers on range {}-{}",
-            self.registry.all_handlers().len(),
-            msg.range_start,
-            msg.range_end
-        );
-
-        // Update block status for live mode compaction (single-block ranges only)
-        if msg.range_end - msg.range_start == 1 {
-            let storage = LiveStorage::new(&self.chain_name);
-            match storage.read_status(msg.range_start) {
-                Ok(mut status) => {
-                    status.transformed = true;
-                    if let Err(e) = storage.write_status(msg.range_start, &status) {
-                        tracing::warn!(
-                            "Failed to set transformed=true for block {}: {}",
-                            msg.range_start, e
-                        );
-                    }
-                }
-                Err(StorageError::NotFound(_)) => {
-                    // Status file doesn't exist yet - this can happen if transformations
-                    // complete before the collector writes the status file
-                    tracing::debug!(
-                        "Status file not found for block {}, skipping transformed=true",
-                        msg.range_start
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read status for block {}: {}",
-                        msg.range_start, e
-                    );
-                }
-            }
-        }
-
+        self.maybe_finalize_range(range_key).await?;
         Ok(())
     }
 
@@ -1773,6 +1727,7 @@ impl TransformationEngine {
             if state.calls_buffer.remove(&range_key).is_some() {
                 tracing::debug!("Removed calls buffer for orphaned range {:?}", range_key);
             }
+            state.completion.remove(&range_key);
 
             // Remove from received_calls
             for ranges in state.received_calls.values_mut() {
@@ -1940,6 +1895,127 @@ impl TransformationEngine {
         }
 
         Ok(())
+    }
+
+    async fn maybe_finalize_range(
+        &self,
+        range_key: (u64, u64),
+    ) -> Result<(), TransformationError> {
+        let should_finalize = {
+            let state = self.live_state.lock().await;
+            let completion = state.completion.get(&range_key).copied().unwrap_or_default();
+            let has_pending = state.pending_events.values().any(|pending_list| {
+                pending_list
+                    .iter()
+                    .any(|pending| (pending.range_start, pending.range_end) == range_key)
+            });
+
+            if has_pending && completion.logs_complete && completion.eth_calls_complete {
+                for (handler_key, pending_list) in &state.pending_events {
+                    for pending in pending_list {
+                        if (pending.range_start, pending.range_end) == range_key {
+                            tracing::warn!(
+                                "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for={:?}. \
+                                 This may indicate missing eth_call configuration or RPC failure.",
+                                handler_key,
+                                pending.range_start,
+                                pending.range_end,
+                                pending.source_name,
+                                pending.event_name,
+                                pending.required_calls
+                            );
+                        }
+                    }
+                }
+            }
+
+            !has_pending
+                && completion.is_ready(
+                    self.expect_log_completion,
+                    self.range_requires_eth_call_completion(range_key),
+                )
+        };
+
+        if !should_finalize {
+            return Ok(());
+        }
+
+        self.finalize_range(range_key.0, range_key.1).await
+    }
+
+    async fn finalize_range(
+        &self,
+        range_start: u64,
+        range_end: u64,
+    ) -> Result<(), TransformationError> {
+        // Mark ALL handlers as complete for this range (event + call handlers)
+        for handler in self.registry.all_handlers() {
+            let handler_key = handler.handler_key();
+            self.record_completed_range_for_handler(&handler_key, range_start, range_end)
+                .await?;
+
+            if range_end - range_start == 1 {
+                if let Some(ref tracker) = self.progress_tracker {
+                    let mut t = tracker.lock().await;
+                    if let Err(e) = t.mark_complete(range_start, &handler_key).await {
+                        tracing::warn!(
+                            "Failed to mark live progress for block {} handler {}: {}",
+                            range_start, handler_key, e
+                        );
+                    }
+                }
+            }
+        }
+
+        let range_key = (range_start, range_end);
+        {
+            let mut state = self.live_state.lock().await;
+            state.calls_buffer.remove(&range_key);
+            state.completion.remove(&range_key);
+            for ranges in state.received_calls.values_mut() {
+                ranges.remove(&range_key);
+            }
+        }
+
+        tracing::debug!(
+            "Recorded progress for {} handlers on range {}-{}",
+            self.registry.all_handlers().len(),
+            range_start,
+            range_end
+        );
+
+        if range_end - range_start == 1 {
+            let storage = LiveStorage::new(&self.chain_name);
+            match storage.read_status(range_start) {
+                Ok(mut status) => {
+                    status.transformed = true;
+                    if let Err(e) = storage.write_status(range_start, &status) {
+                        tracing::warn!(
+                            "Failed to set transformed=true for block {}: {}",
+                            range_start, e
+                        );
+                    }
+                }
+                Err(StorageError::NotFound(_)) => {
+                    tracing::debug!(
+                        "Status file not found for block {}, skipping transformed=true",
+                        range_start
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read status for block {}: {}",
+                        range_start, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn range_requires_eth_call_completion(&self, range_key: (u64, u64)) -> bool {
+        self.expect_eth_call_completion && range_key.1.saturating_sub(range_key.0) == 1
     }
 
     /// Clean up _live_progress entries for orphaned blocks.
@@ -2225,6 +2301,34 @@ impl TransformationEngine {
                 start_block.map_or(true, |sb| c.block_number >= sb)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RangeCompleteKind, RangeCompletionState};
+
+    #[test]
+    fn range_completion_requires_both_streams_when_calls_expected() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::Logs);
+        assert!(!state.is_ready(true, true));
+        state.mark(RangeCompleteKind::EthCalls);
+        assert!(state.is_ready(true, true));
+    }
+
+    #[test]
+    fn range_completion_only_requires_logs_without_calls() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::Logs);
+        assert!(state.is_ready(true, false));
+    }
+
+    #[test]
+    fn range_completion_can_finalize_call_only_ranges() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::EthCalls);
+        assert!(state.is_ready(false, true));
     }
 }
 

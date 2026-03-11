@@ -106,32 +106,13 @@ impl ReorgDetector {
     ///
     /// Returns (common_ancestor_number, orphaned_block_numbers).
     fn find_common_ancestor(&self, new_block: &LiveBlock) -> (u64, Vec<u64>) {
-        let mut orphaned = Vec::new();
-        let mut current_number = new_block.number.saturating_sub(1);
-
-        // Walk back through our tracked blocks
-        while let Some(_) = self.recent_blocks.get(&current_number) {
-            // Check if this tracked block's hash matches the new chain
-            // Since we only have the new block's parent_hash, we can only check immediate parent
-            // For deeper reorgs, we assume all blocks since parent_hash mismatch are orphaned
-            orphaned.push(current_number);
-
-            if current_number == 0 {
-                break;
-            }
-            current_number -= 1;
-        }
-
-        // The common ancestor is the block before the first orphaned block
-        // (or 0 if we orphaned everything we were tracking)
-        let common_ancestor = if orphaned.is_empty() {
-            new_block.number.saturating_sub(1)
-        } else {
-            orphaned.last().copied().unwrap_or(0).saturating_sub(1)
-        };
-
-        // Reverse to have orphaned blocks in ascending order
-        orphaned.reverse();
+        let first_orphaned = new_block.number.saturating_sub(1);
+        let orphaned: Vec<u64> = self
+            .recent_blocks
+            .range(first_orphaned..)
+            .map(|(&block_number, _)| block_number)
+            .collect();
+        let common_ancestor = first_orphaned.saturating_sub(1);
 
         (common_ancestor, orphaned)
     }
@@ -232,8 +213,33 @@ mod tests {
         assert!(event.is_some());
 
         let event = event.unwrap();
-        assert!(!event.orphaned.is_empty());
-        assert!(event.depth >= 1);
+        assert_eq!(event.common_ancestor, 1);
+        assert_eq!(event.orphaned, vec![2, 3]);
+        assert_eq!(event.depth, 2);
+    }
+
+    #[test]
+    fn test_reorg_does_not_orphan_entire_history() {
+        let mut detector = ReorgDetector::new(10);
+
+        for i in 1..=6 {
+            let parent = if i == 1 { 0 } else { i - 1 };
+            detector.process_block(&make_block(i, i as u8, parent as u8));
+        }
+
+        let reorg_block = LiveBlock {
+            number: 6,
+            hash: [66; 32],
+            parent_hash: [55; 32],
+            timestamp: 72,
+            tx_hashes: vec![],
+        };
+
+        let event = detector.process_block(&reorg_block).unwrap();
+        assert_eq!(event.common_ancestor, 4);
+        assert_eq!(event.orphaned, vec![5, 6]);
+        assert!(detector.get_block_hash(4).is_some());
+        assert!(detector.get_block_hash(5).is_none());
     }
 
     #[test]

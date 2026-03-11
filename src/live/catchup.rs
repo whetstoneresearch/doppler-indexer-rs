@@ -510,6 +510,20 @@ impl LiveCatchupService {
                 }
             }
 
+            if let Err(e) = decoder_tx
+                .send(DecoderMessage::EthCallsBlockComplete {
+                    range_start: block_number,
+                    range_end: block_number + 1,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send eth_call block completion for block {} during catchup: {}",
+                    block_number,
+                    e
+                );
+            }
+
             replayed += 1;
             tracing::debug!("Replayed eth_calls for block {} to decoder", block_number);
         }

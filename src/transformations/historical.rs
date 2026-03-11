@@ -404,7 +404,13 @@ fn batch_to_events(
     let addresses = get_address_column(&batch, "contract_address")?;
 
     // Get parameter columns (everything except standard columns)
-    let standard_cols = ["block_number", "block_timestamp", "transaction_hash", "log_index", "address"];
+    let standard_cols = [
+        "block_number",
+        "block_timestamp",
+        "transaction_hash",
+        "log_index",
+        "contract_address",
+    ];
     let schema = batch.schema();
     let param_columns: Vec<_> = schema
         .fields()
@@ -618,4 +624,70 @@ fn extract_value_from_batch(
         "Unhandled Arrow data type in extract_value_from_batch - value will be dropped"
     );
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::{batch_to_events, HistoricalDataReader};
+    use crate::transformations::DecodedValue;
+
+    #[test]
+    fn find_files_for_range_includes_inclusive_range_end() {
+        let reader = HistoricalDataReader::new("missing-chain").unwrap();
+        let mut index = HashMap::new();
+        index.insert(
+            ("v3".to_string(), "Swap".to_string()),
+            vec![(0, 9999, "decoded_0-9999.parquet".into())],
+        );
+
+        let files = reader.find_files_for_range(&index, Some("v3"), Some("Swap"), 9999, 10000);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].3, 0);
+        assert_eq!(files[0].4, 9999);
+    }
+
+    #[test]
+    fn batch_to_events_excludes_contract_address_from_params() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("transaction_hash", DataType::FixedSizeBinary(32), false),
+            Field::new("log_index", DataType::UInt32, false),
+            Field::new("contract_address", DataType::FixedSizeBinary(20), false),
+            Field::new("amount0", DataType::UInt64, true),
+        ]));
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vec![7u64])),
+            Arc::new(UInt64Array::from(vec![99u64])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::once(&[0x11u8; 32][..])).unwrap(),
+            ),
+            Arc::new(UInt32Array::from(vec![3u32])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::once(&[0x22u8; 20][..])).unwrap(),
+            ),
+            Arc::new(UInt64Array::from(vec![42u64])),
+        ];
+
+        let batch = RecordBatch::try_new(schema, arrays)
+        .unwrap();
+
+        let events = batch_to_events(batch, "v3", "Swap").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].contract_address, [0x22u8; 20]);
+        assert_eq!(events[0].params.len(), 1);
+        assert!(matches!(
+            events[0].params.get("amount0"),
+            Some(DecodedValue::Uint64(42))
+        ));
+        assert!(!events[0].params.contains_key("contract_address"));
+    }
 }

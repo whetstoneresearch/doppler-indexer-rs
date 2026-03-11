@@ -25,7 +25,7 @@ use super::current;
 use super::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage,
-    DecodedValue as TransformDecodedValue,
+    DecodedValue as TransformDecodedValue, RangeCompleteMessage,
 };
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::Contracts;
@@ -134,6 +134,7 @@ pub async fn decode_eth_calls(
     raw_data_config: &RawDataCollectionConfig,
     decoder_rx: Receiver<super::types::DecoderMessage>,
     transform_tx: Option<Sender<DecodedCallsMessage>>,
+    complete_tx: Option<Sender<RangeCompleteMessage>>,
     eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
@@ -222,6 +223,7 @@ pub async fn decode_eth_calls(
         &event_configs,
         raw_data_config,
         transform_tx.as_ref(),
+        complete_tx.as_ref(),
     )
     .await?;
 

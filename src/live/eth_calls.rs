@@ -160,6 +160,15 @@ impl LiveEthCallCollector {
             );
         }
 
+        if let Some(tx) = decoder_tx {
+            let _ = tx
+                .send(DecoderMessage::EthCallsBlockComplete {
+                    range_start: block_number,
+                    range_end: block_number + 1,
+                })
+                .await;
+        }
+
         Ok(all_calls)
     }
 

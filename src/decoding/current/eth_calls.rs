@@ -16,7 +16,10 @@ use crate::decoding::eth_calls::{
 use crate::decoding::types::DecoderMessage;
 use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
 use crate::live::LiveStorage;
-use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
+use crate::transformations::{
+    DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteKind,
+    RangeCompleteMessage,
+};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 use super::super::catchup;
@@ -65,6 +68,7 @@ pub async fn decode_eth_calls_live(
     event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    complete_tx: Option<&Sender<RangeCompleteMessage>>,
 ) -> Result<(), EthCallDecodingError> {
     // Live storage for live_mode=true messages
     let live_storage = LiveStorage::new(chain_name);
@@ -412,6 +416,18 @@ pub async fn decode_eth_calls_live(
                     let _ = live_storage.delete_all_decoded_calls(block_number);
                 }
             }
+            Some(DecoderMessage::EthCallsBlockComplete { range_start, range_end }) => {
+                if let Some(tx) = complete_tx {
+                    let msg = RangeCompleteMessage {
+                        range_start,
+                        range_end,
+                        kind: RangeCompleteKind::EthCalls,
+                    };
+                    if let Err(e) = tx.send(msg).await {
+                        tracing::warn!("Failed to send eth_call range complete: {}", e);
+                    }
+                }
+            }
             Some(DecoderMessage::OnceFileBackfilled {
                 range_start,
                 range_end,
@@ -512,4 +528,71 @@ pub async fn decode_eth_calls_live(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tokio::sync::mpsc;
+
+    use super::decode_eth_calls_live;
+    use crate::decoding::DecoderMessage;
+    use crate::transformations::{RangeCompleteKind, RangeCompleteMessage};
+    use crate::types::config::raw_data::{FieldsConfig, RawDataCollectionConfig};
+
+    #[tokio::test]
+    async fn eth_call_block_complete_emits_completion_signal() {
+        let (decoder_tx, decoder_rx) = mpsc::channel(4);
+        let (complete_tx, mut complete_rx) = mpsc::channel::<RangeCompleteMessage>(4);
+
+        let handle = tokio::spawn(async move {
+            decode_eth_calls_live(
+                decoder_rx,
+                Path::new("data/test/raw"),
+                Path::new("data/test/decoded"),
+                "test",
+                &[],
+                &[],
+                &[],
+                &RawDataCollectionConfig {
+                    parquet_block_range: None,
+                    rpc_batch_size: None,
+                    fields: FieldsConfig {
+                        block_fields: None,
+                        receipt_fields: None,
+                        log_fields: None,
+                    },
+                    contract_logs_only: None,
+                    channel_capacity: None,
+                    factory_channel_capacity: None,
+                    block_receipt_concurrency: None,
+                    decoding_concurrency: None,
+                    factory_concurrency: None,
+                    live_mode: None,
+                    reorg_depth: None,
+                    compaction_interval_secs: None,
+                },
+                None,
+                Some(&complete_tx),
+            )
+            .await
+        });
+
+        decoder_tx
+            .send(DecoderMessage::EthCallsBlockComplete {
+                range_start: 42,
+                range_end: 43,
+            })
+            .await
+            .unwrap();
+        decoder_tx.send(DecoderMessage::AllComplete).await.unwrap();
+
+        let msg = complete_rx.recv().await.unwrap();
+        assert_eq!(msg.range_start, 42);
+        assert_eq!(msg.range_end, 43);
+        assert_eq!(msg.kind, RangeCompleteKind::EthCalls);
+
+        handle.await.unwrap().unwrap();
+    }
 }

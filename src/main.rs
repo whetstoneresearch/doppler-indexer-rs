@@ -330,7 +330,7 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
             async move {
                 let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
                 drop(_tx);
-                decode_eth_calls(&chain, &cfg, rx, None, None, None, false)
+                decode_eth_calls(&chain, &cfg, rx, None, None, None, None, false)
                     .await
                     .context("eth call decoding failed")
             }
@@ -496,6 +496,8 @@ async fn process_chain_live_only(
             chain.contracts.clone(),
             tc.handler_concurrency,
             progress_tracker.clone(),
+            has_events,
+            has_calls,
         )
         .await
         .context("failed to create transformation engine")?;
@@ -543,8 +545,18 @@ async fn process_chain_live_only(
         let chain = Arc::new(chain.clone());
         let cfg = config.raw_data_collection.clone();
         let transform_calls_tx = transform_calls_tx.clone();
+        let transform_complete_tx = transform_complete_tx.clone();
         tasks.spawn(async move {
-            decode_eth_calls(&chain, &cfg, rx, transform_calls_tx, None, None, true)
+            decode_eth_calls(
+                &chain,
+                &cfg,
+                rx,
+                transform_calls_tx,
+                transform_complete_tx,
+                None,
+                None,
+                true,
+            )
                 .await
                 .context("eth_call decoding failed")
         });
@@ -1025,10 +1037,20 @@ async fn process_chain(
 
     if has_calls {
         let transform_calls_tx = transform_calls_tx.clone();
+        let transform_complete_tx = transform_complete_tx.clone();
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
-                decode_eth_calls(&chain, &cfg, call_decoder_rx.unwrap(), transform_calls_tx, eth_calls_catchup_done_rx, decode_catchup_done_tx, false)
+                decode_eth_calls(
+                    &chain,
+                    &cfg,
+                    call_decoder_rx.unwrap(),
+                    transform_calls_tx,
+                    transform_complete_tx,
+                    eth_calls_catchup_done_rx,
+                    decode_catchup_done_tx,
+                    false,
+                )
                     .await
                     .context("eth call decoding failed")
             }
@@ -1090,6 +1112,8 @@ async fn process_chain(
             chain.contracts.clone(),
             tc.handler_concurrency,
             progress_tracker.clone(),
+            has_events,
+            has_calls,
         )
         .await
         .context("failed to create transformation engine")?;

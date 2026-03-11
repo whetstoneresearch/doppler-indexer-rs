@@ -76,6 +76,11 @@ pub enum DecoderMessage {
         /// If true, write to live bincode storage instead of parquet
         live_mode: bool,
     },
+    /// Marker indicating all eth_call decode work for this block/range has been queued.
+    EthCallsBlockComplete {
+        range_start: u64,
+        range_end: u64,
+    },
     /// Factory addresses discovered for a range (needed for factory log/call decoding)
     #[allow(dead_code)]
     FactoryAddresses {
