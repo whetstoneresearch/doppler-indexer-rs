@@ -194,19 +194,31 @@ impl LiveCollector {
                     if !first_block_seen {
                         first_block_seen = true;
                         tracing::info!("First live block received: {}", number);
-                        if let Some(expected) = expected_start_block {
-                            if number > expected + 1 {
+                        if let Some(last_processed) = expected_start_block {
+                            // Calculate the expected next block after the last processed one.
+                            // If we receive a block higher than expected_next, there's a gap.
+                            let expected_next = last_processed + 1;
+                            if number > expected_next {
+                                // Gap detected: blocks [expected_next, number - 1] are missing.
+                                // For example: last_processed=100, number=103
+                                //   -> expected_next=101, gap_start=101, gap_end=102
+                                //   -> backfill 2 blocks (101 and 102)
+                                let gap_start = expected_next;
+                                let gap_end = number - 1;
+                                let gap_size = gap_end - gap_start + 1;
                                 tracing::warn!(
-                                    "Gap detected: expected block {}, received {}. Backfilling {} blocks.",
-                                    expected + 1,
+                                    "Gap detected: expected block {}, received {}. Backfilling {} blocks ({}-{}).",
+                                    expected_next,
                                     number,
-                                    number - expected - 1
+                                    gap_size,
+                                    gap_start,
+                                    gap_end,
                                 );
                                 // Backfill the gap before processing this block
                                 if let Err(e) = self
                                     .backfill_blocks(
-                                        expected + 1,
-                                        number - 1,
+                                        gap_start,
+                                        gap_end,
                                         &live_tx,
                                         &log_decoder_tx,
                                         &eth_call_decoder_tx,
@@ -216,8 +228,8 @@ impl LiveCollector {
                                 {
                                     tracing::error!(
                                         "Error backfilling gap blocks {}-{}: {}",
-                                        expected + 1,
-                                        number - 1,
+                                        gap_start,
+                                        gap_end,
                                         e
                                     );
                                 }
@@ -974,5 +986,59 @@ impl std::fmt::Debug for LiveCollector {
             .field("chain", &self.chain.name)
             .field("buffer_size", &self.buffer.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Computes the gap range for backfill given the last processed block and received block.
+    /// Returns Some((gap_start, gap_end)) if there is a gap, None otherwise.
+    fn compute_gap_range(last_processed: u64, received: u64) -> Option<(u64, u64)> {
+        let expected_next = last_processed + 1;
+        if received > expected_next {
+            let gap_start = expected_next;
+            let gap_end = received - 1;
+            Some((gap_start, gap_end))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn test_gap_detection_range() {
+        // Last processed: 100, received: 103
+        // Should backfill blocks 101, 102 (2 blocks)
+        let (gap_start, gap_end) = compute_gap_range(100, 103).unwrap();
+        assert_eq!(gap_start, 101);
+        assert_eq!(gap_end, 102);
+        assert_eq!(gap_end - gap_start + 1, 2);
+    }
+
+    #[test]
+    fn test_gap_detection_single_block_gap() {
+        // Last processed: 100, received: 102
+        // Should backfill block 101 (1 block)
+        let (gap_start, gap_end) = compute_gap_range(100, 102).unwrap();
+        assert_eq!(gap_start, 101);
+        assert_eq!(gap_end, 101);
+        assert_eq!(gap_end - gap_start + 1, 1);
+    }
+
+    #[test]
+    fn test_gap_detection_no_gap() {
+        // Last processed: 100, received: 101
+        // No gap - this is the expected next block
+        let result = compute_gap_range(100, 101);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_gap_detection_large_gap() {
+        // Last processed: 1000, received: 1010
+        // Should backfill blocks 1001-1009 (9 blocks)
+        let (gap_start, gap_end) = compute_gap_range(1000, 1010).unwrap();
+        assert_eq!(gap_start, 1001);
+        assert_eq!(gap_end, 1009);
+        assert_eq!(gap_end - gap_start + 1, 9);
     }
 }
