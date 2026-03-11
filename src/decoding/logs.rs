@@ -563,14 +563,19 @@ fn decode_log(
     }
 
     // Flatten param_values to match flattened_fields order
-    let flattened = flatten_param_values(&param_values, &event.params);
+    // Returns None if any tuple field is missing (C1 fix: avoid silent data loss)
+    let flattened = match flatten_param_values(&param_values, &event.params) {
+        Some(f) => f,
+        None => return Ok(None), // Missing tuple field logged in flatten_param_values
+    };
 
     // Verify we have the right number of values
     if flattened.len() != event.flattened_fields.len() {
         tracing::debug!(
-            "Flattened values count {} doesn't match flattened_fields count {}",
+            "Flattened values count {} doesn't match flattened_fields count {} for event {}",
             flattened.len(),
-            event.flattened_fields.len()
+            event.flattened_fields.len(),
+            event.name
         );
         return Ok(None);
     }
@@ -586,24 +591,57 @@ fn decode_log(
 }
 
 /// Flatten param_values to match the order of flattened_fields
-fn flatten_param_values(values: &[DecodedValue], params: &[EventParam]) -> Vec<DecodedValue> {
+/// Returns None if any tuple field is missing (to avoid corrupt data)
+fn flatten_param_values(
+    values: &[DecodedValue],
+    params: &[EventParam],
+) -> Option<Vec<DecodedValue>> {
     let mut result = Vec::new();
 
     for (value, param) in values.iter().zip(params.iter()) {
-        flatten_single_value(value, param, &mut result);
+        match flatten_single_value(value, param, &mut result) {
+            FlattenResult::Ok => {}
+            FlattenResult::MissingField {
+                field_name,
+                expected_fields,
+                actual_fields,
+            } => {
+                tracing::warn!(
+                    "Missing field '{}' in tuple decode. Expected: {:?}, got: {:?}",
+                    field_name,
+                    expected_fields,
+                    actual_fields
+                );
+                return None; // Skip log rather than produce corrupt data
+            }
+        }
     }
 
-    result
+    Some(result)
 }
 
 /// Recursively flatten a single value based on its param info
-fn flatten_single_value(value: &DecodedValue, param: &EventParam, output: &mut Vec<DecodedValue>) {
+/// Result type for flatten_single_value to propagate missing field errors
+enum FlattenResult {
+    Ok,
+    MissingField {
+        field_name: String,
+        expected_fields: Vec<String>,
+        actual_fields: Vec<String>,
+    },
+}
+
+fn flatten_single_value(
+    value: &DecodedValue,
+    param: &EventParam,
+    output: &mut Vec<DecodedValue>,
+) -> FlattenResult {
     // Check if this is an indexed tuple (stored as hash)
     if param.indexed {
         if let Some(TupleFieldInfo::Tuple(_)) = &param.tuple_fields {
             // Indexed tuple - just add the hash directly
             output.push(value.clone());
-            return;
+            return FlattenResult::Ok;
         }
     }
 
@@ -613,11 +651,20 @@ fn flatten_single_value(value: &DecodedValue, param: &EventParam, output: &mut V
             if let DynSolType::Tuple(types) = &param.param_type {
                 for ((field_name, field_info), field_type) in field_infos.iter().zip(types.iter()) {
                     // Find the matching value
-                    let field_value = named_values
-                        .iter()
-                        .find(|(n, _)| n == field_name)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or(DecodedValue::Bytes(vec![]));
+                    let field_value = match named_values.iter().find(|(n, _)| n == field_name) {
+                        Some((_, v)) => v.clone(),
+                        None => {
+                            let expected_fields: Vec<String> =
+                                field_infos.iter().map(|(n, _)| n.clone()).collect();
+                            let actual_fields: Vec<String> =
+                                named_values.iter().map(|(n, _)| n.clone()).collect();
+                            return FlattenResult::MissingField {
+                                field_name: field_name.clone(),
+                                expected_fields,
+                                actual_fields,
+                            };
+                        }
+                    };
 
                     // Create sub-param for recursion
                     let sub_param = EventParam {
@@ -628,13 +675,19 @@ fn flatten_single_value(value: &DecodedValue, param: &EventParam, output: &mut V
                         tuple_fields: Some(field_info.clone()),
                     };
 
-                    flatten_single_value(&field_value, &sub_param, output);
+                    if let result @ FlattenResult::MissingField { .. } =
+                        flatten_single_value(&field_value, &sub_param, output)
+                    {
+                        return result;
+                    }
                 }
             }
+            FlattenResult::Ok
         }
         _ => {
             // Leaf value - add directly
             output.push(value.clone());
+            FlattenResult::Ok
         }
     }
 }
