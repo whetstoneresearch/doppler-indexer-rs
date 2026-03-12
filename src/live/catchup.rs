@@ -16,18 +16,40 @@ use tokio::sync::mpsc;
 use tokio_postgres::types::ToSql;
 
 use super::storage::{LiveStorage, StorageError};
-use super::types::LiveBlockStatus;
+use super::types::{LiveBlockStatus, LivePipelineExpectations};
 use crate::db::DbPool;
 use crate::decoding::{DecoderMessage, EthCallResult};
 use crate::raw_data::historical::receipts::LogData;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionResumeStage {
+    FetchBlock,
+    FetchReceiptsAndLogs,
+    CollectEthCalls,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionResumeRequest {
+    pub block_number: u64,
+    pub stage: CollectionResumeStage,
+    pub retry_transform_after_decode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallDecodeReplayRequest {
+    pub block_number: u64,
+    pub retry_transform_after_decode: bool,
+}
+
 /// Result of scanning for incomplete blocks.
 #[derive(Debug, Default)]
 pub struct CatchupScanResult {
+    /// Blocks that need collection resumed from a specific stage.
+    pub blocks_needing_collection_resume: Vec<CollectionResumeRequest>,
     /// Blocks that need log decoding (have raw logs but logs_decoded=false).
     pub blocks_needing_log_decode: Vec<u64>,
     /// Blocks that need eth_call decoding (have raw eth_calls but eth_calls_decoded=false).
-    pub blocks_needing_call_decode: Vec<u64>,
+    pub blocks_needing_call_decode: Vec<CallDecodeReplayRequest>,
     /// Blocks that need transformation, with the set of handlers that still need to run.
     /// (block_number, missing_handler_keys)
     pub blocks_needing_transform: Vec<(u64, HashSet<String>)>,
@@ -36,7 +58,8 @@ pub struct CatchupScanResult {
 impl CatchupScanResult {
     /// Check if any catchup work is needed.
     pub fn is_empty(&self) -> bool {
-        self.blocks_needing_log_decode.is_empty()
+        self.blocks_needing_collection_resume.is_empty()
+            && self.blocks_needing_log_decode.is_empty()
             && self.blocks_needing_call_decode.is_empty()
             && self.blocks_needing_transform.is_empty()
     }
@@ -44,8 +67,17 @@ impl CatchupScanResult {
     /// Total number of blocks needing some form of catchup.
     pub fn total_blocks(&self) -> usize {
         let mut blocks: HashSet<u64> = HashSet::new();
+        blocks.extend(
+            self.blocks_needing_collection_resume
+                .iter()
+                .map(|req| req.block_number),
+        );
         blocks.extend(&self.blocks_needing_log_decode);
-        blocks.extend(&self.blocks_needing_call_decode);
+        blocks.extend(
+            self.blocks_needing_call_decode
+                .iter()
+                .map(|req| req.block_number),
+        );
         blocks.extend(self.blocks_needing_transform.iter().map(|(b, _)| *b));
         blocks.len()
     }
@@ -55,16 +87,22 @@ impl CatchupScanResult {
 pub struct LiveCatchupService {
     storage: LiveStorage,
     registered_handlers: HashSet<String>,
+    expectations: LivePipelineExpectations,
     chain_id: i64,
     db_pool: Option<Arc<DbPool>>,
 }
 
 impl LiveCatchupService {
     /// Create a new catchup service.
-    pub fn new(chain_name: &str, registered_handlers: HashSet<String>) -> Self {
+    pub fn new(
+        chain_name: &str,
+        registered_handlers: HashSet<String>,
+        expectations: LivePipelineExpectations,
+    ) -> Self {
         Self {
             storage: LiveStorage::new(chain_name),
             registered_handlers,
+            expectations,
             chain_id: 0,
             db_pool: None,
         }
@@ -75,11 +113,13 @@ impl LiveCatchupService {
         chain_name: &str,
         chain_id: i64,
         registered_handlers: HashSet<String>,
+        expectations: LivePipelineExpectations,
         db_pool: Arc<DbPool>,
     ) -> Self {
         Self {
             storage: LiveStorage::new(chain_name),
             registered_handlers,
+            expectations,
             chain_id,
             db_pool: Some(db_pool),
         }
@@ -134,7 +174,8 @@ impl LiveCatchupService {
         let mut status = LiveBlockStatus::default();
 
         // Check raw data presence
-        let block_exists = self.storage.read_block(block_number).is_ok();
+        let block = self.storage.read_block(block_number).ok();
+        let block_exists = block.is_some();
         let receipts_exist = self.storage.read_receipts(block_number).is_ok();
         let logs_exist = self.storage.read_logs(block_number).is_ok();
         let eth_calls_exist = self.storage.read_eth_calls(block_number).is_ok();
@@ -143,7 +184,8 @@ impl LiveCatchupService {
         // If we have the block, mark collection phases as complete
         if block_exists {
             status.collected = true;
-            status.block_fetched = true;
+            let tx_hashes_present = block.as_ref().is_some_and(|b| !b.tx_hashes.is_empty());
+            status.block_fetched = tx_hashes_present || receipts_exist || logs_exist;
         }
         if receipts_exist {
             status.receipts_collected = true;
@@ -195,10 +237,12 @@ impl LiveCatchupService {
         // For eth_calls: mark as collected/decoded appropriately
         // If decoded data exists, mark as decoded
         // If no eth_calls or eth_calls are empty, no decoding needed
-        status.eth_calls_collected = eth_calls_exist;
+        status.eth_calls_collected = eth_calls_exist || decoded_calls_exist;
         if decoded_calls_exist || !eth_calls_exist || eth_calls_empty {
             status.eth_calls_decoded = true;
         }
+
+        status.apply_expectations(&self.expectations);
 
         // Query database for completed handlers
         if let Some(ref db_pool) = self.db_pool {
@@ -231,7 +275,7 @@ impl LiveCatchupService {
 
         // Check if all handlers are complete
         if status.logs_decoded && status.eth_calls_decoded {
-            if self.registered_handlers.is_empty() {
+            if !self.expectations.expect_transformations || self.registered_handlers.is_empty() {
                 // No handlers registered, transformation is complete
                 status.transformed = true;
             } else if status.completed_handlers.len() == self.registered_handlers.len()
@@ -281,27 +325,57 @@ impl LiveCatchupService {
                 Err(e) => return Err(e),
             };
 
-            // Skip blocks that haven't completed collection phase
-            if !status.logs_collected {
-                tracing::debug!(
-                    "Block {} has incomplete collection, skipping catchup (will be re-collected)",
-                    block_number
-                );
-                continue;
+            if let Some(stage) = self.collection_resume_stage(&status) {
+                let retry_transform_after_decode = self.expectations.expect_transformations
+                    && status.logs_decoded
+                    && !status.transformed;
+                result
+                    .blocks_needing_collection_resume
+                    .push(CollectionResumeRequest {
+                        block_number,
+                        stage,
+                        retry_transform_after_decode,
+                    });
+
+                match stage {
+                    CollectionResumeStage::FetchBlock
+                    | CollectionResumeStage::FetchReceiptsAndLogs => {
+                        continue;
+                    }
+                    CollectionResumeStage::CollectEthCalls => {
+                        if !status.logs_decoded {
+                            result.blocks_needing_log_decode.push(block_number);
+                        }
+                        continue;
+                    }
+                }
             }
 
             // Check for incomplete log decoding
-            if !status.logs_decoded {
+            if self.expectations.expect_log_decode && !status.logs_decoded {
                 result.blocks_needing_log_decode.push(block_number);
             }
 
             // Check for incomplete eth_call decoding
-            if status.eth_calls_collected && !status.eth_calls_decoded {
-                result.blocks_needing_call_decode.push(block_number);
+            if self.expectations.expect_eth_call_decode
+                && status.eth_calls_collected
+                && !status.eth_calls_decoded
+            {
+                result
+                    .blocks_needing_call_decode
+                    .push(CallDecodeReplayRequest {
+                        block_number,
+                        retry_transform_after_decode: self.expectations.expect_transformations
+                            && status.logs_decoded
+                            && !status.transformed,
+                    });
             }
 
             // Check for incomplete transformation
-            if status.logs_decoded && status.eth_calls_decoded && !status.transformed {
+            if self.expectations.expect_transformations
+                && status.transform_inputs_ready_with(&self.expectations)
+                && !status.transformed
+            {
                 let missing_handlers = self.get_missing_handlers(&status);
                 if !missing_handlers.is_empty() {
                     result
@@ -312,8 +386,13 @@ impl LiveCatchupService {
         }
 
         // Sort blocks in ascending order for sequential processing
+        result
+            .blocks_needing_collection_resume
+            .sort_unstable_by_key(|req| req.block_number);
         result.blocks_needing_log_decode.sort_unstable();
-        result.blocks_needing_call_decode.sort_unstable();
+        result
+            .blocks_needing_call_decode
+            .sort_unstable_by_key(|req| req.block_number);
         result
             .blocks_needing_transform
             .sort_unstable_by_key(|(b, _)| *b);
@@ -327,6 +406,22 @@ impl LiveCatchupService {
             .difference(&status.completed_handlers)
             .cloned()
             .collect()
+    }
+
+    fn collection_resume_stage(&self, status: &LiveBlockStatus) -> Option<CollectionResumeStage> {
+        if !status.block_fetched {
+            return Some(CollectionResumeStage::FetchBlock);
+        }
+
+        if !status.receipts_collected || !status.logs_collected || !status.factories_extracted {
+            return Some(CollectionResumeStage::FetchReceiptsAndLogs);
+        }
+
+        if self.expectations.expect_eth_call_collection && !status.eth_calls_collected {
+            return Some(CollectionResumeStage::CollectEthCalls);
+        }
+
+        None
     }
 
     /// Replay raw logs for blocks that need decoding.
@@ -451,7 +546,7 @@ impl LiveCatchupService {
     /// Sends eth_call messages to the decoder channel for each block.
     pub async fn replay_calls_for_decode(
         &self,
-        blocks: &[u64],
+        blocks: &[CallDecodeReplayRequest],
         decoder_tx: &mpsc::Sender<DecoderMessage>,
     ) -> Result<usize, StorageError> {
         if blocks.is_empty() {
@@ -461,13 +556,14 @@ impl LiveCatchupService {
         tracing::info!(
             "Catchup: replaying eth_calls for {} blocks ({} to {})",
             blocks.len(),
-            blocks.first().unwrap_or(&0),
-            blocks.last().unwrap_or(&0)
+            blocks.first().map(|req| req.block_number).unwrap_or(0),
+            blocks.last().map(|req| req.block_number).unwrap_or(0)
         );
 
         let mut replayed = 0;
 
-        for &block_number in blocks {
+        for request in blocks {
+            let block_number = request.block_number;
             // Read raw eth_calls
             let calls = match self.storage.read_eth_calls(block_number) {
                 Ok(c) => c,
@@ -526,6 +622,7 @@ impl LiveCatchupService {
                 .send(DecoderMessage::EthCallsBlockComplete {
                     range_start: block_number,
                     range_end: block_number + 1,
+                    retry_transform_after_decode: request.retry_transform_after_decode,
                 })
                 .await
             {
@@ -541,48 +638,6 @@ impl LiveCatchupService {
         }
 
         Ok(replayed)
-    }
-
-    /// Replay logs for blocks that need transformation retry.
-    ///
-    /// This clears the logs_decoded flag and replays through the decoder,
-    /// which will re-send to the transform engine.
-    pub async fn replay_for_transform(
-        &self,
-        blocks: &[(u64, HashSet<String>)],
-        decoder_tx: &mpsc::Sender<DecoderMessage>,
-    ) -> Result<usize, StorageError> {
-        if blocks.is_empty() {
-            return Ok(0);
-        }
-
-        let block_numbers: Vec<u64> = blocks.iter().map(|(b, _)| *b).collect();
-
-        tracing::info!(
-            "Catchup: retrying transformation for {} blocks ({} to {})",
-            block_numbers.len(),
-            block_numbers.first().unwrap_or(&0),
-            block_numbers.last().unwrap_or(&0)
-        );
-
-        // Clear logs_decoded flag so decoder will re-process and send to transform engine
-        for &block_number in &block_numbers {
-            if let Ok(mut status) = self.storage.read_status(block_number) {
-                status.logs_decoded = false;
-                status.transformed = false;
-                if let Err(e) = self.storage.write_status(block_number, &status) {
-                    tracing::warn!(
-                        "Failed to clear logs_decoded for block {} during transform retry: {}",
-                        block_number,
-                        e
-                    );
-                }
-            }
-        }
-
-        // Replay through decoder - it will re-decode and send to transform engine
-        self.replay_logs_for_decode(&block_numbers, decoder_tx)
-            .await
     }
 
     /// Get the storage reference for external use.
@@ -611,6 +666,10 @@ mod tests {
         let service = LiveCatchupService {
             storage,
             registered_handlers: HashSet::from(["handler_a".to_string()]),
+            expectations: LivePipelineExpectations {
+                expect_log_decode: true,
+                ..Default::default()
+            },
             chain_id: 1,
             db_pool: None,
         };
@@ -649,6 +708,10 @@ mod tests {
         let service = LiveCatchupService {
             storage,
             registered_handlers: HashSet::from(["handler_a".to_string()]),
+            expectations: LivePipelineExpectations {
+                expect_log_decode: true,
+                ..Default::default()
+            },
             chain_id: 1,
             db_pool: None,
         };
@@ -686,6 +749,10 @@ mod tests {
         let service = LiveCatchupService {
             storage,
             registered_handlers: HashSet::from(["handler_a".to_string()]),
+            expectations: LivePipelineExpectations {
+                expect_log_decode: true,
+                ..Default::default()
+            },
             chain_id: 1,
             db_pool: None,
         };
@@ -693,6 +760,196 @@ mod tests {
         let result = service.scan_incomplete_blocks().unwrap();
         assert_eq!(result.blocks_needing_log_decode, vec![100]);
         assert!(result.blocks_needing_call_decode.is_empty());
+        assert!(result.blocks_needing_transform.is_empty());
+    }
+
+    #[test]
+    fn test_scan_needs_collection_resume_from_block_fetch() {
+        let (storage, _tmp) = test_storage();
+
+        let block = super::super::types::LiveBlock {
+            number: 100,
+            hash: [1u8; 32],
+            parent_hash: [0u8; 32],
+            timestamp: 1000,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        storage.write_status(100, &status).unwrap();
+
+        let service = LiveCatchupService {
+            storage,
+            registered_handlers: HashSet::new(),
+            expectations: LivePipelineExpectations::default(),
+            chain_id: 1,
+            db_pool: None,
+        };
+
+        let result = service.scan_incomplete_blocks().unwrap();
+        assert_eq!(
+            result.blocks_needing_collection_resume,
+            vec![CollectionResumeRequest {
+                block_number: 100,
+                stage: CollectionResumeStage::FetchBlock,
+                retry_transform_after_decode: false,
+            }]
+        );
+        assert!(result.blocks_needing_log_decode.is_empty());
+        assert!(result.blocks_needing_call_decode.is_empty());
+        assert!(result.blocks_needing_transform.is_empty());
+    }
+
+    #[test]
+    fn test_scan_needs_collection_resume_for_eth_calls_when_expected() {
+        let (storage, _tmp) = test_storage();
+
+        let block = super::super::types::LiveBlock {
+            number: 100,
+            hash: [1u8; 32],
+            parent_hash: [0u8; 32],
+            timestamp: 1000,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.logs_decoded = true;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        storage.write_status(100, &status).unwrap();
+
+        let service = LiveCatchupService {
+            storage,
+            registered_handlers: HashSet::new(),
+            expectations: LivePipelineExpectations {
+                expect_eth_call_collection: true,
+                expect_eth_call_decode: true,
+                expect_transformations: true,
+                ..Default::default()
+            },
+            chain_id: 1,
+            db_pool: None,
+        };
+
+        let result = service.scan_incomplete_blocks().unwrap();
+        assert_eq!(
+            result.blocks_needing_collection_resume,
+            vec![CollectionResumeRequest {
+                block_number: 100,
+                stage: CollectionResumeStage::CollectEthCalls,
+                retry_transform_after_decode: true,
+            }]
+        );
+        assert!(result.blocks_needing_log_decode.is_empty());
+        assert!(result.blocks_needing_call_decode.is_empty());
+        assert!(result.blocks_needing_transform.is_empty());
+    }
+
+    #[test]
+    fn test_scan_collect_eth_calls_also_replays_logs_when_not_decoded() {
+        let (storage, _tmp) = test_storage();
+
+        let block = super::super::types::LiveBlock {
+            number: 101,
+            hash: [2u8; 32],
+            parent_hash: [1u8; 32],
+            timestamp: 1000,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.logs_decoded = false;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        storage.write_status(101, &status).unwrap();
+
+        let service = LiveCatchupService {
+            storage,
+            registered_handlers: HashSet::from(["handler_a".to_string()]),
+            expectations: LivePipelineExpectations {
+                expect_eth_call_collection: true,
+                expect_log_decode: true,
+                expect_eth_call_decode: true,
+                expect_transformations: true,
+            },
+            chain_id: 1,
+            db_pool: None,
+        };
+
+        let result = service.scan_incomplete_blocks().unwrap();
+        assert_eq!(
+            result.blocks_needing_collection_resume,
+            vec![CollectionResumeRequest {
+                block_number: 101,
+                stage: CollectionResumeStage::CollectEthCalls,
+                retry_transform_after_decode: false,
+            }]
+        );
+        assert_eq!(result.blocks_needing_log_decode, vec![101]);
+        assert!(result.blocks_needing_call_decode.is_empty());
+        assert!(result.blocks_needing_transform.is_empty());
+    }
+
+    #[test]
+    fn test_scan_call_decode_defers_transform_retry_until_after_decode() {
+        let (storage, _tmp) = test_storage();
+
+        let block = super::super::types::LiveBlock {
+            number: 102,
+            hash: [3u8; 32],
+            parent_hash: [2u8; 32],
+            timestamp: 1000,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.eth_calls_collected = true;
+        status.logs_decoded = true;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        storage.write_status(102, &status).unwrap();
+
+        let service = LiveCatchupService {
+            storage,
+            registered_handlers: HashSet::from(["handler_a".to_string()]),
+            expectations: LivePipelineExpectations {
+                expect_eth_call_collection: true,
+                expect_log_decode: true,
+                expect_eth_call_decode: true,
+                expect_transformations: true,
+            },
+            chain_id: 1,
+            db_pool: None,
+        };
+
+        let result = service.scan_incomplete_blocks().unwrap();
+        assert_eq!(
+            result.blocks_needing_call_decode,
+            vec![CallDecodeReplayRequest {
+                block_number: 102,
+                retry_transform_after_decode: true,
+            }]
+        );
         assert!(result.blocks_needing_transform.is_empty());
     }
 
@@ -726,6 +983,10 @@ mod tests {
         let service = LiveCatchupService {
             storage,
             registered_handlers: HashSet::from(["handler_a".to_string(), "handler_b".to_string()]),
+            expectations: LivePipelineExpectations {
+                expect_transformations: true,
+                ..Default::default()
+            },
             chain_id: 1,
             db_pool: None,
         };
@@ -763,6 +1024,7 @@ mod tests {
         let service = LiveCatchupService {
             storage: storage.clone(),
             registered_handlers: HashSet::new(),
+            expectations: LivePipelineExpectations::default(),
             chain_id: 1,
             db_pool: None,
         };
@@ -778,6 +1040,40 @@ mod tests {
         assert!(status.receipts_collected);
         assert!(status.logs_collected);
         // With no handlers registered, transformed should be true
+        assert!(status.transformed);
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_missing_status_applies_disabled_expectations() {
+        let (storage, _tmp) = test_storage();
+
+        let block = super::super::types::LiveBlock {
+            number: 101,
+            hash: [2u8; 32],
+            parent_hash: [1u8; 32],
+            timestamp: 1010,
+            tx_hashes: vec![],
+        };
+        storage.write_block(&block).unwrap();
+        storage.write_receipts(101, &[]).unwrap();
+        storage.write_logs(101, &[]).unwrap();
+
+        let service = LiveCatchupService {
+            storage: storage.clone(),
+            registered_handlers: HashSet::from(["handler_a".to_string()]),
+            expectations: LivePipelineExpectations::default(),
+            chain_id: 1,
+            db_pool: None,
+        };
+
+        let count = service.reconstruct_missing_status_files().await.unwrap();
+        assert_eq!(count, 1);
+
+        let status = storage.read_status(101).unwrap();
+        assert!(status.collected);
+        assert!(status.logs_decoded);
+        assert!(status.eth_calls_collected);
+        assert!(status.eth_calls_decoded);
         assert!(status.transformed);
     }
 }
