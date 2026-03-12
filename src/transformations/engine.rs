@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use alloy::primitives::{I256, U256};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Semaphore};
@@ -20,11 +21,19 @@ use super::historical::HistoricalDataReader;
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::traits::EventHandler;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
+use crate::decoding::eth_calls::{
+    build_decode_configs, build_result_map, CallDecodeConfig, DecodedValue as EthDecodedValue,
+    EventCallDecodeConfig,
+};
+use crate::decoding::event_parsing::ParsedEvent;
+use crate::decoding::logs::build_event_matchers;
 use crate::live::{
-    LiveDbValue, LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, StorageError,
+    LiveDbValue, LiveDecodedValue, LiveProgressTracker, LiveStorage, LiveUpsertSnapshot,
+    StorageError, TransformRetryRequest,
 };
 use crate::rpc::UnifiedRpcClient;
-use crate::types::config::contract::Contracts;
+use crate::types::config::contract::{Contracts, FactoryCollections};
+use crate::types::config::eth_call::EvmType;
 
 /// Message containing decoded events for a block range.
 #[derive(Debug)]
@@ -139,6 +148,12 @@ struct RangeCompletionState {
     eth_calls_complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveRetryCallArtifactKind {
+    Regular,
+    EventTriggered { base_name: String },
+}
+
 impl RangeCompletionState {
     fn mark(&mut self, kind: RangeCompleteKind) {
         match kind {
@@ -150,6 +165,55 @@ impl RangeCompletionState {
     fn is_ready(self, expect_logs: bool, expect_eth_calls: bool) -> bool {
         (!expect_logs || self.logs_complete) && (!expect_eth_calls || self.eth_calls_complete)
     }
+}
+
+fn resolve_retry_missing_handlers(
+    request_missing: Option<HashSet<String>>,
+    tracker_missing: Option<HashSet<String>>,
+    all_handlers: HashSet<String>,
+) -> HashSet<String> {
+    tracker_missing.unwrap_or_else(|| request_missing.unwrap_or(all_handlers))
+}
+
+fn missing_retry_call_dependencies(
+    required_calls: &HashSet<(String, String)>,
+    calls: &[DecodedCall],
+) -> HashSet<(String, String)> {
+    let available_calls: HashSet<(String, String)> = calls
+        .iter()
+        .map(|call| (call.source_name.clone(), call.function_name.clone()))
+        .collect();
+
+    required_calls
+        .difference(&available_calls)
+        .cloned()
+        .collect()
+}
+
+fn classify_live_retry_call_artifact(
+    source_name: &str,
+    function_name: &str,
+    regular_keys: &HashSet<(String, String)>,
+    event_keys: &HashSet<(String, String)>,
+) -> Result<LiveRetryCallArtifactKind, TransformationError> {
+    let exact_key = (source_name.to_string(), function_name.to_string());
+    if regular_keys.contains(&exact_key) {
+        return Ok(LiveRetryCallArtifactKind::Regular);
+    }
+
+    if let Some(base_name) = function_name.strip_suffix("_event") {
+        let event_key = (source_name.to_string(), base_name.to_string());
+        if event_keys.contains(&event_key) {
+            return Ok(LiveRetryCallArtifactKind::EventTriggered {
+                base_name: base_name.to_string(),
+            });
+        }
+    }
+
+    Err(TransformationError::MissingData(format!(
+        "missing call schema for live retry {}/{}",
+        source_name, function_name
+    )))
 }
 
 /// The transformation engine processes decoded data and invokes handlers.
@@ -168,6 +232,7 @@ pub struct TransformationEngine {
     decoded_calls_dir: PathBuf,
     raw_receipts_dir: PathBuf,
     contracts: Arc<Contracts>,
+    factory_collections: Arc<FactoryCollections>,
     /// Maximum number of handlers to execute concurrently.
     handler_concurrency: usize,
     /// Live processing state for buffering events with call dependencies.
@@ -190,6 +255,7 @@ impl TransformationEngine {
         chain_id: u64,
         mode: ExecutionMode,
         contracts: Contracts,
+        factory_collections: FactoryCollections,
         handler_concurrency: usize,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
         expect_log_completion: bool,
@@ -215,6 +281,7 @@ impl TransformationEngine {
             decoded_calls_dir,
             raw_receipts_dir,
             contracts: Arc::new(contracts),
+            factory_collections: Arc::new(factory_collections),
             handler_concurrency,
             live_state: Mutex::new(LiveProcessingState::default()),
             progress_tracker,
@@ -1263,6 +1330,7 @@ impl TransformationEngine {
         mut calls_rx: Receiver<DecodedCallsMessage>,
         mut complete_rx: Receiver<RangeCompleteMessage>,
         mut reorg_rx: Option<Receiver<ReorgMessage>>,
+        mut retry_rx: Option<Receiver<TransformRetryRequest>>,
         decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<(), TransformationError> {
         // Wait for decode catchup to finish so all decoded parquet files exist
@@ -1318,6 +1386,15 @@ impl TransformationEngine {
                     }
                 } => {
                     self.process_reorg(msg).await?;
+                }
+
+                Some(msg) = async {
+                    match retry_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.process_transform_retry(msg).await?;
                 }
 
                 else => {
@@ -1426,8 +1503,12 @@ impl TransformationEngine {
                         };
                         // Track when this pending event was first added for timeout detection
                         let timestamp_key = (msg.range_start, msg.range_end, handler_key.clone());
-                        state.pending_event_timestamps.entry(timestamp_key).or_insert_with(Instant::now);
-                        state.pending_events
+                        state
+                            .pending_event_timestamps
+                            .entry(timestamp_key)
+                            .or_insert_with(Instant::now);
+                        state
+                            .pending_events
                             .entry(handler_key)
                             .or_default()
                             .push(pending);
@@ -1879,7 +1960,9 @@ impl TransformationEngine {
             }
 
             // Remove pending event timestamps for this range
-            state.pending_event_timestamps.retain(|(rs, re, _), _| (*rs, *re) != range_key);
+            state
+                .pending_event_timestamps
+                .retain(|(rs, re, _), _| (*rs, *re) != range_key);
 
             // Remove pending events for this range from all handlers
             for (handler_key, pending_list) in state.pending_events.iter_mut() {
@@ -2056,13 +2139,14 @@ impl TransformationEngine {
         Ok(())
     }
 
-    async fn maybe_finalize_range(
-        &self,
-        range_key: (u64, u64),
-    ) -> Result<(), TransformationError> {
+    async fn maybe_finalize_range(&self, range_key: (u64, u64)) -> Result<(), TransformationError> {
         let (should_finalize, timed_out_handlers) = {
             let mut state = self.live_state.lock().await;
-            let completion = state.completion.get(&range_key).copied().unwrap_or_default();
+            let completion = state
+                .completion
+                .get(&range_key)
+                .copied()
+                .unwrap_or_default();
 
             // Check for timed-out pending events
             let timeout = std::time::Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
@@ -2073,7 +2157,9 @@ impl TransformationEngine {
                 for pending in pending_list {
                     if (pending.range_start, pending.range_end) == range_key {
                         let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
-                        if let Some(&first_seen) = state.pending_event_timestamps.get(&timestamp_key) {
+                        if let Some(&first_seen) =
+                            state.pending_event_timestamps.get(&timestamp_key)
+                        {
                             if now.duration_since(first_seen) >= timeout {
                                 tracing::error!(
                                     "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for={:?}. \
@@ -2096,7 +2182,8 @@ impl TransformationEngine {
             // Remove timed-out pending events
             for handler_key in &timed_out {
                 if let Some(pending_list) = state.pending_events.get_mut(handler_key) {
-                    pending_list.retain(|pending| (pending.range_start, pending.range_end) != range_key);
+                    pending_list
+                        .retain(|pending| (pending.range_start, pending.range_end) != range_key);
                 }
                 let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
                 state.pending_event_timestamps.remove(&timestamp_key);
@@ -2202,7 +2289,9 @@ impl TransformationEngine {
                 ranges.remove(&range_key);
             }
             // Clean up pending event timestamps for this range
-            state.pending_event_timestamps.retain(|(rs, re, _), _| (*rs, *re) != range_key);
+            state
+                .pending_event_timestamps
+                .retain(|(rs, re, _), _| (*rs, *re) != range_key);
         }
 
         tracing::debug!(
@@ -2281,6 +2370,675 @@ impl TransformationEngine {
         self.db_pool.execute_transaction(ops).await?;
 
         Ok(())
+    }
+
+    async fn process_transform_retry(
+        &self,
+        request: TransformRetryRequest,
+    ) -> Result<(), TransformationError> {
+        let block_number = request.block_number;
+        let range_key = (block_number, block_number + 1);
+
+        tracing::info!(
+            "Processing direct transform retry for block {}",
+            block_number
+        );
+
+        {
+            let mut state = self.live_state.lock().await;
+            state.calls_buffer.remove(&range_key);
+            state.completion.remove(&range_key);
+            state.finalized_ranges.remove(&range_key);
+            state
+                .pending_event_timestamps
+                .retain(|(rs, re, _), _| (*rs, *re) != range_key);
+            for ranges in state.received_calls.values_mut() {
+                ranges.remove(&range_key);
+            }
+            for pending in state.pending_events.values_mut() {
+                pending.retain(|entry| (entry.range_start, entry.range_end) != range_key);
+            }
+            state
+                .pending_events
+                .retain(|_, entries| !entries.is_empty());
+        }
+
+        let tracker_missing = if let Some(ref tracker) = self.progress_tracker {
+            Some(tracker.lock().await.get_pending_handlers(block_number))
+        } else {
+            None
+        };
+        let all_handlers: HashSet<String> = self
+            .registry
+            .all_handlers()
+            .iter()
+            .map(|handler| handler.handler_key())
+            .collect();
+        let missing_handlers =
+            resolve_retry_missing_handlers(request.missing_handlers, tracker_missing, all_handlers);
+
+        if missing_handlers.is_empty() {
+            return self.finalize_range(block_number, block_number + 1).await;
+        }
+
+        let (events, calls) = self.read_live_retry_data(block_number).await?;
+        let events = self.filter_events_by_start_block(events);
+        let calls = self.filter_calls_by_start_block(calls);
+
+        let blocked_handlers = self
+            .execute_live_retry_handlers(block_number, events, calls, &missing_handlers)
+            .await?;
+
+        if !blocked_handlers.is_empty() {
+            tracing::warn!(
+                "Live retry for block {} is still waiting on call dependencies for handlers {:?}",
+                block_number,
+                blocked_handlers
+            );
+            return Ok(());
+        }
+
+        self.finalize_range(block_number, block_number + 1).await
+    }
+
+    async fn read_live_retry_data(
+        &self,
+        block_number: u64,
+    ) -> Result<(Vec<DecodedEvent>, Vec<DecodedCall>), TransformationError> {
+        let storage = LiveStorage::new(&self.chain_name);
+        let mut events = Vec::new();
+        let mut calls = Vec::new();
+
+        let (regular_matchers, factory_matchers) =
+            build_event_matchers(&self.contracts, &self.factory_collections).map_err(|e| {
+                TransformationError::DecodeError(format!(
+                    "failed to build live retry event matchers: {}",
+                    e
+                ))
+            })?;
+
+        let mut event_schemas: HashMap<(String, String), ParsedEvent> = HashMap::new();
+        for matcher in regular_matchers {
+            event_schemas.insert(
+                (matcher.name.clone(), matcher.event_name.clone()),
+                matcher.event,
+            );
+        }
+        for matchers in factory_matchers.values() {
+            for matcher in matchers {
+                event_schemas.insert(
+                    (matcher.name.clone(), matcher.event_name.clone()),
+                    matcher.event.clone(),
+                );
+            }
+        }
+
+        for (source_name, event_name) in storage.list_decoded_log_types(block_number)? {
+            let parsed_event = event_schemas
+                .get(&(source_name.clone(), event_name.clone()))
+                .ok_or_else(|| {
+                    TransformationError::MissingData(format!(
+                        "missing event schema for live retry {}/{}",
+                        source_name, event_name
+                    ))
+                })?;
+
+            for log in storage.read_decoded_logs(block_number, &source_name, &event_name)? {
+                events.push(Self::live_log_to_decoded_event(
+                    &log,
+                    parsed_event,
+                    &source_name,
+                    &event_name,
+                )?);
+            }
+        }
+
+        let (regular_configs, once_configs, event_configs) = build_decode_configs(&self.contracts);
+        let regular_map: HashMap<(String, String), CallDecodeConfig> = regular_configs
+            .into_iter()
+            .map(|config| {
+                (
+                    (config.contract_name.clone(), config.function_name.clone()),
+                    config,
+                )
+            })
+            .collect();
+        let once_map: HashMap<(String, String), CallDecodeConfig> = once_configs
+            .into_iter()
+            .map(|config| {
+                (
+                    (config.contract_name.clone(), config.function_name.clone()),
+                    config,
+                )
+            })
+            .collect();
+        let event_map: HashMap<(String, String), EventCallDecodeConfig> = event_configs
+            .into_iter()
+            .map(|config| {
+                (
+                    (config.contract_name.clone(), config.function_name.clone()),
+                    config,
+                )
+            })
+            .collect();
+        let regular_keys: HashSet<(String, String)> = regular_map.keys().cloned().collect();
+        let event_keys: HashSet<(String, String)> = event_map.keys().cloned().collect();
+
+        for (source_name, function_name) in storage.list_decoded_call_types(block_number)? {
+            match classify_live_retry_call_artifact(
+                &source_name,
+                &function_name,
+                &regular_keys,
+                &event_keys,
+            )? {
+                LiveRetryCallArtifactKind::Regular => {
+                    let config = regular_map
+                        .get(&(source_name.clone(), function_name.clone()))
+                        .ok_or_else(|| {
+                            TransformationError::MissingData(format!(
+                                "missing regular call schema for live retry {}/{}",
+                                source_name, function_name
+                            ))
+                        })?;
+
+                    for call in
+                        storage.read_decoded_calls(block_number, &source_name, &function_name)?
+                    {
+                        calls.push(Self::live_call_to_decoded_call(
+                            &call,
+                            &source_name,
+                            &function_name,
+                            &config.output_type,
+                        )?);
+                    }
+                }
+                LiveRetryCallArtifactKind::EventTriggered { base_name } => {
+                    let config = event_map
+                        .get(&(source_name.clone(), base_name.clone()))
+                        .ok_or_else(|| {
+                            TransformationError::MissingData(format!(
+                                "missing event call schema for live retry {}/{}",
+                                source_name, base_name
+                            ))
+                        })?;
+
+                    for call in
+                        storage.read_decoded_event_calls(block_number, &source_name, &base_name)?
+                    {
+                        calls.push(Self::live_event_call_to_decoded_call(
+                            &call,
+                            &source_name,
+                            &base_name,
+                            &config.output_type,
+                        )?);
+                    }
+                }
+            }
+        }
+
+        let mut once_sources: HashSet<String> = self.contracts.keys().cloned().collect();
+        for contract in self.contracts.values() {
+            if let Some(factories) = &contract.factories {
+                once_sources.extend(factories.iter().map(|factory| factory.collection.clone()));
+            }
+        }
+
+        for source_name in once_sources {
+            let Ok(once_calls) = storage.read_decoded_once_calls(block_number, &source_name) else {
+                continue;
+            };
+
+            // Consolidate all function results per address into a single DecodedCall
+            // with function_name = "once" and merged result map.
+            // This mirrors the historical pipeline (src/decoding/eth_calls.rs:632-658)
+            // and matches how handlers declare call_dependencies (e.g., ("DERC20", "once")).
+            for call in once_calls {
+                let mut merged_result = HashMap::new();
+                for (function_name, value) in &call.decoded_values {
+                    if let Some(config) =
+                        once_map.get(&(source_name.clone(), function_name.clone()))
+                    {
+                        let decoded_value = Self::live_value_to_eth_decoded_value(value)?;
+                        let partial_result =
+                            build_result_map(&decoded_value, &config.output_type, function_name);
+                        merged_result.extend(partial_result);
+                    }
+                }
+                if !merged_result.is_empty() {
+                    calls.push(DecodedCall {
+                        block_number: call.block_number,
+                        block_timestamp: call.block_timestamp,
+                        contract_address: call.contract_address,
+                        source_name: source_name.clone(),
+                        function_name: "once".to_string(),
+                        trigger_log_index: None,
+                        result: merged_result,
+                    });
+                }
+            }
+        }
+
+        Ok((events, calls))
+    }
+
+    async fn execute_live_retry_handlers(
+        &self,
+        block_number: u64,
+        events: Vec<DecodedEvent>,
+        calls: Vec<DecodedCall>,
+        missing_handlers: &HashSet<String>,
+    ) -> Result<HashSet<String>, TransformationError> {
+        let range_start = block_number;
+        let range_end = block_number + 1;
+        let tx_addresses = Arc::new(self.read_live_receipt_addresses(block_number)?);
+        let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
+        let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
+        let mut blocked_handlers = HashSet::new();
+
+        for handler_info in self.registry.unique_event_handlers() {
+            let handler = handler_info.handler;
+            let handler_key = handler.handler_key();
+            if !missing_handlers.contains(&handler_key) {
+                continue;
+            }
+
+            let triggers: HashSet<(String, String)> = handler_info
+                .triggers
+                .iter()
+                .map(|trigger| {
+                    (
+                        trigger.source.clone(),
+                        extract_event_name(&trigger.event_signature),
+                    )
+                })
+                .collect();
+            let handler_events: Vec<DecodedEvent> = events
+                .iter()
+                .filter(|event| {
+                    triggers.contains(&(event.source_name.clone(), event.event_name.clone()))
+                })
+                .cloned()
+                .collect();
+
+            if handler_events.is_empty() {
+                continue;
+            }
+
+            let call_deps: HashSet<(String, String)> =
+                handler.call_dependencies().into_iter().collect();
+            let missing_deps = missing_retry_call_dependencies(&call_deps, &calls);
+            if !missing_deps.is_empty() {
+                tracing::warn!(
+                    "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
+                    handler_key,
+                    block_number,
+                    missing_deps
+                );
+                blocked_handlers.insert(handler_key);
+                continue;
+            }
+            let handler_calls: Vec<DecodedCall> = calls
+                .iter()
+                .filter(|call| {
+                    call_deps.contains(&(call.source_name.clone(), call.function_name.clone()))
+                })
+                .cloned()
+                .collect();
+
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let db_pool = self.db_pool.clone();
+            let chain_name = self.chain_name.clone();
+            let chain_id = self.chain_id;
+            let historical = self.historical_reader.clone();
+            let rpc = self.rpc_client.clone();
+            let contracts = self.contracts.clone();
+            let tx_addresses = tx_addresses.clone();
+            let handler_name = handler.name();
+            let handler_version = handler.version();
+
+            join_set.spawn(async move {
+                let _permit = permit;
+                let live_storage = LiveStorage::new(&chain_name);
+                let ctx = TransformationContext::new(
+                    chain_name.clone(),
+                    chain_id,
+                    range_start,
+                    range_end,
+                    Arc::new(handler_events),
+                    Arc::new(handler_calls),
+                    (*tx_addresses).clone(),
+                    historical,
+                    rpc,
+                    contracts,
+                );
+
+                match handler.handle(&ctx).await {
+                    Ok(ops) => {
+                        if !ops.is_empty() {
+                            let ops =
+                                Self::inject_source_version(ops, handler_name, handler_version);
+                            execute_with_snapshot_capture(
+                                ops,
+                                &db_pool,
+                                Some(&live_storage),
+                                range_start,
+                                handler_name,
+                                handler_version,
+                            )
+                            .await?;
+                        }
+                        Ok(Some(handler_key))
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+        }
+
+        for handler_info in self.registry.unique_call_handlers() {
+            let handler = handler_info.handler;
+            let handler_key = handler.handler_key();
+            if !missing_handlers.contains(&handler_key) {
+                continue;
+            }
+
+            let triggers: HashSet<(String, String)> = handler_info
+                .triggers
+                .iter()
+                .map(|trigger| (trigger.source.clone(), trigger.function_name.clone()))
+                .collect();
+            let handler_calls: Vec<DecodedCall> = calls
+                .iter()
+                .filter(|call| {
+                    triggers.contains(&(call.source_name.clone(), call.function_name.clone()))
+                })
+                .cloned()
+                .collect();
+
+            if handler_calls.is_empty() {
+                continue;
+            }
+
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let db_pool = self.db_pool.clone();
+            let chain_name = self.chain_name.clone();
+            let chain_id = self.chain_id;
+            let historical = self.historical_reader.clone();
+            let rpc = self.rpc_client.clone();
+            let contracts = self.contracts.clone();
+            let handler_name = handler.name();
+            let handler_version = handler.version();
+
+            join_set.spawn(async move {
+                let _permit = permit;
+                let live_storage = LiveStorage::new(&chain_name);
+                let ctx = TransformationContext::new(
+                    chain_name.clone(),
+                    chain_id,
+                    range_start,
+                    range_end,
+                    Arc::new(Vec::new()),
+                    Arc::new(handler_calls),
+                    HashMap::new(),
+                    historical,
+                    rpc,
+                    contracts,
+                );
+
+                match handler.handle(&ctx).await {
+                    Ok(ops) => {
+                        if !ops.is_empty() {
+                            let ops =
+                                Self::inject_source_version(ops, handler_name, handler_version);
+                            execute_with_snapshot_capture(
+                                ops,
+                                &db_pool,
+                                Some(&live_storage),
+                                range_start,
+                                handler_name,
+                                handler_version,
+                            )
+                            .await?;
+                        }
+                        Ok(Some(handler_key))
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(Some(handler_key))) => {
+                    if let Err(e) = self
+                        .record_completed_range_for_handler(&handler_key, range_start, range_end)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to record completed range for handler {} on block {}: {}",
+                            handler_key,
+                            block_number,
+                            e
+                        );
+                    }
+
+                    if let Some(ref tracker) = self.progress_tracker {
+                        let mut tracker = tracker.lock().await;
+                        if let Err(e) = tracker.mark_complete(block_number, &handler_key).await {
+                            tracing::warn!(
+                                "Failed to mark retry progress for block {} handler {}: {}",
+                                block_number,
+                                handler_key,
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    // Match normal pipeline: log and skip, don't tear down the engine
+                    tracing::error!(
+                        "Handler failed during live retry for block {}: {}",
+                        block_number,
+                        e
+                    );
+                }
+                Err(e) => {
+                    // Match normal pipeline: log and skip, don't tear down the engine
+                    tracing::error!(
+                        "Handler task panicked during live retry for block {}: {}",
+                        block_number,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(blocked_handlers)
+    }
+
+    fn read_live_receipt_addresses(
+        &self,
+        block_number: u64,
+    ) -> Result<HashMap<[u8; 32], TransactionAddresses>, TransformationError> {
+        let storage = LiveStorage::new(&self.chain_name);
+        let mut tx_addresses = HashMap::new();
+
+        for receipt in storage.read_receipts(block_number)? {
+            tx_addresses.insert(
+                receipt.transaction_hash,
+                TransactionAddresses {
+                    from_address: receipt.from,
+                    to_address: receipt.to,
+                },
+            );
+        }
+
+        Ok(tx_addresses)
+    }
+
+    fn live_log_to_decoded_event(
+        log: &crate::live::LiveDecodedLog,
+        parsed_event: &ParsedEvent,
+        source_name: &str,
+        event_name: &str,
+    ) -> Result<DecodedEvent, TransformationError> {
+        let mut params = HashMap::new();
+        for (flattened, value) in parsed_event
+            .flattened_fields
+            .iter()
+            .zip(log.decoded_values.iter())
+        {
+            params.insert(
+                flattened.full_name.clone(),
+                Self::live_value_to_transform_value(value)?,
+            );
+        }
+
+        Ok(DecodedEvent {
+            block_number: log.block_number,
+            block_timestamp: log.block_timestamp,
+            transaction_hash: log.transaction_hash,
+            log_index: log.log_index,
+            contract_address: log.contract_address,
+            source_name: source_name.to_string(),
+            event_name: event_name.to_string(),
+            event_signature: parsed_event.signature.clone(),
+            params,
+        })
+    }
+
+    fn live_call_to_decoded_call(
+        call: &crate::live::LiveDecodedCall,
+        source_name: &str,
+        function_name: &str,
+        output_type: &EvmType,
+    ) -> Result<DecodedCall, TransformationError> {
+        let decoded_value = Self::live_value_to_eth_decoded_value(&call.decoded_value)?;
+        Ok(DecodedCall {
+            block_number: call.block_number,
+            block_timestamp: call.block_timestamp,
+            contract_address: call.contract_address,
+            source_name: source_name.to_string(),
+            function_name: function_name.to_string(),
+            trigger_log_index: None,
+            result: build_result_map(&decoded_value, output_type, function_name),
+        })
+    }
+
+    fn live_event_call_to_decoded_call(
+        call: &crate::live::LiveDecodedEventCall,
+        source_name: &str,
+        function_name: &str,
+        output_type: &EvmType,
+    ) -> Result<DecodedCall, TransformationError> {
+        let decoded_value = Self::live_value_to_eth_decoded_value(&call.decoded_value)?;
+        Ok(DecodedCall {
+            block_number: call.block_number,
+            block_timestamp: call.block_timestamp,
+            contract_address: call.target_address,
+            source_name: source_name.to_string(),
+            function_name: function_name.to_string(),
+            trigger_log_index: Some(call.log_index),
+            result: build_result_map(&decoded_value, output_type, function_name),
+        })
+    }
+
+    fn live_value_to_transform_value(
+        value: &LiveDecodedValue,
+    ) -> Result<super::context::DecodedValue, TransformationError> {
+        macro_rules! convert_live_value {
+            ($value:expr, $Target:path, $recurse:path) => {
+                Ok(match $value {
+                    LiveDecodedValue::Address(v) => <$Target>::Address(*v),
+                    LiveDecodedValue::Uint256(v) => <$Target>::Uint256(
+                        v.trim()
+                            .parse::<U256>()
+                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
+                    ),
+                    LiveDecodedValue::Int256(v) => <$Target>::Int256(
+                        v.parse::<I256>()
+                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
+                    ),
+                    LiveDecodedValue::Uint64(v) => <$Target>::Uint64(*v),
+                    LiveDecodedValue::Int64(v) => <$Target>::Int64(*v),
+                    LiveDecodedValue::Uint8(v) => <$Target>::Uint8(*v),
+                    LiveDecodedValue::Int8(v) => <$Target>::Int8(*v),
+                    LiveDecodedValue::Bool(v) => <$Target>::Bool(*v),
+                    LiveDecodedValue::Bytes32(v) => <$Target>::Bytes32(*v),
+                    LiveDecodedValue::Bytes(v) => <$Target>::Bytes(v.clone()),
+                    LiveDecodedValue::String(v) => <$Target>::String(v.clone()),
+                    LiveDecodedValue::NamedTuple(fields) => <$Target>::NamedTuple(
+                        fields
+                            .iter()
+                            .map(|(name, val)| Ok((name.clone(), $recurse(val)?)))
+                            .collect::<Result<_, TransformationError>>()?,
+                    ),
+                    LiveDecodedValue::UnnamedTuple(values) => <$Target>::UnnamedTuple(
+                        values
+                            .iter()
+                            .map($recurse)
+                            .collect::<Result<_, TransformationError>>()?,
+                    ),
+                    LiveDecodedValue::Array(values) => <$Target>::Array(
+                        values
+                            .iter()
+                            .map($recurse)
+                            .collect::<Result<_, TransformationError>>()?,
+                    ),
+                })
+            };
+        }
+
+        convert_live_value!(value, super::context::DecodedValue, Self::live_value_to_transform_value)
+    }
+
+    fn live_value_to_eth_decoded_value(
+        value: &LiveDecodedValue,
+    ) -> Result<EthDecodedValue, TransformationError> {
+        macro_rules! convert_live_value {
+            ($value:expr, $Target:path, $recurse:path) => {
+                Ok(match $value {
+                    LiveDecodedValue::Address(v) => <$Target>::Address(*v),
+                    LiveDecodedValue::Uint256(v) => <$Target>::Uint256(
+                        v.trim()
+                            .parse::<U256>()
+                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
+                    ),
+                    LiveDecodedValue::Int256(v) => <$Target>::Int256(
+                        v.parse::<I256>()
+                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
+                    ),
+                    LiveDecodedValue::Uint64(v) => <$Target>::Uint64(*v),
+                    LiveDecodedValue::Int64(v) => <$Target>::Int64(*v),
+                    LiveDecodedValue::Uint8(v) => <$Target>::Uint8(*v),
+                    LiveDecodedValue::Int8(v) => <$Target>::Int8(*v),
+                    LiveDecodedValue::Bool(v) => <$Target>::Bool(*v),
+                    LiveDecodedValue::Bytes32(v) => <$Target>::Bytes32(*v),
+                    LiveDecodedValue::Bytes(v) => <$Target>::Bytes(v.clone()),
+                    LiveDecodedValue::String(v) => <$Target>::String(v.clone()),
+                    LiveDecodedValue::NamedTuple(fields) => <$Target>::NamedTuple(
+                        fields
+                            .iter()
+                            .map(|(name, val)| Ok((name.clone(), $recurse(val)?)))
+                            .collect::<Result<_, TransformationError>>()?,
+                    ),
+                    LiveDecodedValue::UnnamedTuple(values) => <$Target>::UnnamedTuple(
+                        values
+                            .iter()
+                            .map($recurse)
+                            .collect::<Result<_, TransformationError>>()?,
+                    ),
+                    LiveDecodedValue::Array(values) => <$Target>::Array(
+                        values
+                            .iter()
+                            .map($recurse)
+                            .collect::<Result<_, TransformationError>>()?,
+                    ),
+                })
+            };
+        }
+
+        convert_live_value!(value, EthDecodedValue, Self::live_value_to_eth_decoded_value)
     }
 
     /// Process a block range with per-handler transactions.
@@ -2565,7 +3323,14 @@ impl TransformationEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{RangeCompleteKind, RangeCompletionState};
+    use std::collections::{HashMap, HashSet};
+
+    use super::{
+        classify_live_retry_call_artifact, missing_retry_call_dependencies,
+        resolve_retry_missing_handlers, LiveRetryCallArtifactKind, RangeCompleteKind,
+        RangeCompletionState,
+    };
+    use crate::transformations::context::{DecodedCall, DecodedValue};
 
     #[test]
     fn range_completion_requires_both_streams_when_calls_expected() {
@@ -2588,6 +3353,73 @@ mod tests {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::EthCalls);
         assert!(state.is_ready(false, true));
+    }
+
+    #[test]
+    fn retry_missing_handlers_prefers_current_tracker_state() {
+        let requested = Some(HashSet::from([
+            "handler_a_v1".to_string(),
+            "handler_b_v1".to_string(),
+        ]));
+        let tracker = Some(HashSet::from(["handler_b_v1".to_string()]));
+        let all_handlers = HashSet::from([
+            "handler_a_v1".to_string(),
+            "handler_b_v1".to_string(),
+            "handler_c_v1".to_string(),
+        ]);
+
+        let resolved = resolve_retry_missing_handlers(requested, tracker, all_handlers);
+        assert_eq!(resolved, HashSet::from(["handler_b_v1".to_string()]));
+    }
+
+    #[test]
+    fn retry_dependency_check_detects_missing_calls() {
+        let required = HashSet::from([
+            ("Pool".to_string(), "slot0".to_string()),
+            ("Pool".to_string(), "liquidity".to_string()),
+        ]);
+        let calls = vec![DecodedCall {
+            block_number: 100,
+            block_timestamp: 1200,
+            contract_address: [0; 20],
+            source_name: "Pool".to_string(),
+            function_name: "slot0".to_string(),
+            trigger_log_index: None,
+            result: HashMap::from([("result".to_string(), DecodedValue::Uint64(1))]),
+        }];
+
+        let missing = missing_retry_call_dependencies(&required, &calls);
+        assert_eq!(
+            missing,
+            HashSet::from([("Pool".to_string(), "liquidity".to_string())])
+        );
+    }
+
+    #[test]
+    fn live_retry_call_artifact_prefers_regular_name_over_event_suffix() {
+        let regular = HashSet::from([("Pool".to_string(), "foo_event".to_string())]);
+        let event = HashSet::from([("Pool".to_string(), "foo".to_string())]);
+
+        let kind =
+            classify_live_retry_call_artifact("Pool", "foo_event", &regular, &event).unwrap();
+
+        assert_eq!(kind, LiveRetryCallArtifactKind::Regular);
+    }
+
+    #[test]
+    fn live_retry_call_artifact_still_recognizes_event_triggered_suffix() {
+        let regular = HashSet::new();
+        let event = HashSet::from([("Pool".to_string(), "foo".to_string())]);
+
+        let kind =
+            classify_live_retry_call_artifact("Pool", "foo_event", &regular, &event).unwrap();
+
+        assert_eq!(
+            kind,
+            LiveRetryCallArtifactKind::EventTriggered {
+                base_name: "foo".to_string()
+            }
+        );
     }
 }
 

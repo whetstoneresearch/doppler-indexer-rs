@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::db::DbError;
+use crate::live::StorageError;
 
 #[derive(Debug, Error)]
 #[allow(dead_code)]
@@ -54,6 +55,9 @@ pub enum TransformationError {
 
     #[error("Includes precompile address: {0}")]
     IncludesPrecompileError(String),
+
+    #[error("Live storage error: {0}")]
+    LiveStorage(#[from] StorageError),
 }
 
 #[allow(dead_code)]
