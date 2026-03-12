@@ -125,6 +125,7 @@ impl LiveEthCallCollector {
         logs: &[LiveLog],
         factory_addrs: &LiveFactoryAddresses,
         decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        retry_transform_after_decode: bool,
     ) -> Result<Vec<LiveEthCall>, LiveError> {
         let mut all_calls = Vec::new();
 
@@ -165,6 +166,7 @@ impl LiveEthCallCollector {
                 .send(DecoderMessage::EthCallsBlockComplete {
                     range_start: block_number,
                     range_end: block_number + 1,
+                    retry_transform_after_decode,
                 })
                 .await;
         }

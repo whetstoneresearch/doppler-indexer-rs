@@ -15,6 +15,7 @@ use crate::decoding::eth_calls::{
 };
 use crate::decoding::types::DecoderMessage;
 use crate::live::LiveStorage;
+use crate::live::TransformRetryRequest;
 use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
 use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteKind,
@@ -69,6 +70,7 @@ pub async fn decode_eth_calls_live(
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     complete_tx: Option<&Sender<RangeCompleteMessage>>,
+    transform_retry_tx: Option<&Sender<TransformRetryRequest>>,
 ) -> Result<(), EthCallDecodingError> {
     // Live storage for live_mode=true messages
     let live_storage = LiveStorage::new(chain_name);
@@ -162,19 +164,6 @@ pub async fn decode_eth_calls_live(
                                     calls: transform_calls,
                                 };
                                 let _ = tx.send(msg).await;
-                            }
-                        }
-
-                        // Update block status to mark decoding complete
-                        if let Ok(mut status) = live_storage.read_status(range_start) {
-                            status.eth_calls_decoded = true;
-                            if let Err(e) = live_storage.write_status(range_start, &status) {
-                                tracing::warn!(
-                                    "Failed to update block status after eth_call decoding: {}",
-                                    e
-                                );
-                            } else {
-                                tracing::debug!("Block {} eth_calls decoded", range_start);
                             }
                         }
                     } else {
@@ -300,17 +289,6 @@ pub async fn decode_eth_calls_live(
                                 }
                             }
                         }
-
-                        // Update block status to mark decoding complete
-                        if let Ok(mut status) = live_storage.read_status(range_start) {
-                            status.eth_calls_decoded = true;
-                            if let Err(e) = live_storage.write_status(range_start, &status) {
-                                tracing::warn!(
-                                    "Failed to update block status after once_call decoding: {}",
-                                    e
-                                );
-                            }
-                        }
                     } else {
                         // Historical mode: write to parquet
                         process_once_calls(
@@ -417,17 +395,6 @@ pub async fn decode_eth_calls_live(
                                 let _ = tx.send(msg).await;
                             }
                         }
-
-                        // Update block status to mark decoding complete
-                        if let Ok(mut status) = live_storage.read_status(range_start) {
-                            status.eth_calls_decoded = true;
-                            if let Err(e) = live_storage.write_status(range_start, &status) {
-                                tracing::warn!(
-                                    "Failed to update block status after event_call decoding: {}",
-                                    e
-                                );
-                            }
-                        }
                     } else {
                         // Historical mode: write to parquet
                         process_event_calls(
@@ -455,15 +422,53 @@ pub async fn decode_eth_calls_live(
             Some(DecoderMessage::EthCallsBlockComplete {
                 range_start,
                 range_end,
+                retry_transform_after_decode,
             }) => {
-                if let Some(tx) = complete_tx {
-                    let msg = RangeCompleteMessage {
-                        range_start,
-                        range_end,
-                        kind: RangeCompleteKind::EthCalls,
-                    };
-                    if let Err(e) = tx.send(msg).await {
-                        tracing::warn!("Failed to send eth_call range complete: {}", e);
+                if let Ok(mut status) = live_storage.read_status(range_start) {
+                    status.eth_calls_decoded = true;
+                    if let Err(e) = live_storage.write_status(range_start, &status) {
+                        tracing::warn!(
+                            "Failed to update block status after eth_call block completion: {}",
+                            e
+                        );
+                    } else {
+                        tracing::debug!("Block {} eth_calls decoded", range_start);
+                    }
+                }
+
+                if !retry_transform_after_decode {
+                    if let Some(tx) = complete_tx {
+                        let msg = RangeCompleteMessage {
+                            range_start,
+                            range_end,
+                            kind: RangeCompleteKind::EthCalls,
+                        };
+                        if let Err(e) = tx.send(msg).await {
+                            tracing::warn!("Failed to send eth_call range complete: {}", e);
+                        }
+                    }
+                }
+
+                if retry_transform_after_decode {
+                    if let Some(tx) = transform_retry_tx {
+                        if let Err(e) = tx
+                            .send(TransformRetryRequest {
+                                block_number: range_start,
+                                missing_handlers: None,
+                            })
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to queue deferred transform retry for block {}: {}",
+                                range_start,
+                                e
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Block {} requested deferred transform retry but no retry channel is configured",
+                            range_start
+                        );
                     }
                 }
             }
@@ -575,6 +580,7 @@ mod tests {
 
     use super::decode_eth_calls_live;
     use crate::decoding::DecoderMessage;
+    use crate::live::TransformRetryRequest;
     use crate::transformations::{RangeCompleteKind, RangeCompleteMessage};
     use crate::types::config::raw_data::{FieldsConfig, RawDataCollectionConfig};
 
@@ -609,9 +615,11 @@ mod tests {
                     live_mode: None,
                     reorg_depth: None,
                     compaction_interval_secs: None,
+                    transform_retry_grace_period_secs: None,
                 },
                 None,
                 Some(&complete_tx),
+                None,
             )
             .await
         });
@@ -620,6 +628,7 @@ mod tests {
             .send(DecoderMessage::EthCallsBlockComplete {
                 range_start: 42,
                 range_end: 43,
+                retry_transform_after_decode: false,
             })
             .await
             .unwrap();
@@ -629,6 +638,65 @@ mod tests {
         assert_eq!(msg.range_start, 42);
         assert_eq!(msg.range_end, 43);
         assert_eq!(msg.kind, RangeCompleteKind::EthCalls);
+
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn eth_call_block_complete_with_retry_emits_retry_request() {
+        let (decoder_tx, decoder_rx) = mpsc::channel(4);
+        let (retry_tx, mut retry_rx) = mpsc::channel::<TransformRetryRequest>(4);
+        let (complete_tx, mut complete_rx) = mpsc::channel::<RangeCompleteMessage>(4);
+
+        let handle = tokio::spawn(async move {
+            decode_eth_calls_live(
+                decoder_rx,
+                Path::new("data/test/raw"),
+                Path::new("data/test/decoded"),
+                "test",
+                &[],
+                &[],
+                &[],
+                &RawDataCollectionConfig {
+                    parquet_block_range: None,
+                    rpc_batch_size: None,
+                    fields: FieldsConfig {
+                        block_fields: None,
+                        receipt_fields: None,
+                        log_fields: None,
+                    },
+                    contract_logs_only: None,
+                    channel_capacity: None,
+                    factory_channel_capacity: None,
+                    block_receipt_concurrency: None,
+                    decoding_concurrency: None,
+                    factory_concurrency: None,
+                    live_mode: None,
+                    reorg_depth: None,
+                    compaction_interval_secs: None,
+                    transform_retry_grace_period_secs: None,
+                },
+                None,
+                Some(&complete_tx),
+                Some(&retry_tx),
+            )
+            .await
+        });
+
+        decoder_tx
+            .send(DecoderMessage::EthCallsBlockComplete {
+                range_start: 42,
+                range_end: 43,
+                retry_transform_after_decode: true,
+            })
+            .await
+            .unwrap();
+        decoder_tx.send(DecoderMessage::AllComplete).await.unwrap();
+
+        let request = retry_rx.recv().await.unwrap();
+        assert_eq!(request.block_number, 42);
+        assert!(request.missing_handlers.is_none());
+        assert!(complete_rx.try_recv().is_err());
 
         handle.await.unwrap().unwrap();
     }

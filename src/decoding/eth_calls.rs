@@ -25,6 +25,7 @@ use super::catchup::eth_calls::{
 };
 use super::current;
 use super::types::{EthCallResult, EventCallResult, OnceCallResult};
+use crate::live::TransformRetryRequest;
 use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage,
     DecodedValue as TransformDecodedValue, RangeCompleteMessage,
@@ -137,6 +138,7 @@ pub async fn decode_eth_calls(
     decoder_rx: Receiver<super::types::DecoderMessage>,
     transform_tx: Option<Sender<DecodedCallsMessage>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
+    transform_retry_tx: Option<Sender<TransformRetryRequest>>,
     eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
@@ -228,6 +230,7 @@ pub async fn decode_eth_calls(
         raw_data_config,
         transform_tx.as_ref(),
         complete_tx.as_ref(),
+        transform_retry_tx.as_ref(),
     )
     .await?;
 
