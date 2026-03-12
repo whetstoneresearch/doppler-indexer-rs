@@ -20,11 +20,10 @@ use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
-use decoding::handle_transform_retries;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use live::{
     CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig,
-    LiveProgressTracker, TransformRetryRequest,
+    LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
 };
 use raw_data::historical::catchup::blocks::collect_blocks;
 use raw_data::historical::factories::{build_factory_matchers, FactoryMessage, RecollectRequest};
@@ -55,6 +54,20 @@ fn optional_channel<T>(
         (Some(tx), Some(rx))
     } else {
         (None, None)
+    }
+}
+
+fn live_pipeline_expectations(
+    expect_log_decode: bool,
+    expect_eth_call_collection: bool,
+    expect_eth_call_decode: bool,
+    expect_transformations: bool,
+) -> LivePipelineExpectations {
+    LivePipelineExpectations {
+        expect_log_decode,
+        expect_eth_call_collection,
+        expect_eth_call_decode,
+        expect_transformations,
     }
 }
 
@@ -334,7 +347,7 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
             async move {
                 let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
                 drop(_tx);
-                decode_eth_calls(&chain, &cfg, rx, None, None, None, None, false)
+                decode_eth_calls(&chain, &cfg, rx, None, None, None, None, None, false)
                     .await
                     .context("eth call decoding failed")
             }
@@ -466,6 +479,8 @@ async fn process_chain_live_only(
         optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
     let (transform_reorg_tx, transform_reorg_rx) =
         optional_channel::<ReorgMessage>(transformations_enabled, channel_cap);
+    let (transform_retry_tx, transform_retry_rx) =
+        optional_channel::<TransformRetryRequest>(transformations_enabled, 100);
 
     // Setup decoder channels
     let (log_decoder_tx, log_decoder_rx) = if has_events {
@@ -490,6 +505,7 @@ async fn process_chain_live_only(
         let tc = config.transformations.as_ref().unwrap();
 
         let handler_count = registry.handler_count();
+        let retry_rx = transform_retry_rx;
         let engine = TransformationEngine::new(
             Arc::new(registry),
             db_pool.clone().unwrap(),
@@ -498,6 +514,7 @@ async fn process_chain_live_only(
             chain.chain_id,
             ExecutionMode::Streaming, // Live-only mode always uses streaming
             chain.contracts.clone(),
+            chain.factory_collections.clone(),
             tc.handler_concurrency,
             progress_tracker.clone(),
             has_events,
@@ -524,6 +541,7 @@ async fn process_chain_live_only(
                     transform_calls_rx.unwrap(),
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
+                    retry_rx,
                     None, // No decode catchup signal in live-only mode
                 )
                 .await
@@ -558,6 +576,7 @@ async fn process_chain_live_only(
         let cfg = config.raw_data_collection.clone();
         let transform_calls_tx = transform_calls_tx.clone();
         let transform_complete_tx = transform_complete_tx.clone();
+        let transform_retry_tx = transform_retry_tx.clone();
         tasks.spawn(async move {
             decode_eth_calls(
                 &chain,
@@ -565,6 +584,7 @@ async fn process_chain_live_only(
                 rx,
                 transform_calls_tx,
                 transform_complete_tx,
+                transform_retry_tx,
                 None,
                 None,
                 true,
@@ -589,6 +609,7 @@ async fn process_chain_live_only(
         log_decoder_tx,
         eth_call_decoder_tx,
         transform_reorg_tx,
+        transform_retry_tx,
         progress_tracker,
         Some(storage_manager),
         &mut tasks,
@@ -741,6 +762,8 @@ async fn process_chain(
     // Reorg channel for live mode cleanup of pending events
     let (transform_reorg_tx, transform_reorg_rx) =
         optional_channel::<ReorgMessage>(transformations_enabled, channel_cap);
+    let (transform_retry_tx, transform_retry_rx) =
+        optional_channel::<TransformRetryRequest>(transformations_enabled, 100);
 
     // Decode catchup must complete before transformation engine catchup
     let (decode_catchup_done_tx, decode_catchup_done_rx) = if transformations_enabled && has_calls {
@@ -1062,6 +1085,7 @@ async fn process_chain(
     if has_calls {
         let transform_calls_tx = transform_calls_tx.clone();
         let transform_complete_tx = transform_complete_tx.clone();
+        let transform_retry_tx = transform_retry_tx.clone();
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
             async move {
@@ -1071,6 +1095,7 @@ async fn process_chain(
                     call_decoder_rx.unwrap(),
                     transform_calls_tx,
                     transform_complete_tx,
+                    transform_retry_tx,
                     eth_calls_catchup_done_rx,
                     decode_catchup_done_tx,
                     false,
@@ -1126,6 +1151,7 @@ async fn process_chain(
         };
 
         let handler_count = registry.handler_count();
+        let retry_rx = transform_retry_rx;
         let engine = TransformationEngine::new(
             Arc::new(registry),
             db_pool.unwrap(),
@@ -1134,6 +1160,7 @@ async fn process_chain(
             chain.chain_id,
             mode,
             chain.contracts.clone(),
+            chain.factory_collections.clone(),
             tc.handler_concurrency,
             progress_tracker.clone(),
             has_events,
@@ -1161,6 +1188,7 @@ async fn process_chain(
                     transform_calls_rx.unwrap(),
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
+                    retry_rx,
                     decode_catchup_done_rx,
                 )
                 .await
@@ -1185,6 +1213,7 @@ async fn process_chain(
             log_decoder_tx_for_live,
             eth_call_decoder_tx_for_live,
             transform_reorg_tx,
+            transform_retry_tx,
             progress_tracker,
             Some(storage_manager.clone()),
             &mut live_tasks,
@@ -1259,6 +1288,7 @@ async fn spawn_live_mode(
     log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     eth_call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
+    transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     storage_manager: Option<Arc<StorageManager>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -1285,6 +1315,10 @@ async fn spawn_live_mode(
             .raw_data_collection
             .parquet_block_range
             .unwrap_or(1000) as u64,
+        transform_retry_grace_period_secs: config
+            .raw_data_collection
+            .transform_retry_grace_period_secs
+            .unwrap_or(raw_data_defaults::TRANSFORM_RETRY_GRACE_PERIOD_SECS),
     };
 
     tracing::info!(
@@ -1367,8 +1401,12 @@ async fn spawn_live_mode(
         None
     };
 
-    // Clone log_decoder_tx for retry handler before it's moved to collector
-    let log_decoder_tx_for_retry = log_decoder_tx.clone();
+    let live_expectations = live_pipeline_expectations(
+        log_decoder_tx.is_some(),
+        eth_call_collector.is_some(),
+        eth_call_decoder_tx.is_some() && eth_call_collector.is_some(),
+        transform_retry_tx.is_some(),
+    );
 
     // Start live collector
     let collector = LiveCollector::new(
@@ -1379,6 +1417,8 @@ async fn spawn_live_mode(
         factory_matchers,
         eth_call_collector,
         db_pool.clone(),
+        live_expectations,
+        transform_retry_tx.clone(),
     );
     tasks.spawn(async move {
         collector
@@ -1393,32 +1433,23 @@ async fn spawn_live_mode(
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
     });
 
-    // Create retry channel for transformation retries
-    let (retry_tx, retry_rx) = tokio::sync::mpsc::channel::<TransformRetryRequest>(100);
-
     // Start compaction service with retry channel
-    let compaction = CompactionService::new(
+    let mut compaction = CompactionService::new(
         chain.name.clone(),
         chain.chain_id,
         live_config,
         db_pool,
         progress_tracker,
+        live_expectations,
         storage_manager,
-    )
-    .with_retry_tx(retry_tx);
+    );
+    if let Some(retry_tx) = transform_retry_tx {
+        compaction = compaction.with_retry_tx(retry_tx);
+    }
     tasks.spawn(async move {
         compaction.run().await;
         Ok(())
     });
-
-    // Start transform retry handler (replays logs for stuck blocks)
-    if let Some(decoder_tx) = log_decoder_tx_for_retry {
-        let chain_name = chain.name.clone();
-        tasks.spawn(async move {
-            handle_transform_retries(retry_rx, decoder_tx, chain_name).await;
-            Ok(())
-        });
-    }
 
     Ok(())
 }

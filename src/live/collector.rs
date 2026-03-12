@@ -7,7 +7,7 @@
 //! 4. Stores data in live storage format
 //! 5. Forwards to decoder channels
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
@@ -15,16 +15,19 @@ use alloy::primitives::{Address, B256};
 use alloy::rpc::types::BlockNumberOrTag;
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
+use tokio_postgres::types::ToSql;
 
-use super::catchup::LiveCatchupService;
+use super::catchup::{CollectionResumeRequest, CollectionResumeStage, LiveCatchupService};
 use super::eth_calls::LiveEthCallCollector;
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
 use super::storage::{LiveStorage, StorageError};
 use super::types::{
     LiveBlock, LiveBlockStatus, LiveFactoryAddresses, LiveLog, LiveMessage, LiveModeConfig,
-    LiveReceipt,
+    LivePipelineExpectations, LiveReceipt,
 };
+use super::TransformRetryRequest;
+use crate::db::DbError;
 use crate::db::DbPool;
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryMatcher;
@@ -40,6 +43,8 @@ pub enum CollectorError {
     Rpc(#[from] RpcError),
     #[error("Storage error: {0}")]
     Storage(#[from] StorageError),
+    #[error("Database error: {0}")]
+    Database(#[from] DbError),
     #[error("Channel closed")]
     ChannelClosed,
     #[error("Block not found: {0}")]
@@ -67,6 +72,10 @@ pub struct LiveCollector {
     eth_call_collector: Option<LiveEthCallCollector>,
     /// Database pool for status file reconstruction during catchup.
     db_pool: Option<Arc<DbPool>>,
+    /// Runtime expectations for optional pipeline stages.
+    expectations: LivePipelineExpectations,
+    /// Channel for direct transformation retries.
+    transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
 }
 
 impl LiveCollector {
@@ -79,6 +88,8 @@ impl LiveCollector {
         factory_matchers: Arc<Vec<FactoryMatcher>>,
         eth_call_collector: Option<LiveEthCallCollector>,
         db_pool: Option<Arc<DbPool>>,
+        expectations: LivePipelineExpectations,
+        transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
@@ -141,6 +152,8 @@ impl LiveCollector {
             factory_matchers,
             eth_call_collector,
             db_pool,
+            expectations,
+            transform_retry_tx,
         }
     }
 
@@ -483,6 +496,7 @@ impl LiveCollector {
                     &logs,
                     &factory_addresses,
                     eth_call_decoder_tx,
+                    false,
                 )
                 .await
             {
@@ -807,6 +821,412 @@ impl LiveCollector {
         }
     }
 
+    async fn resume_collection_blocks(
+        &mut self,
+        requests: &[CollectionResumeRequest],
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) -> Result<usize, CollectorError> {
+        let mut resumed = 0;
+
+        for request in requests {
+            self.resume_collection_block(request, log_decoder_tx, eth_call_decoder_tx)
+                .await?;
+            resumed += 1;
+        }
+
+        Ok(resumed)
+    }
+
+    async fn resume_collection_block(
+        &mut self,
+        request: &CollectionResumeRequest,
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) -> Result<(), CollectorError> {
+        tracing::info!(
+            "Resuming collection for block {} from stage {:?}",
+            request.block_number,
+            request.stage
+        );
+
+        match request.stage {
+            CollectionResumeStage::FetchBlock => {
+                // Reset is deferred into resume_from_block_fetch, after the
+                // RPC fetch succeeds, so a transient failure won't destroy
+                // existing local state.
+                self.resume_from_block_fetch(
+                    request.block_number,
+                    log_decoder_tx,
+                    eth_call_decoder_tx,
+                )
+                .await
+            }
+            CollectionResumeStage::FetchReceiptsAndLogs => {
+                self.resume_from_receipts_and_logs(
+                    request.block_number,
+                    log_decoder_tx,
+                    eth_call_decoder_tx,
+                )
+                .await
+            }
+            CollectionResumeStage::CollectEthCalls => {
+                self.resume_eth_call_collection(
+                    request.block_number,
+                    eth_call_decoder_tx,
+                    request.retry_transform_after_decode,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reset_downstream_from_block_fetch(
+        &mut self,
+        block_number: u64,
+    ) -> Result<(), CollectorError> {
+        self.storage.delete_receipts(block_number)?;
+        self.storage.delete_logs(block_number)?;
+        self.storage.delete_factories(block_number)?;
+        self.storage.delete_eth_calls(block_number)?;
+        self.storage.delete_all_decoded_logs(block_number)?;
+        self.storage.delete_all_decoded_calls(block_number)?;
+        self.storage.delete_snapshots(block_number)?;
+        self.clear_persisted_progress(block_number).await?;
+
+        let mut status = self.storage.read_status(block_number)?;
+        status.block_fetched = false;
+        status.receipts_collected = false;
+        status.logs_collected = false;
+        status.factories_extracted = false;
+        status.eth_calls_collected = false;
+        status.logs_decoded = false;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        status.completed_handlers.clear();
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status)?;
+
+        Ok(())
+    }
+
+    async fn reset_downstream_from_logs(
+        &mut self,
+        block_number: u64,
+    ) -> Result<(), CollectorError> {
+        self.storage.delete_factories(block_number)?;
+        self.storage.delete_eth_calls(block_number)?;
+        self.storage.delete_all_decoded_logs(block_number)?;
+        self.storage.delete_all_decoded_calls(block_number)?;
+        self.storage.delete_snapshots(block_number)?;
+        self.clear_persisted_progress(block_number).await?;
+
+        let mut status = self.storage.read_status(block_number)?;
+        status.receipts_collected = false;
+        status.logs_collected = false;
+        status.factories_extracted = false;
+        status.eth_calls_collected = false;
+        status.logs_decoded = false;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        status.completed_handlers.clear();
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status)?;
+
+        Ok(())
+    }
+
+    async fn reset_eth_call_state(&mut self, block_number: u64) -> Result<(), CollectorError> {
+        self.storage.delete_eth_calls(block_number)?;
+        self.storage.delete_all_decoded_calls(block_number)?;
+
+        let mut status = self.storage.read_status(block_number)?;
+        status.eth_calls_collected = false;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status)?;
+
+        Ok(())
+    }
+
+    async fn clear_persisted_progress(&mut self, block_number: u64) -> Result<(), CollectorError> {
+        if let Some(ref tracker) = self.progress_tracker {
+            tracker.lock().await.clear_block(block_number);
+        }
+
+        if let Some(ref db_pool) = self.db_pool {
+            let chain_id = self.chain.chain_id as i64;
+            let block_num = block_number as i64;
+            db_pool
+                .query(
+                    "DELETE FROM _live_progress WHERE chain_id = $1 AND block_number = $2",
+                    &[
+                        &chain_id as &(dyn ToSql + Sync),
+                        &block_num as &(dyn ToSql + Sync),
+                    ],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn resume_from_block_fetch(
+        &mut self,
+        block_number: u64,
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) -> Result<(), CollectorError> {
+        let full_block = self.fetch_full_block(block_number).await?;
+
+        // Fetch succeeded — now safe to reset downstream state
+        self.reset_downstream_from_block_fetch(block_number)
+            .await?;
+
+        // Update reorg detector so the first live head after restart is
+        // compared against the canonical hash, not the stale pre-catchup one.
+        self.reorg_detector
+            .update_block_hash(block_number, full_block.hash);
+
+        self.storage.write_block(&full_block)?;
+
+        let mut status = self.storage.read_status(block_number)?;
+        status.collected = true;
+        status.block_fetched = true;
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status)?;
+
+        self.resume_from_receipts_and_logs(block_number, log_decoder_tx, eth_call_decoder_tx)
+            .await
+    }
+
+    async fn resume_from_receipts_and_logs(
+        &mut self,
+        block_number: u64,
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) -> Result<(), CollectorError> {
+        let block = self.storage.read_block(block_number)?;
+        let (receipts, logs) = self.fetch_receipts_and_logs(block_number).await?;
+
+        // Fetch succeeded — now safe to reset downstream state.
+        // Harmless if already reset by reset_downstream_from_block_fetch.
+        self.reset_downstream_from_logs(block_number).await?;
+
+        self.storage.write_receipts(block_number, &receipts)?;
+        self.storage.write_logs(block_number, &logs)?;
+
+        let factory_addresses = self.extract_factory_addresses(&logs, block.timestamp);
+        if !factory_addresses.addresses_by_collection.is_empty() {
+            self.storage
+                .write_factories(block_number, &factory_addresses)?;
+        }
+
+        let mut status = self.storage.read_status(block_number)?;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status)?;
+
+        self.dispatch_logs_for_block(
+            block_number,
+            block.timestamp,
+            &logs,
+            &factory_addresses,
+            log_decoder_tx,
+        )
+        .await?;
+
+        if log_decoder_tx.is_none() {
+            let mut status = self.storage.read_status(block_number)?;
+            status.logs_decoded = true;
+            status.apply_expectations(&self.expectations);
+            self.storage.write_status(block_number, &status)?;
+        }
+
+        // retry_transform_after_decode=false: logs were re-dispatched through the
+        // decoder above, so the normal pipeline (decode -> transform) handles it.
+        self.resume_eth_call_collection(block_number, eth_call_decoder_tx, false)
+            .await
+    }
+
+    async fn dispatch_logs_for_block(
+        &self,
+        block_number: u64,
+        block_timestamp: u64,
+        logs: &[LiveLog],
+        factory_addresses: &LiveFactoryAddresses,
+        log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) -> Result<(), CollectorError> {
+        let Some(decoder_tx) = log_decoder_tx else {
+            return Ok(());
+        };
+
+        if !factory_addresses.addresses_by_collection.is_empty() {
+            let factory_addrs: HashMap<String, Vec<Address>> = factory_addresses
+                .addresses_by_collection
+                .iter()
+                .map(|(name, addrs)| {
+                    (
+                        name.clone(),
+                        addrs.iter().map(|(_, addr)| Address::from(*addr)).collect(),
+                    )
+                })
+                .collect();
+
+            if let Err(e) = decoder_tx
+                .send(DecoderMessage::FactoryAddresses {
+                    range_start: block_number,
+                    range_end: block_number + 1,
+                    addresses: factory_addrs,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "Failed to send factory addresses for block {} during resume: {}",
+                    block_number,
+                    e
+                );
+            }
+        }
+
+        let log_data: Vec<LogData> = logs
+            .iter()
+            .map(|log| LogData {
+                block_number,
+                block_timestamp,
+                transaction_hash: B256::from(log.transaction_hash),
+                log_index: log.log_index,
+                address: log.address,
+                topics: log.topics.clone(),
+                data: log.data.clone(),
+            })
+            .collect();
+
+        decoder_tx
+            .send(DecoderMessage::LogsReady {
+                range_start: block_number,
+                range_end: block_number + 1,
+                logs: log_data,
+                live_mode: true,
+                has_factory_matchers: !self.factory_matchers.is_empty(),
+            })
+            .await
+            .map_err(|_| CollectorError::ChannelClosed)
+    }
+
+    async fn resume_eth_call_collection(
+        &mut self,
+        block_number: u64,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        retry_transform_after_decode: bool,
+    ) -> Result<(), CollectorError> {
+        let block = self.storage.read_block(block_number)?;
+        let logs = self.storage.read_logs(block_number)?;
+        let factory_addresses = self
+            .storage
+            .read_factories(block_number)
+            .unwrap_or_default();
+
+        if let Some(ref mut eth_collector) = self.eth_call_collector {
+            eth_collector.update_factory_addresses(&factory_addresses);
+
+            match eth_collector
+                .collect_for_block(
+                    block_number,
+                    block.timestamp,
+                    &logs,
+                    &factory_addresses,
+                    eth_call_decoder_tx,
+                    retry_transform_after_decode,
+                )
+                .await
+            {
+                Ok(calls) => {
+                    // Collection succeeded — now safe to reset old eth_call state.
+                    // Harmless if already reset by a parent reset method.
+                    self.reset_eth_call_state(block_number).await?;
+
+                    let mut status = self.storage.read_status(block_number)?;
+                    status.eth_calls_collected = true;
+
+                    if !calls.is_empty() {
+                        self.storage.write_eth_calls(block_number, &calls)?;
+                    } else {
+                        status.eth_calls_decoded = true;
+                    }
+
+                    if eth_call_decoder_tx.is_none() {
+                        status.eth_calls_decoded = true;
+                    }
+
+                    status.apply_expectations(&self.expectations);
+                    self.storage.write_status(block_number, &status)?;
+
+                    if retry_transform_after_decode && eth_call_decoder_tx.is_none() {
+                        self.queue_transform_retry(block_number, None).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to resume eth_calls for block {}: {}",
+                        block_number,
+                        e
+                    );
+                }
+            }
+        } else {
+            let mut status = self.storage.read_status(block_number)?;
+            status.eth_calls_collected = true;
+            status.eth_calls_decoded = true;
+            status.apply_expectations(&self.expectations);
+            self.storage.write_status(block_number, &status)?;
+
+            if retry_transform_after_decode {
+                self.queue_transform_retry(block_number, None).await;
+            }
+        }
+
+        if let Some(ref tracker) = self.progress_tracker {
+            tracker
+                .lock()
+                .await
+                .mark_transformed_if_no_handlers(block_number);
+        }
+
+        Ok(())
+    }
+
+    async fn queue_transform_retry(
+        &self,
+        block_number: u64,
+        missing_handlers: Option<HashSet<String>>,
+    ) {
+        let Some(retry_tx) = &self.transform_retry_tx else {
+            tracing::warn!(
+                "Block {} needs transformation retry but no retry channel is configured",
+                block_number
+            );
+            return;
+        };
+
+        if let Err(e) = retry_tx
+            .send(TransformRetryRequest {
+                block_number,
+                missing_handlers,
+            })
+            .await
+        {
+            tracing::warn!(
+                "Failed to queue transform retry for block {}: {}",
+                block_number,
+                e
+            );
+        }
+    }
+
     /// Run catchup phase for incomplete blocks from previous session.
     ///
     /// Scans storage for blocks that were partially processed and replays
@@ -830,10 +1250,15 @@ impl LiveCollector {
                 &self.chain.name,
                 self.chain.chain_id as i64,
                 registered_handlers.clone(),
+                self.expectations,
                 db_pool.clone(),
             )
         } else {
-            LiveCatchupService::new(&self.chain.name, registered_handlers.clone())
+            LiveCatchupService::new(
+                &self.chain.name,
+                registered_handlers.clone(),
+                self.expectations,
+            )
         };
 
         // Reconstruct missing status files before scanning for incomplete blocks
@@ -870,12 +1295,31 @@ impl LiveCollector {
         }
 
         tracing::info!(
-            "Catchup phase: {} blocks need processing ({} log decode, {} call decode, {} transform)",
+            "Catchup phase: {} blocks need processing ({} collection resume, {} log decode, {} call decode, {} transform)",
             scan_result.total_blocks(),
+            scan_result.blocks_needing_collection_resume.len(),
             scan_result.blocks_needing_log_decode.len(),
             scan_result.blocks_needing_call_decode.len(),
             scan_result.blocks_needing_transform.len()
         );
+
+        if !scan_result.blocks_needing_collection_resume.is_empty() {
+            match self
+                .resume_collection_blocks(
+                    &scan_result.blocks_needing_collection_resume,
+                    log_decoder_tx,
+                    eth_call_decoder_tx,
+                )
+                .await
+            {
+                Ok(count) => {
+                    tracing::info!("Catchup: resumed collection for {} blocks", count);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to resume collection during catchup: {}", e);
+                }
+            }
+        }
 
         // Replay logs for decoding
         if !scan_result.blocks_needing_log_decode.is_empty() {
@@ -922,24 +1366,19 @@ impl LiveCollector {
 
         // Replay blocks needing transformation retry
         if !scan_result.blocks_needing_transform.is_empty() {
-            if let Some(decoder_tx) = log_decoder_tx {
-                match catchup_service
-                    .replay_for_transform(&scan_result.blocks_needing_transform, decoder_tx)
-                    .await
-                {
-                    Ok(count) => {
-                        tracing::info!(
-                            "Catchup: replayed {} blocks for transformation retry",
-                            count
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to replay for transform catchup: {}", e);
-                    }
+            if self.transform_retry_tx.is_some() {
+                for (block_number, missing_handlers) in &scan_result.blocks_needing_transform {
+                    self.queue_transform_retry(*block_number, Some(missing_handlers.clone()))
+                        .await;
                 }
+
+                tracing::info!(
+                    "Catchup: queued {} blocks for transformation retry",
+                    scan_result.blocks_needing_transform.len()
+                );
             } else {
                 tracing::warn!(
-                    "Blocks need transformation but no log decoder configured, skipping"
+                    "Blocks need transformation but no transform retry channel is configured, skipping"
                 );
             }
         }
