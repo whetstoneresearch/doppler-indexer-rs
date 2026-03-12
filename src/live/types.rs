@@ -64,6 +64,22 @@ pub struct LiveBlockStatus {
     pub completed_handlers: HashSet<String>,
 }
 
+/// Runtime expectations for optional live-mode stages.
+///
+/// These are derived from the active pipeline wiring rather than persisted in
+/// status files, allowing status reconstruction to remain backward compatible.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LivePipelineExpectations {
+    /// Whether decoded log output is expected from the live decoder.
+    pub expect_log_decode: bool,
+    /// Whether live eth_call collection is enabled for this chain.
+    pub expect_eth_call_collection: bool,
+    /// Whether decoded eth_call output is expected from the live decoder.
+    pub expect_eth_call_decode: bool,
+    /// Whether transformation handlers are expected to run for the block.
+    pub expect_transformations: bool,
+}
+
 impl LiveBlockStatus {
     /// Create a new status indicating only initial collection.
     pub fn collected() -> Self {
@@ -84,6 +100,43 @@ impl LiveBlockStatus {
             && self.logs_decoded
             && self.eth_calls_decoded
             && self.transformed
+    }
+
+    /// Check completeness using the active runtime pipeline expectations.
+    pub fn is_complete_with(&self, expectations: &LivePipelineExpectations) -> bool {
+        self.collected
+            && self.block_fetched
+            && self.receipts_collected
+            && self.logs_collected
+            && self.factories_extracted
+            && (!expectations.expect_eth_call_collection || self.eth_calls_collected)
+            && (!expectations.expect_log_decode || self.logs_decoded)
+            && (!expectations.expect_eth_call_decode || self.eth_calls_decoded)
+            && (!expectations.expect_transformations || self.transformed)
+    }
+
+    /// Check whether all inputs needed for transformation are ready.
+    pub fn transform_inputs_ready_with(&self, expectations: &LivePipelineExpectations) -> bool {
+        (!expectations.expect_log_decode || self.logs_decoded)
+            && (!expectations.expect_eth_call_decode || self.eth_calls_decoded)
+    }
+
+    /// Normalize optional stage flags to match disabled runtime expectations.
+    pub fn apply_expectations(&mut self, expectations: &LivePipelineExpectations) {
+        if !expectations.expect_log_decode {
+            self.logs_decoded = true;
+        }
+
+        if !expectations.expect_eth_call_collection {
+            self.eth_calls_collected = true;
+            self.eth_calls_decoded = true;
+        } else if !expectations.expect_eth_call_decode {
+            self.eth_calls_decoded = true;
+        }
+
+        if !expectations.expect_transformations {
+            self.transformed = true;
+        }
     }
 }
 
@@ -154,6 +207,8 @@ pub struct LiveModeConfig {
     pub compaction_interval_secs: u64,
     /// Block range size for compaction (should match historical range).
     pub range_size: u64,
+    /// Grace period in seconds before retrying stuck transformations.
+    pub transform_retry_grace_period_secs: u64,
 }
 
 impl Default for LiveModeConfig {
@@ -162,6 +217,7 @@ impl Default for LiveModeConfig {
             reorg_depth: defaults::REORG_DEPTH,
             compaction_interval_secs: defaults::COMPACTION_INTERVAL_SECS,
             range_size: 1000,
+            transform_retry_grace_period_secs: defaults::TRANSFORM_RETRY_GRACE_PERIOD_SECS,
         }
     }
 }

@@ -24,5 +24,5 @@ pub use progress::LiveProgressTracker;
 pub use storage::{LiveStorage, StorageError};
 pub use types::{
     LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog, LiveDecodedOnceCall,
-    LiveDecodedValue, LiveMessage, LiveModeConfig, LiveUpsertSnapshot,
+    LiveDecodedValue, LiveMessage, LiveModeConfig, LivePipelineExpectations, LiveUpsertSnapshot,
 };
