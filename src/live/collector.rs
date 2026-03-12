@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_postgres::types::ToSql;
 
 use super::catchup::{CollectionResumeRequest, CollectionResumeStage, LiveCatchupService};
-use super::eth_calls::LiveEthCallCollector;
+use super::eth_calls::{CollectedEthCallBatch, LiveEthCallCollector};
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
 use super::storage::{LiveStorage, StorageError};
@@ -484,36 +484,43 @@ impl LiveCollector {
         }
 
         // Collect eth_calls if configured
-        if let Some(ref mut eth_collector) = self.eth_call_collector {
+        if self.eth_call_collector.is_some() {
             // Update factory addresses in collector
-            eth_collector.update_factory_addresses(&factory_addresses);
+            if let Some(ref mut eth_collector) = self.eth_call_collector {
+                eth_collector.update_factory_addresses(&factory_addresses);
+            }
 
             // Collect eth_calls for this block
-            match eth_collector
-                .collect_for_block(
-                    block_number,
-                    updated_block.timestamp,
-                    &logs,
-                    &factory_addresses,
-                    eth_call_decoder_tx,
-                    false,
-                )
-                .await
-            {
-                Ok(calls) => {
-                    let count = calls.len();
-                    let mut status = self.storage.read_status(block_number)?;
-                    status.eth_calls_collected = true;
+            let batch_result = {
+                let eth_collector = self
+                    .eth_call_collector
+                    .as_ref()
+                    .expect("checked eth_call_collector above");
+                eth_collector
+                    .collect_for_block(
+                        block_number,
+                        updated_block.timestamp,
+                        &logs,
+                        &factory_addresses,
+                        false,
+                    )
+                    .await
+            };
 
-                    if !calls.is_empty() {
-                        self.storage.write_eth_calls(block_number, &calls)?;
+            match batch_result {
+                Ok(batch) => {
+                    let count = batch.calls.len();
+                    self.commit_eth_call_batch(
+                        block_number,
+                        batch,
+                        eth_call_decoder_tx,
+                        false,
+                        false,
+                    )
+                    .await?;
+                    if count != 0 {
                         tracing::info!("Block {} eth_calls collected: {}", block_number, count);
-                    } else {
-                        // No calls to decode for this block - mark as decoded
-                        status.eth_calls_decoded = true;
                     }
-
-                    self.storage.write_status(block_number, &status)?;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -530,13 +537,6 @@ impl LiveCollector {
             status.eth_calls_decoded = true;
             self.storage.write_status(block_number, &status)?;
         };
-
-        // If no eth_call decoder is configured, mark eth_calls as decoded
-        if eth_call_decoder_tx.is_none() && self.eth_call_collector.is_some() {
-            let mut status = self.storage.read_status(block_number)?;
-            status.eth_calls_decoded = true;
-            self.storage.write_status(block_number, &status)?;
-        }
 
         // If no handlers are registered, mark transformed=true
         // (decoders will still set logs_decoded/eth_calls_decoded as they finish)
@@ -981,8 +981,7 @@ impl LiveCollector {
         let full_block = self.fetch_full_block(block_number).await?;
 
         // Fetch succeeded — now safe to reset downstream state
-        self.reset_downstream_from_block_fetch(block_number)
-            .await?;
+        self.reset_downstream_from_block_fetch(block_number).await?;
 
         // Update reorg detector so the first live head after restart is
         // compared against the canonical hash, not the stale pre-catchup one.
@@ -1117,6 +1116,70 @@ impl LiveCollector {
             .map_err(|_| CollectorError::ChannelClosed)
     }
 
+    async fn commit_eth_call_batch(
+        &mut self,
+        block_number: u64,
+        batch: CollectedEthCallBatch,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+        reset_existing_state: bool,
+        retry_transform_after_decode: bool,
+    ) -> Result<(), CollectorError> {
+        if reset_existing_state {
+            self.reset_eth_call_state(block_number).await?;
+        }
+
+        let mut status = self.storage.read_status(block_number)?;
+        status.eth_calls_collected = true;
+
+        if !batch.calls.is_empty() {
+            self.storage.write_eth_calls(block_number, &batch.calls)?;
+        } else {
+            status.eth_calls_decoded = true;
+        }
+
+        if eth_call_decoder_tx.is_none() {
+            status.eth_calls_decoded = true;
+        }
+
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status)?;
+
+        if let Some(ref mut eth_collector) = self.eth_call_collector {
+            eth_collector.apply_collected_batch(&batch);
+        }
+
+        self.dispatch_eth_call_messages(block_number, batch.decoder_messages, eth_call_decoder_tx)
+            .await;
+
+        if retry_transform_after_decode && eth_call_decoder_tx.is_none() {
+            self.queue_transform_retry(block_number, None).await;
+        }
+
+        Ok(())
+    }
+
+    async fn dispatch_eth_call_messages(
+        &self,
+        block_number: u64,
+        messages: Vec<DecoderMessage>,
+        eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
+    ) {
+        let Some(decoder_tx) = eth_call_decoder_tx else {
+            return;
+        };
+
+        for message in messages {
+            if let Err(e) = decoder_tx.send(message).await {
+                tracing::warn!(
+                    "Failed to send staged eth_call decoder message for block {}: {}",
+                    block_number,
+                    e
+                );
+                break;
+            }
+        }
+    }
+
     async fn resume_eth_call_collection(
         &mut self,
         block_number: u64,
@@ -1130,44 +1193,37 @@ impl LiveCollector {
             .read_factories(block_number)
             .unwrap_or_default();
 
-        if let Some(ref mut eth_collector) = self.eth_call_collector {
-            eth_collector.update_factory_addresses(&factory_addresses);
+        if self.eth_call_collector.is_some() {
+            if let Some(ref mut eth_collector) = self.eth_call_collector {
+                eth_collector.update_factory_addresses(&factory_addresses);
+            }
 
-            match eth_collector
-                .collect_for_block(
-                    block_number,
-                    block.timestamp,
-                    &logs,
-                    &factory_addresses,
-                    eth_call_decoder_tx,
-                    retry_transform_after_decode,
-                )
-                .await
-            {
-                Ok(calls) => {
-                    // Collection succeeded — now safe to reset old eth_call state.
-                    // Harmless if already reset by a parent reset method.
-                    self.reset_eth_call_state(block_number).await?;
+            let batch_result = {
+                let eth_collector = self
+                    .eth_call_collector
+                    .as_ref()
+                    .expect("checked eth_call_collector above");
+                eth_collector
+                    .collect_for_block(
+                        block_number,
+                        block.timestamp,
+                        &logs,
+                        &factory_addresses,
+                        retry_transform_after_decode,
+                    )
+                    .await
+            };
 
-                    let mut status = self.storage.read_status(block_number)?;
-                    status.eth_calls_collected = true;
-
-                    if !calls.is_empty() {
-                        self.storage.write_eth_calls(block_number, &calls)?;
-                    } else {
-                        status.eth_calls_decoded = true;
-                    }
-
-                    if eth_call_decoder_tx.is_none() {
-                        status.eth_calls_decoded = true;
-                    }
-
-                    status.apply_expectations(&self.expectations);
-                    self.storage.write_status(block_number, &status)?;
-
-                    if retry_transform_after_decode && eth_call_decoder_tx.is_none() {
-                        self.queue_transform_retry(block_number, None).await;
-                    }
+            match batch_result {
+                Ok(batch) => {
+                    self.commit_eth_call_batch(
+                        block_number,
+                        batch,
+                        eth_call_decoder_tx,
+                        true,
+                        retry_transform_after_decode,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1484,6 +1540,17 @@ impl std::fmt::Debug for LiveCollector {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::live::{LiveDecodedCall, LiveDecodedValue, LiveEthCall};
+    use crate::rpc::UnifiedRpcClient;
+    use crate::types::config::chain::ChainConfig;
+
     /// Computes the gap range for backfill given the last processed block and received block.
     /// Returns Some((gap_start, gap_end)) if there is a gap, None otherwise.
     fn compute_gap_range(last_processed: u64, received: u64) -> Option<(u64, u64)> {
@@ -1494,6 +1561,46 @@ mod tests {
             Some((gap_start, gap_end))
         } else {
             None
+        }
+    }
+
+    fn test_chain(name: &str) -> ChainConfig {
+        ChainConfig {
+            name: name.to_string(),
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            contracts: HashMap::new(),
+            tokens: HashMap::new(),
+            block_receipts_method: None,
+            factory_collections: HashMap::new(),
+        }
+    }
+
+    fn dummy_client() -> Arc<UnifiedRpcClient> {
+        Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
+    }
+
+    fn test_collector(storage: LiveStorage) -> LiveCollector {
+        LiveCollector {
+            chain: Arc::new(test_chain("collector-test")),
+            http_client: dummy_client(),
+            storage,
+            reorg_detector: ReorgDetector::new(8),
+            config: LiveModeConfig::default(),
+            buffer: VecDeque::new(),
+            progress_tracker: None,
+            expected_start_block: None,
+            factory_matchers: Arc::new(vec![]),
+            eth_call_collector: None,
+            db_pool: None,
+            expectations: LivePipelineExpectations {
+                expect_eth_call_collection: true,
+                expect_eth_call_decode: true,
+                ..Default::default()
+            },
+            transform_retry_tx: None,
         }
     }
 
@@ -1533,5 +1640,92 @@ mod tests {
         assert_eq!(gap_start, 1001);
         assert_eq!(gap_end, 1009);
         assert_eq!(gap_end - gap_start + 1, 9);
+    }
+
+    #[tokio::test]
+    async fn commit_eth_call_batch_clears_old_decoded_state_before_messages_are_observable() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
+        storage.ensure_dirs().unwrap();
+
+        let block_number = 77;
+        storage
+            .write_status(block_number, &LiveBlockStatus::collected())
+            .unwrap();
+        storage
+            .write_decoded_calls(
+                block_number,
+                "contract",
+                "foo",
+                &[LiveDecodedCall {
+                    block_number,
+                    block_timestamp: 1_000,
+                    contract_address: [9u8; 20],
+                    decoded_value: LiveDecodedValue::Uint256("1".to_string()),
+                }],
+            )
+            .unwrap();
+
+        let mut batch = CollectedEthCallBatch::default();
+        batch.calls.push(LiveEthCall {
+            block_number,
+            block_timestamp: 1_000,
+            contract_name: "contract".to_string(),
+            contract_address: [7u8; 20],
+            function_name: "foo".to_string(),
+            result: vec![0u8; 32],
+        });
+        batch.decoder_messages.push(DecoderMessage::EthCallsReady {
+            range_start: block_number,
+            range_end: block_number + 1,
+            contract_name: "contract".to_string(),
+            function_name: "foo".to_string(),
+            results: vec![crate::decoding::EthCallResult {
+                block_number,
+                block_timestamp: 1_000,
+                contract_address: [7u8; 20],
+                value: vec![0u8; 32],
+            }],
+            live_mode: true,
+            retry_transform_after_decode: false,
+        });
+        batch
+            .decoder_messages
+            .push(DecoderMessage::EthCallsBlockComplete {
+                range_start: block_number,
+                range_end: block_number + 1,
+                retry_transform_after_decode: false,
+            });
+
+        let (decoder_tx, mut decoder_rx) = mpsc::channel(1);
+        let mut collector = test_collector(storage.clone());
+        let tx_opt = Some(decoder_tx);
+
+        let commit_task = tokio::spawn(async move {
+            collector
+                .commit_eth_call_batch(block_number, batch, &tx_opt, true, false)
+                .await
+                .unwrap();
+        });
+
+        let first_msg = decoder_rx.recv().await.unwrap();
+        assert!(matches!(first_msg, DecoderMessage::EthCallsReady { .. }));
+        assert!(matches!(
+            storage.read_decoded_calls(block_number, "contract", "foo"),
+            Err(StorageError::NotFound(_))
+        ));
+        assert_eq!(storage.read_eth_calls(block_number).unwrap().len(), 1);
+
+        let status = storage.read_status(block_number).unwrap();
+        assert!(status.eth_calls_collected);
+        assert!(!status.eth_calls_decoded);
+
+        let second_msg = decoder_rx.recv().await.unwrap();
+        assert!(matches!(
+            second_msg,
+            DecoderMessage::EthCallsBlockComplete { .. }
+        ));
+
+        commit_task.await.unwrap();
     }
 }

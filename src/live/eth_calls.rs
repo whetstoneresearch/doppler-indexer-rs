@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use tokio::sync::mpsc;
 
 use super::error::LiveError;
 use super::storage::LiveStorage;
@@ -46,6 +45,14 @@ pub struct LiveEthCallCollector {
     frequency_state: FrequencyState,
     _multicall3_address: Option<Address>,
     rpc_batch_size: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct CollectedEthCallBatch {
+    pub(crate) calls: Vec<LiveEthCall>,
+    pub(crate) decoder_messages: Vec<DecoderMessage>,
+    frequency_updates: Vec<((String, String), u64)>,
+    once_called_addresses: Vec<[u8; 20]>,
 }
 
 impl LiveEthCallCollector {
@@ -117,75 +124,101 @@ impl LiveEthCallCollector {
 
     /// Collect all eth_calls for a single block.
     ///
-    /// Returns the collected calls and sends messages to the decoder channel.
+    /// Returns the collected calls plus staged decoder messages and runtime
+    /// state updates. The caller is responsible for persisting state before
+    /// applying the runtime updates or dispatching decoder messages.
     pub async fn collect_for_block(
-        &mut self,
+        &self,
         block_number: u64,
         block_timestamp: u64,
         logs: &[LiveLog],
         factory_addrs: &LiveFactoryAddresses,
-        decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         retry_transform_after_decode: bool,
-    ) -> Result<Vec<LiveEthCall>, LiveError> {
-        let mut all_calls = Vec::new();
+    ) -> Result<CollectedEthCallBatch, LiveError> {
+        let mut batch = CollectedEthCallBatch::default();
 
         // 1. Regular frequency-based calls
-        let regular_calls = self
-            .collect_regular_calls(block_number, block_timestamp, decoder_tx)
-            .await?;
-        all_calls.extend(regular_calls);
+        self.collect_regular_calls(
+            block_number,
+            block_timestamp,
+            retry_transform_after_decode,
+            &mut batch,
+        )
+        .await?;
 
         // 2. Factory calls for known addresses
-        let factory_calls = self
-            .collect_factory_calls(block_number, block_timestamp, decoder_tx)
-            .await?;
-        all_calls.extend(factory_calls);
+        self.collect_factory_calls(
+            block_number,
+            block_timestamp,
+            retry_transform_after_decode,
+            &mut batch,
+        )
+        .await?;
 
         // 3. Once calls for newly discovered addresses
-        let once_calls = self
-            .collect_once_calls(block_number, block_timestamp, factory_addrs, decoder_tx)
-            .await?;
-        all_calls.extend(once_calls);
+        self.collect_once_calls(
+            block_number,
+            block_timestamp,
+            factory_addrs,
+            retry_transform_after_decode,
+            &mut batch,
+        )
+        .await?;
 
         // 4. Event-triggered calls
-        let event_calls = self
-            .collect_event_triggered_calls(block_number, block_timestamp, logs, decoder_tx)
-            .await?;
-        all_calls.extend(event_calls);
+        self.collect_event_triggered_calls(
+            block_number,
+            block_timestamp,
+            logs,
+            retry_transform_after_decode,
+            &mut batch,
+        )
+        .await?;
 
-        if !all_calls.is_empty() {
+        if !batch.calls.is_empty() {
             tracing::debug!(
                 "Collected {} eth_calls for block {}",
-                all_calls.len(),
+                batch.calls.len(),
                 block_number
             );
         }
 
-        if let Some(tx) = decoder_tx {
-            let _ = tx
-                .send(DecoderMessage::EthCallsBlockComplete {
-                    range_start: block_number,
-                    range_end: block_number + 1,
-                    retry_transform_after_decode,
-                })
-                .await;
+        batch
+            .decoder_messages
+            .push(DecoderMessage::EthCallsBlockComplete {
+                range_start: block_number,
+                range_end: block_number + 1,
+                retry_transform_after_decode,
+            });
+
+        Ok(batch)
+    }
+
+    pub fn apply_collected_batch(&mut self, batch: &CollectedEthCallBatch) {
+        for ((contract_name, function_name), block_timestamp) in &batch.frequency_updates {
+            self.frequency_state.last_call_times.insert(
+                (contract_name.clone(), function_name.clone()),
+                *block_timestamp,
+            );
         }
 
-        Ok(all_calls)
+        for address in &batch.once_called_addresses {
+            self.once_called_addresses.insert(*address);
+        }
     }
 
     /// Collect regular frequency-based calls.
     async fn collect_regular_calls(
-        &mut self,
+        &self,
         block_number: u64,
         block_timestamp: u64,
-        decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveError> {
+        retry_transform_after_decode: bool,
+        batch: &mut CollectedEthCallBatch,
+    ) -> Result<(), LiveError> {
         if self.call_configs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut results = Vec::new();
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
         // Group by contract/function for decoder messages
@@ -253,7 +286,7 @@ impl LiveEthCallCollector {
                     }
                 };
 
-                results.push(LiveEthCall {
+                batch.calls.push(LiveEthCall {
                     block_number,
                     block_timestamp,
                     contract_name: contract_name.clone(),
@@ -271,29 +304,25 @@ impl LiveEthCallCollector {
             }
 
             // Update frequency state
-            let state_key = (contract_name.clone(), function_name.clone());
-            self.frequency_state
-                .last_call_times
-                .insert(state_key, block_timestamp);
+            batch.frequency_updates.push((
+                (contract_name.clone(), function_name.clone()),
+                block_timestamp,
+            ));
 
-            // Send to decoder
-            if let Some(tx) = decoder_tx {
-                if !decoder_results.is_empty() {
-                    let _ = tx
-                        .send(DecoderMessage::EthCallsReady {
-                            range_start: block_number,
-                            range_end: block_number + 1,
-                            contract_name: contract_name.clone(),
-                            function_name: function_name.clone(),
-                            results: decoder_results,
-                            live_mode: true,
-                        })
-                        .await;
-                }
+            if !decoder_results.is_empty() {
+                batch.decoder_messages.push(DecoderMessage::EthCallsReady {
+                    range_start: block_number,
+                    range_end: block_number + 1,
+                    contract_name: contract_name.clone(),
+                    function_name: function_name.clone(),
+                    results: decoder_results,
+                    live_mode: true,
+                    retry_transform_after_decode,
+                });
             }
         }
 
-        Ok(results)
+        Ok(())
     }
 
     /// Collect factory calls for known factory addresses.
@@ -301,13 +330,13 @@ impl LiveEthCallCollector {
         &self,
         block_number: u64,
         block_timestamp: u64,
-        decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveError> {
+        retry_transform_after_decode: bool,
+        batch: &mut CollectedEthCallBatch,
+    ) -> Result<(), LiveError> {
         if self.factory_call_configs.is_empty() || self.factory_addresses.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut results = Vec::new();
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
         for (collection_name, call_configs) in &self.factory_call_configs {
@@ -369,7 +398,7 @@ impl LiveEthCallCollector {
                             }
                         };
 
-                        results.push(LiveEthCall {
+                        batch.calls.push(LiveEthCall {
                             block_number,
                             block_timestamp,
                             contract_name: collection_name.clone(),
@@ -387,36 +416,32 @@ impl LiveEthCallCollector {
                     }
                 }
 
-                // Send to decoder
-                if let Some(tx) = decoder_tx {
-                    if !decoder_results.is_empty() {
-                        let _ = tx
-                            .send(DecoderMessage::EthCallsReady {
-                                range_start: block_number,
-                                range_end: block_number + 1,
-                                contract_name: collection_name.clone(),
-                                function_name: function_name.clone(),
-                                results: decoder_results,
-                                live_mode: true,
-                            })
-                            .await;
-                    }
+                if !decoder_results.is_empty() {
+                    batch.decoder_messages.push(DecoderMessage::EthCallsReady {
+                        range_start: block_number,
+                        range_end: block_number + 1,
+                        contract_name: collection_name.clone(),
+                        function_name: function_name.clone(),
+                        results: decoder_results,
+                        live_mode: true,
+                        retry_transform_after_decode,
+                    });
                 }
             }
         }
 
-        Ok(results)
+        Ok(())
     }
 
     /// Collect once calls for newly discovered addresses.
     async fn collect_once_calls(
-        &mut self,
+        &self,
         block_number: u64,
         block_timestamp: u64,
         factory_addrs: &LiveFactoryAddresses,
-        decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveError> {
-        let mut results = Vec::new();
+        retry_transform_after_decode: bool,
+        batch: &mut CollectedEthCallBatch,
+    ) -> Result<(), LiveError> {
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
         // Process factory once calls for newly discovered addresses
@@ -501,7 +526,7 @@ impl LiveEthCallCollector {
                         }
                     };
 
-                    results.push(LiveEthCall {
+                    batch.calls.push(LiveEthCall {
                         block_number,
                         block_timestamp,
                         contract_name: collection_name.clone(),
@@ -513,32 +538,27 @@ impl LiveEthCallCollector {
                     function_results.insert(function_name.clone(), result_bytes);
                 }
 
-                // Mark address as called
-                self.once_called_addresses.insert(*address);
+                batch.once_called_addresses.push(*address);
 
-                // Send to decoder as OnceCallsReady
-                if let Some(tx) = decoder_tx {
-                    if !function_results.is_empty() {
-                        let _ = tx
-                            .send(DecoderMessage::OnceCallsReady {
-                                range_start: block_number,
-                                range_end: block_number + 1,
-                                contract_name: collection_name.clone(),
-                                results: vec![OnceCallResult {
-                                    block_number,
-                                    block_timestamp,
-                                    contract_address: *address,
-                                    results: function_results,
-                                }],
-                                live_mode: true,
-                            })
-                            .await;
-                    }
+                if !function_results.is_empty() {
+                    batch.decoder_messages.push(DecoderMessage::OnceCallsReady {
+                        range_start: block_number,
+                        range_end: block_number + 1,
+                        contract_name: collection_name.clone(),
+                        results: vec![OnceCallResult {
+                            block_number,
+                            block_timestamp,
+                            contract_address: *address,
+                            results: function_results,
+                        }],
+                        live_mode: true,
+                        retry_transform_after_decode,
+                    });
                 }
             }
         }
 
-        Ok(results)
+        Ok(())
     }
 
     /// Collect event-triggered calls.
@@ -547,13 +567,13 @@ impl LiveEthCallCollector {
         block_number: u64,
         block_timestamp: u64,
         logs: &[LiveLog],
-        decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
-    ) -> Result<Vec<LiveEthCall>, LiveError> {
+        retry_transform_after_decode: bool,
+        batch: &mut CollectedEthCallBatch,
+    ) -> Result<(), LiveError> {
         if self.event_call_configs.is_empty() || logs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut results = Vec::new();
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
         // Group calls by (contract_name, function_name) for decoder messages
@@ -659,7 +679,7 @@ impl LiveEthCallCollector {
                         }
                     };
 
-                    results.push(LiveEthCall {
+                    batch.calls.push(LiveEthCall {
                         block_number,
                         block_timestamp,
                         contract_name: contract_name.clone(),
@@ -678,24 +698,22 @@ impl LiveEthCallCollector {
                 }
             }
 
-            // Send to decoder
-            if let Some(tx) = decoder_tx {
-                if !decoder_results.is_empty() {
-                    let _ = tx
-                        .send(DecoderMessage::EventCallsReady {
-                            range_start: block_number,
-                            range_end: block_number + 1,
-                            contract_name: contract_name.clone(),
-                            function_name: function_name.clone(),
-                            results: decoder_results,
-                            live_mode: true,
-                        })
-                        .await;
-                }
+            if !decoder_results.is_empty() {
+                batch
+                    .decoder_messages
+                    .push(DecoderMessage::EventCallsReady {
+                        range_start: block_number,
+                        range_end: block_number + 1,
+                        contract_name: contract_name.clone(),
+                        function_name: function_name.clone(),
+                        results: decoder_results,
+                        live_mode: true,
+                        retry_transform_after_decode,
+                    });
             }
         }
 
-        Ok(results)
+        Ok(())
     }
 
     /// Check if a call should be made based on frequency.
@@ -786,5 +804,96 @@ impl std::fmt::Debug for LiveEthCallCollector {
             .field("call_configs", &self.call_configs.len())
             .field("factory_addresses", &self.factory_addresses.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::types::config::chain::ChainConfig;
+
+    fn test_chain(name: &str) -> ChainConfig {
+        ChainConfig {
+            name: name.to_string(),
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            contracts: HashMap::new(),
+            tokens: HashMap::new(),
+            block_receipts_method: None,
+            factory_collections: HashMap::new(),
+        }
+    }
+
+    fn dummy_client() -> Arc<UnifiedRpcClient> {
+        Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
+    }
+
+    #[tokio::test]
+    async fn collect_for_block_stages_block_complete_message() {
+        let collector = LiveEthCallCollector::new(
+            &test_chain("staged-block-complete"),
+            dummy_client(),
+            None,
+            4,
+        );
+
+        let batch = collector
+            .collect_for_block(42, 1_000, &[], &LiveFactoryAddresses::default(), true)
+            .await
+            .unwrap();
+
+        assert!(batch.calls.is_empty());
+        assert_eq!(batch.decoder_messages.len(), 1);
+        assert!(matches!(
+            batch.decoder_messages.first(),
+            Some(DecoderMessage::EthCallsBlockComplete {
+                range_start: 42,
+                range_end: 43,
+                retry_transform_after_decode: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn apply_collected_batch_commits_runtime_state() {
+        let mut collector =
+            LiveEthCallCollector::new(&test_chain("runtime-state"), dummy_client(), None, 4);
+        let state_key = ("contract".to_string(), "foo".to_string());
+        let address = [7u8; 20];
+
+        assert!(collector.once_called_addresses.is_empty());
+        assert!(collector.frequency_state.last_call_times.is_empty());
+        assert!(collector.should_call_for_frequency(
+            &state_key.0,
+            &state_key.1,
+            60,
+            &Frequency::Duration(30),
+        ));
+
+        let batch = CollectedEthCallBatch {
+            calls: Vec::new(),
+            decoder_messages: Vec::new(),
+            frequency_updates: vec![(state_key.clone(), 50)],
+            once_called_addresses: vec![address],
+        };
+
+        collector.apply_collected_batch(&batch);
+
+        assert_eq!(
+            collector.frequency_state.last_call_times.get(&state_key),
+            Some(&50)
+        );
+        assert!(collector.once_called_addresses.contains(&address));
+        assert!(!collector.should_call_for_frequency(
+            &state_key.0,
+            &state_key.1,
+            60,
+            &Frequency::Duration(30),
+        ));
     }
 }

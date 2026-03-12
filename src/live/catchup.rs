@@ -605,6 +605,7 @@ impl LiveCatchupService {
                         function_name: function_name.clone(),
                         results,
                         live_mode: true,
+                        retry_transform_after_decode: request.retry_transform_after_decode,
                     })
                     .await
                 {

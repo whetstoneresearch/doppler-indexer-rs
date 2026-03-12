@@ -22,7 +22,9 @@ pub use compaction::{CompactionService, TransformRetryRequest};
 pub use eth_calls::LiveEthCallCollector;
 pub use progress::LiveProgressTracker;
 pub use storage::{LiveStorage, StorageError};
+#[allow(unused_imports)]
 pub use types::{
-    LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog, LiveDecodedOnceCall,
-    LiveDecodedValue, LiveMessage, LiveModeConfig, LivePipelineExpectations, LiveUpsertSnapshot,
+    LiveBlockStatus, LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog,
+    LiveDecodedOnceCall, LiveDecodedValue, LiveEthCall, LiveMessage, LiveModeConfig,
+    LivePipelineExpectations, LiveUpsertSnapshot,
 };

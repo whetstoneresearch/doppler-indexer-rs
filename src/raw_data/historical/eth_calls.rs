@@ -969,6 +969,7 @@ pub(crate) async fn process_event_triggers(
                         function_name: function_name.clone(),
                         results: decoder_results,
                         live_mode: false,
+                        retry_transform_after_decode: false,
                     })
                     .await;
             }
@@ -1320,6 +1321,7 @@ pub(crate) async fn process_event_triggers_multicall(
                     function_name: function_name.clone(),
                     results: decoder_results,
                     live_mode: false,
+                    retry_transform_after_decode: false,
                 })
                 .await;
         }
@@ -2378,6 +2380,7 @@ pub(crate) async fn process_factory_range(
                             function_name: function_name.clone(),
                             results,
                             live_mode: false,
+                            retry_transform_after_decode: false,
                         })
                         .await;
                 }
@@ -2696,6 +2699,7 @@ pub(crate) async fn process_factory_range_multicall(
                             function_name: group.function_name.clone(),
                             results,
                             live_mode: false,
+                            retry_transform_after_decode: false,
                         })
                         .await;
                 }
@@ -3498,6 +3502,7 @@ pub(crate) async fn process_once_calls_regular(
                         contract_name: contract_name.clone(),
                         results,
                         live_mode: false,
+                        retry_transform_after_decode: false,
                     })
                     .await;
             }
@@ -4331,6 +4336,7 @@ pub(crate) async fn process_once_calls_multicall(
                             contract_name: contract_name.clone(),
                             results,
                             live_mode: false,
+                            retry_transform_after_decode: false,
                         })
                         .await;
                 }
@@ -5105,6 +5111,7 @@ pub(crate) async fn process_range(
                         function_name: function_name.clone(),
                         results,
                         live_mode: false,
+                        retry_transform_after_decode: false,
                     })
                     .await;
             }
@@ -5383,6 +5390,7 @@ pub(crate) async fn process_range_multicall(
                             function_name: group.function_name.clone(),
                             results,
                             live_mode: false,
+                            retry_transform_after_decode: false,
                         })
                         .await;
                 }
@@ -6033,6 +6041,7 @@ pub(crate) async fn process_token_range_multicall(
                             function_name: group.function_name.clone(),
                             results,
                             live_mode: false,
+                            retry_transform_after_decode: false,
                         })
                         .await;
                 }
@@ -6225,6 +6234,7 @@ pub(crate) async fn process_token_range(
                         function_name: function_name.clone(),
                         results,
                         live_mode: false,
+                        retry_transform_after_decode: false,
                     })
                     .await;
             }

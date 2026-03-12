@@ -56,6 +56,9 @@ pub enum DecoderMessage {
         results: Vec<EthCallResult>,
         /// If true, write to live bincode storage instead of parquet
         live_mode: bool,
+        /// If true, persist decoded artifacts but defer transform execution
+        /// until the block-complete retry request is processed.
+        retry_transform_after_decode: bool,
     },
     /// "Once" eth_call results ready for decoding
     OnceCallsReady {
@@ -65,6 +68,9 @@ pub enum DecoderMessage {
         results: Vec<OnceCallResult>,
         /// If true, write to live bincode storage instead of parquet
         live_mode: bool,
+        /// If true, persist decoded artifacts but defer transform execution
+        /// until the block-complete retry request is processed.
+        retry_transform_after_decode: bool,
     },
     /// Event-triggered eth_call results ready for decoding
     EventCallsReady {
@@ -75,6 +81,9 @@ pub enum DecoderMessage {
         results: Vec<EventCallResult>,
         /// If true, write to live bincode storage instead of parquet
         live_mode: bool,
+        /// If true, persist decoded artifacts but defer transform execution
+        /// until the block-complete retry request is processed.
+        retry_transform_after_decode: bool,
     },
     /// Marker indicating all eth_call decode work for this block/range has been queued.
     EthCallsBlockComplete {
