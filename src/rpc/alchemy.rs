@@ -1186,10 +1186,7 @@ mod tests {
 
         // current_usage should return 500 (entry just inside window)
         let usage = SlidingWindowRateLimiter::current_usage(&history, now, window);
-        assert_eq!(
-            usage, 500,
-            "Entry 1ms inside the window should be counted"
-        );
+        assert_eq!(usage, 500, "Entry 1ms inside the window should be counted");
 
         // cleanup should NOT remove the entry
         SlidingWindowRateLimiter::cleanup(&mut history, now, window);

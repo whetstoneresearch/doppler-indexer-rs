@@ -48,6 +48,9 @@ pub mod raw_data {
 
     /// Default interval in seconds between compaction checks
     pub const COMPACTION_INTERVAL_SECS: u64 = 10;
+
+    /// Default grace period in seconds before retrying stuck transformations
+    pub const TRANSFORM_RETRY_GRACE_PERIOD_SECS: u64 = 300;
 }
 
 /// RPC client defaults
@@ -95,6 +98,7 @@ mod tests {
         assert_eq!(raw_data::FACTORY_CONCURRENCY, 4);
         assert_eq!(raw_data::REORG_DEPTH, 128);
         assert_eq!(raw_data::COMPACTION_INTERVAL_SECS, 10);
+        assert_eq!(raw_data::TRANSFORM_RETRY_GRACE_PERIOD_SECS, 300);
     }
 
     #[test]

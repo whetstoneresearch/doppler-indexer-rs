@@ -31,6 +31,9 @@ pub struct RawDataCollectionConfig {
     /// Interval in seconds between compaction checks.
     /// Default: 10
     pub compaction_interval_secs: Option<u64>,
+    /// Grace period in seconds before retrying stuck transformations.
+    /// Default: 300
+    pub transform_retry_grace_period_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

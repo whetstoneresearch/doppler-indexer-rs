@@ -7,10 +7,10 @@
 //! 4. Updates progress tables
 //! 5. Cleans up live storage
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder, UInt32Builder, UInt64Builder,
@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 
 use super::progress::LiveProgressTracker;
 use super::storage::{LiveStorage, StorageError};
-use super::types::LiveModeConfig;
+use super::types::{LiveModeConfig, LivePipelineExpectations};
 use crate::db::DbPool;
 use crate::storage::StorageManager;
 
@@ -57,6 +57,7 @@ pub struct CompactableRange {
 #[derive(Debug, Clone)]
 pub struct TransformRetryRequest {
     pub block_number: u64,
+    pub missing_handlers: Option<HashSet<String>>,
 }
 
 /// Service for compacting live blocks into parquet ranges.
@@ -67,10 +68,15 @@ pub struct CompactionService {
     config: LiveModeConfig,
     db_pool: Option<Arc<DbPool>>,
     progress_tracker: Arc<Mutex<LiveProgressTracker>>,
+    expectations: LivePipelineExpectations,
     /// Optional S3 storage manager for uploading compacted parquet files
     storage_manager: Option<Arc<StorageManager>>,
     /// Channel to request transformation retries
     retry_tx: Option<tokio::sync::mpsc::Sender<TransformRetryRequest>>,
+    /// When each transform-ready block first became eligible for retry.
+    stuck_blocks: Mutex<HashMap<u64, Instant>>,
+    /// Minimum time a block must remain transform-ready and incomplete before retrying.
+    retry_grace_period: Duration,
 }
 
 impl CompactionService {
@@ -81,6 +87,7 @@ impl CompactionService {
         config: LiveModeConfig,
         db_pool: Option<Arc<DbPool>>,
         progress_tracker: Arc<Mutex<LiveProgressTracker>>,
+        expectations: LivePipelineExpectations,
         storage_manager: Option<Arc<StorageManager>>,
     ) -> Self {
         let storage = LiveStorage::new(&chain_name);
@@ -89,11 +96,14 @@ impl CompactionService {
             chain_name,
             chain_id,
             storage,
-            config,
+            config: config.clone(),
             db_pool,
             progress_tracker,
+            expectations,
             storage_manager,
             retry_tx: None,
+            stuck_blocks: Mutex::new(HashMap::new()),
+            retry_grace_period: Duration::from_secs(config.transform_retry_grace_period_secs),
         }
     }
 
@@ -165,48 +175,80 @@ impl CompactionService {
             return;
         };
 
+        if !self.expectations.expect_transformations {
+            return;
+        }
+
         let blocks = match self.storage.list_blocks() {
             Ok(b) => b,
             Err(_) => return,
         };
 
+        let now = Instant::now();
+        let mut pending_retries = Vec::new();
+        let mut seen_blocks = HashSet::new();
+        let mut stuck_blocks = self.stuck_blocks.lock().await;
+
         for block_number in blocks {
+            seen_blocks.insert(block_number);
+
             let status = match self.storage.read_status(block_number) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(_) => {
+                    stuck_blocks.remove(&block_number);
+                    continue;
+                }
             };
 
-            // Block is decoded but not transformed - needs retry
-            if status.logs_decoded && status.eth_calls_decoded && !status.transformed {
-                // Check if this block has been stuck for a while by checking progress tracker
-                let progress = self.progress_tracker.lock().await;
-                if !progress.is_block_complete(block_number) {
-                    drop(progress);
+            if status.transformed || !status.transform_inputs_ready_with(&self.expectations) {
+                stuck_blocks.remove(&block_number);
+                continue;
+            }
 
-                    // Clear logs_decoded so decoder will re-process
-                    let mut updated_status = status;
-                    updated_status.logs_decoded = false;
-                    if let Err(e) = self.storage.write_status(block_number, &updated_status) {
-                        tracing::warn!(
-                            "Failed to clear logs_decoded for stuck block {}: {}",
-                            block_number,
-                            e
-                        );
-                        continue;
-                    }
+            let progress = self.progress_tracker.lock().await;
+            if progress.is_block_complete(block_number) {
+                stuck_blocks.remove(&block_number);
+                continue;
+            }
 
-                    // Request retry
-                    if let Err(e) = retry_tx.try_send(TransformRetryRequest { block_number }) {
-                        tracing::debug!("Retry channel full for block {}: {}", block_number, e);
-                    } else {
-                        tracing::info!(
-                            "Requested transformation retry for stuck block {}",
-                            block_number
-                        );
-                    }
+            let missing_handlers = progress.get_pending_handlers(block_number);
+            drop(progress);
+
+            if missing_handlers.is_empty() {
+                stuck_blocks.remove(&block_number);
+                continue;
+            }
+
+            let first_seen = stuck_blocks.entry(block_number).or_insert(now);
+            if now.duration_since(*first_seen) >= self.retry_grace_period {
+                pending_retries.push((block_number, missing_handlers));
+            }
+        }
+
+        stuck_blocks.retain(|block_number, _| seen_blocks.contains(block_number));
+
+        // Only remove from stuck_blocks on successful send. If try_send fails
+        // (channel full), the block keeps its original grace timer so it doesn't
+        // restart the grace period on the next cycle.
+        for (block_number, missing_handlers) in pending_retries {
+            match retry_tx.try_send(TransformRetryRequest {
+                block_number,
+                missing_handlers: Some(missing_handlers),
+            }) {
+                Ok(()) => {
+                    stuck_blocks.remove(&block_number);
+                    tracing::info!(
+                        "Requested transformation retry for stuck block {}",
+                        block_number
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("Retry channel full for block {}: {}", block_number, e);
                 }
             }
         }
+
+        drop(stuck_blocks);
     }
 
     /// Find ranges that are ready for compaction.
@@ -268,7 +310,7 @@ impl CompactionService {
             for &block_number in &block_numbers {
                 // Check status file
                 if let Ok(status) = self.storage.read_status(block_number) {
-                    if !status.is_complete() {
+                    if !status.is_complete_with(&self.expectations) {
                         all_complete = false;
                         break;
                     }
@@ -908,6 +950,15 @@ impl std::fmt::Debug for CompactionService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::live::types::{LiveBlock, LiveBlockStatus};
+    use crate::live::LiveProgressTracker;
+
     /// Helper function to validate a range of blocks.
     /// Returns true if the blocks form a complete sequential range.
     fn validate_range(mut block_numbers: Vec<u64>, range_start: u64, range_size: u64) -> bool {
@@ -1002,5 +1053,207 @@ mod tests {
         let nextrange_start_2 = range_end_2 + 1;
 
         assert_eq!(nextrange_start_2, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_find_compactable_ranges_honors_expectations() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
+        storage.ensure_dirs().unwrap();
+
+        for block_number in [0_u64, 1, 10] {
+            storage
+                .write_block(&LiveBlock {
+                    number: block_number,
+                    hash: [block_number as u8; 32],
+                    parent_hash: [block_number.saturating_sub(1) as u8; 32],
+                    timestamp: block_number * 12,
+                    tx_hashes: vec![],
+                })
+                .unwrap();
+        }
+
+        for block_number in [0_u64, 1] {
+            let mut status = LiveBlockStatus::default();
+            status.collected = true;
+            status.block_fetched = true;
+            status.receipts_collected = true;
+            status.logs_collected = true;
+            status.factories_extracted = true;
+            storage.write_status(block_number, &status).unwrap();
+        }
+
+        let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
+            1,
+            None,
+            "test-chain".to_string(),
+        )));
+
+        let config = LiveModeConfig {
+            reorg_depth: 2,
+            compaction_interval_secs: 1,
+            range_size: 2,
+            transform_retry_grace_period_secs: 300,
+        };
+
+        let disabled_expectations = LivePipelineExpectations::default();
+        let service_with_disabled_stages = CompactionService {
+            chain_name: "test-chain".to_string(),
+            chain_id: 1,
+            storage: storage.clone(),
+            config: config.clone(),
+            db_pool: None,
+            progress_tracker: progress_tracker.clone(),
+            expectations: disabled_expectations,
+            storage_manager: None,
+            retry_tx: None,
+            stuck_blocks: Mutex::new(HashMap::new()),
+            retry_grace_period: Duration::from_secs(config.transform_retry_grace_period_secs),
+        };
+
+        let ranges = service_with_disabled_stages
+            .find_compactable_ranges()
+            .await
+            .unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[0].end, 1);
+
+        let service_with_required_decode = CompactionService {
+            expectations: LivePipelineExpectations {
+                expect_log_decode: true,
+                expect_transformations: true,
+                ..disabled_expectations
+            },
+            ..service_with_disabled_stages
+        };
+
+        let ranges = service_with_required_decode
+            .find_compactable_ranges()
+            .await
+            .unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_for_stuck_blocks_skips_decode_incomplete_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
+        storage.ensure_dirs().unwrap();
+
+        storage
+            .write_block(&LiveBlock {
+                number: 100,
+                hash: [1; 32],
+                parent_hash: [0; 32],
+                timestamp: 1200,
+                tx_hashes: vec![],
+            })
+            .unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.logs_decoded = true;
+        status.eth_calls_decoded = false;
+        status.transformed = false;
+        storage.write_status(100, &status).unwrap();
+
+        let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
+            1,
+            None,
+            "test-chain".to_string(),
+        )));
+        progress_tracker.lock().await.register_handler("handler_a");
+
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel(4);
+        let service = CompactionService {
+            chain_name: "test-chain".to_string(),
+            chain_id: 1,
+            storage,
+            config: LiveModeConfig::default(),
+            db_pool: None,
+            progress_tracker,
+            expectations: LivePipelineExpectations {
+                expect_log_decode: true,
+                expect_eth_call_decode: true,
+                expect_transformations: true,
+                ..Default::default()
+            },
+            storage_manager: None,
+            retry_tx: Some(retry_tx),
+            stuck_blocks: Mutex::new(HashMap::new()),
+            retry_grace_period: Duration::ZERO,
+        };
+
+        service.check_for_stuck_blocks().await;
+        assert!(retry_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_check_for_stuck_blocks_retries_transform_ready_blocks_after_grace() {
+        let tmp = TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
+        storage.ensure_dirs().unwrap();
+
+        storage
+            .write_block(&LiveBlock {
+                number: 101,
+                hash: [2; 32],
+                parent_hash: [1; 32],
+                timestamp: 1200,
+                tx_hashes: vec![],
+            })
+            .unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.collected = true;
+        status.block_fetched = true;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        status.transformed = false;
+        storage.write_status(101, &status).unwrap();
+
+        let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
+            1,
+            None,
+            "test-chain".to_string(),
+        )));
+        progress_tracker.lock().await.register_handler("handler_a");
+
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel(4);
+        let service = CompactionService {
+            chain_name: "test-chain".to_string(),
+            chain_id: 1,
+            storage,
+            config: LiveModeConfig::default(),
+            db_pool: None,
+            progress_tracker,
+            expectations: LivePipelineExpectations {
+                expect_log_decode: true,
+                expect_eth_call_decode: true,
+                expect_transformations: true,
+                ..Default::default()
+            },
+            storage_manager: None,
+            retry_tx: Some(retry_tx),
+            stuck_blocks: Mutex::new(HashMap::new()),
+            retry_grace_period: Duration::ZERO,
+        };
+
+        service.check_for_stuck_blocks().await;
+
+        let request = retry_rx.try_recv().unwrap();
+        assert_eq!(request.block_number, 101);
+        assert_eq!(
+            request.missing_handlers,
+            Some(HashSet::from(["handler_a".to_string()]))
+        );
     }
 }

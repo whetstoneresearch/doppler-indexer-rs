@@ -117,7 +117,10 @@ impl LiveProgressTracker {
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to update block status after handler completion: {}", e);
+                tracing::warn!(
+                    "Failed to update block status after handler completion: {}",
+                    e
+                );
             }
         }
 
