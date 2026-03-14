@@ -62,6 +62,10 @@ pub struct LiveBlockStatus {
     /// Used for catchup on restart to determine which handlers still need to run.
     #[serde(default)]
     pub completed_handlers: HashSet<String>,
+    /// Handler keys that failed processing for this block (will be retried).
+    /// Tracks transient failures like DB errors or handler bugs.
+    #[serde(default)]
+    pub failed_handlers: HashSet<String>,
 }
 
 /// Runtime expectations for optional live-mode stages.

@@ -95,6 +95,133 @@ impl Default for ExecutionMode {
     }
 }
 
+/// Outcome of a single handler execution, used to track success/failure per handler.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum HandlerExecutionOutcome {
+    /// Handler executed successfully and produced output.
+    Succeeded {
+        handler_key: String,
+        range_start: u64,
+        range_end: u64,
+    },
+    /// Handler executed successfully but produced no output (empty ops).
+    SucceededEmpty {
+        handler_key: String,
+        range_start: u64,
+        range_end: u64,
+    },
+    /// Handler execution failed (handler logic error).
+    Failed {
+        handler_key: String,
+        range_start: u64,
+        range_end: u64,
+        error: String,
+    },
+    /// Database transaction failed after handler execution.
+    DbTransactionFailed {
+        handler_key: String,
+        range_start: u64,
+        range_end: u64,
+        error: String,
+    },
+    /// Handler blocked waiting for missing dependencies.
+    Blocked {
+        handler_key: String,
+        range_start: u64,
+        range_end: u64,
+        missing_dependencies: Vec<(String, String)>,
+    },
+}
+
+#[allow(dead_code)]
+impl HandlerExecutionOutcome {
+    /// Get the handler key from any outcome variant.
+    pub fn handler_key(&self) -> &str {
+        match self {
+            Self::Succeeded { handler_key, .. }
+            | Self::SucceededEmpty { handler_key, .. }
+            | Self::Failed { handler_key, .. }
+            | Self::DbTransactionFailed { handler_key, .. }
+            | Self::Blocked { handler_key, .. } => handler_key,
+        }
+    }
+
+    /// Returns true if this outcome represents a successful execution.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Succeeded { .. } | Self::SucceededEmpty { .. })
+    }
+
+    /// Returns true if this outcome represents a failure.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. } | Self::DbTransactionFailed { .. })
+    }
+
+    /// Returns true if this outcome represents a blocked handler.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::Blocked { .. })
+    }
+
+    /// Get the range (start, end) from any outcome variant.
+    pub fn range(&self) -> (u64, u64) {
+        match self {
+            Self::Succeeded {
+                range_start,
+                range_end,
+                ..
+            }
+            | Self::SucceededEmpty {
+                range_start,
+                range_end,
+                ..
+            }
+            | Self::Failed {
+                range_start,
+                range_end,
+                ..
+            }
+            | Self::DbTransactionFailed {
+                range_start,
+                range_end,
+                ..
+            }
+            | Self::Blocked {
+                range_start,
+                range_end,
+                ..
+            } => (*range_start, *range_end),
+        }
+    }
+}
+
+/// Aggregate handler outcomes into success/failure/blocked sets.
+fn aggregate_outcomes(
+    outcomes: &[HandlerExecutionOutcome],
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    let mut successful = HashSet::new();
+    let mut failed = HashSet::new();
+    let mut blocked = HashSet::new();
+
+    for outcome in outcomes {
+        let key = outcome.handler_key().to_string();
+        match outcome {
+            HandlerExecutionOutcome::Succeeded { .. }
+            | HandlerExecutionOutcome::SucceededEmpty { .. } => {
+                successful.insert(key);
+            }
+            HandlerExecutionOutcome::Failed { .. }
+            | HandlerExecutionOutcome::DbTransactionFailed { .. } => {
+                failed.insert(key);
+            }
+            HandlerExecutionOutcome::Blocked { .. } => {
+                blocked.insert(key);
+            }
+        }
+    }
+
+    (successful, failed, blocked)
+}
+
 /// Buffered event data waiting for call dependencies.
 #[derive(Debug)]
 struct PendingEventData {
@@ -1523,7 +1650,7 @@ impl TransformationEngine {
 
         // Run ready handlers concurrently
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+        let mut join_set: JoinSet<Result<HandlerExecutionOutcome, TransformationError>> =
             JoinSet::new();
         let tx_addresses = self.read_receipt_addresses(msg.range_start, msg.range_end);
         let tx_addresses = Arc::new(tx_addresses);
@@ -1575,10 +1702,25 @@ impl TransformationEngine {
                                     range_end,
                                     e
                                 );
-                                return Ok(None);
+                                return Ok(HandlerExecutionOutcome::DbTransactionFailed {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                    error: e.to_string(),
+                                });
                             }
+                            Ok(HandlerExecutionOutcome::Succeeded {
+                                handler_key,
+                                range_start,
+                                range_end,
+                            })
+                        } else {
+                            Ok(HandlerExecutionOutcome::SucceededEmpty {
+                                handler_key,
+                                range_start,
+                                range_end,
+                            })
                         }
-                        Ok(Some((handler_key, range_start, range_end)))
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1588,40 +1730,81 @@ impl TransformationEngine {
                             event_name,
                             e
                         );
-                        Ok(None)
+                        Ok(HandlerExecutionOutcome::Failed {
+                            handler_key,
+                            range_start,
+                            range_end,
+                            error: e.to_string(),
+                        })
                     }
                 }
             });
         }
 
-        // Collect results and record progress
+        // Collect outcomes and record progress only for successful handlers
+        let mut outcomes = Vec::new();
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(Some((handler_key, rs, re)))) => {
-                    self.record_completed_range_for_handler(&handler_key, rs, re)
-                        .await?;
-
-                    // Mark live progress for single-block ranges (live mode)
-                    if re - rs == 1 {
-                        if let Some(ref tracker) = self.progress_tracker {
-                            let mut t = tracker.lock().await;
-                            if let Err(e) = t.mark_complete(rs, &handler_key).await {
-                                tracing::warn!(
-                                    "Failed to mark live progress for block {} handler {}: {}",
-                                    rs,
-                                    handler_key,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(Ok(None)) => {}
+                Ok(Ok(outcome)) => outcomes.push(outcome),
                 Ok(Err(e)) => {
                     tracing::error!("Handler task returned error: {}", e);
                 }
                 Err(e) => {
                     tracing::error!("Handler task panicked: {}", e);
+                }
+            }
+        }
+
+        let (_successful, failed, _blocked) = aggregate_outcomes(&outcomes);
+        let is_single_block = msg.range_end - msg.range_start == 1;
+
+        // Record progress only for successful handlers
+        for outcome in &outcomes {
+            if outcome.is_success() {
+                let handler_key = outcome.handler_key();
+                let (rs, re) = outcome.range();
+                self.record_completed_range_for_handler(handler_key, rs, re)
+                    .await?;
+
+                if is_single_block {
+                    if let Some(ref tracker) = self.progress_tracker {
+                        let mut t = tracker.lock().await;
+                        if let Err(e) = t.mark_complete(rs, handler_key).await {
+                            tracing::warn!(
+                                "Failed to mark live progress for block {} handler {}: {}",
+                                rs,
+                                handler_key,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Persist failed handlers to status file for retry (atomic update)
+        if !failed.is_empty() && is_single_block {
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Err(e) = storage.update_status_atomic(msg.range_start, |status| {
+                status.failed_handlers.extend(failed.iter().cloned());
+                for h in &failed {
+                    status.completed_handlers.remove(h);
+                }
+            }) {
+                match e {
+                    StorageError::NotFound(_) => {
+                        tracing::debug!(
+                            "Status file not found for block {}, cannot persist failed handlers",
+                            msg.range_start
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Failed to persist failed handlers for block {}: {}",
+                            msg.range_start,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -1763,7 +1946,7 @@ impl TransformationEngine {
 
         // Process ready events concurrently
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+        let mut join_set: JoinSet<Result<HandlerExecutionOutcome, TransformationError>> =
             JoinSet::new();
 
         for (handler_key, event_data, handler) in ready_events {
@@ -1822,10 +2005,25 @@ impl TransformationEngine {
                                     re,
                                     e
                                 );
-                                return Ok(None);
+                                return Ok(HandlerExecutionOutcome::DbTransactionFailed {
+                                    handler_key,
+                                    range_start: rs,
+                                    range_end: re,
+                                    error: e.to_string(),
+                                });
                             }
+                            Ok(HandlerExecutionOutcome::Succeeded {
+                                handler_key,
+                                range_start: rs,
+                                range_end: re,
+                            })
+                        } else {
+                            Ok(HandlerExecutionOutcome::SucceededEmpty {
+                                handler_key,
+                                range_start: rs,
+                                range_end: re,
+                            })
                         }
-                        Ok(Some((handler_key, rs, re)))
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1835,40 +2033,78 @@ impl TransformationEngine {
                             event_name,
                             e
                         );
-                        Ok(None)
+                        Ok(HandlerExecutionOutcome::Failed {
+                            handler_key,
+                            range_start: rs,
+                            range_end: re,
+                            error: e.to_string(),
+                        })
                     }
                 }
             });
         }
 
-        // Collect results and record progress
+        // Collect outcomes and record progress only for successful handlers
+        let mut outcomes = Vec::new();
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(Some((handler_key, rs, re)))) => {
-                    self.record_completed_range_for_handler(&handler_key, rs, re)
-                        .await?;
-
-                    // Mark live progress for single-block ranges (live mode)
-                    if re - rs == 1 {
-                        if let Some(ref tracker) = self.progress_tracker {
-                            let mut t = tracker.lock().await;
-                            if let Err(e) = t.mark_complete(rs, &handler_key).await {
-                                tracing::warn!(
-                                    "Failed to mark live progress for block {} handler {}: {}",
-                                    rs,
-                                    handler_key,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(Ok(None)) => {}
+                Ok(Ok(outcome)) => outcomes.push(outcome),
                 Ok(Err(e)) => {
                     tracing::error!("Handler task returned error: {}", e);
                 }
                 Err(e) => {
                     tracing::error!("Handler task panicked: {}", e);
+                }
+            }
+        }
+
+        let (_successful, failed, _blocked) = aggregate_outcomes(&outcomes);
+
+        // Record progress only for successful handlers
+        for outcome in &outcomes {
+            if outcome.is_success() {
+                let handler_key = outcome.handler_key();
+                let (rs, re) = outcome.range();
+                self.record_completed_range_for_handler(handler_key, rs, re)
+                    .await?;
+
+                if re - rs == 1 {
+                    if let Some(ref tracker) = self.progress_tracker {
+                        let mut t = tracker.lock().await;
+                        if let Err(e) = t.mark_complete(rs, handler_key).await {
+                            tracing::warn!(
+                                "Failed to mark live progress for block {} handler {}: {}",
+                                rs,
+                                handler_key,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Persist failed handlers to status file for retry (atomic update)
+        if !failed.is_empty() {
+            // All events in this batch have the same range (single-block in live mode)
+            if let Some(first_outcome) = outcomes.first() {
+                let (rs, re) = first_outcome.range();
+                if re - rs == 1 {
+                    let storage = LiveStorage::new(&self.chain_name);
+                    if let Err(e) = storage.update_status_atomic(rs, |status| {
+                        status.failed_handlers.extend(failed.iter().cloned());
+                        for h in &failed {
+                            status.completed_handlers.remove(h);
+                        }
+                    }) {
+                        if !matches!(e, StorageError::NotFound(_)) {
+                            tracing::warn!(
+                                "Failed to persist failed handlers for block {}: {}",
+                                rs,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2245,6 +2481,7 @@ impl TransformationEngine {
         range_end: u64,
     ) -> Result<(), TransformationError> {
         let range_key = (range_start, range_end);
+        let is_single_block = range_end - range_start == 1;
 
         // Prevent double finalization by checking and marking atomically
         {
@@ -2260,13 +2497,46 @@ impl TransformationEngine {
             state.finalized_ranges.insert(range_key);
         }
 
-        // Mark ALL handlers as complete for this range (event + call handlers)
+        // For single-block ranges (live mode), check which handlers failed
+        // and exclude them from finalization
+        let (failed_handlers, completed_handlers) = if is_single_block {
+            let storage = LiveStorage::new(&self.chain_name);
+            match storage.read_status(range_start) {
+                Ok(status) => (status.failed_handlers, status.completed_handlers),
+                Err(_) => (HashSet::new(), HashSet::new()),
+            }
+        } else {
+            (HashSet::new(), HashSet::new())
+        };
+
+        // Mark handlers as complete only if they didn't fail
+        // Handlers that weren't triggered at all (no matching events/calls) are marked complete
+        // Handlers that were triggered and succeeded were already marked in the execution loops
+        // Handlers that failed are NOT marked complete here
+        let mut handlers_marked = 0;
         for handler in self.registry.all_handlers() {
             let handler_key = handler.handler_key();
+
+            // Skip handlers that failed - they need to be retried
+            if failed_handlers.contains(&handler_key) {
+                tracing::debug!(
+                    "Handler {} failed for block {}, not marking complete in finalize_range",
+                    handler_key,
+                    range_start
+                );
+                continue;
+            }
+
+            // Skip handlers that are already completed (to avoid duplicate DB writes)
+            if completed_handlers.contains(&handler_key) {
+                continue;
+            }
+
             self.record_completed_range_for_handler(&handler_key, range_start, range_end)
                 .await?;
+            handlers_marked += 1;
 
-            if range_end - range_start == 1 {
+            if is_single_block {
                 if let Some(ref tracker) = self.progress_tracker {
                     let mut t = tracker.lock().await;
                     if let Err(e) = t.mark_complete(range_start, &handler_key).await {
@@ -2295,33 +2565,70 @@ impl TransformationEngine {
         }
 
         tracing::debug!(
-            "Recorded progress for {} handlers on range {}-{}",
-            self.registry.all_handlers().len(),
+            "Recorded progress for {} handlers on range {}-{} ({} skipped due to failure)",
+            handlers_marked,
             range_start,
-            range_end
+            range_end,
+            failed_handlers.len()
         );
 
-        if range_end - range_start == 1 {
+        // Only set transformed=true if there are no failed handlers (atomic update)
+        // Also filter out stale handler keys that are no longer in the registry
+        if is_single_block {
             let storage = LiveStorage::new(&self.chain_name);
-            match storage.read_status(range_start) {
-                Ok(mut status) => {
+            let registered_handlers: HashSet<String> = self
+                .registry
+                .all_handlers()
+                .iter()
+                .map(|h| h.handler_key())
+                .collect();
+
+            let mut marked_complete = false;
+            let mut stale_removed = 0;
+            let mut remaining_failures = Vec::new();
+
+            if let Err(e) = storage.update_status_atomic(range_start, |status| {
+                // Filter out stale handler keys (handlers no longer in registry)
+                let original_len = status.failed_handlers.len();
+                status
+                    .failed_handlers
+                    .retain(|k| registered_handlers.contains(k));
+                stale_removed = original_len - status.failed_handlers.len();
+
+                // Check if all remaining failures are resolved
+                if status.failed_handlers.is_empty() {
                     status.transformed = true;
-                    if let Err(e) = storage.write_status(range_start, &status) {
-                        tracing::warn!(
-                            "Failed to set transformed=true for block {}: {}",
-                            range_start,
-                            e
+                    marked_complete = true;
+                } else {
+                    remaining_failures = status.failed_handlers.iter().cloned().collect();
+                }
+            }) {
+                match e {
+                    StorageError::NotFound(_) => {
+                        tracing::debug!(
+                            "Status file not found for block {}, skipping transformed=true",
+                            range_start
                         );
                     }
+                    _ => {
+                        tracing::warn!("Failed to finalize status for block {}: {}", range_start, e);
+                    }
                 }
-                Err(StorageError::NotFound(_)) => {
-                    tracing::debug!(
-                        "Status file not found for block {}, skipping transformed=true",
-                        range_start
+            } else {
+                if stale_removed > 0 {
+                    tracing::info!(
+                        "Block {}: removed {} stale failed handler keys (handlers no longer registered)",
+                        range_start,
+                        stale_removed
                     );
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to read status for block {}: {}", range_start, e);
+                if !remaining_failures.is_empty() {
+                    tracing::info!(
+                        "Block {} has {} failed handlers, not marking transformed=true: {:?}",
+                        range_start,
+                        remaining_failures.len(),
+                        remaining_failures
+                    );
                 }
             }
         }
@@ -2632,7 +2939,8 @@ impl TransformationEngine {
         let range_end = block_number + 1;
         let tx_addresses = Arc::new(self.read_live_receipt_addresses(block_number)?);
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<HandlerExecutionOutcome, TransformationError>> =
+            JoinSet::new();
         let mut blocked_handlers = HashSet::new();
 
         for handler_info in self.registry.unique_event_handlers() {
@@ -2717,7 +3025,7 @@ impl TransformationEngine {
                         if !ops.is_empty() {
                             let ops =
                                 Self::inject_source_version(ops, handler_name, handler_version);
-                            execute_with_snapshot_capture(
+                            if let Err(e) = execute_with_snapshot_capture(
                                 ops,
                                 &db_pool,
                                 Some(&live_storage),
@@ -2725,11 +3033,34 @@ impl TransformationEngine {
                                 handler_name,
                                 handler_version,
                             )
-                            .await?;
+                            .await
+                            {
+                                return Ok(HandlerExecutionOutcome::DbTransactionFailed {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                    error: e.to_string(),
+                                });
+                            }
+                            Ok(HandlerExecutionOutcome::Succeeded {
+                                handler_key,
+                                range_start,
+                                range_end,
+                            })
+                        } else {
+                            Ok(HandlerExecutionOutcome::SucceededEmpty {
+                                handler_key,
+                                range_start,
+                                range_end,
+                            })
                         }
-                        Ok(Some(handler_key))
                     }
-                    Err(e) => Err(e),
+                    Err(e) => Ok(HandlerExecutionOutcome::Failed {
+                        handler_key,
+                        range_start,
+                        range_end,
+                        error: e.to_string(),
+                    }),
                 }
             });
         }
@@ -2789,7 +3120,7 @@ impl TransformationEngine {
                         if !ops.is_empty() {
                             let ops =
                                 Self::inject_source_version(ops, handler_name, handler_version);
-                            execute_with_snapshot_capture(
+                            if let Err(e) = execute_with_snapshot_capture(
                                 ops,
                                 &db_pool,
                                 Some(&live_storage),
@@ -2797,53 +3128,51 @@ impl TransformationEngine {
                                 handler_name,
                                 handler_version,
                             )
-                            .await?;
+                            .await
+                            {
+                                return Ok(HandlerExecutionOutcome::DbTransactionFailed {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                    error: e.to_string(),
+                                });
+                            }
+                            Ok(HandlerExecutionOutcome::Succeeded {
+                                handler_key,
+                                range_start,
+                                range_end,
+                            })
+                        } else {
+                            Ok(HandlerExecutionOutcome::SucceededEmpty {
+                                handler_key,
+                                range_start,
+                                range_end,
+                            })
                         }
-                        Ok(Some(handler_key))
                     }
-                    Err(e) => Err(e),
+                    Err(e) => Ok(HandlerExecutionOutcome::Failed {
+                        handler_key,
+                        range_start,
+                        range_end,
+                        error: e.to_string(),
+                    }),
                 }
             });
         }
 
+        // Collect outcomes
+        let mut outcomes = Vec::new();
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(Some(handler_key))) => {
-                    if let Err(e) = self
-                        .record_completed_range_for_handler(&handler_key, range_start, range_end)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to record completed range for handler {} on block {}: {}",
-                            handler_key,
-                            block_number,
-                            e
-                        );
-                    }
-
-                    if let Some(ref tracker) = self.progress_tracker {
-                        let mut tracker = tracker.lock().await;
-                        if let Err(e) = tracker.mark_complete(block_number, &handler_key).await {
-                            tracing::warn!(
-                                "Failed to mark retry progress for block {} handler {}: {}",
-                                block_number,
-                                handler_key,
-                                e
-                            );
-                        }
-                    }
-                }
-                Ok(Ok(None)) => {}
+                Ok(Ok(outcome)) => outcomes.push(outcome),
                 Ok(Err(e)) => {
-                    // Match normal pipeline: log and skip, don't tear down the engine
                     tracing::error!(
-                        "Handler failed during live retry for block {}: {}",
+                        "Handler task returned error during live retry for block {}: {}",
                         block_number,
                         e
                     );
                 }
                 Err(e) => {
-                    // Match normal pipeline: log and skip, don't tear down the engine
                     tracing::error!(
                         "Handler task panicked during live retry for block {}: {}",
                         block_number,
@@ -2851,6 +3180,75 @@ impl TransformationEngine {
                     );
                 }
             }
+        }
+
+        let (successful, failed, _blocked) = aggregate_outcomes(&outcomes);
+
+        // Record progress for successful handlers
+        for outcome in &outcomes {
+            if outcome.is_success() {
+                let handler_key = outcome.handler_key();
+                if let Err(e) = self
+                    .record_completed_range_for_handler(handler_key, range_start, range_end)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to record completed range for handler {} on block {}: {}",
+                        handler_key,
+                        block_number,
+                        e
+                    );
+                }
+
+                if let Some(ref tracker) = self.progress_tracker {
+                    let mut tracker = tracker.lock().await;
+                    if let Err(e) = tracker.mark_complete(block_number, handler_key).await {
+                        tracing::warn!(
+                            "Failed to mark retry progress for block {} handler {}: {}",
+                            block_number,
+                            handler_key,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Update status file atomically: move successful handlers from failed to completed,
+        // keep failed handlers in failed set
+        let storage = LiveStorage::new(&self.chain_name);
+        let mut marked_complete = false;
+        if let Err(e) = storage.update_status_atomic(block_number, |status| {
+            // Move successful handlers from failed_handlers to completed_handlers
+            for handler_key in &successful {
+                status.failed_handlers.remove(handler_key);
+                status.completed_handlers.insert(handler_key.clone());
+            }
+
+            // Keep failed handlers in failed_handlers (they'll be retried again)
+            for handler_key in &failed {
+                status.failed_handlers.insert(handler_key.clone());
+                status.completed_handlers.remove(handler_key);
+            }
+
+            // Check if all handlers are now complete
+            if status.failed_handlers.is_empty() {
+                status.transformed = true;
+                marked_complete = true;
+            }
+        }) {
+            if !matches!(e, StorageError::NotFound(_)) {
+                tracing::warn!(
+                    "Failed to update status for block {} after retry: {}",
+                    block_number,
+                    e
+                );
+            }
+        } else if marked_complete {
+            tracing::info!(
+                "Block {} transformation complete after retry (all handlers succeeded)",
+                block_number
+            );
         }
 
         Ok(blocked_handlers)
@@ -3086,7 +3484,7 @@ impl TransformationEngine {
         ));
 
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+        let mut join_set: JoinSet<Result<HandlerExecutionOutcome, TransformationError>> =
             JoinSet::new();
 
         // Spawn event handlers concurrently
@@ -3151,10 +3549,25 @@ impl TransformationEngine {
                                         range_end,
                                         e
                                     );
-                                    return Ok(None);
+                                    return Ok(HandlerExecutionOutcome::DbTransactionFailed {
+                                        handler_key,
+                                        range_start,
+                                        range_end,
+                                        error: e.to_string(),
+                                    });
                                 }
+                                Ok(HandlerExecutionOutcome::Succeeded {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                })
+                            } else {
+                                Ok(HandlerExecutionOutcome::SucceededEmpty {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                })
                             }
-                            Ok(Some((handler_key, range_start, range_end)))
                         }
                         Err(e) => {
                             tracing::error!(
@@ -3164,7 +3577,12 @@ impl TransformationEngine {
                                 event_name,
                                 e
                             );
-                            Ok(None)
+                            Ok(HandlerExecutionOutcome::Failed {
+                                handler_key,
+                                range_start,
+                                range_end,
+                                error: e.to_string(),
+                            })
                         }
                     }
                 });
@@ -3229,10 +3647,25 @@ impl TransformationEngine {
                                         range_end,
                                         e
                                     );
-                                    return Ok(None);
+                                    return Ok(HandlerExecutionOutcome::DbTransactionFailed {
+                                        handler_key,
+                                        range_start,
+                                        range_end,
+                                        error: e.to_string(),
+                                    });
                                 }
+                                Ok(HandlerExecutionOutcome::Succeeded {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                })
+                            } else {
+                                Ok(HandlerExecutionOutcome::SucceededEmpty {
+                                    handler_key,
+                                    range_start,
+                                    range_end,
+                                })
                             }
-                            Ok(Some((handler_key, range_start, range_end)))
                         }
                         Err(e) => {
                             tracing::error!(
@@ -3242,43 +3675,73 @@ impl TransformationEngine {
                                 function_name,
                                 e
                             );
-                            Ok(None)
+                            Ok(HandlerExecutionOutcome::Failed {
+                                handler_key,
+                                range_start,
+                                range_end,
+                                error: e.to_string(),
+                            })
                         }
                     }
                 });
             }
         }
 
-        // Collect results and record progress
+        // Collect outcomes and record progress only for successful handlers
+        let mut outcomes = Vec::new();
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(Some((handler_key, rs, re)))) => {
-                    self.record_completed_range_for_handler(&handler_key, rs, re)
-                        .await?;
-
-                    // Mark live progress for single-block ranges (live mode)
-                    if re - rs == 1 {
-                        if let Some(ref tracker) = self.progress_tracker {
-                            let mut t = tracker.lock().await;
-                            if let Err(e) = t.mark_complete(rs, &handler_key).await {
-                                tracing::warn!(
-                                    "Failed to mark live progress for block {} handler {}: {}",
-                                    rs,
-                                    handler_key,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-                Ok(Ok(None)) => {
-                    // Handler failed or had no ops — already logged
-                }
+                Ok(Ok(outcome)) => outcomes.push(outcome),
                 Ok(Err(e)) => {
                     tracing::error!("Handler task returned error: {}", e);
                 }
                 Err(e) => {
                     tracing::error!("Handler task panicked: {}", e);
+                }
+            }
+        }
+
+        let (_successful, failed, _blocked) = aggregate_outcomes(&outcomes);
+
+        // Record progress only for successful handlers
+        for outcome in &outcomes {
+            if outcome.is_success() {
+                let handler_key = outcome.handler_key();
+                let (rs, re) = outcome.range();
+                self.record_completed_range_for_handler(handler_key, rs, re)
+                    .await?;
+
+                if is_live_mode {
+                    if let Some(ref tracker) = self.progress_tracker {
+                        let mut t = tracker.lock().await;
+                        if let Err(e) = t.mark_complete(rs, handler_key).await {
+                            tracing::warn!(
+                                "Failed to mark live progress for block {} handler {}: {}",
+                                rs,
+                                handler_key,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Persist failed handlers to status file for retry (atomic update, live mode only)
+        if !failed.is_empty() && is_live_mode {
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Err(e) = storage.update_status_atomic(range_start, |status| {
+                status.failed_handlers.extend(failed.iter().cloned());
+                for h in &failed {
+                    status.completed_handlers.remove(h);
+                }
+            }) {
+                if !matches!(e, StorageError::NotFound(_)) {
+                    tracing::warn!(
+                        "Failed to persist failed handlers for block {}: {}",
+                        range_start,
+                        e
+                    );
                 }
             }
         }
@@ -3420,6 +3883,193 @@ mod tests {
                 base_name: "foo".to_string()
             }
         );
+    }
+
+    // ─── Handler Execution Outcome Tests ─────────────────────────────────
+
+    use super::{aggregate_outcomes, HandlerExecutionOutcome};
+
+    #[test]
+    fn outcome_is_success_returns_true_for_succeeded() {
+        let outcome = HandlerExecutionOutcome::Succeeded {
+            handler_key: "test_v1".to_string(),
+            range_start: 100,
+            range_end: 101,
+        };
+        assert!(outcome.is_success());
+        assert!(!outcome.is_failure());
+        assert!(!outcome.is_blocked());
+    }
+
+    #[test]
+    fn outcome_is_success_returns_true_for_succeeded_empty() {
+        let outcome = HandlerExecutionOutcome::SucceededEmpty {
+            handler_key: "test_v1".to_string(),
+            range_start: 100,
+            range_end: 101,
+        };
+        assert!(outcome.is_success());
+        assert!(!outcome.is_failure());
+    }
+
+    #[test]
+    fn outcome_is_failure_returns_true_for_failed() {
+        let outcome = HandlerExecutionOutcome::Failed {
+            handler_key: "test_v1".to_string(),
+            range_start: 100,
+            range_end: 101,
+            error: "handler error".to_string(),
+        };
+        assert!(outcome.is_failure());
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn outcome_is_failure_returns_true_for_db_transaction_failed() {
+        let outcome = HandlerExecutionOutcome::DbTransactionFailed {
+            handler_key: "test_v1".to_string(),
+            range_start: 100,
+            range_end: 101,
+            error: "db error".to_string(),
+        };
+        assert!(outcome.is_failure());
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn outcome_is_blocked_returns_true_for_blocked() {
+        let outcome = HandlerExecutionOutcome::Blocked {
+            handler_key: "test_v1".to_string(),
+            range_start: 100,
+            range_end: 101,
+            missing_dependencies: vec![("Pool".to_string(), "slot0".to_string())],
+        };
+        assert!(outcome.is_blocked());
+        assert!(!outcome.is_success());
+        assert!(!outcome.is_failure());
+    }
+
+    #[test]
+    fn outcome_handler_key_returns_correct_key() {
+        let outcome = HandlerExecutionOutcome::Succeeded {
+            handler_key: "my_handler_v2".to_string(),
+            range_start: 100,
+            range_end: 101,
+        };
+        assert_eq!(outcome.handler_key(), "my_handler_v2");
+    }
+
+    #[test]
+    fn outcome_range_returns_correct_range() {
+        let outcome = HandlerExecutionOutcome::Failed {
+            handler_key: "test_v1".to_string(),
+            range_start: 500,
+            range_end: 600,
+            error: "error".to_string(),
+        };
+        assert_eq!(outcome.range(), (500, 600));
+    }
+
+    #[test]
+    fn aggregate_outcomes_separates_success_failure_blocked() {
+        let outcomes = vec![
+            HandlerExecutionOutcome::Succeeded {
+                handler_key: "handler_a_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+            },
+            HandlerExecutionOutcome::SucceededEmpty {
+                handler_key: "handler_b_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+            },
+            HandlerExecutionOutcome::Failed {
+                handler_key: "handler_c_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+                error: "error".to_string(),
+            },
+            HandlerExecutionOutcome::DbTransactionFailed {
+                handler_key: "handler_d_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+                error: "db error".to_string(),
+            },
+            HandlerExecutionOutcome::Blocked {
+                handler_key: "handler_e_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+                missing_dependencies: vec![],
+            },
+        ];
+
+        let (successful, failed, blocked) = aggregate_outcomes(&outcomes);
+
+        assert_eq!(
+            successful,
+            HashSet::from(["handler_a_v1".to_string(), "handler_b_v1".to_string()])
+        );
+        assert_eq!(
+            failed,
+            HashSet::from(["handler_c_v1".to_string(), "handler_d_v1".to_string()])
+        );
+        assert_eq!(blocked, HashSet::from(["handler_e_v1".to_string()]));
+    }
+
+    #[test]
+    fn aggregate_outcomes_handles_empty_list() {
+        let outcomes: Vec<HandlerExecutionOutcome> = vec![];
+        let (successful, failed, blocked) = aggregate_outcomes(&outcomes);
+
+        assert!(successful.is_empty());
+        assert!(failed.is_empty());
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn aggregate_outcomes_all_successful() {
+        let outcomes = vec![
+            HandlerExecutionOutcome::Succeeded {
+                handler_key: "a_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+            },
+            HandlerExecutionOutcome::Succeeded {
+                handler_key: "b_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+            },
+        ];
+
+        let (successful, failed, blocked) = aggregate_outcomes(&outcomes);
+
+        assert_eq!(successful.len(), 2);
+        assert!(failed.is_empty());
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn aggregate_outcomes_all_failed() {
+        let outcomes = vec![
+            HandlerExecutionOutcome::Failed {
+                handler_key: "a_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+                error: "error".to_string(),
+            },
+            HandlerExecutionOutcome::DbTransactionFailed {
+                handler_key: "b_v1".to_string(),
+                range_start: 100,
+                range_end: 101,
+                error: "db error".to_string(),
+            },
+        ];
+
+        let (successful, failed, blocked) = aggregate_outcomes(&outcomes);
+
+        assert!(successful.is_empty());
+        assert_eq!(failed.len(), 2);
+        assert!(blocked.is_empty());
     }
 }
 
