@@ -684,7 +684,10 @@ async fn process_chain(
         .or(config.raw_data_collection.rpc_batch_size)
         .unwrap_or(rpc_defaults::MAX_BATCH_SIZE);
 
-    let raw_config = Arc::new(config.raw_data_collection.clone());
+    // Apply the computed batch size to raw_config so collectors use it
+    let mut raw_config = config.raw_data_collection.clone();
+    raw_config.rpc_batch_size = Some(rpc_batch_size);
+    let raw_config = Arc::new(raw_config);
 
     tracing::info!(
         "RPC config: concurrency={}, cu_per_second={}, batch_size={}",
@@ -1174,6 +1177,13 @@ async fn spawn_live_mode(
     let ws_url = env::var(ws_env_var)
         .with_context(|| format!("env var {} not set for chain {}", ws_env_var, chain.name))?;
 
+    // Use batch size from chain.rpc, falling back to raw_data_collection config, then defaults
+    let rpc_batch_size = chain
+        .rpc
+        .batch_size
+        .or(config.raw_data_collection.rpc_batch_size)
+        .unwrap_or(rpc_defaults::MAX_BATCH_SIZE);
+
     // Build live mode config
     let live_config = LiveModeConfig {
         reorg_depth: config
@@ -1260,10 +1270,7 @@ async fn spawn_live_mode(
             &chain,
             http_client.clone(),
             multicall3_address,
-            config
-                .raw_data_collection
-                .rpc_batch_size
-                .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize,
+            rpc_batch_size as usize,
         );
         if collector.has_calls() {
             Some(collector)
