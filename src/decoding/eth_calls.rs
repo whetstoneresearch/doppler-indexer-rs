@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
-use alloy::primitives::{I256, U256};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
     Int16Array, Int32Array, Int64Array, Int8Array, StringArray, StructArray, UInt16Array,
@@ -27,9 +26,9 @@ use super::current;
 use super::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::live::TransformRetryRequest;
 use crate::transformations::{
-    DecodedCall as TransformDecodedCall, DecodedCallsMessage,
-    DecodedValue as TransformDecodedValue, RangeCompleteMessage,
+    DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteMessage,
 };
+use crate::types::decoded::DecodedValue;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::Contracts;
 use crate::types::config::eth_call::EvmType;
@@ -101,28 +100,6 @@ pub(crate) struct DecodedOnceRecord {
     pub contract_address: [u8; 20],
     /// function_name -> decoded value
     pub decoded_values: HashMap<String, DecodedValue>,
-}
-
-/// A decoded value
-#[derive(Debug, Clone)]
-pub(crate) enum DecodedValue {
-    Address([u8; 20]),
-    Uint256(U256),
-    Int256(I256),
-    Uint64(u64),
-    Int64(i64),
-    Uint8(u8),
-    Int8(i8),
-    Bool(bool),
-    Bytes32([u8; 32]),
-    Bytes(Vec<u8>),
-    String(String),
-    /// Named tuple of (field_name, field_value) pairs
-    NamedTuple(Vec<(std::string::String, DecodedValue)>),
-    /// Unnamed tuple of values (no field names)
-    UnnamedTuple(Vec<DecodedValue>),
-    /// Array of values
-    Array(Vec<DecodedValue>),
 }
 
 /// Result of processing once calls, used to batch update column indexes after all tasks complete.
@@ -4448,67 +4425,26 @@ fn extract_once_tuple_bytes<'a>(
     }
 }
 
-/// Convert internal DecodedValue to transformation DecodedValue
-pub(crate) fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
-    match value {
-        DecodedValue::Address(a) => TransformDecodedValue::Address(*a),
-        DecodedValue::Uint256(v) => TransformDecodedValue::Uint256(*v),
-        DecodedValue::Int256(v) => TransformDecodedValue::Int256(*v),
-        DecodedValue::Uint64(v) => TransformDecodedValue::Uint64(*v),
-        DecodedValue::Int64(v) => TransformDecodedValue::Int64(*v),
-        DecodedValue::Uint8(v) => TransformDecodedValue::Uint8(*v),
-        DecodedValue::Int8(v) => TransformDecodedValue::Int8(*v),
-        DecodedValue::Bool(v) => TransformDecodedValue::Bool(*v),
-        DecodedValue::Bytes32(b) => TransformDecodedValue::Bytes32(*b),
-        DecodedValue::Bytes(b) => TransformDecodedValue::Bytes(b.clone()),
-        DecodedValue::String(s) => TransformDecodedValue::String(s.clone()),
-        DecodedValue::NamedTuple(fields) => {
-            let converted: Vec<(String, TransformDecodedValue)> = fields
-                .iter()
-                .map(|(name, val)| (name.clone(), convert_decoded_value(val)))
-                .collect();
-            TransformDecodedValue::NamedTuple(converted)
-        }
-        DecodedValue::UnnamedTuple(values) => {
-            let converted: Vec<TransformDecodedValue> = values
-                .iter()
-                .map(|val| convert_decoded_value(val))
-                .collect();
-            TransformDecodedValue::UnnamedTuple(converted)
-        }
-        DecodedValue::Array(values) => {
-            let converted: Vec<TransformDecodedValue> = values
-                .iter()
-                .map(|val| convert_decoded_value(val))
-                .collect();
-            TransformDecodedValue::Array(converted)
-        }
-    }
-}
-
 /// Build result HashMap based on output type
 pub(crate) fn build_result_map(
     value: &DecodedValue,
     output_type: &EvmType,
     function_name: &str,
-) -> HashMap<String, TransformDecodedValue> {
+) -> HashMap<String, DecodedValue> {
     let mut result = HashMap::new();
     match output_type {
         EvmType::Named { name, .. } => {
-            // Named single value
-            result.insert(name.clone(), convert_decoded_value(value));
+            result.insert(name.clone(), value.clone());
         }
         EvmType::NamedTuple(fields) => {
-            // Named tuple: extract each field
             if let DecodedValue::NamedTuple(named_values) = value {
                 for ((field_name, _), (_, val)) in fields.iter().zip(named_values.iter()) {
-                    result.insert(field_name.clone(), convert_decoded_value(val));
+                    result.insert(field_name.clone(), val.clone());
                 }
             }
         }
         _ => {
-            // Simple type: use function name or "result"
-            result.insert(function_name.to_string(), convert_decoded_value(value));
+            result.insert(function_name.to_string(), value.clone());
         }
     }
     result

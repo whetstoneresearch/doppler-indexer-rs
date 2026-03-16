@@ -18,13 +18,14 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
 use super::types::DecoderMessage;
-use crate::live::{LiveDecodedLog, LiveDecodedValue, LiveStorage};
+use crate::live::{LiveDecodedLog, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::{
-    DecodedEvent as TransformDecodedEvent, DecodedEventsMessage,
-    DecodedValue as TransformDecodedValue, RangeCompleteKind, RangeCompleteMessage,
+    DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
+    RangeCompleteMessage,
 };
+use crate::types::decoded::DecodedValue;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
@@ -80,24 +81,6 @@ struct DecodedLogRecord {
     contract_address: [u8; 20],
     /// Decoded parameters flattened to match flattened_fields order
     decoded_values: Vec<DecodedValue>,
-}
-
-/// A decoded value with its type information
-#[derive(Debug, Clone)]
-enum DecodedValue {
-    Address([u8; 20]),
-    Uint256(U256),
-    Int256(I256),
-    Uint64(u64),
-    Int64(i64),
-    Uint8(u8),
-    Int8(i8),
-    Bool(bool),
-    Bytes32([u8; 32]),
-    Bytes(Vec<u8>),
-    String(String),
-    /// Named tuple of (field_name, field_value) pairs - for intermediate decoding
-    NamedTuple(Vec<(std::string::String, DecodedValue)>),
 }
 
 pub async fn decode_logs(
@@ -1029,30 +1012,6 @@ fn build_flattened_field_array(
     }
 }
 
-/// Convert internal DecodedValue to transformation DecodedValue
-fn convert_decoded_value(value: &DecodedValue) -> TransformDecodedValue {
-    match value {
-        DecodedValue::Address(a) => TransformDecodedValue::Address(*a),
-        DecodedValue::Uint256(v) => TransformDecodedValue::Uint256(*v),
-        DecodedValue::Int256(v) => TransformDecodedValue::Int256(*v),
-        DecodedValue::Uint64(v) => TransformDecodedValue::Uint64(*v),
-        DecodedValue::Int64(v) => TransformDecodedValue::Int64(*v),
-        DecodedValue::Uint8(v) => TransformDecodedValue::Uint8(*v),
-        DecodedValue::Int8(v) => TransformDecodedValue::Int8(*v),
-        DecodedValue::Bool(v) => TransformDecodedValue::Bool(*v),
-        DecodedValue::Bytes32(b) => TransformDecodedValue::Bytes32(*b),
-        DecodedValue::Bytes(b) => TransformDecodedValue::Bytes(b.clone()),
-        DecodedValue::String(s) => TransformDecodedValue::String(s.clone()),
-        DecodedValue::NamedTuple(fields) => {
-            let converted: Vec<(String, TransformDecodedValue)> = fields
-                .iter()
-                .map(|(name, val)| (name.clone(), convert_decoded_value(val)))
-                .collect();
-            TransformDecodedValue::NamedTuple(converted)
-        }
-    }
-}
-
 /// Convert a DecodedLogRecord to a TransformDecodedEvent
 fn convert_to_transform_event(
     record: &DecodedLogRecord,
@@ -1064,7 +1023,7 @@ fn convert_to_transform_event(
     let mut params = HashMap::new();
     for (idx, flattened) in parsed_event.flattened_fields.iter().enumerate() {
         if let Some(value) = record.decoded_values.get(idx) {
-            params.insert(flattened.full_name.clone(), convert_decoded_value(value));
+            params.insert(flattened.full_name.clone(), value.clone());
         }
     }
 
@@ -1085,30 +1044,6 @@ fn convert_to_transform_event(
 // Live mode support
 // =========================================================================
 
-/// Convert DecodedValue to LiveDecodedValue for bincode storage.
-fn convert_to_live_decoded_value(value: &DecodedValue) -> LiveDecodedValue {
-    match value {
-        DecodedValue::Address(a) => LiveDecodedValue::Address(*a),
-        DecodedValue::Uint256(v) => LiveDecodedValue::Uint256(v.to_string()),
-        DecodedValue::Int256(v) => LiveDecodedValue::Int256(v.to_string()),
-        DecodedValue::Uint64(v) => LiveDecodedValue::Uint64(*v),
-        DecodedValue::Int64(v) => LiveDecodedValue::Int64(*v),
-        DecodedValue::Uint8(v) => LiveDecodedValue::Uint8(*v),
-        DecodedValue::Int8(v) => LiveDecodedValue::Int8(*v),
-        DecodedValue::Bool(v) => LiveDecodedValue::Bool(*v),
-        DecodedValue::Bytes32(b) => LiveDecodedValue::Bytes32(*b),
-        DecodedValue::Bytes(b) => LiveDecodedValue::Bytes(b.clone()),
-        DecodedValue::String(s) => LiveDecodedValue::String(s.clone()),
-        DecodedValue::NamedTuple(fields) => {
-            let converted: Vec<(String, LiveDecodedValue)> = fields
-                .iter()
-                .map(|(name, val)| (name.clone(), convert_to_live_decoded_value(val)))
-                .collect();
-            LiveDecodedValue::NamedTuple(converted)
-        }
-    }
-}
-
 /// Convert DecodedLogRecord to LiveDecodedLog for bincode storage.
 fn convert_to_live_decoded_log(record: &DecodedLogRecord) -> LiveDecodedLog {
     LiveDecodedLog {
@@ -1117,11 +1052,7 @@ fn convert_to_live_decoded_log(record: &DecodedLogRecord) -> LiveDecodedLog {
         transaction_hash: record.transaction_hash,
         log_index: record.log_index,
         contract_address: record.contract_address,
-        decoded_values: record
-            .decoded_values
-            .iter()
-            .map(convert_to_live_decoded_value)
-            .collect(),
+        decoded_values: record.decoded_values.clone(),
     }
 }
 
