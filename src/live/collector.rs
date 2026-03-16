@@ -904,6 +904,7 @@ impl LiveCollector {
         status.eth_calls_decoded = false;
         status.transformed = false;
         status.completed_handlers.clear();
+        status.failed_handlers.clear();
         status.apply_expectations(&self.expectations);
         self.storage.write_status(block_number, &status)?;
 
@@ -930,6 +931,7 @@ impl LiveCollector {
         status.eth_calls_decoded = false;
         status.transformed = false;
         status.completed_handlers.clear();
+        status.failed_handlers.clear();
         status.apply_expectations(&self.expectations);
         self.storage.write_status(block_number, &status)?;
 

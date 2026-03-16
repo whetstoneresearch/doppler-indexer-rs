@@ -3217,6 +3217,7 @@ impl TransformationEngine {
         // Update status file atomically: move successful handlers from failed to completed,
         // keep failed handlers in failed set
         let storage = LiveStorage::new(&self.chain_name);
+        let no_blocked = blocked_handlers.is_empty();
         let mut marked_complete = false;
         if let Err(e) = storage.update_status_atomic(block_number, |status| {
             // Move successful handlers from failed_handlers to completed_handlers
@@ -3231,8 +3232,9 @@ impl TransformationEngine {
                 status.completed_handlers.remove(handler_key);
             }
 
-            // Check if all handlers are now complete
-            if status.failed_handlers.is_empty() {
+            // Check if all handlers are now complete (no failed AND no blocked)
+            // blocked_handlers is captured before the closure since it doesn't change
+            if status.failed_handlers.is_empty() && no_blocked {
                 status.transformed = true;
                 marked_complete = true;
             }

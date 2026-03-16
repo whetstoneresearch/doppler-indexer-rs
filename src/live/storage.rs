@@ -349,7 +349,7 @@ impl LiveStorage {
     ///
     /// This provides atomic read-modify-write semantics by using file locking
     /// to prevent concurrent updates from overwriting each other's changes.
-    /// The closure receives the current status and returns the modified status.
+    /// The closure receives the current status and can modify it in place.
     ///
     /// If the status file doesn't exist, returns NotFound error.
     pub fn update_status_atomic<F>(
@@ -382,12 +382,31 @@ impl LiveStorage {
         // Apply the update
         update_fn(&mut status);
 
-        // Write updated status atomically (tmp + rename)
-        // Release lock before rename to avoid deadlock
-        drop(file);
+        // Write to temp file while STILL holding lock on original file
+        let random_suffix: u32 = rand::random();
+        let temp_name = format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            random_suffix
+        );
+        let temp_path = path.with_file_name(temp_name);
 
-        self.write_status(block_number, &status)?;
+        {
+            let temp_file = fs::File::create(&temp_path)?;
+            let mut writer = BufWriter::new(temp_file);
+            serde_json::to_writer_pretty(&mut writer, &status)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .sync_all()?;
+        }
 
+        // Rename while STILL holding lock - this is safe because the lock is
+        // on the original file handle, not the path
+        fs::rename(&temp_path, &path)?;
+
+        // Lock is released when `file` is dropped here
         Ok(())
     }
 
