@@ -605,7 +605,7 @@ mod tests {
     }
 
     fn cleanup_chain_storage(chain_name: &str) {
-        let _ = std::fs::remove_dir_all(format!("data/{}/live", chain_name));
+        let _ = std::fs::remove_dir_all(format!("data/{}", chain_name));
     }
 
     fn encode_uint256(value: u64) -> Vec<u8> {
