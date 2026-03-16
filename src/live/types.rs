@@ -239,27 +239,7 @@ pub struct LiveProgress {
 // Decoded data types for live mode storage
 // =========================================================================
 
-/// A decoded event value stored as bincode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LiveDecodedValue {
-    Address([u8; 20]),
-    Uint256(String), // Stored as string to avoid serialization issues with U256
-    Int256(String),  // Stored as string to avoid serialization issues with I256
-    Uint64(u64),
-    Int64(i64),
-    Uint8(u8),
-    Int8(i8),
-    Bool(bool),
-    Bytes32([u8; 32]),
-    Bytes(Vec<u8>),
-    String(String),
-    /// Named tuple of (field_name, field_value) pairs
-    NamedTuple(Vec<(String, LiveDecodedValue)>),
-    /// Unnamed tuple of values
-    UnnamedTuple(Vec<LiveDecodedValue>),
-    /// Array of values
-    Array(Vec<LiveDecodedValue>),
-}
+use crate::types::decoded::DecodedValue;
 
 /// A decoded log record stored as bincode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,7 +250,7 @@ pub struct LiveDecodedLog {
     pub log_index: u32,
     pub contract_address: [u8; 20],
     /// Decoded parameter values in flattened order
-    pub decoded_values: Vec<LiveDecodedValue>,
+    pub decoded_values: Vec<DecodedValue>,
 }
 
 /// A decoded eth_call result stored as bincode.
@@ -279,7 +259,7 @@ pub struct LiveDecodedCall {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub contract_address: [u8; 20],
-    pub decoded_value: LiveDecodedValue,
+    pub decoded_value: DecodedValue,
 }
 
 /// A decoded event-triggered eth_call result stored as bincode.
@@ -289,7 +269,7 @@ pub struct LiveDecodedEventCall {
     pub block_timestamp: u64,
     pub log_index: u32,
     pub target_address: [u8; 20],
-    pub decoded_value: LiveDecodedValue,
+    pub decoded_value: DecodedValue,
 }
 
 /// A decoded "once" call result stored as bincode.
@@ -299,7 +279,7 @@ pub struct LiveDecodedOnceCall {
     pub block_timestamp: u64,
     pub contract_address: [u8; 20],
     /// function_name -> decoded value
-    pub decoded_values: Vec<(String, LiveDecodedValue)>,
+    pub decoded_values: Vec<(String, DecodedValue)>,
 }
 
 /// Metadata for a decoded data file.

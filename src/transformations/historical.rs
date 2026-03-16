@@ -647,7 +647,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::{batch_to_events, HistoricalDataReader};
-    use crate::transformations::DecodedValue;
+    use crate::types::decoded::DecodedValue;
 
     #[test]
     fn find_files_for_range_includes_inclusive_range_end() {

@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy::primitives::{I256, U256};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::{Mutex, Semaphore};
@@ -22,13 +21,12 @@ use super::registry::{extract_event_name, TransformationRegistry};
 use super::traits::EventHandler;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
 use crate::decoding::eth_calls::{
-    build_decode_configs, build_result_map, CallDecodeConfig, DecodedValue as EthDecodedValue,
-    EventCallDecodeConfig,
+    build_decode_configs, build_result_map, CallDecodeConfig, EventCallDecodeConfig,
 };
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
 use crate::live::{
-    LiveDbValue, LiveDecodedValue, LiveProgressTracker, LiveStorage, LiveUpsertSnapshot,
+    LiveDbValue, LiveProgressTracker, LiveStorage, LiveUpsertSnapshot,
     StorageError, TransformRetryRequest,
 };
 use crate::rpc::UnifiedRpcClient;
@@ -2796,7 +2794,7 @@ impl TransformationEngine {
                     parsed_event,
                     &source_name,
                     &event_name,
-                )?);
+                ));
             }
         }
 
@@ -2856,7 +2854,7 @@ impl TransformationEngine {
                             &source_name,
                             &function_name,
                             &config.output_type,
-                        )?);
+                        ));
                     }
                 }
                 LiveRetryCallArtifactKind::EventTriggered { base_name } => {
@@ -2877,7 +2875,7 @@ impl TransformationEngine {
                             &source_name,
                             &base_name,
                             &config.output_type,
-                        )?);
+                        ));
                     }
                 }
             }
@@ -2905,9 +2903,8 @@ impl TransformationEngine {
                     if let Some(config) =
                         once_map.get(&(source_name.clone(), function_name.clone()))
                     {
-                        let decoded_value = Self::live_value_to_eth_decoded_value(value)?;
                         let partial_result =
-                            build_result_map(&decoded_value, &config.output_type, function_name);
+                            build_result_map(value, &config.output_type, function_name);
                         merged_result.extend(partial_result);
                     }
                 }
@@ -3281,20 +3278,17 @@ impl TransformationEngine {
         parsed_event: &ParsedEvent,
         source_name: &str,
         event_name: &str,
-    ) -> Result<DecodedEvent, TransformationError> {
+    ) -> DecodedEvent {
         let mut params = HashMap::new();
         for (flattened, value) in parsed_event
             .flattened_fields
             .iter()
             .zip(log.decoded_values.iter())
         {
-            params.insert(
-                flattened.full_name.clone(),
-                Self::live_value_to_transform_value(value)?,
-            );
+            params.insert(flattened.full_name.clone(), value.clone());
         }
 
-        Ok(DecodedEvent {
+        DecodedEvent {
             block_number: log.block_number,
             block_timestamp: log.block_timestamp,
             transaction_hash: log.transaction_hash,
@@ -3304,7 +3298,7 @@ impl TransformationEngine {
             event_name: event_name.to_string(),
             event_signature: parsed_event.signature.clone(),
             params,
-        })
+        }
     }
 
     fn live_call_to_decoded_call(
@@ -3312,17 +3306,16 @@ impl TransformationEngine {
         source_name: &str,
         function_name: &str,
         output_type: &EvmType,
-    ) -> Result<DecodedCall, TransformationError> {
-        let decoded_value = Self::live_value_to_eth_decoded_value(&call.decoded_value)?;
-        Ok(DecodedCall {
+    ) -> DecodedCall {
+        DecodedCall {
             block_number: call.block_number,
             block_timestamp: call.block_timestamp,
             contract_address: call.contract_address,
             source_name: source_name.to_string(),
             function_name: function_name.to_string(),
             trigger_log_index: None,
-            result: build_result_map(&decoded_value, output_type, function_name),
-        })
+            result: build_result_map(&call.decoded_value, output_type, function_name),
+        }
     }
 
     fn live_event_call_to_decoded_call(
@@ -3330,115 +3323,16 @@ impl TransformationEngine {
         source_name: &str,
         function_name: &str,
         output_type: &EvmType,
-    ) -> Result<DecodedCall, TransformationError> {
-        let decoded_value = Self::live_value_to_eth_decoded_value(&call.decoded_value)?;
-        Ok(DecodedCall {
+    ) -> DecodedCall {
+        DecodedCall {
             block_number: call.block_number,
             block_timestamp: call.block_timestamp,
             contract_address: call.target_address,
             source_name: source_name.to_string(),
             function_name: function_name.to_string(),
             trigger_log_index: Some(call.log_index),
-            result: build_result_map(&decoded_value, output_type, function_name),
-        })
-    }
-
-    fn live_value_to_transform_value(
-        value: &LiveDecodedValue,
-    ) -> Result<super::context::DecodedValue, TransformationError> {
-        macro_rules! convert_live_value {
-            ($value:expr, $Target:path, $recurse:path) => {
-                Ok(match $value {
-                    LiveDecodedValue::Address(v) => <$Target>::Address(*v),
-                    LiveDecodedValue::Uint256(v) => <$Target>::Uint256(
-                        v.trim()
-                            .parse::<U256>()
-                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
-                    ),
-                    LiveDecodedValue::Int256(v) => <$Target>::Int256(
-                        v.parse::<I256>()
-                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
-                    ),
-                    LiveDecodedValue::Uint64(v) => <$Target>::Uint64(*v),
-                    LiveDecodedValue::Int64(v) => <$Target>::Int64(*v),
-                    LiveDecodedValue::Uint8(v) => <$Target>::Uint8(*v),
-                    LiveDecodedValue::Int8(v) => <$Target>::Int8(*v),
-                    LiveDecodedValue::Bool(v) => <$Target>::Bool(*v),
-                    LiveDecodedValue::Bytes32(v) => <$Target>::Bytes32(*v),
-                    LiveDecodedValue::Bytes(v) => <$Target>::Bytes(v.clone()),
-                    LiveDecodedValue::String(v) => <$Target>::String(v.clone()),
-                    LiveDecodedValue::NamedTuple(fields) => <$Target>::NamedTuple(
-                        fields
-                            .iter()
-                            .map(|(name, val)| Ok((name.clone(), $recurse(val)?)))
-                            .collect::<Result<_, TransformationError>>()?,
-                    ),
-                    LiveDecodedValue::UnnamedTuple(values) => <$Target>::UnnamedTuple(
-                        values
-                            .iter()
-                            .map($recurse)
-                            .collect::<Result<_, TransformationError>>()?,
-                    ),
-                    LiveDecodedValue::Array(values) => <$Target>::Array(
-                        values
-                            .iter()
-                            .map($recurse)
-                            .collect::<Result<_, TransformationError>>()?,
-                    ),
-                })
-            };
+            result: build_result_map(&call.decoded_value, output_type, function_name),
         }
-
-        convert_live_value!(value, super::context::DecodedValue, Self::live_value_to_transform_value)
-    }
-
-    fn live_value_to_eth_decoded_value(
-        value: &LiveDecodedValue,
-    ) -> Result<EthDecodedValue, TransformationError> {
-        macro_rules! convert_live_value {
-            ($value:expr, $Target:path, $recurse:path) => {
-                Ok(match $value {
-                    LiveDecodedValue::Address(v) => <$Target>::Address(*v),
-                    LiveDecodedValue::Uint256(v) => <$Target>::Uint256(
-                        v.trim()
-                            .parse::<U256>()
-                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
-                    ),
-                    LiveDecodedValue::Int256(v) => <$Target>::Int256(
-                        v.parse::<I256>()
-                            .map_err(|e| TransformationError::TypeConversion(e.to_string()))?,
-                    ),
-                    LiveDecodedValue::Uint64(v) => <$Target>::Uint64(*v),
-                    LiveDecodedValue::Int64(v) => <$Target>::Int64(*v),
-                    LiveDecodedValue::Uint8(v) => <$Target>::Uint8(*v),
-                    LiveDecodedValue::Int8(v) => <$Target>::Int8(*v),
-                    LiveDecodedValue::Bool(v) => <$Target>::Bool(*v),
-                    LiveDecodedValue::Bytes32(v) => <$Target>::Bytes32(*v),
-                    LiveDecodedValue::Bytes(v) => <$Target>::Bytes(v.clone()),
-                    LiveDecodedValue::String(v) => <$Target>::String(v.clone()),
-                    LiveDecodedValue::NamedTuple(fields) => <$Target>::NamedTuple(
-                        fields
-                            .iter()
-                            .map(|(name, val)| Ok((name.clone(), $recurse(val)?)))
-                            .collect::<Result<_, TransformationError>>()?,
-                    ),
-                    LiveDecodedValue::UnnamedTuple(values) => <$Target>::UnnamedTuple(
-                        values
-                            .iter()
-                            .map($recurse)
-                            .collect::<Result<_, TransformationError>>()?,
-                    ),
-                    LiveDecodedValue::Array(values) => <$Target>::Array(
-                        values
-                            .iter()
-                            .map($recurse)
-                            .collect::<Result<_, TransformationError>>()?,
-                    ),
-                })
-            };
-        }
-
-        convert_live_value!(value, EthDecodedValue, Self::live_value_to_eth_decoded_value)
     }
 
     /// Process a block range with per-handler transactions.

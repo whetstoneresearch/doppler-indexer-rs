@@ -25,6 +25,6 @@ pub use storage::{LiveStorage, StorageError};
 #[allow(unused_imports)]
 pub use types::{
     LiveBlockStatus, LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog,
-    LiveDecodedOnceCall, LiveDecodedValue, LiveEthCall, LiveMessage, LiveModeConfig,
-    LivePipelineExpectations, LiveUpsertSnapshot,
+    LiveDecodedOnceCall, LiveEthCall, LiveMessage, LiveModeConfig, LivePipelineExpectations,
+    LiveUpsertSnapshot,
 };
