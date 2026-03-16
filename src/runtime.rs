@@ -125,6 +125,7 @@ impl ChainFeatures {
 pub fn build_rpc_client(
     rpc_url: &str,
     rpc_config: &RpcConfig,
+    batch_size: usize,
 ) -> anyhow::Result<(Arc<SlidingWindowRateLimiter>, Arc<UnifiedRpcClient>)> {
     let concurrency = rpc_config.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
     let cu_per_second = rpc_config
@@ -137,6 +138,7 @@ pub fn build_rpc_client(
         rpc_url,
         cu_per_second,
         concurrency,
+        batch_size,
         Some(rate_limiter.clone()),
     )?;
 
@@ -144,7 +146,7 @@ pub fn build_rpc_client(
         "RPC config: concurrency={}, cu_per_second={}, batch_size={}",
         concurrency,
         cu_per_second,
-        rpc_config.batch_size.unwrap_or(rpc_defaults::MAX_BATCH_SIZE)
+        batch_size
     );
 
     Ok((rate_limiter, Arc::new(client)))
@@ -154,6 +156,7 @@ pub fn build_rpc_client(
 pub fn build_rpc_client_with_limiter(
     rpc_url: &str,
     rpc_config: &RpcConfig,
+    batch_size: usize,
     shared_limiter: Arc<SlidingWindowRateLimiter>,
 ) -> anyhow::Result<UnifiedRpcClient> {
     let concurrency = rpc_config.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
@@ -165,6 +168,7 @@ pub fn build_rpc_client_with_limiter(
         rpc_url,
         cu_per_second,
         concurrency,
+        batch_size,
         Some(shared_limiter),
     )
     .map_err(Into::into)
@@ -292,6 +296,7 @@ pub struct ChainRuntime {
     pub rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub http_client: Arc<UnifiedRpcClient>,
     pub rpc_url: String,
+    pub rpc_batch_size: usize,
     pub db_pool: Option<Arc<DbPool>>,
     pub registry: Arc<TransformationRegistry>,
     pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
@@ -313,8 +318,16 @@ impl ChainRuntime {
         let features = ChainFeatures::detect(chain, config);
         features.log_summary(&chain.name);
 
+        // Resolve batch size with full fallback chain:
+        // chain.rpc.batch_size -> raw_data_collection.rpc_batch_size -> default
+        let rpc_batch_size = chain
+            .rpc
+            .batch_size
+            .or(config.raw_data_collection.rpc_batch_size)
+            .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
+
         // Build RPC client with rate limiter from per-chain config
-        let (rate_limiter, http_client) = build_rpc_client(&rpc_url, &chain.rpc)?;
+        let (rate_limiter, http_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
 
         // Build transformation registry
         let registry = build_registry();
@@ -376,6 +389,7 @@ impl ChainRuntime {
             rate_limiter,
             http_client,
             rpc_url,
+            rpc_batch_size,
             db_pool,
             registry: Arc::new(registry),
             progress_tracker,
@@ -386,6 +400,11 @@ impl ChainRuntime {
 
     /// Create an additional RPC client sharing the same rate limiter.
     pub fn build_additional_client(&self) -> anyhow::Result<UnifiedRpcClient> {
-        build_rpc_client_with_limiter(&self.rpc_url, &self.chain.rpc, self.rate_limiter.clone())
+        build_rpc_client_with_limiter(
+            &self.rpc_url,
+            &self.chain.rpc,
+            self.rpc_batch_size,
+            self.rate_limiter.clone(),
+        )
     }
 }

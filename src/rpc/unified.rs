@@ -8,7 +8,7 @@ use alloy::rpc::types::{
 use async_trait::async_trait;
 
 use crate::rpc::alchemy::{AlchemyClient, SlidingWindowRateLimiter};
-use crate::rpc::rpc::{RpcClient, RpcError, RpcProvider};
+use crate::rpc::rpc::{RpcClient, RpcClientConfig, RpcError, RpcProvider};
 
 pub enum UnifiedRpcClient {
     Standard(RpcClient),
@@ -56,11 +56,13 @@ impl UnifiedRpcClient {
     /// * `url` - RPC endpoint URL
     /// * `compute_units_per_second` - CU/s rate limit (e.g., 7500 for Growth tier)
     /// * `rpc_concurrency` - Max concurrent in-flight RPC requests
+    /// * `max_batch_size` - Maximum number of requests per JSON-RPC batch
     /// * `shared_limiter` - Optional shared rate limiter for account-level rate limiting
     pub fn from_url_with_options(
         url: &str,
         compute_units_per_second: u32,
         rpc_concurrency: usize,
+        max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
     ) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
@@ -68,10 +70,14 @@ impl UnifiedRpcClient {
                 url,
                 compute_units_per_second,
                 rpc_concurrency,
+                max_batch_size,
                 shared_limiter,
             )?))
         } else {
-            Ok(Self::Standard(RpcClient::from_url(url)?))
+            let parsed_url =
+                url::Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
+            let config = RpcClientConfig::new(parsed_url).with_batch_size(max_batch_size);
+            Ok(Self::Standard(RpcClient::new(config)?))
         }
     }
 

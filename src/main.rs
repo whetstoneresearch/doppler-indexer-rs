@@ -704,18 +704,21 @@ async fn process_chain(
         &rpc_url,
         cu_per_second,
         rpc_concurrency,
+        rpc_batch_size as usize,
         Some(shared_limiter.clone()),
     )?;
     let receipts_client = UnifiedRpcClient::from_url_with_options(
         &rpc_url,
         cu_per_second,
         rpc_concurrency,
+        rpc_batch_size as usize,
         Some(shared_limiter.clone()),
     )?;
     let eth_calls_client = UnifiedRpcClient::from_url_with_options(
         &rpc_url,
         cu_per_second,
         rpc_concurrency,
+        rpc_batch_size as usize,
         Some(shared_limiter.clone()),
     )?;
 
@@ -760,6 +763,7 @@ async fn process_chain(
         Some(Arc::new(build_rpc_client_with_limiter(
             &rpc_url,
             &chain.rpc,
+            rpc_batch_size as usize,
             shared_limiter.clone(),
         )?))
     } else {
@@ -1015,6 +1019,7 @@ async fn process_chain(
         let rpc_client = Arc::new(build_rpc_client_with_limiter(
             &rpc_url,
             &chain.rpc,
+            rpc_batch_size as usize,
             shared_limiter.clone(),
         )?);
         let tc = config.transformations.as_ref().unwrap();
