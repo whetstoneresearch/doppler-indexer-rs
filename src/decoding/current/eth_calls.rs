@@ -11,51 +11,20 @@ use crate::decoding::catchup::eth_calls::{
 };
 use crate::decoding::eth_calls::{
     build_result_map, decode_value, process_event_calls, process_once_calls, process_regular_calls,
-    CallDecodeConfig, DecodedValue, EthCallDecodingError, EventCallDecodeConfig,
+    CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig,
 };
 use crate::decoding::types::DecoderMessage;
 use crate::live::LiveStorage;
 use crate::live::TransformRetryRequest;
-use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall, LiveDecodedValue};
+use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall};
 use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteKind,
     RangeCompleteMessage,
 };
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::decoded::DecodedValue;
 
 use super::super::catchup;
-
-/// Convert DecodedValue to LiveDecodedValue for bincode serialization.
-fn to_live_value(value: &DecodedValue) -> LiveDecodedValue {
-    match value {
-        DecodedValue::Address(a) => LiveDecodedValue::Address(*a),
-        DecodedValue::Uint256(v) => LiveDecodedValue::Uint256(v.to_string()),
-        DecodedValue::Int256(v) => LiveDecodedValue::Int256(v.to_string()),
-        DecodedValue::Uint64(v) => LiveDecodedValue::Uint64(*v),
-        DecodedValue::Int64(v) => LiveDecodedValue::Int64(*v),
-        DecodedValue::Uint8(v) => LiveDecodedValue::Uint8(*v),
-        DecodedValue::Int8(v) => LiveDecodedValue::Int8(*v),
-        DecodedValue::Bool(v) => LiveDecodedValue::Bool(*v),
-        DecodedValue::Bytes32(v) => LiveDecodedValue::Bytes32(*v),
-        DecodedValue::Bytes(v) => LiveDecodedValue::Bytes(v.clone()),
-        DecodedValue::String(v) => LiveDecodedValue::String(v.clone()),
-        DecodedValue::NamedTuple(fields) => {
-            let converted: Vec<(String, LiveDecodedValue)> = fields
-                .iter()
-                .map(|(name, val)| (name.clone(), to_live_value(val)))
-                .collect();
-            LiveDecodedValue::NamedTuple(converted)
-        }
-        DecodedValue::UnnamedTuple(values) => {
-            let converted: Vec<LiveDecodedValue> = values.iter().map(to_live_value).collect();
-            LiveDecodedValue::UnnamedTuple(converted)
-        }
-        DecodedValue::Array(values) => {
-            let converted: Vec<LiveDecodedValue> = values.iter().map(to_live_value).collect();
-            LiveDecodedValue::Array(converted)
-        }
-    }
-}
 
 /// Live phase: Process new data as it arrives via channel.
 /// Returns when AllComplete message is received or channel closes.
@@ -122,7 +91,7 @@ pub async fn decode_eth_calls_live(
                                         block_number: result.block_number,
                                         block_timestamp: result.block_timestamp,
                                         contract_address: result.contract_address,
-                                        decoded_value: to_live_value(&decoded),
+                                        decoded_value: decoded.clone(),
                                     });
                                 }
                                 Err(e) => {
@@ -209,7 +178,7 @@ pub async fn decode_eth_calls_live(
                         > = std::collections::HashMap::new();
 
                         for result in &results {
-                            let mut decoded_values: Vec<(String, LiveDecodedValue)> = Vec::new();
+                            let mut decoded_values: Vec<(String, DecodedValue)> = Vec::new();
 
                             for config in &configs {
                                 if let Some(raw_value) = result.results.get(&config.function_name) {
@@ -237,7 +206,7 @@ pub async fn decode_eth_calls_live(
                                             // Build live value for bincode storage
                                             decoded_values.push((
                                                 config.function_name.clone(),
-                                                to_live_value(&decoded),
+                                                decoded.clone(),
                                             ));
                                         }
                                         Err(e) => {
@@ -357,7 +326,7 @@ pub async fn decode_eth_calls_live(
                                         block_timestamp: result.block_timestamp,
                                         log_index: result.log_index,
                                         target_address: result.target_address,
-                                        decoded_value: to_live_value(&decoded),
+                                        decoded_value: decoded.clone(),
                                     });
                                 }
                                 Err(e) => {
@@ -593,7 +562,9 @@ mod tests {
     use super::decode_eth_calls_live;
     use crate::decoding::eth_calls::{CallDecodeConfig, EventCallDecodeConfig};
     use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
-    use crate::live::{LiveBlockStatus, LiveDecodedValue, LiveStorage, TransformRetryRequest};
+    use alloy::primitives::U256;
+    use crate::live::{LiveBlockStatus, LiveStorage, TransformRetryRequest};
+    use crate::types::decoded::DecodedValue;
     use crate::transformations::{DecodedCallsMessage, RangeCompleteKind, RangeCompleteMessage};
     use crate::types::config::eth_call::EvmType;
     use crate::types::config::raw_data::{FieldsConfig, RawDataCollectionConfig};
@@ -634,7 +605,7 @@ mod tests {
     }
 
     fn cleanup_chain_storage(chain_name: &str) {
-        let _ = std::fs::remove_dir_all(format!("data/{}/live", chain_name));
+        let _ = std::fs::remove_dir_all(format!("data/{}", chain_name));
     }
 
     fn encode_uint256(value: u64) -> Vec<u8> {
@@ -823,7 +794,7 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(matches!(
             decoded[0].decoded_value,
-            LiveDecodedValue::Uint256(ref value) if value == "5"
+            DecodedValue::Uint256(ref value) if *value == U256::from(5)
         ));
 
         cleanup_chain_storage(&chain_name);
@@ -894,7 +865,7 @@ mod tests {
         assert_eq!(decoded[0].decoded_values[0].0, "once");
         assert!(matches!(
             decoded[0].decoded_values[0].1,
-            LiveDecodedValue::Uint256(ref value) if value == "6"
+            DecodedValue::Uint256(ref value) if *value == U256::from(6)
         ));
 
         cleanup_chain_storage(&chain_name);
@@ -966,7 +937,7 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(matches!(
             decoded[0].decoded_value,
-            LiveDecodedValue::Uint256(ref value) if value == "7"
+            DecodedValue::Uint256(ref value) if *value == U256::from(7)
         ));
 
         cleanup_chain_storage(&chain_name);

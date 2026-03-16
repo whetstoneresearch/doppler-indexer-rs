@@ -1547,7 +1547,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::live::{LiveDecodedCall, LiveDecodedValue, LiveEthCall};
+    use alloy::primitives::U256;
+    use crate::live::{LiveDecodedCall, LiveEthCall};
+    use crate::types::decoded::DecodedValue;
     use crate::rpc::UnifiedRpcClient;
     use crate::types::config::chain::ChainConfig;
 
@@ -1662,7 +1664,7 @@ mod tests {
                     block_number,
                     block_timestamp: 1_000,
                     contract_address: [9u8; 20],
-                    decoded_value: LiveDecodedValue::Uint256("1".to_string()),
+                    decoded_value: DecodedValue::Uint256(U256::from(1)),
                 }],
             )
             .unwrap();
