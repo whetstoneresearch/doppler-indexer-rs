@@ -363,26 +363,30 @@ impl LiveStorage {
         use fs2::FileExt;
 
         let path = self.status_path(block_number);
+        let lock_path = path.with_extension("json.lock");
 
-        // Open file for reading and acquire exclusive lock
-        let file = fs::OpenOptions::new()
-            .read(true)
+        // Use a separate lock file so the status file has no open handles during rename.
+        // This keeps the lock held through the entire read-modify-write-rename cycle
+        // (no lost-update race) while keeping the rename target handle-free (Windows-safe).
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
             .write(true)
-            .open(&path)
-            .map_err(|e| map_io_not_found(e, block_number))?;
+            .truncate(true)
+            .open(&lock_path)
+            .map_err(StorageError::Io)?;
 
-        // Acquire exclusive lock (blocks until lock is available)
-        file.lock_exclusive()
+        lock_file
+            .lock_exclusive()
             .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         // Read current status while holding lock
-        let reader = BufReader::new(&file);
-        let mut status: LiveBlockStatus = serde_json::from_reader(reader)?;
+        let data = fs::read(&path).map_err(|e| map_io_not_found(e, block_number))?;
+        let mut status: LiveBlockStatus = serde_json::from_slice(&data)?;
 
         // Apply the update
         update_fn(&mut status);
 
-        // Write to temp file while STILL holding lock on original file
+        // Write to temp file, then rename — all while holding the lock
         let random_suffix: u32 = rand::random();
         let temp_name = format!(
             "{}.tmp.{}",
@@ -402,11 +406,10 @@ impl LiveStorage {
                 .sync_all()?;
         }
 
-        // Rename while STILL holding lock - this is safe because the lock is
-        // on the original file handle, not the path
         fs::rename(&temp_path, &path)?;
 
-        // Lock is released when `file` is dropped here
+        // lock_file dropped here, releasing the exclusive lock
+
         Ok(())
     }
 
