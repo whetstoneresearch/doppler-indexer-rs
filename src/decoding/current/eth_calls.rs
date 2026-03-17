@@ -5,7 +5,7 @@ use std::path::Path;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::decoding::catchup::eth_calls::{
+use crate::decoding::eth_calls::column_index::{
     load_or_build_decoded_column_index, read_once_calls_from_parquet,
     read_raw_parquet_function_names,
 };
@@ -24,7 +24,7 @@ use crate::transformations::{
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::decoded::DecodedValue;
 
-use super::super::catchup;
+use crate::decoding::catchup::eth_calls::catchup_decode_eth_calls;
 
 /// Live phase: Process new data as it arrives via channel.
 /// Returns when AllComplete message is received or channel closes.
@@ -528,7 +528,7 @@ pub async fn decode_eth_calls_live(
                 // This second pass picks up the newly added columns with fresh indexes.
                 if raw_calls_dir.exists() {
                     tracing::info!("Raw collection complete, re-running decode catchup");
-                    catchup::catchup_decode_eth_calls(
+                    catchup_decode_eth_calls(
                         raw_calls_dir,
                         output_base,
                         regular_configs,
