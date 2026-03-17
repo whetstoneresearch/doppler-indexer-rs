@@ -29,7 +29,7 @@ use super::live_state::{LiveProcessingState, PendingEventData};
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::retry::{filter_calls_by_start_block, filter_events_by_start_block, RetryProcessor};
 use crate::db::DbPool;
-use crate::live::{LiveProgressTracker, TransformRetryRequest};
+use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 
@@ -1232,12 +1232,18 @@ impl TransformationEngine {
             })
             .collect();
 
+        let submitted_keys: HashSet<String> =
+            tasks.iter().map(|t| t.handler.handler_key()).collect();
+
         let outcomes = self
             .executor
             .execute_handlers(tasks, msg.range_start, msg.range_end, &DbExecMode::Direct)
             .await;
 
-        for outcome in outcomes {
+        let succeeded_keys: HashSet<String> =
+            outcomes.iter().map(|o| o.handler_key.clone()).collect();
+
+        for outcome in &outcomes {
             self.finalizer
                 .record_completed_range_for_handler(
                     &outcome.handler_key,
@@ -1260,6 +1266,29 @@ impl TransformationEngine {
                             e
                         );
                     }
+                }
+            }
+        }
+
+        // Persist failed handlers to status file (single-block live mode only)
+        let failed_keys: HashSet<String> = submitted_keys
+            .difference(&succeeded_keys)
+            .cloned()
+            .collect();
+        if !failed_keys.is_empty() && msg.range_end - msg.range_start == 1 {
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Err(e) = storage.update_status_atomic(msg.range_start, |status| {
+                status.failed_handlers.extend(failed_keys.iter().cloned());
+                for h in &failed_keys {
+                    status.completed_handlers.remove(h);
+                }
+            }) {
+                if !matches!(e, StorageError::NotFound(_)) {
+                    tracing::warn!(
+                        "Failed to persist failed handlers for block {}: {}",
+                        msg.range_start,
+                        e
+                    );
                 }
             }
         }
@@ -1401,12 +1430,18 @@ impl TransformationEngine {
             });
         }
 
+        let submitted_keys: HashSet<String> =
+            tasks.iter().map(|t| t.handler.handler_key()).collect();
+
         let outcomes = self
             .executor
             .execute_handlers(tasks, range_key.0, range_key.1, &DbExecMode::Direct)
             .await;
 
-        for outcome in outcomes {
+        let succeeded_keys: HashSet<String> =
+            outcomes.iter().map(|o| o.handler_key.clone()).collect();
+
+        for outcome in &outcomes {
             self.finalizer
                 .record_completed_range_for_handler(
                     &outcome.handler_key,
@@ -1429,6 +1464,29 @@ impl TransformationEngine {
                             e
                         );
                     }
+                }
+            }
+        }
+
+        // Persist failed handlers to status file (single-block live mode only)
+        let failed_keys: HashSet<String> = submitted_keys
+            .difference(&succeeded_keys)
+            .cloned()
+            .collect();
+        if !failed_keys.is_empty() && range_key.1 - range_key.0 == 1 {
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
+                status.failed_handlers.extend(failed_keys.iter().cloned());
+                for h in &failed_keys {
+                    status.completed_handlers.remove(h);
+                }
+            }) {
+                if !matches!(e, StorageError::NotFound(_)) {
+                    tracing::warn!(
+                        "Failed to persist failed handlers for block {}: {}",
+                        range_key.0,
+                        e
+                    );
                 }
             }
         }
@@ -1500,12 +1558,18 @@ impl TransformationEngine {
             }
         }
 
+        let submitted_keys: HashSet<String> =
+            tasks.iter().map(|t| t.handler.handler_key()).collect();
+
         let outcomes = self
             .executor
             .execute_handlers(tasks, range_start, range_end, &db_exec_mode)
             .await;
 
-        for outcome in outcomes {
+        let succeeded_keys: HashSet<String> =
+            outcomes.iter().map(|o| o.handler_key.clone()).collect();
+
+        for outcome in &outcomes {
             self.finalizer
                 .record_completed_range_for_handler(
                     &outcome.handler_key,
@@ -1528,6 +1592,29 @@ impl TransformationEngine {
                             e
                         );
                     }
+                }
+            }
+        }
+
+        // Persist failed handlers to status file (single-block live mode only)
+        let failed_keys: HashSet<String> = submitted_keys
+            .difference(&succeeded_keys)
+            .cloned()
+            .collect();
+        if !failed_keys.is_empty() && range_end - range_start == 1 {
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Err(e) = storage.update_status_atomic(range_start, |status| {
+                status.failed_handlers.extend(failed_keys.iter().cloned());
+                for h in &failed_keys {
+                    status.completed_handlers.remove(h);
+                }
+            }) {
+                if !matches!(e, StorageError::NotFound(_)) {
+                    tracing::warn!(
+                        "Failed to persist failed handlers for block {}: {}",
+                        range_start,
+                        e
+                    );
                 }
             }
         }

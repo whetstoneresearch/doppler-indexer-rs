@@ -211,8 +211,13 @@ impl CompactionService {
                 continue;
             }
 
-            let missing_handlers = progress.get_pending_handlers(block_number);
+            // Combine handlers that are pending in the progress tracker with
+            // handlers that explicitly failed (stored in status file)
+            let mut missing_handlers = progress.get_pending_handlers(block_number);
             drop(progress);
+
+            // Include failed handlers from status file - these need retry
+            missing_handlers.extend(status.failed_handlers.iter().cloned());
 
             if missing_handlers.is_empty() {
                 stuck_blocks.remove(&block_number);

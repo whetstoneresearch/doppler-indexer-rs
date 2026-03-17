@@ -21,7 +21,7 @@ use crate::decoding::eth_calls::{
 };
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
-use crate::live::{LiveProgressTracker, LiveStorage, TransformRetryRequest};
+use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::eth_call::EvmType;
@@ -352,6 +352,7 @@ impl RetryProcessor {
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
         let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
         let mut blocked_handlers = HashSet::new();
+        let mut attempted_keys = HashSet::new();
 
         for handler_info in self.registry.unique_event_handlers() {
             let handler = handler_info.handler;
@@ -402,6 +403,8 @@ impl RetryProcessor {
                 })
                 .cloned()
                 .collect();
+
+            attempted_keys.insert(handler_key.clone());
 
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let db_pool = self.db_pool.clone();
@@ -476,6 +479,8 @@ impl RetryProcessor {
                 continue;
             }
 
+            attempted_keys.insert(handler_key.clone());
+
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let db_pool = self.db_pool.clone();
             let chain_name = self.chain_name.clone();
@@ -524,9 +529,12 @@ impl RetryProcessor {
             });
         }
 
+        let mut succeeded_keys = HashSet::new();
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(Ok(Some(handler_key))) => {
+                    succeeded_keys.insert(handler_key.clone());
+
                     if let Err(e) = self
                         .db_pool
                         .execute_transaction(vec![crate::db::DbOperation::Upsert {
@@ -590,8 +598,59 @@ impl RetryProcessor {
             }
         }
 
+        // Update status file: mark succeeded handlers, track failed ones
+        let storage = LiveStorage::new(&self.chain_name);
+        if let Err(e) = update_retry_status(
+            &storage,
+            block_number,
+            &attempted_keys,
+            &succeeded_keys,
+            &blocked_handlers,
+        ) {
+            if !matches!(e, StorageError::NotFound(_)) {
+                tracing::warn!(
+                    "Failed to update status for block {} after retry: {}",
+                    block_number,
+                    e
+                );
+            }
+        }
+
         Ok(blocked_handlers)
     }
+}
+
+// ─── Retry status helpers ───────────────────────────────────────────
+
+/// Update the status file after retry: mark succeeded handlers as completed,
+/// mark failed (non-blocked) handlers as failed. Never sets `transformed` —
+/// that is `finalize_range()`'s responsibility after all `_handler_progress`
+/// rows are recorded.
+pub(crate) fn update_retry_status(
+    storage: &LiveStorage,
+    block_number: u64,
+    attempted_keys: &HashSet<String>,
+    succeeded_keys: &HashSet<String>,
+    blocked_handlers: &HashSet<String>,
+) -> Result<(), StorageError> {
+    let failed_keys: HashSet<String> = attempted_keys
+        .difference(succeeded_keys)
+        .filter(|k| !blocked_handlers.contains(*k))
+        .cloned()
+        .collect();
+
+    storage.update_status_atomic(block_number, |status| {
+        for key in succeeded_keys {
+            status.failed_handlers.remove(key);
+            status.completed_handlers.insert(key.clone());
+        }
+        for key in &failed_keys {
+            status.failed_handlers.insert(key.clone());
+            status.completed_handlers.remove(key);
+        }
+        // Don't set transformed=true here — finalize_range() handles that
+        // after recording _handler_progress for all handlers.
+    })
 }
 
 // ─── Trait for finalization callback ────────────────────────────────
@@ -725,6 +784,7 @@ pub(crate) fn filter_calls_by_start_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::{LiveBlockStatus, LiveStorage};
     use crate::transformations::context::DecodedValue;
 
     #[test]
@@ -792,5 +852,107 @@ mod tests {
                 base_name: "foo".to_string()
             }
         );
+    }
+
+    /// Regression: `update_retry_status` (called by `execute_live_retry_handlers`)
+    /// must record handler outcomes but never set `transformed`. That flag is
+    /// `finalize_range`'s responsibility; setting it early would let blocks be
+    /// skipped on restart if finalization fails afterward.
+    #[test]
+    fn retry_status_update_records_completed_without_setting_transformed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        storage.write_status(100, &status).unwrap();
+
+        // Call the production function used by execute_live_retry_handlers
+        let attempted = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
+        let succeeded = HashSet::from(["handler_a".to_string()]);
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            !s.transformed,
+            "retry must not set transformed; finalization owns that flag"
+        );
+        assert!(
+            s.completed_handlers.contains("handler_a"),
+            "succeeded handler must be in completed_handlers"
+        );
+        assert!(
+            !s.failed_handlers.contains("handler_a"),
+            "succeeded handler must not be in failed_handlers"
+        );
+        assert!(
+            s.failed_handlers.contains("handler_b"),
+            "non-succeeded attempted handler must be in failed_handlers"
+        );
+        assert!(
+            !s.completed_handlers.contains("handler_b"),
+            "failed handler must not be in completed_handlers"
+        );
+    }
+
+    /// Regression: the original bug was "retry records success, then finalization
+    /// fails before it is truly done" → blocks marked transformed prematurely.
+    ///
+    /// This test exercises the actual two-phase interaction:
+    /// 1. `update_retry_status` records one handler succeeded, one failed
+    /// 2. `update_finalization_status` (from finalizer.rs) refuses to set
+    ///    `transformed` because `failed_handlers` is non-empty
+    /// 3. After retry clears the failure, finalization sets `transformed`
+    #[test]
+    fn retry_then_finalize_interaction_gates_transformed_on_failures() {
+        use super::super::finalizer::update_finalization_status;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        storage.write_status(100, &status).unwrap();
+
+        let registered_keys =
+            HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
+
+        // Phase 1: Retry runs — handler_a succeeds, handler_b fails
+        let attempted = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
+        let succeeded = HashSet::from(["handler_a".to_string()]);
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        // Phase 2: Finalization runs but handler_b still failed → transformed stays false
+        update_finalization_status(&storage, 100, &registered_keys).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            !s.transformed,
+            "finalization must not set transformed when failed_handlers is non-empty"
+        );
+        assert!(s.failed_handlers.contains("handler_b"));
+
+        // Phase 3: Second retry succeeds for handler_b
+        let attempted = HashSet::from(["handler_b".to_string()]);
+        let succeeded = HashSet::from(["handler_b".to_string()]);
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        // Phase 4: Finalization runs again — no failures remain → transformed set
+        update_finalization_status(&storage, 100, &registered_keys).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.transformed,
+            "finalization must set transformed once all failures are cleared"
+        );
+        assert!(s.failed_handlers.is_empty());
+        assert!(s.completed_handlers.contains("handler_a"));
+        assert!(s.completed_handlers.contains("handler_b"));
     }
 }

@@ -139,7 +139,11 @@ impl RangeFinalizer {
             .await
     }
 
-    /// Finalize a range: record progress for all handlers and clean up state.
+    /// Finalize a range: record progress for non-failed handlers and clean up state.
+    ///
+    /// For single-block ranges, reads failed/completed handlers from the status file
+    /// to avoid marking failed handlers as complete and to skip already-completed ones.
+    /// Only sets `transformed=true` when no failed handlers remain.
     pub async fn finalize_range(
         &self,
         range_start: u64,
@@ -156,13 +160,48 @@ impl RangeFinalizer {
             }
         }
 
-        // Mark ALL handlers as complete for this range (event + call handlers)
+        let is_single_block = range_end - range_start == 1;
+
+        // Read failed/completed handlers from status file (single-block only)
+        let (failed_handlers, completed_handlers) = if is_single_block {
+            let storage = LiveStorage::new(&self.chain_name);
+            match storage.read_status(range_start) {
+                Ok(status) => (status.failed_handlers, status.completed_handlers),
+                Err(StorageError::NotFound(_)) => (HashSet::new(), HashSet::new()),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read status for block {}, finalizing all handlers: {}",
+                        range_start,
+                        e
+                    );
+                    (HashSet::new(), HashSet::new())
+                }
+            }
+        } else {
+            (HashSet::new(), HashSet::new())
+        };
+
+        let mut skipped_failed = 0usize;
+        let mut skipped_completed = 0usize;
+
+        // Mark handlers as complete, skipping failed and already-completed ones
         for handler in self.registry.all_handlers() {
             let handler_key = handler.handler_key();
+
+            if failed_handlers.contains(&handler_key) {
+                skipped_failed += 1;
+                continue;
+            }
+
+            if completed_handlers.contains(&handler_key) {
+                skipped_completed += 1;
+                continue;
+            }
+
             self.record_completed_range_for_handler(&handler_key, range_start, range_end)
                 .await?;
 
-            if range_end - range_start == 1 {
+            if is_single_block {
                 if let Some(ref tracker) = self.progress_tracker {
                     let mut t = tracker.lock().await;
                     if let Err(e) = t.mark_complete(range_start, &handler_key).await {
@@ -182,34 +221,41 @@ impl RangeFinalizer {
             state.cleanup_after_finalize(range_key);
         }
 
+        if skipped_failed > 0 || skipped_completed > 0 {
+            tracing::debug!(
+                "Finalized range {}-{}: skipped {} failed, {} already-completed handlers",
+                range_start,
+                range_end,
+                skipped_failed,
+                skipped_completed
+            );
+        }
+
         tracing::debug!(
             "Recorded progress for {} handlers on range {}-{}",
-            self.registry.all_handlers().len(),
+            self.registry.all_handlers().len() - skipped_failed - skipped_completed,
             range_start,
             range_end
         );
 
-        if range_end - range_start == 1 {
+        // Only set transformed=true if no failed handlers remain
+        if is_single_block {
             let storage = LiveStorage::new(&self.chain_name);
-            match storage.read_status(range_start) {
-                Ok(mut status) => {
-                    status.transformed = true;
-                    if let Err(e) = storage.write_status(range_start, &status) {
-                        tracing::warn!(
-                            "Failed to set transformed=true for block {}: {}",
-                            range_start,
-                            e
-                        );
-                    }
-                }
-                Err(StorageError::NotFound(_)) => {
-                    tracing::debug!(
-                        "Status file not found for block {}, skipping transformed=true",
-                        range_start
+            let registered_keys: HashSet<String> = self
+                .registry
+                .all_handlers()
+                .iter()
+                .map(|h| h.handler_key())
+                .collect();
+            if let Err(e) =
+                update_finalization_status(&storage, range_start, &registered_keys)
+            {
+                if !matches!(e, StorageError::NotFound(_)) {
+                    tracing::warn!(
+                        "Failed to update status for block {} during finalization: {}",
+                        range_start,
+                        e
                     );
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to read status for block {}: {}", range_start, e);
                 }
             }
         }
@@ -430,4 +476,25 @@ impl RangeFinalizer {
 
         Ok(())
     }
+}
+
+/// Update the status file during finalization: prune stale failed handler keys,
+/// then set `transformed=true` only when no failures remain. This is the second
+/// half of the two-phase protocol — retry records handler outcomes, finalization
+/// gates the `transformed` flag.
+pub(crate) fn update_finalization_status(
+    storage: &LiveStorage,
+    block_number: u64,
+    registered_keys: &HashSet<String>,
+) -> Result<(), StorageError> {
+    storage.update_status_atomic(block_number, |status| {
+        // Filter stale keys: only keep failed handlers that are still registered
+        status
+            .failed_handlers
+            .retain(|k| registered_keys.contains(k));
+
+        if status.failed_handlers.is_empty() {
+            status.transformed = true;
+        }
+    })
 }

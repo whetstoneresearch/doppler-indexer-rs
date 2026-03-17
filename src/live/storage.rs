@@ -349,7 +349,7 @@ impl LiveStorage {
     ///
     /// This provides atomic read-modify-write semantics by using file locking
     /// to prevent concurrent updates from overwriting each other's changes.
-    /// The closure receives the current status and returns the modified status.
+    /// The closure receives the current status and can modify it in place.
     ///
     /// If the status file doesn't exist, returns NotFound error.
     pub fn update_status_atomic<F>(
@@ -363,37 +363,61 @@ impl LiveStorage {
         use fs2::FileExt;
 
         let path = self.status_path(block_number);
+        let lock_path = path.with_extension("json.lock");
 
-        // Open file for reading and acquire exclusive lock
-        let file = fs::OpenOptions::new()
-            .read(true)
+        // Use a separate lock file so the status file has no open handles during rename.
+        // This keeps the lock held through the entire read-modify-write-rename cycle
+        // (no lost-update race) while keeping the rename target handle-free (Windows-safe).
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
             .write(true)
-            .open(&path)
-            .map_err(|e| map_io_not_found(e, block_number))?;
+            .truncate(true)
+            .open(&lock_path)
+            .map_err(StorageError::Io)?;
 
-        // Acquire exclusive lock (blocks until lock is available)
-        file.lock_exclusive()
+        lock_file
+            .lock_exclusive()
             .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         // Read current status while holding lock
-        let reader = BufReader::new(&file);
-        let mut status: LiveBlockStatus = serde_json::from_reader(reader)?;
+        let data = fs::read(&path).map_err(|e| map_io_not_found(e, block_number))?;
+        let mut status: LiveBlockStatus = serde_json::from_slice(&data)?;
 
         // Apply the update
         update_fn(&mut status);
 
-        // Write updated status atomically (tmp + rename)
-        // Release lock before rename to avoid deadlock
-        drop(file);
+        // Write to temp file, then rename — all while holding the lock
+        let random_suffix: u32 = rand::random();
+        let temp_name = format!(
+            "{}.tmp.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            random_suffix
+        );
+        let temp_path = path.with_file_name(temp_name);
 
-        self.write_status(block_number, &status)?;
+        {
+            let temp_file = fs::File::create(&temp_path)?;
+            let mut writer = BufWriter::new(temp_file);
+            serde_json::to_writer_pretty(&mut writer, &status)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .sync_all()?;
+        }
+
+        fs::rename(&temp_path, &path)?;
+
+        // lock_file dropped here, releasing the exclusive lock
 
         Ok(())
     }
 
     /// Delete status for a block.
     pub fn delete_status(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete(&self.status_path(block_number))
+        let path = self.status_path(block_number);
+        safe_delete(&path)?;
+        safe_delete(&path.with_extension("json.lock"))
     }
 
     // =========================================================================
