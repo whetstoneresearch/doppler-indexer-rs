@@ -1,9 +1,10 @@
+//! Decoded parquet writers/readers and arrow array builders.
+
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use alloy::dyn_abi::{DynSolType, DynSolValue};
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
     Int16Array, Int32Array, Int64Array, Int8Array, StringArray, StructArray, UInt16Array,
@@ -14,973 +15,15 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use thiserror::Error;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::oneshot;
 
-use super::catchup;
-use super::catchup::eth_calls::{
-    read_decoded_column_index, read_decoded_parquet_function_names, write_decoded_column_index,
+use super::types::{
+    CallDecodeConfig, DecodedCallRecord, DecodedEventCallRecord, DecodedOnceRecord,
+    EthCallDecodingError,
 };
-use super::current;
-use super::types::{EthCallResult, EventCallResult, OnceCallResult};
-use crate::live::TransformRetryRequest;
-use crate::transformations::{
-    DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteMessage,
-};
-use crate::types::decoded::DecodedValue;
-use crate::types::config::chain::ChainConfig;
-use crate::types::config::contract::Contracts;
 use crate::types::config::eth_call::EvmType;
-use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::decoded::DecodedValue;
 
-#[derive(Debug, Error)]
-pub enum EthCallDecodingError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Parquet error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
-
-    #[error("Arrow error: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
-
-    #[error("Decoding error: {0}")]
-    Decode(String),
-
-    #[error("Task join error: {0}")]
-    JoinError(String),
-}
-
-/// Configuration for a call to decode
-#[derive(Debug, Clone)]
-pub(crate) struct CallDecodeConfig {
-    pub contract_name: String,
-    pub function_name: String,
-    pub output_type: EvmType,
-    pub _is_once: bool,
-    /// Start block for this contract (calls before this block are skipped)
-    pub start_block: Option<u64>,
-}
-
-/// Configuration for an event-triggered call to decode
-#[derive(Debug, Clone)]
-pub(crate) struct EventCallDecodeConfig {
-    pub contract_name: String,
-    pub function_name: String,
-    pub output_type: EvmType,
-    /// Start block for this contract (calls before this block are skipped)
-    pub start_block: Option<u64>,
-}
-
-/// Decoded call result
-#[derive(Debug)]
-pub(crate) struct DecodedCallRecord {
-    pub block_number: u64,
-    pub block_timestamp: u64,
-    pub contract_address: [u8; 20],
-    pub decoded_value: DecodedValue,
-}
-
-/// Decoded event-triggered call result
-#[derive(Debug)]
-pub(crate) struct DecodedEventCallRecord {
-    pub block_number: u64,
-    pub block_timestamp: u64,
-    pub log_index: u32,
-    pub target_address: [u8; 20],
-    pub decoded_value: DecodedValue,
-}
-
-/// Decoded "once" call result
-#[derive(Debug)]
-pub(crate) struct DecodedOnceRecord {
-    pub block_number: u64,
-    pub block_timestamp: u64,
-    pub contract_address: [u8; 20],
-    /// function_name -> decoded value
-    pub decoded_values: HashMap<String, DecodedValue>,
-}
-
-/// Result of processing once calls, used to batch update column indexes after all tasks complete.
-pub(crate) struct OnceCallsResult {
-    pub contract_name: String,
-    pub file_name: String,
-    pub columns: Vec<String>,
-}
-
-pub async fn decode_eth_calls(
-    chain: &ChainConfig,
-    raw_data_config: &RawDataCollectionConfig,
-    decoder_rx: Receiver<super::types::DecoderMessage>,
-    transform_tx: Option<Sender<DecodedCallsMessage>>,
-    complete_tx: Option<Sender<RangeCompleteMessage>>,
-    transform_retry_tx: Option<Sender<TransformRetryRequest>>,
-    eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
-    decode_catchup_done_tx: Option<oneshot::Sender<()>>,
-    skip_catchup: bool,
-) -> Result<(), EthCallDecodingError> {
-    let output_base = PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain.name));
-    std::fs::create_dir_all(&output_base)?;
-
-    // Build decode configs from contract configurations
-    let (regular_configs, once_configs, event_configs) = build_decode_configs(&chain.contracts);
-
-    if regular_configs.is_empty() && once_configs.is_empty() && event_configs.is_empty() {
-        tracing::info!(
-            "No eth_calls configured for decoding on chain {}",
-            chain.name
-        );
-        // Signal barrier before early return so the engine doesn't wait forever
-        if let Some(tx) = decode_catchup_done_tx {
-            let _ = tx.send(());
-        }
-        // Drain channel and return
-        let mut decoder_rx = decoder_rx;
-        while decoder_rx.recv().await.is_some() {}
-        return Ok(());
-    }
-
-    tracing::info!(
-        "Eth_call decoder starting for chain {} with {} regular configs, {} once configs, {} event configs",
-        chain.name,
-        regular_configs.len(),
-        once_configs.len(),
-        event_configs.len()
-    );
-
-    let raw_calls_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
-
-    if !skip_catchup {
-        // =========================================================================
-        // Wait for eth_call collection catchup before decoding
-        // =========================================================================
-        if let Some(rx) = eth_calls_catchup_done_rx {
-            tracing::info!(
-                "Waiting for eth_call collection catchup to complete before decoding..."
-            );
-            let _ = rx.await;
-            tracing::info!("Eth_call collection catchup complete, proceeding with decoding");
-        }
-
-        // =========================================================================
-        // Catchup phase: Process existing raw eth_call files
-        // =========================================================================
-        if raw_calls_dir.exists() {
-            // Pass None for transform_tx during catchup to avoid deadlock:
-            // the engine is blocked waiting for our barrier signal and won't read
-            // from the channel, so sends could block forever. The engine will read
-            // decoded parquet files during its own catchup instead.
-            catchup::catchup_decode_eth_calls(
-                &raw_calls_dir,
-                &output_base,
-                &regular_configs,
-                &once_configs,
-                &event_configs,
-                raw_data_config,
-                None,
-            )
-            .await?;
-        }
-
-        tracing::info!(
-            "Eth_call decoding catchup complete for chain {}",
-            chain.name
-        );
-
-        if let Some(tx) = decode_catchup_done_tx {
-            let _ = tx.send(());
-        }
-    }
-
-    // =========================================================================
-    // Live phase: Process new data as it arrives
-    // =========================================================================
-    current::decode_eth_calls_live(
-        decoder_rx,
-        &raw_calls_dir,
-        &output_base,
-        &chain.name,
-        &regular_configs,
-        &once_configs,
-        &event_configs,
-        raw_data_config,
-        transform_tx.as_ref(),
-        complete_tx.as_ref(),
-        transform_retry_tx.as_ref(),
-    )
-    .await?;
-
-    tracing::info!("Eth_call decoding complete for chain {}", chain.name);
-    Ok(())
-}
-
-/// Build decode configurations from contracts
-pub(crate) fn build_decode_configs(
-    contracts: &Contracts,
-) -> (
-    Vec<CallDecodeConfig>,
-    Vec<CallDecodeConfig>,
-    Vec<EventCallDecodeConfig>,
-) {
-    let mut regular = Vec::new();
-    let mut once = Vec::new();
-    let mut event = Vec::new();
-
-    for (contract_name, contract) in contracts {
-        let start_block = contract.start_block.map(|u| u.to::<u64>());
-
-        if let Some(calls) = &contract.calls {
-            for call in calls {
-                let function_name = call
-                    .function
-                    .split('(')
-                    .next()
-                    .unwrap_or(&call.function)
-                    .to_string();
-
-                if call.frequency.is_once() {
-                    once.push(CallDecodeConfig {
-                        contract_name: contract_name.clone(),
-                        function_name,
-                        output_type: call.output_type.clone(),
-                        _is_once: true,
-                        start_block,
-                    });
-                } else if call.frequency.is_on_events() {
-                    event.push(EventCallDecodeConfig {
-                        contract_name: contract_name.clone(),
-                        function_name,
-                        output_type: call.output_type.clone(),
-                        start_block,
-                    });
-                } else {
-                    regular.push(CallDecodeConfig {
-                        contract_name: contract_name.clone(),
-                        function_name,
-                        output_type: call.output_type.clone(),
-                        _is_once: false,
-                        start_block,
-                    });
-                }
-            }
-        }
-
-        // Factory calls - use None for start_block (they use discovery block)
-        if let Some(factories) = &contract.factories {
-            for factory in factories {
-                if let Some(calls) = &factory.calls {
-                    for call in calls {
-                        let function_name = call
-                            .function
-                            .split('(')
-                            .next()
-                            .unwrap_or(&call.function)
-                            .to_string();
-
-                        if call.frequency.is_once() {
-                            once.push(CallDecodeConfig {
-                                contract_name: factory.collection.clone(),
-                                function_name,
-                                output_type: call.output_type.clone(),
-                                _is_once: true,
-                                start_block: None,
-                            });
-                        } else if call.frequency.is_on_events() {
-                            event.push(EventCallDecodeConfig {
-                                contract_name: factory.collection.clone(),
-                                function_name,
-                                output_type: call.output_type.clone(),
-                                start_block: None,
-                            });
-                        } else {
-                            regular.push(CallDecodeConfig {
-                                contract_name: factory.collection.clone(),
-                                function_name,
-                                output_type: call.output_type.clone(),
-                                _is_once: false,
-                                start_block: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (regular, once, event)
-}
-
-/// Process regular call results
-pub(crate) async fn process_regular_calls(
-    results: &[EthCallResult],
-    range_start: u64,
-    range_end: u64,
-    config: &CallDecodeConfig,
-    output_base: &Path,
-    transform_tx: Option<&Sender<DecodedCallsMessage>>,
-) -> Result<(), EthCallDecodingError> {
-    // Skip if entire range is before contract's start_block
-    if let Some(sb) = config.start_block {
-        if range_end <= sb {
-            return Ok(());
-        }
-    }
-
-    let mut decoded_records = Vec::new();
-    let mut decode_failures = 0u64;
-    let mut non_empty_count = 0u64;
-
-    for result in results {
-        // Skip if block is before contract's start_block
-        if let Some(sb) = config.start_block {
-            if result.block_number < sb {
-                continue;
-            }
-        }
-        if result.value.is_empty() {
-            continue;
-        }
-        non_empty_count += 1;
-
-        match decode_value(&result.value, &config.output_type) {
-            Ok(decoded) => {
-                decoded_records.push(DecodedCallRecord {
-                    block_number: result.block_number,
-                    block_timestamp: result.block_timestamp,
-                    contract_address: result.contract_address,
-                    decoded_value: decoded,
-                });
-            }
-            Err(e) => {
-                decode_failures += 1;
-                tracing::debug!(
-                    "Failed to decode {}.{} at block {}: {}",
-                    config.contract_name,
-                    config.function_name,
-                    result.block_number,
-                    e
-                );
-            }
-        }
-    }
-
-    if decode_failures > 0 && decode_failures == non_empty_count {
-        tracing::warn!(
-            "All {} decode attempts failed for {}.{} (output_type: {:?}) in blocks {}-{} — check output_type in config",
-            decode_failures,
-            config.contract_name,
-            config.function_name,
-            config.output_type,
-            range_start,
-            range_end - 1
-        );
-    } else if decode_failures > 0 {
-        tracing::warn!(
-            "{}/{} decode failures for {}.{} in blocks {}-{}",
-            decode_failures,
-            non_empty_count,
-            config.contract_name,
-            config.function_name,
-            range_start,
-            range_end - 1
-        );
-    }
-
-    // Write decoded data
-    let output_dir = output_base
-        .join(&config.contract_name)
-        .join(&config.function_name);
-    std::fs::create_dir_all(&output_dir)?;
-
-    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-    let output_path = output_dir.join(&file_name);
-
-    write_decoded_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
-
-    if decoded_records.is_empty() {
-        tracing::debug!(
-            "Wrote 0 decoded {}.{} results to {}",
-            config.contract_name,
-            config.function_name,
-            output_path.display()
-        );
-    } else {
-        tracing::info!(
-            "Wrote {} decoded {}.{} results to {}",
-            decoded_records.len(),
-            config.contract_name,
-            config.function_name,
-            output_path.display()
-        );
-    }
-
-    // Send to transformation channel if enabled
-    if let Some(tx) = transform_tx {
-        let transform_calls: Vec<TransformDecodedCall> = decoded_records
-            .iter()
-            .map(|r| {
-                convert_to_transform_call(
-                    r,
-                    &config.contract_name,
-                    &config.function_name,
-                    &config.output_type,
-                )
-            })
-            .collect();
-
-        if !transform_calls.is_empty() {
-            let msg = DecodedCallsMessage {
-                range_start,
-                range_end,
-                source_name: config.contract_name.clone(),
-                function_name: config.function_name.clone(),
-                calls: transform_calls,
-            };
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(
-                    "Failed to send decoded calls to transformation channel: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Process "once" call results.
-/// Returns `OnceCallsResult` with column index info for batch updating (avoids race conditions).
-/// When `return_index_info` is true, skips writing the column index (caller will batch update).
-pub(crate) async fn process_once_calls(
-    results: &[OnceCallResult],
-    range_start: u64,
-    range_end: u64,
-    contract_name: &str,
-    configs: &[&CallDecodeConfig],
-    output_base: &Path,
-    transform_tx: Option<&Sender<DecodedCallsMessage>>,
-    return_index_info: bool,
-) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
-    // Get start_block from first config (all configs for a contract share the same start_block)
-    let start_block = configs.first().and_then(|c| c.start_block);
-
-    // Skip if entire range is before contract's start_block
-    if let Some(sb) = start_block {
-        if range_end <= sb {
-            return Ok(None);
-        }
-    }
-
-    let mut decoded_records = Vec::new();
-    // Track decode failures per function: fn_name -> (successes, failures)
-    let mut decode_stats: HashMap<String, (u64, u64)> = HashMap::new();
-
-    for result in results {
-        // Skip if block is before contract's start_block
-        if let Some(sb) = start_block {
-            if result.block_number < sb {
-                continue;
-            }
-        }
-        let mut decoded_values = HashMap::new();
-
-        for config in configs {
-            if let Some(raw_value) = result.results.get(&config.function_name) {
-                if !raw_value.is_empty() {
-                    let stats = decode_stats
-                        .entry(config.function_name.clone())
-                        .or_insert((0, 0));
-                    match decode_value(raw_value, &config.output_type) {
-                        Ok(decoded) => {
-                            stats.0 += 1;
-                            decoded_values.insert(config.function_name.clone(), decoded);
-                        }
-                        Err(e) => {
-                            stats.1 += 1;
-                            tracing::debug!(
-                                "Failed to decode {}.{} at block {}: {}",
-                                contract_name,
-                                config.function_name,
-                                result.block_number,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        decoded_records.push(DecodedOnceRecord {
-            block_number: result.block_number,
-            block_timestamp: result.block_timestamp,
-            contract_address: result.contract_address,
-            decoded_values,
-        });
-    }
-
-    // Log warnings for functions with decode failures
-    for (fn_name, (successes, failures)) in &decode_stats {
-        if *failures > 0 {
-            let config = configs.iter().find(|c| &c.function_name == fn_name);
-            let output_type_str = config
-                .map(|c| format!("{:?}", c.output_type))
-                .unwrap_or_default();
-            if *successes == 0 {
-                tracing::warn!(
-                    "All {} decode attempts failed for {}/{} (output_type: {}) in blocks {}-{} — check output_type in config",
-                    failures,
-                    contract_name,
-                    fn_name,
-                    output_type_str,
-                    range_start,
-                    range_end - 1
-                );
-            } else {
-                tracing::warn!(
-                    "{}/{} decode failures for {}/{} in blocks {}-{}",
-                    failures,
-                    successes + failures,
-                    contract_name,
-                    fn_name,
-                    range_start,
-                    range_end - 1
-                );
-            }
-        }
-    }
-
-    // Write decoded data
-    let output_dir = output_base.join(contract_name).join("once");
-    std::fs::create_dir_all(&output_dir)?;
-
-    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-    let output_path = output_dir.join(&file_name);
-
-    // Check if we need to merge with existing decoded data
-    if output_path.exists() {
-        tracing::info!(
-            "Merging new decoded columns into existing file {}",
-            output_path.display()
-        );
-        merge_decoded_once_calls(&output_path, &decoded_records, configs)?;
-    } else {
-        write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
-    }
-
-    // Read actual columns from written file
-    let actual_cols: Vec<String> = read_decoded_parquet_function_names(&output_path)
-        .into_iter()
-        .collect();
-
-    if decoded_records.is_empty() {
-        tracing::debug!(
-            "Wrote 0 decoded {}/once results to {} ({} columns: {:?})",
-            contract_name,
-            output_path.display(),
-            actual_cols.len(),
-            actual_cols
-        );
-    } else {
-        tracing::info!(
-            "Wrote {} decoded {}/once results to {} ({} columns: {:?})",
-            decoded_records.len(),
-            contract_name,
-            output_path.display(),
-            actual_cols.len(),
-            actual_cols
-        );
-    }
-
-    // If not returning index info, update column index directly (live mode)
-    if !return_index_info {
-        let mut index = read_decoded_column_index(&output_dir);
-        index.insert(file_name.clone(), actual_cols.clone());
-        write_decoded_column_index(&output_dir, &index)?;
-    }
-
-    // Send to transformation channel if enabled
-    if let Some(tx) = transform_tx {
-        // For "once" calls, we consolidate ALL functions per address into a single DecodedCall
-        // with function_name = "once" and ALL results merged. This matches:
-        // 1. How handlers specify call_dependencies (e.g., ("DERC20", "once"))
-        // 2. How catchup reads from parquet (one row per address with all columns as result fields)
-        // 3. How handlers filter (call.function_name == "once") and access (call.result.get("name"))
-        let transform_calls: Vec<TransformDecodedCall> = decoded_records
-            .iter()
-            .map(|record| {
-                // Merge all function results for this address into one result map
-                let mut merged_result = HashMap::new();
-                for config in configs {
-                    if let Some(decoded_value) = record.decoded_values.get(&config.function_name) {
-                        let partial_result = build_result_map(
-                            decoded_value,
-                            &config.output_type,
-                            &config.function_name,
-                        );
-                        merged_result.extend(partial_result);
-                    }
-                }
-                TransformDecodedCall {
-                    block_number: record.block_number,
-                    block_timestamp: record.block_timestamp,
-                    contract_address: record.contract_address,
-                    source_name: contract_name.to_string(),
-                    function_name: "once".to_string(),
-                    trigger_log_index: None,
-                    result: merged_result,
-                }
-            })
-            .filter(|call| !call.result.is_empty())
-            .collect();
-
-        if !transform_calls.is_empty() {
-            tracing::info!(
-                "Sending DecodedCallsMessage: source_name={}, function_name=once, range=({}, {}), {} calls",
-                contract_name, range_start, range_end, transform_calls.len()
-            );
-            let msg = DecodedCallsMessage {
-                range_start,
-                range_end,
-                source_name: contract_name.to_string(),
-                function_name: "once".to_string(),
-                calls: transform_calls,
-            };
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(
-                    "Failed to send decoded calls to transformation channel: {}",
-                    e
-                );
-            }
-        } else {
-            tracing::debug!(
-                "No transform_calls to send for {}/once range ({}, {})",
-                contract_name,
-                range_start,
-                range_end
-            );
-        }
-    }
-
-    // Return index info for batch updating (catchup mode)
-    if return_index_info {
-        Ok(Some(OnceCallsResult {
-            contract_name: contract_name.to_string(),
-            file_name,
-            columns: actual_cols,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Process event-triggered call results
-pub(crate) async fn process_event_calls(
-    results: &[EventCallResult],
-    range_start: u64,
-    range_end: u64,
-    config: &EventCallDecodeConfig,
-    output_base: &Path,
-    transform_tx: Option<&Sender<DecodedCallsMessage>>,
-) -> Result<(), EthCallDecodingError> {
-    // Skip if entire range is before contract's start_block
-    if let Some(sb) = config.start_block {
-        if range_end <= sb {
-            return Ok(());
-        }
-    }
-
-    let mut decoded_records = Vec::new();
-    let mut decode_failures = 0u64;
-    let mut non_empty_count = 0u64;
-
-    for result in results {
-        // Skip if block is before contract's start_block
-        if let Some(sb) = config.start_block {
-            if result.block_number < sb {
-                continue;
-            }
-        }
-        if result.value.is_empty() {
-            continue;
-        }
-        non_empty_count += 1;
-
-        match decode_value(&result.value, &config.output_type) {
-            Ok(decoded) => {
-                decoded_records.push(DecodedEventCallRecord {
-                    block_number: result.block_number,
-                    block_timestamp: result.block_timestamp,
-                    log_index: result.log_index,
-                    target_address: result.target_address,
-                    decoded_value: decoded,
-                });
-            }
-            Err(e) => {
-                decode_failures += 1;
-                tracing::debug!(
-                    "Failed to decode {}.{} at block {}: {}",
-                    config.contract_name,
-                    config.function_name,
-                    result.block_number,
-                    e
-                );
-            }
-        }
-    }
-
-    if decode_failures > 0 && decode_failures == non_empty_count {
-        tracing::warn!(
-            "All {} decode attempts failed for {}.{} (output_type: {:?}) in blocks {}-{} — check output_type in config",
-            decode_failures,
-            config.contract_name,
-            config.function_name,
-            config.output_type,
-            range_start,
-            range_end - 1
-        );
-    } else if decode_failures > 0 {
-        tracing::warn!(
-            "{}/{} decode failures for {}.{} in blocks {}-{}",
-            decode_failures,
-            non_empty_count,
-            config.contract_name,
-            config.function_name,
-            range_start,
-            range_end - 1
-        );
-    }
-
-    // Write decoded data to on_events/ subdirectory
-    let output_dir = output_base
-        .join(&config.contract_name)
-        .join(&config.function_name)
-        .join("on_events");
-    std::fs::create_dir_all(&output_dir)?;
-
-    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-    let output_path = output_dir.join(&file_name);
-
-    // Always write file (even if empty) for catchup idempotency
-    write_decoded_event_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
-
-    if decoded_records.is_empty() {
-        tracing::debug!(
-            "Wrote 0 decoded {}.{} event call results to {}",
-            config.contract_name,
-            config.function_name,
-            output_path.display()
-        );
-    } else {
-        tracing::info!(
-            "Wrote {} decoded {}.{} event call results to {}",
-            decoded_records.len(),
-            config.contract_name,
-            config.function_name,
-            output_path.display()
-        );
-    }
-
-    // Send to transformation channel if enabled
-    if let Some(tx) = transform_tx {
-        let transform_calls: Vec<TransformDecodedCall> = decoded_records
-            .iter()
-            .map(|r| {
-                convert_event_call_to_transform_call(
-                    r,
-                    &config.contract_name,
-                    &config.function_name,
-                    &config.output_type,
-                )
-            })
-            .collect();
-
-        if !transform_calls.is_empty() {
-            let msg = DecodedCallsMessage {
-                range_start,
-                range_end,
-                source_name: config.contract_name.clone(),
-                function_name: config.function_name.clone(),
-                calls: transform_calls,
-            };
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(
-                    "Failed to send decoded event calls to transformation channel: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Convert an EvmType to a DynSolType for decoding
-fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
-    match output_type {
-        EvmType::Int256 => DynSolType::Int(256),
-        EvmType::Int128 => DynSolType::Int(128),
-        EvmType::Int64 => DynSolType::Int(64),
-        EvmType::Int32 => DynSolType::Int(32),
-        EvmType::Int24 => DynSolType::Int(24),
-        EvmType::Int16 => DynSolType::Int(16),
-        EvmType::Int8 => DynSolType::Int(8),
-        EvmType::Uint256 => DynSolType::Uint(256),
-        EvmType::Uint160 => DynSolType::Uint(160),
-        EvmType::Uint128 => DynSolType::Uint(128),
-        EvmType::Uint96 => DynSolType::Uint(96),
-        EvmType::Uint80 => DynSolType::Uint(80),
-        EvmType::Uint64 => DynSolType::Uint(64),
-        EvmType::Uint32 => DynSolType::Uint(32),
-        EvmType::Uint24 => DynSolType::Uint(24),
-        EvmType::Uint16 => DynSolType::Uint(16),
-        EvmType::Uint8 => DynSolType::Uint(8),
-        EvmType::Address => DynSolType::Address,
-        EvmType::Bool => DynSolType::Bool,
-        EvmType::Bytes32 => DynSolType::FixedBytes(32),
-        EvmType::Bytes => DynSolType::Bytes,
-        EvmType::String => DynSolType::String,
-        EvmType::Named { inner, .. } => evm_type_to_dyn_sol_type(inner),
-        EvmType::NamedTuple(fields) => {
-            let field_types: Vec<DynSolType> = fields
-                .iter()
-                .map(|(_, ty)| evm_type_to_dyn_sol_type(ty))
-                .collect();
-            DynSolType::Tuple(field_types)
-        }
-        EvmType::UnnamedTuple(fields) => {
-            let field_types: Vec<DynSolType> = fields
-                .iter()
-                .map(|ty| evm_type_to_dyn_sol_type(ty))
-                .collect();
-            DynSolType::Tuple(field_types)
-        }
-        EvmType::Array(inner) => DynSolType::Array(Box::new(evm_type_to_dyn_sol_type(inner))),
-    }
-}
-
-/// Decode a raw value using the specified type
-pub fn decode_value(
-    raw: &[u8],
-    output_type: &EvmType,
-) -> Result<DecodedValue, EthCallDecodingError> {
-    let sol_type = evm_type_to_dyn_sol_type(output_type);
-
-    let decoded = sol_type
-        .abi_decode(raw)
-        .map_err(|e| EthCallDecodingError::Decode(e.to_string()))?;
-
-    convert_dyn_sol_value(&decoded, output_type)
-}
-
-/// Convert DynSolValue to DecodedValue
-fn convert_dyn_sol_value(
-    value: &DynSolValue,
-    output_type: &EvmType,
-) -> Result<DecodedValue, EthCallDecodingError> {
-    // Handle Named types by delegating to inner type
-    if let EvmType::Named { inner, .. } = output_type {
-        return convert_dyn_sol_value(value, inner);
-    }
-
-    // Handle NamedTuple types
-    if let EvmType::NamedTuple(fields) = output_type {
-        if let DynSolValue::Tuple(values) = value {
-            if values.len() != fields.len() {
-                return Err(EthCallDecodingError::Decode(format!(
-                    "Tuple length mismatch: expected {}, got {}",
-                    fields.len(),
-                    values.len()
-                )));
-            }
-            let mut named_values = Vec::with_capacity(fields.len());
-            for ((name, field_type), val) in fields.iter().zip(values.iter()) {
-                let decoded = convert_dyn_sol_value(val, field_type)?;
-                named_values.push((name.clone(), decoded));
-            }
-            return Ok(DecodedValue::NamedTuple(named_values));
-        } else {
-            return Err(EthCallDecodingError::Decode(format!(
-                "Expected tuple value for NamedTuple type, got {:?}",
-                value
-            )));
-        }
-    }
-
-    // Handle UnnamedTuple types
-    if let EvmType::UnnamedTuple(field_types) = output_type {
-        if let DynSolValue::Tuple(values) = value {
-            if values.len() != field_types.len() {
-                return Err(EthCallDecodingError::Decode(format!(
-                    "Tuple length mismatch: expected {}, got {}",
-                    field_types.len(),
-                    values.len()
-                )));
-            }
-            let decoded: Vec<DecodedValue> = field_types
-                .iter()
-                .zip(values.iter())
-                .map(|(ty, val)| convert_dyn_sol_value(val, ty))
-                .collect::<Result<_, _>>()?;
-            return Ok(DecodedValue::UnnamedTuple(decoded));
-        } else {
-            return Err(EthCallDecodingError::Decode(format!(
-                "Expected tuple value for UnnamedTuple type, got {:?}",
-                value
-            )));
-        }
-    }
-
-    // Handle Array types
-    if let EvmType::Array(inner_type) = output_type {
-        if let DynSolValue::Array(values) = value {
-            let decoded: Vec<DecodedValue> = values
-                .iter()
-                .map(|v| convert_dyn_sol_value(v, inner_type))
-                .collect::<Result<_, _>>()?;
-            return Ok(DecodedValue::Array(decoded));
-        } else {
-            return Err(EthCallDecodingError::Decode(format!(
-                "Expected array value for Array type, got {:?}",
-                value
-            )));
-        }
-    }
-
-    match value {
-        DynSolValue::Address(addr) => Ok(DecodedValue::Address(addr.0 .0)),
-        DynSolValue::Uint(val, _) => match output_type {
-            EvmType::Uint8 => Ok(DecodedValue::Uint8((*val).try_into().unwrap_or(u8::MAX))),
-            EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
-                Ok(DecodedValue::Uint64((*val).try_into().unwrap_or(u64::MAX)))
-            }
-            _ => Ok(DecodedValue::Uint256(*val)),
-        },
-        DynSolValue::Int(val, _) => match output_type {
-            EvmType::Int8 => Ok(DecodedValue::Int8((*val).try_into().unwrap_or(i8::MAX))),
-            EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
-                Ok(DecodedValue::Int64((*val).try_into().unwrap_or(i64::MAX)))
-            }
-            _ => Ok(DecodedValue::Int256(*val)),
-        },
-        DynSolValue::Bool(b) => Ok(DecodedValue::Bool(*b)),
-        DynSolValue::FixedBytes(bytes, 32) => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes[..]);
-            Ok(DecodedValue::Bytes32(arr))
-        }
-        DynSolValue::FixedBytes(bytes, _) => Ok(DecodedValue::Bytes(bytes.to_vec())),
-        DynSolValue::Bytes(bytes) => Ok(DecodedValue::Bytes(bytes.clone())),
-        DynSolValue::String(s) => Ok(DecodedValue::String(s.clone())),
-        _ => Err(EthCallDecodingError::Decode(format!(
-            "Unsupported value type: {:?}",
-            value
-        ))),
-    }
-}
-
-/// Write decoded regular calls to parquet
-fn write_decoded_calls_to_parquet(
+pub(super) fn write_decoded_calls_to_parquet(
     records: &[DecodedCallRecord],
     output_type: &EvmType,
     output_path: &Path,
@@ -1072,7 +115,7 @@ fn write_decoded_calls_to_parquet(
 }
 
 /// Write decoded event-triggered calls to parquet
-fn write_decoded_event_calls_to_parquet(
+pub(super) fn write_decoded_event_calls_to_parquet(
     records: &[DecodedEventCallRecord],
     output_type: &EvmType,
     output_path: &Path,
@@ -1163,7 +206,7 @@ fn write_decoded_event_calls_to_parquet(
 }
 
 /// Build an Arrow array for event call decoded values
-fn build_event_value_array(
+pub(super) fn build_event_value_array(
     records: &[DecodedEventCallRecord],
     output_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
@@ -1349,7 +392,7 @@ fn build_event_value_array(
 }
 
 /// Build an Arrow ListArray for array-typed decoded values in event calls
-fn build_event_array_value_array(
+pub(super) fn build_event_array_value_array(
     records: &[DecodedEventCallRecord],
     inner_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
@@ -1481,7 +524,7 @@ fn build_event_array_value_array(
 }
 
 /// Build an Arrow array for a specific field of a named tuple in event calls
-fn build_event_tuple_field_array(
+pub(super) fn build_event_tuple_field_array(
     records: &[DecodedEventCallRecord],
     field_idx: usize,
     field_type: &EvmType,
@@ -1636,7 +679,7 @@ fn build_event_tuple_field_array(
 }
 
 /// Build a StructArray for a nested NamedTuple field in event call records
-fn build_event_nested_struct_array(
+pub(super) fn build_event_nested_struct_array(
     records: &[DecodedEventCallRecord],
     field_idx: usize,
     nested_fields: &[(String, Box<EvmType>)],
@@ -1674,7 +717,7 @@ fn build_event_nested_struct_array(
 }
 
 /// Build a StructArray for a nested UnnamedTuple field in event call records
-fn build_event_nested_unnamed_struct_array(
+pub(super) fn build_event_nested_unnamed_struct_array(
     records: &[DecodedEventCallRecord],
     field_idx: usize,
     nested_fields: &[Box<EvmType>],
@@ -1716,7 +759,7 @@ fn build_event_nested_unnamed_struct_array(
 }
 
 /// Build an array for a specific field within nested named tuple values
-fn build_nested_field_array(
+pub(super) fn build_nested_field_array(
     nested_values: &[Option<&Vec<(String, DecodedValue)>>],
     nested_idx: usize,
     field_type: &EvmType,
@@ -1943,7 +986,7 @@ fn build_nested_field_array(
 }
 
 /// Build an array for a specific field within nested unnamed tuple values
-fn build_unnamed_nested_field_array(
+pub(super) fn build_unnamed_nested_field_array(
     nested_values: &[Option<&Vec<DecodedValue>>],
     nested_idx: usize,
     field_type: &EvmType,
@@ -2173,7 +1216,7 @@ fn build_unnamed_nested_field_array(
 
 // Helper functions for extracting event tuple field values
 
-fn extract_event_tuple_uint8(r: &DecodedEventCallRecord, idx: usize) -> Option<u8> {
+pub(super) fn extract_event_tuple_uint8(r: &DecodedEventCallRecord, idx: usize) -> Option<u8> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint8(val) => Some(*val),
@@ -2183,7 +1226,7 @@ fn extract_event_tuple_uint8(r: &DecodedEventCallRecord, idx: usize) -> Option<u
     }
 }
 
-fn extract_event_tuple_uint64(r: &DecodedEventCallRecord, idx: usize) -> Option<u64> {
+pub(super) fn extract_event_tuple_uint64(r: &DecodedEventCallRecord, idx: usize) -> Option<u64> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => Some(*val),
@@ -2194,7 +1237,7 @@ fn extract_event_tuple_uint64(r: &DecodedEventCallRecord, idx: usize) -> Option<
     }
 }
 
-fn extract_event_tuple_uint32(r: &DecodedEventCallRecord, idx: usize) -> Option<u32> {
+pub(super) fn extract_event_tuple_uint32(r: &DecodedEventCallRecord, idx: usize) -> Option<u32> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => (*val).try_into().ok(),
@@ -2205,7 +1248,7 @@ fn extract_event_tuple_uint32(r: &DecodedEventCallRecord, idx: usize) -> Option<
     }
 }
 
-fn extract_event_tuple_uint16(r: &DecodedEventCallRecord, idx: usize) -> Option<u16> {
+pub(super) fn extract_event_tuple_uint16(r: &DecodedEventCallRecord, idx: usize) -> Option<u16> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => (*val).try_into().ok(),
@@ -2216,7 +1259,7 @@ fn extract_event_tuple_uint16(r: &DecodedEventCallRecord, idx: usize) -> Option<
     }
 }
 
-fn extract_event_tuple_uint256_string(r: &DecodedEventCallRecord, idx: usize) -> Option<String> {
+pub(super) fn extract_event_tuple_uint256_string(r: &DecodedEventCallRecord, idx: usize) -> Option<String> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint256(val) => Some(val.to_string()),
@@ -2227,7 +1270,7 @@ fn extract_event_tuple_uint256_string(r: &DecodedEventCallRecord, idx: usize) ->
     }
 }
 
-fn extract_event_tuple_int8(r: &DecodedEventCallRecord, idx: usize) -> Option<i8> {
+pub(super) fn extract_event_tuple_int8(r: &DecodedEventCallRecord, idx: usize) -> Option<i8> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int8(val) => Some(*val),
@@ -2237,7 +1280,7 @@ fn extract_event_tuple_int8(r: &DecodedEventCallRecord, idx: usize) -> Option<i8
     }
 }
 
-fn extract_event_tuple_int64(r: &DecodedEventCallRecord, idx: usize) -> Option<i64> {
+pub(super) fn extract_event_tuple_int64(r: &DecodedEventCallRecord, idx: usize) -> Option<i64> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => Some(*val),
@@ -2248,7 +1291,7 @@ fn extract_event_tuple_int64(r: &DecodedEventCallRecord, idx: usize) -> Option<i
     }
 }
 
-fn extract_event_tuple_int32(r: &DecodedEventCallRecord, idx: usize) -> Option<i32> {
+pub(super) fn extract_event_tuple_int32(r: &DecodedEventCallRecord, idx: usize) -> Option<i32> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -2259,7 +1302,7 @@ fn extract_event_tuple_int32(r: &DecodedEventCallRecord, idx: usize) -> Option<i
     }
 }
 
-fn extract_event_tuple_int16(r: &DecodedEventCallRecord, idx: usize) -> Option<i16> {
+pub(super) fn extract_event_tuple_int16(r: &DecodedEventCallRecord, idx: usize) -> Option<i16> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -2270,7 +1313,7 @@ fn extract_event_tuple_int16(r: &DecodedEventCallRecord, idx: usize) -> Option<i
     }
 }
 
-fn extract_event_tuple_int256_string(r: &DecodedEventCallRecord, idx: usize) -> Option<String> {
+pub(super) fn extract_event_tuple_int256_string(r: &DecodedEventCallRecord, idx: usize) -> Option<String> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int256(val) => Some(val.to_string()),
@@ -2281,7 +1324,7 @@ fn extract_event_tuple_int256_string(r: &DecodedEventCallRecord, idx: usize) -> 
     }
 }
 
-fn extract_event_tuple_bool(r: &DecodedEventCallRecord, idx: usize) -> Option<bool> {
+pub(super) fn extract_event_tuple_bool(r: &DecodedEventCallRecord, idx: usize) -> Option<bool> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Bool(val) => Some(*val),
@@ -2291,7 +1334,7 @@ fn extract_event_tuple_bool(r: &DecodedEventCallRecord, idx: usize) -> Option<bo
     }
 }
 
-fn extract_event_tuple_string(r: &DecodedEventCallRecord, idx: usize) -> Option<&str> {
+pub(super) fn extract_event_tuple_string(r: &DecodedEventCallRecord, idx: usize) -> Option<&str> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::String(s) => Some(s.as_str()),
@@ -2301,7 +1344,7 @@ fn extract_event_tuple_string(r: &DecodedEventCallRecord, idx: usize) -> Option<
     }
 }
 
-fn extract_event_tuple_bytes(r: &DecodedEventCallRecord, idx: usize) -> Option<&[u8]> {
+pub(super) fn extract_event_tuple_bytes(r: &DecodedEventCallRecord, idx: usize) -> Option<&[u8]> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Bytes(b) => Some(b.as_slice()),
@@ -2313,7 +1356,7 @@ fn extract_event_tuple_bytes(r: &DecodedEventCallRecord, idx: usize) -> Option<&
 }
 
 /// Build an Arrow array for a specific field of a named tuple
-fn build_tuple_field_array(
+pub(super) fn build_tuple_field_array(
     records: &[DecodedCallRecord],
     field_idx: usize,
     field_type: &EvmType,
@@ -2470,7 +1513,7 @@ fn build_tuple_field_array(
 }
 
 /// Build a StructArray for a nested NamedTuple field in regular call records
-fn build_nested_struct_array(
+pub(super) fn build_nested_struct_array(
     records: &[DecodedCallRecord],
     field_idx: usize,
     nested_fields: &[(String, Box<EvmType>)],
@@ -2508,7 +1551,7 @@ fn build_nested_struct_array(
 }
 
 /// Build a StructArray for a nested UnnamedTuple field in regular call records
-fn build_nested_unnamed_struct_array(
+pub(super) fn build_nested_unnamed_struct_array(
     records: &[DecodedCallRecord],
     field_idx: usize,
     nested_fields: &[Box<EvmType>],
@@ -2551,7 +1594,7 @@ fn build_nested_unnamed_struct_array(
 
 // Helper functions for extracting tuple field values
 
-fn extract_tuple_uint8(r: &DecodedCallRecord, idx: usize) -> Option<u8> {
+pub(super) fn extract_tuple_uint8(r: &DecodedCallRecord, idx: usize) -> Option<u8> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint8(val) => Some(*val),
@@ -2561,7 +1604,7 @@ fn extract_tuple_uint8(r: &DecodedCallRecord, idx: usize) -> Option<u8> {
     }
 }
 
-fn extract_tuple_uint64(r: &DecodedCallRecord, idx: usize) -> Option<u64> {
+pub(super) fn extract_tuple_uint64(r: &DecodedCallRecord, idx: usize) -> Option<u64> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => Some(*val),
@@ -2572,7 +1615,7 @@ fn extract_tuple_uint64(r: &DecodedCallRecord, idx: usize) -> Option<u64> {
     }
 }
 
-fn extract_tuple_uint32(r: &DecodedCallRecord, idx: usize) -> Option<u32> {
+pub(super) fn extract_tuple_uint32(r: &DecodedCallRecord, idx: usize) -> Option<u32> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => (*val).try_into().ok(),
@@ -2583,7 +1626,7 @@ fn extract_tuple_uint32(r: &DecodedCallRecord, idx: usize) -> Option<u32> {
     }
 }
 
-fn extract_tuple_uint16(r: &DecodedCallRecord, idx: usize) -> Option<u16> {
+pub(super) fn extract_tuple_uint16(r: &DecodedCallRecord, idx: usize) -> Option<u16> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint64(val) => (*val).try_into().ok(),
@@ -2594,7 +1637,7 @@ fn extract_tuple_uint16(r: &DecodedCallRecord, idx: usize) -> Option<u16> {
     }
 }
 
-fn extract_tuple_uint256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
+pub(super) fn extract_tuple_uint256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint256(val) => Some(val.to_string()),
@@ -2605,7 +1648,7 @@ fn extract_tuple_uint256_string(r: &DecodedCallRecord, idx: usize) -> Option<Str
     }
 }
 
-fn extract_tuple_int8(r: &DecodedCallRecord, idx: usize) -> Option<i8> {
+pub(super) fn extract_tuple_int8(r: &DecodedCallRecord, idx: usize) -> Option<i8> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int8(val) => Some(*val),
@@ -2615,7 +1658,7 @@ fn extract_tuple_int8(r: &DecodedCallRecord, idx: usize) -> Option<i8> {
     }
 }
 
-fn extract_tuple_int64(r: &DecodedCallRecord, idx: usize) -> Option<i64> {
+pub(super) fn extract_tuple_int64(r: &DecodedCallRecord, idx: usize) -> Option<i64> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => Some(*val),
@@ -2626,7 +1669,7 @@ fn extract_tuple_int64(r: &DecodedCallRecord, idx: usize) -> Option<i64> {
     }
 }
 
-fn extract_tuple_int32(r: &DecodedCallRecord, idx: usize) -> Option<i32> {
+pub(super) fn extract_tuple_int32(r: &DecodedCallRecord, idx: usize) -> Option<i32> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -2637,7 +1680,7 @@ fn extract_tuple_int32(r: &DecodedCallRecord, idx: usize) -> Option<i32> {
     }
 }
 
-fn extract_tuple_int16(r: &DecodedCallRecord, idx: usize) -> Option<i16> {
+pub(super) fn extract_tuple_int16(r: &DecodedCallRecord, idx: usize) -> Option<i16> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -2648,7 +1691,7 @@ fn extract_tuple_int16(r: &DecodedCallRecord, idx: usize) -> Option<i16> {
     }
 }
 
-fn extract_tuple_int256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
+pub(super) fn extract_tuple_int256_string(r: &DecodedCallRecord, idx: usize) -> Option<String> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int256(val) => Some(val.to_string()),
@@ -2659,7 +1702,7 @@ fn extract_tuple_int256_string(r: &DecodedCallRecord, idx: usize) -> Option<Stri
     }
 }
 
-fn extract_tuple_bool(r: &DecodedCallRecord, idx: usize) -> Option<bool> {
+pub(super) fn extract_tuple_bool(r: &DecodedCallRecord, idx: usize) -> Option<bool> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Bool(val) => Some(*val),
@@ -2669,7 +1712,7 @@ fn extract_tuple_bool(r: &DecodedCallRecord, idx: usize) -> Option<bool> {
     }
 }
 
-fn extract_tuple_string(r: &DecodedCallRecord, idx: usize) -> Option<&str> {
+pub(super) fn extract_tuple_string(r: &DecodedCallRecord, idx: usize) -> Option<&str> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::String(s) => Some(s.as_str()),
@@ -2679,7 +1722,7 @@ fn extract_tuple_string(r: &DecodedCallRecord, idx: usize) -> Option<&str> {
     }
 }
 
-fn extract_tuple_bytes(r: &DecodedCallRecord, idx: usize) -> Option<&[u8]> {
+pub(super) fn extract_tuple_bytes(r: &DecodedCallRecord, idx: usize) -> Option<&[u8]> {
     match &r.decoded_value {
         DecodedValue::NamedTuple(fields) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Bytes(b) => Some(b.as_slice()),
@@ -2691,7 +1734,7 @@ fn extract_tuple_bytes(r: &DecodedCallRecord, idx: usize) -> Option<&[u8]> {
 }
 
 /// Read existing decoded once parquet file and return record batches
-fn read_existing_decoded_once_parquet(
+pub(super) fn read_existing_decoded_once_parquet(
     path: &Path,
 ) -> Result<Vec<RecordBatch>, EthCallDecodingError> {
     let file = File::open(path)?;
@@ -2701,7 +1744,7 @@ fn read_existing_decoded_once_parquet(
 }
 
 /// Merge new decoded columns into an existing decoded once parquet file
-fn merge_decoded_once_calls(
+pub(super) fn merge_decoded_once_calls(
     output_path: &Path,
     new_records: &[DecodedOnceRecord],
     new_configs: &[&CallDecodeConfig],
@@ -2893,7 +1936,7 @@ fn merge_decoded_once_calls(
 }
 
 /// Write decoded "once" calls to parquet
-fn write_decoded_once_calls_to_parquet(
+pub(super) fn write_decoded_once_calls_to_parquet(
     records: &[DecodedOnceRecord],
     configs: &[&CallDecodeConfig],
     output_path: &Path,
@@ -2989,7 +2032,7 @@ fn write_decoded_once_calls_to_parquet(
 }
 
 /// Build an Arrow array for decoded values
-fn build_value_array(
+pub(super) fn build_value_array(
     records: &[DecodedCallRecord],
     output_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
@@ -3178,7 +2221,7 @@ fn build_value_array(
 }
 
 /// Build an Arrow ListArray for array-typed decoded values
-fn build_array_value_array(
+pub(super) fn build_array_value_array(
     records: &[DecodedCallRecord],
     inner_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
@@ -3310,7 +2353,7 @@ fn build_array_value_array(
 }
 
 /// Build a StructArray from a single DecodedValue (NamedTuple or UnnamedTuple)
-fn build_decoded_value_struct(
+pub(super) fn build_decoded_value_struct(
     value: &DecodedValue,
     field_names: &[String],
     field_types: &[&EvmType],
@@ -3349,7 +2392,7 @@ fn build_decoded_value_struct(
 }
 
 /// Build an Arrow array from a single DecodedValue
-fn build_single_decoded_value_array(
+pub(super) fn build_single_decoded_value_array(
     value: &DecodedValue,
     output_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
@@ -3429,7 +2472,7 @@ fn build_single_decoded_value_array(
 }
 
 /// Build an Arrow array for "once" decoded values
-fn build_once_value_array(
+pub(super) fn build_once_value_array(
     records: &[DecodedOnceRecord],
     function_name: &str,
     output_type: &EvmType,
@@ -3622,7 +2665,7 @@ fn build_once_value_array(
 /// Build an Arrow array for "once" decoded values, aligned to existing addresses.
 /// For each address in `address_arr`, looks up the record in `records_by_addr` and extracts the value.
 /// Returns NULL for addresses not found in the lookup map.
-fn build_once_value_array_aligned(
+pub(super) fn build_once_value_array_aligned(
     address_arr: &FixedSizeBinaryArray,
     records_by_addr: &HashMap<[u8; 20], &DecodedOnceRecord>,
     function_name: &str,
@@ -3886,7 +2929,7 @@ fn build_once_value_array_aligned(
 }
 
 /// Build an Arrow array for a specific field of a named tuple from "once" calls, aligned to existing addresses.
-fn build_once_tuple_field_array_aligned(
+pub(super) fn build_once_tuple_field_array_aligned(
     address_arr: &FixedSizeBinaryArray,
     records_by_addr: &HashMap<[u8; 20], &DecodedOnceRecord>,
     function_name: &str,
@@ -4081,7 +3124,7 @@ fn build_once_tuple_field_array_aligned(
 }
 
 /// Build an Arrow array for a specific field of a named tuple from "once" calls
-fn build_once_tuple_field_array(
+pub(super) fn build_once_tuple_field_array(
     records: &[DecodedOnceRecord],
     function_name: &str,
     field_idx: usize,
@@ -4224,7 +3267,7 @@ fn build_once_tuple_field_array(
 
 // Helper functions for extracting tuple field values from "once" records
 
-fn extract_once_tuple_address<'a>(
+pub(super) fn extract_once_tuple_address<'a>(
     r: &'a DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4241,7 +3284,7 @@ fn extract_once_tuple_address<'a>(
     }
 }
 
-fn extract_once_tuple_uint8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u8> {
+pub(super) fn extract_once_tuple_uint8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u8> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint8(val) => Some(*val),
@@ -4251,7 +3294,7 @@ fn extract_once_tuple_uint8(r: &DecodedOnceRecord, function_name: &str, idx: usi
     }
 }
 
-fn extract_once_tuple_uint64(
+pub(super) fn extract_once_tuple_uint64(
     r: &DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4266,7 +3309,7 @@ fn extract_once_tuple_uint64(
     }
 }
 
-fn extract_once_tuple_uint32(
+pub(super) fn extract_once_tuple_uint32(
     r: &DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4281,7 +3324,7 @@ fn extract_once_tuple_uint32(
     }
 }
 
-fn extract_once_tuple_uint16(
+pub(super) fn extract_once_tuple_uint16(
     r: &DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4296,7 +3339,7 @@ fn extract_once_tuple_uint16(
     }
 }
 
-fn extract_once_tuple_uint256_string(
+pub(super) fn extract_once_tuple_uint256_string(
     r: &DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4311,7 +3354,7 @@ fn extract_once_tuple_uint256_string(
     }
 }
 
-fn extract_once_tuple_int8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i8> {
+pub(super) fn extract_once_tuple_int8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i8> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int8(val) => Some(*val),
@@ -4321,7 +3364,7 @@ fn extract_once_tuple_int8(r: &DecodedOnceRecord, function_name: &str, idx: usiz
     }
 }
 
-fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i64> {
+pub(super) fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i64> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => Some(*val),
@@ -4332,7 +3375,7 @@ fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &str, idx: usi
     }
 }
 
-fn extract_once_tuple_int32(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i32> {
+pub(super) fn extract_once_tuple_int32(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i32> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -4343,7 +3386,7 @@ fn extract_once_tuple_int32(r: &DecodedOnceRecord, function_name: &str, idx: usi
     }
 }
 
-fn extract_once_tuple_int16(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i16> {
+pub(super) fn extract_once_tuple_int16(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i16> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -4354,7 +3397,7 @@ fn extract_once_tuple_int16(r: &DecodedOnceRecord, function_name: &str, idx: usi
     }
 }
 
-fn extract_once_tuple_int256_string(
+pub(super) fn extract_once_tuple_int256_string(
     r: &DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4369,7 +3412,7 @@ fn extract_once_tuple_int256_string(
     }
 }
 
-fn extract_once_tuple_bool(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<bool> {
+pub(super) fn extract_once_tuple_bool(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<bool> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Bool(val) => Some(*val),
@@ -4379,7 +3422,7 @@ fn extract_once_tuple_bool(r: &DecodedOnceRecord, function_name: &str, idx: usiz
     }
 }
 
-fn extract_once_tuple_bytes32<'a>(
+pub(super) fn extract_once_tuple_bytes32<'a>(
     r: &'a DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4396,7 +3439,7 @@ fn extract_once_tuple_bytes32<'a>(
     }
 }
 
-fn extract_once_tuple_string<'a>(
+pub(super) fn extract_once_tuple_string<'a>(
     r: &'a DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4410,7 +3453,7 @@ fn extract_once_tuple_string<'a>(
     }
 }
 
-fn extract_once_tuple_bytes<'a>(
+pub(super) fn extract_once_tuple_bytes<'a>(
     r: &'a DecodedOnceRecord,
     function_name: &str,
     idx: usize,
@@ -4425,63 +3468,3 @@ fn extract_once_tuple_bytes<'a>(
     }
 }
 
-/// Build result HashMap based on output type
-pub(crate) fn build_result_map(
-    value: &DecodedValue,
-    output_type: &EvmType,
-    function_name: &str,
-) -> HashMap<String, DecodedValue> {
-    let mut result = HashMap::new();
-    match output_type {
-        EvmType::Named { name, .. } => {
-            result.insert(name.clone(), value.clone());
-        }
-        EvmType::NamedTuple(fields) => {
-            if let DecodedValue::NamedTuple(named_values) = value {
-                for ((field_name, _), (_, val)) in fields.iter().zip(named_values.iter()) {
-                    result.insert(field_name.clone(), val.clone());
-                }
-            }
-        }
-        _ => {
-            result.insert(function_name.to_string(), value.clone());
-        }
-    }
-    result
-}
-
-/// Convert a DecodedCallRecord to a TransformDecodedCall
-fn convert_to_transform_call(
-    record: &DecodedCallRecord,
-    source_name: &str,
-    function_name: &str,
-    output_type: &EvmType,
-) -> TransformDecodedCall {
-    TransformDecodedCall {
-        block_number: record.block_number,
-        block_timestamp: record.block_timestamp,
-        contract_address: record.contract_address,
-        source_name: source_name.to_string(),
-        function_name: function_name.to_string(),
-        trigger_log_index: None,
-        result: build_result_map(&record.decoded_value, output_type, function_name),
-    }
-}
-
-/// Convert a DecodedEventCallRecord to a TransformDecodedCall
-fn convert_event_call_to_transform_call(
-    record: &DecodedEventCallRecord,
-    source_name: &str,
-    function_name: &str,
-    output_type: &EvmType,
-) -> TransformDecodedCall {
-    TransformDecodedCall {
-        block_number: record.block_number,
-        block_timestamp: record.block_timestamp,
-        contract_address: record.target_address,
-        source_name: source_name.to_string(),
-        function_name: function_name.to_string(),
-        trigger_log_index: Some(record.log_index),
-        result: build_result_map(&record.decoded_value, output_type, function_name),
-    }
-}
