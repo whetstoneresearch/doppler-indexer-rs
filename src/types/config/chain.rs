@@ -9,6 +9,19 @@ use crate::types::config::contract::{
 use crate::types::config::generic::InlineOrPath;
 use crate::types::config::tokens::{load_tokens_from_path, Tokens};
 
+/// RPC client configuration for a chain.
+///
+/// All fields are optional and fall back to defaults in `defaults::rpc`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RpcConfig {
+    /// Max concurrent in-flight RPC requests (default: 100)
+    pub concurrency: Option<usize>,
+    /// Compute units per second rate limit (default: 7500, for Alchemy)
+    pub compute_units_per_second: Option<u32>,
+    /// Max batch size for RPC requests (default: 100)
+    pub batch_size: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChainConfigRaw {
     pub name: String,
@@ -22,6 +35,9 @@ pub struct ChainConfigRaw {
     pub block_receipts_method: Option<String>,
     #[serde(default)]
     pub factory_collections: Option<InlineOrPath<FactoryCollections>>,
+    /// RPC client configuration (rate limiting, concurrency).
+    #[serde(default)]
+    pub rpc: RpcConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +52,8 @@ pub struct ChainConfig {
     pub tokens: Tokens,
     pub block_receipts_method: Option<String>,
     pub factory_collections: FactoryCollections,
+    /// RPC client configuration (rate limiting, concurrency).
+    pub rpc: RpcConfig,
 }
 
 pub fn resolve_chain_config(
@@ -92,5 +110,6 @@ pub fn resolve_chain_config(
         tokens,
         block_receipts_method: raw_config.block_receipts_method,
         factory_collections,
+        rpc: raw_config.rpc,
     })
 }

@@ -6,6 +6,7 @@ mod live;
 mod metrics;
 mod raw_data;
 mod rpc;
+mod runtime;
 mod storage;
 mod transformations;
 mod types;
@@ -30,15 +31,15 @@ use raw_data::historical::factories::{build_factory_matchers, FactoryMessage, Re
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
+use rpc::{UnifiedRpcClient, WsClient};
+use runtime::{build_rpc_client_with_limiter, ChainFeatures, ChainRuntime, CommonChannels};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
 use transformations::{
-    build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteMessage,
-    ReorgMessage, TransformationEngine,
+    build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
+    RangeCompleteMessage, ReorgMessage, TransformationEngine,
 };
 use types::config::chain::ChainConfig;
 use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
-use types::config::eth_call::Frequency;
 use types::config::indexer::IndexerConfig;
 
 fn has_items<T>(opt: &Option<Vec<T>>) -> bool {
@@ -389,126 +390,27 @@ async fn process_chain_live_only(
         }
     }
 
-    // Setup RPC client
-    let rpc_url = env::var(&chain.rpc_url_env_var).with_context(|| {
-        format!(
-            "env var {} not set for chain {}",
-            chain.rpc_url_env_var, chain.name
-        )
-    })?;
-    let http_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
+    // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
+    let runtime = ChainRuntime::build(config, chain).await?;
 
-    // Setup database if transformations enabled
-    let db_pool = if let Some(ref tc) = config.transformations {
-        let database_url = env::var(&tc.database_url_env_var).with_context(|| {
-            format!(
-                "env var {} not set for transformations",
-                tc.database_url_env_var
-            )
-        })?;
-
-        let pool = DbPool::new(&database_url)
-            .await
-            .context("failed to create database pool")?;
-        pool.run_migrations()
-            .await
-            .context("failed to run database migrations")?;
-
-        tracing::info!("Database pool initialized for live mode");
-        Some(Arc::new(pool))
-    } else {
-        None
-    };
-
-    // Build transformation registry
-    let registry = build_registry();
-    let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
-
-    // Create progress tracker if transformations enabled
-    let progress_tracker = if transformations_enabled {
-        let tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
-            chain.chain_id as i64,
-            db_pool.clone(),
-            chain.name.clone(),
-        )));
-
-        // Register all handlers
-        {
-            let mut t = tracker.lock().await;
-            for handler in registry.all_handlers() {
-                t.register_handler(&handler.handler_key());
-            }
-        }
-        tracing::info!(
-            "Registered {} handlers with live progress tracker",
-            registry.all_handlers().len()
-        );
-
-        Some(tracker)
-    } else {
-        None
-    };
-
-    // Check if decoding is needed
-    let has_events = chain.contracts.values().any(|c| {
-        has_items(&c.events)
-            || c.factories
-                .as_ref()
-                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.events)))
-    });
-
-    // Check if eth_calls are configured
-    let has_calls = chain.contracts.values().any(|c| {
-        has_items(&c.calls)
-            || c.factories
-                .as_ref()
-                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.calls)))
-    });
-
-    // Setup transformation channels
-    let channel_cap = config
-        .raw_data_collection
-        .channel_capacity
-        .unwrap_or(raw_data_defaults::CHANNEL_CAPACITY);
-
-    let (transform_events_tx, transform_events_rx) =
-        optional_channel::<DecodedEventsMessage>(transformations_enabled, channel_cap);
-    let (transform_calls_tx, transform_calls_rx) =
-        optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
-    let (transform_complete_tx, transform_complete_rx) =
-        optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
-    let (transform_reorg_tx, transform_reorg_rx) =
-        optional_channel::<ReorgMessage>(transformations_enabled, channel_cap);
-    let (transform_retry_tx, transform_retry_rx) =
-        optional_channel::<TransformRetryRequest>(transformations_enabled, 100);
-
-    // Setup decoder channels
-    let (log_decoder_tx, log_decoder_rx) = if has_events {
-        let (tx, rx) = mpsc::channel(1000);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let (eth_call_decoder_tx, eth_call_decoder_rx) = if has_calls {
-        let (tx, rx) = mpsc::channel(1000);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    // Build channels with config-derived capacity
+    let channels = CommonChannels::build_for_live_only(
+        config,
+        &runtime.features,
+        runtime.transformations_enabled,
+    );
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     // Spawn transformation engine if enabled
-    if transformations_enabled {
-        let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
+    if runtime.transformations_enabled {
+        let rpc_client = Arc::new(runtime.build_additional_client()?);
         let tc = config.transformations.as_ref().unwrap();
 
-        let handler_count = registry.handler_count();
-        let retry_rx = transform_retry_rx;
+        let handler_count = runtime.registry.handler_count();
         let engine = TransformationEngine::new(
-            Arc::new(registry),
-            db_pool.clone().unwrap(),
+            runtime.registry.clone(),
+            runtime.db_pool.clone().unwrap(),
             rpc_client,
             chain.name.clone(),
             chain.chain_id,
@@ -516,9 +418,9 @@ async fn process_chain_live_only(
             chain.contracts.clone(),
             chain.factory_collections.clone(),
             tc.handler_concurrency,
-            progress_tracker.clone(),
-            has_events,
-            has_calls,
+            runtime.progress_tracker.clone(),
+            runtime.features.has_events,
+            runtime.features.has_calls,
         )
         .await
         .context("failed to create transformation engine")?;
@@ -534,6 +436,12 @@ async fn process_chain_live_only(
             handler_count
         );
 
+        let transform_events_rx = channels.transform_events_rx;
+        let transform_calls_rx = channels.transform_calls_rx;
+        let transform_complete_rx = channels.transform_complete_rx;
+        let transform_reorg_rx = channels.transform_reorg_rx;
+        let transform_retry_rx = channels.transform_retry_rx;
+
         tasks.spawn(async move {
             engine
                 .run(
@@ -541,7 +449,7 @@ async fn process_chain_live_only(
                     transform_calls_rx.unwrap(),
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
-                    retry_rx,
+                    transform_retry_rx,
                     None, // No decode catchup signal in live-only mode
                 )
                 .await
@@ -549,9 +457,18 @@ async fn process_chain_live_only(
         });
     }
 
+    // Clone senders before channels are consumed
+    let transform_events_tx = channels.transform_events_tx.clone();
+    let transform_calls_tx = channels.transform_calls_tx.clone();
+    let transform_complete_tx = channels.transform_complete_tx.clone();
+    let transform_reorg_tx = channels.transform_reorg_tx.clone();
+    let transform_retry_tx = channels.transform_retry_tx.clone();
+    let log_decoder_tx = channels.log_decoder_tx.clone();
+    let eth_call_decoder_tx = channels.call_decoder_tx.clone();
+
     // Spawn decoder task for live mode (if events are configured)
-    if let Some(rx) = log_decoder_rx {
-        let chain = Arc::new(chain.clone());
+    if let Some(rx) = channels.log_decoder_rx {
+        let chain = runtime.chain.clone();
         let cfg = config.raw_data_collection.clone();
         let transform_events_tx = transform_events_tx.clone();
         let transform_complete_tx = transform_complete_tx.clone();
@@ -571,8 +488,8 @@ async fn process_chain_live_only(
     }
 
     // Spawn eth_call decoder task for live mode (if calls are configured)
-    if let Some(rx) = eth_call_decoder_rx {
-        let chain = Arc::new(chain.clone());
+    if let Some(rx) = channels.call_decoder_rx {
+        let chain = runtime.chain.clone();
         let cfg = config.raw_data_collection.clone();
         let transform_calls_tx = transform_calls_tx.clone();
         let transform_complete_tx = transform_complete_tx.clone();
@@ -602,15 +519,15 @@ async fn process_chain_live_only(
 
     // Spawn live mode directly (no historical processing)
     spawn_live_mode(
-        Arc::new(chain.clone()),
+        runtime.chain.clone(),
         config,
-        http_client,
-        db_pool,
+        runtime.http_client.clone(),
+        runtime.db_pool.clone(),
         log_decoder_tx,
         eth_call_decoder_tx,
         transform_reorg_tx,
         transform_retry_tx,
-        progress_tracker,
+        runtime.progress_tracker.clone(),
         Some(storage_manager),
         &mut tasks,
     )
@@ -640,61 +557,17 @@ async fn process_chain(
     })?;
 
     // Feature detection
-    let has_factories = chain.contracts.values().any(|c| has_items(&c.factories));
+    let features = ChainFeatures::detect(chain, config);
+    features.log_summary(&chain.name);
 
-    let contract_logs_only = config
-        .raw_data_collection
-        .contract_logs_only
-        .unwrap_or(false);
-
-    let needs_factory_filtering = has_factories && contract_logs_only;
-
-    let has_factory_calls = chain.contracts.values().any(|c| {
-        c.factories
-            .as_ref()
-            .is_some_and(|factories| factories.iter().any(|f| has_items(&f.calls)))
-    });
-
-    let has_event_triggered_calls = chain.contracts.values().any(|c| {
-        c.calls.as_ref().is_some_and(|calls| {
-            calls
-                .iter()
-                .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
-        }) || c.factories.as_ref().is_some_and(|factories| {
-            factories.iter().any(|f| {
-                f.calls.as_ref().is_some_and(|calls| {
-                    calls
-                        .iter()
-                        .any(|call| matches!(call.frequency, Frequency::OnEvents(_)))
-                })
-            })
-        })
-    });
-
-    let has_events = chain.contracts.values().any(|c| {
-        has_items(&c.events)
-            || c.factories
-                .as_ref()
-                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.events)))
-    });
-
-    let has_calls = chain.contracts.values().any(|c| {
-        has_items(&c.calls)
-            || c.factories
-                .as_ref()
-                .is_some_and(|f| f.iter().any(|fc| has_items(&fc.calls)))
-    });
-
-    tracing::info!(
-        "Chain {} - has_factories: {}, contract_logs_only: {}, has_factory_calls: {}, has_event_triggered_calls: {}",
-        chain.name, has_factories, contract_logs_only, has_factory_calls, has_event_triggered_calls
-    );
-    tracing::info!(
-        "Chain {} - decode_logs: {}, decode_calls: {}",
-        chain.name,
-        has_events,
-        has_calls
-    );
+    // Extract feature flags for easier access
+    let has_factories = features.has_factories;
+    let has_events = features.has_events;
+    let has_calls = features.has_calls;
+    let has_factory_calls = features.has_factory_calls;
+    let has_event_triggered_calls = features.has_event_triggered_calls;
+    let needs_factory_filtering = features.needs_factory_filtering;
+    let needs_recollect = features.needs_recollect;
 
     // Channel setup
     let channel_cap = config
@@ -722,7 +595,6 @@ async fn process_chain(
     let (call_decoder_tx, call_decoder_rx) =
         optional_channel::<DecoderMessage>(has_calls, channel_cap);
     // Recollect channel is needed by both factory collector and log decoder
-    let needs_recollect = has_factories || has_events;
     let (recollect_tx, recollect_rx) =
         optional_channel::<RecollectRequest>(needs_recollect, channel_cap);
 
@@ -798,56 +670,55 @@ async fn process_chain(
     // Shared state for spawned tasks
     let chain = Arc::new(chain.clone());
 
-    // RPC configuration from environment variables
-    let rpc_concurrency: usize = env::var("RPC_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(rpc_defaults::CONCURRENCY);
-
-    let alchemy_cu_per_second: u32 = env::var("ALCHEMY_CU_PER_SECOND")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    // RPC configuration from per-chain config (not env vars)
+    let rpc_concurrency = chain.rpc.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
+    let cu_per_second = chain
+        .rpc
+        .compute_units_per_second
         .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
-    // Allow overriding batch size via env var for larger concurrent fetches
-    let rpc_batch_size: Option<u32> = env::var("RPC_BATCH_SIZE").ok().and_then(|s| s.parse().ok());
+    // Use batch size from chain.rpc, falling back to raw_data_collection config, then defaults
+    let rpc_batch_size = chain
+        .rpc
+        .batch_size
+        .or(config.raw_data_collection.rpc_batch_size)
+        .unwrap_or(rpc_defaults::MAX_BATCH_SIZE);
 
-    // Apply env var overrides to raw_config
+    // Apply the computed batch size to raw_config so collectors use it
     let mut raw_config = config.raw_data_collection.clone();
-    if let Some(batch_size) = rpc_batch_size {
-        raw_config.rpc_batch_size = Some(batch_size);
-    }
+    raw_config.rpc_batch_size = Some(rpc_batch_size);
     let raw_config = Arc::new(raw_config);
 
     tracing::info!(
-        "RPC config: concurrency={}, alchemy_cu_per_second={}, batch_size={}",
+        "RPC config: concurrency={}, cu_per_second={}, batch_size={}",
         rpc_concurrency,
-        alchemy_cu_per_second,
-        raw_config
-            .rpc_batch_size
-            .unwrap_or(rpc_defaults::MAX_BATCH_SIZE)
+        cu_per_second,
+        rpc_batch_size
     );
 
     // Create shared rate limiter for account-level rate limiting across all clients
-    let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(alchemy_cu_per_second));
+    let shared_limiter = Arc::new(rpc::SlidingWindowRateLimiter::new(cu_per_second));
 
     // Pre-create RPC clients with shared rate limiter
     let blocks_client = UnifiedRpcClient::from_url_with_options(
         &rpc_url,
-        alchemy_cu_per_second,
+        cu_per_second,
         rpc_concurrency,
+        rpc_batch_size as usize,
         Some(shared_limiter.clone()),
     )?;
     let receipts_client = UnifiedRpcClient::from_url_with_options(
         &rpc_url,
-        alchemy_cu_per_second,
+        cu_per_second,
         rpc_concurrency,
+        rpc_batch_size as usize,
         Some(shared_limiter.clone()),
     )?;
     let eth_calls_client = UnifiedRpcClient::from_url_with_options(
         &rpc_url,
-        alchemy_cu_per_second,
+        cu_per_second,
         rpc_concurrency,
+        rpc_batch_size as usize,
         Some(shared_limiter.clone()),
     )?;
 
@@ -887,9 +758,14 @@ async fn process_chain(
         None
     };
 
-    // Create HTTP client for live mode (if enabled)
+    // Create HTTP client for live mode (if enabled) - shares rate limiter
     let http_client_for_live = if should_enable_live_mode(config, &chain) {
-        Some(Arc::new(UnifiedRpcClient::from_url(&rpc_url)?))
+        Some(Arc::new(build_rpc_client_with_limiter(
+            &rpc_url,
+            &chain.rpc,
+            rpc_batch_size as usize,
+            shared_limiter.clone(),
+        )?))
     } else {
         None
     };
@@ -1127,7 +1003,7 @@ async fn process_chain(
     // Register handlers with progress tracker
     if let Some(ref tracker) = progress_tracker {
         let mut t = tracker.lock().await;
-        for handler in registry.all_handlers() {
+        for handler in registry.all_handlers().iter() {
             t.register_handler(&handler.handler_key());
         }
         tracing::info!(
@@ -1140,7 +1016,12 @@ async fn process_chain(
     let mut live_tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     if transformations_enabled {
-        let rpc_client = Arc::new(UnifiedRpcClient::from_url(&rpc_url)?);
+        let rpc_client = Arc::new(build_rpc_client_with_limiter(
+            &rpc_url,
+            &chain.rpc,
+            rpc_batch_size as usize,
+            shared_limiter.clone(),
+        )?);
         let tc = config.transformations.as_ref().unwrap();
         let mode = if tc.mode.batch_for_catchup {
             ExecutionMode::Batch {
@@ -1301,6 +1182,13 @@ async fn spawn_live_mode(
     let ws_url = env::var(ws_env_var)
         .with_context(|| format!("env var {} not set for chain {}", ws_env_var, chain.name))?;
 
+    // Use batch size from chain.rpc, falling back to raw_data_collection config, then defaults
+    let rpc_batch_size = chain
+        .rpc
+        .batch_size
+        .or(config.raw_data_collection.rpc_batch_size)
+        .unwrap_or(rpc_defaults::MAX_BATCH_SIZE);
+
     // Build live mode config
     let live_config = LiveModeConfig {
         reorg_depth: config
@@ -1387,10 +1275,7 @@ async fn spawn_live_mode(
             &chain,
             http_client.clone(),
             multicall3_address,
-            config
-                .raw_data_collection
-                .rpc_batch_size
-                .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize,
+            rpc_batch_size as usize,
         );
         if collector.has_calls() {
             Some(collector)

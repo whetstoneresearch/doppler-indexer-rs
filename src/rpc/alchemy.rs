@@ -341,11 +341,13 @@ impl AlchemyClient {
         url: &str,
         compute_units_per_second: u32,
         rpc_concurrency: usize,
+        max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
     ) -> Result<Self, RpcError> {
         let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
-        let config =
-            AlchemyConfig::new(url, compute_units_per_second).with_rpc_concurrency(rpc_concurrency);
+        let config = AlchemyConfig::new(url, compute_units_per_second)
+            .with_rpc_concurrency(rpc_concurrency)
+            .with_batch_size(max_batch_size);
         Self::new_with_limiter(config, shared_limiter)
     }
 

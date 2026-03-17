@@ -1577,6 +1577,7 @@ mod tests {
             tokens: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),
+            rpc: Default::default(),
         }
     }
 
