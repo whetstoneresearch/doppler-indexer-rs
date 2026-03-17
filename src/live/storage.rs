@@ -415,7 +415,9 @@ impl LiveStorage {
 
     /// Delete status for a block.
     pub fn delete_status(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete(&self.status_path(block_number))
+        let path = self.status_path(block_number);
+        safe_delete(&path)?;
+        safe_delete(&path.with_extension("json.lock"))
     }
 
     // =========================================================================

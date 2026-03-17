@@ -942,13 +942,11 @@ impl LiveCollector {
         self.storage.delete_eth_calls(block_number)?;
         self.storage.delete_all_decoded_calls(block_number)?;
         self.storage.delete_snapshots(block_number)?;
-        self.clear_persisted_progress(block_number).await?;
 
         let mut status = self.storage.read_status(block_number)?;
         status.eth_calls_collected = false;
         status.eth_calls_decoded = false;
         status.transformed = false;
-        status.completed_handlers.clear();
         status.failed_handlers.clear();
         status.apply_expectations(&self.expectations);
         self.storage.write_status(block_number, &status)?;
