@@ -20,6 +20,12 @@ pub struct Beneficiary {
     shares: u64,
 }
 
+impl Beneficiary {
+    pub fn new(beneficiary: [u8; 20], shares: u64) -> Self {
+        Self { beneficiary, shares }
+    }
+}
+
 pub type BeneficiariesData = Vec<Beneficiary>;
 
 pub fn insert_pool(
