@@ -975,15 +975,24 @@ impl TransformationEngine {
         let mut read_tasks = JoinSet::new();
 
         for (source_name, function_name) in call_triggers {
-            let file_path = self
+            let base_dir = self
                 .decoded_calls_dir
                 .join(source_name)
-                .join(function_name)
-                .join(&file_name);
+                .join(function_name);
 
-            if !file_path.exists() {
-                continue;
-            }
+            // Check base path, then subdirectories (on_events/, once/)
+            let file_path = [
+                base_dir.join(&file_name),
+                base_dir.join("on_events").join(&file_name),
+                base_dir.join("once").join(&file_name),
+            ]
+            .into_iter()
+            .find(|p| p.exists());
+
+            let file_path = match file_path {
+                Some(p) => p,
+                None => continue,
+            };
 
             let reader = self.historical_reader.clone();
             let src = source_name.clone();
