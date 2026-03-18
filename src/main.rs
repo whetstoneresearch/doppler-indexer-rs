@@ -83,9 +83,16 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let decode_only = args.iter().any(|a| a == "--decode-only");
     let live_only = args.iter().any(|a| a == "--live-only");
+    let catch_up_only = args.iter().any(|a| a == "--catch-up-only");
 
     if live_only && decode_only {
         anyhow::bail!("Cannot use --live-only and --decode-only together");
+    }
+    if catch_up_only && live_only {
+        anyhow::bail!("Cannot use --catch-up-only and --live-only together");
+    }
+    if catch_up_only && decode_only {
+        anyhow::bail!("Cannot use --catch-up-only and --decode-only together");
     }
 
     let config = IndexerConfig::load(Path::new("config/config.json"))?;
@@ -239,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Running in decode-only mode (no collection, no transformations)");
     } else if live_only {
         tracing::info!("Running in live-only mode (skips historical processing)");
+    } else if catch_up_only {
+        tracing::info!("Running in catch-up-only mode (fills gaps in existing data, no live mode)");
     }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
@@ -249,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         } else if decode_only {
             decode_only_chain(&config, chain).await?;
         } else {
-            process_chain(&config, chain, storage_manager.clone()).await?;
+            process_chain(&config, chain, storage_manager.clone(), catch_up_only).await?;
         }
     }
 
@@ -546,6 +555,7 @@ async fn process_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
     storage_manager: Arc<StorageManager>,
+    catch_up_only: bool,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
 
@@ -746,20 +756,22 @@ async fn process_chain(
     };
 
     // Clone for live mode transition (before originals are moved)
-    let log_decoder_tx_for_live = if has_events && should_enable_live_mode(config, &chain) {
-        log_decoder_tx.clone()
-    } else {
-        None
-    };
+    let log_decoder_tx_for_live =
+        if !catch_up_only && has_events && should_enable_live_mode(config, &chain) {
+            log_decoder_tx.clone()
+        } else {
+            None
+        };
 
-    let eth_call_decoder_tx_for_live = if has_calls && should_enable_live_mode(config, &chain) {
-        call_decoder_tx.clone()
-    } else {
-        None
-    };
+    let eth_call_decoder_tx_for_live =
+        if !catch_up_only && has_calls && should_enable_live_mode(config, &chain) {
+            call_decoder_tx.clone()
+        } else {
+            None
+        };
 
     // Create HTTP client for live mode (if enabled) - shares rate limiter
-    let http_client_for_live = if should_enable_live_mode(config, &chain) {
+    let http_client_for_live = if !catch_up_only && should_enable_live_mode(config, &chain) {
         Some(Arc::new(build_rpc_client_with_limiter(
             &rpc_url,
             &chain.rpc,
@@ -772,6 +784,17 @@ async fn process_chain(
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
+    // In catch-up-only mode, drop the block and eth_call senders so the current
+    // phases (which read from these channels) see closed channels and exit
+    // immediately after catchup completes.
+    let (block_tx_for_collector, eth_call_tx_for_collector) = if catch_up_only {
+        drop(block_tx);
+        drop(eth_call_tx);
+        (None, None)
+    } else {
+        (Some(block_tx), Some(eth_call_tx))
+    };
+
     tasks.spawn({
         let (chain, cfg) = (chain.clone(), raw_config.clone());
         let s3_manifest = storage_manager.manifest_for(&chain.name);
@@ -781,8 +804,8 @@ async fn process_chain(
                 &chain,
                 &blocks_client,
                 &cfg,
-                Some(block_tx),
-                Some(eth_call_tx),
+                block_tx_for_collector,
+                eth_call_tx_for_collector,
                 s3_manifest.as_ref(),
                 Some(sm),
             )
@@ -982,6 +1005,12 @@ async fn process_chain(
         });
     }
 
+    // In catch-up-only mode, drop recollect_tx so the receipt current phase
+    // (which waits for this channel to close) can exit after catchup data is processed.
+    if catch_up_only {
+        drop(recollect_tx);
+    }
+
     // Clone db_pool for live mode before it's potentially consumed by transformation engine
     let db_pool_for_live = if should_enable_live_mode(config, &chain) {
         db_pool.clone()
@@ -990,15 +1019,16 @@ async fn process_chain(
     };
 
     // Create progress tracker for live mode (must be before engine creation so we can pass it)
-    let progress_tracker = if should_enable_live_mode(config, &chain) && db_pool.is_some() {
-        Some(Arc::new(Mutex::new(LiveProgressTracker::new(
-            chain.chain_id as i64,
-            db_pool.clone(),
-            chain.name.clone(),
-        ))))
-    } else {
-        None
-    };
+    let progress_tracker =
+        if !catch_up_only && should_enable_live_mode(config, &chain) && db_pool.is_some() {
+            Some(Arc::new(Mutex::new(LiveProgressTracker::new(
+                chain.chain_id as i64,
+                db_pool.clone(),
+                chain.name.clone(),
+            ))))
+        } else {
+            None
+        };
 
     // Register handlers with progress tracker
     if let Some(ref tracker) = progress_tracker {
@@ -1084,7 +1114,16 @@ async fn process_chain(
     tracing::info!("Completed historical processing for chain {}", chain.name);
 
     // Transition to live mode (default behavior unless explicitly disabled)
-    if should_enable_live_mode(config, &chain) {
+    if catch_up_only {
+        tracing::info!(
+            "Catch-up-only mode complete for chain {}, skipping live mode",
+            chain.name
+        );
+        // Wait for transformation engine to finish processing catchup data
+        while let Some(result) = live_tasks.join_next().await {
+            result.context("transformation engine task panicked")??;
+        }
+    } else if should_enable_live_mode(config, &chain) {
         tracing::info!("Historical processing complete, transitioning to live mode");
         spawn_live_mode(
             chain.clone(),
