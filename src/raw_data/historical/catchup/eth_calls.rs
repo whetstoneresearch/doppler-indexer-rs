@@ -652,6 +652,12 @@ pub async fn collect_eth_calls(
             let mut needs_processing = false;
             for (_, configs) in &event_call_configs {
                 for config in configs {
+                    // Range is entirely before this config's start_block — no output needed
+                    if let Some(sb) = config.start_block {
+                        if log_range.end <= sb {
+                            continue;
+                        }
+                    }
                     if !event_output_exists(
                         &base_output_dir,
                         &config.contract_name,

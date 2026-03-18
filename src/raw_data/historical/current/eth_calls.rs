@@ -238,6 +238,10 @@ pub async fn collect_eth_calls(
                             let configured_pairs: std::collections::HashSet<(String, String)> = state.event_call_configs
                                 .values()
                                 .flatten()
+                                .filter(|c| match c.start_block {
+                                    Some(sb) => range_end > sb,
+                                    None => true,
+                                })
                                 .map(|c| (c.contract_name.clone(), c.function_name.clone()))
                                 .collect();
 
@@ -675,6 +679,10 @@ pub async fn collect_eth_calls(
                         let configured_pairs: std::collections::HashSet<(String, String)> = state.event_call_configs
                             .values()
                             .flatten()
+                            .filter(|c| match c.start_block {
+                                Some(sb) => range_end > sb,
+                                None => true,
+                            })
                             .map(|c| (c.contract_name.clone(), c.function_name.clone()))
                             .collect();
 
