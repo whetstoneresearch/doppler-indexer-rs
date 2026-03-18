@@ -34,10 +34,7 @@ use raw_data::historical::receipts::{
 use rpc::{UnifiedRpcClient, WsClient};
 use runtime::{build_rpc_client_with_limiter, ChainFeatures, ChainRuntime, CommonChannels};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
-use transformations::{
-    build_registry, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
-    RangeCompleteMessage, ReorgMessage, TransformationEngine,
-};
+use transformations::{build_registry, ExecutionMode, ReorgMessage, TransformationEngine};
 use types::config::chain::ChainConfig;
 use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use types::config::indexer::IndexerConfig;
@@ -600,10 +597,6 @@ async fn process_chain(
         optional_channel::<FactoryMessage>(has_factory_calls, factory_cap);
     let (event_trigger_tx, event_trigger_rx) =
         optional_channel::<EventTriggerMessage>(has_event_triggered_calls, channel_cap);
-    let (log_decoder_tx, log_decoder_rx) =
-        optional_channel::<DecoderMessage>(has_events, channel_cap);
-    let (call_decoder_tx, call_decoder_rx) =
-        optional_channel::<DecoderMessage>(has_calls, channel_cap);
     // Recollect channel is needed by both factory collector and log decoder
     let (recollect_tx, recollect_rx) =
         optional_channel::<RecollectRequest>(needs_recollect, channel_cap);
@@ -635,25 +628,24 @@ async fn process_chain(
     let registry = build_registry();
     let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
-    let (transform_events_tx, transform_events_rx) =
-        optional_channel::<DecodedEventsMessage>(transformations_enabled, channel_cap);
-    let (transform_calls_tx, transform_calls_rx) =
-        optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
-    let (transform_complete_tx, transform_complete_rx) =
-        optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
-    // Reorg channel for live mode cleanup of pending events
-    let (transform_reorg_tx, transform_reorg_rx) =
-        optional_channel::<ReorgMessage>(transformations_enabled, channel_cap);
-    let (transform_retry_tx, transform_retry_rx) =
-        optional_channel::<TransformRetryRequest>(transformations_enabled, 100);
-
-    // Decode catchup must complete before transformation engine catchup
-    let (decode_catchup_done_tx, decode_catchup_done_rx) = if transformations_enabled && has_calls {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let CommonChannels {
+        log_decoder_tx,
+        log_decoder_rx,
+        call_decoder_tx,
+        call_decoder_rx,
+        transform_events_tx,
+        transform_events_rx,
+        transform_calls_tx,
+        transform_calls_rx,
+        transform_complete_tx,
+        transform_complete_rx,
+        transform_reorg_tx,
+        transform_reorg_rx,
+        transform_retry_tx,
+        transform_retry_rx,
+        decode_catchup_done_tx,
+        decode_catchup_done_rx,
+    } = CommonChannels::build_for_full(config, &features, transformations_enabled);
 
     let db_pool = if transformations_enabled {
         let tc = config.transformations.as_ref().unwrap();
