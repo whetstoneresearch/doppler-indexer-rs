@@ -8,7 +8,7 @@ use std::sync::RwLock;
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, Int8Array,
-    StringArray, UInt32Array, UInt64Array, UInt8Array,
+    ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -463,8 +463,14 @@ fn batch_to_calls(
     let block_timestamps = get_u64_column(&batch, "block_timestamp")?;
     let addresses = get_address_column(&batch, "address")?;
 
-    // Get result columns
-    let standard_cols = ["block_number", "block_timestamp", "address"];
+    // Extract log_index if present (event-triggered calls have this column)
+    let log_indices = batch
+        .column_by_name("log_index")
+        .map(|_| get_u32_column(&batch, "log_index"))
+        .transpose()?;
+
+    // Get result columns (exclude standard + log_index)
+    let standard_cols = ["block_number", "block_timestamp", "address", "log_index"];
     let schema = batch.schema();
     let result_columns: Vec<_> = schema
         .fields()
@@ -480,7 +486,13 @@ fn batch_to_calls(
 
         for (col_idx, field) in &result_columns {
             if let Some(value) = extract_value_from_batch(&batch, *col_idx, row)? {
-                result.insert(field.name().clone(), value);
+                // Map generic "decoded_value" column to the function name for handler access
+                let key = if field.name() == "decoded_value" {
+                    function_name.to_string()
+                } else {
+                    field.name().clone()
+                };
+                result.insert(key, value);
             }
         }
 
@@ -490,7 +502,7 @@ fn batch_to_calls(
             contract_address: addresses[row],
             source_name: source_name.to_string(),
             function_name: function_name.to_string(),
-            trigger_log_index: None,
+            trigger_log_index: log_indices.as_ref().map(|indices| indices[row]),
             result,
         });
     }
@@ -625,6 +637,27 @@ fn extract_value_from_batch(
         };
     }
 
+    // List(Struct(...)) → Array of NamedTuple/UnnamedTuple
+    if let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() {
+        let offsets = list_arr.offsets();
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        let values = list_arr.values();
+
+        if let Some(struct_arr) = values.as_any().downcast_ref::<StructArray>() {
+            let mut elements = Vec::with_capacity(end - start);
+            for i in start..end {
+                elements.push(extract_struct_value(struct_arr, i)?);
+            }
+            return Ok(Some(DecodedValue::Array(elements)));
+        }
+    }
+
+    // Standalone Struct → NamedTuple/UnnamedTuple
+    if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
+        return Ok(Some(extract_struct_value(struct_arr, row)?));
+    }
+
     // Unknown type - log warning so we don't silently drop data
     let schema = batch.schema();
     let field_name = schema.field(col_idx).name();
@@ -635,6 +668,103 @@ fn extract_value_from_batch(
         "Unhandled Arrow data type in extract_value_from_batch - value will be dropped"
     );
     Ok(None)
+}
+
+/// Extract a single row from a StructArray into a DecodedValue.
+/// Fields with numeric names ("0", "1", ...) produce UnnamedTuple, otherwise NamedTuple.
+fn extract_struct_value(
+    struct_arr: &StructArray,
+    row: usize,
+) -> Result<DecodedValue, TransformationError> {
+    let fields = struct_arr.fields();
+    let is_unnamed = fields.iter().all(|f| f.name().parse::<usize>().is_ok());
+
+    let mut values = Vec::with_capacity(fields.len());
+    for (col_idx, field) in fields.iter().enumerate() {
+        let col = struct_arr.column(col_idx);
+        let val = extract_value_from_array(col.as_ref(), row)?;
+        values.push((field.name().clone(), val));
+    }
+
+    if is_unnamed {
+        Ok(DecodedValue::UnnamedTuple(
+            values.into_iter().map(|(_, v)| v).collect(),
+        ))
+    } else {
+        Ok(DecodedValue::NamedTuple(values))
+    }
+}
+
+/// Extract a value from an Arrow array at the given row index.
+fn extract_value_from_array(
+    col: &dyn Array,
+    row: usize,
+) -> Result<DecodedValue, TransformationError> {
+    if col.is_null(row) {
+        return Ok(DecodedValue::String("null".to_string()));
+    }
+
+    if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(DecodedValue::Uint64(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+        return Ok(DecodedValue::Int64(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<UInt32Array>() {
+        return Ok(DecodedValue::Uint32(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+        return Ok(DecodedValue::Int32(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
+        return Ok(DecodedValue::Int8(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<UInt8Array>() {
+        return Ok(DecodedValue::Uint8(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(DecodedValue::Bool(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(DecodedValue::String(arr.value(row).to_string()));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(DecodedValue::Bytes(arr.value(row).to_vec()));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+        let bytes = arr.value(row);
+        return match bytes.len() {
+            20 => {
+                let addr: [u8; 20] = bytes.try_into().unwrap();
+                Ok(DecodedValue::Address(addr))
+            }
+            32 => {
+                let hash: [u8; 32] = bytes.try_into().unwrap();
+                Ok(DecodedValue::Bytes32(hash))
+            }
+            _ => Ok(DecodedValue::Bytes(bytes.to_vec())),
+        };
+    }
+    if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
+        return Ok(extract_struct_value(struct_arr, row)?);
+    }
+    if let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() {
+        let offsets = list_arr.offsets();
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        let values = list_arr.values();
+        let mut elements = Vec::with_capacity(end - start);
+        for i in start..end {
+            elements.push(extract_value_from_array(values.as_ref(), i)?);
+        }
+        return Ok(DecodedValue::Array(elements));
+    }
+
+    tracing::warn!(
+        data_type = ?col.data_type(),
+        "Unhandled Arrow data type in struct field extraction"
+    );
+    Ok(DecodedValue::String("unsupported".to_string()))
 }
 
 #[cfg(test)]
