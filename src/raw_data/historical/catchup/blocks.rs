@@ -36,6 +36,7 @@ pub async fn collect_blocks(
     eth_call_sender: Option<Sender<(u64, u64)>>,
     s3_manifest: Option<&S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
+    catch_up_only: bool,
 ) -> Result<(), BlockCollectionError> {
     let output_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain.name));
     std::fs::create_dir_all(&output_dir)?;
@@ -52,9 +53,33 @@ pub async fn collect_blocks(
         start_block
     );
 
+    // In catch-up-only mode, only fill gaps within existing data — don't extend
+    // to chain head. The upper bound is the highest block in existing files.
+    let effective_head = if catch_up_only {
+        let existing = scan_existing_parquet_files(&output_dir);
+        let max_existing = highest_block_from_files(&existing, s3_manifest);
+        match max_existing {
+            Some(max) => {
+                tracing::info!(
+                    "Catch-up-only mode: limiting block collection to existing frontier (block {})",
+                    max,
+                );
+                max
+            }
+            None => {
+                tracing::info!(
+                    "Catch-up-only mode: no existing block data found, nothing to catch up"
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        chain_head
+    };
+
     let ranges = compute_ranges_to_fetch(
         start_block,
-        chain_head,
+        effective_head,
         range_size,
         &output_dir,
         s3_manifest,
@@ -373,6 +398,36 @@ fn compute_ranges_to_fetch(
             true
         })
         .collect()
+}
+
+/// Returns the highest block number covered by existing parquet files (local + S3).
+fn highest_block_from_files(
+    local_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
+) -> Option<u64> {
+    let mut max_block: Option<u64> = None;
+
+    // Parse "blocks_{start}-{end}.parquet" file names
+    for name in local_files {
+        if let Some(end_str) = name
+            .strip_prefix("blocks_")
+            .and_then(|s| s.strip_suffix(".parquet"))
+            .and_then(|s| s.split('-').last())
+        {
+            if let Ok(end) = end_str.parse::<u64>() {
+                max_block = Some(max_block.map_or(end, |m: u64| m.max(end)));
+            }
+        }
+    }
+
+    // Also check S3 manifest for block ranges
+    if let Some(manifest) = s3_manifest {
+        if let Some(s3_max) = manifest.max_raw_blocks_block() {
+            max_block = Some(max_block.map_or(s3_max, |m: u64| m.max(s3_max)));
+        }
+    }
+
+    max_block
 }
 
 fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {

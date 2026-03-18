@@ -180,8 +180,9 @@ pub async fn collect_eth_calls(
         }
 
         let mut catchup_count = 0;
+        let total_ranges = block_ranges.len();
 
-        for block_range in &block_ranges {
+        for (idx, block_range) in block_ranges.iter().enumerate() {
             let range = BlockRange {
                 start: block_range.start,
                 end: block_range.end,
@@ -348,7 +349,9 @@ pub async fn collect_eth_calls(
             }
 
             tracing::info!(
-                "Catchup: processing eth_calls for blocks {}-{} from existing block file",
+                "Catchup: processing eth_calls range {}/{} for blocks {}-{} from existing block file",
+                idx + 1,
+                total_ranges,
                 range.start,
                 range.end - 1
             );
@@ -481,6 +484,12 @@ pub async fn collect_eth_calls(
                 catchup_count,
                 chain.name
             );
+        } else {
+            tracing::info!(
+                "eth_calls catchup: all {} block ranges already complete for chain {}",
+                total_ranges,
+                chain.name
+            );
         }
     }
 
@@ -526,9 +535,10 @@ pub async fn collect_eth_calls(
 
         if !factory_catchup_data.is_empty() {
             let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
+            let total_factory_ranges = block_ranges.len();
             let mut factory_once_catchup_count = 0;
 
-            for block_range in &block_ranges {
+            for (idx, block_range) in block_ranges.iter().enumerate() {
                 let range = BlockRange {
                     start: block_range.start,
                     end: block_range.end,
@@ -574,6 +584,13 @@ pub async fn collect_eth_calls(
                 .await?;
 
                 factory_once_catchup_count += 1;
+                tracing::debug!(
+                    "Factory once calls catchup: processed range {}/{} (blocks {}-{})",
+                    idx + 1,
+                    total_factory_ranges,
+                    range.start,
+                    range.end - 1
+                );
             }
 
             if factory_once_catchup_count > 0 {
@@ -582,7 +599,15 @@ pub async fn collect_eth_calls(
                     factory_once_catchup_count,
                     chain.name
                 );
+            } else {
+                tracing::info!(
+                    "Factory once calls catchup: all {} ranges already complete for chain {}",
+                    total_factory_ranges,
+                    chain.name
+                );
             }
+        } else {
+            tracing::info!("Factory once calls catchup: no factory address data found, skipping");
         }
     }
 
@@ -613,6 +638,7 @@ pub async fn collect_eth_calls(
 
         let log_ranges = get_existing_log_ranges(&chain.name, s3_manifest.as_ref());
         let event_matchers = build_event_trigger_matchers(&chain.contracts);
+        let total_log_ranges = log_ranges.len();
         let mut event_catchup_count = 0;
 
         tracing::info!(
@@ -621,7 +647,7 @@ pub async fn collect_eth_calls(
             chain.name
         );
 
-        for log_range in &log_ranges {
+        for (idx, log_range) in log_ranges.iter().enumerate() {
             // Check if output already exists for all event-triggered call configs
             let mut needs_processing = false;
             for (_, configs) in &event_call_configs {
@@ -726,6 +752,13 @@ pub async fn collect_eth_calls(
             }
 
             event_catchup_count += 1;
+            tracing::debug!(
+                "Event-triggered calls catchup: processed range {}/{} (blocks {}-{})",
+                idx + 1,
+                total_log_ranges,
+                log_range.start,
+                log_range.end - 1
+            );
         }
 
         if event_catchup_count > 0 {
@@ -734,8 +767,16 @@ pub async fn collect_eth_calls(
                 event_catchup_count,
                 chain.name
             );
+        } else {
+            tracing::info!(
+                "Event-triggered calls catchup: all {} log ranges already complete for chain {}",
+                total_log_ranges,
+                chain.name
+            );
         }
     }
+
+    tracing::info!("Eth_call collection catchup finished for chain {}", chain.name);
 
     // Signal that all catchup phases are complete
     if let Some(tx) = eth_calls_catchup_done_tx {

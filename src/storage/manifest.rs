@@ -169,6 +169,11 @@ impl S3Manifest {
             .unwrap_or(false)
     }
 
+    /// Return the highest block number across all raw_blocks ranges, if any.
+    pub fn max_raw_blocks_block(&self) -> Option<u64> {
+        self.raw_blocks.iter().map(|(_, end)| *end).max()
+    }
+
     /// Add a raw blocks range.
     pub fn add_raw_blocks(&mut self, start: u64, end: u64) {
         if !self.has_raw_blocks(start, end) {

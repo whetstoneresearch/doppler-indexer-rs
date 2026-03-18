@@ -12,7 +12,7 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::{
     build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet,
     process_range_batches, read_log_batches_from_parquet, scan_existing_parquet_files,
-    FactoryAddressData, FactoryCatchupState, FactoryCollectionError, FactoryMessage,
+    FactoryAddressData, FactoryCatchupState, FactoryCollectionError,
     RecollectRequest,
 };
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
@@ -23,9 +23,7 @@ pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     logs_factory_tx: &Option<Sender<FactoryAddressData>>,
-    eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
-    call_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
     factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     s3_manifest: Option<S3Manifest>,
@@ -57,13 +55,13 @@ pub async fn collect_factories(
                 }
             }
 
-            if let Some(ref tx) = eth_calls_factory_tx {
-                let _ = tx
-                    .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
-                    .await;
-            }
+            // Note: eth_calls_factory_tx and call_decoder_tx sends are intentionally
+            // skipped during catchup. Both consumers load factory addresses from parquet
+            // during their own catchup phases. Sending here would deadlock because those
+            // channels (capacity 1000) aren't consumed until after factory catchup completes.
+            // The channels are used during the live/current phase instead.
 
-            // Send to decoders
+            // Send to log decoder
             let addresses: HashMap<String, Vec<Address>> = factory_data
                 .addresses_by_block
                 .values()
@@ -74,16 +72,6 @@ pub async fn collect_factories(
                 });
 
             if let Some(ref tx) = log_decoder_tx {
-                let _ = tx
-                    .send(DecoderMessage::FactoryAddresses {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                        addresses: addresses.clone(),
-                    })
-                    .await;
-            }
-
-            if let Some(ref tx) = call_decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::FactoryAddresses {
                         range_start: factory_data.range_start,
@@ -314,18 +302,8 @@ pub async fn collect_factories(
                 }
             }
 
-            if let Some(ref tx) = eth_calls_factory_tx {
-                // Send incremental addresses during catchup, then range complete
-                let _ = tx
-                    .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
-                    .await;
-                let _ = tx
-                    .send(FactoryMessage::RangeComplete {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                    })
-                    .await;
-            }
+            // eth_calls_factory_tx and call_decoder_tx sends skipped during catchup
+            // (see comment in existing data forwarding loop above)
 
             let addresses: HashMap<String, Vec<Address>> = factory_data
                 .addresses_by_block
@@ -337,16 +315,6 @@ pub async fn collect_factories(
                 });
 
             if let Some(ref tx) = log_decoder_tx {
-                let _ = tx
-                    .send(DecoderMessage::FactoryAddresses {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                        addresses: addresses.clone(),
-                    })
-                    .await;
-            }
-
-            if let Some(ref tx) = call_decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::FactoryAddresses {
                         range_start: factory_data.range_start,

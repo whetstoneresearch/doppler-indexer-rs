@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -363,16 +365,36 @@ pub async fn catchup_decode_eth_calls(
     }
 
     if work_items.is_empty() {
+        tracing::info!("Eth_call decoding catchup: all files already decoded");
         return Ok(());
     }
 
+    let regular_count = work_items
+        .iter()
+        .filter(|w| matches!(w, CatchupWorkItem::Regular { .. }))
+        .count();
+    let once_count = work_items
+        .iter()
+        .filter(|w| matches!(w, CatchupWorkItem::Once { .. }))
+        .count();
+    let event_count = work_items
+        .iter()
+        .filter(|w| matches!(w, CatchupWorkItem::EventTriggered { .. }))
+        .count();
+
     tracing::info!(
-        "Eth_call decoding catchup: processing {} files with concurrency {}",
+        "Eth_call decoding catchup: processing {} files ({} regular, {} once, {} event) with concurrency {}",
         work_items.len(),
+        regular_count,
+        once_count,
+        event_count,
         concurrency
     );
 
     // Process work items concurrently
+    let start_time = Instant::now();
+    let total_files = work_items.len();
+    let completed = Arc::new(AtomicUsize::new(0));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let output_base = Arc::new(output_base.to_path_buf());
     let transform_tx = transform_tx.cloned();
@@ -382,11 +404,12 @@ pub async fn catchup_decode_eth_calls(
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
+        let completed = completed.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
 
-            match item {
+            let result = match item {
                 CatchupWorkItem::Regular {
                     file_path,
                     range_start,
@@ -447,7 +470,20 @@ pub async fn catchup_decode_eth_calls(
                     // Event calls don't need index updates
                     Ok(None)
                 }
+            };
+
+            if result.is_ok() {
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 50 == 0 || done == total_files {
+                    tracing::info!(
+                        "Eth_call decoding catchup: decoded {}/{} files",
+                        done,
+                        total_files
+                    );
+                }
             }
+
+            result
         });
     }
 
@@ -484,6 +520,12 @@ pub async fn catchup_decode_eth_calls(
             index.len()
         );
     }
+
+    tracing::info!(
+        "Eth_call decoding catchup complete: decoded {} files in {:.1}s",
+        total_files,
+        start_time.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }

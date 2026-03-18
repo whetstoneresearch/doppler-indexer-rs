@@ -14,6 +14,7 @@ pub use process::{process_event_calls, process_once_calls, process_regular_calls
 pub use transform::build_result_map;
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -85,6 +86,7 @@ pub async fn decode_eth_calls(
         // Catchup phase: Process existing raw eth_call files
         // =========================================================================
         if raw_calls_dir.exists() {
+            let decode_start = Instant::now();
             // Pass None for transform_tx during catchup to avoid deadlock:
             // the engine is blocked waiting for our barrier signal and won't read
             // from the channel, so sends could block forever. The engine will read
@@ -99,12 +101,18 @@ pub async fn decode_eth_calls(
                 None,
             )
             .await?;
-        }
 
-        tracing::info!(
-            "Eth_call decoding catchup complete for chain {}",
-            chain.name
-        );
+            tracing::info!(
+                "Eth_call decoding catchup complete for chain {} in {:.1}s",
+                chain.name,
+                decode_start.elapsed().as_secs_f64()
+            );
+        } else {
+            tracing::info!(
+                "Eth_call decoding catchup complete for chain {} (no raw files)",
+                chain.name
+            );
+        }
 
         if let Some(tx) = decode_catchup_done_tx {
             let _ = tx.send(());

@@ -808,6 +808,7 @@ async fn process_chain(
                 eth_call_tx_for_collector,
                 s3_manifest.as_ref(),
                 Some(sm),
+                catch_up_only,
             )
             .await
             .context("block collection failed")
@@ -928,9 +929,7 @@ async fn process_chain(
                     &chain,
                     &cfg,
                     &logs_factory_tx,
-                    &eth_calls_factory_tx,
                     &log_decoder_tx_for_factories,
-                    &call_decoder_tx_for_factories,
                     &recollect_tx_for_factories,
                     factory_catchup_done_tx,
                     s3_manifest,
