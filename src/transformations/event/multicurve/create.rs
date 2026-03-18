@@ -8,12 +8,12 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
-use crate::transformations::util::db::token::{PoolAddressOrPoolId, insert_token};
+use crate::transformations::util::db::token::insert_token;
 use crate::transformations::util::db::v4_pool_configs::insert_pool_config;
 use crate::transformations::util::db::pool::{Beneficiary, BeneficiariesData, insert_pool};
-use crate::transformations::util::shared::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata;
 use crate::types::decoded::DecodedValue;
-use crate::types::uniswap::v4::{PoolKey, V4PoolConfig};
+use crate::types::uniswap::v4::{PoolKey, V4PoolConfig, PoolAddressOrPoolId};
 
 pub struct V4MulticurveCreateHandler;
 
@@ -77,6 +77,15 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                     "No getState call for asset {} at block {} tx {}",
                     Address::from(asset), event.block_number, B256::from(event.transaction_hash)
                 )))?;
+
+            let num_to_sell = ctx.calls_of_type("DERC20", "once")
+                .filter(|call| call.contract_address == asset)
+                .next()
+                .ok_or_else( || TransformationError::MissingData(format!(
+                    "No getAssetData call for asset {} at block {} tx {}",
+                    Address::from(asset), event.block_number, B256::from(event.transaction_hash)
+                )))?
+                .get("getAssetData.numTokensToSell")?;
 
             let pool_key = {
                 let field_err = |field: &str, expected: &str| {
@@ -186,11 +195,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
             let is_token_0 = asset < numeraire;
 
             let pool_config = V4PoolConfig {
-                num_tokens_to_sell: get_state_call.result.get("numTokensToSell")
-                    .ok_or_else(|| TransformationError::MissingData(format!(
-                        "No numTokensToSell in getState for asset {} at block {} tx {}",
-                        Address::from(asset), event.block_number, B256::from(event.transaction_hash)
-                    )))?
+                num_tokens_to_sell: num_to_sell
                     .as_uint256()
                     .ok_or_else(|| TransformationError::TypeConversion(format!(
                         "numTokensToSell is not uint256 in getState for asset {} at block {} tx {}",
@@ -351,9 +356,9 @@ impl EventHandler for V4MulticurveCreateHandler {
         vec![
             ("DERC20".to_string(), "once".to_string()),
             ("Numeraires".to_string(), "once".to_string()),
-            ("V4MulticurveInitializer".to_string(), "getState".to_string()),
-            ("V4MulticurveInitializer".to_string(), "getBeneficiaries".to_string()),
-            ("V4MulticurveInitializer".to_string(), "getPositions".to_string()),
+            ("UniswapV4MulticurveInitializer".to_string(), "getState".to_string()),
+            ("UniswapV4MulticurveInitializer".to_string(), "getBeneficiaries".to_string()),
+            ("UniswapV4MulticurveInitializer".to_string(), "getPositions".to_string()),
         ]
     }
 }

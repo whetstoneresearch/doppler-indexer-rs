@@ -23,8 +23,8 @@ pub fn get_metadata(
     }
 
     let asset_metadata = ctx
-        .calls_for_address(*asset)
-        .filter(|call| call.function_name == "once")
+        .calls_of_type("DERC20", "once")
+        .filter(|call| call.contract_address == *asset)
         .next()
         .ok_or_else(|| {
             let available_calls: Vec<_> = ctx
@@ -32,7 +32,7 @@ pub fn get_metadata(
                 .map(|c| format!("{}:{}", c.source_name, c.function_name))
                 .collect();
             TransformationError::MissingData(format!(
-                "No 'once' call found for asset {} at block {} tx {}. Available calls: {:?}",
+                "No DERC20 'once' call found for asset {} at block {} tx {}. Available calls: {:?}",
                 Address::from(asset),
                 event.block_number,
                 B256::from(event.transaction_hash),
@@ -145,15 +145,15 @@ pub fn get_metadata(
             decimals: 18,
         }
     } else {
-        let call = ctx.calls_for_address(*numeraire)
-            .filter(|call| call.function_name == "once")
+        let call = ctx.calls_of_type("Numeraires", "once")
+            .filter(|call| call.contract_address == *numeraire)
             .next()
             .ok_or_else(|| {
                 let available_calls: Vec<_> = ctx.calls_for_address(*numeraire)
                     .map(|c| format!("{}:{}", c.source_name, c.function_name))
                     .collect();
                 TransformationError::MissingData(format!(
-                    "No 'once' call found for numeraire {} at block {} tx {}. Available calls: {:?}",
+                    "No Numeraires 'once' call found for numeraire {} at block {} tx {}. Available calls: {:?}",
                     Address::from(numeraire), event.block_number, B256::from(event.transaction_hash), available_calls
                 ))
             })?;
