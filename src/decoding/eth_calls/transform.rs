@@ -19,8 +19,10 @@ pub fn build_result_map(
         }
         EvmType::NamedTuple(fields) => {
             if let DecodedValue::NamedTuple(named_values) = value {
-                for ((field_name, _), (_, val)) in fields.iter().zip(named_values.iter()) {
-                    result.insert(field_name.clone(), val.clone());
+                for ((field_name, field_type), (_, val)) in
+                    fields.iter().zip(named_values.iter())
+                {
+                    insert_flattened(&mut result, field_name, field_type, val);
                 }
             }
         }
@@ -29,6 +31,31 @@ pub fn build_result_map(
         }
     }
     result
+}
+
+/// Recursively flatten nested NamedTuples into dot-notation keys.
+fn insert_flattened(
+    result: &mut HashMap<String, DecodedValue>,
+    prefix: &str,
+    field_type: &EvmType,
+    value: &DecodedValue,
+) {
+    match (field_type, value) {
+        (EvmType::NamedTuple(fields), DecodedValue::NamedTuple(named_values)) => {
+            for ((child_name, child_type), (_, child_val)) in
+                fields.iter().zip(named_values.iter())
+            {
+                let key = format!("{}.{}", prefix, child_name);
+                insert_flattened(result, &key, child_type, child_val);
+            }
+        }
+        (EvmType::Named { inner, .. }, _) => {
+            insert_flattened(result, prefix, inner, value);
+        }
+        _ => {
+            result.insert(prefix.to_string(), value.clone());
+        }
+    }
 }
 
 /// Convert a DecodedCallRecord to a TransformDecodedCall
