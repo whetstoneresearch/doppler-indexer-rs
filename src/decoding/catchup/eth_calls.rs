@@ -229,72 +229,74 @@ pub async fn catchup_decode_eth_calls(
                             }
                         }
                     } else {
-                        let config = regular_configs.iter().find(|c| {
+                        // Collect regular call files (if a regular config exists)
+                        let regular_config = regular_configs.iter().find(|c| {
                             c.contract_name == contract_name && c.function_name == function_name
                         });
 
-                        if config.is_none() {
-                            continue;
-                        }
-                        let config = config.unwrap().clone();
-
-                        // Collect regular call files
-                        if let Ok(file_entries) = std::fs::read_dir(&function_path) {
-                            for file_entry in file_entries.flatten() {
-                                let file_path = file_entry.path();
-                                if !file_path
-                                    .extension()
-                                    .map(|e| e == "parquet")
-                                    .unwrap_or(false)
-                                {
-                                    continue;
-                                }
-
-                                let file_name =
-                                    file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-
-                                // Check if already decoded
-                                let rel_path =
-                                    format!("{}/{}/{}", contract_name, function_name, file_name);
-                                if existing_decoded.contains(&rel_path) {
-                                    continue;
-                                }
-
-                                // Parse range from filename
-                                let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
-                                let parts: Vec<&str> = range_str.split('-').collect();
-                                if parts.len() != 2 {
-                                    continue;
-                                }
-                                let range_start: u64 = match parts[0].parse() {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
-                                };
-                                let range_end: u64 = match parts[1].parse::<u64>() {
-                                    Ok(v) => v + 1,
-                                    Err(_) => continue,
-                                };
-
-                                // Skip if config's start_block is beyond this range
-                                if let Some(start) = config.start_block {
-                                    if start >= range_end {
+                        if let Some(config) = regular_config {
+                            let config = config.clone();
+                            if let Ok(file_entries) = std::fs::read_dir(&function_path) {
+                                for file_entry in file_entries.flatten() {
+                                    let file_path = file_entry.path();
+                                    if !file_path
+                                        .extension()
+                                        .map(|e| e == "parquet")
+                                        .unwrap_or(false)
+                                    {
                                         continue;
                                     }
-                                }
 
-                                work_items.push(CatchupWorkItem::Regular {
-                                    file_path,
-                                    range_start,
-                                    range_end,
-                                    config: config.clone(),
-                                });
+                                    let file_name = file_path
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("");
+
+                                    // Check if already decoded
+                                    let rel_path = format!(
+                                        "{}/{}/{}",
+                                        contract_name, function_name, file_name
+                                    );
+                                    if existing_decoded.contains(&rel_path) {
+                                        continue;
+                                    }
+
+                                    // Parse range from filename
+                                    let range_str =
+                                        file_name.strip_suffix(".parquet").unwrap_or("");
+                                    let parts: Vec<&str> = range_str.split('-').collect();
+                                    if parts.len() != 2 {
+                                        continue;
+                                    }
+                                    let range_start: u64 = match parts[0].parse() {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    let range_end: u64 = match parts[1].parse::<u64>() {
+                                        Ok(v) => v + 1,
+                                        Err(_) => continue,
+                                    };
+
+                                    // Skip if config's start_block is beyond this range
+                                    if let Some(start) = config.start_block {
+                                        if start >= range_end {
+                                            continue;
+                                        }
+                                    }
+
+                                    work_items.push(CatchupWorkItem::Regular {
+                                        file_path,
+                                        range_start,
+                                        range_end,
+                                        config: config.clone(),
+                                    });
+                                }
                             }
                         }
 
-                        // Check for on_events/ subdirectory within this function directory
+                        // Check for on_events/ subdirectory independently of regular config
                         let on_events_path = function_path.join("on_events");
                         if on_events_path.exists() && on_events_path.is_dir() {
-                            // Find event config for this contract/function
                             let event_config = event_configs.iter().find(|c| {
                                 c.contract_name == contract_name && c.function_name == function_name
                             });

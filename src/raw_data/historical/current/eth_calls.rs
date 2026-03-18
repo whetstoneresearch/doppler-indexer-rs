@@ -12,7 +12,7 @@ use crate::raw_data::historical::eth_calls::{
     BlockRange, EthCallCatchupState, EthCallCollectionError,
 };
 use crate::raw_data::historical::factories::{FactoryAddressData, FactoryMessage};
-use crate::raw_data::historical::receipts::EventTriggerMessage;
+use crate::raw_data::historical::receipts::{EventTriggerData, EventTriggerMessage};
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::StorageManager;
 use crate::types::config::chain::ChainConfig;
@@ -41,6 +41,7 @@ pub async fn collect_eth_calls(
 
     let mut block_rx_closed = false;
     let mut event_trigger_rx_closed = !state.has_event_triggered_calls;
+    let mut pending_event_triggers: Vec<EventTriggerData> = Vec::new();
 
     loop {
         if block_rx_closed {
@@ -193,48 +194,53 @@ pub async fn collect_eth_calls(
                 } => {
                     match event_result {
                         Some(EventTriggerMessage::Triggers(triggers)) => {
-                            // Derive range from trigger block numbers
-                            let range_start = triggers.iter().map(|t| t.block_number).min().unwrap_or(0);
-                            let range_end = triggers.iter().map(|t| t.block_number).max().unwrap_or(0);
-
-                            if let Some(multicall_addr) = state.multicall3_address {
-                                process_event_triggers_multicall(
-                                    triggers,
-                                    &state.event_call_configs,
-                                    &state.factory_addresses,
-                                    client,
-                                    &state.base_output_dir,
-                                    state.rpc_batch_size,
-                                    &decoder_tx,
-                                    multicall_addr,
-                                    range_start,
-                                    range_end,
-                                    &chain.name,
-                                    storage_manager.as_ref(),
-                                )
-                                .await?;
-                            } else {
-                                process_event_triggers(
-                                    triggers,
-                                    &state.event_call_configs,
-                                    &state.factory_addresses,
-                                    client,
-                                    &state.base_output_dir,
-                                    state.rpc_batch_size,
-                                    &decoder_tx,
-                                    range_start,
-                                    range_end,
-                                    &chain.name,
-                                    storage_manager.as_ref(),
-                                )
-                                .await?;
-                            }
+                            // Buffer triggers until RangeComplete arrives with aligned range
+                            pending_event_triggers.extend(triggers);
                         }
                         Some(EventTriggerMessage::RangeComplete { range_start, range_end }) => {
-                            // Range complete - write empty files for configured pairs that had no events
-                            // Note: This handles the case where no events matched any trigger patterns
-                            // The process_event_triggers functions handle empty files for pairs that
-                            // had some events but not for all configured pairs
+                            // range_end is exclusive (from BlockRange), convert to inclusive for filenames
+                            let inclusive_end = range_end - 1;
+
+                            // Process all buffered triggers for this range
+                            if !pending_event_triggers.is_empty() {
+                                let triggers = std::mem::take(&mut pending_event_triggers);
+                                if let Some(multicall_addr) = state.multicall3_address {
+                                    process_event_triggers_multicall(
+                                        triggers,
+                                        &state.event_call_configs,
+                                        &state.factory_addresses,
+                                        client,
+                                        &state.base_output_dir,
+                                        state.rpc_batch_size,
+                                        &decoder_tx,
+                                        multicall_addr,
+                                        range_start,
+                                        inclusive_end,
+                                        &chain.name,
+                                        storage_manager.as_ref(),
+                                    )
+                                    .await?;
+                                } else {
+                                    process_event_triggers(
+                                        triggers,
+                                        &state.event_call_configs,
+                                        &state.factory_addresses,
+                                        client,
+                                        &state.base_output_dir,
+                                        state.rpc_batch_size,
+                                        &decoder_tx,
+                                        range_start,
+                                        inclusive_end,
+                                        &chain.name,
+                                        storage_manager.as_ref(),
+                                    )
+                                    .await?;
+                                }
+                            } else {
+                                pending_event_triggers.clear();
+                            }
+
+                            // Write empty files for configured pairs that had no events
                             let configured_pairs: std::collections::HashSet<(String, String)> = state.event_call_configs
                                 .values()
                                 .flatten()
@@ -247,7 +253,7 @@ pub async fn collect_eth_calls(
 
                             for (contract_name, function_name) in configured_pairs {
                                 let sub_dir = state.base_output_dir.join(&contract_name).join(&function_name).join("on_events");
-                                let file_name = format!("{}-{}.parquet", range_start, range_end);
+                                let file_name = format!("{}-{}.parquet", range_start, inclusive_end);
                                 let output_path = sub_dir.join(&file_name);
                                 // Only write if file doesn't exist (don't overwrite if we already wrote results)
                                 if !output_path.exists() {
@@ -637,45 +643,53 @@ pub async fn collect_eth_calls(
             } => {
                 match event_result {
                     Some(EventTriggerMessage::Triggers(triggers)) => {
-                        // Derive range from trigger block numbers
-                        let range_start = triggers.iter().map(|t| t.block_number).min().unwrap_or(0);
-                        let range_end = triggers.iter().map(|t| t.block_number).max().unwrap_or(0);
-
-                        if let Some(multicall_addr) = state.multicall3_address {
-                            process_event_triggers_multicall(
-                                triggers,
-                                &state.event_call_configs,
-                                &state.factory_addresses,
-                                client,
-                                &state.base_output_dir,
-                                state.rpc_batch_size,
-                                &decoder_tx,
-                                multicall_addr,
-                                range_start,
-                                range_end,
-                                &chain.name,
-                                storage_manager.as_ref(),
-                            )
-                            .await?;
-                        } else {
-                            process_event_triggers(
-                                triggers,
-                                &state.event_call_configs,
-                                &state.factory_addresses,
-                                client,
-                                &state.base_output_dir,
-                                state.rpc_batch_size,
-                                &decoder_tx,
-                                range_start,
-                                range_end,
-                                &chain.name,
-                                storage_manager.as_ref(),
-                            )
-                            .await?;
-                        }
+                        // Buffer triggers until RangeComplete arrives with aligned range
+                        pending_event_triggers.extend(triggers);
                     }
                     Some(EventTriggerMessage::RangeComplete { range_start, range_end }) => {
-                        // Range complete - write empty files for configured pairs that had no events
+                        // range_end is exclusive (from BlockRange), convert to inclusive for filenames
+                        let inclusive_end = range_end - 1;
+
+                        // Process all buffered triggers for this range
+                        if !pending_event_triggers.is_empty() {
+                            let triggers = std::mem::take(&mut pending_event_triggers);
+                            if let Some(multicall_addr) = state.multicall3_address {
+                                process_event_triggers_multicall(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    client,
+                                    &state.base_output_dir,
+                                    state.rpc_batch_size,
+                                    &decoder_tx,
+                                    multicall_addr,
+                                    range_start,
+                                    inclusive_end,
+                                    &chain.name,
+                                    storage_manager.as_ref(),
+                                )
+                                .await?;
+                            } else {
+                                process_event_triggers(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    client,
+                                    &state.base_output_dir,
+                                    state.rpc_batch_size,
+                                    &decoder_tx,
+                                    range_start,
+                                    inclusive_end,
+                                    &chain.name,
+                                    storage_manager.as_ref(),
+                                )
+                                .await?;
+                            }
+                        } else {
+                            pending_event_triggers.clear();
+                        }
+
+                        // Write empty files for configured pairs that had no events
                         let configured_pairs: std::collections::HashSet<(String, String)> = state.event_call_configs
                             .values()
                             .flatten()
@@ -688,7 +702,7 @@ pub async fn collect_eth_calls(
 
                         for (contract_name, function_name) in configured_pairs {
                             let sub_dir = state.base_output_dir.join(&contract_name).join(&function_name).join("on_events");
-                            let file_name = format!("{}-{}.parquet", range_start, range_end);
+                            let file_name = format!("{}-{}.parquet", range_start, inclusive_end);
                             let output_path = sub_dir.join(&file_name);
                             // Only write if file doesn't exist
                             if !output_path.exists() {

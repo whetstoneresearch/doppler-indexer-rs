@@ -761,16 +761,18 @@ pub(crate) async fn process_event_triggers(
                 .join("on_events");
             std::fs::create_dir_all(&sub_dir)?;
 
-            let file_name = format!("{}-{}.parquet", min_block, max_block);
+            let file_name = format!("{}-{}.parquet", range_start, range_end);
             let output_path = sub_dir.join(&file_name);
 
             let result_count = all_results.len();
             write_event_call_results_to_parquet(&all_results, &output_path, max_params)?;
 
             tracing::info!(
-                "Wrote {} event-triggered eth_call results to {}",
+                "Wrote {} event-triggered eth_call results to {} (event blocks {}-{})",
                 result_count,
-                output_path.display()
+                output_path.display(),
+                min_block,
+                max_block,
             );
 
             // Upload to S3 if configured
@@ -784,14 +786,14 @@ pub(crate) async fn process_event_triggers(
                     &output_path,
                     chain_name,
                     &data_type,
-                    min_block,
-                    max_block,
+                    range_start,
+                    range_end,
                 )
                 .await
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            // Send to decoder for decoding
+            // Send to decoder for decoding (range_end + 1 for exclusive convention)
             if let Some(tx) = decoder_tx {
                 let decoder_results: Vec<DecoderEventCallResult> = all_results
                     .iter()
@@ -806,8 +808,8 @@ pub(crate) async fn process_event_triggers(
 
                 let _ = tx
                     .send(DecoderMessage::EventCallsReady {
-                        range_start: min_block,
-                        range_end: max_block,
+                        range_start,
+                        range_end: range_end + 1,
                         contract_name: contract_name.clone(),
                         function_name: function_name.clone(),
                         results: decoder_results,
@@ -1108,7 +1110,7 @@ pub(crate) async fn process_event_triggers_multicall(
             .join("on_events");
         std::fs::create_dir_all(&sub_dir)?;
 
-        let file_name = format!("{}-{}.parquet", min_block, max_block);
+        let file_name = format!("{}-{}.parquet", range_start, range_end);
         let output_path = sub_dir.join(&file_name);
 
         let result_count = results.len();
@@ -1120,9 +1122,11 @@ pub(crate) async fn process_event_triggers_multicall(
         write_event_call_results_to_parquet(&results, &output_path, max_params)?;
 
         tracing::info!(
-            "Wrote {} multicall event-triggered eth_call results to {}",
+            "Wrote {} multicall event-triggered eth_call results to {} (event blocks {}-{})",
             result_count,
-            output_path.display()
+            output_path.display(),
+            min_block,
+            max_block,
         );
 
         // Upload to S3 if configured
@@ -1136,14 +1140,14 @@ pub(crate) async fn process_event_triggers_multicall(
                 &output_path,
                 chain_name,
                 &data_type,
-                min_block,
-                max_block,
+                range_start,
+                range_end,
             )
             .await
             .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        // Send to decoder
+        // Send to decoder (range_end + 1 for exclusive convention)
         if let Some(tx) = decoder_tx {
             let decoder_results: Vec<DecoderEventCallResult> = results
                 .iter()
@@ -1158,8 +1162,8 @@ pub(crate) async fn process_event_triggers_multicall(
 
             let _ = tx
                 .send(DecoderMessage::EventCallsReady {
-                    range_start: min_block,
-                    range_end: max_block,
+                    range_start,
+                    range_end: range_end + 1,
                     contract_name: contract_name.clone(),
                     function_name: function_name.clone(),
                     results: decoder_results,
