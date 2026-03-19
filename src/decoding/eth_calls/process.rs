@@ -14,7 +14,7 @@ use super::parquet_io::{
     write_decoded_event_calls_to_parquet, write_decoded_once_calls_to_parquet,
 };
 use super::transform::{
-    build_result_map, convert_event_call_to_transform_call, convert_to_transform_call,
+    build_result_map_for_merge, convert_event_call_to_transform_call, convert_to_transform_call,
 };
 use super::types::{
     CallDecodeConfig, DecodedCallRecord, DecodedEventCallRecord, DecodedOnceRecord,
@@ -324,7 +324,7 @@ pub async fn process_once_calls(
                 let mut merged_result = HashMap::new();
                 for config in configs {
                     if let Some(decoded_value) = record.decoded_values.get(&config.function_name) {
-                        let partial_result = build_result_map(
+                        let partial_result = build_result_map_for_merge(
                             decoded_value,
                             &config.output_type,
                             &config.function_name,

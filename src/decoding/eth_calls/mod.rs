@@ -11,7 +11,7 @@ pub use types::*;
 pub use config::build_decode_configs;
 pub use decode::decode_value;
 pub use process::{process_event_calls, process_once_calls, process_regular_calls};
-pub use transform::build_result_map;
+pub use transform::{build_result_map, build_result_map_for_merge};
 
 use std::path::PathBuf;
 use std::time::Instant;

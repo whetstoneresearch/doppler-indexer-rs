@@ -33,6 +33,25 @@ pub fn build_result_map(
     result
 }
 
+/// Like `build_result_map`, but prefixes NamedTuple field keys with the function name.
+/// This is needed when merging multiple function results into a single "once" DecodedCall,
+/// so that keys like `totalSupply` become `getAssetData.totalSupply` — matching the parquet
+/// column naming convention (`{function_name}.{field_name}`).
+pub fn build_result_map_for_merge(
+    value: &DecodedValue,
+    output_type: &EvmType,
+    function_name: &str,
+) -> HashMap<String, DecodedValue> {
+    let base = build_result_map(value, output_type, function_name);
+    match output_type {
+        EvmType::NamedTuple(_) => base
+            .into_iter()
+            .map(|(k, v)| (format!("{}.{}", function_name, k), v))
+            .collect(),
+        _ => base,
+    }
+}
+
 /// Recursively flatten nested NamedTuples into dot-notation keys.
 fn insert_flattened(
     result: &mut HashMap<String, DecodedValue>,

@@ -17,7 +17,8 @@ use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
 use crate::decoding::eth_calls::{
-    build_decode_configs, build_result_map, CallDecodeConfig, EventCallDecodeConfig,
+    build_decode_configs, build_result_map, build_result_map_for_merge, CallDecodeConfig,
+    EventCallDecodeConfig,
 };
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
@@ -315,7 +316,7 @@ impl RetryProcessor {
                         once_map.get(&(source_name.clone(), function_name.clone()))
                     {
                         let partial_result =
-                            build_result_map(value, &config.output_type, function_name);
+                            build_result_map_for_merge(value, &config.output_type, function_name);
                         merged_result.extend(partial_result);
                     }
                 }
