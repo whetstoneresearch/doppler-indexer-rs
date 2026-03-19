@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::DecoderMessage;
+use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::raw_data::historical::factories::{
     build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet,
     process_range_batches, read_log_batches_from_parquet, scan_existing_parquet_files,
@@ -29,7 +30,7 @@ pub async fn collect_factories(
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
-    let output_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
+    let output_dir = factories_dir_path(&chain.name);
     std::fs::create_dir_all(&output_dir)?;
 
     let existing_factory_data = load_factory_addresses_from_parquet(&output_dir)?;

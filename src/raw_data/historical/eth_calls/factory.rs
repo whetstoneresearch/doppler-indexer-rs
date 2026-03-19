@@ -12,6 +12,7 @@ use super::types::{
     EthCallCollectionError, EventCallKey, EventTriggeredCallConfig, OnceCallConfig,
 };
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::paths::{factories_dir as factories_dir_path, parse_range_from_filename, raw_logs_dir};
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 
 /// Load historical factory addresses from parquet files for event trigger catchup
@@ -36,7 +37,7 @@ pub(crate) async fn load_historical_factory_addresses(
         return result;
     }
 
-    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
+    let factories_dir = factories_dir_path(chain_name);
     let data_loader = DataLoader::new(
         storage_manager.map(|sm| sm.clone()),
         chain_name,
@@ -169,7 +170,7 @@ pub(crate) async fn load_factory_addresses_for_once_catchup(
         return result;
     }
 
-    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
+    let factories_dir = factories_dir_path(chain_name);
     let data_loader = DataLoader::new(
         storage_manager.map(|sm| sm.clone()),
         chain_name,
@@ -441,7 +442,7 @@ pub(crate) fn get_existing_log_ranges(
     chain_name: &str,
     s3_manifest: Option<&S3Manifest>,
 ) -> Vec<ExistingLogRange> {
-    let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain_name));
+    let logs_dir = raw_logs_dir(chain_name);
     let mut ranges = Vec::new();
     let mut local_ranges: HashSet<(u64, u64)> = HashSet::new();
 
@@ -471,31 +472,11 @@ pub(crate) fn get_existing_log_ranges(
             continue;
         }
 
-        let file_name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
-
-        // Parse "logs_START-END" format
-        if !file_name.starts_with("logs_") {
+        let Some((start, end_inclusive)) = parse_range_from_filename(&path) else {
             continue;
-        }
-
-        let range_part = &file_name[5..]; // Skip "logs_"
-        let range_parts: Vec<&str> = range_part.split('-').collect();
-        if range_parts.len() != 2 {
-            continue;
-        }
-
-        let start: u64 = match range_parts[0].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let end: u64 = match range_parts[1].parse::<u64>() {
-            Ok(v) => v + 1, // Convert inclusive end to exclusive
-            Err(_) => continue,
         };
 
+        let end = end_inclusive + 1; // Convert inclusive end to exclusive
         local_ranges.insert((start, end));
         ranges.push(ExistingLogRange {
             start,

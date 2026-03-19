@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use alloy::primitives::B256;
@@ -12,6 +12,7 @@ use crate::raw_data::historical::blocks::{
     write_minimal_blocks_to_parquet, BlockCollectionError, FullBlockRecord, MinimalBlockRecord,
 };
 use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::paths::{parse_range_from_filename, raw_blocks_dir, scan_parquet_filenames};
 use crate::storage::{upload_parquet_to_s3, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{BlockField, RawDataCollectionConfig};
@@ -38,7 +39,7 @@ pub async fn collect_blocks(
     storage_manager: Option<Arc<StorageManager>>,
     catch_up_only: bool,
 ) -> Result<(), BlockCollectionError> {
-    let output_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain.name));
+    let output_dir = raw_blocks_dir(&chain.name);
     std::fs::create_dir_all(&output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
@@ -409,14 +410,8 @@ fn highest_block_from_files(
 
     // Parse "blocks_{start}-{end}.parquet" file names
     for name in local_files {
-        if let Some(end_str) = name
-            .strip_prefix("blocks_")
-            .and_then(|s| s.strip_suffix(".parquet"))
-            .and_then(|s| s.split('-').last())
-        {
-            if let Ok(end) = end_str.parse::<u64>() {
-                max_block = Some(max_block.map_or(end, |m: u64| m.max(end)));
-            }
+        if let Some((_start, end)) = parse_range_from_filename(Path::new(name)) {
+            max_block = Some(max_block.map_or(end, |m: u64| m.max(end)));
         }
     }
 
@@ -431,15 +426,5 @@ fn highest_block_from_files(
 }
 
 fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("blocks_") && name.ends_with(".parquet") {
-                    files.insert(name.to_string());
-                }
-            }
-        }
-    }
-    files
+    scan_parquet_filenames(dir, "blocks_")
 }

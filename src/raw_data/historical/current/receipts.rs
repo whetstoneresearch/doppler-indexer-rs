@@ -15,6 +15,7 @@ use crate::raw_data::historical::receipts::{
     EventTriggerMessage, LogMessage, ReceiptBatchState, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::paths::raw_receipts_dir;
 use crate::storage::{upload_parquet_to_s3, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -32,7 +33,7 @@ pub async fn collect_receipts(
     catchup_state: ReceiptsCatchupState,
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), ReceiptCollectionError> {
-    let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
+    let output_dir = raw_receipts_dir(&chain.name);
     std::fs::create_dir_all(&output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;

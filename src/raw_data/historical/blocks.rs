@@ -15,6 +15,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
 use crate::rpc::RpcError;
+use crate::storage::paths::{parse_range_from_filename, raw_blocks_dir};
 use crate::storage::S3Manifest;
 use crate::types::config::raw_data::BlockField;
 
@@ -395,7 +396,7 @@ pub fn get_existing_block_ranges(
 ) -> Vec<ExistingBlockRange> {
     use std::collections::HashSet;
 
-    let blocks_dir = PathBuf::from(format!("data/{}/historical/raw/blocks", chain_name));
+    let blocks_dir = raw_blocks_dir(chain_name);
     let mut ranges = Vec::new();
     let mut local_ranges: HashSet<(u64, u64)> = HashSet::new();
 
@@ -425,31 +426,11 @@ pub fn get_existing_block_ranges(
             continue;
         }
 
-        let file_name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
-
-        // Parse "blocks_START-END" format
-        if !file_name.starts_with("blocks_") {
+        let Some((start, end_inclusive)) = parse_range_from_filename(&path) else {
             continue;
-        }
-
-        let range_part = &file_name[7..]; // Skip "blocks_"
-        let range_parts: Vec<&str> = range_part.split('-').collect();
-        if range_parts.len() != 2 {
-            continue;
-        }
-
-        let start: u64 = match range_parts[0].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let end: u64 = match range_parts[1].parse::<u64>() {
-            Ok(v) => v + 1, // Convert inclusive end to exclusive
-            Err(_) => continue,
         };
 
+        let end = end_inclusive + 1; // Convert inclusive end to exclusive
         local_ranges.insert((start, end));
         ranges.push(ExistingBlockRange {
             start,

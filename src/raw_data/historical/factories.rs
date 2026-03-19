@@ -17,6 +17,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::paths::{parse_range_from_filename, raw_logs_dir, scan_nested_parquet_files_1};
 use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
@@ -693,33 +694,7 @@ fn write_factory_records_to_parquet(
 }
 
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-
-    // Scan nested directories: dir/collection/*.parquet
-    if let Ok(collection_entries) = std::fs::read_dir(dir) {
-        for collection_entry in collection_entries.flatten() {
-            let collection_path = collection_entry.path();
-            if !collection_path.is_dir() {
-                continue;
-            }
-            let collection_name = match collection_entry.file_name().to_str() {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            if let Ok(file_entries) = std::fs::read_dir(&collection_path) {
-                for file_entry in file_entries.flatten() {
-                    if let Some(name) = file_entry.file_name().to_str() {
-                        if name.ends_with(".parquet") {
-                            // Store as collection/filename
-                            files.insert(format!("{}/{}", collection_name, name));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    files
+    scan_nested_parquet_files_1(dir)
 }
 
 pub(crate) fn load_factory_addresses_from_parquet(
@@ -750,25 +725,12 @@ pub(crate) fn load_factory_addresses_from_parquet(
                 continue;
             }
 
-            // Filename is now just "start-end.parquet"
-            let file_name = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(name) => name,
-                None => continue,
-            };
-
-            let range_parts: Vec<&str> = file_name.split('-').collect();
-            if range_parts.len() != 2 {
+            // Filename is "start-end.parquet" (no prefix)
+            let Some((start_inclusive, end_inclusive)) = parse_range_from_filename(&path) else {
                 continue;
-            }
-
-            let range_start: u64 = match range_parts[0].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
             };
-            let range_end: u64 = match range_parts[1].parse::<u64>() {
-                Ok(v) => v + 1,
-                Err(_) => continue,
-            };
+            let range_start: u64 = start_inclusive;
+            let range_end: u64 = end_inclusive + 1;
 
             let file = match File::open(&path) {
                 Ok(f) => f,
@@ -972,7 +934,7 @@ pub(crate) fn get_existing_log_ranges(
     chain_name: &str,
     s3_manifest: Option<&S3Manifest>,
 ) -> Vec<ExistingLogRange> {
-    let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain_name));
+    let logs_dir = raw_logs_dir(chain_name);
     let mut ranges = Vec::new();
     let mut local_ranges: HashSet<(u64, u64)> = HashSet::new();
 
@@ -1002,31 +964,11 @@ pub(crate) fn get_existing_log_ranges(
             continue;
         }
 
-        let file_name = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
-
-        // Parse "logs_START-END" format
-        if !file_name.starts_with("logs_") {
+        let Some((start, end_inclusive)) = parse_range_from_filename(&path) else {
             continue;
-        }
-
-        let range_part = &file_name[5..]; // Skip "logs_"
-        let range_parts: Vec<&str> = range_part.split('-').collect();
-        if range_parts.len() != 2 {
-            continue;
-        }
-
-        let start: u64 = match range_parts[0].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let end: u64 = match range_parts[1].parse::<u64>() {
-            Ok(v) => v + 1, // Convert inclusive end to exclusive
-            Err(_) => continue,
         };
 
+        let end = end_inclusive + 1; // Convert inclusive end to exclusive
         local_ranges.insert((start, end));
         ranges.push(ExistingLogRange {
             start,
