@@ -20,6 +20,7 @@ use crate::types::config::chain::{ChainConfig, RpcConfig};
 use crate::types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use crate::types::config::eth_call::Frequency;
 use crate::types::config::indexer::IndexerConfig;
+use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::{has_items, optional_channel};
 
 /// Feature flags derived from chain configuration.
@@ -406,5 +407,15 @@ impl ChainRuntime {
             self.rpc_batch_size,
             self.rate_limiter.clone(),
         )
+    }
+
+    /// Build a `RawDataCollectionConfig` with the resolved batch size applied.
+    ///
+    /// Collectors use `raw_config.rpc_batch_size` to determine batch sizes,
+    /// so we patch the config with the runtime's resolved value.
+    pub fn raw_config(&self, base: &RawDataCollectionConfig) -> Arc<RawDataCollectionConfig> {
+        let mut cfg = base.clone();
+        cfg.rpc_batch_size = Some(self.rpc_batch_size as u32);
+        Arc::new(cfg)
     }
 }
