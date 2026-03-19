@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use alloy::dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, U256};
 
 use crate::db::{DbOperation, DbPool};
@@ -15,12 +16,12 @@ use crate::transformations::util::metadata::get_metadata;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolKey, V4PoolConfig, PoolAddressOrPoolId};
 
-pub struct V4MulticurveCreateHandler;
+pub struct V4ScheduledMulticurveCreateHandler;
 
 #[async_trait]
-impl TransformationHandler for V4MulticurveCreateHandler {
+impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
     fn name(&self) -> &'static str {
-        "V4MulticurveCreateHandler"
+        "V4ScheduledMulticurveCreateHandler"
     }
 
     fn version(&self) -> u32 {
@@ -124,6 +125,21 @@ impl TransformationHandler for V4MulticurveCreateHandler {
             let hook: [u8; 20] = pool_key.hooks.into();
             let pool_id = pool_key.pool_id();
 
+            let starting_time_result = ctx.eth_call(
+                event.contract_address,
+                "startingTimeOf(bytes32)(uint256)",
+                vec![DynSolValue::FixedBytes(pool_id.into(), 32)],
+                event.block_number,
+            ).await?;
+
+            let starting_time = starting_time_result
+                .as_uint()
+                .map(|(v, _)| v)
+                .ok_or_else(|| TransformationError::TypeConversion(format!(
+                    "startingTimeOf did not return uint256 for pool {} at block {} tx {}",
+                    pool_id, event.block_number, B256::from(event.transaction_hash)
+                )))?;
+
             let far_tick = get_state_call.result.get("farTick")
                 .ok_or_else(|| TransformationError::MissingData(format!(
                     "No farTick in getState for asset {} at block {} tx {}",
@@ -198,7 +214,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                     )))?,
                 min_proceeds: U256::ZERO,
                 max_proceeds: U256::ZERO,
-                starting_time: 0,
+                starting_time: starting_time.to::<u64>(),
                 ending_time: 0,
                 starting_tick,
                 ending_tick,
@@ -311,7 +327,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 &asset,
                 &numeraire,
                 pool_config.is_token_0,
-                "v4",
+                "scheduled_multicurve",
                 asset_metadata.integrator.into(),
                 asset_metadata.initializer.into(),
                 pool_key.fee,
@@ -334,12 +350,12 @@ impl TransformationHandler for V4MulticurveCreateHandler {
     }
 
     async fn initialize(&self, _db_pool: &DbPool) -> Result<(), TransformationError> {
-        tracing::info!("V4MulticurveCreateHandler initialized");
+        tracing::info!("V4ScheduledMulticurveCreateHandler initialized");
         Ok(())
     }
 }
 
-impl EventHandler for V4MulticurveCreateHandler {
+impl EventHandler for V4ScheduledMulticurveCreateHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(
             "UniswapV4ScheduledMulticurveInitializer",
@@ -359,5 +375,5 @@ impl EventHandler for V4MulticurveCreateHandler {
 }
 
 pub fn register_handlers(registry: &mut TransformationRegistry) {
-    registry.register_event_handler(V4MulticurveCreateHandler);
+    registry.register_event_handler(V4ScheduledMulticurveCreateHandler);
 }
