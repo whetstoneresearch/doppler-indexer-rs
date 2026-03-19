@@ -149,6 +149,11 @@ pub async fn decode_logs(
         tracing::info!("Log decoding catchup complete for chain {}", chain.name);
     }
 
+    // Recollect is only used during catchup (to re-fetch corrupt raw files).
+    // Drop the sender so recollect_rx in the receipts collector can close,
+    // allowing it to send AllRangesComplete and unblock shutdown.
+    drop(recollect_tx);
+
     // =========================================================================
     // Live phase: Process new data as it arrives
     // =========================================================================
