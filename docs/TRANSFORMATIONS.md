@@ -27,6 +27,12 @@ Decoded Events/Calls ──► TransformationEngine ──► Handlers ──►
 
 The transformation engine receives decoded data via channels from the decoders, invokes registered handlers, collects database operations, injects `source`/`source_version` columns automatically, and executes them transactionally.
 
+The engine delegates to sub-components:
+- **HandlerExecutor** (`executor.rs`): Concurrent handler spawn-loop, context construction, source/version injection, optional snapshot capture
+- **RangeFinalizer** (`finalizer.rs`): Range finalization, reorg cleanup, progress tracking
+- **RetryProcessor** (`retry.rs`): Re-processing failed live blocks from bincode storage
+- **LiveProcessingState** (`live_state.rs`): Pending event buffering for handlers with unmet call dependencies
+
 ## Configuration
 
 Configure transformations in your `config.json`. Transformations are automatically enabled when:
@@ -59,19 +65,9 @@ Configure transformations in your `config.json`. Transformations are automatical
 
 ## Database Migrations
 
-SQL migrations are stored in the `migrations/` directory and run automatically on startup:
+SQL migrations are stored in the `migrations/` directory and run automatically on startup.
 
-```
-migrations/
-├── tables/              # Handler table migrations
-│   ├── tokens.sql
-│   ├── pools.sql
-│   ├── transfers.sql
-│   └── users.sql
-└── (global migrations tracked in _migrations table)
-```
-
-Global migrations in `migrations/` are executed in alphabetical order. Each migration runs once and is tracked in a `_migrations` table with a `handlers/` prefix for handler-specific migrations.
+Global migrations (numbered files like `000_handler_progress.sql`, `001_active_versions.sql`) at the top level of `migrations/` are executed in alphabetical order. Each migration runs once and is tracked in a `_migrations` table. Handler-specific migration paths are also tracked in the same `_migrations` table using their full path as the key.
 
 Handler migration paths are specified by each handler via `migration_paths()`. Each path can be:
 - **A directory**: All `.sql` files in it are run in alphabetical order (scanned flat, no subdirectories)
@@ -210,8 +206,8 @@ The engine automatically injects `source` (handler name) and `source_version` (h
 |-----------|-----------|
 | `Upsert` | Appends to `columns`, `values`, and `conflict_columns` |
 | `Insert` | Appends to `columns` and `values` |
-| `Update` | Merges into `where_clause` |
-| `Delete` | Merges into `where_clause` |
+| `Update` | Merges into `where_clause` (`Eq`/`And` only; `Raw` is skipped) |
+| `Delete` | Merges into `where_clause` (`Eq`/`And` only; `Raw` is skipped) |
 | `RawSql` | Skipped (handler must manage manually) |
 
 Handlers should **not** include `source` or `source_version` in their operations — the engine handles this.
@@ -383,6 +379,7 @@ Handlers are registered at compile-time via the `build_registry()` function in `
 pub fn register_handlers(registry: &mut TransformationRegistry) {
     derc20_transfer::register_handlers(registry);
     v4::create::register_handlers(registry);
+    multicurve::create::register_handlers(registry);
     // Add more handler registrations here
 }
 ```
@@ -414,8 +411,8 @@ The context provides handlers with all necessary data and utilities:
 ```rust
 ctx.chain_name      // "base", "mainnet", etc.
 ctx.chain_id        // 8453, 1, etc.
-ctx.block_range_start
-ctx.block_range_end
+ctx.blockrange_start
+ctx.blockrange_end
 ```
 
 ### Decoded Data Access
@@ -493,7 +490,7 @@ let past_events = ctx.query_events(HistoricalEventQuery {
     source: Some("UniswapV4PoolManager".into()),
     event_name: Some("Initialize".into()),
     from_block: 0,
-    to_block: ctx.block_range_end,  // Cannot exceed current range
+    to_block: ctx.blockrange_end,  // Cannot exceed current range
     contract_address: None,
     limit: Some(100),
 }).await?;
@@ -508,7 +505,7 @@ let past_calls = ctx.query_calls(HistoricalCallQuery {
 }).await?;
 ```
 
-**Important:** Historical queries cannot access future blocks. The `to_block` is automatically clamped to `block_range_end`.
+**Important:** Historical queries cannot access future blocks. The `to_block` cannot exceed `blockrange_end` or the query will return a `FutureBlockAccess` error.
 
 ### Ad-hoc RPC Calls
 
@@ -623,12 +620,17 @@ pub trait FieldExtractor {
     fn extract_uint256(&self, field: &str) -> Result<U256, TransformationError>;
     fn extract_int256(&self, field: &str) -> Result<I256, TransformationError>;
     fn extract_u64(&self, field: &str) -> Result<u64, TransformationError>;
-    fn extract_u64_flexible(&self, field: &str) -> Result<u64, TransformationError>;
-    fn extract_i32(&self, field: &str) -> Result<i32, TransformationError>;
+    fn extract_i64(&self, field: &str) -> Result<i64, TransformationError>;
     fn extract_u32(&self, field: &str) -> Result<u32, TransformationError>;
-    fn extract_bytes32(&self, field: &str) -> Result<[u8; 32], TransformationError>;
+    fn extract_i32(&self, field: &str) -> Result<i32, TransformationError>;
+    fn extract_u8(&self, field: &str) -> Result<u8, TransformationError>;
     fn extract_bool(&self, field: &str) -> Result<bool, TransformationError>;
-    fn extract_string(&self, field: &str) -> Result<String, TransformationError>;
+    fn extract_string(&self, field: &str) -> Result<&str, TransformationError>;
+    fn extract_bytes32(&self, field: &str) -> Result<[u8; 32], TransformationError>;
+    fn extract_bytes(&self, field: &str) -> Result<&[u8], TransformationError>;
+    fn extract_u64_flexible(&self, field: &str) -> Result<u64, TransformationError>;
+    fn extract_i32_flexible(&self, field: &str) -> Result<i32, TransformationError>;
+    fn extract_u32_flexible(&self, field: &str) -> Result<u32, TransformationError>;
 }
 
 // Usage example:
@@ -637,7 +639,11 @@ let amount = event.extract_uint256("value")?;
 let tick = call.extract_i32("tick")?;
 ```
 
-The `extract_u64_flexible` method handles conversion from various uint sizes (u8, u32, u64, u128, U256) to u64, useful when the exact type varies.
+The `_flexible` methods handle conversion from multiple numeric types and numeric strings, useful when the exact encoding varies:
+
+- `extract_u64_flexible`: handles u64, i64, and numeric strings
+- `extract_i32_flexible`: handles i32, u32, and numeric strings
+- `extract_u32_flexible`: handles u32, i32, and numeric strings
 
 ## Database Operations
 
@@ -707,20 +713,23 @@ DbOperation::RawSql {
 |---------|-----------|-----------------|
 | `Null` | - | NULL |
 | `Bool(bool)` | `bool` | BOOLEAN |
+| `Int2(u8)` | `u8` | SMALLINT (INT2) |
 | `Int32(i32)` | `i32` | INTEGER |
 | `Int64(i64)` | `i64` | BIGINT |
 | `Uint64(u64)` | `u64` | BIGINT |
 | `Text(String)` | `String` | TEXT |
+| `VarChar(String)` | `String` | VARCHAR |
 | `Bytes(Vec<u8>)` | `Vec<u8>` | BYTEA |
 | `Address([u8; 20])` | `[u8; 20]` | BYTEA |
 | `Bytes32([u8; 32])` | `[u8; 32]` | BYTEA |
 | `Numeric(String)` | `String` | NUMERIC |
 | `Timestamp(i64)` | `i64` | BIGINT |
-| `Json(Value)` | `serde_json::Value` | JSONB |
+| `Json(Value)` | `serde_json::Value` | JSON |
+| `JsonB(Value)` | `serde_json::Value` | JSONB |
 
 ## Error Handling
 
-Transformation errors halt processing to maintain data integrity:
+Transformation errors are handled per-handler to maintain data integrity while allowing other handlers to continue:
 
 ```rust
 pub enum TransformationError {
@@ -739,19 +748,21 @@ pub enum TransformationError {
     ConfigError(String),
     ChannelError(String),
     IncludesPrecompileError(String),
+    LiveStorage(StorageError),      // Live storage read/write failures
 }
 
 // Create a handler error with context
 TransformationError::handler("MyHandler", "Failed to process swap event")
 ```
 
-When any handler returns an error, the engine:
+When a handler returns an error:
 
-1. Logs the error with full context
-2. Rolls back the current transaction
-3. Halts processing
+1. The handler's transaction is rolled back (no partial data for that handler)
+2. The error is logged with full context (handler key, block range)
+3. Other handlers continue processing independently
+4. In live mode, failed handler keys are persisted to the block's status file for retry
 
-This ensures no partial data is written and issues are immediately visible.
+During catchup, a handler error stops catchup for that specific handler but does not affect other handlers.
 
 ## Execution Modes
 
@@ -819,26 +830,36 @@ During compaction, `_live_progress` entries are migrated to `_handler_progress` 
 src/transformations/
 ├── mod.rs           # Module exports and re-exports
 ├── traits.rs        # TransformationHandler, EventHandler, EthCallHandler traits
-├── context.rs       # TransformationContext, DecodedEvent, DecodedCall, DecodedValue
-├── engine.rs        # TransformationEngine (orchestration, catchup, execution)
+├── context.rs       # TransformationContext, DecodedEvent, DecodedCall, FieldExtractor
+├── engine.rs        # TransformationEngine (orchestration, catchup, live processing)
+├── executor.rs      # HandlerExecutor — concurrent handler spawn-loop, source/version injection
+├── finalizer.rs     # RangeFinalizer — range finalization, reorg cleanup, progress tracking
+├── live_state.rs    # LiveProcessingState — pending event buffering, completion tracking
+├── retry.rs         # RetryProcessor — live retry from bincode storage for failed blocks
 ├── registry.rs      # Handler registration and build_registry()
 ├── historical.rs    # HistoricalDataReader for parquet queries
 ├── error.rs         # TransformationError enum
 ├── event/           # Event handlers
 │   ├── mod.rs           # register_handlers() for all event handlers
 │   ├── derc20_transfer.rs  # ERC20 Transfer handler
-│   └── v4/              # V4-specific handlers
-│       ├── mod.rs
-│       └── create.rs    # V4 pool creation handler
+│   ├── airlock_migrate.rs  # Airlock migration handler
+│   ├── v4/              # V4-specific handlers
+│   │   ├── mod.rs
+│   │   └── create.rs
+│   ├── multicurve/      # Multicurve handlers
+│   │   ├── mod.rs
+│   │   └── create.rs
+│   ├── scheduled_multicurve/  # Scheduled multicurve handlers
+│   │   ├── mod.rs
+│   │   └── create.rs
+│   ├── decay_multicurve/  # Decay multicurve handlers
+│   │   └── mod.rs
+│   └── dhook/           # DHook handlers
+│       └── (scaffolded)
 ├── eth_call/        # Call handlers
 │   └── mod.rs           # register_handlers() for all call handlers
-└── util/            # Shared utilities (see [TRANSFORMATION_UTILS.md](TRANSFORMATION_UTILS.md))
-    ├── mod.rs           # Byte/address/hex conversions
-    ├── constants.rs     # Q192, WAD, time intervals
-    ├── price.rs         # sqrtPriceX96 and reserve price computation
-    ├── market.rs        # Market cap, liquidity, volume calculations
-    ├── price_fetch.rs   # PriceFetcher — reads prices from parquet files
-    ├── quote_info.rs    # QuoteResolver — quote token identification & USD pricing
+└── util/            # Shared utilities
+    ├── mod.rs
     ├── metadata.rs      # Token metadata extraction utilities
     ├── sanitize.rs      # Address validation (precompile detection)
     └── db/              # Database operation helpers
@@ -850,13 +871,23 @@ src/transformations/
         └── v4_pool_configs.rs  # insert_pool_config helper
 
 migrations/
+├── 000_handler_progress.sql  # _handler_progress table
+├── 001_active_versions.sql   # active_versions table
+├── 002_live_progress.sql     # _live_progress table
 ├── tables/              # Table creation migrations
 │   ├── tokens.sql
 │   ├── pools.sql
 │   ├── transfers.sql
 │   ├── users.sql
-│   └── v4_pool_configs.sql
-└── (global migrations tracked in _migrations table)
+│   ├── v4_pool_configs.sql
+│   ├── swaps.sql
+│   ├── pool_metrics.sql
+│   ├── token_metrics.sql
+│   ├── liquidity_delta.sql
+│   ├── position.sql
+│   ├── portfolios.sql
+│   └── cumulated_fees.sql
+└── views/               # View migrations
 ```
 
 ## Performance Considerations

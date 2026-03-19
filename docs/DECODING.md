@@ -15,15 +15,17 @@ Decoded data is written to `data/{chain}/historical/decoded/` (for historical mo
 
 ```
                                     DecoderMessage
-┌─────────────────────┐     ┌───────────────────────┐
-│  Raw Data Collector │ ────┤  LogsReady            │───► Log Decoder
-│  (logs, eth_calls)  │     │  EthCallsReady        │───► Eth Call Decoder
-└─────────────────────┘     │  OnceCallsReady       │───► Eth Call Decoder
-                            │  EventCallsReady      │───► Eth Call Decoder
-                            │  FactoryAddresses     │───► Log Decoder
-                            │  OnceFileBackfilled   │───► Eth Call Decoder
-                            │  AllComplete          │───► Both Decoders
-                            └───────────────────────┘
+┌─────────────────────┐     ┌───────────────────────────┐
+│  Raw Data Collector │ ────┤  LogsReady                │───► Log Decoder
+│  (logs, eth_calls)  │     │  EthCallsReady            │───► Eth Call Decoder
+└─────────────────────┘     │  OnceCallsReady           │───► Eth Call Decoder
+                            │  EventCallsReady          │───► Eth Call Decoder
+                            │  EthCallsBlockComplete    │───► Eth Call Decoder
+                            │  FactoryAddresses         │───► Log Decoder
+                            │  OnceFileBackfilled       │───► Eth Call Decoder
+                            │  Reorg                    │───► Both Decoders
+                            │  AllComplete              │───► Both Decoders
+                            └───────────────────────────┘
                                       │
                                       ▼
                                data/{chain}/historical/decoded/
@@ -44,6 +46,7 @@ The `DecoderMessage` enum coordinates communication between collectors and decod
 | `EthCallsReady` | Regular eth_call results ready for decoding |
 | `OnceCallsReady` | One-time eth_call results ready for decoding |
 | `EventCallsReady` | Event-triggered eth_call results ready for decoding |
+| `EthCallsBlockComplete` | All eth_call decode work for a block/range has been queued (signals range completion or deferred transform retry) |
 | `FactoryAddresses` | Factory-discovered addresses for a range (needed for factory event matching) |
 | `OnceFileBackfilled` | A once-call file was backfilled with new columns - decoder should re-check it |
 | `Reorg` | A chain reorganization was detected - decoder should clean up orphaned blocks |
@@ -51,7 +54,7 @@ The `DecoderMessage` enum coordinates communication between collectors and decod
 
 ### Live Mode Flag
 
-The `LogsReady`, `EthCallsReady`, `OnceCallsReady`, and `EventCallsReady` variants include a `live_mode: bool` field that determines the output format:
+The `LogsReady`, `EthCallsReady`, `OnceCallsReady`, and `EventCallsReady` variants include a `live_mode: bool` field that determines the output format. The eth_call variants also include a `retry_transform_after_decode: bool` field that, when true, causes the decoder to persist decoded artifacts but defer transform execution until a block-complete retry request is processed:
 
 - **`live_mode: false`** (Historical mode): Decoded data is written to parquet files in `data/{chain}/historical/decoded/`
 - **`live_mode: true`** (Live mode): Decoded data is written to bincode files in `data/{chain}/live/decoded/` for fast per-block storage
@@ -72,6 +75,15 @@ DecoderMessage::Reorg {
 The decoder responds by:
 1. Deleting decoded bincode files for all orphaned blocks
 2. Continuing to process new canonical blocks as they arrive
+
+### Eth Call Block Completion
+
+The `EthCallsBlockComplete` message is sent after all eth_call decode work for a block/range has been queued. It serves two purposes:
+
+1. **Range completion signal**: When `retry_transform_after_decode` is false, the decoder sends a `RangeCompleteMessage` to the transformation engine indicating eth_call decoding is done for this range.
+2. **Deferred transform retry**: When `retry_transform_after_decode` is true, the decoder sends a `TransformRetryRequest` instead. This is used when eth_call results arrive after the initial transformation attempt, allowing the transformation engine to retry with the now-available decoded data.
+
+The eth_call decoder also updates the live block status (`eth_calls_decoded = true`) when processing this message.
 
 ## Log Decoding
 
@@ -159,7 +171,7 @@ Decoded log files contain:
 | `block_number` | UInt64 | Block number |
 | `block_timestamp` | UInt64 | Block timestamp |
 | `transaction_hash` | FixedSizeBinary(32) | Transaction hash |
-| `log_index` | UInt32 | Log index within transaction |
+| `log_index` | UInt32 | Log index within block |
 | `contract_address` | FixedSizeBinary(20) | Emitting contract address |
 | `{param_name}` | varies | One column per event parameter |
 | `{tuple_name}.{field_name}` | varies | Flattened tuple fields (e.g., `key.currency0`) |
@@ -280,8 +292,10 @@ The call is made at the block where the event was emitted, and the `log_index` i
 |--------|------|-------------|
 | `block_number` | UInt64 | Block number |
 | `block_timestamp` | UInt64 | Block timestamp |
-| `contract_address` | FixedSizeBinary(20) | Contract called |
-| `decoded_value` | varies | Decoded return value |
+| `address` | FixedSizeBinary(20) | Contract called |
+| `decoded_value` | varies | Decoded return value (simple types) |
+| `{name}` | varies | Named single value column (e.g., `latestAnswer`) |
+| `{field}` | varies | One column per tuple field (named tuples, flattened with dot-notation for nested tuples) |
 
 ### Output Schema - Once Calls
 
@@ -302,7 +316,8 @@ The call is made at the block where the event was emitted, and the `log_index` i
 | `log_index` | UInt32 | Log index of the triggering event |
 | `address` | FixedSizeBinary(20) | Target contract address |
 | `decoded_value` | varies | Decoded return value (simple types) |
-| `{field}` | varies | One column per tuple field (named tuples) |
+| `{name}` | varies | Named single value column |
+| `{field}` | varies | One column per tuple field (named tuples, flattened with dot-notation for nested tuples) |
 
 **Named Tuple Support for Once Calls:**
 
@@ -317,6 +332,21 @@ When a "once" call returns a named tuple, each field is stored as a separate col
 ```
 
 Output columns: `slot0.sqrtPriceX96`, `slot0.tick`, `slot0.feeProtocol`
+
+**Nested Named Tuple Support:**
+
+Eth_call output types support nested named tuples. Nested fields are recursively flattened into dot-notation columns:
+
+```json
+{
+  "function": "getState(address)",
+  "output_type": "(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee) poolKey, int24 farTick)",
+  "frequency": "once",
+  "params": [{"type": "address", "source": "self"}]
+}
+```
+
+Output columns: `getState.numeraire`, `getState.status`, `getState.poolKey.currency0`, `getState.poolKey.currency1`, `getState.poolKey.fee`, `getState.farTick`
 
 **Self-Address Parameters:**
 
@@ -349,6 +379,27 @@ data/{chain}/historical/decoded/eth_calls/{contract_name}/{function_name}/on_eve
 ## Supported Types
 
 ### Type Mapping
+
+Log decoding and eth_call decoding use different Arrow type mappings. Log decoding uses broader integer buckets (determined dynamically from the ABI bit width), while eth_call decoding uses narrower types (determined from the explicit `EvmType` in config).
+
+**Log decoding** (`param_type_to_arrow`):
+
+| Solidity Type | Decoded Representation | Arrow Type |
+|---------------|----------------------|------------|
+| `address` | `[u8; 20]` | FixedSizeBinary(20) |
+| `uint8` | `u8` | UInt8 |
+| `uint16`-`uint64` | `u64` | UInt64 |
+| `uint80`-`uint256` | `U256` (string) | Utf8 |
+| `int8` | `i8` | Int8 |
+| `int16`-`int64` | `i64` | Int64 |
+| `int80`-`int256` | `I256` (string) | Utf8 |
+| `bool` | `bool` | Boolean |
+| `bytes32` | `[u8; 32]` | FixedSizeBinary(32) |
+| `bytesN` (N != 32) | `Vec<u8>` | Binary |
+| `bytes` | `Vec<u8>` | Binary |
+| `string` | `String` | Utf8 |
+
+**Eth_call decoding** (`EvmType::to_arrow_type`):
 
 | Solidity Type | Decoded Representation | Arrow Type |
 |---------------|----------------------|------------|
@@ -384,9 +435,10 @@ Large integers (> 64 bits) are stored as decimal strings to avoid precision loss
 For factory-created contracts, the decoder:
 
 1. Receives `FactoryAddresses` messages with newly discovered addresses
-2. Stores addresses per block range
+2. Accumulates addresses across all ranges (the log decoder maintains a cumulative set of all known factory addresses loaded from both compacted parquet and uncompacted bincode files)
 3. When processing logs, matches against factory addresses instead of static addresses
 4. Supports factory-specific event and call configurations
+5. Factory addresses are not removed on reorg, since once-discovered addresses remain valid contracts
 
 ## Catchup Behavior
 
@@ -407,6 +459,8 @@ When the eth_call decoder receives `AllComplete`, it re-runs the catchup phase. 
 ### Synchronization Barrier
 
 The eth_call decoder waits for raw eth_call collection catchup to complete before starting its own catchup phase. This is coordinated via a `oneshot` channel (`eth_calls_catchup_done_rx`). After the decoder's catchup completes, it signals back via `decode_catchup_done_tx` to allow the transformation engine to proceed. This prevents deadlocks where the engine might be waiting for decoded data that hasn't been produced yet.
+
+During catchup, the eth_call decoder passes `None` for `transform_tx` to avoid a different deadlock: the transformation engine is blocked waiting for the decoder's barrier signal and won't read from the channel, so sends could block forever. Instead, the engine reads the decoded parquet files directly during its own catchup phase.
 
 ### Incremental Decoding
 

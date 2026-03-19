@@ -128,8 +128,8 @@ Both contracts feed into the same `DERC20` collection, sharing the calls and eve
 
 When a factory config references a collection type:
 
-1. **Calls are merged**: Collection type calls + inline calls (deduplicated by function signature)
-2. **Events are merged**: Collection type events + inline events (deduplicated by topic0)
+1. **Calls are merged**: Collection type calls + inline calls (extended, not replaced). Deduplication by function signature happens when `get_factory_call_configs` merges across multiple contracts contributing to the same collection.
+2. **Events are merged**: Collection type events + inline events (extended, not replaced)
 3. **Inline overrides**: If you specify calls/events inline, they extend (not replace) the collection type config
 
 ```json
@@ -245,18 +245,23 @@ pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     logs_factory_tx: &Option<Sender<FactoryAddressData>>,
-    eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
-    call_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
     factory_catchup_done_tx: Option<oneshot::Sender<()>>,
+    s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError>
 ```
+
+Note: `eth_calls_factory_tx` and `call_decoder_tx` are intentionally omitted from the catchup signature. Both consumers load factory addresses from parquet during their own catchup phases. Sending during factory catchup would deadlock because those channels are not consumed until after factory catchup completes.
 
 Returns `FactoryCatchupState` containing:
 - `matchers`: Arc-wrapped factory matchers for reuse
 - `existing_files`: Arc-wrapped set of existing parquet file paths
 - `output_dir`: Arc-wrapped output directory path
+- `s3_manifest`: Optional S3 manifest for remote storage
+- `storage_manager`: Optional storage manager for S3 uploads
+- `chain_name`: Chain name string
 
 ### Phase 2: Current/Streaming (`current/factories.rs`)
 
@@ -274,25 +279,29 @@ pub async fn collect_factories(
     matchers: Arc<Vec<FactoryMatcher>>,
     existing_files: Arc<HashSet<String>>,
     output_dir: Arc<PathBuf>,
+    s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), FactoryCollectionError>
 ```
 
 ### Parameters
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `chain` | `&ChainConfig` | Chain configuration with contracts |
-| `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and concurrency configuration |
-| `log_rx` | `Receiver<LogMessage>` | Channel receiving log messages from receipt collector (current phase only) |
-| `logs_factory_tx` | `Option<Sender<FactoryAddressData>>` | Channel to send addresses to logs collector |
-| `eth_calls_factory_tx` | `Option<Sender<FactoryMessage>>` | Channel to send factory messages to eth_calls collector |
-| `log_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to log decoder |
-| `call_decoder_tx` | `Option<Sender<DecoderMessage>>` | Channel to send addresses to call decoder |
-| `recollect_tx` | `Option<Sender<RecollectRequest>>` | Channel to request recollection of corrupted log files (catchup only) |
-| `factory_catchup_done_tx` | `Option<oneshot::Sender<()>>` | Signal when catchup completes (catchup only) |
-| `matchers` | `Arc<Vec<FactoryMatcher>>` | Pre-built factory matchers from catchup (current only) |
-| `existing_files` | `Arc<HashSet<String>>` | Pre-scanned existing files from catchup (current only) |
-| `output_dir` | `Arc<PathBuf>` | Output directory from catchup (current only) |
+| Parameter | Type | Phase | Description |
+|-----------|------|-------|-------------|
+| `chain` | `&ChainConfig` | Both | Chain configuration with contracts |
+| `raw_data_config` | `&RawDataCollectionConfig` | Both | Parquet range size and concurrency configuration |
+| `log_rx` | `Receiver<LogMessage>` | Current | Channel receiving log messages from receipt collector |
+| `logs_factory_tx` | `Option<Sender<FactoryAddressData>>` | Both | Channel to send addresses to logs collector |
+| `eth_calls_factory_tx` | `Option<Sender<FactoryMessage>>` | Current | Channel to send factory messages to eth_calls collector |
+| `log_decoder_tx` | `Option<Sender<DecoderMessage>>` | Both | Channel to send addresses to log decoder |
+| `call_decoder_tx` | `Option<Sender<DecoderMessage>>` | Current | Channel to send addresses to call decoder |
+| `recollect_tx` | `Option<Sender<RecollectRequest>>` | Catchup | Channel to request recollection of corrupted log files |
+| `factory_catchup_done_tx` | `Option<oneshot::Sender<()>>` | Catchup | Signal when catchup completes |
+| `matchers` | `Arc<Vec<FactoryMatcher>>` | Current | Pre-built factory matchers from catchup |
+| `existing_files` | `Arc<HashSet<String>>` | Current | Pre-scanned existing files from catchup |
+| `output_dir` | `Arc<PathBuf>` | Current | Output directory from catchup |
+| `s3_manifest` | `Option<S3Manifest>` | Both | S3 manifest for checking remote file existence and skipping already-uploaded ranges |
+| `storage_manager` | `Option<Arc<StorageManager>>` | Both | Storage manager for uploading parquet files to S3 |
 
 ### LogMessage Protocol
 
@@ -371,7 +380,9 @@ The `addresses_by_block` map contains `(timestamp, address, collection_name)` tu
                     │                     │                          │
                     │                     ▼ FactoryCatchupState      │
                     │                     │ (matchers, existing_files│
-                    │                     │  output_dir)             │
+                    │                     │  output_dir, s3_manifest,│
+                    │                     │  storage_manager,        │
+                    │                     │  chain_name)             │
                     └─────────────────────┼──────────────────────────┘
                                           │
                                           ▼
@@ -488,7 +499,8 @@ The shared `factories.rs` module provides internal functions used by both catchu
 
 ```rust
 // Build factory matchers from contract configuration
-pub(crate) fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher>
+// Handles both Single and Multiple address configs, creating matchers for each address
+pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher>
 
 // Scan existing factory parquet files, returns relative paths like "collection/start-end.parquet"
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String>
@@ -497,7 +509,8 @@ pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String>
 pub(crate) fn load_factory_addresses_from_parquet(dir: &Path) -> Result<Vec<FactoryAddressData>, ...>
 
 // Get existing log file ranges for catchup gap detection
-pub(crate) fn get_existing_log_ranges(chain_name: &str) -> Vec<ExistingLogRange>
+// Also includes ranges from S3 manifest that aren't present locally
+pub(crate) fn get_existing_log_ranges(chain_name: &str, s3_manifest: Option<&S3Manifest>) -> Vec<ExistingLogRange>
 
 // Read log batches from parquet with column projection (block_number, block_timestamp, address, topics, data)
 pub(crate) fn read_log_batches_from_parquet(file_path: &Path) -> Result<Vec<RecordBatch>, ...>
@@ -510,6 +523,9 @@ pub(crate) async fn process_range_batches(
     matchers: &[FactoryMatcher],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<FactoryAddressData, ...>
 
 // Process logs from Vec<LogData> (used by current/streaming phase)
@@ -520,6 +536,9 @@ pub(crate) async fn process_range(
     matchers: &[FactoryMatcher],
     output_dir: &Path,
     existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<&Arc<StorageManager>>,
+    chain_name: &str,
 ) -> Result<FactoryAddressData, ...>
 ```
 
@@ -727,17 +746,18 @@ Collection is fully resumable with multiple safeguards:
 
 ### Factory Parquet Skipping
 
-Existing parquet files are scanned on startup and their ranges are skipped during collection.
+Existing parquet files are scanned on startup and their ranges are skipped during collection. When S3 storage is configured, the S3 manifest is also checked, so ranges already uploaded to S3 are skipped even if the local files have been cleaned up.
 
 ### Catchup Phase
 
 On startup, before processing new logs from the channel, the factory collector performs a catchup phase:
 
-1. **Load existing factory data**: Reads all existing factory parquet files and sends addresses to downstream collectors (logs, eth_calls, decoders)
-2. **Scan for gaps**: Scans `data/{chain}/historical/raw/logs/` for existing log parquet files
-3. **Check completeness**: For each log file, checks if corresponding factory files exist for all configured collections
-4. **Process gaps concurrently**: If any factory files are missing, reads logs from the existing parquet file and processes them using semaphore-bounded concurrency (controlled by `factory_concurrency` config)
-5. **Signal completion**: Sends `factory_catchup_done_tx` oneshot to unblock dependent catchup phases (e.g., eth_calls)
+1. **Load existing factory data**: Reads all existing factory parquet files and sends addresses to downstream collectors (logs, decoders)
+2. **Scan for gaps**: Scans `data/{chain}/historical/raw/logs/` for existing log parquet files (and S3 manifest ranges not present locally)
+3. **Check completeness**: For each log file, checks if corresponding factory files exist for all configured collections (checking both local files and S3 manifest)
+4. **Process gaps concurrently**: If any factory files are missing, reads logs from the existing parquet file (downloading from S3 if needed) and processes them using semaphore-bounded concurrency (controlled by `factory_concurrency` config)
+5. **Upload to S3**: If storage manager is configured, newly written factory parquet files are uploaded to S3
+6. **Signal completion**: Sends `factory_catchup_done_tx` oneshot to unblock dependent catchup phases (e.g., eth_calls)
 
 This is particularly useful when:
 - Factory collection was interrupted mid-run
@@ -764,7 +784,7 @@ During catchup, if a log parquet file is corrupted (fails to parse), the factory
 pub struct RecollectRequest {
     pub range_start: u64,
     pub range_end: u64,
-    pub file_path: PathBuf,
+    pub _file_path: PathBuf,
 }
 ```
 
@@ -811,7 +831,7 @@ For each block range processed, the factory collector writes a parquet file for 
 
 ### Downstream Collector Notification
 
-On startup, factory addresses from existing parquet files are read and sent to the logs and eth_calls collectors. This allows those collectors to process ranges that they haven't yet handled, even if the factory collector already processed them in a previous run.
+On startup, factory addresses from existing parquet files are read and sent to the logs collector and log decoder. The eth_calls collector and call decoder are intentionally not notified during catchup -- they load factory addresses from parquet during their own catchup phases. This avoids deadlock since those channels are not consumed until after factory catchup completes.
 
 ### Catchup Coordination
 
@@ -826,3 +846,27 @@ On the next run, the receipt collector will detect the missing factory files and
 ### Manual Re-collection
 
 To re-collect a factory range, delete the corresponding file from `data/{chain}/historical/factories/{collection}/` (or `data/{chain}/live/factories/{collection}/` for live data). Note that you may also need to delete the corresponding receipts file to trigger re-processing.
+
+## S3 Storage Integration
+
+When a `StorageManager` is configured, factory collection integrates with S3 for remote storage:
+
+### Upload
+
+After writing a factory parquet file locally, it is uploaded to S3 using the data type path `factories/{collection_name}`. This applies to both non-empty and empty (placeholder) factory parquet files.
+
+### Skip Logic
+
+Before writing a factory parquet file, the collector checks both:
+- The local `existing_files` set (scanned on startup)
+- The `S3Manifest` (via `has_factories()`)
+
+If the range already exists in either location, writing is skipped.
+
+### Download on Demand
+
+During catchup, if a log parquet file is referenced in the S3 manifest but not present locally, the collector uses `DataLoader::ensure_local()` to download it from S3 before processing.
+
+### Gap Detection
+
+`get_existing_log_ranges()` merges local log file ranges with ranges from the S3 manifest, so catchup can detect and process gaps even when some data only exists remotely.

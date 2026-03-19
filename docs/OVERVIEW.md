@@ -11,6 +11,8 @@ Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rus
 - **Event Decoding** - Parses raw log data into typed columns using Solidity event signatures
 - **Transformations** - Custom Rust handlers process decoded data and write to PostgreSQL with per-handler progress tracking
 - **Live Mode** - Real-time block processing via WebSocket with reorg detection and automatic compaction
+- **S3 Storage** - Optional S3-compatible storage with write-through caching, manifest management, and retry queues
+- **Prometheus Metrics** - RPC and pipeline metrics exposed via HTTP endpoint
 - **Parallel Processing** - Async task-based architecture with configurable concurrency for maximum throughput
 - **Resumable** - Automatic catchup on restart, skipping already-collected ranges
 - **Flexible Output** - Parquet files for analytics, PostgreSQL for application data
@@ -24,12 +26,15 @@ The indexer supports multiple operating modes:
 | **Full Mode** | Historical collection followed by live WebSocket processing |
 | **Decode-Only** (`--decode-only`) | Run decoders on existing raw parquet files without collection |
 | **Live-Only** (`--live-only`) | Skip historical processing and start directly in live mode |
+| **Catch-Up-Only** (`--catch-up-only`) | Fill gaps in existing data, then exit (no live mode) |
 
 ## Project Structure
 
 ```
 src/
 ├── main.rs              # Entry point, orchestrates the pipeline
+├── runtime.rs           # Chain runtime setup (RPC clients, features, channels)
+├── bench.rs             # Benchmarking (behind "bench" feature flag)
 ├── db/                  # Database layer
 │   ├── pool.rs          # PostgreSQL connection pool (deadpool_postgres)
 │   ├── types.rs         # DbValue, DbOperation, WhereClause types
@@ -40,43 +45,74 @@ src/
 │   ├── alchemy.rs       # Alchemy client with CU rate limiting
 │   ├── rpc.rs           # Standard RPC client
 │   └── websocket.rs     # WebSocket client for live mode
-├── raw_data/            # Data collection and decoding
-│   ├── historical/      # Historical collection pipeline
-│   │   ├── catchup/     # Catchup phase (process existing ranges)
-│   │   ├── current/     # Current phase (process new blocks)
-│   │   ├── blocks.rs    # Block collection
-│   │   ├── receipts.rs  # Receipt collection
-│   │   ├── logs.rs      # Log collection
-│   │   ├── eth_calls.rs # ETH call collection
-│   │   └── factories.rs # Factory contract discovery
-│   └── decoding/        # ABI decoding
-│       ├── logs.rs      # Log decoder
-│       ├── eth_calls.rs # ETH call decoder
-│       ├── catchup/     # Catchup decoding
-│       └── current/     # Live decoding
+├── raw_data/            # Raw data collection
+│   └── historical/      # Historical collection pipeline
+│       ├── catchup/     # Catchup phase (process existing ranges)
+│       ├── current/     # Current phase (process new blocks)
+│       ├── blocks.rs    # Block collection
+│       ├── receipts.rs  # Receipt collection
+│       ├── logs.rs      # Log collection
+│       ├── eth_calls/   # ETH call collection (config, execution, frequency, etc.)
+│       └── factories.rs # Factory contract discovery
+├── decoding/            # ABI decoding (top-level module)
+│   ├── logs.rs          # Log decoder
+│   ├── event_parsing.rs # Event signature parsing
+│   ├── eth_calls/       # ETH call decoder (decode, transform, column_index, etc.)
+│   ├── catchup/         # Catchup decoding
+│   └── current/         # Live decoding
 ├── live/                # Live mode components
 │   ├── collector.rs     # WebSocket block collection
 │   ├── storage.rs       # Bincode storage for live data
 │   ├── compaction.rs    # Bincode to parquet compaction
 │   ├── progress.rs      # Per-block progress tracking
-│   └── reorg.rs         # Chain reorganization detection
+│   ├── reorg.rs         # Chain reorganization detection
+│   ├── eth_calls.rs     # Live eth_call collection
+│   ├── catchup.rs       # Live mode catchup/backfill
+│   ├── error.rs         # Live mode error types
+│   └── types.rs         # Live mode types
+├── storage/             # Storage abstraction layer
+│   ├── local.rs         # Local filesystem backend
+│   ├── s3.rs            # S3-compatible object storage backend
+│   ├── cached.rs        # Write-through cache (local + S3)
+│   ├── manifest.rs      # S3 manifest management
+│   ├── upload.rs        # Parquet upload to S3
+│   ├── retry.rs         # Failed upload retry queue
+│   ├── initial_sync.rs  # Initial sync of local data to S3
+│   ├── data_loader.rs   # Data loading utilities
+│   └── error.rs         # Storage error types
+├── metrics/             # Prometheus metrics
+│   ├── mod.rs           # Metrics server initialization
+│   └── rpc.rs           # RPC metrics (counters, histograms)
 ├── transformations/     # Transformation system
 │   ├── traits.rs        # TransformationHandler, EventHandler, EthCallHandler traits
 │   ├── registry.rs      # Handler registration
 │   ├── engine.rs        # Transformation engine (orchestrates handlers)
+│   ├── executor.rs      # Handler execution logic
+│   ├── finalizer.rs     # Post-execution finalization
 │   ├── context.rs       # TransformationContext, DecodedEvent, DecodedCall
 │   ├── historical.rs    # HistoricalDataReader (parquet queries)
+│   ├── live_state.rs    # Live mode state tracking
+│   ├── retry.rs         # Transformation retry logic
+│   ├── error.rs         # Transformation error types
 │   ├── event/           # Event handlers
 │   ├── eth_call/        # ETH call handlers
-│   └── util/            # Shared utilities (price, market, db helpers)
+│   └── util/            # Shared utilities (db helpers, metadata, sanitize)
 └── types/               # Type definitions
     ├── config/          # Configuration types
     │   ├── indexer.rs   # IndexerConfig
-    │   ├── chain.rs     # ChainConfig
+    │   ├── chain.rs     # ChainConfig, RpcConfig
     │   ├── contract.rs  # Contract definitions
     │   ├── eth_call.rs  # ETH call config (frequency, triggers)
+    │   ├── raw_data.rs  # RawDataCollectionConfig
+    │   ├── transformations.rs # TransformationConfig
+    │   ├── storage.rs   # StorageConfig (S3, cache, sync)
+    │   ├── defaults.rs  # Centralized default values
+    │   ├── tokens.rs    # Token configuration
+    │   ├── metrics.rs   # Metrics configuration
     │   └── ...
-    └── shared/          # Shared types
+    ├── shared/          # Shared types (metadata)
+    ├── decoded.rs       # DecodedValue type
+    └── uniswap/         # Uniswap-specific types
 ```
 
 ## Architecture
@@ -196,13 +232,14 @@ data/{chain}/
     └── status/               # Per-block processing status
 
 migrations/
-├── tables/              # Core table migrations
-│   ├── tokens.sql
-│   ├── pools.sql
-│   └── ...
-└── handlers/            # Per-handler migrations
-    └── {handler_name}/
-        └── {migration}.sql
+├── 000_handler_progress.sql  # Core migrations (numbered)
+├── 001_active_versions.sql
+├── 002_live_progress.sql
+└── tables/                   # Per-handler table migrations
+    ├── tokens.sql
+    ├── pools.sql
+    ├── swaps.sql
+    └── ...
 ```
 
 ## Transformation System
@@ -216,9 +253,9 @@ The transformation system processes decoded events and eth_calls, transforming t
 #[async_trait]
 pub trait TransformationHandler: Send + Sync + 'static {
     fn name(&self) -> &'static str;
-    fn version(&self) -> u32 { 1 }              // Bump to reprocess all data
-    fn handler_key(&self) -> String;            // "{name}_v{version}"
-    fn migration_paths(&self) -> Vec<&'static str>;  // Handler-specific SQL
+    fn version(&self) -> u32 { 1 }                          // Bump to reprocess all data
+    fn handler_key(&self) -> String;                        // "{name}_v{version}"
+    fn migration_paths(&self) -> Vec<&'static str> { vec![] }  // Handler-specific SQL
     fn reorg_tables(&self) -> Vec<&'static str> { vec![] }  // Tables for reorg rollback
     async fn handle(&self, ctx: &TransformationContext) -> Result<Vec<DbOperation>, TransformationError>;
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> { Ok(()) }
@@ -307,13 +344,20 @@ client.get_blocks_streaming(block_numbers, full_transactions, result_tx)
 
 This enables pipeline parallelism where downstream collectors process data while upstream is still fetching.
 
+### RPC Configuration
+
+RPC parameters are configured per-chain in the `rpc` config block (not via environment variables):
+
+| Config Field | Default | Description |
+|--------------|---------|-------------|
+| `rpc.concurrency` | 100 | Max concurrent RPC requests |
+| `rpc.compute_units_per_second` | 7500 | Alchemy compute units per second |
+| `rpc.batch_size` | 100 | Max batch size for RPC requests |
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RPC_CONCURRENCY` | 100 | Max concurrent RPC requests |
-| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second |
-| `RPC_BATCH_SIZE` | (config) | Override for batch size |
 | `DB_POOL_SIZE` | 16 | PostgreSQL connection pool size |
 
 ## Factory Collection
@@ -434,21 +478,23 @@ cargo run --release
       "start_block": 26602741,
       "contracts": "contracts/base",
       "tokens": "tokens/base.json",
-      "factory_collections": "factory_collections/base.json",
-      "block_receipts_method": "eth_getBlockReceipts"
+      "block_receipts_method": "eth_getBlockReceipts",
+      "rpc": {
+        "concurrency": 100,
+        "compute_units_per_second": 7500,
+        "batch_size": 1000
+      }
     }
   ],
   "raw_data_collection": {
+    "channel_capacity": 5000,
+    "factory_channel_capacity": 5000,
+    "block_receipt_concurrency": 100,
     "parquet_block_range": 10000,
-    "rpc_batch_size": 100,
-    "contract_logs_only": true,
-    "live_mode": true,
-    "reorg_depth": 128,
-    "compaction_interval_secs": 10,
-    "decoding_concurrency": 4,
-    "factory_concurrency": 4,
+    "rpc_batch_size": 1000,
+    "contract_logs_only": false,
     "fields": {
-      "block_fields": ["number", "timestamp", "transactions"],
+      "block_fields": ["number", "timestamp", "transactions", "uncles"],
       "receipt_fields": ["block_number", "timestamp", "transaction_hash", "from", "to"],
       "log_fields": ["block_number", "timestamp", "transaction_hash", "log_index", "address", "topics", "data"]
     }
@@ -456,9 +502,18 @@ cargo run --release
   "transformations": {
     "database_url_env_var": "DATABASE_URL",
     "handler_concurrency": 4,
+    "max_batch_size": 1000,
     "mode": {
       "batch_for_catchup": true,
       "catchup_batch_size": 10000
+    }
+  },
+  "storage": {
+    "s3": {
+      "endpoint_env_var": "S3_ENDPOINT",
+      "access_key_env_var": "S3_ACCESS_KEY",
+      "secret_key_env_var": "S3_SECRET_KEY",
+      "bucket_env_var": "S3_BUCKET"
     }
   },
   "metrics": {
@@ -504,7 +559,7 @@ The indexer is designed for high throughput:
 - **Multicall3 batching** - Combine all eth_calls per block into a single RPC call
 - **Rate limit aware** - Sliding window rate limiter matches Alchemy's 10-second window
 - **Shared rate limiter** - Single limiter across all clients for account-level limiting
-- **Semaphore-bounded concurrency** - `RPC_CONCURRENCY` controls in-flight requests
+- **Semaphore-bounded concurrency** - `rpc.concurrency` config controls in-flight requests
 - **Efficient storage** - Snappy-compressed Parquet with configurable schemas
 - **Resumable** - Automatic catchup skips already-processed ranges
 - **Incremental decoding** - New events/calls only process what's missing

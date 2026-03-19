@@ -30,13 +30,13 @@ src/rpc/
 
 ```rust
 // From mod.rs
-pub use alchemy::{AlchemyClient, AlchemyConfig, ComputeUnitCost, SlidingWindowRateLimiter};
-pub use rpc::{RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider};
+pub use alchemy::SlidingWindowRateLimiter;
+pub use rpc::RpcError;
 pub use unified::UnifiedRpcClient;
-pub use websocket::{BlockHeader, ReconnectConfig, WsClient, WsError, WsEvent};
+pub use websocket::{WsClient, WsEvent};
 ```
 
-Note: `RateLimitConfig` (for governor-based rate limiting in `RpcClient`) is defined in `rpc.rs` but not re-exported from the module root. To use it, either add it to the `pub use` in `mod.rs` or import directly from the submodule.
+Note: Most types (`AlchemyClient`, `AlchemyConfig`, `ComputeUnitCost`, `RpcClient`, `RpcClientConfig`, `RpcProvider`, `RetryConfig`, `RateLimitConfig`, `BlockHeader`, `ReconnectConfig`, `WsError`) are defined in their respective submodules but not re-exported from the module root. To use them, either add them to the `pub use` in `mod.rs` or import directly from the submodule.
 
 ## RpcProvider Trait
 
@@ -288,6 +288,7 @@ Errors are automatically classified as retryable or permanent. Retryable errors 
 - **Rate limit errors** - 429 responses, "too many requests"
 - **Server errors** - 502, 503, 504 responses
 - **Timeout errors** - Connection timeouts, request timeouts
+- **Network errors** - "network", "sending request", "bad gateway"
 - **Temporary failures** - Errors containing "retry", "temporarily", "try again"
 
 Non-retryable errors (like invalid URL or malformed requests) fail immediately without retry.
@@ -355,11 +356,12 @@ let client = UnifiedRpcClient::from_url_with_options(
     "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY",
     7500,  // CU per second
     500,   // Max concurrent requests
+    100,   // Max batch size
     Some(shared_limiter.clone()),  // Shared limiter
 )?;
 ```
 
-Note: For non-Alchemy URLs, `from_url_with_options()` ignores the CU, concurrency, and limiter parameters and creates a standard `RpcClient`.
+Note: For non-Alchemy URLs, `from_url_with_options()` ignores the CU, concurrency, and limiter parameters but still applies `max_batch_size` to the standard `RpcClient`.
 
 ### Available Methods
 
@@ -447,10 +449,10 @@ let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(7500));
 
 // All clients share the same limiter
 let blocks_client = UnifiedRpcClient::from_url_with_options(
-    &rpc_url, 7500, 100, Some(shared_limiter.clone())
+    &rpc_url, 7500, 100, 100, Some(shared_limiter.clone())
 )?;
 let receipts_client = UnifiedRpcClient::from_url_with_options(
-    &rpc_url, 7500, 100, Some(shared_limiter.clone())
+    &rpc_url, 7500, 100, 100, Some(shared_limiter.clone())
 )?;
 ```
 
@@ -676,9 +678,9 @@ if error.is_retryable() {
 ```
 
 The `is_retryable()` method checks for common transient error patterns:
-- Network/connection errors: "connection", "timeout", "reset", "broken pipe", "eof"
+- Network/connection errors: "connection", "timeout", "timed out", "reset", "broken pipe", "network", "eof", "sending request"
 - Rate limiting: "rate limit", "too many requests", "429"
-- Server errors: "502", "503", "504", "internal server error", "service unavailable"
+- Server errors: "502", "503", "504", "internal server error", "service unavailable", "bad gateway"
 - Temporary failures: "temporarily", "try again", "retry"
 
 ## Accessing the Underlying Provider
@@ -748,7 +750,7 @@ let ws_client = Arc::new(WsClient::new(
 // Create channel for receiving events
 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-// Start subscription - returns a JoinHandle for the background task
+// Start subscription - returns a JoinHandle<Result<(), WsError>> for the background task
 let handle = ws_client.subscribe(event_tx);
 
 // Receive events from the channel
@@ -800,6 +802,12 @@ pub struct ReconnectConfig {
 | `SubscriptionFailed` | Failed to subscribe to newHeads |
 | `ChannelClosed` | Event channel was closed |
 
+### Additional Methods
+
+- `WsClient::from_urls(ws_url, http_client)` - Create with default `ReconnectConfig`
+- `ws_client.is_alchemy()` - Whether this client is connected to Alchemy (detected from URL)
+- `ws_client.http_client()` - Get the `Arc<UnifiedRpcClient>` for backfill operations
+
 ### Gap Detection
 
 On reconnection, the client uses the HTTP client to get the current block number and compares it with the last received block. If a gap is detected, a `WsEvent::Reconnected { missed_from, missed_to }` event is sent, allowing the caller to backfill missing blocks using `ws_client.http_client()`.
@@ -823,7 +831,7 @@ The `AlchemyClient` uses an internal `ConcurrentExecutor` helper struct that enc
 struct ConcurrentExecutor {
     semaphore: Arc<Semaphore>,
     rate_limiter: Arc<SlidingWindowRateLimiter>,
-    rpc_concurrency: u32,
+    cost_per_request: u32,
 }
 ```
 

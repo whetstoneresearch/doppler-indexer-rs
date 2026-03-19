@@ -20,12 +20,20 @@ use tokio::sync::mpsc;
 let client = UnifiedRpcClient::from_url(&rpc_url)?;
 let (tx, rx) = mpsc::channel(1000);
 
-// Basic usage with transaction sender only
-collect_blocks(&chain_config, &client, &raw_data_config, Some(tx), None).await?;
+// Basic usage with transaction sender only (no S3, no storage manager, full collection)
+collect_blocks(&chain_config, &client, &raw_data_config, Some(tx), None, None, None, false).await?;
 
 // With both transaction and eth_call senders
 let (eth_call_tx, eth_call_rx) = mpsc::channel(1000);
-collect_blocks(&chain_config, &client, &raw_data_config, Some(tx), Some(eth_call_tx)).await?;
+collect_blocks(&chain_config, &client, &raw_data_config, Some(tx), Some(eth_call_tx), None, None, false).await?;
+
+// With S3 manifest and storage manager for remote storage
+collect_blocks(
+    &chain_config, &client, &raw_data_config,
+    Some(tx), Some(eth_call_tx),
+    s3_manifest.as_ref(), Some(storage_manager.clone()),
+    false,
+).await?;
 ```
 
 ## Function Signature
@@ -37,6 +45,9 @@ pub async fn collect_blocks(
     raw_data_config: &RawDataCollectionConfig,
     tx_sender: Option<Sender<(u64, u64, Vec<B256>)>>,
     eth_call_sender: Option<Sender<(u64, u64)>>,
+    s3_manifest: Option<&S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
+    catch_up_only: bool,
 ) -> Result<(), BlockCollectionError>
 ```
 
@@ -49,6 +60,9 @@ pub async fn collect_blocks(
 | `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
 | `tx_sender` | `Option<Sender<(u64, u64, Vec<B256>)>>` | Optional channel for receipt/log collection |
 | `eth_call_sender` | `Option<Sender<(u64, u64)>>` | Optional channel for eth_call data collection |
+| `s3_manifest` | `Option<&S3Manifest>` | Optional S3 manifest for skipping ranges already in remote storage |
+| `storage_manager` | `Option<Arc<StorageManager>>` | Optional storage manager for uploading Parquet files to S3 after writing |
+| `catch_up_only` | `bool` | When true, only fills gaps within existing data without extending to chain head |
 
 ### Channel Message Format
 
@@ -91,7 +105,7 @@ The start block is aligned to the nearest multiple of the range size (rounded do
 
 ## Resumability
 
-Collection is resumable. On each run, existing Parquet files are scanned and their ranges are skipped. To re-collect a range, delete the corresponding file.
+Collection is resumable. On each run, existing Parquet files are scanned (both local and in S3 via the manifest) and their ranges are skipped. To re-collect a range, delete the corresponding local file (and remove it from the S3 manifest if applicable).
 
 ## Field Configuration
 
@@ -154,7 +168,7 @@ When no fields are specified, all block header fields are stored:
 Block collection uses a **streaming approach** for maximum throughput:
 
 1. **Concurrent dispatch**: All block requests for a range are dispatched at once via `get_blocks_streaming()`
-2. **Rate limiting**: Semaphore limits concurrent in-flight requests (`RPC_CONCURRENCY`)
+2. **Rate limiting**: Semaphore limits concurrent in-flight requests (`rpc.concurrency`)
 3. **Per-request CU tracking**: Each request acquires compute units individually from the sliding window limiter
 4. **Immediate forwarding**: As each block arrives, it's immediately forwarded to downstream collectors
 5. **Ordered output**: Records are buffered in a BTreeMap for sorted parquet output
@@ -195,18 +209,17 @@ The `UnifiedRpcClient::get_blocks_streaming()` method behaves differently based 
 - **Pipeline parallelism**: While blocks are being fetched, downstream is already processing
 - **Better rate limit utilization**: Continuous request flow instead of batch-wait-batch pattern
 
-### Environment Variables
+### RPC Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RPC_CONCURRENCY` | 100 | Max concurrent in-flight block requests |
-| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second |
-| `RPC_BATCH_SIZE` | (from config) | Override for `rpc_batch_size` config value |
+RPC settings are configured per-chain in the config file under the `rpc` section (not via environment variables):
 
-**Example for high throughput:**
-```bash
-RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
-```
+| Config Field | Default | Description |
+|-------------|---------|-------------|
+| `rpc.concurrency` | 100 | Max concurrent in-flight RPC requests |
+| `rpc.compute_units_per_second` | 7500 | Alchemy compute units per second |
+| `rpc.batch_size` | 100 | Max number of requests per JSON-RPC batch |
+
+These values can also be set via `rpc_batch_size` in the `raw_data_collection` section as a fallback for batch size.
 
 ## RPC Client Selection
 
@@ -229,6 +242,7 @@ let client = UnifiedRpcClient::from_url_with_options(
     &rpc_url,
     7500,                    // compute_units_per_second
     100,                     // rpc_concurrency
+    100,                     // max_batch_size
     Some(shared_limiter),    // optional shared rate limiter
 )?;
 ```
@@ -256,7 +270,12 @@ All clients can share a rate limiter for account-level rate limiting across bloc
       "name": "ethereum",
       "chain_id": 1,
       "rpc_url_env_var": "ETHEREUM_RPC_URL",
-      "start_block": "17000000"
+      "start_block": "17000000",
+      "rpc": {
+        "concurrency": 100,
+        "compute_units_per_second": 7500,
+        "batch_size": 100
+      }
     }
   ],
   "raw_data_collection": {
@@ -275,16 +294,25 @@ This configuration:
 - Uses streaming collection with channel buffer size of 1000
 - Stores all block fields (full schema)
 - Reads RPC URL from `ETHEREUM_RPC_URL` environment variable
+- Uses per-chain RPC settings (concurrency, CU rate, batch size)
 
 ### Additional Configuration Options
+
+These options are under `raw_data_collection`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `parquet_block_range` | 1000 | Number of blocks per Parquet file |
+| `rpc_batch_size` | 100 | Fallback batch size (overridden by per-chain `rpc.batch_size`) |
 | `channel_capacity` | 1000 | Capacity for main channels (blocks, logs, eth_calls) |
+| `factory_channel_capacity` | 1000 | Capacity for factory-related channels |
 | `block_receipt_concurrency` | 10 | Concurrent block receipt fetches |
 | `decoding_concurrency` | 4 | Concurrent decoding tasks |
 | `factory_concurrency` | 4 | Concurrent factory collection tasks |
+| `live_mode` | false | Enable WebSocket live mode after catchup completes |
+| `reorg_depth` | 128 | Number of blocks to track for reorg detection |
+| `compaction_interval_secs` | 10 | Interval in seconds between compaction checks |
+| `transform_retry_grace_period_secs` | 300 | Grace period in seconds before retrying stuck transformations |
 
 ## Helper Functions
 
@@ -295,10 +323,13 @@ Two helper functions are available for reading previously collected block data:
 #### `get_existing_block_ranges`
 
 ```rust
-pub fn get_existing_block_ranges(chain_name: &str) -> Vec<ExistingBlockRange>
+pub fn get_existing_block_ranges(
+    chain_name: &str,
+    s3_manifest: Option<&S3Manifest>,
+) -> Vec<ExistingBlockRange>
 ```
 
-Scans the output directory and returns all existing Parquet file ranges for a chain. Useful for determining what data has already been collected.
+Scans the local output directory and the S3 manifest (if provided) and returns all existing Parquet file ranges for a chain. S3-only ranges that are not present locally are included. Useful for determining what data has already been collected.
 
 **Returns:** `Vec<ExistingBlockRange>` sorted by start block, where each range contains:
 - `start: u64` - First block number (inclusive)

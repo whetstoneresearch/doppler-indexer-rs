@@ -44,7 +44,12 @@ s3://{bucket}/
     markers/
       raw/blocks/{start}_{end}.marker
       raw/logs/{start}_{end}.marker
-      ...
+      raw/receipts/{start}_{end}.marker
+      raw/eth_calls/{contract}/{function}/{start}_{end}.marker
+      raw/eth_calls/{contract}/{function}/on_events/{start}_{end}.marker
+      decoded/logs/{source}/{event}/{start}_{end}.marker
+      decoded/eth_calls/{source}/{function}/{start}_{end}.marker
+      factories/{collection}/{start}_{end}.marker
     manifest.json
 ```
 
@@ -143,10 +148,10 @@ The indexer uses a tiered caching strategy:
 
 ### Pinned Prefixes
 
-Data matching pinned prefixes is never evicted from local cache. This ensures transformation dependencies are always available locally:
+Data matching pinned prefixes is never evicted from local cache. The match is a substring check (via `contains`), not a strict prefix match, so a key like `chain/decoded/logs/event.parquet` matches the `decoded` prefix. This ensures transformation dependencies are always available locally:
 
-- `factories/` - Factory addresses needed for log filtering
-- `decoded/` - Decoded events/calls needed for transformations
+- `factories` - Factory addresses needed for log filtering
+- `decoded` - Decoded events/calls needed for transformations
 
 ### LRU Eviction
 
@@ -193,8 +198,15 @@ The manifest aggregates all marker information for fast queries:
   "generated_at": 1709567890,
   "raw_blocks": [[0, 999], [1000, 1999], ...],
   "raw_logs": [[0, 999], [1000, 1999], ...],
+  "raw_receipts": [[0, 999], [1000, 1999], ...],
+  "raw_eth_calls": {
+    "contract/function": [[0, 999], [1000, 1999], ...]
+  },
   "decoded_logs": {
     "v3/Swap": [[0, 999], [1000, 1999], ...]
+  },
+  "decoded_eth_calls": {
+    "v3/slot0": [[0, 999], [1000, 1999], ...]
   },
   "factories": {
     "v3_pools": [[0, 999], [1000, 1999], ...]
@@ -202,7 +214,7 @@ The manifest aggregates all marker information for fast queries:
 }
 ```
 
-Services check the manifest on startup to avoid re-collecting existing data.
+The manifest is stored per-chain at `{chain}/manifest.json`. Services check the manifest on startup to avoid re-collecting existing data. The `ManifestManager` supports multi-chain deployments via `register_chain()` and per-chain manifest access via `manifest_for(chain)`.
 
 ## Graceful Degradation
 
@@ -214,6 +226,33 @@ If S3 is not configured, the indexer operates in local-only mode:
 
 To run without S3, simply omit the `storage` section from config.
 
+## Module Overview
+
+The S3 storage system is composed of several modules in `src/storage/`:
+
+| Module | Description |
+|--------|-------------|
+| `mod.rs` | `StorageBackend` trait, `StorageManager` high-level manager |
+| `s3.rs` | `S3Backend` using the `object_store` crate |
+| `local.rs` | `LocalBackend` for filesystem operations (atomic writes via tmp+rename) |
+| `cached.rs` | `CachedBackend` write-through cache combining local and S3 with LRU eviction |
+| `manifest.rs` | `ManifestManager`, `S3Manifest`, and `Marker` types for distributed coordination |
+| `initial_sync.rs` | `InitialSyncService` for uploading existing local data to S3 |
+| `retry.rs` | `RetryQueue` with exponential backoff for failed uploads |
+| `upload.rs` | `upload_parquet_to_s3` helper for historical collectors |
+| `data_loader.rs` | `DataLoader` for on-demand S3 download with local caching |
+| `error.rs` | `StorageError` enum (Io, ObjectStore, NotFound, Config, Serialization, Cache, Manifest) |
+
+### DataLoader
+
+The `DataLoader` provides transparent on-demand fetching from S3. When a file is needed locally but missing, it downloads from S3 and writes it to the local filesystem atomically (via tmp file + rename). This is used by catchup collectors to fetch data that may have been produced by another service.
+
+```rust
+let loader = DataLoader::new(Some(storage_manager), "ethereum", local_base);
+// Returns true if file exists locally or was downloaded from S3
+let available = loader.ensure_local(&path).await?;
+```
+
 ## Initial Sync
 
 When S3 storage is first configured on a node that already has local data, the indexer automatically uploads existing data to S3.
@@ -222,11 +261,14 @@ When S3 storage is first configured on a node that already has local data, the i
 
 On startup, if S3 is enabled:
 
-1. Scans all `{chain}/historical/` and `{chain}/live/` directories
-2. Identifies `.parquet` files (skips bincode live data)
+1. Scans all configured prefixes (e.g., `{chain}/historical/`, `{chain}/live/`)
+2. Identifies `.parquet` files (skips bincode live data and `.tmp` files)
 3. Checks if each file exists in S3
 4. Uploads missing files with bounded concurrency (10 parallel uploads)
-5. Logs a summary when complete
+5. Writes marker files for each uploaded file (when a manifest manager is provided)
+6. Logs a summary when complete
+
+The service accepts a shutdown signal and will stop early if the process is shutting down.
 
 ### What Gets Synced
 
@@ -267,10 +309,11 @@ The service requires no configuration - it starts automatically when S3 storage 
 Failed uploads are queued for retry:
 
 1. Data is written locally first (always succeeds)
-2. S3 upload is attempted synchronously
-3. On failure, upload is queued with exponential backoff
-4. Queue is persisted to `data/.upload_queue.json` for crash recovery
+2. S3 upload is attempted
+3. On failure, upload is queued with exponential backoff (`base * 2^attempts`, capped at 1 hour)
+4. Queue is persisted to `data/.upload_queue.json` for crash recovery (atomic write via tmp+rename)
 5. Background retry service processes the queue automatically
+6. Uploads exceeding `max_retries` are dropped with an error log
 
 ### Network Partitions
 
@@ -332,7 +375,8 @@ env | grep S3_
 
 Check endpoint URL format:
 - Must include protocol (`http://` or `https://`)
-- For MinIO, ensure `http://` is used for local development
+- HTTP is automatically allowed when the endpoint starts with `http://`
+- Path-style requests are always used (forced for MinIO/R2 compatibility)
 
 ### "Upload failed, queued for retry"
 

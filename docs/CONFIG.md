@@ -9,10 +9,12 @@ config/
 ├── config.json              # Main configuration file
 ├── contracts/
 │   └── base/                # Chain-specific contract files
+│       ├── multicurve.json
+│       ├── shared.json
 │       ├── v2.json
 │       ├── v3.json
 │       ├── v4.json
-│       └── shared.json
+│       └── zora.json
 ├── tokens/
 │   └── base.json            # Chain-specific token definitions
 └── factory_collections/
@@ -27,6 +29,9 @@ The indexer supports the following command line arguments:
 |----------|-------------|
 | `--decode-only` | Runs decoders on existing raw parquet files without collection or transformations |
 | `--live-only` | Skips historical processing and starts directly in live mode |
+| `--catch-up-only` | Fills gaps in existing data then exits without entering live mode |
+
+These flags are mutually exclusive: `--decode-only`, `--live-only`, and `--catch-up-only` cannot be combined with each other.
 
 Example:
 ```bash
@@ -39,22 +44,22 @@ The following environment variables control indexer behavior:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RPC_CONCURRENCY` | 100 | Maximum concurrent RPC requests |
-| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second rate limit |
-| `RPC_BATCH_SIZE` | (from config) | Override for `rpc_batch_size` config value |
 | `DB_POOL_SIZE` | 16 | PostgreSQL connection pool size |
 | `RUST_LOG` | info | Log level filter (standard tracing crate) |
 
+RPC tuning parameters (`concurrency`, `compute_units_per_second`, `batch_size`) are configured per-chain via the `rpc` config object rather than environment variables. See [Chain RPC Configuration](#chain-rpc-configuration) below.
+
 ## Main Configuration
 
-The root configuration file has four top-level sections:
+The root configuration file has up to five top-level sections:
 
 ```json
 {
     "chains": [...],
     "raw_data_collection": {...},
     "transformations": {...},
-    "metrics": {...}
+    "metrics": {...},
+    "storage": {...}
 }
 ```
 
@@ -73,6 +78,7 @@ An array of chain configurations. Each chain requires:
 | `tokens` | object \| string | Yes | Inline tokens object or path to tokens file/directory |
 | `factory_collections` | object \| string | No | Inline factory collection types or path to factory collections file/directory |
 | `block_receipts_method` | string | No | RPC method for fetching all receipts in a block (e.g., `eth_getBlockReceipts`) |
+| `rpc` | object | No | Per-chain RPC client configuration (rate limiting, concurrency, batch size) |
 
 Example:
 ```json
@@ -80,10 +86,10 @@ Example:
     "name": "base",
     "chain_id": 8453,
     "rpc_url_env_var": "BASE_RPC_URL",
+    "ws_url_env_var": "BASE_WS_URL",
     "start_block": 26602741,
     "contracts": "contracts/base",
     "tokens": "tokens/base.json",
-    "factory_collections": "factory_collections/base.json",
     "block_receipts_method": "eth_getBlockReceipts"
 }
 ```
@@ -110,6 +116,29 @@ When configured:
 
 When omitted, the default per-transaction batching is used (`eth_getTransactionReceipt` for each transaction).
 
+#### Chain RPC Configuration
+
+The optional `rpc` object on each chain configures RPC client behavior:
+
+```json
+{
+    "name": "base",
+    "chain_id": 8453,
+    "rpc_url_env_var": "BASE_RPC_URL",
+    "rpc": {
+        "concurrency": 100,
+        "compute_units_per_second": 7500,
+        "batch_size": 100
+    }
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `concurrency` | number | No | 100 | Maximum concurrent in-flight RPC requests |
+| `compute_units_per_second` | number | No | 7500 | Compute units per second rate limit (matches Alchemy Scale tier) |
+| `batch_size` | number | No | 100 | Maximum batch size for JSON-RPC batch requests. Falls back to `raw_data_collection.rpc_batch_size` if not set. |
+
 ### Raw Data Collection
 
 Controls how raw blockchain data is collected and stored:
@@ -128,6 +157,7 @@ Controls how raw blockchain data is collected and stored:
 | `live_mode` | boolean | No | `true` | Enable live mode after historical catchup (requires `ws_url_env_var` in chain config) |
 | `reorg_depth` | number | No | 128 | Blocks to track for reorg detection in live mode |
 | `compaction_interval_secs` | number | No | 10 | Interval between compaction checks in live mode |
+| `transform_retry_grace_period_secs` | number | No | 300 | Grace period in seconds before retrying stuck transformations in live mode |
 
 #### Fields Configuration
 
@@ -695,3 +725,59 @@ The optional `metrics` section configures the Prometheus metrics HTTP server:
 | `addr` | string | Yes | Address to bind the metrics HTTP server (e.g., "0.0.0.0:9090") |
 
 When configured, the indexer exposes Prometheus metrics at the specified address for monitoring RPC latency, request counts, and other operational metrics.
+
+## Storage Configuration
+
+The optional `storage` section configures S3-compatible remote storage with local caching and synchronization.
+
+```json
+{
+    "storage": {
+        "s3": {
+            "endpoint_env_var": "S3_ENDPOINT",
+            "access_key_env_var": "S3_ACCESS_KEY",
+            "secret_key_env_var": "S3_SECRET_KEY",
+            "bucket_env_var": "S3_BUCKET",
+            "region": "us-east-1"
+        },
+        "cache": {
+            "max_size_gb": 100,
+            "pinned_prefixes": ["factories", "decoded"],
+            "eviction_threshold": 0.8
+        },
+        "sync": {
+            "marker_freshness_ranges": 10,
+            "manifest_refresh_secs": 60,
+            "retry_interval_secs": 30,
+            "max_retries": 10
+        }
+    }
+}
+```
+
+### S3 Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `endpoint_env_var` | string | Yes | - | Environment variable name containing the S3 endpoint URL |
+| `access_key_env_var` | string | Yes | - | Environment variable name containing the access key ID |
+| `secret_key_env_var` | string | Yes | - | Environment variable name containing the secret access key |
+| `bucket_env_var` | string | Yes | - | Environment variable name containing the bucket name |
+| `region` | string | No | `"us-east-1"` | AWS region |
+
+### Cache Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `max_size_gb` | number | No | 100 | Maximum local cache size in gigabytes |
+| `pinned_prefixes` | array | No | `["factories", "decoded"]` | Prefixes that are never evicted from cache |
+| `eviction_threshold` | number | No | 0.8 | Fraction of `max_size_gb` at which LRU eviction begins |
+
+### Sync Configuration
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `marker_freshness_ranges` | number | No | 10 | Number of recent ranges to check markers directly (vs manifest) |
+| `manifest_refresh_secs` | number | No | 60 | How often to refresh the cached manifest from S3 (in seconds) |
+| `retry_interval_secs` | number | No | 30 | Retry interval for failed uploads (in seconds) |
+| `max_retries` | number | No | 10 | Maximum number of retry attempts before giving up |

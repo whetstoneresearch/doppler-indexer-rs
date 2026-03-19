@@ -285,10 +285,12 @@ DecoderMessage::EventCallsReady {
     contract_name: String,
     function_name: String,
     results: Vec<EventCallResult>,
+    live_mode: bool,                    // If true, write to live bincode storage instead of parquet
+    retry_transform_after_decode: bool, // If true, defer transform execution until block-complete
 }
 ```
 
-Where `EventCallResult` (from `src/raw_data/decoding/types.rs`) contains:
+Where `EventCallResult` (from `src/decoding/types.rs`) contains:
 - `block_number: u64`
 - `block_timestamp: u64`
 - `log_index: u32`
@@ -370,21 +372,22 @@ pub struct EventTriggerMatcher {
 }
 ```
 
-### Processing Types (`src/raw_data/historical/eth_calls.rs`)
+### Processing Types (`src/raw_data/historical/eth_calls/types.rs`)
 
 ```rust
 /// Configuration for an event-triggered call
-pub(crate) struct EventTriggeredCallConfig {
+pub struct EventTriggeredCallConfig {
     pub contract_name: String,
     pub target_address: Option<Address>,  // None for factory collections (use event emitter)
     pub function_name: String,
     pub function_selector: [u8; 4],
     pub params: Vec<ParamConfig>,
     pub is_factory: bool,
+    pub start_block: Option<u64>,         // Calls before this block are skipped
 }
 
 /// Result from an event-triggered call (internal processing type)
-pub(crate) struct EventCallResult {
+pub struct EventCallResult {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub log_index: u32,
@@ -394,10 +397,10 @@ pub(crate) struct EventCallResult {
 }
 
 /// Key for grouping event-triggered calls: (source_name, event_signature_hash)
-pub(crate) type EventCallKey = (String, [u8; 32]);
+pub type EventCallKey = (String, [u8; 32]);
 ```
 
-### Decoder Types (`src/raw_data/decoding/types.rs`)
+### Decoder Types (`src/decoding/types.rs`)
 
 ```rust
 /// Event-triggered eth_call result data for decoding
@@ -410,18 +413,19 @@ pub struct EventCallResult {
 }
 ```
 
-### Decoder Configuration (`src/raw_data/decoding/eth_calls.rs`)
+### Decoder Configuration (`src/decoding/eth_calls/types.rs`)
 
 ```rust
 /// Configuration for an event-triggered call to decode
-pub(crate) struct EventCallDecodeConfig {
+pub struct EventCallDecodeConfig {
     pub contract_name: String,
     pub function_name: String,
     pub output_type: EvmType,
+    pub start_block: Option<u64>,  // Calls before this block are skipped
 }
 
 /// Decoded event-triggered call result
-pub(crate) struct DecodedEventCallRecord {
+pub struct DecodedEventCallRecord {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub log_index: u32,
@@ -452,9 +456,9 @@ Event-triggered calls include `trigger_log_index: Some(log_index)` to correlate 
 |------|---------|
 | `src/types/config/eth_call.rs` | Added `OnEvents` frequency variant, `EventTriggerConfig`, `EventTriggerConfigs` (single/multiple support), extended `ParamConfig` with `FromEvent` and `SelfAddress` variants; added `Int24`, `Int16`, `Uint24`, `Uint160`, `Uint96` types; `CallTarget` for target address overrides |
 | `src/raw_data/historical/receipts.rs` | Added `EventTriggerData`, `EventTriggerMessage`, `EventTriggerMatcher` types; `build_event_trigger_matchers()`, `extract_event_triggers()` functions with deduplication; channel sending; `send_range_complete()` |
-| `src/raw_data/historical/eth_calls.rs` | Added event processing: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `extract_value_from_32_bytes()`, `build_event_call_params()`, `process_event_triggers()`, `process_event_triggers_multicall()`, `write_event_call_results_to_parquet()`, `write_empty_event_call_file()`, `build_event_call_schema()`; catchup: `load_historical_factory_addresses()`, `read_factory_addresses_from_parquet()` |
+| `src/raw_data/historical/eth_calls/` | Module directory (split from single file). `types.rs`: `EventTriggeredCallConfig`, `EventCallResult`, `EventCallKey` types. `event_triggers.rs`: `build_event_triggered_call_configs()`, `extract_param_from_event()`, `extract_value_from_32_bytes()`, `build_event_call_params()`, `process_event_triggers()`, `process_event_triggers_multicall()`, `write_event_call_results_to_parquet()`, `write_empty_event_call_file()`, `build_event_call_schema()`, `encode_once_call_params()`. `factory.rs`: `load_historical_factory_addresses()`, `read_factory_addresses_from_parquet()`, `event_output_exists()` |
 | `src/decoding/types.rs` | Added `EventCallResult` type and `EventCallsReady` variant to `DecoderMessage` |
-| `src/decoding/eth_calls.rs` | Added `EventCallDecodeConfig`, `DecodedEventCallRecord` types; `process_event_calls()`, `build_decode_configs()` includes event configs; support for all int/uint types in decoding |
+| `src/decoding/eth_calls/` | Module directory (split from single file). `types.rs`: `EventCallDecodeConfig`, `DecodedEventCallRecord` types. `config.rs`: `build_decode_configs()` includes event configs. `process.rs`: `process_event_calls()`. Support for all int/uint types in decoding |
 | `src/decoding/catchup/eth_calls.rs` | Catchup phase eth_call decoding |
 | `src/decoding/current/eth_calls.rs` | Current/streaming phase eth_call decoding |
 | `src/decoding/mod.rs` | Exported `EventCallResult` |
@@ -519,7 +523,7 @@ The `target` field in call configuration allows routing event-triggered calls to
 
 2. **Factory collection race window:** During live processing, there may be a brief window where events from newly-created factory contracts are skipped because the factory address hasn't been discovered yet. These events will be processed during the next catchup phase.
 
-3. **Failed calls stored as empty:** If an eth_call fails (e.g., contract reverted), an empty result is stored with empty `value_bytes`. Failed calls during catchup are not automatically retried on subsequent runs. Decode failures are logged with warnings.
+3. **Failed calls skipped:** If an eth_call fails (e.g., contract reverted), the result is skipped entirely rather than stored. Failed calls during catchup are not automatically retried on subsequent runs. Decode failures are logged with warnings.
 
 4. **No cross-event parameter passing:** Parameters can only be extracted from the triggering event itself, not from other events in the same block or transaction.
 

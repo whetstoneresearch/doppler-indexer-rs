@@ -24,7 +24,8 @@ let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
 let (factory_log_tx, factory_log_rx) = mpsc::channel::<LogMessage>(1000);
 
 // Run catchup phase (no block_rx needed - reads from existing block parquet files)
-collect_receipts(
+// Returns ReceiptsCatchupState to pass to the current phase
+let catchup_state = collect_receipts(
     &chain_config,
     &client,
     &raw_data_config,
@@ -32,6 +33,8 @@ collect_receipts(
     &Some(factory_log_tx),
     &None,  // event_trigger_tx
     &[],    // event_matchers
+    None,   // s3_manifest
+    None,   // storage_manager
 ).await?;
 ```
 
@@ -55,6 +58,7 @@ let (factory_log_tx, factory_log_rx) = mpsc::channel::<LogMessage>(1000);
 let (recollect_tx, recollect_rx) = mpsc::channel::<RecollectRequest>(100);
 
 // Run current phase (processes new blocks from channel)
+// catchup_state is returned from the catchup phase collect_receipts call
 collect_receipts(
     &chain_config,
     &client,
@@ -65,6 +69,8 @@ collect_receipts(
     None,  // event_trigger_tx
     vec![], // event_matchers
     Some(recollect_rx),
+    catchup_state,
+    None,  // storage_manager
 ).await?;
 ```
 
@@ -82,7 +88,9 @@ pub async fn collect_receipts(
     factory_log_tx: &Option<Sender<LogMessage>>,
     event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
     event_matchers: &[EventTriggerMatcher],
-) -> Result<(), ReceiptCollectionError>
+    s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
+) -> Result<ReceiptsCatchupState, ReceiptCollectionError>
 ```
 
 ### Current Phase
@@ -99,6 +107,8 @@ pub async fn collect_receipts(
     event_trigger_tx: Option<Sender<EventTriggerMessage>>,
     event_matchers: Vec<EventTriggerMatcher>,
     recollect_rx: Option<Receiver<RecollectRequest>>,
+    catchup_state: ReceiptsCatchupState,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), ReceiptCollectionError>
 ```
 
@@ -115,6 +125,22 @@ pub async fn collect_receipts(
 | `factory_log_tx` | `&Option<Sender<LogMessage>>` | Optional channel for forwarding logs to factory collector (reference) |
 | `event_trigger_tx` | `&Option<Sender<EventTriggerMessage>>` | Optional channel for event-triggered eth_calls (reference) |
 | `event_matchers` | `&[EventTriggerMatcher]` | Matchers for detecting events that trigger eth_calls (slice reference) |
+| `s3_manifest` | `Option<S3Manifest>` | Optional S3 manifest for checking remote file availability |
+| `storage_manager` | `Option<Arc<StorageManager>>` | Optional storage manager for S3 uploads and downloads |
+
+#### Return Value
+
+The catchup phase returns `ReceiptsCatchupState`, which is passed to the current phase:
+
+```rust
+pub struct ReceiptsCatchupState {
+    pub existing_files: HashSet<String>,
+    pub existing_logs_files: HashSet<String>,
+    pub s3_manifest: Option<S3Manifest>,
+}
+```
+
+This transfers pre-scanned file lists and the S3 manifest to the current phase, avoiding redundant filesystem/S3 checks.
 
 #### Current Phase Parameters
 
@@ -129,6 +155,8 @@ pub async fn collect_receipts(
 | `event_trigger_tx` | `Option<Sender<EventTriggerMessage>>` | Optional channel for event-triggered eth_calls |
 | `event_matchers` | `Vec<EventTriggerMatcher>` | Matchers for detecting events that trigger eth_calls |
 | `recollect_rx` | `Option<Receiver<RecollectRequest>>` | Optional channel for receiving recollection requests from factory collector |
+| `catchup_state` | `ReceiptsCatchupState` | State from catchup phase with pre-scanned file lists and S3 manifest |
+| `storage_manager` | `Option<Arc<StorageManager>>` | Optional storage manager for S3 uploads |
 
 ### Input Channel Message Format (Current Phase)
 
@@ -235,26 +263,29 @@ data/ethereum/historical/raw/receipts/
 
 ### Catchup Phase
 
-1. Scans existing block parquet files in `data/{chain}/historical/raw/blocks/`
-2. For each block range, checks if receipts and logs parquet files exist
-3. If missing, reads block info from existing block parquet file
+1. Scans existing block parquet files in `data/{chain}/historical/raw/blocks/` (and S3 manifest if provided)
+2. For each block range, checks if receipts and logs parquet files exist (locally or in S3)
+3. If missing, reads block info from existing block parquet file (downloading from S3 if needed)
 4. Fetches receipts via RPC and processes them
-5. Sends `RangeComplete` signals for each range (even if already complete) to synchronize downstream collectors
+5. Uploads receipt parquet files to S3 if `storage_manager` is configured
+6. Sends `RangeComplete` signals for each range (even if already complete) to synchronize downstream collectors
 
 ### Current Phase (Early Batch Fetching)
 
 The current phase uses early batch-based RPC fetching to improve throughput:
 
 1. Receives block info (block number, timestamp, tx hashes) from block collector
-2. Tracks blocks in batch states per range (`ReceiptBatchState`)
-3. **Early fetch**: When unfetched blocks reach `rpc_batch_size`, immediately fetches receipts via RPC without waiting for full range
-4. Sends logs immediately to downstream collectors as batches complete
-5. When all blocks in a range are received:
+2. Skips ranges that already exist (checked against catchup state's file lists and S3 manifest)
+3. Tracks blocks in batch states per range (`ReceiptBatchState`)
+4. **Early fetch**: When unfetched blocks reach `rpc_batch_size`, immediately fetches receipts via RPC without waiting for full range
+5. Sends logs immediately to downstream collectors as batches complete
+6. When all blocks in a range are received:
    - Fetches any remaining unfetched blocks
    - Sorts records by block number
    - Writes receipt data to Parquet file
-6. Handles recollection requests via `tokio::select!` alongside normal block processing
-7. On shutdown, processes any incomplete ranges with partial data
+   - Uploads to S3 if `storage_manager` is configured
+7. Handles recollection requests via `tokio::select!` alongside normal block processing
+8. On shutdown, processes any incomplete ranges with partial data
 
 ## Fetching Strategies
 
@@ -312,12 +343,13 @@ Collection is fully resumable with comprehensive catchup logic. The catchup and 
 
 The catchup phase runs first as a separate function (`catchup::receipts::collect_receipts`):
 
-1. **Scans existing block files** - Reads `data/{chain}/historical/raw/blocks/` to find all available block ranges
+1. **Scans existing block files** - Reads `data/{chain}/historical/raw/blocks/` to find all available block ranges (also checks S3 manifest if provided)
 2. **Checks downstream files** - For each block range, checks if:
-   - Receipt parquet file exists
-   - Logs parquet file exists (if log collection is enabled)
-3. **Re-processes missing ranges** - If any downstream files are missing, reads block info from the existing block parquet file and re-processes that range
+   - Receipt parquet file exists (locally or in S3)
+   - Logs parquet file exists (locally or in S3, if log collection is enabled)
+3. **Re-processes missing ranges** - If any downstream files are missing, reads block info from the existing block parquet file (downloading from S3 if needed) and re-processes that range
 4. **Signals completion** - Sends `RangeComplete` for all ranges (including already-complete ones) to synchronize downstream collectors
+5. **Returns state** - Returns `ReceiptsCatchupState` containing pre-scanned file lists and S3 manifest to pass to the current phase
 
 Note: Factory catchup is handled separately by the factories module reading from logs files directly.
 
@@ -325,10 +357,12 @@ Note: Factory catchup is handled separately by the factories module reading from
 
 The current phase runs after catchup completes (`current::receipts::collect_receipts`):
 
-1. **Processes new blocks** - Receives block info from the block collector channel
-2. **Uses early batch fetching** - Starts RPC work before full range is complete for better throughput
-3. **Handles recollection requests** - Processes requests from factory collector in parallel via `tokio::select!`
-4. **Shutdown cleanup** - Processes any incomplete ranges when the block channel closes
+1. **Receives catchup state** - Uses `ReceiptsCatchupState` from the catchup phase, which includes pre-scanned file lists and S3 manifest to skip already-processed ranges
+2. **Processes new blocks** - Receives block info from the block collector channel
+3. **Uses early batch fetching** - Starts RPC work before full range is complete for better throughput
+4. **Handles recollection requests** - Processes requests from factory collector in parallel via `tokio::select!`
+5. **Uploads to S3** - When `storage_manager` is provided, uploads completed parquet files to S3
+6. **Shutdown cleanup** - Processes any incomplete ranges when the block channel closes
 
 This separation ensures that catchup completes fully before processing new blocks, preventing race conditions between historical and live data.
 
@@ -365,7 +399,7 @@ Note: Only the current phase function accepts `recollect_rx`. The catchup phase 
 pub struct RecollectRequest {
     pub range_start: u64,
     pub range_end: u64,
-    pub file_path: PathBuf,
+    pub _file_path: PathBuf,
 }
 ```
 

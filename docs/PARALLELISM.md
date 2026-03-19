@@ -67,7 +67,7 @@ Each collector runs independently and communicates via typed channels, allowing 
        │                     │ addresses   │  │  addresses  │           │
        │                     └──────┬──────┘  └──────┬──────┘           │
        │                            │                │                  │
-       │                            │                │ FactoryAddressData
+       │                            │                │ FactoryMessage
        │                            ▼                │                  │
        │                     ┌─────────────┐         │                  │
        │                     │  filtered   │         │                  │
@@ -114,9 +114,20 @@ pub enum LogMessage {
 - `RangeComplete` - Signals a block range is fully processed, triggers parquet writes
 - `AllRangesComplete` - Signals end of collection, receivers should shut down
 
-### Factories to Logs / Eth Calls
+### Factories to Eth Calls
+
+The factory-to-eth_calls channel uses `FactoryMessage`, which supports incremental address forwarding:
 
 ```rust
+pub enum FactoryMessage {
+    /// Incremental batch of factory addresses discovered (sent per rpc_batch_size logs)
+    IncrementalAddresses(FactoryAddressData),
+    /// A block range is complete - parquet files written
+    RangeComplete { range_start: u64, range_end: u64 },
+    /// All processing is complete
+    AllComplete,
+}
+
 pub struct FactoryAddressData {
     pub range_start: u64,
     pub range_end: u64,
@@ -124,17 +135,61 @@ pub struct FactoryAddressData {
 }
 ```
 
-Contains discovered factory addresses grouped by block number, with `(timestamp, address, collection_name)` tuples.
+`FactoryAddressData` contains discovered factory addresses grouped by block number, with `(timestamp, address, collection_name)` tuples. The `IncrementalAddresses` variant enables early RPC fetching before the full range is processed.
+
+### Receipts to Event Trigger Channel
+
+When `on_events` eth_calls are configured, the receipts collector also sends matched events to the eth_calls collector:
+
+```rust
+pub enum EventTriggerMessage {
+    Triggers(Vec<EventTriggerData>),
+    RangeComplete { range_start: u64, range_end: u64 },
+    AllComplete,
+}
+```
 
 ### Collectors to Decoders
 
 ```rust
 pub enum DecoderMessage {
-    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData> },
-    EthCallsReady { ... },
-    OnceCallsReady { ... },
-    FactoryAddresses { ... },
+    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData>, live_mode: bool, has_factory_matchers: bool },
+    EthCallsReady { range_start: u64, range_end: u64, contract_name: String, function_name: String, results: Vec<EthCallResult>, live_mode: bool, retry_transform_after_decode: bool },
+    OnceCallsReady { range_start: u64, range_end: u64, contract_name: String, results: Vec<OnceCallResult>, live_mode: bool, retry_transform_after_decode: bool },
+    EventCallsReady { range_start: u64, range_end: u64, contract_name: String, function_name: String, results: Vec<EventCallResult>, live_mode: bool, retry_transform_after_decode: bool },
+    EthCallsBlockComplete { range_start: u64, range_end: u64, retry_transform_after_decode: bool },
+    FactoryAddresses { range_start: u64, range_end: u64, addresses: HashMap<String, Vec<Address>> },
+    OnceFileBackfilled { range_start: u64, range_end: u64, contract_name: String },
+    Reorg { _common_ancestor: u64, orphaned: Vec<u64> },
     AllComplete,
+}
+```
+
+The `live_mode` flag controls whether decoded output is written to bincode (live) or parquet (historical). The `retry_transform_after_decode` flag defers transform execution until a block-complete retry request is processed.
+
+### Decoders to Transformation Engine
+
+```rust
+pub struct DecodedEventsMessage {
+    pub range_start: u64, pub range_end: u64,
+    pub source_name: String, pub event_name: String,
+    pub events: Vec<DecodedEvent>,
+}
+
+pub struct DecodedCallsMessage {
+    pub range_start: u64, pub range_end: u64,
+    pub source_name: String, pub function_name: String,
+    pub calls: Vec<DecodedCall>,
+}
+
+pub struct RangeCompleteMessage {
+    pub range_start: u64, pub range_end: u64,
+    pub kind: RangeCompleteKind,  // Logs or EthCalls
+}
+
+pub struct ReorgMessage {
+    pub common_ancestor: u64,
+    pub orphaned: Vec<u64>,
 }
 ```
 
@@ -202,17 +257,27 @@ Note: The sliding window tracks CU usage over 10-second windows (7500 CU/s * 10 
 
 ## Concurrency Settings
 
-### Environment Variables
+### Per-Chain RPC Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RPC_CONCURRENCY` | 100 | Max concurrent in-flight RPC requests across all collectors |
-| `ALCHEMY_CU_PER_SECOND` | 7500 | Alchemy compute units per second (match your plan) |
-| `RPC_BATCH_SIZE` | from config | Override for batch size (larger = more concurrent requests) |
+RPC concurrency, rate limiting, and batch size are configured per chain in the `rpc` block. There are no environment variables for these settings.
 
-**Recommended settings for high throughput:**
-```bash
-RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `rpc.concurrency` | 100 | Max concurrent in-flight RPC requests across all collectors |
+| `rpc.compute_units_per_second` | 7500 | Alchemy compute units per second (match your plan) |
+| `rpc.batch_size` | 100 | Max batch size for RPC requests (fallback: `raw_data_collection.rpc_batch_size`) |
+
+```json
+{
+  "chains": [{
+    "name": "base",
+    "rpc": {
+      "concurrency": 500,
+      "compute_units_per_second": 7500,
+      "batch_size": 100
+    }
+  }]
+}
 ```
 
 ### Shared Rate Limiter
@@ -221,14 +286,14 @@ All RPC clients share a single `SlidingWindowRateLimiter` for account-level rate
 
 ```rust
 // Create shared limiter for account-level rate limiting across all clients
-let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(alchemy_cu_per_second));
+let shared_limiter = Arc::new(SlidingWindowRateLimiter::new(cu_per_second));
 
 // All clients share the same limiter
 let blocks_client = UnifiedRpcClient::from_url_with_options(
-    &rpc_url, alchemy_cu_per_second, rpc_concurrency, Some(shared_limiter.clone())
+    &rpc_url, cu_per_second, rpc_concurrency, rpc_batch_size as usize, Some(shared_limiter.clone())
 )?;
 let receipts_client = UnifiedRpcClient::from_url_with_options(
-    &rpc_url, alchemy_cu_per_second, rpc_concurrency, Some(shared_limiter.clone())
+    &rpc_url, cu_per_second, rpc_concurrency, rpc_batch_size as usize, Some(shared_limiter.clone())
 )?;
 ```
 
@@ -256,11 +321,21 @@ When using `block_receipts_method` (e.g., `eth_getBlockReceipts`), receipts are 
 
 ### RPC Batch Size
 
-Controls how many RPC requests are batched together:
+Controls how many RPC requests are batched together. Resolution order: `chain.rpc.batch_size` -> `raw_data_collection.rpc_batch_size` -> default (100).
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `rpc_batch_size` | 100 | Requests per RPC batch (blocks, receipts per-tx, eth_calls) |
+| `rpc.batch_size` | 100 | Per-chain batch size override |
+| `raw_data_collection.rpc_batch_size` | 100 | Global fallback batch size |
+
+### Catchup Concurrency Settings
+
+Additional concurrency settings in `raw_data_collection` for catchup phases:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `decoding_concurrency` | 4 | Number of concurrent decoding tasks for log and eth_call catchup |
+| `factory_concurrency` | 4 | Number of concurrent tasks for factory collection catchup |
 
 ## Coordination Between Collectors
 
@@ -334,26 +409,52 @@ If you delete a downstream file, the upstream collector's catchup will detect th
 
 ## Threading Model
 
-The indexer uses Tokio's async runtime with multiple concurrent tasks:
+The indexer uses Tokio's async runtime with two JoinSets for task lifecycle management. Each collector is split into a catchup phase and a current phase that runs sequentially within its task.
+
+**Historical tasks** (`tasks` JoinSet) -- complete after historical processing:
 
 ```rust
-let mut tasks = JoinSet::new();
+let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
-tasks.spawn(collect_blocks(...));
-tasks.spawn(collect_receipts(...));
-tasks.spawn(collect_logs(...));
-tasks.spawn(collect_factories(...));  // if factories configured
-tasks.spawn(collect_eth_calls(...));  // if eth_calls configured
-tasks.spawn(decode_logs(...));        // if events configured
-tasks.spawn(decode_calls(...));       // if eth_calls with output_type configured
-tasks.spawn(engine.run(...));         // if transformations configured
+tasks.spawn(collect_blocks(...));       // catchup then current phase
+tasks.spawn(collect_receipts(...));     // catchup then current phase
+tasks.spawn(collect_logs(...));         // catchup then current phase
+tasks.spawn(collect_factories(...));    // if factories configured
+tasks.spawn(collect_eth_calls(...));    // catchup then current phase
+tasks.spawn(decode_logs(...));          // if events configured
+tasks.spawn(decode_eth_calls(...));     // if eth_calls configured
 
 while let Some(result) = tasks.join_next().await {
     result??;
 }
 ```
 
+**Live tasks** (`live_tasks` JoinSet) -- continue running into live mode:
+
+```rust
+let mut live_tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
+
+live_tasks.spawn(engine.run(...));      // if transformations configured
+
+// After historical tasks complete, live mode tasks are spawned into live_tasks:
+// - WebSocket subscription
+// - LiveCollector (block processing, reorg detection)
+// - CompactionService (periodic parquet compaction)
+// - LiveMessage drain task
+
+while let Some(result) = live_tasks.join_next().await {
+    result??;
+}
+```
+
 All RPC tasks share the same rate limiter (`SlidingWindowRateLimiter`), which manages CU consumption across all operations. This ensures the combined RPC usage stays within provider limits.
+
+### Catchup Synchronization Barriers
+
+The system uses `oneshot` channels as barriers to coordinate catchup ordering:
+
+1. **Factory catchup barrier**: Factory catchup must complete before factory-dependent eth_call catchup begins.
+2. **Eth_call decode catchup barrier**: Eth_call decode catchup must complete before the transformation engine runs its own catchup, ensuring decoded parquet files are available.
 
 ## Transformation Engine Parallelism
 
@@ -407,11 +508,19 @@ This ensures:
 
 ```json
 {
+  "chains": [{
+    "rpc": {
+      "concurrency": 500,
+      "compute_units_per_second": 7500,
+      "batch_size": 100
+    }
+  }],
   "raw_data_collection": {
     "parquet_block_range": 10000,
-    "rpc_batch_size": 100,
     "channel_capacity": 5000,
-    "block_receipt_concurrency": 20
+    "block_receipt_concurrency": 20,
+    "decoding_concurrency": 8,
+    "factory_concurrency": 8
   },
   "transformations": {
     "handler_concurrency": 8,
@@ -423,20 +532,23 @@ This ensures:
 }
 ```
 
-With environment variables:
-```bash
-RPC_CONCURRENCY=500 ALCHEMY_CU_PER_SECOND=7500 cargo run
-```
-
 ### For Memory-Constrained Environments
 
 ```json
 {
+  "chains": [{
+    "rpc": {
+      "concurrency": 50,
+      "batch_size": 50
+    }
+  }],
   "raw_data_collection": {
     "parquet_block_range": 1000,
     "rpc_batch_size": 50,
     "channel_capacity": 500,
-    "factory_channel_capacity": 500
+    "factory_channel_capacity": 500,
+    "decoding_concurrency": 2,
+    "factory_concurrency": 2
   },
   "transformations": {
     "handler_concurrency": 2,
@@ -465,7 +577,7 @@ The `AlchemyClient` uses a `ConcurrentExecutor` helper struct that encapsulates 
 struct ConcurrentExecutor {
     semaphore: Arc<Semaphore>,
     rate_limiter: Arc<SlidingWindowRateLimiter>,
-    rpc_concurrency: u32,
+    cost_per_request: u32,
 }
 ```
 
@@ -566,6 +678,30 @@ Concurrent batch methods handle task panics gracefully:
 - Panics are logged and tracked
 - Method returns `Err(RpcError::ProviderError("One or more concurrent tasks panicked"))`
 - Prevents silent partial results
+
+## Live Mode
+
+After historical processing completes, the system transitions to live mode (enabled by default when `ws_url_env_var` is configured). Live mode adds several concurrent tasks:
+
+1. **WebSocket Subscription** - Subscribes to new block headers via `eth_subscribe("newHeads")`
+2. **LiveCollector** - Processes each new block: fetches full block data, extracts logs, runs factory matchers, triggers eth_calls, sends decoded data to decoders
+3. **LiveEthCallCollector** - Executes eth_call requests for each new block, supporting multicall3 batching
+4. **CompactionService** - Periodically compacts per-block bincode files into parquet ranges
+
+Live mode reuses the same decoder and transformation engine channels from historical mode, so the transformation engine processes both historical catchup data and live data through the same `select!` loop.
+
+### Transformation Retry
+
+The `CompactionService` detects blocks with incomplete or failed transformations and sends `TransformRetryRequest` messages to the transformation engine:
+
+```rust
+pub struct TransformRetryRequest {
+    pub block_number: u64,
+    pub missing_handlers: Option<HashSet<String>>,
+}
+```
+
+A configurable grace period (`transform_retry_grace_period_secs`, default 300s) prevents retrying blocks that are still being actively processed.
 
 ## See Also
 

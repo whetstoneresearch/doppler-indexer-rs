@@ -87,8 +87,8 @@ After historical catchup completes, the indexer transitions to live mode for rea
 └─────────────────────────────────────┘
                     │
                     ▼
-            data/{chain}/historical/raw/
-            data/{chain}/historical/decoded/
+            data/raw/{chain}/
+            data/derived/{chain}/
 ```
 
 ### Data Flow Summary
@@ -135,12 +135,17 @@ Each block's processing status is tracked in a JSON file:
   "block_fetched": true,
   "receipts_collected": true,
   "logs_collected": true,
-  "decoded": true,
-  "transformed": true
+  "factories_extracted": true,
+  "eth_calls_collected": true,
+  "logs_decoded": true,
+  "eth_calls_decoded": true,
+  "transformed": true,
+  "completed_handlers": ["handler_v1"],
+  "failed_handlers": []
 }
 ```
 
-A block is ready for compaction when all flags are `true`.
+A block is ready for compaction when all flags are `true`. The completeness check uses `is_complete_with(expectations)` which respects `LivePipelineExpectations` -- optional stages (eth_call collection, decoding, transformations) are skipped if not expected by the runtime pipeline configuration.
 
 ### LiveLog (Raw Log Storage)
 
@@ -168,7 +173,8 @@ DecoderMessage::LogsReady {
     range_start: u64,
     range_end: u64,
     logs: Vec<LogData>,
-    live_mode: bool,  // true for live mode
+    live_mode: bool,              // true for live mode
+    has_factory_matchers: bool,   // whether factory address matching is active
 }
 ```
 
@@ -182,26 +188,28 @@ When `live_mode: false`:
 
 ## Live Decoded Data Types
 
-Decoded data in live mode uses serializable types optimized for bincode:
-
-### LiveDecodedValue
+Decoded data in live mode reuses the shared `DecodedValue` enum from `crate::types::decoded`, which supports bincode serialization:
 
 ```rust
-pub enum LiveDecodedValue {
+pub enum DecodedValue {
     Address([u8; 20]),
-    Uint256(String),    // Stored as string for bincode compatibility
-    Int256(String),
+    Uint256(U256),
+    Int256(I256),
+    Uint128(u128),
+    Int128(i128),
     Uint64(u64),
     Int64(i64),
+    Uint32(u32),
+    Int32(i32),
     Uint8(u8),
     Int8(i8),
     Bool(bool),
     Bytes32([u8; 32]),
     Bytes(Vec<u8>),
     String(String),
-    NamedTuple(Vec<(String, LiveDecodedValue)>),
-    UnnamedTuple(Vec<LiveDecodedValue>),
-    Array(Vec<LiveDecodedValue>),
+    NamedTuple(Vec<(String, DecodedValue)>),
+    UnnamedTuple(Vec<DecodedValue>),
+    Array(Vec<DecodedValue>),
 }
 ```
 
@@ -214,7 +222,7 @@ pub struct LiveDecodedLog {
     pub transaction_hash: [u8; 32],
     pub log_index: u32,
     pub contract_address: [u8; 20],
-    pub decoded_values: Vec<LiveDecodedValue>,
+    pub decoded_values: Vec<DecodedValue>,
 }
 ```
 
@@ -225,7 +233,7 @@ pub struct LiveDecodedCall {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub contract_address: [u8; 20],
-    pub decoded_value: LiveDecodedValue,
+    pub decoded_value: DecodedValue,
 }
 ```
 
@@ -237,7 +245,7 @@ pub struct LiveDecodedEventCall {
     pub block_timestamp: u64,
     pub log_index: u32,
     pub target_address: [u8; 20],
-    pub decoded_value: LiveDecodedValue,
+    pub decoded_value: DecodedValue,
 }
 ```
 
@@ -248,7 +256,7 @@ pub struct LiveDecodedOnceCall {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub contract_address: [u8; 20],
-    pub decoded_values: Vec<(String, LiveDecodedValue)>,  // function_name -> value
+    pub decoded_values: Vec<(String, DecodedValue)>,  // function_name -> value
 }
 ```
 
@@ -261,13 +269,15 @@ When the LiveCollector detects a chain reorganization (parent hash mismatch):
 3. **Cleanup**:
    - Delete raw data for orphaned blocks from `data/{chain}/live/`
    - Delete decoded data for orphaned blocks
-   - Send `DecoderMessage::Reorg` to decoder for additional cleanup
+   - Clear progress tracker entries for orphaned blocks
+   - Send `DecoderMessage::Reorg` to log and eth_call decoder channels
+   - Send `ReorgMessage` to the transformation engine to clean up pending events
    - Send `LiveMessage::Reorg` downstream
 
 ```rust
 DecoderMessage::Reorg {
-    common_ancestor: u64,  // Last valid block
-    orphaned: Vec<u64>,    // Blocks to delete
+    _common_ancestor: u64,  // Last valid block
+    orphaned: Vec<u64>,     // Blocks to delete
 }
 ```
 
@@ -279,8 +289,9 @@ The CompactionService periodically checks for complete block ranges and compacts
 
 A range is ready for compaction when:
 1. All blocks in the range are present **and sequential** (e.g., blocks 1000-1999 with no gaps)
-2. All blocks have `status.is_complete() == true`
-3. All transformation handlers have completed for all blocks
+2. All blocks have `status.is_complete_with(expectations) == true` (respects `LivePipelineExpectations` for optional stages)
+3. All transformation handlers have completed for all blocks (checked via `LiveProgressTracker`)
+4. The range end is beyond the reorg safety boundary (`latest_block - reorg_depth`)
 
 **Sequential validation:** The compaction service validates that blocks form a complete sequential range, not just that the count matches. This prevents compacting sparse ranges (e.g., `[0,2,4,6,8...]`) that happen to have the correct count:
 
@@ -303,9 +314,15 @@ if has_gap {
 
 1. Read all bincode files for the range
 2. Convert to Arrow arrays
-3. Write parquet to `data/{chain}/historical/raw/` and `data/{chain}/historical/decoded/`
-4. Migrate progress from `_live_progress` to `_handler_progress`
-5. Delete bincode files and status files
+3. Write parquet files:
+   - Blocks to `data/raw/{chain}/blocks/{start}_{end}.parquet`
+   - Logs to `data/raw/{chain}/logs/{start}_{end}.parquet`
+   - Eth calls to `data/raw/{chain}/eth_calls/{start}_{end}.parquet`
+   - Factory addresses to `data/derived/{chain}/factories/{collection}/{start}-{end}.parquet`
+4. Optionally upload parquet files to S3 (if `StorageManager` is configured)
+5. Migrate progress from `_live_progress` to `_handler_progress`
+6. Delete bincode files, status files, and decoded data
+7. Clear progress tracker in-memory state for the range
 
 ### Configuration
 
@@ -324,6 +341,7 @@ if has_gap {
 | `live_mode` | true | Enable WebSocket live mode (enabled by default when `ws_url_env_var` is set) |
 | `reorg_depth` | 128 | Blocks to track for reorg detection |
 | `compaction_interval_secs` | 10 | Check interval for compaction |
+| `transform_retry_grace_period_secs` | 300 | Minimum seconds before retrying stuck transformations |
 
 ## Progress Tracking
 
@@ -351,7 +369,8 @@ The `LiveProgressTracker` coordinates between the transformation engine and comp
 ```rust
 pub struct LiveProgressTracker {
     chain_id: i64,
-    completed: HashMap<u64, HashSet<String>>,  // block -> completed handler keys
+    chain_name: String,                        // for LiveStorage access
+    completed: HashMap<u64, HashSet<String>>,   // block -> completed handler keys
     handler_keys: HashSet<String>,              // all registered handlers
     db_pool: Option<Arc<DbPool>>,
 }
@@ -366,8 +385,9 @@ pub struct LiveProgressTracker {
 1. Handler processes a block and calls `record_completed_range_for_handler()`
 2. Engine calls `progress_tracker.mark_complete(block, handler_key)` for single-block ranges
 3. Tracker persists to `_live_progress` table and updates in-memory state
-4. `is_block_complete(block)` returns `true` when all handlers have marked complete
-5. Compaction service checks completion before compacting ranges
+4. Tracker atomically updates the status file via `update_status_atomic()` (file-locked read-modify-write) to add the handler key to `completed_handlers` and set `transformed = true` when all handlers are done
+5. `is_block_complete(block)` returns `true` when all handlers have marked complete
+6. Compaction service checks completion before compacting ranges
 
 **Why this matters:** Without handler registration, `is_block_complete()` returns `true` immediately (empty handler set), allowing compaction before handlers finish processing.
 
@@ -442,6 +462,21 @@ impl LiveStorage {
     fn delete_block(&self, block_number: u64) -> Result<()>;
     fn list_blocks(&self) -> Result<Vec<u64>>;
 
+    // Receipt operations
+    fn write_receipts(&self, block_number: u64, receipts: &[LiveReceipt]) -> Result<()>;
+    fn read_receipts(&self, block_number: u64) -> Result<Vec<LiveReceipt>>;
+    fn delete_receipts(&self, block_number: u64) -> Result<()>;
+
+    // Log operations
+    fn write_logs(&self, block_number: u64, logs: &[LiveLog]) -> Result<()>;
+    fn read_logs(&self, block_number: u64) -> Result<Vec<LiveLog>>;
+    fn delete_logs(&self, block_number: u64) -> Result<()>;
+
+    // Eth call operations
+    fn write_eth_calls(&self, block_number: u64, calls: &[LiveEthCall]) -> Result<()>;
+    fn read_eth_calls(&self, block_number: u64) -> Result<Vec<LiveEthCall>>;
+    fn delete_eth_calls(&self, block_number: u64) -> Result<()>;
+
     // Factory operations
     fn write_factories(&self, block_number: u64, addresses: &LiveFactoryAddresses) -> Result<()>;
     fn read_factories(&self, block_number: u64) -> Result<LiveFactoryAddresses>;
@@ -457,18 +492,23 @@ impl LiveStorage {
     fn write_decoded_logs(&self, block_number: u64, contract: &str, event: &str, logs: &[LiveDecodedLog]) -> Result<()>;
     fn read_decoded_logs(&self, block_number: u64, contract: &str, event: &str) -> Result<Vec<LiveDecodedLog>>;
     fn delete_all_decoded_logs(&self, block_number: u64) -> Result<()>;
+    fn list_decoded_log_types(&self, block_number: u64) -> Result<Vec<(String, String)>>;
 
     // Decoded eth_call operations
     fn write_decoded_calls(&self, block_number: u64, contract: &str, function: &str, calls: &[LiveDecodedCall]) -> Result<()>;
     fn write_decoded_once_calls(&self, block_number: u64, contract: &str, calls: &[LiveDecodedOnceCall]) -> Result<()>;
     fn write_decoded_event_calls(&self, block_number: u64, contract: &str, function: &str, calls: &[LiveDecodedEventCall]) -> Result<()>;
+    fn delete_all_decoded_calls(&self, block_number: u64) -> Result<()>;
+    fn list_decoded_call_types(&self, block_number: u64) -> Result<Vec<(String, String)>>;
 
     // Status operations
     fn write_status(&self, block_number: u64, status: &LiveBlockStatus) -> Result<()>;
     fn read_status(&self, block_number: u64) -> Result<LiveBlockStatus>;
+    fn update_status_atomic<F>(&self, block_number: u64, update_fn: F) -> Result<()>;  // File-locked read-modify-write
+    fn delete_status(&self, block_number: u64) -> Result<()>;
 
     // Reorg detection helpers
-    fn get_recent_blocks_for_reorg(&self, count: u64) -> Result<Vec<(u64, [u8; 32])>>;
+    fn get_recent_blocks_for_reorg(&self, count: u64) -> Result<Vec<LiveBlock>>;
     fn max_block_number(&self) -> Result<Option<u64>>;
 
     // Gap detection
@@ -495,8 +535,10 @@ impl LiveStorage {
 All file writes use atomic operations to prevent corruption from crashes:
 
 ```rust
-// Write to temp file, flush, sync, then atomic rename
-let temp_path = path.with_extension("tmp");
+// Write to temp file with unique suffix, flush, sync, then atomic rename
+let random_suffix: u32 = rand::random();
+let temp_name = format!("{}.tmp.{}", path.file_name()..., random_suffix);
+let temp_path = path.with_file_name(temp_name);
 let file = fs::File::create(&temp_path)?;
 let mut writer = BufWriter::new(file);
 bincode::serialize_into(&mut writer, data)?;
@@ -505,7 +547,22 @@ writer.into_inner()?.sync_all()?;
 fs::rename(&temp_path, path)?;
 ```
 
-On startup, `ensure_dirs()` cleans up any leftover `.tmp` files from interrupted writes.
+Temp files use a random suffix (`.tmp.{random}`) to avoid race conditions between concurrent writers (e.g., collector and decoder both updating status for the same block).
+
+On startup, `ensure_dirs()` cleans up any leftover `.tmp` files from interrupted writes, including in nested subdirectories.
+
+### Atomic Status Updates
+
+Status files support atomic read-modify-write via `update_status_atomic()`, which uses a separate `.json.lock` file with exclusive file locking to prevent concurrent updates from overwriting each other:
+
+```rust
+storage.update_status_atomic(block_number, |status| {
+    status.completed_handlers.insert(handler_key);
+    if all_complete {
+        status.transformed = true;
+    }
+});
+```
 
 ### TOCTOU Race Prevention
 
@@ -605,6 +662,55 @@ match self.storage.read_block(block_number) {
 }
 ```
 
+## Stuck Block Detection and Transform Retry
+
+The `CompactionService` monitors for blocks that are decoded but stuck waiting for transformation. This handles cases where the transformation engine drops a block due to transient errors (DB failures, handler bugs).
+
+**Detection criteria** (checked each compaction cycle):
+1. Block's transform inputs are ready (`logs_decoded` and `eth_calls_decoded`)
+2. Block is NOT yet `transformed`
+3. Block is NOT complete in the progress tracker
+4. Block has been in this state for at least `transform_retry_grace_period_secs` (default: 300s)
+
+**Retry mechanism:**
+- The compaction service sends a `TransformRetryRequest` (with the block number and set of missing/failed handler keys) via a bounded channel to the transformation engine
+- Failed handlers from the status file's `failed_handlers` set are included alongside pending handlers from the progress tracker
+- Grace period prevents premature retries for blocks that are simply still being processed
+- If the retry channel is full, the block keeps its original grace timer and will be retried on the next cycle
+
+```rust
+pub struct TransformRetryRequest {
+    pub block_number: u64,
+    pub missing_handlers: Option<HashSet<String>>,
+}
+```
+
+## LivePipelineExpectations
+
+Runtime expectations for optional pipeline stages, derived from the active pipeline wiring:
+
+```rust
+pub struct LivePipelineExpectations {
+    pub expect_log_decode: bool,
+    pub expect_eth_call_collection: bool,
+    pub expect_eth_call_decode: bool,
+    pub expect_transformations: bool,
+}
+```
+
+These control which status flags are required for completeness checks. When a stage is not expected, its status flag is automatically set to `true` via `apply_expectations()`. This avoids blocking compaction on stages that aren't wired up in the current pipeline.
+
+## LiveEthCallCollector
+
+The `LiveEthCallCollector` (`src/live/eth_calls.rs`) handles all eth_call collection for live mode blocks, supporting:
+
+1. **Regular frequency-based calls** - calls made at configured intervals (every block, duration-based)
+2. **Factory calls** - calls to all known factory-discovered addresses
+3. **Once calls** - one-time calls for newly discovered factory addresses
+4. **Event-triggered calls** - calls triggered by matching log events
+
+The collector uses a staged batch pattern (`CollectedEthCallBatch`): calls are collected, then the caller persists storage state before applying runtime updates or dispatching decoder messages. This ensures crash safety -- if the process dies between collection and persistence, the catchup service can re-collect.
+
 ## Outstanding Issues
 
 > **Note**: Most critical issues have been resolved. The following items remain.
@@ -617,14 +723,9 @@ The following issues from earlier versions have been fixed:
 - **Issue 8 (Logs Parquet Missing transaction_hash):** Fixed - `compaction.rs` now includes `transaction_hash` field in the logs parquet schema.
 - **Issue 9 (Progress Tracker Handlers Never Registered):** Fixed - Handlers are registered in `main.rs` during initialization.
 
+- **Issue 3 (Transformation Engine in Live-Only Mode):** Now fixed - `process_chain_live_only()` spawns the `TransformationEngine` when `transformations_enabled` is true, alongside decoders and the live collector.
+
 ### Remaining Issues
-
-#### 3. Transformation Engine in Live-Only Mode
-
-When using `--live-only` mode, the transformation engine is NOT running (the engine only continues into live mode after completing historical processing). This means:
-
-- In normal mode (historical → live transition): transformation engine DOES continue running in live mode
-- In `--live-only` mode: transformation engine is not started
 
 #### 10. Decoded Data Discarded During Compaction
 
@@ -646,20 +747,28 @@ For reorg rollback support, live mode captures snapshots of database state befor
 ```rust
 pub struct LiveUpsertSnapshot {
     pub table: String,
-    pub key_columns: Vec<String>,
-    pub key_values: Vec<LiveDbValue>,
-    pub previous_row: Option<HashMap<String, LiveDbValue>>,
+    pub source: String,                                // Handler source name (for scoped restoration)
+    pub source_version: u32,                           // Handler source version
+    pub key_columns: Vec<(String, LiveDbValue)>,       // Key columns with their values
+    pub previous_row: Option<Vec<(String, LiveDbValue)>>,  // None = INSERT (reorg should DELETE)
 }
 
 pub enum LiveDbValue {
     Null,
     Bool(bool),
-    Int32(i32),
     Int64(i64),
+    Int32(i32),
+    Int2(u8),
+    Uint64(u64),
     Text(String),
+    VarChar(String),
     Bytes(Vec<u8>),
+    Address([u8; 20]),
+    Bytes32([u8; 32]),
     Numeric(String),
+    Timestamp(i64),
     Json(String),
+    JsonB(String),
 }
 ```
 
@@ -669,27 +778,26 @@ Tracks factory addresses discovered in each block:
 
 ```rust
 pub struct LiveFactoryAddresses {
-    pub addresses: HashMap<String, Vec<[u8; 20]>>,  // collection_name -> addresses
+    /// collection_name -> list of (timestamp, address) discovered
+    pub addresses_by_collection: HashMap<String, Vec<(u64, [u8; 20])>>,
 }
 ```
 
 ## Unified Error Type
 
-Live mode uses a unified `LiveError` type that consolidates errors from various modules:
+Live mode uses a unified `LiveError` type (`src/live/error.rs`) that consolidates errors from various modules:
 
 ```rust
 pub enum LiveError {
     Storage(StorageError),
     Rpc(RpcError),
-    Channel(String),
-    Decode(String),
-    Io(std::io::Error),
     Database(DbError),
-    Progress(String),
+    ChannelClosed,
+    BlockNotFound(u64),
 }
 ```
 
-`ProgressError` and `LiveEthCallError` are now type aliases to `LiveError`.
+Additionally, `CollectorError` (`src/live/collector.rs`) and `CompactionError` (`src/live/compaction.rs`) are separate error types specific to their modules.
 
 ## Recovery and Catchup
 
@@ -721,11 +829,12 @@ The status file now tracks which handlers have completed:
   "logs_decoded": true,
   "eth_calls_decoded": true,
   "transformed": true,
-  "completed_handlers": ["v3_handler_v1", "v4_handler_v1"]
+  "completed_handlers": ["v3_handler_v1", "v4_handler_v1"],
+  "failed_handlers": []
 }
 ```
 
-The `completed_handlers` field (with `#[serde(default)]` for backwards compatibility) enables catchup to determine exactly which handlers still need to run without querying the database.
+The `completed_handlers` and `failed_handlers` fields (with `#[serde(default)]` for backwards compatibility) enable catchup to determine exactly which handlers still need to run without querying the database. Failed handlers are retried via the stuck block detection mechanism.
 
 **LiveCatchupService**
 
@@ -772,9 +881,12 @@ Startup:
   2. run_catchup_phase()
      ├── Reconstruct missing status files from data + database
      ├── Load progress from storage status files
-     ├── scan_incomplete_blocks()
+     ├── scan_incomplete_blocks() → CatchupScanResult
+     ├── resume_collection_blocks() for blocks needing re-collection
+     │   (FetchBlock / FetchReceiptsAndLogs / CollectEthCalls stages)
      ├── replay_logs_for_decode() → log_decoder channel
-     └── replay_calls_for_decode() → eth_call_decoder channel
+     ├── replay_calls_for_decode() → eth_call_decoder channel
+     └── queue_transform_retry() for blocks needing transformation
   3. backfill_storage_gaps()
      ├── Find gaps in block number sequence
      └── Backfill missing blocks via HTTP
@@ -808,15 +920,17 @@ Live mode now has clearer logging to understand pipeline progress:
 | `Log decoder live phase started` | Decoder task running |
 | `No incomplete blocks found, skipping catchup phase` | Clean startup |
 
-### Files Modified
+### Module Structure
 
-| File | Changes |
+| File | Purpose |
 |------|---------|
-| `src/live/types.rs` | Added `completed_handlers: HashSet<String>` to `LiveBlockStatus` |
-| `src/live/progress.rs` | Updated `mark_complete()` to persist handlers, added `load_from_storage()` |
-| `src/live/collector.rs` | Added `run_catchup_phase()`, `backfill_storage_gaps()`, accepts `db_pool` |
-| `src/live/catchup.rs` | **NEW** - `LiveCatchupService` with `reconstruct_missing_status_files()` |
-| `src/live/storage.rs` | Added `find_gaps()` for detecting missing blocks in storage |
-| `src/live/mod.rs` | Export catchup module |
-| `src/decoding/current/logs.rs` | Added decoder startup and completion logging |
-| `src/transformations/engine.rs` | Cleaned up verbose call dependency logging |
+| `src/live/mod.rs` | Module exports |
+| `src/live/types.rs` | All live mode types: `LiveBlock`, `LiveBlockStatus`, `LiveLog`, `LiveReceipt`, `LiveEthCall`, `LiveFactoryAddresses`, `LiveDecodedLog/Call/EventCall/OnceCall`, `LiveUpsertSnapshot`, `LiveDbValue`, `LiveModeConfig`, `LivePipelineExpectations`, `LiveMessage` |
+| `src/live/collector.rs` | `LiveCollector` - WebSocket block processing, catchup, backfill, factory extraction |
+| `src/live/compaction.rs` | `CompactionService` - bincode-to-parquet compaction, stuck block detection, S3 upload |
+| `src/live/progress.rs` | `LiveProgressTracker` - per-block, per-handler completion tracking |
+| `src/live/storage.rs` | `LiveStorage` - bincode/JSON file operations with atomic writes |
+| `src/live/reorg.rs` | `ReorgDetector` - parent hash verification and common ancestor search |
+| `src/live/catchup.rs` | `LiveCatchupService` - status reconstruction and incomplete block scanning |
+| `src/live/eth_calls.rs` | `LiveEthCallCollector` - frequency, factory, once, and event-triggered eth_call collection |
+| `src/live/error.rs` | `LiveError` - unified error type |

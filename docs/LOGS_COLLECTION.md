@@ -38,7 +38,9 @@ use doppler_indexer_rs::raw_data::historical::current::logs as current_logs;
 use doppler_indexer_rs::raw_data::historical::receipts::{LogData, LogMessage};
 use doppler_indexer_rs::raw_data::historical::factories::FactoryAddressData;
 use doppler_indexer_rs::decoding::DecoderMessage;
+use doppler_indexer_rs::storage::{S3Manifest, StorageManager};
 use tokio::sync::mpsc;
+use std::sync::Arc;
 
 // Channel from receipt collector (sends LogMessage)
 let (log_tx, log_rx) = mpsc::channel::<LogMessage>(1000);
@@ -49,8 +51,14 @@ let factory_rx: Option<Receiver<FactoryAddressData>> = None;
 // Optional decoder channel (for ABI decoding)
 let decoder_tx: Option<Sender<DecoderMessage>> = None;
 
+// Optional S3 manifest and storage manager for remote storage
+let s3_manifest: Option<S3Manifest> = None;
+let storage_manager: Option<Arc<StorageManager>> = None;
+
 // Phase 1: Catchup - initialize state
-let catchup_state = catchup_logs::collect_logs(&chain_config, &raw_data_config).await?;
+let catchup_state = catchup_logs::collect_logs(
+    &chain_config, &raw_data_config, s3_manifest, storage_manager,
+).await?;
 
 // Phase 2: Current - process logs from channel
 current_logs::collect_logs(&chain_config, log_rx, factory_rx, decoder_tx, catchup_state).await?;
@@ -64,6 +72,8 @@ current_logs::collect_logs(&chain_config, log_rx, factory_rx, decoder_tx, catchu
 pub async fn collect_logs(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
+    s3_manifest: Option<S3Manifest>,
+    storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<LogsCatchupState, LogCollectionError>
 ```
 
@@ -76,6 +86,9 @@ Returns a `LogsCatchupState` containing:
 - `contract_logs_only`: Whether to filter to configured contracts only
 - `needs_factory_wait`: Whether to wait for factory addresses before writing
 - `log_fields`: Optional list of specific fields to include
+- `s3_manifest`: Optional S3 manifest for skipping ranges already uploaded
+- `storage_manager`: Optional storage manager for uploading parquet files to S3
+- `chain_name`: Chain name used for S3 upload paths
 
 ### Current Phase
 
@@ -97,6 +110,8 @@ pub async fn collect_logs(
 |-----------|------|-------------|
 | `chain` | `&ChainConfig` | Chain configuration with name and contracts |
 | `raw_data_config` | `&RawDataCollectionConfig` | Parquet range size and field configuration |
+| `s3_manifest` | `Option<S3Manifest>` | Optional S3 manifest for skipping already-uploaded ranges |
+| `storage_manager` | `Option<Arc<StorageManager>>` | Optional storage manager for uploading parquet files to S3 |
 
 #### Current Phase
 
@@ -139,13 +154,37 @@ When `decoder_tx` is provided, the collector sends `DecoderMessage` for each com
 
 ```rust
 pub enum DecoderMessage {
-    LogsReady { range_start: u64, range_end: u64, logs: Vec<LogData>, live_mode: bool, has_factory_matchers: bool },
-    EthCallsReady { range_start: u64, range_end: u64, ... },
-    OnceCallsReady { range_start: u64, range_end: u64, ... },
-    EventCallsReady { range_start: u64, range_end: u64, ... },
-    FactoryAddresses { range_start: u64, range_end: u64, addresses: HashMap<String, Vec<Address>> },
-    OnceFileBackfilled { contract_name: String, file_name: String },
-    Reorg { common_ancestor: u64, orphaned: Vec<u64> },
+    LogsReady {
+        range_start: u64, range_end: u64, logs: Vec<LogData>,
+        live_mode: bool, has_factory_matchers: bool,
+    },
+    EthCallsReady {
+        range_start: u64, range_end: u64, contract_name: String,
+        function_name: String, results: Vec<EthCallResult>,
+        live_mode: bool, retry_transform_after_decode: bool,
+    },
+    OnceCallsReady {
+        range_start: u64, range_end: u64, contract_name: String,
+        results: Vec<OnceCallResult>,
+        live_mode: bool, retry_transform_after_decode: bool,
+    },
+    EventCallsReady {
+        range_start: u64, range_end: u64, contract_name: String,
+        function_name: String, results: Vec<EventCallResult>,
+        live_mode: bool, retry_transform_after_decode: bool,
+    },
+    EthCallsBlockComplete {
+        range_start: u64, range_end: u64,
+        retry_transform_after_decode: bool,
+    },
+    FactoryAddresses {
+        range_start: u64, range_end: u64,
+        addresses: HashMap<String, Vec<Address>>,
+    },
+    OnceFileBackfilled {
+        range_start: u64, range_end: u64, contract_name: String,
+    },
+    Reorg { _common_ancestor: u64, orphaned: Vec<u64> },
     AllComplete,
 }
 ```
@@ -154,11 +193,12 @@ pub enum DecoderMessage {
   - `live_mode: false` for historical collection (writes parquet)
   - `live_mode: true` for live WebSocket collection (writes bincode)
   - `has_factory_matchers: bool` indicates if factory matchers exist for this range
-- **`EthCallsReady`** - Regular eth_call results ready for decoding
+- **`EthCallsReady`** - Regular eth_call results ready for decoding (includes `retry_transform_after_decode` for deferred transform execution)
 - **`OnceCallsReady`** - One-time eth_call results ready for decoding
 - **`EventCallsReady`** - Event-triggered eth_call results ready for decoding
+- **`EthCallsBlockComplete`** - Marker indicating all eth_call decode work for a block/range has been queued; when `retry_transform_after_decode` is true, this triggers deferred transform execution
 - **`FactoryAddresses`** - Factory-discovered addresses for a range (needed for factory event matching)
-- **`OnceFileBackfilled`** - A once-call file was backfilled with new columns - decoder should re-check it
+- **`OnceFileBackfilled`** - A once-call file was backfilled with new columns for a specific range and contract - decoder should re-check it
 - **`Reorg`** - Signals a chain reorganization for cleanup of orphaned blocks
 - **`AllComplete`** - Signals that all log collection is finished
 
@@ -189,10 +229,11 @@ data/{chain}/historical/raw/logs/
 1. Receives `LogMessage` from the receipt collector via channel
 2. For `LogMessage::Logs`: accumulates logs into per-range buckets
 3. For `LogMessage::RangeComplete`: signals a range is ready to process
+   - Skips the range if the parquet file already exists on disk or in the S3 manifest
    - If `contract_logs_only` is enabled and factories are configured, waits for factory addresses
    - Filters logs to configured contracts and factory-created contracts (if filtering enabled)
    - Sends logs to decoder (if decoder channel provided)
-   - Writes range to Parquet file
+   - Writes range to Parquet file and uploads to S3 (if storage manager configured)
 4. For `LogMessage::AllRangesComplete`: signals collection is finished
    - Waits for any pending ranges that need factory data
    - Sends `DecoderMessage::AllComplete` to decoder (if configured)
@@ -255,7 +296,7 @@ use doppler_indexer_rs::raw_data::historical::{
 let (decoder_tx, decoder_rx) = mpsc::channel(1000);
 
 // Phase 1: Catchup
-let catchup_state = catchup_logs::collect_logs(&chain, &config).await?;
+let catchup_state = catchup_logs::collect_logs(&chain, &config, None, None).await?;
 
 // Phase 2: Current - with decoder channel
 current_logs::collect_logs(&chain, log_rx, factory_rx, Some(decoder_tx), catchup_state).await?;
@@ -300,6 +341,15 @@ Log files can also be automatically recollected when the factory collector detec
 5. **Writing**: The logs collector receives the data through its normal channel and writes a new parquet file
 
 This automatic recovery ensures data integrity without manual intervention. See [Factory Collection](./FACTORY_COLLECTION.md#corrupted-file-recovery) and [Receipt Collection](./RECEIPTS_COLLECTION.md#automatic-recollection-corrupted-file-recovery) for more details.
+
+## S3 / Remote Storage Integration
+
+When an `S3Manifest` and `StorageManager` are provided to the catchup phase, the log collector integrates with remote storage:
+
+- **Skipping already-uploaded ranges**: Before writing a parquet file, the collector checks both the local filesystem and the S3 manifest. Ranges that already exist in S3 are skipped even if the local file is absent.
+- **Uploading new ranges**: After writing a parquet file locally, the collector uploads it to S3 via the `StorageManager` using the path pattern `raw/logs/{range_start}-{range_end}.parquet`.
+
+Both the `s3_manifest` and `storage_manager` are carried through `LogsCatchupState` so the current phase can use them without additional parameters.
 
 ## Field Configuration
 
@@ -540,7 +590,7 @@ tasks.spawn({
     let (chain, config) = (chain.clone(), config.clone());
     async move {
         // Phase 1: Catchup - initialize state
-        let catchup_state = catchup_logs::collect_logs(&chain, &config).await?;
+        let catchup_state = catchup_logs::collect_logs(&chain, &config, None, None).await?;
 
         // Phase 2: Current - process logs from channel
         current_logs::collect_logs(&chain, log_rx, None, None, catchup_state).await

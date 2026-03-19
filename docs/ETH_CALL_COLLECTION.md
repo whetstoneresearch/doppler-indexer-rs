@@ -61,6 +61,8 @@ The `output_type` field (and parameter types) support the following EVM types:
 | `bytes32` | Fixed 32-byte value |
 | `bytes` | Dynamic byte array |
 | `string` | Dynamic string |
+| `(type1, type2, ...)` | Unnamed tuple (positional fields) |
+| `type[]` | Dynamic array of elements (e.g., `address[]`, `(address, uint96)[]`) |
 
 ### Named Output Types
 
@@ -87,6 +89,43 @@ This creates separate columns: `sqrtPriceX96`, `tick`, `observationIndex`, `obse
 The format is `type name` for each field, with tuples enclosed in parentheses and fields separated by commas.
 
 **Named tuples work with all frequency settings**, including `"once"`. For once calls, the decoded column naming pattern is `{function}.{field_name}` (e.g., `slot0.sqrtPriceX96`).
+
+### Unnamed Tuples
+
+For functions returning multiple values without needing named columns, use unnamed tuples:
+
+```json
+{
+  "function": "getAmountsOut(uint256,address[])",
+  "output_type": "(address, uint96)"
+}
+```
+
+Unnamed tuple fields are assigned positional names `0`, `1`, etc. in the decoded output.
+
+### Array Types
+
+Output types can include dynamic arrays, either of simple types or tuples:
+
+```json
+{
+  "function": "getRecipients()",
+  "output_type": "(address beneficiary, uint96 shares)[]"
+}
+```
+
+Array types are stored as Arrow `List` columns. Arrays can wrap simple types (`address[]`), unnamed tuples (`(address, uint96)[]`), or named tuples (`(address beneficiary, uint96 shares)[]`).
+
+### Nested Tuples
+
+Named tuples can contain nested tuples for complex return types:
+
+```json
+{
+  "function": "getState(bytes32)",
+  "output_type": "(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee) poolKey, int24 farTick)"
+}
+```
 
 ## Parameters
 
@@ -502,7 +541,7 @@ Example: `data/base/historical/raw/eth_calls/V3Pool/slot0/on_events/0-9999.parqu
 |--------|------|-------------|
 | `block_number` | UInt64 | The block height at which the call was made |
 | `block_timestamp` | UInt64 | Unix timestamp of the block |
-| `contract_address` | FixedSizeBinary(20) | The contract address called |
+| `address` | FixedSizeBinary(20) | The contract address called |
 | `value` | Binary | Raw bytes returned by eth_call |
 | `param_0`, `param_1`, ... | Binary | ABI-encoded parameter values (only present if function has parameters) |
 
@@ -521,7 +560,7 @@ Example: `data/base/historical/raw/eth_calls/V3Pool/slot0/on_events/0-9999.parqu
 
 The `value` column contains raw ABI-encoded bytes from the eth_call response. To decode:
 
-1. Look up the `contract_address` in your config to find the `output_type`
+1. Look up the `address` in your config to find the `output_type`
 2. Decode the bytes according to the type:
    - `uint*`: 32-byte big-endian unsigned integer (left-padded with zeros)
    - `int*`: 32-byte big-endian signed integer (two's complement)
@@ -551,9 +590,10 @@ if 'param_0' in df.columns:
 
 ## Error Handling
 
-- If an eth_call fails (e.g., contract doesn't exist at that block), an empty `value` is stored
+- **Without Multicall3:** If an eth_call reverts or fails (e.g., contract doesn't exist at that block), the result is skipped entirely — no row is written for that call
+- **With Multicall3:** Individual sub-call failures return empty bytes (due to `allowFailure=true`), so a row with an empty `value` is stored
 - Failed calls are logged with a warning but don't stop collection
-- Empty values in the output indicate either a failed call or a zero-length response
+- If the Multicall3 RPC call itself fails, all sub-calls for that block are treated as failed
 
 ## Performance Considerations
 
@@ -791,7 +831,7 @@ When using named tuple output types, the decoded parquet files will have named c
 |--------|------|-------------|
 | `block_number` | UInt64 | Block height |
 | `block_timestamp` | UInt64 | Unix timestamp |
-| `contract_address` | FixedSizeBinary(20) | Target contract address |
+| `address` | FixedSizeBinary(20) | Target contract address |
 | `sqrtPriceX96` | Utf8 | First tuple field (stored as string for large integers) |
 | `tick` | Int32 | Second tuple field |
 | `observationIndex` | UInt32 | Third tuple field |
