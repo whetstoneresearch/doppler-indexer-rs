@@ -35,6 +35,7 @@ mod error;
 mod initial_sync;
 mod local;
 mod manifest;
+pub mod paths;
 mod retry;
 mod s3;
 mod upload;
