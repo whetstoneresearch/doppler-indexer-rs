@@ -1,6 +1,7 @@
 {
     "UniswapV4MulticurveInitializer": {
         "address": "0x65de470da664a5be139a5d812be5fda0d76cc951",
+        "start_block": 36178538,
         "events": [
             { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
         ],
@@ -21,6 +22,19 @@
             {
                 "function": "getBeneficiaries(address)",
                 "output_type": "(address, uint96)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4MulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            },
+            {
+                "function": "getPositions(address)",
+                "output_type": "(int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt)[]",
                 "frequency": {
                     "on_events": {
                         "source": "UniswapV4MulticurveInitializer",
@@ -71,6 +85,19 @@
                 "params": [
                     { "type": "address", "from_event": "topics[2]"}
                 ]
+            },
+            {
+                "function": "getPositions(address)",
+                "output_type": "(int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
             }
         ]          
     },
@@ -103,6 +130,19 @@
             {
                 "function": "getBeneficiaries(address)",
                 "output_type": "(address, uint96)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "DecayMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            },
+            {
+                "function": "getPositions(address)",
+                "output_type": "(int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt)[]",
                 "frequency": {
                     "on_events": {
                         "source": "DecayMulticurveInitializer",

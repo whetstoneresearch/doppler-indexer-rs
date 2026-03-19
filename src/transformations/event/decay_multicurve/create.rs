@@ -47,7 +47,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
     ) -> Result<Vec<DbOperation>, TransformationError>{
         let mut ops = Vec::new();
 
-        for event in ctx.events_of_type("UniswapV4DecayMulticurveInitializer", "Create") {
+        for event in ctx.events_of_type("DecayMulticurveInitializer", "Create") {
             let asset = event.get("asset")?.as_address().ok_or_else(|| {
                 TransformationError::TypeConversion("asset is not an address".to_string())
             })?;
@@ -70,7 +70,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                 }
             }
 
-            let get_state_call = ctx.calls_of_type("UniswapV4DecayMulticurveInitializer", "getState")
+            let get_state_call = ctx.calls_of_type("DecayMulticurveInitializer", "getState")
                 .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .next()
                 .ok_or_else(|| TransformationError::MissingData(format!(
@@ -90,14 +90,14 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
             let pool_key = {
                 let field_err = |field: &str, expected: &str| {
                     TransformationError::TypeConversion(format!(
-                        "UniswapV4DecayMulticurveInitializer getState for {} field '{}': expected {} but got {:?} at block {} tx {}",
+                        "DecayMulticurveInitializer getState for {} field '{}': expected {} but got {:?} at block {} tx {}",
                         Address::from(asset), field, expected, get_state_call.result.get(field),
                         event.block_number, B256::from(event.transaction_hash)
                     ))
                 };
                 let missing_err = |field: &str| {
                     TransformationError::MissingData(format!(
-                        "UniswapV4DecayMulticurveInitializer getState for {} missing field '{}' at block {} tx {}. Available fields: {:?}",
+                        "DecayMulticurveInitializer getState for {} missing field '{}' at block {} tx {}. Available fields: {:?}",
                         Address::from(asset), field, event.block_number, B256::from(event.transaction_hash),
                         get_state_call.result.keys().collect::<Vec<_>>()
                     ))
@@ -144,7 +144,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                     Address::from(asset), event.block_number, B256::from(event.transaction_hash)
                 )))?;
 
-            let get_positions_call = ctx.calls_of_type("UniswapV4DecayMulticurveInitializer", "getPositions")
+            let get_positions_call = ctx.calls_of_type("DecayMulticurveInitializer", "getPositions")
                 .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .next()
                 .ok_or_else(|| TransformationError::MissingData(format!(
@@ -272,7 +272,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                 ctx
             ));
 
-            let beneficiaries: Option<BeneficiariesData> = ctx.calls_of_type("UniswapV4DecayMulticurveInitializer", "getBeneficiaries")
+            let beneficiaries: Option<BeneficiariesData> = ctx.calls_of_type("DecayMulticurveInitializer", "getBeneficiaries")
                 .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .next()
                 .and_then(|call| call.result.get("getBeneficiaries"))
@@ -347,7 +347,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
 impl EventHandler for V4DecayMulticurveCreateHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(
-            "UniswapV4DecayMulticurveInitializer",
+            "DecayMulticurveInitializer",
             "Create(address,address,address)"
         )]
     }
@@ -356,9 +356,9 @@ impl EventHandler for V4DecayMulticurveCreateHandler {
         vec![
             ("DERC20".to_string(), "once".to_string()),
             ("Numeraires".to_string(), "once".to_string()),
-            ("UniswapV4DecayMulticurveInitializer".to_string(), "getState".to_string()),
-            ("UniswapV4DecayMulticurveInitializer".to_string(), "getBeneficiaries".to_string()),
-            ("UniswapV4DecayMulticurveInitializer".to_string(), "getPositions".to_string()),
+            ("DecayMulticurveInitializer".to_string(), "getState".to_string()),
+            ("DecayMulticurveInitializer".to_string(), "getBeneficiaries".to_string()),
+            ("DecayMulticurveInitializer".to_string(), "getPositions".to_string()),
         ]
     }
 }
