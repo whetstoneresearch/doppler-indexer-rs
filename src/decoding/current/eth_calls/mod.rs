@@ -1,30 +1,29 @@
 //! Live/current phase for eth_call decoding - processes new data as it arrives via channel.
 
-use std::collections::HashSet;
+mod events;
+mod factory;
+mod range_processor;
+mod state;
+
 use std::path::Path;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::decoding::eth_calls::column_index::{
-    load_or_build_decoded_column_index, read_once_calls_from_parquet,
-    read_raw_parquet_function_names,
-};
 use crate::decoding::eth_calls::{
-    build_result_map, decode_value, process_event_calls, process_once_calls, process_regular_calls,
-    CallDecodeConfig, EthCallDecodingError, EventCallDecodeConfig,
+    process_event_calls, process_once_calls, process_regular_calls, CallDecodeConfig,
+    EthCallDecodingError, EventCallDecodeConfig,
 };
 use crate::decoding::types::DecoderMessage;
-use crate::live::LiveStorage;
 use crate::live::TransformRetryRequest;
-use crate::live::{LiveDecodedCall, LiveDecodedEventCall, LiveDecodedOnceCall};
-use crate::transformations::{
-    DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteKind,
-    RangeCompleteMessage,
-};
+use crate::transformations::{DecodedCallsMessage, RangeCompleteMessage};
 use crate::types::config::raw_data::RawDataCollectionConfig;
-use crate::types::decoded::DecodedValue;
 
 use crate::decoding::catchup::eth_calls::catchup_decode_eth_calls;
+
+use self::events::handle_event_calls_live;
+use self::factory::{handle_once_calls_live, handle_once_file_backfilled};
+use self::range_processor::{handle_block_complete, handle_regular_calls_live};
+use self::state::DecoderState;
 
 /// Live phase: Process new data as it arrives via channel.
 /// Returns when AllComplete message is received or channel closes.
@@ -41,8 +40,7 @@ pub async fn decode_eth_calls_live(
     complete_tx: Option<&Sender<RangeCompleteMessage>>,
     transform_retry_tx: Option<&Sender<TransformRetryRequest>>,
 ) -> Result<(), EthCallDecodingError> {
-    // Live storage for live_mode=true messages
-    let live_storage = LiveStorage::new(chain_name);
+    let state = DecoderState::new(chain_name);
 
     loop {
         match decoder_rx.recv().await {
@@ -62,82 +60,18 @@ pub async fn decode_eth_calls_live(
 
                 if let Some(config) = config {
                     if live_mode {
-                        // Live mode: decode and write to bincode storage
-                        let mut decoded_calls: Vec<LiveDecodedCall> =
-                            Vec::with_capacity(results.len());
-                        let mut transform_calls: Vec<TransformDecodedCall> =
-                            Vec::with_capacity(results.len());
-
-                        for result in &results {
-                            match decode_value(&result.value, &config.output_type) {
-                                Ok(decoded) => {
-                                    // Build transform call for transformation engine
-                                    transform_calls.push(TransformDecodedCall {
-                                        block_number: result.block_number,
-                                        block_timestamp: result.block_timestamp,
-                                        contract_address: result.contract_address,
-                                        source_name: contract_name.clone(),
-                                        function_name: function_name.clone(),
-                                        trigger_log_index: None,
-                                        result: build_result_map(
-                                            &decoded,
-                                            &config.output_type,
-                                            &function_name,
-                                        ),
-                                    });
-
-                                    // Build live call for bincode storage
-                                    decoded_calls.push(LiveDecodedCall {
-                                        block_number: result.block_number,
-                                        block_timestamp: result.block_timestamp,
-                                        contract_address: result.contract_address,
-                                        decoded_value: decoded.clone(),
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to decode eth_call {}/{} at block {}: address={}, raw_bytes=0x{}, error={}",
-                                        contract_name, function_name, result.block_number,
-                                        alloy::primitives::Address::from(result.contract_address),
-                                        hex::encode(&result.value),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-
-                        if !decoded_calls.is_empty() {
-                            if let Err(e) = live_storage.write_decoded_calls(
-                                range_start,
-                                &contract_name,
-                                &function_name,
-                                &decoded_calls,
-                            ) {
-                                tracing::warn!(
-                                    "Failed to write decoded eth_calls for {}/{} at block {}: {}",
-                                    contract_name,
-                                    function_name,
-                                    range_start,
-                                    e
-                                );
-                            }
-                        }
-
-                        // Send to transformation engine
-                        if !retry_transform_after_decode {
-                            if let Some(tx) = transform_tx {
-                                if !transform_calls.is_empty() {
-                                    let msg = DecodedCallsMessage {
-                                        range_start,
-                                        range_end,
-                                        source_name: contract_name.clone(),
-                                        function_name: function_name.clone(),
-                                        calls: transform_calls,
-                                    };
-                                    let _ = tx.send(msg).await;
-                                }
-                            }
-                        }
+                        handle_regular_calls_live(
+                            &state.live_storage,
+                            range_start,
+                            range_end,
+                            &contract_name,
+                            &function_name,
+                            &results,
+                            config,
+                            transform_tx,
+                            retry_transform_after_decode,
+                        )
+                        .await?;
                     } else {
                         // Historical mode: write to parquet
                         process_regular_calls(
@@ -160,7 +94,6 @@ pub async fn decode_eth_calls_live(
                 live_mode,
                 retry_transform_after_decode,
             }) => {
-                // Find the once configs for this contract
                 let configs: Vec<&CallDecodeConfig> = once_configs
                     .iter()
                     .filter(|c| c.contract_name == contract_name)
@@ -168,103 +101,17 @@ pub async fn decode_eth_calls_live(
 
                 if !configs.is_empty() {
                     if live_mode {
-                        // Live mode: decode and write to bincode storage
-                        let mut decoded_once_calls: Vec<LiveDecodedOnceCall> =
-                            Vec::with_capacity(results.len());
-                        // Group transform calls by function name
-                        let mut transform_calls_by_fn: std::collections::HashMap<
-                            String,
-                            Vec<TransformDecodedCall>,
-                        > = std::collections::HashMap::new();
-
-                        for result in &results {
-                            let mut decoded_values: Vec<(String, DecodedValue)> = Vec::new();
-
-                            for config in &configs {
-                                if let Some(raw_value) = result.results.get(&config.function_name) {
-                                    match decode_value(raw_value, &config.output_type) {
-                                        Ok(decoded) => {
-                                            // Build transform call for transformation engine
-                                            let transform_call = TransformDecodedCall {
-                                                block_number: result.block_number,
-                                                block_timestamp: result.block_timestamp,
-                                                contract_address: result.contract_address,
-                                                source_name: contract_name.clone(),
-                                                function_name: config.function_name.clone(),
-                                                trigger_log_index: None,
-                                                result: build_result_map(
-                                                    &decoded,
-                                                    &config.output_type,
-                                                    &config.function_name,
-                                                ),
-                                            };
-                                            transform_calls_by_fn
-                                                .entry(config.function_name.clone())
-                                                .or_default()
-                                                .push(transform_call);
-
-                                            // Build live value for bincode storage
-                                            decoded_values.push((
-                                                config.function_name.clone(),
-                                                decoded.clone(),
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Failed to decode once_call {}/{} at block {}: address={}, raw_bytes=0x{}, error={}",
-                                                contract_name, config.function_name, result.block_number,
-                                                alloy::primitives::Address::from(result.contract_address),
-                                                hex::encode(raw_value),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !decoded_values.is_empty() {
-                                decoded_once_calls.push(LiveDecodedOnceCall {
-                                    block_number: result.block_number,
-                                    block_timestamp: result.block_timestamp,
-                                    contract_address: result.contract_address,
-                                    decoded_values,
-                                });
-                            }
-                        }
-
-                        if !decoded_once_calls.is_empty() {
-                            if let Err(e) = live_storage.write_decoded_once_calls(
-                                range_start,
-                                &contract_name,
-                                &decoded_once_calls,
-                            ) {
-                                tracing::warn!(
-                                    "Failed to write decoded once_calls for {} at block {}: {}",
-                                    contract_name,
-                                    range_start,
-                                    e
-                                );
-                            }
-                        }
-
-                        // Send to transformation engine (one message per function)
-                        if !retry_transform_after_decode {
-                            for (function_name, calls) in transform_calls_by_fn {
-                                if let Some(tx) = transform_tx {
-                                    if calls.is_empty() {
-                                        continue;
-                                    }
-                                    let msg = DecodedCallsMessage {
-                                        range_start,
-                                        range_end,
-                                        source_name: contract_name.clone(),
-                                        function_name,
-                                        calls,
-                                    };
-                                    let _ = tx.send(msg).await;
-                                }
-                            }
-                        }
+                        handle_once_calls_live(
+                            &state.live_storage,
+                            range_start,
+                            range_end,
+                            &contract_name,
+                            &results,
+                            &configs,
+                            transform_tx,
+                            retry_transform_after_decode,
+                        )
+                        .await?;
                     } else {
                         // Historical mode: write to parquet
                         process_once_calls(
@@ -275,7 +122,7 @@ pub async fn decode_eth_calls_live(
                             &configs,
                             output_base,
                             transform_tx,
-                            false, // Update index directly (no concurrent tasks)
+                            false,
                         )
                         .await?;
                     }
@@ -290,90 +137,23 @@ pub async fn decode_eth_calls_live(
                 live_mode,
                 retry_transform_after_decode,
             }) => {
-                // Find the decode config for this event-triggered call
                 if let Some(config) = event_configs
                     .iter()
                     .find(|c| c.contract_name == contract_name && c.function_name == function_name)
                 {
                     if live_mode {
-                        // Live mode: decode and write to bincode storage
-                        let mut decoded_event_calls: Vec<LiveDecodedEventCall> =
-                            Vec::with_capacity(results.len());
-                        let mut transform_calls: Vec<TransformDecodedCall> =
-                            Vec::with_capacity(results.len());
-
-                        for result in &results {
-                            match decode_value(&result.value, &config.output_type) {
-                                Ok(decoded) => {
-                                    // Build transform call for transformation engine
-                                    transform_calls.push(TransformDecodedCall {
-                                        block_number: result.block_number,
-                                        block_timestamp: result.block_timestamp,
-                                        contract_address: result.target_address,
-                                        source_name: contract_name.clone(),
-                                        function_name: function_name.clone(),
-                                        trigger_log_index: Some(result.log_index),
-                                        result: build_result_map(
-                                            &decoded,
-                                            &config.output_type,
-                                            &function_name,
-                                        ),
-                                    });
-
-                                    // Build live call for bincode storage
-                                    decoded_event_calls.push(LiveDecodedEventCall {
-                                        block_number: result.block_number,
-                                        block_timestamp: result.block_timestamp,
-                                        log_index: result.log_index,
-                                        target_address: result.target_address,
-                                        decoded_value: decoded.clone(),
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to decode event_call {}/{} at block {}: address={}, log_index={}, raw_bytes=0x{}, error={}",
-                                        contract_name, function_name, result.block_number,
-                                        alloy::primitives::Address::from(result.target_address),
-                                        result.log_index,
-                                        hex::encode(&result.value),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-
-                        if !decoded_event_calls.is_empty() {
-                            if let Err(e) = live_storage.write_decoded_event_calls(
-                                range_start,
-                                &contract_name,
-                                &function_name,
-                                &decoded_event_calls,
-                            ) {
-                                tracing::warn!(
-                                    "Failed to write decoded event_calls for {}/{} at block {}: {}",
-                                    contract_name,
-                                    function_name,
-                                    range_start,
-                                    e
-                                );
-                            }
-                        }
-
-                        // Send to transformation engine
-                        if !retry_transform_after_decode {
-                            if let Some(tx) = transform_tx {
-                                if !transform_calls.is_empty() {
-                                    let msg = DecodedCallsMessage {
-                                        range_start,
-                                        range_end,
-                                        source_name: contract_name.clone(),
-                                        function_name: function_name.clone(),
-                                        calls: transform_calls,
-                                    };
-                                    let _ = tx.send(msg).await;
-                                }
-                            }
-                        }
+                        handle_event_calls_live(
+                            &state.live_storage,
+                            range_start,
+                            range_end,
+                            &contract_name,
+                            &function_name,
+                            &results,
+                            config,
+                            transform_tx,
+                            retry_transform_after_decode,
+                        )
+                        .await?;
                     } else {
                         // Historical mode: write to parquet
                         process_event_calls(
@@ -389,13 +169,12 @@ pub async fn decode_eth_calls_live(
                 }
             }
             Some(DecoderMessage::Reorg { orphaned, .. }) => {
-                // Delete decoded data for orphaned blocks
                 tracing::info!(
                     "Handling reorg in eth_calls decoder, deleting {} orphaned blocks",
                     orphaned.len()
                 );
                 for block_number in orphaned {
-                    let _ = live_storage.delete_all_decoded_calls(block_number);
+                    let _ = state.live_storage.delete_all_decoded_calls(block_number);
                 }
             }
             Some(DecoderMessage::EthCallsBlockComplete {
@@ -403,129 +182,34 @@ pub async fn decode_eth_calls_live(
                 range_end,
                 retry_transform_after_decode,
             }) => {
-                if let Ok(mut status) = live_storage.read_status(range_start) {
-                    status.eth_calls_decoded = true;
-                    if let Err(e) = live_storage.write_status(range_start, &status) {
-                        tracing::warn!(
-                            "Failed to update block status after eth_call block completion: {}",
-                            e
-                        );
-                    } else {
-                        tracing::debug!("Block {} eth_calls decoded", range_start);
-                    }
-                }
-
-                if !retry_transform_after_decode {
-                    if let Some(tx) = complete_tx {
-                        let msg = RangeCompleteMessage {
-                            range_start,
-                            range_end,
-                            kind: RangeCompleteKind::EthCalls,
-                        };
-                        if let Err(e) = tx.send(msg).await {
-                            tracing::warn!("Failed to send eth_call range complete: {}", e);
-                        }
-                    }
-                }
-
-                if retry_transform_after_decode {
-                    if let Some(tx) = transform_retry_tx {
-                        if let Err(e) = tx
-                            .send(TransformRetryRequest {
-                                block_number: range_start,
-                                missing_handlers: None,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to queue deferred transform retry for block {}: {}",
-                                range_start,
-                                e
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            "Block {} requested deferred transform retry but no retry channel is configured",
-                            range_start
-                        );
-                    }
-                }
+                handle_block_complete(
+                    &state.live_storage,
+                    range_start,
+                    range_end,
+                    retry_transform_after_decode,
+                    complete_tx,
+                    transform_retry_tx,
+                )
+                .await;
             }
             Some(DecoderMessage::OnceFileBackfilled {
                 range_start,
                 range_end,
                 contract_name,
             }) => {
-                // A once-call file was backfilled with new columns - decode missing columns
-                let configs: Vec<&CallDecodeConfig> = once_configs
-                    .iter()
-                    .filter(|c| c.contract_name == contract_name)
-                    .collect();
-
-                if !configs.is_empty() {
-                    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-                    let raw_path = raw_calls_dir
-                        .join(&contract_name)
-                        .join("once")
-                        .join(&file_name);
-
-                    if raw_path.exists() {
-                        // Read raw columns from parquet
-                        let raw_cols: HashSet<String> = read_raw_parquet_function_names(&raw_path);
-
-                        // Read decoded columns from index or parquet
-                        let decoded_dir = output_base.join(&contract_name).join("once");
-                        let raw_once_dir = raw_calls_dir.join(&contract_name).join("once");
-                        let decoded_index =
-                            load_or_build_decoded_column_index(&decoded_dir, &raw_once_dir);
-                        let decoded_cols: HashSet<String> = decoded_index
-                            .get(&file_name)
-                            .map(|cols| cols.iter().cloned().collect())
-                            .unwrap_or_default();
-
-                        // Find configs that need decoding
-                        let missing_configs: Vec<CallDecodeConfig> = configs
-                            .iter()
-                            .filter(|c| {
-                                raw_cols.contains(&c.function_name)
-                                    && !decoded_cols.contains(&c.function_name)
-                            })
-                            .cloned()
-                            .cloned()
-                            .collect();
-
-                        if !missing_configs.is_empty() {
-                            tracing::info!(
-                                "OnceFileBackfilled: decoding {} new columns for {}/{}",
-                                missing_configs.len(),
-                                contract_name,
-                                file_name
-                            );
-
-                            // Read raw parquet and decode the missing columns
-                            let configs_ref: Vec<&CallDecodeConfig> =
-                                missing_configs.iter().collect();
-                            let results = read_once_calls_from_parquet(&raw_path, &configs_ref)?;
-                            process_once_calls(
-                                &results,
-                                range_start,
-                                range_end,
-                                &contract_name,
-                                &configs_ref,
-                                output_base,
-                                transform_tx,
-                                false,
-                            )
-                            .await?;
-                        }
-                    }
-                }
+                handle_once_file_backfilled(
+                    raw_calls_dir,
+                    output_base,
+                    range_start,
+                    range_end,
+                    &contract_name,
+                    once_configs,
+                    transform_tx,
+                )
+                .await?;
             }
             Some(DecoderMessage::AllComplete) => {
                 // Re-run catchup to decode any new columns added by raw backfill.
-                // Initial catchup may have decoded partial data (e.g., name, symbol)
-                // while raw backfill was still adding new columns (e.g., getAssetData).
-                // This second pass picks up the newly added columns with fresh indexes.
                 if raw_calls_dir.exists() {
                     tracing::info!("Raw collection complete, re-running decode catchup");
                     catchup_decode_eth_calls(

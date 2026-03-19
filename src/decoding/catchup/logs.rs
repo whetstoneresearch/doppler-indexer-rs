@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
+use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::transformations::DecodedEventsMessage;
@@ -373,40 +374,6 @@ fn load_factory_addresses_for_catchup(
     }
 
     Ok(result)
-}
-
-/// Read factory addresses from a factory parquet file
-pub fn read_factory_addresses_from_parquet(
-    path: &Path,
-) -> Result<HashSet<[u8; 20]>, LogDecodingError> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-
-    let mut addresses = HashSet::new();
-
-    for batch_result in reader {
-        let batch = batch_result?;
-
-        // Look for "factory_address" column (the address of factory-created contracts)
-        if let Some(col_idx) = batch.schema().index_of("factory_address").ok() {
-            let col = batch.column(col_idx);
-            if let Some(addr_array) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                for i in 0..addr_array.len() {
-                    if !addr_array.is_null(i) {
-                        let bytes = addr_array.value(i);
-                        if bytes.len() == 20 {
-                            let mut addr = [0u8; 20];
-                            addr.copy_from_slice(bytes);
-                            addresses.insert(addr);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(addresses)
 }
 
 /// Read logs from a raw parquet file
