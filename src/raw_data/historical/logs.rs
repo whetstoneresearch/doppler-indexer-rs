@@ -16,6 +16,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::paths::scan_parquet_filenames;
 use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::LogField;
@@ -275,17 +276,7 @@ pub(crate) async fn process_range(
 }
 
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("logs_") && name.ends_with(".parquet") {
-                    files.insert(name.to_string());
-                }
-            }
-        }
-    }
-    files
+    scan_parquet_filenames(dir, "logs_")
 }
 
 pub(crate) fn build_log_schema(fields: &Option<Vec<LogField>>) -> Arc<Schema> {

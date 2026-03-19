@@ -17,6 +17,7 @@ use super::context::{
     DecodedCall, DecodedEvent, DecodedValue, HistoricalCallQuery, HistoricalEventQuery,
 };
 use super::error::TransformationError;
+use crate::storage::paths::{decoded_base_dir, scan_parquet_ranges};
 
 /// Reader for historical decoded data stored in parquet files.
 pub struct HistoricalDataReader {
@@ -32,7 +33,7 @@ pub struct HistoricalDataReader {
 impl HistoricalDataReader {
     /// Create a new historical data reader for a chain.
     pub fn new(chain_name: &str) -> Result<Self, TransformationError> {
-        let decoded_base = PathBuf::from(format!("data/{}/historical/decoded", chain_name));
+        let decoded_base = decoded_base_dir(chain_name);
 
         let reader = Self {
             chain_name: chain_name.to_string(),
@@ -96,23 +97,8 @@ impl HistoricalDataReader {
                 }
                 let name = name_entry.file_name().to_string_lossy().to_string();
 
-                // Find parquet files and extract ranges
-                let mut files: Vec<(u64, u64, PathBuf)> = Vec::new();
-
-                for file_entry in std::fs::read_dir(name_entry.path())? {
-                    let file_entry = file_entry?;
-                    let path = file_entry.path();
-
-                    if path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                        // Parse range from filename like "decoded_0-9999.parquet"
-                        if let Some(range) = parse_range_from_filename(&path) {
-                            files.push((range.0, range.1, path));
-                        }
-                    }
-                }
-
-                // Sort by range start
-                files.sort_by_key(|(start, _, _)| *start);
+                // Find parquet files and extract ranges (already sorted by start)
+                let files = scan_parquet_ranges(&name_entry.path())?;
 
                 let key = (source_name.clone(), name);
                 index.insert(key, files);
@@ -295,24 +281,6 @@ impl HistoricalDataReader {
         files.sort_by_key(|(_, _, _, start, _)| *start);
         files
     }
-}
-
-/// Parse range from filename like "decoded_0-9999.parquet".
-fn parse_range_from_filename(path: &Path) -> Option<(u64, u64)> {
-    let filename = path.file_stem()?.to_str()?;
-
-    // Try different filename patterns
-    // Pattern 1: "decoded_0-9999"
-    // Pattern 2: "0-9999"
-    let parts: Vec<&str> = filename.trim_start_matches("decoded_").split('-').collect();
-
-    if parts.len() == 2 {
-        let start = parts[0].parse().ok()?;
-        let end = parts[1].parse().ok()?;
-        return Some((start, end));
-    }
-
-    None
 }
 
 /// Read events from a parquet file with filtering.

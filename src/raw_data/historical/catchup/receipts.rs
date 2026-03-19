@@ -13,6 +13,7 @@ use crate::raw_data::historical::receipts::{
     EventTriggerMessage, LogMessage, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::paths::{raw_logs_dir, raw_receipts_dir};
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -39,7 +40,7 @@ pub async fn collect_receipts(
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<ReceiptsCatchupState, ReceiptCollectionError> {
-    let output_dir = PathBuf::from(format!("data/{}/historical/raw/receipts", chain.name));
+    let output_dir = raw_receipts_dir(&chain.name);
     std::fs::create_dir_all(&output_dir)?;
 
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
@@ -69,7 +70,7 @@ pub async fn collect_receipts(
     let mut catchup_count = 0;
 
     // Check existing logs files
-    let logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
+    let logs_dir = raw_logs_dir(&chain.name);
     let existing_logs_files = scan_existing_logs_files(&logs_dir);
 
     // Note: Factory catchup is handled by the factories module reading from logs files directly.

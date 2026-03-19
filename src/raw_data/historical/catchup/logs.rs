@@ -1,11 +1,11 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::raw_data::historical::logs::{
     build_configured_addresses, build_log_schema, scan_existing_parquet_files, LogCollectionError,
     LogsCatchupState,
 };
+use crate::storage::paths::raw_logs_dir;
 use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -16,7 +16,7 @@ pub async fn collect_logs(
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<LogsCatchupState, LogCollectionError> {
-    let output_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
+    let output_dir = raw_logs_dir(&chain.name);
     std::fs::create_dir_all(&output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;

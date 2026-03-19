@@ -14,51 +14,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 use super::types::{CallResult, EthCallCollectionError, OnceCallResult};
+use crate::storage::paths::scan_nested_parquet_files_2;
 
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-
-    // Scan nested directories: dir/contract/function/*.parquet
-    if let Ok(contract_entries) = std::fs::read_dir(dir) {
-        for contract_entry in contract_entries.flatten() {
-            let contract_path = contract_entry.path();
-            if !contract_path.is_dir() {
-                continue;
-            }
-            let contract_name = match contract_entry.file_name().to_str() {
-                Some(name) => name.to_string(),
-                None => continue,
-            };
-
-            if let Ok(function_entries) = std::fs::read_dir(&contract_path) {
-                for function_entry in function_entries.flatten() {
-                    let function_path = function_entry.path();
-                    if !function_path.is_dir() {
-                        continue;
-                    }
-                    let function_name = match function_entry.file_name().to_str() {
-                        Some(name) => name.to_string(),
-                        None => continue,
-                    };
-
-                    if let Ok(file_entries) = std::fs::read_dir(&function_path) {
-                        for file_entry in file_entries.flatten() {
-                            if let Some(name) = file_entry.file_name().to_str() {
-                                if name.ends_with(".parquet") {
-                                    // Store as contract/function/filename
-                                    files.insert(format!(
-                                        "{}/{}/{}",
-                                        contract_name, function_name, name
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    files
+    scan_nested_parquet_files_2(dir)
 }
 
 pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {

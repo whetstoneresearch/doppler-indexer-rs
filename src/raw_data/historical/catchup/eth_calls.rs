@@ -10,6 +10,7 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges, read_block_info_from_parquet,
 };
+use crate::storage::paths::raw_eth_calls_dir;
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, build_token_call_configs, event_output_exists,
@@ -41,7 +42,7 @@ pub async fn collect_eth_calls(
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<EthCallCatchupState, EthCallCollectionError> {
-    let base_output_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
+    let base_output_dir = raw_eth_calls_dir(&chain.name);
     std::fs::create_dir_all(&base_output_dir)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::paths::scan_parquet_filenames;
 use crate::storage::{upload_parquet_to_s3, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::ReceiptField;
@@ -1111,31 +1112,11 @@ fn extract_logs(
 }
 
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("receipts_") && name.ends_with(".parquet") {
-                    files.insert(name.to_string());
-                }
-            }
-        }
-    }
-    files
+    scan_parquet_filenames(dir, "receipts_")
 }
 
 pub(crate) fn scan_existing_logs_files(dir: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("logs_") && name.ends_with(".parquet") {
-                    files.insert(name.to_string());
-                }
-            }
-        }
-    }
-    files
+    scan_parquet_filenames(dir, "logs_")
 }
 
 pub(crate) fn build_receipt_schema(fields: &Option<Vec<ReceiptField>>) -> Arc<Schema> {
