@@ -732,6 +732,12 @@ fn parse_function_signature(sig: &str) -> Result<([u8; 4], DynSolType), Transfor
         ))
     })?;
 
+    // Unwrap single-element tuples so callers get the value directly
+    let output_type = match output_type {
+        DynSolType::Tuple(ref types) if types.len() == 1 => types[0].clone(),
+        other => other,
+    };
+
     Ok((selector, output_type))
 }
 

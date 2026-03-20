@@ -1,17 +1,16 @@
 {
-    "UniswapV4MulticurveInitializer": {
-        "address": "0x65de470da664a5be139a5d812be5fda0d76cc951",
-        "start_block": 36178538,
+    "DecayMulticurveInitializer": {
+        "address": "0xd59ce43e53d69f190e15d9822fb4540dccc91178",
         "events": [
             { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
         ],
         "calls": [
             {
                 "function": "getState(address)",
-                "output_type": "(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
+                "output_type": "(address numeraire, uint256 totalTokensOnBondingCurve, address dopplerHook, bytes graduationDopplerHookCalldata, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
                 "frequency": {
                     "on_events": {
-                        "source": "UniswapV4MulticurveInitializer",
+                        "source": "DecayMulticurveInitializer",
                         "event": "Create(address,address,address)"
                     }
                 },
@@ -24,7 +23,7 @@
                 "output_type": "(address, uint96)[]",
                 "frequency": {
                     "on_events": {
-                        "source": "UniswapV4MulticurveInitializer",
+                        "source": "DecayMulticurveInitializer",
                         "event": "Create(address,address,address)"
                     }
                 },
@@ -37,7 +36,7 @@
                 "output_type": "(int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt)[]",
                 "frequency": {
                     "on_events": {
-                        "source": "UniswapV4MulticurveInitializer",
+                        "source": "DecayMulticurveInitializer",
                         "event": "Create(address,address,address)"
                     }
                 },
@@ -47,11 +46,11 @@
             }
         ]   
     },
-    "UniswapV4MulticurveInitializerHook": {
-        "address": "0x892d3c2b4abeaaf67d52a7b29783e2161b7cad40",
-        "events": [      
-            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },      
-            { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
+    "DecayMulticurveHook": {
+        "address": "0xbb7784a4d481184283ed89619a3e3ed143e1adc0",
+        "events": [
+            { "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)" },
+            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" }
         ]
     }
 }

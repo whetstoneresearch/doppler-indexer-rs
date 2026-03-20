@@ -198,7 +198,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 num_tokens_to_sell: num_to_sell
                     .as_uint256()
                     .ok_or_else(|| TransformationError::TypeConversion(format!(
-                        "numTokensToSell is not uint256 in getState for asset {} at block {} tx {}",
+                        "numTokensToSell is not uint256 in getAssetData for asset {} at block {} tx {}",
                         Address::from(asset), event.block_number, B256::from(event.transaction_hash)
                     )))?,
                 min_proceeds: U256::ZERO,
