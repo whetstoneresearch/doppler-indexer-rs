@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
-use alloy::primitives::{Address, Bytes, I256, U256};
+use alloy::primitives::{Address, Bytes, I256, U256, B256};
 
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
@@ -661,6 +661,40 @@ impl TransformationContext {
             .map_err(|e| TransformationError::DecodeError(e.to_string()))?;
 
         Ok(decoded)
+    }
+
+    /// Find the address of a contract that emitted a log with a given topic0 in a transaction.
+    ///
+    /// Fetches the transaction receipt via RPC and searches for a matching log.
+    /// Returns the emitting contract's address, or an error if not found.
+    pub async fn find_log_emitter(
+        &self,
+        transaction_hash: [u8; 32],
+        topic0: B256,
+    ) -> Result<[u8; 20], TransformationError> {
+        let tx_hash = B256::from(transaction_hash);
+        let receipt = self
+            .rpc
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(|e| TransformationError::RpcError(e.to_string()))?
+            .ok_or_else(|| {
+                TransformationError::MissingData(format!(
+                    "No receipt found for tx {}",
+                    tx_hash
+                ))
+            })?;
+
+        for log in receipt.inner.logs() {
+            if log.topics().first() == Some(&topic0) {
+                return Ok(log.address().0 .0);
+            }
+        }
+
+        Err(TransformationError::MissingData(format!(
+            "No log with topic0 {} found in tx {}",
+            topic0, tx_hash
+        )))
     }
 
     /// Make multiple eth_calls concurrently (more efficient than sequential).
