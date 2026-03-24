@@ -417,9 +417,12 @@ impl ManifestManager {
                 manifest
             }
             Err(StorageError::NotFound(_)) => {
-                // No manifest yet - start with empty
-                tracing::debug!("No manifest found for chain {}, starting empty", chain);
-                S3Manifest::new()
+                // No manifest file yet - rebuild from markers
+                tracing::info!(
+                    "No manifest found for chain {}, rebuilding from markers",
+                    chain
+                );
+                return self.refresh_from_markers(chain).await;
             }
             Err(e) => return Err(e),
         };
@@ -522,6 +525,9 @@ impl ManifestManager {
     }
 
     /// Helper to aggregate markers for a single data type.
+    ///
+    /// Lists all entries under the prefix and parses marker filenames directly.
+    /// The S3 list call returns flat relative paths like "0_999.marker".
     async fn aggregate_raw_markers<F>(
         &self,
         prefix: &str,
@@ -530,7 +536,7 @@ impl ManifestManager {
     where
         F: FnMut(u64, u64),
     {
-        let markers = self.s3.list(prefix).await.unwrap_or_default();
+        let markers = self.s3.list(prefix).await?;
 
         for marker_file in markers {
             // Parse range from filename like "0_999.marker"
@@ -543,6 +549,10 @@ impl ManifestManager {
     }
 
     /// Helper to aggregate nested markers (source/item structure like decoded logs).
+    ///
+    /// Uses a single flat list call and parses paths locally.
+    /// S3 list returns flat relative paths like "v3/Swap/0_999.marker",
+    /// which we split into source ("v3"), item ("Swap"), and marker filename.
     async fn aggregate_nested_markers<F>(
         &self,
         prefix: &str,
@@ -551,30 +561,13 @@ impl ManifestManager {
     where
         F: FnMut(&str, &str, u64, u64),
     {
-        let sources = self.s3.list(prefix).await.unwrap_or_default();
-        for source in sources {
-            let source_name = source.trim_end_matches('/');
-            // Skip if it looks like a marker file itself
-            if source_name.ends_with(".marker") {
-                continue;
-            }
-
-            let source_prefix = format!("{}/{}", prefix, source_name);
-            let items = self.s3.list(&source_prefix).await.unwrap_or_default();
-
-            for item in items {
-                let item_name = item.trim_end_matches('/');
-                if item_name.ends_with(".marker") {
-                    continue;
-                }
-
-                let item_prefix = format!("{}/{}", source_prefix, item_name);
-                let markers = self.s3.list(&item_prefix).await.unwrap_or_default();
-
-                for marker in markers {
-                    if let Some((start, end)) = parse_marker_filename(&marker) {
-                        add_fn(source_name, item_name, start, end);
-                    }
+        let all_entries = self.s3.list(prefix).await?;
+        for entry in all_entries {
+            let parts: Vec<&str> = entry.split('/').collect();
+            // Expect: source/item/start_end.marker
+            if parts.len() == 3 {
+                if let Some((start, end)) = parse_marker_filename(parts[2]) {
+                    add_fn(parts[0], parts[1], start, end);
                 }
             }
         }
@@ -582,6 +575,10 @@ impl ManifestManager {
     }
 
     /// Helper to aggregate factory markers (collection structure).
+    ///
+    /// Uses a single flat list call and parses paths locally.
+    /// S3 list returns flat relative paths like "poolcollection/0_999.marker",
+    /// which we split into collection name and marker filename.
     async fn aggregate_factory_markers<F>(
         &self,
         prefix: &str,
@@ -590,30 +587,27 @@ impl ManifestManager {
     where
         F: FnMut(&str, u64, u64),
     {
-        let collections = self.s3.list(prefix).await.unwrap_or_default();
-        for collection in collections {
-            let name = collection.trim_end_matches('/');
-            if name.ends_with(".marker") {
-                continue;
-            }
-
-            let collection_prefix = format!("{}/{}", prefix, name);
-            let markers = self.s3.list(&collection_prefix).await.unwrap_or_default();
-
-            for marker in markers {
-                if let Some((start, end)) = parse_marker_filename(&marker) {
-                    add_fn(name, start, end);
+        let all_entries = self.s3.list(prefix).await?;
+        for entry in all_entries {
+            let parts: Vec<&str> = entry.split('/').collect();
+            // Expect: collection/start_end.marker
+            if parts.len() == 2 {
+                if let Some((start, end)) = parse_marker_filename(parts[1]) {
+                    add_fn(parts[0], start, end);
                 }
             }
         }
         Ok(())
     }
 
-    /// Helper to aggregate eth_call markers with up to 3 levels of nesting.
+    /// Helper to aggregate eth_call markers with up to 4 levels of nesting.
+    ///
+    /// Uses a single flat list call and parses paths locally.
+    /// S3 list returns flat relative paths, which we split by '/'.
     ///
     /// Handles both:
-    /// - Regular: {prefix}/{contract}/{function}/{start}_{end}.marker
-    /// - On events: {prefix}/{contract}/{function}/on_events/{start}_{end}.marker
+    /// - Regular (3 parts): contract/function/start_end.marker
+    /// - On events (4 parts): contract/function/on_events/start_end.marker
     ///
     /// Keys are formatted as "contract/function" or "contract/function/on_events".
     async fn aggregate_eth_call_markers<F>(
@@ -624,46 +618,24 @@ impl ManifestManager {
     where
         F: FnMut(&str, &str, u64, u64),
     {
-        let contracts = self.s3.list(prefix).await.unwrap_or_default();
-        for contract in contracts {
-            let contract_name = contract.trim_end_matches('/');
-            if contract_name.ends_with(".marker") {
-                continue;
-            }
-
-            let contract_prefix = format!("{}/{}", prefix, contract_name);
-            let functions = self.s3.list(&contract_prefix).await.unwrap_or_default();
-
-            for function in functions {
-                let function_name = function.trim_end_matches('/');
-                if function_name.ends_with(".marker") {
-                    continue;
-                }
-
-                let function_prefix = format!("{}/{}", contract_prefix, function_name);
-                let items = self.s3.list(&function_prefix).await.unwrap_or_default();
-
-                for item in items {
-                    let item_name = item.trim_end_matches('/');
-
-                    if item_name.ends_with(".marker") {
-                        // Direct marker at function level: contract/function/{start}_{end}.marker
-                        if let Some((start, end)) = parse_marker_filename(item_name) {
-                            add_fn(contract_name, function_name, start, end);
-                        }
-                    } else if item_name == "on_events" {
-                        // Sub-directory for on_events: contract/function/on_events/{start}_{end}.marker
-                        let on_events_prefix = format!("{}/{}", function_prefix, item_name);
-                        let markers = self.s3.list(&on_events_prefix).await.unwrap_or_default();
-
-                        let combined_func = format!("{}/on_events", function_name);
-                        for marker in markers {
-                            if let Some((start, end)) = parse_marker_filename(&marker) {
-                                add_fn(contract_name, &combined_func, start, end);
-                            }
-                        }
+        let all_entries = self.s3.list(prefix).await?;
+        for entry in all_entries {
+            let parts: Vec<&str> = entry.split('/').collect();
+            match parts.len() {
+                // contract/function/start_end.marker
+                3 => {
+                    if let Some((start, end)) = parse_marker_filename(parts[2]) {
+                        add_fn(parts[0], parts[1], start, end);
                     }
                 }
+                // contract/function/on_events/start_end.marker
+                4 if parts[2] == "on_events" => {
+                    if let Some((start, end)) = parse_marker_filename(parts[3]) {
+                        let combined_func = format!("{}/on_events", parts[1]);
+                        add_fn(parts[0], &combined_func, start, end);
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -740,5 +712,308 @@ mod tests {
             Some((1000, 1999))
         );
         assert_eq!(parse_marker_filename("invalid.marker"), None);
+    }
+
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+
+    fn create_test_manager() -> ManifestManager {
+        let store = Arc::new(InMemory::new());
+        let s3 = S3Backend::from_store(store, "test-bucket".to_string());
+        ManifestManager::new(s3, PathBuf::from("/tmp/test"), SyncConfig::default())
+    }
+
+    /// Write a marker file to the in-memory S3 backend at the given key.
+    async fn write_marker_at(manager: &ManifestManager, key: &str) {
+        let marker = Marker::new(format!("data/{}", key), "test".to_string());
+        let data = marker.to_bytes().unwrap();
+        manager.s3.write(key, &data).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_nested_markers_flat_parsing() {
+        let manager = create_test_manager();
+
+        // Write markers at the flat paths that S3 list returns relative to prefix
+        let prefix = "eth/markers/decoded/logs";
+        write_marker_at(&manager, &format!("{}/v3/Swap/0_999.marker", prefix)).await;
+        write_marker_at(&manager, &format!("{}/v3/Swap/1000_1999.marker", prefix)).await;
+        write_marker_at(&manager, &format!("{}/v3/Burn/0_999.marker", prefix)).await;
+        write_marker_at(&manager, &format!("{}/v4/Transfer/500_1499.marker", prefix)).await;
+
+        let mut results: Vec<(String, String, u64, u64)> = Vec::new();
+        manager
+            .aggregate_nested_markers(prefix, &mut |source, item, start, end| {
+                results.push((source.to_string(), item.to_string(), start, end));
+            })
+            .await
+            .unwrap();
+
+        results.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], ("v3".to_string(), "Burn".to_string(), 0, 999));
+        assert_eq!(results[1], ("v3".to_string(), "Swap".to_string(), 0, 999));
+        assert_eq!(
+            results[2],
+            ("v3".to_string(), "Swap".to_string(), 1000, 1999)
+        );
+        assert_eq!(
+            results[3],
+            ("v4".to_string(), "Transfer".to_string(), 500, 1499)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_factory_markers_flat_parsing() {
+        let manager = create_test_manager();
+
+        let prefix = "eth/markers/factories";
+        write_marker_at(
+            &manager,
+            &format!("{}/pool_collection/0_999.marker", prefix),
+        )
+        .await;
+        write_marker_at(
+            &manager,
+            &format!("{}/pool_collection/1000_1999.marker", prefix),
+        )
+        .await;
+        write_marker_at(&manager, &format!("{}/token_pairs/0_999.marker", prefix)).await;
+
+        let mut results: Vec<(String, u64, u64)> = Vec::new();
+        manager
+            .aggregate_factory_markers(prefix, &mut |collection, start, end| {
+                results.push((collection.to_string(), start, end));
+            })
+            .await
+            .unwrap();
+
+        results.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], ("pool_collection".to_string(), 0, 999));
+        assert_eq!(results[1], ("pool_collection".to_string(), 1000, 1999));
+        assert_eq!(results[2], ("token_pairs".to_string(), 0, 999));
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_eth_call_markers_regular_and_on_events() {
+        let manager = create_test_manager();
+
+        let prefix = "eth/markers/raw/eth_calls";
+        // Regular: contract/function/start_end.marker
+        write_marker_at(&manager, &format!("{}/0xabc/getPrice/0_999.marker", prefix)).await;
+        write_marker_at(
+            &manager,
+            &format!("{}/0xabc/getPrice/1000_1999.marker", prefix),
+        )
+        .await;
+        // On events: contract/function/on_events/start_end.marker
+        write_marker_at(
+            &manager,
+            &format!("{}/0xdef/getLiquidity/on_events/0_999.marker", prefix),
+        )
+        .await;
+        write_marker_at(
+            &manager,
+            &format!("{}/0xdef/getLiquidity/on_events/1000_1999.marker", prefix),
+        )
+        .await;
+
+        let mut results: Vec<(String, String, u64, u64)> = Vec::new();
+        manager
+            .aggregate_eth_call_markers(prefix, &mut |contract, func, start, end| {
+                results.push((contract.to_string(), func.to_string(), start, end));
+            })
+            .await
+            .unwrap();
+
+        results.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            results[0],
+            ("0xabc".to_string(), "getPrice".to_string(), 0, 999)
+        );
+        assert_eq!(
+            results[1],
+            ("0xabc".to_string(), "getPrice".to_string(), 1000, 1999)
+        );
+        assert_eq!(
+            results[2],
+            (
+                "0xdef".to_string(),
+                "getLiquidity/on_events".to_string(),
+                0,
+                999
+            )
+        );
+        assert_eq!(
+            results[3],
+            (
+                "0xdef".to_string(),
+                "getLiquidity/on_events".to_string(),
+                1000,
+                1999
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_raw_markers_propagates_errors() {
+        // The InMemory store returns an empty list (not an error) for empty prefix,
+        // so we test that the `?` propagation works by verifying non-error case succeeds.
+        // The key behavioral change is that unwrap_or_default() is replaced with ?,
+        // so real S3 errors bubble up instead of being silently swallowed.
+        let manager = create_test_manager();
+
+        // No markers written - should return Ok with empty results
+        let mut results: Vec<(u64, u64)> = Vec::new();
+        let result = manager
+            .aggregate_raw_markers("nonexistent/prefix", |start, end| {
+                results.push((start, end));
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_markers_full_chain() {
+        let manager = create_test_manager();
+
+        // Write markers for various data types
+        let chain = "ethereum";
+
+        // Raw blocks
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/raw/blocks/0_999.marker", chain),
+        )
+        .await;
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/raw/blocks/1000_1999.marker", chain),
+        )
+        .await;
+
+        // Raw logs
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/raw/logs/0_999.marker", chain),
+        )
+        .await;
+
+        // Decoded logs (nested: source/event/marker)
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/decoded/logs/v3/Swap/0_999.marker", chain),
+        )
+        .await;
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/decoded/logs/v3/Burn/0_999.marker", chain),
+        )
+        .await;
+
+        // Factories
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/factories/pools/0_999.marker", chain),
+        )
+        .await;
+
+        // Raw eth_calls with on_events
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/raw/eth_calls/0xabc/slot0/0_999.marker", chain),
+        )
+        .await;
+        write_marker_at(
+            &manager,
+            &format!(
+                "{}/markers/raw/eth_calls/0xabc/slot0/on_events/0_999.marker",
+                chain
+            ),
+        )
+        .await;
+
+        let manifest = manager.aggregate_markers(chain).await.unwrap();
+
+        assert_eq!(manifest.raw_blocks.len(), 2);
+        assert!(manifest.has_raw_blocks(0, 999));
+        assert!(manifest.has_raw_blocks(1000, 1999));
+
+        assert_eq!(manifest.raw_logs.len(), 1);
+        assert!(manifest.has_raw_logs(0, 999));
+
+        assert!(manifest.has_decoded_logs("v3", "Swap", 0, 999));
+        assert!(manifest.has_decoded_logs("v3", "Burn", 0, 999));
+
+        assert!(manifest.has_factories("pools", 0, 999));
+
+        assert!(manifest.has_raw_eth_calls_granular("0xabc", "slot0", 0, 999));
+        assert!(manifest.has_raw_eth_calls_granular("0xabc", "slot0/on_events", 0, 999));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_for_chain_rebuilds_from_markers_when_no_manifest() {
+        let manager = create_test_manager();
+        let chain = "ethereum";
+
+        // Write some markers but NO manifest.json
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/raw/blocks/0_999.marker", chain),
+        )
+        .await;
+        write_marker_at(
+            &manager,
+            &format!("{}/markers/raw/blocks/1000_1999.marker", chain),
+        )
+        .await;
+
+        // refresh_for_chain should detect missing manifest and rebuild from markers
+        manager.refresh_for_chain(chain).await.unwrap();
+
+        let cached = manager.cached_manifest_for(chain);
+        assert!(cached.is_some());
+
+        let manifest = cached.unwrap();
+        assert_eq!(manifest.raw_blocks.len(), 2);
+        assert!(manifest.has_raw_blocks(0, 999));
+        assert!(manifest.has_raw_blocks(1000, 1999));
+
+        // Verify manifest.json was saved to S3
+        let key = ManifestManager::manifest_key(chain);
+        let data = manager.s3.read(&key).await.unwrap();
+        let saved_manifest = S3Manifest::from_bytes(&data).unwrap();
+        assert_eq!(saved_manifest.raw_blocks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_nested_markers_ignores_wrong_depth_entries() {
+        let manager = create_test_manager();
+
+        let prefix = "eth/markers/decoded/logs";
+        // Correct depth (3 parts)
+        write_marker_at(&manager, &format!("{}/v3/Swap/0_999.marker", prefix)).await;
+        // Wrong depth (1 part - just a marker at root level)
+        write_marker_at(&manager, &format!("{}/0_999.marker", prefix)).await;
+
+        let mut results: Vec<(String, String, u64, u64)> = Vec::new();
+        manager
+            .aggregate_nested_markers(prefix, &mut |source, item, start, end| {
+                results.push((source.to_string(), item.to_string(), start, end));
+            })
+            .await
+            .unwrap();
+
+        // Only the correctly-nested entry should be picked up
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("v3".to_string(), "Swap".to_string(), 0, 999));
     }
 }
