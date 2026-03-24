@@ -138,7 +138,7 @@ impl StorageManager {
                     s3_backend,
                     cache_config,
                     local_base.clone(),
-                    retry_queue,
+                    retry_queue.clone(),
                 )
                 .await?;
 
@@ -147,6 +147,12 @@ impl StorageManager {
                     local_base.clone(),
                     sync_config,
                 ));
+
+                // Give the retry queue access to the manifest manager so it can
+                // write markers after successful retry uploads.
+                if let Some(ref rq) = retry_queue {
+                    rq.set_manifest_manager(manifest_manager.clone());
+                }
 
                 tracing::info!("Storage initialized with S3 backend");
 
