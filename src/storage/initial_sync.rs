@@ -251,6 +251,8 @@ impl InitialSyncService {
 /// - "ethereum/historical/raw/blocks/blocks_0_999.parquet" -> ("ethereum", "raw/blocks", 0, 999)
 /// - "raw/ethereum/blocks/0_999.parquet" -> ("ethereum", "raw/blocks", 0, 999)
 /// - "ethereum/historical/decoded/logs/v3/Swap/0_999.parquet" -> ("ethereum", "decoded/logs/v3/Swap", 0, 999)
+/// - "ethereum/historical/raw/eth_calls/Pool/slot0/blocks_0-999.parquet" -> ("ethereum", "raw/eth_calls/Pool/slot0", 0, 999)
+/// - "ethereum/historical/decoded/eth_calls/Pool/slot0/0_999.parquet" -> ("ethereum", "decoded/eth_calls/Pool/slot0", 0, 999)
 fn parse_parquet_key(key: &str) -> Option<(String, String, u64, u64)> {
     let key = key.trim_end_matches(".parquet");
     let parts: Vec<&str> = key.split('/').collect();
@@ -268,15 +270,13 @@ fn parse_parquet_key(key: &str) -> Option<(String, String, u64, u64)> {
         // Format: {chain}/historical/{category}/{type}/...
         // e.g., "ethereum/historical/raw/blocks/blocks_0_999"
         let chain = parts[0].to_string();
-        let category = parts[2]; // "raw", "decoded", "factories"
-
-        if category == "decoded" && parts.len() >= 6 {
-            // decoded/logs/{source}/{event}/...
+        if parts.len() >= 5 {
+            // Join all path segments between "historical" and the filename.
+            // This preserves full granularity for deeply nested paths like:
+            //   raw/eth_calls/Pool/slot0  (from raw/eth_calls/Pool/slot0/blocks_0-999)
+            //   decoded/logs/v3/Swap      (from decoded/logs/v3/Swap/0_999)
+            //   raw/blocks                (from raw/blocks/blocks_0_999)
             let data_type = parts[2..parts.len() - 1].join("/");
-            return Some((chain, data_type, start, end));
-        } else if parts.len() >= 5 {
-            // raw/{type}/...
-            let data_type = format!("{}/{}", category, parts[3]);
             return Some((chain, data_type, start, end));
         }
     } else if parts[0] == "raw" || parts[0] == "derived" {
@@ -306,7 +306,7 @@ fn parse_range_from_filename(filename: &str) -> Option<(u64, u64)> {
     }
 
     // Try hyphen-separated range: "logs_0-999"
-    if let Some(range_part) = filename.split('_').last() {
+    if let Some(range_part) = filename.split('_').next_back() {
         let range_parts: Vec<&str> = range_part.split('-').collect();
         if range_parts.len() == 2 {
             if let (Ok(start), Ok(end)) =
@@ -495,5 +495,82 @@ mod tests {
 
         // Bincode should NOT be in S3
         assert!(!s3.exists("chain/live/raw/blocks/12345.bin").await.unwrap());
+    }
+
+    #[test]
+    fn test_parse_parquet_key_raw_eth_calls_with_source_and_function() {
+        let result =
+            parse_parquet_key("ethereum/historical/raw/eth_calls/Pool/slot0/blocks_0-999.parquet");
+        assert_eq!(
+            result,
+            Some((
+                "ethereum".to_string(),
+                "raw/eth_calls/Pool/slot0".to_string(),
+                0,
+                999
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_parquet_key_raw_eth_calls_with_on_events() {
+        let result = parse_parquet_key(
+            "ethereum/historical/raw/eth_calls/Pool/slot0/on_events/blocks_0-999.parquet",
+        );
+        assert_eq!(
+            result,
+            Some((
+                "ethereum".to_string(),
+                "raw/eth_calls/Pool/slot0/on_events".to_string(),
+                0,
+                999
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_parquet_key_raw_eth_calls_once() {
+        let result = parse_parquet_key(
+            "ethereum/historical/raw/eth_calls/v3_pools/once/blocks_0-999.parquet",
+        );
+        assert_eq!(
+            result,
+            Some((
+                "ethereum".to_string(),
+                "raw/eth_calls/v3_pools/once".to_string(),
+                0,
+                999
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_parquet_key_decoded_eth_calls() {
+        let result =
+            parse_parquet_key("ethereum/historical/decoded/eth_calls/Pool/slot0/0_999.parquet");
+        assert_eq!(
+            result,
+            Some((
+                "ethereum".to_string(),
+                "decoded/eth_calls/Pool/slot0".to_string(),
+                0,
+                999
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_parquet_key_decoded_logs_deep() {
+        let result =
+            parse_parquet_key("ethereum/historical/decoded/logs/v3/Swap/blocks_0_999.parquet");
+        assert_eq!(
+            result,
+            Some((
+                "ethereum".to_string(),
+                "decoded/logs/v3/Swap".to_string(),
+                0,
+                999
+            ))
+        );
     }
 }
