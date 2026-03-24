@@ -375,7 +375,13 @@ impl StorageBackend for CachedBackend {
             if let Some(ref queue) = self.retry_queue {
                 tracing::warn!("S3 write failed for {}, queueing for retry: {}", key, e);
                 let local_path = self.local_base.join(key);
-                queue.enqueue(key.to_string(), local_path).await;
+                if let Err(enqueue_err) = queue.enqueue(key.to_string(), local_path).await {
+                    tracing::warn!(
+                        "Failed to persist retry queue after enqueueing {}: {}",
+                        key,
+                        enqueue_err
+                    );
+                }
                 // Return Ok - local succeeded, S3 will retry
             } else {
                 return Err(e);
