@@ -49,3 +49,4 @@ object_store = { version = "0.11", features = ["aws"] }
 
 # File locking
 fs2 = "0.4"
+tokio-util = { version = "0.7.18", features = ["rt"] }
