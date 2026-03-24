@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use rand::Rng;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -49,8 +50,16 @@ impl StorageBackend for LocalBackend {
             fs::create_dir_all(parent).await?;
         }
 
-        // Atomic write: write to temp file, then rename
-        let tmp_path = path.with_extension("tmp");
+        // Atomic write: write to uniquely-named temp file, then rename.
+        // A random suffix prevents races when multiple tasks write to the
+        // same key concurrently (deterministic ".tmp" would collide).
+        let random_suffix: u64 = rand::rng().random();
+        let tmp_name = format!(
+            "{}.{:x}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            random_suffix
+        );
+        let tmp_path = path.with_file_name(tmp_name);
         let mut file = fs::File::create(&tmp_path).await?;
         file.write_all(data).await?;
         file.sync_all().await?;
@@ -80,8 +89,10 @@ impl StorageBackend for LocalBackend {
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
         let path = self.full_path(prefix);
 
-        if !path.exists() {
-            return Ok(Vec::new());
+        match fs::metadata(&path).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(StorageError::Io(e)),
         }
 
         let mut results = Vec::new();
@@ -188,5 +199,36 @@ mod tests {
 
         let result = backend.read("nonexistent.txt").await;
         assert!(matches!(result, Err(StorageError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_local_backend_concurrent_writes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = std::sync::Arc::new(LocalBackend::new(temp_dir.path().to_path_buf()));
+
+        // Spawn 10 concurrent writes to the same key, each with unique data
+        let mut handles = Vec::new();
+        for i in 0u8..10 {
+            let b = backend.clone();
+            handles.push(tokio::spawn(async move {
+                let data = vec![i; 1024]; // 1 KiB of repeated byte value
+                b.write("concurrent/target.parquet", &data).await.unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // The file must exist and contain exactly one writer's data
+        // (no corruption from interleaved writes).
+        let data = backend.read("concurrent/target.parquet").await.unwrap();
+        assert_eq!(data.len(), 1024);
+        // Every byte should be the same value (written atomically by one writer)
+        let first = data[0];
+        assert!(
+            data.iter().all(|&b| b == first),
+            "data is corrupted: not all bytes match"
+        );
     }
 }

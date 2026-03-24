@@ -7,6 +7,18 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
+// Range separator conventions
+// ---------------------------------------------------------------------------
+
+/// Separator used in parquet filenames (e.g., "blocks_0-999.parquet").
+#[allow(dead_code)]
+pub const PARQUET_RANGE_SEPARATOR: char = '-';
+
+/// Separator used in marker filenames (e.g., "0_999.marker").
+#[allow(dead_code)]
+pub const MARKER_RANGE_SEPARATOR: char = '_';
+
+// ---------------------------------------------------------------------------
 // Path builders
 // ---------------------------------------------------------------------------
 
@@ -219,16 +231,37 @@ mod tests {
     #[test]
     fn parse_range_invalid() {
         assert_eq!(parse_range_from_filename(Path::new("foo.parquet")), None);
-        assert_eq!(parse_range_from_filename(Path::new("blocks_abc.parquet")), None);
+        assert_eq!(
+            parse_range_from_filename(Path::new("blocks_abc.parquet")),
+            None
+        );
     }
 
     #[test]
     fn path_builders() {
-        assert_eq!(raw_blocks_dir("ethereum"), PathBuf::from("data/ethereum/historical/raw/blocks"));
-        assert_eq!(raw_receipts_dir("base"), PathBuf::from("data/base/historical/raw/receipts"));
-        assert_eq!(raw_logs_dir("base"), PathBuf::from("data/base/historical/raw/logs"));
-        assert_eq!(raw_eth_calls_dir("base"), PathBuf::from("data/base/historical/raw/eth_calls"));
-        assert_eq!(factories_dir("base"), PathBuf::from("data/base/historical/factories"));
-        assert_eq!(decoded_base_dir("base"), PathBuf::from("data/base/historical/decoded"));
+        assert_eq!(
+            raw_blocks_dir("ethereum"),
+            PathBuf::from("data/ethereum/historical/raw/blocks")
+        );
+        assert_eq!(
+            raw_receipts_dir("base"),
+            PathBuf::from("data/base/historical/raw/receipts")
+        );
+        assert_eq!(
+            raw_logs_dir("base"),
+            PathBuf::from("data/base/historical/raw/logs")
+        );
+        assert_eq!(
+            raw_eth_calls_dir("base"),
+            PathBuf::from("data/base/historical/raw/eth_calls")
+        );
+        assert_eq!(
+            factories_dir("base"),
+            PathBuf::from("data/base/historical/factories")
+        );
+        assert_eq!(
+            decoded_base_dir("base"),
+            PathBuf::from("data/base/historical/decoded")
+        );
     }
 }

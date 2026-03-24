@@ -93,6 +93,8 @@ pub trait StorageBackend: Send + Sync {
 pub struct StorageManager {
     /// The active storage backend (local-only or cached with S3)
     backend: Arc<dyn StorageBackend>,
+    /// Direct S3 backend for upload operations that bypass the cache layer
+    s3_backend: Option<S3Backend>,
     /// Manifest manager for S3 coordination (None if local-only)
     manifest_manager: Option<Arc<ManifestManager>>,
     /// Base path for local storage
@@ -127,6 +129,10 @@ impl StorageManager {
                     .cloned()
                     .unwrap_or_default();
 
+                // Clone S3 backend before moving into CachedBackend so we can
+                // keep a direct reference for upload operations that skip the cache.
+                let direct_s3 = s3_backend.clone();
+
                 let cached_backend = CachedBackend::new(
                     local_backend,
                     s3_backend,
@@ -146,6 +152,7 @@ impl StorageManager {
 
                 Ok(Self {
                     backend: Arc::new(cached_backend),
+                    s3_backend: Some(direct_s3),
                     manifest_manager: Some(manifest_manager),
                     local_base,
                     s3_enabled: true,
@@ -159,6 +166,7 @@ impl StorageManager {
 
                 Ok(Self {
                     backend: Arc::new(local_backend),
+                    s3_backend: None,
                     manifest_manager: None,
                     local_base,
                     s3_enabled: false,
@@ -170,6 +178,14 @@ impl StorageManager {
     /// Get the storage backend.
     pub fn backend(&self) -> Arc<dyn StorageBackend> {
         self.backend.clone()
+    }
+
+    /// Get the direct S3 backend (if S3 is enabled).
+    ///
+    /// This bypasses the cache layer and is intended for upload operations
+    /// where the file already exists locally (avoiding redundant local writes).
+    pub fn s3_backend(&self) -> Option<&S3Backend> {
+        self.s3_backend.as_ref()
     }
 
     /// Get the manifest manager (if S3 is enabled).
