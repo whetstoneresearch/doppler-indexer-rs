@@ -45,9 +45,13 @@ impl DataLoader {
     /// Returns Ok(true) if file exists (locally or downloaded).
     /// Returns Ok(false) if file doesn't exist anywhere.
     pub async fn ensure_local(&self, local_path: &Path) -> Result<bool, StorageError> {
-        // Check local first
-        if local_path.exists() {
-            return Ok(true);
+        // Check local first (async to avoid blocking the executor)
+        match tokio::fs::metadata(local_path).await {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Not found locally, continue to S3 download path
+            }
+            Err(e) => return Err(StorageError::Io(e)),
         }
 
         // Try S3 if available
