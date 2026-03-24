@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use super::manifest::ManifestManager;
 use super::s3::S3Backend;
 use super::{StorageBackend, StorageError};
 use crate::types::config::storage::SyncConfig;
@@ -28,6 +29,18 @@ pub struct PendingUpload {
     pub queued_at: u64,
     /// Unix timestamp of when to next attempt
     pub next_attempt_at: u64,
+    /// Chain identifier for marker writing after successful retry
+    #[serde(default)]
+    pub chain: Option<String>,
+    /// Data type identifier for marker writing after successful retry
+    #[serde(default)]
+    pub data_type: Option<String>,
+    /// Block range start for marker writing after successful retry
+    #[serde(default)]
+    pub start: Option<u64>,
+    /// Block range end for marker writing after successful retry
+    #[serde(default)]
+    pub end: Option<u64>,
 }
 
 impl PendingUpload {
@@ -44,6 +57,10 @@ impl PendingUpload {
             attempts: 0,
             queued_at: now,
             next_attempt_at: now,
+            chain: None,
+            data_type: None,
+            start: None,
+            end: None,
         }
     }
 
@@ -84,6 +101,8 @@ pub struct RetryQueue {
     config: SyncConfig,
     /// S3 backend for retries
     s3: S3Backend,
+    /// Manifest manager for writing markers after successful retry uploads
+    manifest_manager: std::sync::RwLock<Option<Arc<ManifestManager>>>,
 }
 
 #[allow(dead_code)]
@@ -97,6 +116,7 @@ impl RetryQueue {
             persistence_path,
             config,
             s3,
+            manifest_manager: std::sync::RwLock::new(None),
         }
     }
 
@@ -136,13 +156,52 @@ impl RetryQueue {
         Ok(())
     }
 
-    /// Add a failed upload to the queue.
-    pub async fn enqueue(&self, key: String, local_path: PathBuf) {
-        let mut queue = self.queue.write().await;
-        let pending = PendingUpload::new(key, local_path);
-        queue.push_back(pending);
+    /// Set the manifest manager for writing markers after successful retries.
+    ///
+    /// This is called after construction because the ManifestManager is created
+    /// after the RetryQueue in StorageManager::new().
+    pub fn set_manifest_manager(&self, mm: Arc<ManifestManager>) {
+        let mut guard = self.manifest_manager.write().unwrap();
+        *guard = Some(mm);
+    }
 
-        tracing::warn!("Queued upload for retry: {} items in queue", queue.len());
+    /// Add a failed upload to the queue and persist immediately for crash safety.
+    pub async fn enqueue(&self, key: String, local_path: PathBuf) -> Result<(), StorageError> {
+        {
+            let mut queue = self.queue.write().await;
+            let pending = PendingUpload::new(key, local_path);
+            queue.push_back(pending);
+            tracing::warn!("Queued upload for retry: {} items in queue", queue.len());
+        }
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Add a failed upload with marker metadata so a marker is written after successful retry.
+    pub async fn enqueue_with_marker(
+        &self,
+        key: String,
+        local_path: PathBuf,
+        chain: String,
+        data_type: String,
+        start: u64,
+        end: u64,
+    ) -> Result<(), StorageError> {
+        {
+            let mut queue = self.queue.write().await;
+            let mut pending = PendingUpload::new(key, local_path);
+            pending.chain = Some(chain);
+            pending.data_type = Some(data_type);
+            pending.start = Some(start);
+            pending.end = Some(end);
+            queue.push_back(pending);
+            tracing::warn!(
+                "Queued upload for retry (with marker): {} items in queue",
+                queue.len()
+            );
+        }
+        self.save().await?;
+        Ok(())
     }
 
     /// Get the number of pending uploads.
@@ -195,6 +254,28 @@ impl RetryQueue {
                         pending.key,
                         pending.attempts + 1
                     );
+
+                    // Write marker if metadata is available
+                    let mm = self.manifest_manager.read().unwrap().clone();
+                    if let (Some(ref mm), Some(ref chain), Some(ref dt), Some(start), Some(end)) = (
+                        &mm,
+                        &pending.chain,
+                        &pending.data_type,
+                        pending.start,
+                        pending.end,
+                    ) {
+                        if let Err(e) = mm
+                            .write_marker(chain, dt, start, end, &pending.key, "retry")
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to write marker after retry upload for {}: {}",
+                                pending.key,
+                                e
+                            );
+                        }
+                    }
+
                     successful += 1;
                 }
                 Err(e) => {
@@ -290,5 +371,114 @@ mod tests {
             .as_secs()
             + 1000;
         assert!(!pending.is_due());
+    }
+
+    #[test]
+    fn test_pending_upload_with_marker_fields_serialization() {
+        let mut pending = PendingUpload::new(
+            "eth/historical/raw/blocks/blocks_0-999.parquet".to_string(),
+            PathBuf::from("/tmp/blocks.parquet"),
+        );
+        pending.chain = Some("ethereum".to_string());
+        pending.data_type = Some("raw/blocks".to_string());
+        pending.start = Some(0);
+        pending.end = Some(999);
+
+        let json = serde_json::to_string(&pending).unwrap();
+        let deserialized: PendingUpload = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.chain.as_deref(), Some("ethereum"));
+        assert_eq!(deserialized.data_type.as_deref(), Some("raw/blocks"));
+        assert_eq!(deserialized.start, Some(0));
+        assert_eq!(deserialized.end, Some(999));
+        assert_eq!(deserialized.key, pending.key);
+    }
+
+    #[test]
+    fn test_pending_upload_without_marker_fields_backwards_compat() {
+        // Simulate an old-format JSON without the marker fields
+        let old_json = r#"{
+            "key": "test/file.parquet",
+            "local_path": "/tmp/test",
+            "attempts": 2,
+            "queued_at": 1000000,
+            "next_attempt_at": 1000060
+        }"#;
+
+        let deserialized: PendingUpload = serde_json::from_str(old_json).unwrap();
+
+        assert_eq!(deserialized.key, "test/file.parquet");
+        assert_eq!(deserialized.attempts, 2);
+        assert!(deserialized.chain.is_none());
+        assert!(deserialized.data_type.is_none());
+        assert!(deserialized.start.is_none());
+        assert!(deserialized.end.is_none());
+    }
+
+    fn create_test_retry_queue(base_path: PathBuf) -> RetryQueue {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let s3 = S3Backend::from_store(store, "test-bucket".to_string());
+        let config = SyncConfig::default();
+        RetryQueue::new(base_path, config, s3)
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_persists_to_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        // Create a dummy local file for the pending upload to reference
+        let local_file = base_path.join("test_file.parquet");
+        tokio::fs::write(&local_file, b"test data").await.unwrap();
+
+        // Enqueue an item
+        let queue = create_test_retry_queue(base_path.clone());
+        queue
+            .enqueue("test/key.parquet".to_string(), local_file.clone())
+            .await
+            .unwrap();
+
+        // Verify the persistence file was written
+        let persistence_path = base_path.join(".upload_queue.json");
+        assert!(persistence_path.exists());
+
+        // Create a new RetryQueue and load from disk
+        let queue2 = create_test_retry_queue(base_path);
+        queue2.load().await.unwrap();
+        assert_eq!(queue2.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_with_marker_persists_to_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        let local_file = base_path.join("test_file.parquet");
+        tokio::fs::write(&local_file, b"test data").await.unwrap();
+
+        let queue = create_test_retry_queue(base_path.clone());
+        queue
+            .enqueue_with_marker(
+                "eth/raw/blocks/blocks_0-999.parquet".to_string(),
+                local_file,
+                "ethereum".to_string(),
+                "raw/blocks".to_string(),
+                0,
+                999,
+            )
+            .await
+            .unwrap();
+
+        // Load into a fresh queue and verify marker fields survived
+        let queue2 = create_test_retry_queue(base_path);
+        queue2.load().await.unwrap();
+        assert_eq!(queue2.len().await, 1);
+
+        let items = queue2.queue.read().await;
+        let item = items.front().unwrap();
+        assert_eq!(item.chain.as_deref(), Some("ethereum"));
+        assert_eq!(item.data_type.as_deref(), Some("raw/blocks"));
+        assert_eq!(item.start, Some(0));
+        assert_eq!(item.end, Some(999));
     }
 }

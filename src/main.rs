@@ -19,6 +19,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
@@ -164,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
 
     let storage_manager = Arc::new(storage_manager);
 
+    // Create a cancellation token for graceful shutdown of background S3 tasks
+    let shutdown_token = CancellationToken::new();
+
     // Start periodic manifest refresh and other S3 services if enabled
     if storage_manager.is_s3_enabled() {
         // Periodic manifest refresh task
@@ -175,14 +179,22 @@ async fn main() -> anyhow::Result<()> {
             .map(|s| s.manifest_refresh_secs)
             .unwrap_or(60);
 
+        let token = shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
             loop {
-                interval.tick().await;
-                if let Err(e) = sm.refresh_manifest().await {
-                    tracing::warn!("Periodic manifest refresh failed: {}", e);
-                } else {
-                    tracing::debug!("Periodic manifest refresh completed");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = sm.refresh_manifest().await {
+                            tracing::warn!("Periodic manifest refresh failed: {}", e);
+                        } else {
+                            tracing::debug!("Periodic manifest refresh completed");
+                        }
+                    }
+                    _ = token.cancelled() => {
+                        tracing::info!("Manifest refresh task shutting down");
+                        break;
+                    }
                 }
             }
         });
@@ -198,8 +210,14 @@ async fn main() -> anyhow::Result<()> {
         // Spawn retry queue background task
         if let Some(queue) = retry_queue {
             let queue_handle = queue.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let token = shutdown_token.clone();
+            // Bridge cancellation token to oneshot for RetryQueue::run()
             tokio::spawn(async move {
-                let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                token.cancelled().await;
+                let _ = tx.send(());
+            });
+            tokio::spawn(async move {
                 queue_handle.run(rx).await;
             });
             tracing::info!("Retry queue service started");
@@ -232,8 +250,14 @@ async fn main() -> anyhow::Result<()> {
                 manifest_manager,
             ));
 
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let token = shutdown_token.clone();
+            // Bridge cancellation token to oneshot for InitialSyncService::run()
             tokio::spawn(async move {
-                let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+                token.cancelled().await;
+                let _ = tx.send(());
+            });
+            tokio::spawn(async move {
                 if let Err(e) = initial_sync.run(rx).await {
                     tracing::error!("Initial S3 sync failed: {}", e);
                 }
@@ -251,6 +275,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Running in catch-up-only mode (fills gaps in existing data, no live mode)");
     }
 
+    // Spawn a signal handler to trigger graceful shutdown of background S3 tasks
+    let shutdown_token_signal = shutdown_token.clone();
+    tokio::spawn(async move {
+        if let Ok(()) = tokio::signal::ctrl_c().await {
+            tracing::info!("Received shutdown signal, cancelling background tasks...");
+            shutdown_token_signal.cancel();
+        }
+    });
+
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
     for chain in &config.chains {
@@ -262,6 +295,11 @@ async fn main() -> anyhow::Result<()> {
             process_chain(&config, chain, storage_manager.clone(), catch_up_only).await?;
         }
     }
+
+    // Signal all background tasks to shut down
+    shutdown_token.cancel();
+    // Give them a moment to flush state
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     tracing::info!("All chains processed successfully");
     Ok(())
@@ -742,7 +780,10 @@ impl FullPipelineContext {
                 let (chain, cfg) = (chain.clone(), cfg.clone());
                 async move {
                     raw_data::historical::catchup::logs::collect_logs(
-                        &chain, &cfg, s3_manifest, Some(sm),
+                        &chain,
+                        &cfg,
+                        s3_manifest,
+                        Some(sm),
                     )
                     .await
                     .context("log catchup failed")
@@ -1292,8 +1333,7 @@ async fn process_chain(
         tracing::info!("Historical processing complete, transitioning to live mode");
 
         // Create HTTP client for live mode - shares rate limiter
-        let http_client_for_live =
-            Arc::new(pipeline.runtime.build_additional_client()?);
+        let http_client_for_live = Arc::new(pipeline.runtime.build_additional_client()?);
 
         spawn_live_mode(
             pipeline.runtime.chain.clone(),
