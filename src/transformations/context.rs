@@ -521,7 +521,7 @@ impl TransformationContext {
     pub fn get_contract_start_block(&self, name: &str) -> Option<u64> {
         self.contracts
             .get(name)
-            .and_then(|c| c.start_block.map(|u| u.to::<u64>()))
+            .and_then(|c| c.start_block.map(|u| u.try_into().unwrap_or(u64::MAX)))
     }
 
     /// Look up a contract name by its address.

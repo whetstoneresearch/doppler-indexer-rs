@@ -1,9 +1,12 @@
 //! Catchup phase for log decoding - processes existing raw log parquet files.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt32Array, UInt64Array};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -13,7 +16,7 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::factory_data::load_factory_addresses_by_range;
-use crate::storage::parquet_readers::read_raw_logs_from_parquet;
+use crate::storage::parquet_readers::{read_factory_addresses_from_parquet, read_raw_logs_from_parquet};
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
