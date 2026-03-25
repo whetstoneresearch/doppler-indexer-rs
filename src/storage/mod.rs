@@ -48,6 +48,7 @@ pub use error::StorageError;
 pub use initial_sync::InitialSyncService;
 pub use local::LocalBackend;
 pub use manifest::{ManifestManager, S3Manifest};
+pub use paths::BlockRange;
 pub use retry::RetryQueue;
 pub use s3::S3Backend;
 pub use upload::upload_parquet_to_s3;

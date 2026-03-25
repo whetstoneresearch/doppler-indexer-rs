@@ -135,12 +135,9 @@ impl TransformationEngine {
         expect_eth_call_completion: bool,
     ) -> Result<Self, TransformationError> {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
-        let decoded_logs_dir =
-            PathBuf::from(format!("data/{}/historical/decoded/logs", chain_name));
-        let decoded_calls_dir =
-            PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain_name));
-        let raw_receipts_dir =
-            PathBuf::from(format!("data/{}/historical/raw/receipts", chain_name));
+        let decoded_logs_dir = crate::storage::paths::decoded_logs_dir(&chain_name);
+        let decoded_calls_dir = crate::storage::paths::decoded_eth_calls_dir(&chain_name);
+        let raw_receipts_dir = crate::storage::paths::raw_receipts_dir(&chain_name);
 
         let contracts = Arc::new(contracts);
         let factory_collections = Arc::new(factory_collections);

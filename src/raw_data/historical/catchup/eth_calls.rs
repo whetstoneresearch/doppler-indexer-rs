@@ -204,7 +204,7 @@ pub async fn collect_eth_calls(
                         "{}/{}/{}",
                         config.contract_name,
                         config.function_name,
-                        range.file_name()
+                        range.file_name("")
                     );
                     existing_files.contains(&rel_path)
                 });
@@ -216,7 +216,7 @@ pub async fn collect_eth_calls(
                         "{}_pool/{}/{}",
                         config.token_name,
                         config.function_name,
-                        range.file_name()
+                        range.file_name("")
                     );
                     existing_files.contains(&rel_path)
                 });
@@ -232,7 +232,7 @@ pub async fn collect_eth_calls(
                         }
                     }
 
-                    let rel_path = format!("{}/once/{}", contract_name, range.file_name());
+                    let rel_path = format!("{}/once/{}", contract_name, range.file_name(""));
                     let expected: HashSet<&str> = configs
                         .iter()
                         .map(|c| c.function_name.as_str())
@@ -251,7 +251,7 @@ pub async fn collect_eth_calls(
 
                     // Use pre-loaded index (which was built from parquet schemas if index file didn't exist)
                     let index = once_column_indexes.get(contract_name).unwrap();
-                    match index.get(&range.file_name()) {
+                    match index.get(&range.file_name("")) {
                         Some(cols) => {
                             let missing: Vec<_> = expected
                                 .iter()
@@ -260,7 +260,7 @@ pub async fn collect_eth_calls(
                             if !missing.is_empty() {
                                 tracing::info!(
                                     "Once file {} for {} exists but missing columns: {:?} (has: {:?})",
-                                    range.file_name(),
+                                    range.file_name(""),
                                     contract_name,
                                     missing,
                                     cols
@@ -269,7 +269,7 @@ pub async fn collect_eth_calls(
                             } else {
                                 tracing::debug!(
                                     "Once file {} for {} complete with all {} columns",
-                                    range.file_name(),
+                                    range.file_name(""),
                                     contract_name,
                                     cols.len()
                                 );
@@ -280,7 +280,7 @@ pub async fn collect_eth_calls(
                             // File exists but wasn't found by index builder - shouldn't happen but handle it
                             tracing::warn!(
                                 "Once file {} for {} exists but not in pre-built index, will collect",
-                                range.file_name(),
+                                range.file_name(""),
                                 contract_name
                             );
                             false
