@@ -8,9 +8,7 @@ use std::sync::Arc;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use arrow::array::{
-    ArrayRef, BinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array,
-};
+use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -18,23 +16,17 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use tokio::sync::mpsc::Sender;
 
+use super::config::compute_function_selector;
 use super::types::{
     EthCallCollectionError, EventCallKey, EventCallResult, EventTriggeredCallConfig,
 };
-use super::config::compute_function_selector;
-use super::{
-    BlockMulticall, EventCallMeta, MulticallSlotGeneric, execute_multicalls_generic,
-};
-use crate::decoding::{
-    DecoderMessage, EventCallResult as DecoderEventCallResult,
-};
+use super::{execute_multicalls_generic, BlockMulticall, EventCallMeta, MulticallSlotGeneric};
+use crate::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
 use crate::raw_data::historical::receipts::EventTriggerData;
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::{upload_parquet_to_s3, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::{
-    encode_call_with_params, EvmType, ParamConfig,
-};
+use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig};
 
 /// Build event-triggered call configs from contracts configuration
 /// Returns a map from (source_name, event_signature_hash) -> Vec<EventTriggeredCallConfig>

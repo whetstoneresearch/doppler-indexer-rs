@@ -80,8 +80,7 @@ impl LiveProcessingState {
             }
 
             // Remove pending event timestamps for this range
-            self
-                .pending_event_timestamps
+            self.pending_event_timestamps
                 .retain(|(rs, re, _), _| (*rs, *re) != range_key);
 
             // Remove pending events for this range from all handlers
@@ -121,8 +120,7 @@ impl LiveProcessingState {
         for pending in self.pending_events.values_mut() {
             pending.retain(|entry| (entry.range_start, entry.range_end) != range_key);
         }
-        self.pending_events
-            .retain(|_, entries| !entries.is_empty());
+        self.pending_events.retain(|_, entries| !entries.is_empty());
     }
 
     /// Check if a range is ready for finalization.
@@ -133,11 +131,7 @@ impl LiveProcessingState {
         expect_logs: bool,
         expect_eth_calls: bool,
     ) -> (bool, Vec<String>) {
-        let completion = self
-            .completion
-            .get(&range_key)
-            .copied()
-            .unwrap_or_default();
+        let completion = self.completion.get(&range_key).copied().unwrap_or_default();
 
         // Check for timed-out pending events
         let timeout = Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
@@ -148,9 +142,7 @@ impl LiveProcessingState {
             for pending in pending_list {
                 if (pending.range_start, pending.range_end) == range_key {
                     let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
-                    if let Some(&first_seen) =
-                        self.pending_event_timestamps.get(&timestamp_key)
-                    {
+                    if let Some(&first_seen) = self.pending_event_timestamps.get(&timestamp_key) {
                         if now.duration_since(first_seen) >= timeout {
                             tracing::error!(
                                 "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for={:?}. \

@@ -10,7 +10,6 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges, read_block_info_from_parquet,
 };
-use crate::storage::paths::raw_eth_calls_dir;
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, build_token_call_configs, event_output_exists,
@@ -25,6 +24,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::paths::raw_eth_calls_dir;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::AddressOrAddresses;
@@ -783,7 +783,10 @@ pub async fn collect_eth_calls(
         }
     }
 
-    tracing::info!("Eth_call collection catchup finished for chain {}", chain.name);
+    tracing::info!(
+        "Eth_call collection catchup finished for chain {}",
+        chain.name
+    );
 
     // Signal that all catchup phases are complete
     if let Some(tx) = eth_calls_catchup_done_tx {

@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::decoding::logs::{
     delete_decoded_logs_for_blocks, process_logs, process_logs_live, EventMatcher, LogDecodingError,
 };
 use crate::decoding::types::DecoderMessage;
 use crate::live::LiveStorage;
+use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::transformations::{DecodedEventsMessage, RangeCompleteMessage};
 
 /// Load accumulated factory addresses from both compacted parquet and uncompacted bincode files.

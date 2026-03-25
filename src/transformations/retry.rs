@@ -212,8 +212,7 @@ impl RetryProcessor {
             }
         }
 
-        let (regular_configs, once_configs, event_configs) =
-            build_decode_configs(&self.contracts);
+        let (regular_configs, once_configs, event_configs) = build_decode_configs(&self.contracts);
         let regular_map: HashMap<(String, String), CallDecodeConfig> = regular_configs
             .into_iter()
             .map(|config| {
@@ -304,8 +303,7 @@ impl RetryProcessor {
         }
 
         for source_name in once_sources {
-            let Ok(once_calls) = storage.read_decoded_once_calls(block_number, &source_name)
-            else {
+            let Ok(once_calls) = storage.read_decoded_once_calls(block_number, &source_name) else {
                 continue;
             };
 
@@ -346,10 +344,7 @@ impl RetryProcessor {
     ) -> Result<HashSet<String>, TransformationError> {
         let range_start = block_number;
         let range_end = block_number + 1;
-        let tx_addresses = Arc::new(read_live_receipt_addresses(
-            &self.chain_name,
-            block_number,
-        )?);
+        let tx_addresses = Arc::new(read_live_receipt_addresses(&self.chain_name, block_number)?);
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
         let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
         let mut blocked_handlers = HashSet::new();
@@ -437,8 +432,7 @@ impl RetryProcessor {
                 match handler.handle(&ctx).await {
                     Ok(ops) => {
                         if !ops.is_empty() {
-                            let ops =
-                                inject_source_version(ops, handler_name, handler_version);
+                            let ops = inject_source_version(ops, handler_name, handler_version);
                             execute_with_snapshot_capture(
                                 ops,
                                 &db_pool,
@@ -511,8 +505,7 @@ impl RetryProcessor {
                 match handler.handle(&ctx).await {
                     Ok(ops) => {
                         if !ops.is_empty() {
-                            let ops =
-                                inject_source_version(ops, handler_name, handler_version);
+                            let ops = inject_source_version(ops, handler_name, handler_version);
                             execute_with_snapshot_capture(
                                 ops,
                                 &db_pool,
@@ -920,8 +913,7 @@ mod tests {
         status.eth_calls_decoded = true;
         storage.write_status(100, &status).unwrap();
 
-        let registered_keys =
-            HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
+        let registered_keys = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
 
         // Phase 1: Retry runs — handler_a succeeds, handler_b fails
         let attempted = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);

@@ -537,11 +537,8 @@ impl TransformationEngine {
                         match handler.handle(&ctx).await {
                             Ok(ops) => {
                                 if !ops.is_empty() {
-                                    let ops = inject_source_version(
-                                        ops,
-                                        handler_name,
-                                        handler_version,
-                                    );
+                                    let ops =
+                                        inject_source_version(ops, handler_name, handler_version);
                                     db_pool.execute_transaction(ops).await?;
                                 }
                                 Ok(Some((handler_key, rs, re)))
@@ -703,11 +700,8 @@ impl TransformationEngine {
                         match handler.handle(&ctx).await {
                             Ok(ops) => {
                                 if !ops.is_empty() {
-                                    let ops = inject_source_version(
-                                        ops,
-                                        handler_name,
-                                        handler_version,
-                                    );
+                                    let ops =
+                                        inject_source_version(ops, handler_name, handler_version);
                                     db_pool.execute_transaction(ops).await?;
                                 }
                                 Ok(Some((handler_key, rs, re)))
@@ -975,10 +969,7 @@ impl TransformationEngine {
         let mut read_tasks = JoinSet::new();
 
         for (source_name, function_name) in call_triggers {
-            let base_dir = self
-                .decoded_calls_dir
-                .join(source_name)
-                .join(function_name);
+            let base_dir = self.decoded_calls_dir.join(source_name).join(function_name);
 
             // Check base path, then subdirectories (on_events/, once/)
             let file_path = [
@@ -1152,13 +1143,15 @@ impl TransformationEngine {
             );
         }
 
-        let filtered_events =
-            filter_events_by_start_block(&self.contracts, msg.events.clone());
+        let filtered_events = filter_events_by_start_block(&self.contracts, msg.events.clone());
         let events = Arc::new(filtered_events.clone());
 
         // Categorize handlers: ready to run vs needs buffering
         let range_key = (msg.range_start, msg.range_end);
-        let mut ready_handlers: Vec<(Arc<dyn super::traits::TransformationHandler>, Arc<Vec<DecodedCall>>)> = Vec::new();
+        let mut ready_handlers: Vec<(
+            Arc<dyn super::traits::TransformationHandler>,
+            Arc<Vec<DecodedCall>>,
+        )> = Vec::new();
         {
             let mut state = self.live_state.lock().await;
             for handler in &handlers {
@@ -1352,7 +1345,11 @@ impl TransformationEngine {
         &self,
         range_key: (u64, u64),
     ) -> Result<(), TransformationError> {
-        let ready_events: Vec<(String, PendingEventData, Arc<dyn super::traits::TransformationHandler>)> = {
+        let ready_events: Vec<(
+            String,
+            PendingEventData,
+            Arc<dyn super::traits::TransformationHandler>,
+        )> = {
             let mut state = self.live_state.lock().await;
             let mut ready = Vec::new();
 

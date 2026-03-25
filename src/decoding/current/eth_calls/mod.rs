@@ -246,12 +246,12 @@ mod tests {
     use super::decode_eth_calls_live;
     use crate::decoding::eth_calls::{CallDecodeConfig, EventCallDecodeConfig};
     use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
-    use alloy::primitives::U256;
     use crate::live::{LiveBlockStatus, LiveStorage, TransformRetryRequest};
-    use crate::types::decoded::DecodedValue;
     use crate::transformations::{DecodedCallsMessage, RangeCompleteKind, RangeCompleteMessage};
     use crate::types::config::eth_call::EvmType;
     use crate::types::config::raw_data::{FieldsConfig, RawDataCollectionConfig};
+    use crate::types::decoded::DecodedValue;
+    use alloy::primitives::U256;
 
     fn raw_data_config() -> RawDataCollectionConfig {
         RawDataCollectionConfig {

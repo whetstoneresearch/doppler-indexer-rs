@@ -25,12 +25,12 @@ use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
     RangeCompleteMessage,
 };
-use crate::types::decoded::DecodedValue;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
 };
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::decoded::DecodedValue;
 
 #[derive(Debug, Error)]
 pub enum LogDecodingError {

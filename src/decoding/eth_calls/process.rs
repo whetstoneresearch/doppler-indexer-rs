@@ -10,8 +10,8 @@ use super::column_index::{
 };
 use super::decode::decode_value;
 use super::parquet_io::{
-    merge_decoded_once_calls, write_decoded_calls_to_parquet,
-    write_decoded_event_calls_to_parquet, write_decoded_once_calls_to_parquet,
+    merge_decoded_once_calls, write_decoded_calls_to_parquet, write_decoded_event_calls_to_parquet,
+    write_decoded_once_calls_to_parquet,
 };
 use super::transform::{
     build_result_map_for_merge, convert_event_call_to_transform_call, convert_to_transform_call,
@@ -525,4 +525,3 @@ pub async fn process_event_calls(
 
     Ok(())
 }
-

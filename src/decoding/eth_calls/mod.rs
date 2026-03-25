@@ -22,9 +22,7 @@ use tokio::sync::oneshot;
 use super::catchup;
 use super::current;
 use crate::live::TransformRetryRequest;
-use crate::transformations::{
-    DecodedCallsMessage, RangeCompleteMessage,
-};
+use crate::transformations::{DecodedCallsMessage, RangeCompleteMessage};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 

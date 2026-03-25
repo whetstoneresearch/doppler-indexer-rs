@@ -19,9 +19,7 @@ pub fn build_result_map(
         }
         EvmType::NamedTuple(fields) => {
             if let DecodedValue::NamedTuple(named_values) = value {
-                for ((field_name, field_type), (_, val)) in
-                    fields.iter().zip(named_values.iter())
-                {
+                for ((field_name, field_type), (_, val)) in fields.iter().zip(named_values.iter()) {
                     insert_flattened(&mut result, field_name, field_type, val);
                 }
             }
@@ -61,8 +59,7 @@ fn insert_flattened(
 ) {
     match (field_type, value) {
         (EvmType::NamedTuple(fields), DecodedValue::NamedTuple(named_values)) => {
-            for ((child_name, child_type), (_, child_val)) in
-                fields.iter().zip(named_values.iter())
+            for ((child_name, child_type), (_, child_val)) in fields.iter().zip(named_values.iter())
             {
                 let key = format!("{}.{}", prefix, child_name);
                 insert_flattened(result, &key, child_type, child_val);
