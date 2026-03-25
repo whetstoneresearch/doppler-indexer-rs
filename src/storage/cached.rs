@@ -63,6 +63,8 @@ pub struct CachedBackend {
     total_size: Arc<AtomicU64>,
     /// Total size of pinned entries (tracked separately, never evicted)
     pinned_size: Arc<AtomicU64>,
+    /// Per-key size tracking for pinned entries (needed for delta computation on overwrite/delete)
+    pinned_entries: Arc<RwLock<HashMap<String, u64>>>,
     /// Retry queue for failed S3 uploads
     retry_queue: Option<Arc<RetryQueue>>,
     /// Lock to prevent concurrent eviction runs
@@ -89,6 +91,7 @@ impl CachedBackend {
             entries: Arc::new(RwLock::new(HashMap::new())),
             total_size: Arc::new(AtomicU64::new(0)),
             pinned_size: Arc::new(AtomicU64::new(0)),
+            pinned_entries: Arc::new(RwLock::new(HashMap::new())),
             retry_queue,
             eviction_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -121,8 +124,20 @@ impl CachedBackend {
     /// Non-pinned entries are tracked in the HashMap for LRU eviction.
     async fn record_entry(&self, key: &str, size: u64) {
         if self.is_pinned(key) {
-            // Pinned entries are not tracked in the index - just account for size
-            self.pinned_size.fetch_add(size, Ordering::Relaxed);
+            // Pinned entries are not tracked in the LRU index, but we track per-key
+            // sizes so we can compute deltas on overwrite and decrement on delete.
+            let mut pinned = self.pinned_entries.write().await;
+            if let Some(old_size) = pinned.insert(key.to_string(), size) {
+                if size >= old_size {
+                    self.pinned_size
+                        .fetch_add(size - old_size, Ordering::Relaxed);
+                } else {
+                    self.pinned_size
+                        .fetch_sub(old_size - size, Ordering::Relaxed);
+                }
+            } else {
+                self.pinned_size.fetch_add(size, Ordering::Relaxed);
+            }
             return;
         }
 
@@ -313,8 +328,11 @@ impl CachedBackend {
         let files = self.local.list(prefix).await?;
 
         let mut entries = self.entries.write().await;
+        let mut pinned = self.pinned_entries.write().await;
         let mut total_size = 0u64;
         let mut pinned_size_acc = 0u64;
+
+        pinned.clear();
 
         for file in files {
             let key = if prefix.is_empty() {
@@ -328,7 +346,8 @@ impl CachedBackend {
                 let size = metadata.len();
 
                 if self.is_pinned(&key) {
-                    // Pinned entries tracked separately
+                    // Pinned entries tracked separately with per-key sizes
+                    pinned.insert(key, size);
                     pinned_size_acc += size;
                 } else {
                     entries.insert(
@@ -490,8 +509,12 @@ impl StorageBackend for CachedBackend {
             if let Some(ref queue) = self.retry_queue {
                 tracing::warn!("S3 write failed for {}, queueing for retry: {}", key, e);
                 let local_path = self.local_base.join(key);
+                // Note: the item is in the in-memory retry queue but failed to persist
+                // to disk. If the process crashes before the next successful save, this
+                // retry entry will be lost. The local file still exists, so data is not
+                // permanently lost — only the retry intent.
                 if let Err(enqueue_err) = queue.enqueue(key.to_string(), local_path).await {
-                    tracing::warn!(
+                    tracing::error!(
                         "Failed to persist retry queue after enqueueing {}: {}",
                         key,
                         enqueue_err
@@ -516,7 +539,16 @@ impl StorageBackend for CachedBackend {
 
         // Now safe to clean up local state
         self.local.delete(key).await?;
-        self.remove_entry(key).await;
+
+        // Remove from the appropriate index and update size tracking
+        if self.is_pinned(key) {
+            let mut pinned = self.pinned_entries.write().await;
+            if let Some(old_size) = pinned.remove(key) {
+                self.pinned_size.fetch_sub(old_size, Ordering::Relaxed);
+            }
+        } else {
+            self.remove_entry(key).await;
+        }
 
         Ok(())
     }
@@ -803,6 +835,97 @@ mod tests {
 
         // pinned_size should track pinned entries
         assert_eq!(backend.pinned_size.load(Ordering::Relaxed), 800);
+    }
+
+    #[tokio::test]
+    async fn test_pinned_size_updates_on_overwrite() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = create_test_backend(temp_dir.path()).await;
+
+        // "decoded" is a pinned prefix in the test config
+        // First write: 500 bytes
+        backend
+            .record_entry("chain/decoded/logs/event.parquet", 500)
+            .await;
+        assert_eq!(backend.pinned_size.load(Ordering::Relaxed), 500);
+
+        // Overwrite with 300 bytes - pinned_size should reflect only 300, not 500+300
+        backend
+            .record_entry("chain/decoded/logs/event.parquet", 300)
+            .await;
+        assert_eq!(
+            backend.pinned_size.load(Ordering::Relaxed),
+            300,
+            "pinned_size should reflect only the latest size, not the sum"
+        );
+
+        // Overwrite with a larger size (700 bytes)
+        backend
+            .record_entry("chain/decoded/logs/event.parquet", 700)
+            .await;
+        assert_eq!(
+            backend.pinned_size.load(Ordering::Relaxed),
+            700,
+            "pinned_size should increase when overwritten with a larger file"
+        );
+
+        // Add a second pinned entry
+        backend
+            .record_entry("chain/decoded/eth_calls/call.parquet", 200)
+            .await;
+        assert_eq!(
+            backend.pinned_size.load(Ordering::Relaxed),
+            900,
+            "pinned_size should be the sum of all current pinned entries"
+        );
+
+        // Overwrite first entry again with smaller size
+        backend
+            .record_entry("chain/decoded/logs/event.parquet", 100)
+            .await;
+        assert_eq!(
+            backend.pinned_size.load(Ordering::Relaxed),
+            300,
+            "pinned_size should be 100 + 200 = 300"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pinned_size_decreases_on_delete() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = create_test_backend(temp_dir.path()).await;
+
+        // Write a pinned file through the full write path (so it exists on disk and S3)
+        backend
+            .write("chain/decoded/logs/event.parquet", b"some data here!!")
+            .await
+            .unwrap();
+
+        let expected_size = b"some data here!!".len() as u64;
+        assert_eq!(
+            backend.pinned_size.load(Ordering::Relaxed),
+            expected_size,
+            "pinned_size should reflect the written data"
+        );
+
+        // Delete the pinned file
+        backend
+            .delete("chain/decoded/logs/event.parquet")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.pinned_size.load(Ordering::Relaxed),
+            0,
+            "pinned_size should be 0 after deleting the only pinned entry"
+        );
+
+        // Verify the pinned_entries map is also empty
+        let pinned = backend.pinned_entries.read().await;
+        assert!(
+            pinned.is_empty(),
+            "pinned_entries map should be empty after delete"
+        );
     }
 
     #[tokio::test]
