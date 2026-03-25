@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::paths::scan_parquet_filenames;
-use crate::storage::{upload_parquet_to_s3, StorageManager};
+use crate::storage::{upload_parquet_to_s3, BlockRange, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::ReceiptField;
 use alloy::primitives::{keccak256, B256};
@@ -42,18 +42,6 @@ pub enum ReceiptCollectionError {
 
     #[error("Task join error: {0}")]
     JoinError(String),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BlockRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-}
-
-impl BlockRange {
-    pub(crate) fn file_name(&self) -> String {
-        format!("receipts_{}-{}.parquet", self.start, self.end - 1)
-    }
 }
 
 #[derive(Debug)]
@@ -928,7 +916,7 @@ pub(crate) async fn process_range(
     }
 
     let write_start = Instant::now();
-    let output_path = output_dir.join(range.file_name());
+    let output_path = output_dir.join(range.file_name(Some("receipts")));
     let total_receipts = match receipt_fields {
         Some(fields) => {
             let count = all_minimal_records.len();

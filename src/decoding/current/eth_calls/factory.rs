@@ -84,11 +84,9 @@ pub(super) async fn handle_once_calls_live(
     }
 
     if !decoded_once_calls.is_empty() {
-        if let Err(e) = live_storage.write_decoded_once_calls(
-            range_start,
-            contract_name,
-            &decoded_once_calls,
-        ) {
+        if let Err(e) =
+            live_storage.write_decoded_once_calls(range_start, contract_name, &decoded_once_calls)
+        {
             tracing::warn!(
                 "Failed to write decoded once_calls for {} at block {}: {}",
                 contract_name,
@@ -164,9 +162,7 @@ pub(super) async fn handle_once_file_backfilled(
     // Find configs that need decoding
     let missing_configs: Vec<CallDecodeConfig> = configs
         .iter()
-        .filter(|c| {
-            raw_cols.contains(&c.function_name) && !decoded_cols.contains(&c.function_name)
-        })
+        .filter(|c| raw_cols.contains(&c.function_name) && !decoded_cols.contains(&c.function_name))
         .cloned()
         .cloned()
         .collect();

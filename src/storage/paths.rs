@@ -52,6 +52,21 @@ pub fn decoded_base_dir(chain: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/historical/decoded", chain))
 }
 
+/// `data/{chain}/historical/decoded/logs`
+pub fn decoded_logs_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/logs", chain))
+}
+
+/// `data/{chain}/historical/decoded/eth_calls`
+pub fn decoded_eth_calls_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain))
+}
+
+/// `data/{chain}/live`
+pub fn live_base_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/live", chain))
+}
+
 // ---------------------------------------------------------------------------
 // Range parsing
 // ---------------------------------------------------------------------------
@@ -262,6 +277,18 @@ mod tests {
         assert_eq!(
             decoded_base_dir("base"),
             PathBuf::from("data/base/historical/decoded")
+        );
+        assert_eq!(
+            decoded_logs_dir("ethereum"),
+            PathBuf::from("data/ethereum/historical/decoded/logs")
+        );
+        assert_eq!(
+            decoded_eth_calls_dir("base"),
+            PathBuf::from("data/base/historical/decoded/eth_calls")
+        );
+        assert_eq!(
+            live_base_dir("ethereum"),
+            PathBuf::from("data/ethereum/live")
         );
     }
 }

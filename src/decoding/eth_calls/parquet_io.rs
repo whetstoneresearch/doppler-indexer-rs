@@ -635,12 +635,11 @@ fn build_array_from_decoded_values(
             if values.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
             } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(values.iter().map(|opt| {
-                    match opt {
+                let arr =
+                    FixedSizeBinaryArray::try_from_iter(values.iter().map(|opt| match opt {
                         Some(DecodedValue::Address(addr)) => addr.as_slice(),
                         _ => &[0u8; 20][..],
-                    }
-                }))?;
+                    }))?;
                 Ok(Arc::new(arr))
             }
         }
@@ -770,12 +769,11 @@ fn build_array_from_decoded_values(
             if values.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
             } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(values.iter().map(|opt| {
-                    match opt {
+                let arr =
+                    FixedSizeBinaryArray::try_from_iter(values.iter().map(|opt| match opt {
                         Some(DecodedValue::Bytes32(b)) => b.as_slice(),
                         _ => &[0u8; 32][..],
-                    }
-                }))?;
+                    }))?;
                 Ok(Arc::new(arr))
             }
         }
@@ -2359,7 +2357,11 @@ pub(super) fn extract_once_tuple_address<'a>(
     }
 }
 
-pub(super) fn extract_once_tuple_uint8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<u8> {
+pub(super) fn extract_once_tuple_uint8(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<u8> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Uint8(val) => Some(*val),
@@ -2429,7 +2431,11 @@ pub(super) fn extract_once_tuple_uint256_string(
     }
 }
 
-pub(super) fn extract_once_tuple_int8(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i8> {
+pub(super) fn extract_once_tuple_int8(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<i8> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int8(val) => Some(*val),
@@ -2439,7 +2445,11 @@ pub(super) fn extract_once_tuple_int8(r: &DecodedOnceRecord, function_name: &str
     }
 }
 
-pub(super) fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i64> {
+pub(super) fn extract_once_tuple_int64(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<i64> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => Some(*val),
@@ -2450,7 +2460,11 @@ pub(super) fn extract_once_tuple_int64(r: &DecodedOnceRecord, function_name: &st
     }
 }
 
-pub(super) fn extract_once_tuple_int32(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i32> {
+pub(super) fn extract_once_tuple_int32(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<i32> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -2461,7 +2475,11 @@ pub(super) fn extract_once_tuple_int32(r: &DecodedOnceRecord, function_name: &st
     }
 }
 
-pub(super) fn extract_once_tuple_int16(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<i16> {
+pub(super) fn extract_once_tuple_int16(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<i16> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Int64(val) => (*val).try_into().ok(),
@@ -2487,7 +2505,11 @@ pub(super) fn extract_once_tuple_int256_string(
     }
 }
 
-pub(super) fn extract_once_tuple_bool(r: &DecodedOnceRecord, function_name: &str, idx: usize) -> Option<bool> {
+pub(super) fn extract_once_tuple_bool(
+    r: &DecodedOnceRecord,
+    function_name: &str,
+    idx: usize,
+) -> Option<bool> {
     match r.decoded_values.get(function_name) {
         Some(DecodedValue::NamedTuple(fields)) => fields.get(idx).and_then(|(_, v)| match v {
             DecodedValue::Bool(val) => Some(*val),
@@ -2542,4 +2564,3 @@ pub(super) fn extract_once_tuple_bytes<'a>(
         _ => None,
     }
 }
-

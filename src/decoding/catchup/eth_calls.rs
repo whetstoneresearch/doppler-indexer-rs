@@ -730,4 +730,3 @@ pub fn read_event_calls_from_parquet(
 
     Ok(results)
 }
-

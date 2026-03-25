@@ -19,15 +19,14 @@ use super::config::{compute_function_selector, generate_param_combinations};
 use super::event_triggers::encode_once_call_params;
 use super::frequency::filter_blocks_for_frequency;
 use super::parquet_io::{
-    extract_addresses_from_once_parquet,
-    extract_existing_results_from_parquet, find_null_entries,
+    extract_addresses_from_once_parquet, extract_existing_results_from_parquet, find_null_entries,
     merge_once_columns, read_existing_once_parquet, read_once_column_index,
-    read_parquet_column_names, write_once_column_index,
-    write_once_results_to_parquet, write_results_to_parquet,
+    read_parquet_column_names, write_once_column_index, write_once_results_to_parquet,
+    write_results_to_parquet,
 };
 use super::types::{
-    BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError, FrequencyState, OnceCallConfig,
-    OnceCallResult, TokenCallConfig,
+    BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError, FrequencyState,
+    OnceCallConfig, OnceCallResult, TokenCallConfig,
 };
 use crate::decoding::{
     DecoderMessage, EthCallResult as DecoderEthCallResult, OnceCallResult as DecoderOnceCallResult,
@@ -36,10 +35,7 @@ use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::{upload_parquet_to_s3, S3Manifest, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::{
-    encode_call_with_params, EthCallConfig, Frequency,
-};
-
+use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, Frequency};
 
 pub(crate) async fn process_factory_range(
     range: &BlockRange,
@@ -85,7 +81,7 @@ pub(crate) async fn process_factory_range(
                 .unwrap_or(&call_config.function)
                 .to_string();
 
-            let file_name = range.file_name();
+            let file_name = range.file_name(None);
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
             if existing_files.contains(&rel_path) {
@@ -393,7 +389,7 @@ pub(crate) async fn process_factory_range_multicall(
                 .unwrap_or(&call_config.function)
                 .to_string();
 
-            let file_name = range.file_name();
+            let file_name = range.file_name(None);
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
             if existing_files.contains(&rel_path) {
@@ -569,7 +565,7 @@ pub(crate) async fn process_factory_range_multicall(
             results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let result_count = results.len();
-            let file_name = range.file_name();
+            let file_name = range.file_name(None);
             let sub_dir = output_dir
                 .join(&group.collection_name)
                 .join(&group.function_name);
@@ -653,9 +649,6 @@ pub(crate) async fn process_factory_range_multicall(
     Ok(())
 }
 
-
-
-
 pub(crate) async fn process_once_calls_regular(
     range: &BlockRange,
     blocks: &[BlockInfo],
@@ -678,7 +671,7 @@ pub(crate) async fn process_once_calls_regular(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/once/{}", contract_name, file_name);
         let sub_dir = output_dir.join(contract_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -1033,7 +1026,7 @@ pub(crate) async fn process_factory_once_calls(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/once/{}", collection_name, file_name);
         let sub_dir = output_dir.join(collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -1533,7 +1526,7 @@ pub(crate) async fn process_once_calls_multicall(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/once/{}", contract_name, file_name);
         let sub_dir = output_dir.join(contract_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -1893,7 +1886,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/once/{}", collection_name, file_name);
         let sub_dir = output_dir.join(collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -2401,7 +2394,7 @@ pub(crate) async fn process_range(
     }
 
     for ((contract_name, function_name), configs) in &grouped_configs {
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
@@ -2664,7 +2657,7 @@ pub(crate) async fn process_range_multicall(
     let mut active_groups: Vec<GroupInfo> = Vec::new();
 
     for ((contract_name, function_name), configs) in &grouped_configs {
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
@@ -2821,7 +2814,7 @@ pub(crate) async fn process_range_multicall(
             results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let result_count = results.len();
-            let file_name = range.file_name();
+            let file_name = range.file_name(None);
             let sub_dir = output_dir
                 .join(&group.contract_name)
                 .join(&group.function_name);
@@ -3285,7 +3278,7 @@ pub(crate) async fn process_token_range_multicall(
 
     for ((token_name, function_name), configs) in &grouped_configs {
         let output_name = format!("{}_pool", token_name);
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
 
         if existing_files.contains(&rel_path) {
@@ -3472,7 +3465,7 @@ pub(crate) async fn process_token_range_multicall(
             results.sort_by_key(|r| (r.block_number, r.contract_address));
 
             let result_count = results.len();
-            let file_name = range.file_name();
+            let file_name = range.file_name(None);
             let sub_dir = output_dir
                 .join(&group.output_name)
                 .join(&group.function_name);
@@ -3581,7 +3574,7 @@ pub(crate) async fn process_token_range(
 
     for ((token_name, function_name), configs) in &grouped_configs {
         let output_name = format!("{}_pool", token_name);
-        let file_name = range.file_name();
+        let file_name = range.file_name(None);
         let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
 
         if existing_files.contains(&rel_path) {
@@ -3748,4 +3741,3 @@ pub(crate) async fn process_token_range(
 
     Ok(())
 }
-

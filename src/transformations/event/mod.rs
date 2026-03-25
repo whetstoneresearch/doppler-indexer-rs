@@ -2,11 +2,11 @@
 //!
 //! Add new event handler modules here and register them in `register_handlers`.
 
+pub mod decay_multicurve;
 pub mod derc20_transfer;
-pub mod v4;
 pub mod multicurve;
 pub mod scheduled_multicurve;
-pub mod decay_multicurve;
+pub mod v4;
 
 use super::registry::TransformationRegistry;
 

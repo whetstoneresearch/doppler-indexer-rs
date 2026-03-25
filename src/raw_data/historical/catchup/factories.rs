@@ -9,13 +9,12 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::DecoderMessage;
-use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::raw_data::historical::factories::{
     build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet,
     process_range_batches, read_log_batches_from_parquet, scan_existing_parquet_files,
-    FactoryAddressData, FactoryCatchupState, FactoryCollectionError,
-    RecollectRequest,
+    FactoryAddressData, FactoryCatchupState, FactoryCollectionError, RecollectRequest,
 };
+use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;

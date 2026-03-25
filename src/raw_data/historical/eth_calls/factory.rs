@@ -12,7 +12,9 @@ use super::types::{
     EthCallCollectionError, EventCallKey, EventTriggeredCallConfig, OnceCallConfig,
 };
 use crate::raw_data::historical::receipts::LogData;
-use crate::storage::paths::{factories_dir as factories_dir_path, parse_range_from_filename, raw_logs_dir};
+use crate::storage::paths::{
+    factories_dir as factories_dir_path, parse_range_from_filename, raw_logs_dir,
+};
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 
 /// Load historical factory addresses from parquet files for event trigger catchup

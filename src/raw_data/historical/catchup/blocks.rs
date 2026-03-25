@@ -13,21 +13,9 @@ use crate::raw_data::historical::blocks::{
 };
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::paths::{parse_range_from_filename, raw_blocks_dir, scan_parquet_filenames};
-use crate::storage::{upload_parquet_to_s3, S3Manifest, StorageManager};
+use crate::storage::{upload_parquet_to_s3, BlockRange, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{BlockField, RawDataCollectionConfig};
-
-#[derive(Debug, Clone)]
-struct BlockRange {
-    start: u64,
-    end: u64,
-}
-
-impl BlockRange {
-    fn file_name(&self) -> String {
-        format!("blocks_{}-{}.parquet", self.start, self.end - 1)
-    }
-}
 
 pub async fn collect_blocks(
     chain: &ChainConfig,
@@ -119,7 +107,7 @@ pub async fn collect_blocks(
         )
         .await?;
 
-        let output_path = output_dir.join(range.file_name());
+        let output_path = output_dir.join(range.file_name(Some("blocks")));
         tracing::info!("Wrote {} blocks to {}", record_count, output_path.display());
 
         // Upload to S3 if configured
@@ -260,7 +248,7 @@ async fn collect_blocks_streaming(
             // Write to parquet
             let schema_clone = schema.clone();
             let fields_vec = fields.to_vec();
-            let output_path = output_dir.join(range.file_name());
+            let output_path = output_dir.join(range.file_name(Some("blocks")));
             tokio::task::spawn_blocking(move || {
                 write_minimal_blocks_to_parquet(
                     &all_records,
@@ -344,7 +332,7 @@ async fn collect_blocks_streaming(
 
             // Write to parquet
             let schema_clone = schema.clone();
-            let output_path = output_dir.join(range.file_name());
+            let output_path = output_dir.join(range.file_name(Some("blocks")));
             tokio::task::spawn_blocking(move || {
                 write_full_blocks_to_parquet(&all_records, &schema_clone, &output_path)
             })
@@ -382,7 +370,7 @@ fn compute_ranges_to_fetch(
         .into_iter()
         .filter(|range| {
             // Skip if file exists locally
-            if existing_files.contains(&range.file_name()) {
+            if existing_files.contains(&range.file_name(Some("blocks"))) {
                 return false;
             }
             // Skip if range exists in S3 manifest

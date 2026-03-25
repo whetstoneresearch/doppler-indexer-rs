@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
-use alloy::primitives::{Address, Bytes, I256, U256, B256};
+use alloy::primitives::{Address, Bytes, B256, I256, U256};
 
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
@@ -679,10 +679,7 @@ impl TransformationContext {
             .await
             .map_err(|e| TransformationError::RpcError(e.to_string()))?
             .ok_or_else(|| {
-                TransformationError::MissingData(format!(
-                    "No receipt found for tx {}",
-                    tx_hash
-                ))
+                TransformationError::MissingData(format!("No receipt found for tx {}", tx_hash))
             })?;
 
         for log in receipt.inner.logs() {

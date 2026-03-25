@@ -17,7 +17,7 @@ use tokio::sync::mpsc::Sender;
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::receipts::LogData;
 use crate::storage::paths::scan_parquet_filenames;
-use crate::storage::{S3Manifest, StorageManager};
+use crate::storage::{BlockRange, S3Manifest, StorageManager};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::LogField;
 
@@ -48,18 +48,6 @@ pub(crate) struct LogsCatchupState {
     pub(crate) s3_manifest: Option<S3Manifest>,
     pub(crate) storage_manager: Option<Arc<StorageManager>>,
     pub(crate) chain_name: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BlockRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-}
-
-impl BlockRange {
-    pub(crate) fn file_name(&self) -> String {
-        format!("logs_{}-{}.parquet", self.start, self.end - 1)
-    }
 }
 
 #[derive(Debug)]
@@ -106,7 +94,7 @@ pub(crate) async fn process_completed_range(
     };
 
     // Check filesystem directly instead of cache to handle files deleted during recollection
-    let output_path = output_dir.join(range.file_name());
+    let output_path = output_dir.join(range.file_name(Some("logs")));
     if output_path.exists() {
         tracing::debug!(
             "Skipping logs for blocks {}-{} (already exists)",
@@ -225,7 +213,7 @@ pub(crate) async fn process_range(
                 .collect();
             let schema_clone = schema.clone();
             let fields_vec = fields.to_vec();
-            let output_path = output_dir.join(range.file_name());
+            let output_path = output_dir.join(range.file_name(Some("logs")));
             tokio::task::spawn_blocking(move || {
                 write_minimal_logs_to_parquet(&records, &schema_clone, &fields_vec, &output_path)
             })
@@ -246,7 +234,7 @@ pub(crate) async fn process_range(
                 })
                 .collect();
             let schema_clone = schema.clone();
-            let output_path = output_dir.join(range.file_name());
+            let output_path = output_dir.join(range.file_name(Some("logs")));
             tokio::task::spawn_blocking(move || {
                 write_full_logs_to_parquet(&records, &schema_clone, &output_path)
             })
@@ -255,7 +243,7 @@ pub(crate) async fn process_range(
         }
     }
 
-    let output_path = output_dir.join(range.file_name());
+    let output_path = output_dir.join(range.file_name(Some("logs")));
     tracing::info!("Wrote logs to {}", output_path.display());
 
     // Upload to S3 if configured

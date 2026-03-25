@@ -10,7 +10,6 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges, read_block_info_from_parquet,
 };
-use crate::storage::paths::raw_eth_calls_dir;
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, build_token_call_configs, event_output_exists,
@@ -25,6 +24,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::paths::raw_eth_calls_dir;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::AddressOrAddresses;
@@ -202,7 +202,7 @@ pub async fn collect_eth_calls(
                         "{}/{}/{}",
                         config.contract_name,
                         config.function_name,
-                        range.file_name()
+                        range.file_name(None)
                     );
                     existing_files.contains(&rel_path)
                 });
@@ -214,7 +214,7 @@ pub async fn collect_eth_calls(
                         "{}_pool/{}/{}",
                         config.token_name,
                         config.function_name,
-                        range.file_name()
+                        range.file_name(None)
                     );
                     existing_files.contains(&rel_path)
                 });
@@ -230,7 +230,7 @@ pub async fn collect_eth_calls(
                         }
                     }
 
-                    let rel_path = format!("{}/once/{}", contract_name, range.file_name());
+                    let rel_path = format!("{}/once/{}", contract_name, range.file_name(None));
                     let expected: HashSet<&str> = configs
                         .iter()
                         .map(|c| c.function_name.as_str())
@@ -249,7 +249,7 @@ pub async fn collect_eth_calls(
 
                     // Use pre-loaded index (which was built from parquet schemas if index file didn't exist)
                     let index = once_column_indexes.get(contract_name).unwrap();
-                    match index.get(&range.file_name()) {
+                    match index.get(&range.file_name(None)) {
                         Some(cols) => {
                             let missing: Vec<_> = expected
                                 .iter()
@@ -258,7 +258,7 @@ pub async fn collect_eth_calls(
                             if !missing.is_empty() {
                                 tracing::info!(
                                     "Once file {} for {} exists but missing columns: {:?} (has: {:?})",
-                                    range.file_name(),
+                                    range.file_name(None),
                                     contract_name,
                                     missing,
                                     cols
@@ -267,7 +267,7 @@ pub async fn collect_eth_calls(
                             } else {
                                 tracing::debug!(
                                     "Once file {} for {} complete with all {} columns",
-                                    range.file_name(),
+                                    range.file_name(None),
                                     contract_name,
                                     cols.len()
                                 );
@@ -278,7 +278,7 @@ pub async fn collect_eth_calls(
                             // File exists but wasn't found by index builder - shouldn't happen but handle it
                             tracing::warn!(
                                 "Once file {} for {} exists but not in pre-built index, will collect",
-                                range.file_name(),
+                                range.file_name(None),
                                 contract_name
                             );
                             false
@@ -783,7 +783,10 @@ pub async fn collect_eth_calls(
         }
     }
 
-    tracing::info!("Eth_call collection catchup finished for chain {}", chain.name);
+    tracing::info!(
+        "Eth_call collection catchup finished for chain {}",
+        chain.name
+    );
 
     // Signal that all catchup phases are complete
     if let Some(tx) = eth_calls_catchup_done_tx {

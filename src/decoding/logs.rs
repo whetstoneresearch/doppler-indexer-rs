@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
@@ -21,16 +21,17 @@ use super::types::DecoderMessage;
 use crate::live::{LiveDecodedLog, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::paths::{decoded_logs_dir, raw_logs_dir};
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
     RangeCompleteMessage,
 };
-use crate::types::decoded::DecodedValue;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
 };
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::decoded::DecodedValue;
 
 #[derive(Debug, Error)]
 pub enum LogDecodingError {
@@ -92,7 +93,7 @@ pub async fn decode_logs(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     skip_catchup: bool,
 ) -> Result<(), LogDecodingError> {
-    let output_base = PathBuf::from(format!("data/{}/historical/decoded/logs", chain.name));
+    let output_base = decoded_logs_dir(&chain.name);
     std::fs::create_dir_all(&output_base)?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
@@ -130,7 +131,7 @@ pub async fn decode_logs(
     // Catchup phase: Process existing raw log files
     // =========================================================================
     if !skip_catchup {
-        let raw_logs_dir = PathBuf::from(format!("data/{}/historical/raw/logs", chain.name));
+        let raw_logs_dir = raw_logs_dir(&chain.name);
         if raw_logs_dir.exists() {
             super::catchup::catchup_decode_logs(
                 &raw_logs_dir,

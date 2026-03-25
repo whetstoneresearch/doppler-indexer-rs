@@ -2,14 +2,10 @@
 
 use tokio::sync::mpsc::Sender;
 
-use crate::decoding::eth_calls::{
-    build_result_map, decode_value, EventCallDecodeConfig,
-};
-use crate::live::{LiveDecodedEventCall, LiveStorage};
-use crate::transformations::{
-    DecodedCall as TransformDecodedCall, DecodedCallsMessage,
-};
 use crate::decoding::eth_calls::EthCallDecodingError;
+use crate::decoding::eth_calls::{build_result_map, decode_value, EventCallDecodeConfig};
+use crate::live::{LiveDecodedEventCall, LiveStorage};
+use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
 
 /// Handle a live-mode `EventCallsReady` message: decode results, persist to bincode,
 /// and optionally forward to the transformation engine.
@@ -24,10 +20,8 @@ pub(super) async fn handle_event_calls_live(
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     retry_transform_after_decode: bool,
 ) -> Result<(), EthCallDecodingError> {
-    let mut decoded_event_calls: Vec<LiveDecodedEventCall> =
-        Vec::with_capacity(results.len());
-    let mut transform_calls: Vec<TransformDecodedCall> =
-        Vec::with_capacity(results.len());
+    let mut decoded_event_calls: Vec<LiveDecodedEventCall> = Vec::with_capacity(results.len());
+    let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
 
     for result in results {
         match decode_value(&result.value, &config.output_type) {
@@ -39,11 +33,7 @@ pub(super) async fn handle_event_calls_live(
                     source_name: contract_name.to_string(),
                     function_name: function_name.to_string(),
                     trigger_log_index: Some(result.log_index),
-                    result: build_result_map(
-                        &decoded,
-                        &config.output_type,
-                        function_name,
-                    ),
+                    result: build_result_map(&decoded, &config.output_type, function_name),
                 });
 
                 decoded_event_calls.push(LiveDecodedEventCall {

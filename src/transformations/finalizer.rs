@@ -96,11 +96,7 @@ impl RangeFinalizer {
     ) -> Result<(), TransformationError> {
         {
             let mut state = live_state.lock().await;
-            state
-                .completion
-                .entry(range_key)
-                .or_default()
-                .mark(kind);
+            state.completion.entry(range_key).or_default().mark(kind);
         }
 
         self.maybe_finalize_range(range_key, live_state).await?;
@@ -247,9 +243,7 @@ impl RangeFinalizer {
                 .iter()
                 .map(|h| h.handler_key())
                 .collect();
-            if let Err(e) =
-                update_finalization_status(&storage, range_start, &registered_keys)
-            {
+            if let Err(e) = update_finalization_status(&storage, range_start, &registered_keys) {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to update status for block {} during finalization: {}",

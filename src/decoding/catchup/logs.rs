@@ -15,6 +15,7 @@ use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::paths::factories_dir;
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -315,7 +316,7 @@ fn load_factory_addresses_for_catchup(
     let mut result: HashMap<u64, HashMap<String, HashSet<[u8; 20]>>> = HashMap::new();
 
     // Look for factory parquet files
-    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
+    let factories_dir = factories_dir(&chain.name);
     if !factories_dir.exists() {
         return Ok(result);
     }

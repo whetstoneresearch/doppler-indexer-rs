@@ -11,12 +11,12 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, extract_event_triggers, fetch_receipts_for_blocks, process_range,
     send_logs_to_channels, send_range_complete, write_full_receipts_to_parquet,
-    write_minimal_receipts_to_parquet, BlockInfo, BlockRange, ChannelMetrics, EventTriggerMatcher,
+    write_minimal_receipts_to_parquet, BlockInfo, ChannelMetrics, EventTriggerMatcher,
     EventTriggerMessage, LogMessage, ReceiptBatchState, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::raw_receipts_dir;
-use crate::storage::{upload_parquet_to_s3, StorageManager};
+use crate::storage::{upload_parquet_to_s3, BlockRange, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -108,7 +108,7 @@ pub async fn collect_receipts(
                         let exists_in_s3 = s3_manifest
                             .as_ref()
                             .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
-                        if existing_files.contains(&range.file_name()) || exists_in_s3 {
+                        if existing_files.contains(&range.file_name(Some("receipts"))) || exists_in_s3 {
                             // Check if range is now complete
                             let expected: HashSet<u64> = (range_start..range_end).collect();
                             let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
@@ -280,7 +280,7 @@ pub async fn collect_receipts(
                             minimal_records.sort_by_key(|r| r.block_number);
                             full_records.sort_by_key(|r| r.block_number);
 
-                            let output_path = output_dir.join(range.file_name());
+                            let output_path = output_dir.join(range.file_name(Some("receipts")));
                             let total_receipts = match receipt_fields {
                                 Some(fields) => {
                                     let count = minimal_records.len();
@@ -465,7 +465,7 @@ pub async fn collect_receipts(
         let exists_in_s3 = s3_manifest
             .as_ref()
             .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
-        if existing_files.contains(&range.file_name()) || exists_in_s3 {
+        if existing_files.contains(&range.file_name(Some("receipts"))) || exists_in_s3 {
             tracing::info!(
                 "Skipping receipts for blocks {}-{} (already exists)",
                 range.start,
@@ -546,7 +546,7 @@ pub async fn collect_receipts(
         state.minimal_records.sort_by_key(|r| r.block_number);
         state.full_records.sort_by_key(|r| r.block_number);
 
-        let output_path = output_dir.join(range.file_name());
+        let output_path = output_dir.join(range.file_name(Some("receipts")));
         let total_receipts = match receipt_fields {
             Some(fields) => {
                 let count = state.minimal_records.len();

@@ -22,7 +22,10 @@ pub struct Beneficiary {
 
 impl Beneficiary {
     pub fn new(beneficiary: [u8; 20], shares: u64) -> Self {
-        Self { beneficiary, shares }
+        Self {
+            beneficiary,
+            shares,
+        }
     }
 }
 

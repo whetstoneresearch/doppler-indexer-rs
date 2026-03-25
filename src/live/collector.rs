@@ -1551,11 +1551,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use alloy::primitives::U256;
     use crate::live::{LiveDecodedCall, LiveEthCall};
-    use crate::types::decoded::DecodedValue;
     use crate::rpc::UnifiedRpcClient;
     use crate::types::config::chain::ChainConfig;
+    use crate::types::decoded::DecodedValue;
+    use alloy::primitives::U256;
 
     /// Computes the gap range for backfill given the last processed block and received block.
     /// Returns Some((gap_start, gap_end)) if there is a gap, None otherwise.

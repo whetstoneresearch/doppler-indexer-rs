@@ -1,16 +1,16 @@
 //! Live/current phase for log decoding - processes new data as it arrives via channel.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::decoding::logs::{
     delete_decoded_logs_for_blocks, process_logs, process_logs_live, EventMatcher, LogDecodingError,
 };
 use crate::decoding::types::DecoderMessage;
 use crate::live::LiveStorage;
+use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::transformations::{DecodedEventsMessage, RangeCompleteMessage};
 
 /// Load accumulated factory addresses from both compacted parquet and uncompacted bincode files.
@@ -23,7 +23,7 @@ fn load_accumulated_factory_addresses(
     let mut result: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
 
     // 1. Load from compacted parquet files: data/{chain}/historical/factories/{collection}/*.parquet
-    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain_name));
+    let factories_dir = crate::storage::paths::factories_dir(chain_name);
     if factories_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&factories_dir) {
             for entry in entries.flatten() {

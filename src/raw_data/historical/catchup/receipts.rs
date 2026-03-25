@@ -9,11 +9,12 @@ use crate::raw_data::historical::blocks::{
 };
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, process_range, scan_existing_logs_files, scan_existing_parquet_files,
-    send_range_complete, BlockInfo, BlockRange, ChannelMetrics, EventTriggerMatcher,
-    EventTriggerMessage, LogMessage, ReceiptCollectionError,
+    send_range_complete, BlockInfo, ChannelMetrics, EventTriggerMatcher, EventTriggerMessage,
+    LogMessage, ReceiptCollectionError,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::{raw_logs_dir, raw_receipts_dir};
+use crate::storage::BlockRange;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -82,7 +83,7 @@ pub async fn collect_receipts(
             end: block_range.end,
         };
 
-        let receipts_exist = existing_files.contains(&range.file_name())
+        let receipts_exist = existing_files.contains(&range.file_name(Some("receipts")))
             || s3_manifest
                 .as_ref()
                 .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));

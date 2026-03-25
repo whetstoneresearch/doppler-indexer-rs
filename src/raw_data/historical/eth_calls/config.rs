@@ -6,13 +6,10 @@ use std::collections::HashMap;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::Bytes;
 
-use super::types::{
-    CallConfig, EthCallCollectionError, OnceCallConfig, TokenCallConfig,
-};
+use super::types::{CallConfig, EthCallCollectionError, OnceCallConfig, TokenCallConfig};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{
-    encode_call_with_params, EthCallConfig, EvmType, ParamConfig, ParamError,
-    ParamValue,
+    encode_call_with_params, EthCallConfig, EvmType, ParamConfig, ParamError, ParamValue,
 };
 use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 

@@ -97,4 +97,3 @@ pub fn build_decode_configs(
 
     (regular, once, event)
 }
-

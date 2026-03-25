@@ -54,7 +54,7 @@ pub struct LiveStorage {
 impl LiveStorage {
     /// Create a new LiveStorage for the given chain.
     pub fn new(chain_name: &str) -> Self {
-        let base_dir = PathBuf::from(format!("data/{}/live", chain_name));
+        let base_dir = crate::storage::paths::live_base_dir(chain_name);
         Self { base_dir }
     }
 
