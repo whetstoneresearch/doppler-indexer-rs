@@ -1,21 +1,19 @@
 //! Catchup phase for log decoding - processes existing raw log parquet files.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt32Array, UInt64Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
-use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
 use crate::storage::decoded_index::scan_existing_decoded_files;
+use crate::storage::factory_data::load_factory_addresses_by_range;
+use crate::storage::parquet_readers::read_raw_logs_from_parquet;
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -73,7 +71,7 @@ pub async fn catchup_decode_logs(
     );
 
     // Load factory addresses from factory parquet files for catchup
-    let factory_addresses = Arc::new(load_factory_addresses_for_catchup(chain)?);
+    let factory_addresses = Arc::new(load_factory_addresses_by_range(&chain.name)?);
 
     let total_factory_addrs: usize = factory_addresses
         .values()
@@ -154,7 +152,7 @@ pub async fn catchup_decode_logs(
 
             // Read raw logs from parquet
             let file_path_for_read = file_path.clone();
-            let logs = match read_logs_from_parquet(&file_path_for_read) {
+            let logs = match read_raw_logs_from_parquet(&file_path_for_read) {
                 Ok(logs) => logs,
                 Err(e) => {
                     tracing::warn!(
@@ -293,7 +291,7 @@ fn load_factory_addresses_for_catchup(
     let mut result: HashMap<u64, HashMap<String, HashSet<[u8; 20]>>> = HashMap::new();
 
     // Look for factory parquet files
-    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
+    let factories_dir = crate::storage::paths::factories_dir(&chain.name);
     if !factories_dir.exists() {
         return Ok(result);
     }

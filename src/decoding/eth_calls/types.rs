@@ -18,6 +18,9 @@ pub enum EthCallDecodingError {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
+    #[error("Parquet read error: {0}")]
+    ParquetRead(#[from] crate::storage::parquet_readers::ParquetReadError),
+
     #[error("Decoding error: {0}")]
     Decode(String),
 

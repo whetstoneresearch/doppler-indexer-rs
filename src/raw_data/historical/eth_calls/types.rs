@@ -27,6 +27,9 @@ pub enum EthCallCollectionError {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
+    #[error("Parquet read error: {0}")]
+    ParquetRead(#[from] crate::storage::parquet_readers::ParquetReadError),
+
     #[error("Parameter error: {0}")]
     Param(#[from] ParamError),
 
@@ -37,17 +40,7 @@ pub enum EthCallCollectionError {
     EventParamExtraction(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct BlockRange {
-    pub start: u64,
-    pub end: u64,
-}
-
-impl BlockRange {
-    pub fn file_name(&self) -> String {
-        format!("{}-{}.parquet", self.start, self.end - 1)
-    }
-}
+pub use crate::storage::BlockRange;
 
 #[derive(Debug, Clone)]
 pub struct BlockInfo {

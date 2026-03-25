@@ -13,7 +13,6 @@ pub use decode::decode_value;
 pub use process::{process_event_calls, process_once_calls, process_regular_calls};
 pub use transform::{build_result_map, build_result_map_for_merge};
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -37,7 +36,7 @@ pub async fn decode_eth_calls(
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
 ) -> Result<(), EthCallDecodingError> {
-    let output_base = PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain.name));
+    let output_base = crate::storage::paths::decoded_eth_calls_dir(&chain.name);
     std::fs::create_dir_all(&output_base)?;
 
     // Build decode configs from contract configurations
@@ -66,7 +65,7 @@ pub async fn decode_eth_calls(
         event_configs.len()
     );
 
-    let raw_calls_dir = PathBuf::from(format!("data/{}/historical/raw/eth_calls", chain.name));
+    let raw_calls_dir = crate::storage::paths::raw_eth_calls_dir(&chain.name);
 
     if !skip_catchup {
         // =========================================================================

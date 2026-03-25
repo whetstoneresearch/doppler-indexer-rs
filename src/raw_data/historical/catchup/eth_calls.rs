@@ -13,8 +13,7 @@ use crate::raw_data::historical::blocks::{
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, build_token_call_configs, event_output_exists,
-    get_existing_log_ranges, load_factory_addresses_for_once_catchup,
-    load_historical_factory_addresses, load_or_build_once_column_index, process_event_triggers,
+    get_existing_log_ranges, load_or_build_once_column_index, process_event_triggers,
     process_event_triggers_multicall, process_factory_once_calls, process_once_calls_multicall,
     process_once_calls_regular, process_range, process_range_multicall, process_token_range,
     process_token_range_multicall, read_logs_from_parquet, read_once_column_index,
@@ -24,6 +23,9 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::factory_data::{
+    load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
+};
 use crate::storage::paths::raw_eth_calls_dir;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
@@ -202,7 +204,7 @@ pub async fn collect_eth_calls(
                         "{}/{}/{}",
                         config.contract_name,
                         config.function_name,
-                        range.file_name()
+                        range.file_name("")
                     );
                     existing_files.contains(&rel_path)
                 });
@@ -214,7 +216,7 @@ pub async fn collect_eth_calls(
                         "{}_pool/{}/{}",
                         config.token_name,
                         config.function_name,
-                        range.file_name()
+                        range.file_name("")
                     );
                     existing_files.contains(&rel_path)
                 });
@@ -230,7 +232,7 @@ pub async fn collect_eth_calls(
                         }
                     }
 
-                    let rel_path = format!("{}/once/{}", contract_name, range.file_name());
+                    let rel_path = format!("{}/once/{}", contract_name, range.file_name(""));
                     let expected: HashSet<&str> = configs
                         .iter()
                         .map(|c| c.function_name.as_str())
@@ -249,7 +251,7 @@ pub async fn collect_eth_calls(
 
                     // Use pre-loaded index (which was built from parquet schemas if index file didn't exist)
                     let index = once_column_indexes.get(contract_name).unwrap();
-                    match index.get(&range.file_name()) {
+                    match index.get(&range.file_name("")) {
                         Some(cols) => {
                             let missing: Vec<_> = expected
                                 .iter()
@@ -258,7 +260,7 @@ pub async fn collect_eth_calls(
                             if !missing.is_empty() {
                                 tracing::info!(
                                     "Once file {} for {} exists but missing columns: {:?} (has: {:?})",
-                                    range.file_name(),
+                                    range.file_name(""),
                                     contract_name,
                                     missing,
                                     cols
@@ -267,7 +269,7 @@ pub async fn collect_eth_calls(
                             } else {
                                 tracing::debug!(
                                     "Once file {} for {} complete with all {} columns",
-                                    range.file_name(),
+                                    range.file_name(""),
                                     contract_name,
                                     cols.len()
                                 );
@@ -278,7 +280,7 @@ pub async fn collect_eth_calls(
                             // File exists but wasn't found by index builder - shouldn't happen but handle it
                             tracing::warn!(
                                 "Once file {} for {} exists but not in pre-built index, will collect",
-                                range.file_name(),
+                                range.file_name(""),
                                 contract_name
                             );
                             false
@@ -526,9 +528,10 @@ pub async fn collect_eth_calls(
         }
 
         // Load factory address data from existing parquet files
-        let factory_catchup_data = load_factory_addresses_for_once_catchup(
+        let collections_needed: HashSet<String> = factory_once_configs.keys().cloned().collect();
+        let factory_catchup_data = load_factory_addresses_with_metadata(
             &chain.name,
-            &factory_once_configs,
+            &collections_needed,
             s3_manifest.as_ref(),
             storage_manager.as_ref(),
         )
@@ -618,9 +621,15 @@ pub async fn collect_eth_calls(
     if has_event_triggered_calls {
         // CRITICAL: Load historical factory addresses BEFORE processing event triggers
         // This ensures we can properly filter events from factory-created contracts
-        let historical_factory_addrs = load_historical_factory_addresses(
+        let factory_collections: HashSet<String> = event_call_configs
+            .values()
+            .flatten()
+            .filter(|c| c.is_factory)
+            .map(|c| c.contract_name.clone())
+            .collect();
+        let historical_factory_addrs = load_factory_addresses_by_collection(
             &chain.name,
-            &event_call_configs,
+            &factory_collections,
             s3_manifest.as_ref(),
             storage_manager.as_ref(),
         )

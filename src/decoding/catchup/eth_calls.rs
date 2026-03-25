@@ -1,14 +1,11 @@
 //! Catchup phase for eth_call decoding - processes existing raw eth_call parquet files.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -23,6 +20,9 @@ use crate::decoding::eth_calls::{
 };
 use crate::decoding::types::{EthCallResult, EventCallResult};
 use crate::storage::decoded_index::scan_existing_decoded_files;
+use crate::storage::parquet_readers::{
+    read_event_calls_from_parquet, read_regular_calls_from_parquet,
+};
 use crate::transformations::DecodedCallsMessage;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -707,4 +707,25 @@ pub fn read_event_calls_from_parquet(
     }
 
     Ok(results)
+/// Scan existing decoded files
+fn scan_existing_decoded_files(output_base: &Path) -> HashSet<String> {
+    let mut files = HashSet::new();
+
+    fn scan_recursive(dir: &Path, base: &Path, files: &mut HashSet<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_recursive(&path, base, files);
+                } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                    if let Ok(rel) = path.strip_prefix(base) {
+                        files.insert(rel.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    scan_recursive(output_base, output_base, &mut files);
+    files
 }
