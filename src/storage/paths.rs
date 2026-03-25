@@ -52,6 +52,53 @@ pub fn decoded_base_dir(chain: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/historical/decoded", chain))
 }
 
+/// `data/{chain}/historical/decoded/logs`
+pub fn decoded_logs_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/logs", chain))
+}
+
+/// `data/{chain}/historical/decoded/eth_calls`
+pub fn decoded_eth_calls_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/eth_calls", chain))
+}
+
+// ---------------------------------------------------------------------------
+// Unified BlockRange
+// ---------------------------------------------------------------------------
+
+/// A half-open block range `[start, end)` used for naming parquet files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRange {
+    pub start: u64,
+    /// Exclusive upper bound.
+    pub end: u64,
+}
+
+impl BlockRange {
+    #[allow(dead_code)]
+    pub fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    /// Build a parquet file name for this range.
+    ///
+    /// When `prefix` is non-empty the format is `"{prefix}_{start}-{end_inclusive}.parquet"`,
+    /// otherwise `"{start}-{end_inclusive}.parquet"`.
+    pub fn file_name(&self, prefix: &str) -> String {
+        let end_inclusive = self.end_inclusive();
+        if prefix.is_empty() {
+            format!("{}-{}.parquet", self.start, end_inclusive)
+        } else {
+            format!("{}_{}-{}.parquet", prefix, self.start, end_inclusive)
+        }
+    }
+
+    /// Return the inclusive end (`end - 1`).
+    pub fn end_inclusive(&self) -> u64 {
+        self.end - 1
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Range parsing
 // ---------------------------------------------------------------------------
@@ -263,5 +310,33 @@ mod tests {
             decoded_base_dir("base"),
             PathBuf::from("data/base/historical/decoded")
         );
+        assert_eq!(
+            decoded_logs_dir("ethereum"),
+            PathBuf::from("data/ethereum/historical/decoded/logs")
+        );
+        assert_eq!(
+            decoded_eth_calls_dir("ethereum"),
+            PathBuf::from("data/ethereum/historical/decoded/eth_calls")
+        );
+    }
+
+    #[test]
+    fn block_range_file_name_with_prefix() {
+        let r = BlockRange::new(0, 1000);
+        assert_eq!(r.file_name("blocks"), "blocks_0-999.parquet");
+        assert_eq!(r.file_name("logs"), "logs_0-999.parquet");
+        assert_eq!(r.file_name("receipts"), "receipts_0-999.parquet");
+    }
+
+    #[test]
+    fn block_range_file_name_no_prefix() {
+        let r = BlockRange::new(1000, 2000);
+        assert_eq!(r.file_name(""), "1000-1999.parquet");
+    }
+
+    #[test]
+    fn block_range_end_inclusive() {
+        let r = BlockRange::new(0, 1000);
+        assert_eq!(r.end_inclusive(), 999);
     }
 }

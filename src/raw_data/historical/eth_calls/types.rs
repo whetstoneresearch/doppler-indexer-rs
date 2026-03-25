@@ -37,17 +37,7 @@ pub enum EthCallCollectionError {
     EventParamExtraction(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct BlockRange {
-    pub start: u64,
-    pub end: u64,
-}
-
-impl BlockRange {
-    pub fn file_name(&self) -> String {
-        format!("{}-{}.parquet", self.start, self.end - 1)
-    }
-}
+pub use crate::storage::BlockRange;
 
 #[derive(Debug, Clone)]
 pub struct BlockInfo {

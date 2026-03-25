@@ -81,7 +81,7 @@ pub(crate) async fn process_factory_range(
                 .unwrap_or(&call_config.function)
                 .to_string();
 
-            let file_name = range.file_name();
+            let file_name = range.file_name("");
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
             if existing_files.contains(&rel_path) {
@@ -389,7 +389,7 @@ pub(crate) async fn process_factory_range_multicall(
                 .unwrap_or(&call_config.function)
                 .to_string();
 
-            let file_name = range.file_name();
+            let file_name = range.file_name("");
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
             if existing_files.contains(&rel_path) {
@@ -565,7 +565,7 @@ pub(crate) async fn process_factory_range_multicall(
             results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let result_count = results.len();
-            let file_name = range.file_name();
+            let file_name = range.file_name("");
             let sub_dir = output_dir
                 .join(&group.collection_name)
                 .join(&group.function_name);
@@ -671,7 +671,7 @@ pub(crate) async fn process_once_calls_regular(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", contract_name, file_name);
         let sub_dir = output_dir.join(contract_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -1026,7 +1026,7 @@ pub(crate) async fn process_factory_once_calls(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", collection_name, file_name);
         let sub_dir = output_dir.join(collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -1526,7 +1526,7 @@ pub(crate) async fn process_once_calls_multicall(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", contract_name, file_name);
         let sub_dir = output_dir.join(contract_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -1886,7 +1886,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
             continue;
         }
 
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", collection_name, file_name);
         let sub_dir = output_dir.join(collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
@@ -2394,7 +2394,7 @@ pub(crate) async fn process_range(
     }
 
     for ((contract_name, function_name), configs) in &grouped_configs {
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
@@ -2657,7 +2657,7 @@ pub(crate) async fn process_range_multicall(
     let mut active_groups: Vec<GroupInfo> = Vec::new();
 
     for ((contract_name, function_name), configs) in &grouped_configs {
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
@@ -2814,7 +2814,7 @@ pub(crate) async fn process_range_multicall(
             results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let result_count = results.len();
-            let file_name = range.file_name();
+            let file_name = range.file_name("");
             let sub_dir = output_dir
                 .join(&group.contract_name)
                 .join(&group.function_name);
@@ -3278,7 +3278,7 @@ pub(crate) async fn process_token_range_multicall(
 
     for ((token_name, function_name), configs) in &grouped_configs {
         let output_name = format!("{}_pool", token_name);
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
 
         if existing_files.contains(&rel_path) {
@@ -3465,7 +3465,7 @@ pub(crate) async fn process_token_range_multicall(
             results.sort_by_key(|r| (r.block_number, r.contract_address));
 
             let result_count = results.len();
-            let file_name = range.file_name();
+            let file_name = range.file_name("");
             let sub_dir = output_dir
                 .join(&group.output_name)
                 .join(&group.function_name);
@@ -3574,7 +3574,7 @@ pub(crate) async fn process_token_range(
 
     for ((token_name, function_name), configs) in &grouped_configs {
         let output_name = format!("{}_pool", token_name);
-        let file_name = range.file_name();
+        let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
 
         if existing_files.contains(&rel_path) {
