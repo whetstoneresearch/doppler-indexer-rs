@@ -31,6 +31,7 @@
 
 mod cached;
 mod data_loader;
+pub mod decoded_index;
 mod error;
 mod initial_sync;
 mod local;

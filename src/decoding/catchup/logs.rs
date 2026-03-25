@@ -15,6 +15,7 @@ use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -283,29 +284,6 @@ fn get_missing_matchers(
         .collect();
 
     (missing_regular, missing_factory)
-}
-
-/// Scan existing decoded files
-fn scan_existing_decoded_files(output_base: &Path) -> HashSet<String> {
-    let mut files = HashSet::new();
-
-    fn scan_recursive(dir: &Path, base: &Path, files: &mut HashSet<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_recursive(&path, base, files);
-                } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                    if let Ok(rel) = path.strip_prefix(base) {
-                        files.insert(rel.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    scan_recursive(output_base, output_base, &mut files);
-    files
 }
 
 /// Load factory addresses from parquet files for catchup
