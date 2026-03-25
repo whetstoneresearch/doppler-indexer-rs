@@ -18,6 +18,8 @@ use crate::decoding::eth_calls::{
     process_event_calls, process_once_calls, process_regular_calls, CallDecodeConfig,
     EthCallDecodingError, EventCallDecodeConfig,
 };
+use crate::decoding::types::{EthCallResult, EventCallResult};
+use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::parquet_readers::{
     read_event_calls_from_parquet, read_regular_calls_from_parquet,
 };
@@ -531,6 +533,180 @@ pub async fn catchup_decode_eth_calls(
     Ok(())
 }
 
+/// Read regular call results from parquet
+pub fn read_regular_calls_from_parquet(
+    path: &Path,
+) -> Result<Vec<EthCallResult>, EthCallDecodingError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut results = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let schema = batch.schema();
+
+        let block_number_idx = schema.index_of("block_number").ok();
+        let block_timestamp_idx = schema.index_of("block_timestamp").ok();
+        let address_idx = schema.index_of("address").ok();
+        let value_idx = schema.index_of("value").ok();
+
+        for row in 0..batch.num_rows() {
+            let block_number = block_number_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let block_timestamp = block_timestamp_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let contract_address = address_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<FixedSizeBinaryArray>()
+                        .and_then(|a| {
+                            let bytes = a.value(row);
+                            if bytes.len() == 20 {
+                                let mut arr = [0u8; 20];
+                                arr.copy_from_slice(bytes);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .unwrap_or_default();
+
+            let value = value_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .map(|a| a.value(row).to_vec())
+                })
+                .unwrap_or_default();
+
+            results.push(EthCallResult {
+                block_number,
+                block_timestamp,
+                contract_address,
+                value,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Read event-triggered call results from parquet
+pub fn read_event_calls_from_parquet(
+    path: &Path,
+) -> Result<Vec<EventCallResult>, EthCallDecodingError> {
+    use arrow::array::UInt32Array;
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut results = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let schema = batch.schema();
+
+        let block_number_idx = schema.index_of("block_number").ok();
+        let block_timestamp_idx = schema.index_of("block_timestamp").ok();
+        let log_index_idx = schema.index_of("log_index").ok();
+        let address_idx = schema.index_of("target_address").ok();
+        let value_idx = schema.index_of("value").ok();
+
+        for row in 0..batch.num_rows() {
+            let block_number = block_number_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let block_timestamp = block_timestamp_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let log_index = log_index_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(0);
+
+            let target_address = address_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<FixedSizeBinaryArray>()
+                        .and_then(|a| {
+                            let bytes = a.value(row);
+                            if bytes.len() == 20 {
+                                let mut arr = [0u8; 20];
+                                arr.copy_from_slice(bytes);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .unwrap_or_default();
+
+            let value = value_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .map(|a| a.value(row).to_vec())
+                })
+                .unwrap_or_default();
+
+            results.push(EventCallResult {
+                block_number,
+                block_timestamp,
+                log_index,
+                target_address,
+                value,
+            });
+        }
+    }
+
+    Ok(results)
 /// Scan existing decoded files
 fn scan_existing_decoded_files(output_base: &Path) -> HashSet<String> {
     let mut files = HashSet::new();
