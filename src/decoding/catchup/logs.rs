@@ -1,20 +1,17 @@
 //! Catchup phase for log decoding - processes existing raw log parquet files.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt32Array, UInt64Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
-use crate::raw_data::historical::eth_calls::read_factory_addresses_from_parquet;
 use crate::raw_data::historical::factories::RecollectRequest;
-use crate::raw_data::historical::receipts::LogData;
+use crate::storage::factory_data::load_factory_addresses_by_range;
+use crate::storage::parquet_readers::read_raw_logs_from_parquet;
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -72,7 +69,7 @@ pub async fn catchup_decode_logs(
     );
 
     // Load factory addresses from factory parquet files for catchup
-    let factory_addresses = Arc::new(load_factory_addresses_for_catchup(chain)?);
+    let factory_addresses = Arc::new(load_factory_addresses_by_range(&chain.name)?);
 
     let total_factory_addrs: usize = factory_addresses
         .values()
@@ -153,7 +150,7 @@ pub async fn catchup_decode_logs(
 
             // Read raw logs from parquet
             let file_path_for_read = file_path.clone();
-            let logs = match read_logs_from_parquet(&file_path_for_read) {
+            let logs = match read_raw_logs_from_parquet(&file_path_for_read) {
                 Ok(logs) => logs,
                 Err(e) => {
                     tracing::warn!(
@@ -306,215 +303,4 @@ fn scan_existing_decoded_files(output_base: &Path) -> HashSet<String> {
 
     scan_recursive(output_base, output_base, &mut files);
     files
-}
-
-/// Load factory addresses from parquet files for catchup
-fn load_factory_addresses_for_catchup(
-    chain: &ChainConfig,
-) -> Result<HashMap<u64, HashMap<String, HashSet<[u8; 20]>>>, LogDecodingError> {
-    let mut result: HashMap<u64, HashMap<String, HashSet<[u8; 20]>>> = HashMap::new();
-
-    // Look for factory parquet files
-    let factories_dir = PathBuf::from(format!("data/{}/historical/factories", chain.name));
-    if !factories_dir.exists() {
-        return Ok(result);
-    }
-
-    // Scan factory directories
-    if let Ok(entries) = std::fs::read_dir(&factories_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let collection_name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            // Read parquet files in this collection
-            if let Ok(files) = std::fs::read_dir(&path) {
-                for file_entry in files.flatten() {
-                    let file_path = file_entry.path();
-                    if !file_path
-                        .extension()
-                        .map(|e| e == "parquet")
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-
-                    // Parse range from filename
-                    let file_name = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
-                    let parts: Vec<&str> = range_str.split('-').collect();
-                    if parts.len() != 2 {
-                        continue;
-                    }
-
-                    let range_start: u64 = match parts[0].parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    // Read addresses from parquet
-                    if let Ok(addresses) = read_factory_addresses_from_parquet(&file_path) {
-                        result
-                            .entry(range_start)
-                            .or_default()
-                            .entry(collection_name.clone())
-                            .or_default()
-                            .extend(addresses);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-/// Read logs from a raw parquet file
-pub fn read_logs_from_parquet(path: &Path) -> Result<Vec<LogData>, LogDecodingError> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-
-    let mut logs = Vec::new();
-
-    for batch_result in reader {
-        let batch = batch_result?;
-        let schema = batch.schema();
-
-        let block_number_idx = schema.index_of("block_number").ok();
-        let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let tx_hash_idx = schema.index_of("transaction_hash").ok();
-        let log_index_idx = schema.index_of("log_index").ok();
-        let address_idx = schema.index_of("address").ok();
-        let topics_idx = schema.index_of("topics").ok();
-        let data_idx = schema.index_of("data").ok();
-
-        for row in 0..batch.num_rows() {
-            let block_number = block_number_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .map(|a| a.value(row))
-                })
-                .unwrap_or(0);
-
-            let block_timestamp = block_timestamp_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .map(|a| a.value(row))
-                })
-                .unwrap_or(0);
-
-            let transaction_hash = tx_hash_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .and_then(|a| {
-                            let bytes = a.value(row);
-                            if bytes.len() == 32 {
-                                let mut arr = [0u8; 32];
-                                arr.copy_from_slice(bytes);
-                                Some(alloy::primitives::B256::from(arr))
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .unwrap_or_default();
-
-            let log_index = log_index_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<UInt32Array>()
-                        .map(|a| a.value(row))
-                })
-                .unwrap_or(0);
-
-            let address = address_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .and_then(|a| {
-                            let bytes = a.value(row);
-                            if bytes.len() == 20 {
-                                let mut arr = [0u8; 20];
-                                arr.copy_from_slice(bytes);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .unwrap_or_default();
-
-            let topics = topics_idx
-                .and_then(|i| {
-                    use arrow::array::ListArray;
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .and_then(|list| {
-                            let values = list.value(row);
-                            values.as_any().downcast_ref::<FixedSizeBinaryArray>().map(
-                                |topics_arr| {
-                                    (0..topics_arr.len())
-                                        .filter_map(|j| {
-                                            let bytes = topics_arr.value(j);
-                                            if bytes.len() == 32 {
-                                                let mut arr = [0u8; 32];
-                                                arr.copy_from_slice(bytes);
-                                                Some(arr)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect::<Vec<[u8; 32]>>()
-                                },
-                            )
-                        })
-                })
-                .unwrap_or_default();
-
-            let data = data_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .map(|a| a.value(row).to_vec())
-                })
-                .unwrap_or_default();
-
-            logs.push(LogData {
-                block_number,
-                block_timestamp,
-                transaction_hash,
-                log_index,
-                address,
-                topics,
-                data,
-            });
-        }
-    }
-
-    Ok(logs)
 }
