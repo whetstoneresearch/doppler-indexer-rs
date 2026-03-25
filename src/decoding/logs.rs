@@ -43,6 +43,9 @@ pub enum LogDecodingError {
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
 
+    #[error("Parquet read error: {0}")]
+    ParquetRead(#[from] crate::storage::parquet_readers::ParquetReadError),
+
     #[error("Event parsing error: {0}")]
     EventParse(#[from] super::event_parsing::EventParseError),
 
