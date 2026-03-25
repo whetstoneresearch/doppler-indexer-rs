@@ -12,7 +12,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::{ArrowWriter, ProjectionMask};
+use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
@@ -44,6 +44,16 @@ pub enum FactoryCollectionError {
 
     #[error("Task join error: {0}")]
     JoinError(String),
+}
+
+impl From<crate::storage::parquet::ParquetReadError> for FactoryCollectionError {
+    fn from(err: crate::storage::parquet::ParquetReadError) -> Self {
+        match err {
+            crate::storage::parquet::ParquetReadError::Io(e) => Self::Io(e),
+            crate::storage::parquet::ParquetReadError::Parquet(e) => Self::Parquet(e),
+            crate::storage::parquet::ParquetReadError::Arrow(e) => Self::Arrow(e),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -291,35 +301,14 @@ pub(crate) async fn process_range(
 }
 
 /// Read log batches from a parquet file with column projection.
-/// Only reads block_number, block_timestamp, address, topics, data — skips transaction_hash and log_index.
+///
+/// Delegates to the shared reader in `storage::parquet::logs`.
 pub(crate) fn read_log_batches_from_parquet(
     file_path: &Path,
 ) -> Result<Vec<RecordBatch>, FactoryCollectionError> {
-    let file = File::open(file_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let arrow_schema = builder.schema().clone();
-
-    let needed = [
-        "block_number",
-        "block_timestamp",
-        "address",
-        "topics",
-        "data",
-    ];
-    let root_indices: Vec<usize> = needed
-        .iter()
-        .filter_map(|name| arrow_schema.index_of(name).ok())
-        .collect();
-
-    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
-    let reader = builder.with_projection(mask).build()?;
-
-    let mut batches = Vec::new();
-    for batch_result in reader {
-        batches.push(batch_result?);
-    }
-
-    Ok(batches)
+    Ok(crate::storage::parquet::logs::read_log_batches_projected(
+        file_path,
+    )?)
 }
 
 /// Process log record batches using Arrow-native column access.

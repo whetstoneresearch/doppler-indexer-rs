@@ -25,6 +25,16 @@ pub enum EthCallDecodingError {
     JoinError(String),
 }
 
+impl From<crate::storage::parquet::ParquetReadError> for EthCallDecodingError {
+    fn from(err: crate::storage::parquet::ParquetReadError) -> Self {
+        match err {
+            crate::storage::parquet::ParquetReadError::Io(e) => Self::Io(e),
+            crate::storage::parquet::ParquetReadError::Parquet(e) => Self::Parquet(e),
+            crate::storage::parquet::ParquetReadError::Arrow(e) => Self::Arrow(e),
+        }
+    }
+}
+
 /// Configuration for a call to decode
 #[derive(Debug, Clone)]
 pub struct CallDecodeConfig {

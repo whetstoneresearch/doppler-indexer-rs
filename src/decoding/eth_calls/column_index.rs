@@ -6,107 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array};
+use arrow::array::{Array, FixedSizeBinaryArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
-use super::{CallDecodeConfig, EthCallDecodingError};
-use crate::decoding::types::OnceCallResult;
-
-/// Read "once" call results from parquet
-pub fn read_once_calls_from_parquet(
-    path: &Path,
-    configs: &[&CallDecodeConfig],
-) -> Result<Vec<OnceCallResult>, EthCallDecodingError> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-
-    let mut results = Vec::new();
-
-    for batch_result in reader {
-        let batch = batch_result?;
-        let schema = batch.schema();
-
-        let block_number_idx = schema.index_of("block_number").ok();
-        let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema
-            .index_of("address")
-            .or_else(|_| schema.index_of("address"))
-            .ok();
-
-        // Find function result columns
-        let function_indices: Vec<(String, Option<usize>)> = configs
-            .iter()
-            .map(|c| {
-                let col_name = format!("{}_result", c.function_name);
-                (c.function_name.clone(), schema.index_of(&col_name).ok())
-            })
-            .collect();
-
-        for row in 0..batch.num_rows() {
-            let block_number = block_number_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .map(|a| a.value(row))
-                })
-                .unwrap_or(0);
-
-            let block_timestamp = block_timestamp_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .map(|a| a.value(row))
-                })
-                .unwrap_or(0);
-
-            let contract_address = address_idx
-                .and_then(|i| {
-                    batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .and_then(|a| {
-                            let bytes = a.value(row);
-                            if bytes.len() == 20 {
-                                let mut arr = [0u8; 20];
-                                arr.copy_from_slice(bytes);
-                                Some(arr)
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .unwrap_or_default();
-
-            let mut function_results = HashMap::new();
-            for (function_name, idx_opt) in &function_indices {
-                if let Some(idx) = idx_opt {
-                    if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<BinaryArray>() {
-                        if !arr.is_null(row) {
-                            function_results.insert(function_name.clone(), arr.value(row).to_vec());
-                        }
-                    }
-                }
-            }
-
-            results.push(OnceCallResult {
-                block_number,
-                block_timestamp,
-                contract_address,
-                results: function_results,
-            });
-        }
-    }
-
-    Ok(results)
-}
+use super::EthCallDecodingError;
 
 // ============================================================================
 // Column Index Functions for Decoded Data
@@ -459,29 +364,3 @@ pub fn read_raw_column_index(raw_once_dir: &Path) -> HashMap<String, Vec<String>
     }
 }
 
-/// Read function names from a raw parquet file's schema.
-/// Raw columns are named like `{function_name}_result` -> returns `function_name`.
-pub fn read_raw_parquet_function_names(path: &Path) -> HashSet<String> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return HashSet::new(),
-    };
-
-    let reader = match SerializedFileReader::new(file) {
-        Ok(r) => r,
-        Err(_) => return HashSet::new(),
-    };
-
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let mut fn_names = HashSet::new();
-
-    for field in schema.columns() {
-        let name = field.name();
-        // Extract function name from column name (e.g., "getAssetData_result" -> "getAssetData")
-        if let Some(fn_name) = name.strip_suffix("_result") {
-            fn_names.insert(fn_name.to_string());
-        }
-    }
-
-    fn_names
-}

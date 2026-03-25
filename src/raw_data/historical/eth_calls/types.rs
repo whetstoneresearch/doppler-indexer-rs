@@ -37,6 +37,16 @@ pub enum EthCallCollectionError {
     EventParamExtraction(String),
 }
 
+impl From<crate::storage::parquet::ParquetReadError> for EthCallCollectionError {
+    fn from(err: crate::storage::parquet::ParquetReadError) -> Self {
+        match err {
+            crate::storage::parquet::ParquetReadError::Io(e) => Self::Io(e),
+            crate::storage::parquet::ParquetReadError::Parquet(e) => Self::Parquet(e),
+            crate::storage::parquet::ParquetReadError::Arrow(e) => Self::Arrow(e),
+        }
+    }
+}
+
 // BlockRange is now in crate::storage::ranges and re-exported from crate::storage.
 pub use crate::storage::BlockRange;
 

@@ -229,32 +229,10 @@ pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String
 }
 
 /// Read column names from a parquet file's schema (for fallback when index is missing).
-/// Returns function names by stripping the `_result` suffix from column names.
+///
+/// Delegates to the shared reader in `storage::parquet::schema`.
 pub(crate) fn read_parquet_column_names(path: &Path) -> HashSet<String> {
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return HashSet::new(),
-    };
-
-    let reader = match SerializedFileReader::new(file) {
-        Ok(r) => r,
-        Err(_) => return HashSet::new(),
-    };
-
-    let schema = reader.metadata().file_metadata().schema_descr();
-    let mut fn_names = HashSet::new();
-
-    for field in schema.columns() {
-        let name = field.name();
-        // Extract function name from column name (e.g., "getAssetData_result" -> "getAssetData")
-        if let Some(fn_name) = name.strip_suffix("_result") {
-            fn_names.insert(fn_name.to_string());
-        }
-    }
-
-    fn_names
+    crate::storage::parquet::schema::read_raw_parquet_function_names(path)
 }
 
 /// Find per-address null entries in `_result` columns.

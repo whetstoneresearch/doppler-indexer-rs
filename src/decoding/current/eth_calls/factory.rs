@@ -5,14 +5,13 @@ use std::path::Path;
 
 use tokio::sync::mpsc::Sender;
 
-use crate::decoding::eth_calls::column_index::{
-    load_or_build_decoded_column_index, read_once_calls_from_parquet,
-    read_raw_parquet_function_names,
-};
+use crate::decoding::eth_calls::column_index::load_or_build_decoded_column_index;
 use crate::decoding::eth_calls::{
     build_result_map, decode_value, process_once_calls, CallDecodeConfig, EthCallDecodingError,
 };
 use crate::live::{LiveDecodedOnceCall, LiveStorage};
+use crate::storage::parquet::once_calls::read_once_calls_from_parquet;
+use crate::storage::parquet::schema::read_raw_parquet_function_names;
 use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
 use crate::types::decoded::DecodedValue;
 

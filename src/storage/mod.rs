@@ -32,9 +32,11 @@
 mod cached;
 mod data_loader;
 mod error;
+pub mod factory_loader;
 mod initial_sync;
 mod local;
 mod manifest;
+pub mod parquet;
 pub mod paths;
 pub mod ranges;
 mod retry;

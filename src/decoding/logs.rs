@@ -54,6 +54,16 @@ pub enum LogDecodingError {
     JoinError(String),
 }
 
+impl From<crate::storage::parquet::ParquetReadError> for LogDecodingError {
+    fn from(err: crate::storage::parquet::ParquetReadError) -> Self {
+        match err {
+            crate::storage::parquet::ParquetReadError::Io(e) => Self::Io(e),
+            crate::storage::parquet::ParquetReadError::Parquet(e) => Self::Parquet(e),
+            crate::storage::parquet::ParquetReadError::Arrow(e) => Self::Arrow(e),
+        }
+    }
+}
+
 /// Matcher for a specific event on specific addresses
 #[derive(Debug, Clone)]
 pub(crate) struct EventMatcher {
