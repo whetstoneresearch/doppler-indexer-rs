@@ -17,7 +17,8 @@ use super::context::{
     DecodedCall, DecodedEvent, DecodedValue, HistoricalCallQuery, HistoricalEventQuery,
 };
 use super::error::TransformationError;
-use crate::storage::paths::{decoded_base_dir, scan_parquet_ranges};
+use crate::storage::decoded_index::build_decoded_file_index;
+use crate::storage::paths::decoded_base_dir;
 
 /// Reader for historical decoded data stored in parquet files.
 pub struct HistoricalDataReader {
@@ -81,30 +82,8 @@ impl HistoricalDataReader {
         base: &Path,
         index: &mut HashMap<(String, String), Vec<(u64, u64, PathBuf)>>,
     ) -> Result<(), TransformationError> {
-        // Iterate over source directories
-        for source_entry in std::fs::read_dir(base)? {
-            let source_entry = source_entry?;
-            if !source_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let source_name = source_entry.file_name().to_string_lossy().to_string();
-
-            // Iterate over event/function directories
-            for name_entry in std::fs::read_dir(source_entry.path())? {
-                let name_entry = name_entry?;
-                if !name_entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let name = name_entry.file_name().to_string_lossy().to_string();
-
-                // Find parquet files and extract ranges (already sorted by start)
-                let files = scan_parquet_ranges(&name_entry.path())?;
-
-                let key = (source_name.clone(), name);
-                index.insert(key, files);
-            }
-        }
-
+        let dir_index = build_decoded_file_index(base)?;
+        index.extend(dir_index);
         Ok(())
     }
 
