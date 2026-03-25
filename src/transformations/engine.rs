@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
@@ -421,17 +421,6 @@ impl TransformationEngine {
 
             let call_deps = handler_info.handler.call_dependencies();
 
-            let available_call_ranges: Vec<HashSet<(u64, u64)>> = call_deps
-                .iter()
-                .map(|(source, func)| {
-                    let dir = self.decoded_calls_dir.join(source).join(func);
-                    self.scan_available_ranges(&dir)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect()
-                })
-                .collect();
-
             let completed = self
                 .finalizer
                 .get_completed_ranges_for_handler(&handler_key)
@@ -456,148 +445,212 @@ impl TransformationEngine {
                 call_deps
             );
 
-            let total = to_process.len();
-            let mut processed = 0;
-            let mut skipped = 0;
-            let mut errored = false;
+            let mut ranges_to_attempt = to_process;
+            let mut pass = 0u32;
+            let mut total_processed = 0usize;
 
-            let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-            let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
-                JoinSet::new();
-
-            for (range_start, range_end) in &to_process {
-                let events = self
-                    .read_decoded_events_for_triggers(*range_start, *range_end, &event_triggers)
-                    .await?;
-
-                let events = filter_events_by_start_block(&self.contracts, events);
-
-                if !events.is_empty() && !call_deps.is_empty() {
-                    let calls_ready = available_call_ranges
-                        .iter()
-                        .all(|ranges| ranges.contains(&(*range_start, *range_end)));
-
-                    if !calls_ready {
-                        tracing::debug!(
-                            "Handler {} skipping range {}-{}: call dependencies not yet decoded",
-                            handler_key,
-                            range_start,
-                            range_end
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+            loop {
+                pass += 1;
+                if ranges_to_attempt.is_empty() {
+                    break;
                 }
 
-                let calls = if !events.is_empty() && !call_deps.is_empty() {
-                    let calls = self
-                        .read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps)
-                        .await?;
-                    filter_calls_by_start_block(&self.contracts, calls)
-                } else {
-                    Vec::new()
-                };
-
-                processed += 1;
-
-                if !events.is_empty() {
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
-                    let handler = handler.clone();
-                    let db_pool = self.db_pool.clone();
-                    let handler_key = handler_key.clone();
-                    let handler_name = handler.name();
-                    let handler_version = handler.version();
-                    let tx_addresses = self.read_receipt_addresses(*range_start, *range_end);
-                    let chain_name = self.chain_name.clone();
-                    let chain_id = self.chain_id;
-                    let historical = self.historical_reader.clone();
-                    let rpc = self.executor.rpc_client.clone();
-                    let contracts = self.contracts.clone();
-                    let rs = *range_start;
-                    let re = *range_end;
-
-                    join_set.spawn(async move {
-                        let _permit = permit;
-                        let ctx = TransformationContext::new(
-                            chain_name,
-                            chain_id,
-                            rs,
-                            re,
-                            Arc::new(events),
-                            Arc::new(calls),
-                            tx_addresses,
-                            historical,
-                            rpc,
-                            contracts,
-                        );
-
-                        match handler.handle(&ctx).await {
-                            Ok(ops) => {
-                                if !ops.is_empty() {
-                                    let ops =
-                                        inject_source_version(ops, handler_name, handler_version);
-                                    db_pool.execute_transaction(ops).await?;
-                                }
-                                Ok(Some((handler_key, rs, re)))
-                            }
-                            Err(e) => Err(e),
-                        }
-                    });
-                } else {
-                    self.finalizer
-                        .record_completed_range_for_handler(&handler_key, *range_start, *range_end)
-                        .await?;
-                }
-
-                if processed % 50 == 0 {
+                if pass > 1 {
                     tracing::info!(
-                        "Handler {} catchup progress: {}/{} (skipped {} waiting for calls)",
+                        "Handler {} catchup pass {}: retrying {} ranges waiting for call dependencies",
                         handler_key,
-                        processed,
-                        total,
-                        skipped
+                        pass,
+                        ranges_to_attempt.len()
                     );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-            }
 
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok(Ok(Some((hk, rs, re)))) => {
+                // Re-scan available call ranges from filesystem each pass
+                let available_call_ranges: Vec<HashSet<(u64, u64)>> = call_deps
+                    .iter()
+                    .map(|(source, func)| {
+                        let dir = self.decoded_calls_dir.join(source).join(func);
+                        self.scan_available_ranges(&dir)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect()
+                    })
+                    .collect();
+
+                let total = ranges_to_attempt.len();
+                let mut processed = 0;
+                let mut skipped_ranges: Vec<(u64, u64)> = Vec::new();
+                let mut errored = false;
+
+                let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
+                let mut join_set:
+                    JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+                        JoinSet::new();
+
+                for (range_start, range_end) in &ranges_to_attempt {
+                    let events = self
+                        .read_decoded_events_for_triggers(
+                            *range_start,
+                            *range_end,
+                            &event_triggers,
+                        )
+                        .await?;
+
+                    let events = filter_events_by_start_block(&self.contracts, events);
+
+                    if !events.is_empty() && !call_deps.is_empty() {
+                        let calls_ready = available_call_ranges
+                            .iter()
+                            .all(|ranges| ranges.contains(&(*range_start, *range_end)));
+
+                        if !calls_ready {
+                            tracing::debug!(
+                                "Handler {} skipping range {}-{}: call dependencies not yet decoded",
+                                handler_key,
+                                range_start,
+                                range_end
+                            );
+                            skipped_ranges.push((*range_start, *range_end));
+                            continue;
+                        }
+                    }
+
+                    let calls = if !events.is_empty() && !call_deps.is_empty() {
+                        let calls = self
+                            .read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps)
+                            .await?;
+                        filter_calls_by_start_block(&self.contracts, calls)
+                    } else {
+                        Vec::new()
+                    };
+
+                    processed += 1;
+
+                    if !events.is_empty() {
+                        let permit = semaphore.clone().acquire_owned().await.unwrap();
+                        let handler = handler.clone();
+                        let db_pool = self.db_pool.clone();
+                        let handler_key = handler_key.clone();
+                        let handler_name = handler.name();
+                        let handler_version = handler.version();
+                        let tx_addresses =
+                            self.read_receipt_addresses(*range_start, *range_end);
+                        let chain_name = self.chain_name.clone();
+                        let chain_id = self.chain_id;
+                        let historical = self.historical_reader.clone();
+                        let rpc = self.executor.rpc_client.clone();
+                        let contracts = self.contracts.clone();
+                        let rs = *range_start;
+                        let re = *range_end;
+
+                        join_set.spawn(async move {
+                            let _permit = permit;
+                            let ctx = TransformationContext::new(
+                                chain_name,
+                                chain_id,
+                                rs,
+                                re,
+                                Arc::new(events),
+                                Arc::new(calls),
+                                tx_addresses,
+                                historical,
+                                rpc,
+                                contracts,
+                            );
+
+                            match handler.handle(&ctx).await {
+                                Ok(ops) => {
+                                    if !ops.is_empty() {
+                                        let ops = inject_source_version(
+                                            ops,
+                                            handler_name,
+                                            handler_version,
+                                        );
+                                        db_pool.execute_transaction(ops).await?;
+                                    }
+                                    Ok(Some((handler_key, rs, re)))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        });
+                    } else {
                         self.finalizer
-                            .record_completed_range_for_handler(&hk, rs, re)
+                            .record_completed_range_for_handler(
+                                &handler_key,
+                                *range_start,
+                                *range_end,
+                            )
                             .await?;
                     }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!(
-                            "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
-                            handler_key, e
+
+                    if processed % 50 == 0 {
+                        tracing::info!(
+                            "Handler {} catchup pass {} progress: {}/{} (skipped {} waiting for calls)",
+                            handler_key,
+                            pass,
+                            processed,
+                            total,
+                            skipped_ranges.len()
                         );
-                        errored = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                        errored = true;
-                        break;
                     }
                 }
-            }
 
-            if skipped > 0 {
-                tracing::info!(
-                    "Handler {} catchup: skipped {} ranges waiting for call dependencies to be decoded",
-                    handler_key,
-                    skipped
-                );
-            }
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok(Ok(Some((hk, rs, re)))) => {
+                            self.finalizer
+                                .record_completed_range_for_handler(&hk, rs, re)
+                                .await?;
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
+                                handler_key, e
+                            );
+                            errored = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Handler {} catchup task panicked: {}",
+                                handler_key,
+                                e
+                            );
+                            errored = true;
+                            break;
+                        }
+                    }
+                }
 
-            if !errored {
-                tracing::info!(
-                    "Handler {} catchup complete: processed {} ranges",
-                    handler_key,
-                    processed
-                );
+                total_processed += processed;
+
+                if errored {
+                    break;
+                }
+
+                if skipped_ranges.is_empty() {
+                    tracing::info!(
+                        "Handler {} catchup complete in {} pass(es): processed {} ranges",
+                        handler_key,
+                        pass,
+                        total_processed
+                    );
+                    break;
+                }
+
+                if skipped_ranges.len() == ranges_to_attempt.len() {
+                    tracing::warn!(
+                        "Handler {} catchup: no progress on {} ranges still waiting for call dependencies after {} pass(es). Giving up.",
+                        handler_key,
+                        skipped_ranges.len(),
+                        pass
+                    );
+                    break;
+                }
+
+                // Progress was made, retry the skipped ranges
+                ranges_to_attempt = skipped_ranges;
             }
         }
 
