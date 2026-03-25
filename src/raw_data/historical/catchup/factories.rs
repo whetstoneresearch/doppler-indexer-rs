@@ -72,13 +72,24 @@ pub async fn collect_factories(
                 });
 
             if let Some(ref tx) = log_decoder_tx {
-                let _ = tx
+                if tx
                     .send(DecoderMessage::FactoryAddresses {
                         range_start: factory_data.range_start,
                         range_end: factory_data.range_end,
                         addresses,
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        "Failed to send factory addresses to log decoder for range {}-{} - receiver dropped",
+                        factory_data.range_start, factory_data.range_end
+                    );
+                    return Err(FactoryCollectionError::ChannelSend(format!(
+                        "log_decoder_tx (existing factory data {}-{}) - receiver dropped",
+                        factory_data.range_start, factory_data.range_end
+                    )));
+                }
             }
         }
     }
@@ -315,13 +326,24 @@ pub async fn collect_factories(
                 });
 
             if let Some(ref tx) = log_decoder_tx {
-                let _ = tx
+                if tx
                     .send(DecoderMessage::FactoryAddresses {
                         range_start: factory_data.range_start,
                         range_end: factory_data.range_end,
                         addresses,
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        "Failed to send factory addresses to log decoder for range {}-{} - receiver dropped",
+                        factory_data.range_start, factory_data.range_end
+                    );
+                    return Err(FactoryCollectionError::ChannelSend(format!(
+                        "log_decoder_tx (catchup factory data {}-{}) - receiver dropped",
+                        factory_data.range_start, factory_data.range_end
+                    )));
+                }
             }
 
             catchup_count += 1;
