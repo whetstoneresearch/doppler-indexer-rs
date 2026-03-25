@@ -707,6 +707,8 @@ pub fn read_event_calls_from_parquet(
     }
 
     Ok(results)
+}
+
 /// Scan existing decoded files
 fn scan_existing_decoded_files(output_base: &Path) -> HashSet<String> {
     let mut files = HashSet::new();

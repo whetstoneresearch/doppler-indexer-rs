@@ -584,10 +584,23 @@ impl LiveCollector {
             }
         }
 
-        // Broadcast reorg to decoder channels
+        // Compute which blocks were actually cleaned up
+        let successfully_deleted: Vec<u64> = event
+            .orphaned
+            .iter()
+            .filter(|b| !failed_deletions.contains(b))
+            .copied()
+            .collect();
+
+        // If ALL deletions failed, don't broadcast stale reorg data — fail immediately
+        if successfully_deleted.is_empty() && !failed_deletions.is_empty() {
+            return Err(CollectorError::ReorgCleanupFailed(failed_deletions));
+        }
+
+        // Broadcast reorg to decoder channels (only for successfully deleted blocks)
         broadcast_reorg_to_decoders(
             event.common_ancestor,
-            &event.orphaned,
+            &successfully_deleted,
             log_decoder_tx,
             eth_call_decoder_tx,
         )
@@ -598,7 +611,7 @@ impl LiveCollector {
             if let Err(e) = transform_tx
                 .send(ReorgMessage {
                     common_ancestor: event.common_ancestor,
-                    orphaned: event.orphaned.clone(),
+                    orphaned: successfully_deleted.clone(),
                 })
                 .await
             {
@@ -613,12 +626,12 @@ impl LiveCollector {
         live_tx
             .send(LiveMessage::Reorg {
                 common_ancestor: event.common_ancestor,
-                orphaned: event.orphaned.clone(),
+                orphaned: successfully_deleted.clone(),
             })
             .await
             .map_err(|_| CollectorError::ChannelClosed)?;
 
-        // Return error if any deletions failed
+        // Return error if any deletions failed (partial failure)
         if !failed_deletions.is_empty() {
             return Err(CollectorError::ReorgCleanupFailed(failed_deletions));
         }

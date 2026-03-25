@@ -179,7 +179,7 @@ impl LiveCatchupService {
         let receipts_exist = self.storage.read_receipts(block_number).is_ok();
         let logs_exist = self.storage.read_logs(block_number).is_ok();
         let eth_calls_exist = self.storage.read_eth_calls(block_number).is_ok();
-        let _factories_exist = self.storage.read_factories(block_number).is_ok();
+        let factories_exist = self.storage.read_factories(block_number).is_ok();
 
         // If we have the block, mark collection phases as complete
         if block_exists {
@@ -193,8 +193,8 @@ impl LiveCatchupService {
         if logs_exist {
             status.logs_collected = true;
         }
-        // Factories are optional - mark as extracted if we have logs (extraction happens during collection)
-        if logs_exist {
+        // Factories are optional - mark as extracted only if factory data actually exists
+        if factories_exist {
             status.factories_extracted = true;
         }
 

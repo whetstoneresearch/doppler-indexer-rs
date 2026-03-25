@@ -324,16 +324,25 @@ impl LiveStorage {
 
         let file = fs::File::create(&temp_path)?;
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, status)?;
 
-        writer.flush()?;
-        writer
-            .into_inner()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-            .sync_all()?;
+        // Wrap write+flush+sync+rename so we can clean up the temp file on any failure
+        let result = (|| -> Result<(), StorageError> {
+            serde_json::to_writer_pretty(&mut writer, status)?;
+            writer.flush()?;
+            writer
+                .into_inner()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .sync_all()?;
+            fs::rename(&temp_path, &path)?;
+            Ok(())
+        })();
 
-        fs::rename(&temp_path, &path)?;
-        Ok(())
+        if let Err(e) = &result {
+            tracing::debug!("Cleaning up temp file after status write error: {:?} ({})", temp_path, e);
+            let _ = fs::remove_file(&temp_path);
+        }
+
+        result
     }
 
     /// Read status for a block.
@@ -395,22 +404,30 @@ impl LiveStorage {
         );
         let temp_path = path.with_file_name(temp_name);
 
-        {
-            let temp_file = fs::File::create(&temp_path)?;
-            let mut writer = BufWriter::new(temp_file);
-            serde_json::to_writer_pretty(&mut writer, &status)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-                .sync_all()?;
-        }
+        let result = (|| -> Result<(), StorageError> {
+            {
+                let temp_file = fs::File::create(&temp_path)?;
+                let mut writer = BufWriter::new(temp_file);
+                serde_json::to_writer_pretty(&mut writer, &status)?;
+                writer.flush()?;
+                writer
+                    .into_inner()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                    .sync_all()?;
+            }
 
-        fs::rename(&temp_path, &path)?;
+            fs::rename(&temp_path, &path)?;
+            Ok(())
+        })();
+
+        if let Err(e) = &result {
+            tracing::debug!("Cleaning up temp file after atomic status write error: {:?} ({})", temp_path, e);
+            let _ = fs::remove_file(&temp_path);
+        }
 
         // lock_file dropped here, releasing the exclusive lock
 
-        Ok(())
+        result
     }
 
     /// Delete status for a block.
@@ -814,16 +831,25 @@ fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), Sto
 
     let file = fs::File::create(&temp_path)?;
     let mut writer = BufWriter::new(file);
-    bincode::serialize_into(&mut writer, data)?;
 
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-        .sync_all()?;
+    // Wrap write+flush+sync+rename so we can clean up the temp file on any failure
+    let result = (|| -> Result<(), StorageError> {
+        bincode::serialize_into(&mut writer, data)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .sync_all()?;
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
 
-    fs::rename(&temp_path, path)?;
-    Ok(())
+    if let Err(e) = &result {
+        tracing::debug!("Cleaning up temp file after write error: {:?} ({})", temp_path, e);
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    result
 }
 
 fn read_bincode<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
