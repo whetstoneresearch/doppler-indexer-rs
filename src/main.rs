@@ -169,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create a cancellation token for graceful shutdown of background S3 tasks
     let shutdown_token = CancellationToken::new();
+    let mut s3_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // Start periodic manifest refresh and other S3 services if enabled
     if storage_manager.is_s3_enabled() {
@@ -182,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(60);
 
         let token = shutdown_token.clone();
-        tokio::spawn(async move {
+        s3_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
             loop {
                 tokio::select! {
@@ -199,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-        });
+        }));
 
         tracing::info!(
             "Periodic manifest refresh enabled (every {}s)",
@@ -215,13 +216,13 @@ async fn main() -> anyhow::Result<()> {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             let token = shutdown_token.clone();
             // Bridge cancellation token to oneshot for RetryQueue::run()
-            tokio::spawn(async move {
+            s3_tasks.push(tokio::spawn(async move {
                 token.cancelled().await;
                 let _ = tx.send(());
-            });
-            tokio::spawn(async move {
+            }));
+            s3_tasks.push(tokio::spawn(async move {
                 queue_handle.run(rx).await;
-            });
+            }));
             tracing::info!("Retry queue service started");
         }
 
@@ -255,15 +256,15 @@ async fn main() -> anyhow::Result<()> {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             let token = shutdown_token.clone();
             // Bridge cancellation token to oneshot for InitialSyncService::run()
-            tokio::spawn(async move {
+            s3_tasks.push(tokio::spawn(async move {
                 token.cancelled().await;
                 let _ = tx.send(());
-            });
-            tokio::spawn(async move {
+            }));
+            s3_tasks.push(tokio::spawn(async move {
                 if let Err(e) = initial_sync.run(rx).await {
                     tracing::error!("Initial S3 sync failed: {}", e);
                 }
-            });
+            }));
 
             tracing::info!("Initial S3 sync service started");
         }
@@ -300,8 +301,26 @@ async fn main() -> anyhow::Result<()> {
 
     // Signal all background tasks to shut down
     shutdown_token.cancel();
-    // Give them a moment to flush state
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Wait for S3 background tasks to finish gracefully
+    let shutdown_deadline = std::time::Duration::from_secs(5);
+    for (i, handle) in s3_tasks.into_iter().enumerate() {
+        match tokio::time::timeout(shutdown_deadline, handle).await {
+            Ok(Ok(())) => {
+                tracing::debug!("S3 background task {} shut down cleanly", i);
+            }
+            Ok(Err(e)) => {
+                tracing::error!("S3 background task {} panicked during shutdown: {}", i, e);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "S3 background task {} did not finish within {:?} timeout",
+                    i,
+                    shutdown_deadline
+                );
+            }
+        }
+    }
 
     tracing::info!("All chains processed successfully");
     Ok(())
