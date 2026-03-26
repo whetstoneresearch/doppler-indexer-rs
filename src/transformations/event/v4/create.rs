@@ -8,9 +8,9 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
-use crate::transformations::util::db::pool::insert_pool;
-use crate::transformations::util::db::token::insert_token;
-use crate::transformations::util::db::v4_pool_configs::insert_pool_config;
+use crate::transformations::util::db::pool::{insert_pool, PoolData};
+use crate::transformations::util::db::token::{insert_token, TokenData};
+use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
 use crate::transformations::util::metadata::get_metadata;
 
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
@@ -105,61 +105,67 @@ impl TransformationHandler for V4CreateHandler {
             };
 
             ops.push(insert_token(
-                event.block_number,
-                event.block_timestamp,
-                &event.transaction_hash,
-                ctx.tx_from(&event.transaction_hash),
-                Some(&asset_metadata.integrator.into()),
-                &asset,
-                Some(&PoolAddressOrPoolId::PoolId(pool_id.0)),
-                &asset_metadata.name,
-                &asset_metadata.symbol,
-                asset_metadata.decimals,
-                Some(&asset_metadata.total_supply),
-                Some(&asset_metadata.token_uri),
-                true,
-                false,
-                false,
-                None,
-                Some(&asset_metadata.governance),
+                &TokenData {
+                    block_number: event.block_number,
+                    block_timestamp: event.block_timestamp,
+                    tx_hash: &event.transaction_hash,
+                    creator_address: ctx.tx_from(&event.transaction_hash),
+                    integrator: Some(&asset_metadata.integrator.into()),
+                    token_address: &asset,
+                    pool: Some(&PoolAddressOrPoolId::PoolId(pool_id.0)),
+                    name: &asset_metadata.name,
+                    symbol: &asset_metadata.symbol,
+                    decimals: asset_metadata.decimals,
+                    total_supply: Some(&asset_metadata.total_supply),
+                    token_uri: Some(&asset_metadata.token_uri),
+                    is_derc20: true,
+                    is_creator_coin: false,
+                    is_content_coin: false,
+                    creator_coin_pool: None,
+                    governance: Some(&asset_metadata.governance),
+                },
                 ctx,
             ));
 
             ops.push(insert_token(
-                event.block_number,
-                event.block_timestamp,
-                &event.transaction_hash,
-                None,
-                None,
-                &numeraire,
-                None,
-                &numeraire_metadata.name,
-                &numeraire_metadata.symbol,
-                numeraire_metadata.decimals,
-                None,
-                None,
-                false,
-                false,
-                false,
-                None,
-                None,
+                &TokenData {
+                    block_number: event.block_number,
+                    block_timestamp: event.block_timestamp,
+                    tx_hash: &event.transaction_hash,
+                    creator_address: None,
+                    integrator: None,
+                    token_address: &numeraire,
+                    pool: None,
+                    name: &numeraire_metadata.name,
+                    symbol: &numeraire_metadata.symbol,
+                    decimals: numeraire_metadata.decimals,
+                    total_supply: None,
+                    token_uri: None,
+                    is_derc20: false,
+                    is_creator_coin: false,
+                    is_content_coin: false,
+                    creator_coin_pool: None,
+                    governance: None,
+                },
                 ctx,
             ));
 
             ops.push(insert_pool_config(
-                pool_id.into(),
-                hook,
-                pool_config.num_tokens_to_sell,
-                pool_config.min_proceeds,
-                pool_config.max_proceeds,
-                pool_config.starting_time,
-                pool_config.ending_time,
-                pool_config.starting_tick,
-                pool_config.ending_tick,
-                pool_config.epoch_length,
-                pool_config.gamma,
-                pool_config.is_token_0,
-                pool_config.num_pd_slugs,
+                &PoolConfigData {
+                    pool_id: pool_id.into(),
+                    hook_address: hook,
+                    num_tokens_to_sell: pool_config.num_tokens_to_sell,
+                    min_proceeds: pool_config.min_proceeds,
+                    max_proceeds: pool_config.max_proceeds,
+                    starting_time: pool_config.starting_time,
+                    ending_time: pool_config.ending_time,
+                    starting_tick: pool_config.starting_tick,
+                    ending_tick: pool_config.ending_tick,
+                    epoch_length: pool_config.epoch_length,
+                    gamma: pool_config.gamma,
+                    is_token_0: pool_config.is_token_0,
+                    num_pd_slugs: pool_config.num_pd_slugs,
+                },
                 ctx,
             ));
 
@@ -183,27 +189,29 @@ impl TransformationHandler for V4CreateHandler {
                 .unwrap_or("unknown");
 
             ops.push(insert_pool(
-                event.block_number,
-                event.block_timestamp,
-                PoolAddressOrPoolId::PoolId(pool_id.into()),
-                &asset,
-                &numeraire,
-                pool_config.is_token_0,
-                "v4",
-                asset_metadata.integrator.into(),
-                asset_metadata.initializer.into(),
-                pool_key.fee,
-                pool_config.min_proceeds,
-                pool_config.max_proceeds,
-                asset_metadata.migrator.into(),
-                None,
-                asset_metadata.migration_pool,
-                migration_type,
-                None,
-                None,
-                pool_key,
-                pool_config.starting_time,
-                pool_config.ending_time,
+                &PoolData {
+                    block_number: event.block_number,
+                    block_timestamp: event.block_timestamp,
+                    address: PoolAddressOrPoolId::PoolId(pool_id.into()),
+                    base_token: asset,
+                    quote_token: numeraire,
+                    is_token_0: pool_config.is_token_0,
+                    pool_type: "v4".to_string(),
+                    integrator: asset_metadata.integrator.into(),
+                    initializer: asset_metadata.initializer.into(),
+                    fee: pool_key.fee,
+                    min_threshold: pool_config.min_proceeds,
+                    max_threshold: pool_config.max_proceeds,
+                    migrator: asset_metadata.migrator.into(),
+                    migrated_at: None,
+                    migration_pool: asset_metadata.migration_pool,
+                    migration_type: migration_type.to_string(),
+                    lock_duration: None,
+                    beneficiaries: None,
+                    pool_key,
+                    starting_time: pool_config.starting_time,
+                    ending_time: pool_config.ending_time,
+                },
                 ctx,
             ));
         }

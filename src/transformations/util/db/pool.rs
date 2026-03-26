@@ -31,30 +31,32 @@ impl Beneficiary {
 
 pub type BeneficiariesData = Vec<Beneficiary>;
 
-pub fn insert_pool(
-    block_number: u64,
-    block_timestamp: u64,
-    address: PoolAddressOrPoolId,
-    base_token: &[u8; 20],
-    quote_token: &[u8; 20],
-    is_token_0: bool,
-    pool_type: &str,
-    integrator: [u8; 20],
-    initializer: [u8; 20],
-    fee: u32,
-    min_threshold: U256,
-    max_threshold: U256,
-    migrator: [u8; 20],
-    migrated_at: Option<u64>,
-    migration_pool: PoolAddressOrPoolId,
-    migration_type: &str,
-    lock_duration: Option<u32>,
-    beneficiaries: Option<BeneficiariesData>,
-    pool_key: PoolKey,
-    starting_time: u64,
-    ending_time: u64,
-    ctx: &TransformationContext,
-) -> DbOperation {
+/// Domain data for inserting a pool record into the database.
+pub struct PoolData {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub address: PoolAddressOrPoolId,
+    pub base_token: [u8; 20],
+    pub quote_token: [u8; 20],
+    pub is_token_0: bool,
+    pub pool_type: String,
+    pub integrator: [u8; 20],
+    pub initializer: [u8; 20],
+    pub fee: u32,
+    pub min_threshold: U256,
+    pub max_threshold: U256,
+    pub migrator: [u8; 20],
+    pub migrated_at: Option<u64>,
+    pub migration_pool: PoolAddressOrPoolId,
+    pub migration_type: String,
+    pub lock_duration: Option<u32>,
+    pub beneficiaries: Option<BeneficiariesData>,
+    pub pool_key: PoolKey,
+    pub starting_time: u64,
+    pub ending_time: u64,
+}
+
+pub fn insert_pool(data: &PoolData, ctx: &TransformationContext) -> DbOperation {
     DbOperation::Upsert {
         table: "pools".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
@@ -85,42 +87,42 @@ pub fn insert_pool(
         ],
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
-            DbValue::Uint64(block_number),
-            DbValue::Timestamp(block_timestamp as i64),
-            match address {
-                PoolAddressOrPoolId::Address(address) => DbValue::Address(address),
-                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(pool_id),
+            DbValue::Uint64(data.block_number),
+            DbValue::Timestamp(data.block_timestamp as i64),
+            match &data.address {
+                PoolAddressOrPoolId::Address(address) => DbValue::Address(*address),
+                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(*pool_id),
             },
-            DbValue::Address(*base_token),
-            DbValue::Address(*quote_token),
-            DbValue::Bool(is_token_0),
-            DbValue::VarChar(pool_type.to_string()),
-            DbValue::Address(integrator),
-            DbValue::Address(initializer),
-            DbValue::Int32(fee as i32),
-            DbValue::Numeric(min_threshold.to_string()),
-            DbValue::Numeric(max_threshold.to_string()),
-            DbValue::Address(migrator),
-            match migrated_at {
+            DbValue::Address(data.base_token),
+            DbValue::Address(data.quote_token),
+            DbValue::Bool(data.is_token_0),
+            DbValue::VarChar(data.pool_type.clone()),
+            DbValue::Address(data.integrator),
+            DbValue::Address(data.initializer),
+            DbValue::Int32(data.fee as i32),
+            DbValue::Numeric(data.min_threshold.to_string()),
+            DbValue::Numeric(data.max_threshold.to_string()),
+            DbValue::Address(data.migrator),
+            match data.migrated_at {
                 Some(timestamp) => DbValue::Timestamp(timestamp as i64),
                 None => DbValue::Null,
             },
-            match migration_pool {
-                PoolAddressOrPoolId::Address(address) => DbValue::Address(address),
-                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(pool_id),
+            match &data.migration_pool {
+                PoolAddressOrPoolId::Address(address) => DbValue::Address(*address),
+                PoolAddressOrPoolId::PoolId(pool_id) => DbValue::Bytes32(*pool_id),
             },
-            DbValue::VarChar(migration_type.to_string()),
-            match lock_duration {
+            DbValue::VarChar(data.migration_type.clone()),
+            match data.lock_duration {
                 Some(duration) => DbValue::Int32(duration as i32),
                 None => DbValue::Null,
             },
-            match beneficiaries {
+            match &data.beneficiaries {
                 Some(beneficiaries_data) => DbValue::jsonb(beneficiaries_data),
                 None => DbValue::Null,
             },
-            DbValue::jsonb(pool_key),
-            DbValue::Timestamp(starting_time as i64),
-            DbValue::Timestamp(ending_time as i64),
+            DbValue::jsonb(&data.pool_key),
+            DbValue::Timestamp(data.starting_time as i64),
+            DbValue::Timestamp(data.ending_time as i64),
         ],
     }
 }

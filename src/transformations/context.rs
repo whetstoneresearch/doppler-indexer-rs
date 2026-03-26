@@ -421,7 +421,7 @@ pub struct TransformationContext {
     pub(crate) contracts: Arc<Contracts>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 impl TransformationContext {
     /// Create a new transformation context.
     pub fn new(

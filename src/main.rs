@@ -38,7 +38,9 @@ use raw_data::historical::receipts::{
 use rpc::{UnifiedRpcClient, WsClient};
 use runtime::{ChainRuntime, CommonChannels};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
-use transformations::{ExecutionMode, ReorgMessage, TransformationEngine};
+use transformations::{
+    ExecutionMode, ReorgMessage, TransformationEngine, TransformationEngineConfig,
+};
 use types::config::chain::ChainConfig;
 use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use types::config::indexer::IndexerConfig;
@@ -460,15 +462,17 @@ async fn process_chain_live_only(
             runtime.registry.clone(),
             runtime.db_pool.clone().unwrap(),
             rpc_client,
-            chain.name.clone(),
-            chain.chain_id,
-            ExecutionMode::Streaming, // Live-only mode always uses streaming
-            chain.contracts.clone(),
-            chain.factory_collections.clone(),
-            tc.handler_concurrency,
+            TransformationEngineConfig {
+                chain_name: chain.name.clone(),
+                chain_id: chain.chain_id,
+                mode: ExecutionMode::Streaming, // Live-only mode always uses streaming
+                contracts: chain.contracts.clone(),
+                factory_collections: chain.factory_collections.clone(),
+                handler_concurrency: tc.handler_concurrency,
+                expect_log_completion: runtime.features.has_events,
+                expect_eth_call_completion: runtime.features.has_calls,
+            },
             runtime.progress_tracker.clone(),
-            runtime.features.has_events,
-            runtime.features.has_calls,
         )
         .await
         .context("failed to create transformation engine")?;
@@ -1271,15 +1275,17 @@ async fn process_chain(
             pipeline.runtime.registry.clone(),
             pipeline.runtime.db_pool.clone().unwrap(),
             rpc_client,
-            pipeline.runtime.chain.name.clone(),
-            pipeline.runtime.chain.chain_id,
-            mode,
-            pipeline.runtime.chain.contracts.clone(),
-            pipeline.runtime.chain.factory_collections.clone(),
-            tc.handler_concurrency,
+            TransformationEngineConfig {
+                chain_name: pipeline.runtime.chain.name.clone(),
+                chain_id: pipeline.runtime.chain.chain_id,
+                mode,
+                contracts: pipeline.runtime.chain.contracts.clone(),
+                factory_collections: pipeline.runtime.chain.factory_collections.clone(),
+                handler_concurrency: tc.handler_concurrency,
+                expect_log_completion: has_events,
+                expect_eth_call_completion: has_calls,
+            },
             pipeline.runtime.progress_tracker.clone(),
-            has_events,
-            has_calls,
         )
         .await
         .context("failed to create transformation engine")?;

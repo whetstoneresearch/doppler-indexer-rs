@@ -19,15 +19,16 @@ use super::context::{
 use super::error::TransformationError;
 use crate::storage::paths::{decoded_base_dir, scan_parquet_ranges};
 
+/// Index mapping (source_name, event_or_function_name) to available parquet file ranges.
+type FileIndex = HashMap<(String, String), Vec<(u64, u64, PathBuf)>>;
+
 /// Reader for historical decoded data stored in parquet files.
 pub struct HistoricalDataReader {
     chain_name: String,
     /// Base path for decoded data
     decoded_base: PathBuf,
     /// Cache of available file ranges per (source, event/function)
-    /// Key: (source_name, event_or_function_name)
-    /// Value: Vec<(range_start, range_end, file_path)>
-    file_index: RwLock<HashMap<(String, String), Vec<(u64, u64, PathBuf)>>>,
+    file_index: RwLock<FileIndex>,
 }
 
 impl HistoricalDataReader {
@@ -79,7 +80,7 @@ impl HistoricalDataReader {
     fn index_directory(
         &self,
         base: &Path,
-        index: &mut HashMap<(String, String), Vec<(u64, u64, PathBuf)>>,
+        index: &mut FileIndex,
     ) -> Result<(), TransformationError> {
         // Iterate over source directories
         for source_entry in std::fs::read_dir(base)? {
@@ -241,7 +242,7 @@ impl HistoricalDataReader {
     #[allow(dead_code)]
     fn find_files_for_range(
         &self,
-        index: &HashMap<(String, String), Vec<(u64, u64, PathBuf)>>,
+        index: &FileIndex,
         source_filter: Option<&str>,
         name_filter: Option<&str>,
         from_block: u64,
