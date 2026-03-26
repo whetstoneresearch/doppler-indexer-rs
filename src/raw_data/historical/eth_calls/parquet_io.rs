@@ -29,7 +29,7 @@ pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
     ];
 
     for i in 0..num_params {
-        fields.push(Field::new(&format!("param_{}", i), DataType::Binary, true));
+        fields.push(Field::new(format!("param_{}", i), DataType::Binary, true));
     }
 
     Arc::new(Schema::new(fields))
@@ -95,7 +95,7 @@ pub(crate) fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
 
     for fn_name in function_names {
         fields.push(Field::new(
-            &format!("{}_result", fn_name),
+            format!("{}_result", fn_name),
             DataType::Binary,
             true,
         ));
@@ -142,8 +142,7 @@ pub(crate) fn write_once_column_index(
         index.len()
     );
     let content = serde_json::to_string_pretty(index).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             format!("JSON serialize error: {}", e),
         )
     })?;
@@ -548,7 +547,7 @@ pub(crate) fn merge_once_columns(
             continue;
         }
         fields.push(Field::new(
-            &format!("{}_result", fn_name),
+            format!("{}_result", fn_name),
             DataType::Binary,
             true,
         ));

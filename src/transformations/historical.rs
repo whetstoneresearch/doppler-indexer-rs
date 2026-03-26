@@ -714,7 +714,7 @@ fn extract_value_from_array(
         };
     }
     if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
-        return Ok(extract_struct_value(struct_arr, row)?);
+        return extract_struct_value(struct_arr, row);
     }
     if let Some(list_arr) = col.as_any().downcast_ref::<ListArray>() {
         let offsets = list_arr.offsets();

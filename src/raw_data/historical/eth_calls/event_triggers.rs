@@ -1251,7 +1251,7 @@ pub(crate) fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
     ];
 
     for i in 0..num_params {
-        fields.push(Field::new(&format!("param_{}", i), DataType::Binary, true));
+        fields.push(Field::new(format!("param_{}", i), DataType::Binary, true));
     }
 
     Arc::new(Schema::new(fields))

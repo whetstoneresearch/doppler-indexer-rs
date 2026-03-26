@@ -56,7 +56,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 TransformationError::TypeConversion("numeraire is not an address".to_string())
             })?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, &ctx);
+            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
 
             let asset_metadata;
             let numeraire_metadata;
@@ -69,9 +69,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
             }
 
             let get_state_call = ctx
-                .calls_of_type("UniswapV4MulticurveInitializer", "getState")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+                .calls_of_type("UniswapV4MulticurveInitializer", "getState").find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call for asset {} at block {} tx {}",
@@ -82,9 +80,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 })?;
 
             let num_to_sell = ctx
-                .calls_of_type("DERC20", "once")
-                .filter(|call| call.contract_address == asset)
-                .next()
+                .calls_of_type("DERC20", "once").find(|call| call.contract_address == asset)
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getAssetData call for asset {} at block {} tx {}",
@@ -180,9 +176,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 })?;
 
             let get_positions_call = ctx
-                .calls_of_type("UniswapV4MulticurveInitializer", "getPositions")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+                .calls_of_type("UniswapV4MulticurveInitializer", "getPositions").find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getPositions call for asset {} at block {} tx {}",
@@ -323,9 +317,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
             ));
 
             let beneficiaries: Option<BeneficiariesData> = ctx
-                .calls_of_type("UniswapV4MulticurveInitializer", "getBeneficiaries")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+                .calls_of_type("UniswapV4MulticurveInitializer", "getBeneficiaries").find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
                     DecodedValue::Array(elements) => elements

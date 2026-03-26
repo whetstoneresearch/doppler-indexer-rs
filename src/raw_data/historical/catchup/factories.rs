@@ -151,7 +151,7 @@ pub async fn collect_factories(
                     log_range.end - 1
                 );
                 existing_files.contains(&rel_path)
-                    || s3_manifest.as_ref().as_ref().map_or(false, |m| {
+                    || s3_manifest.as_ref().as_ref().is_some_and(|m| {
                         m.has_factories(collection, log_range.start, log_range.end - 1)
                     })
             });

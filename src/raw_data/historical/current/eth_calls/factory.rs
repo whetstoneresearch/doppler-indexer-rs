@@ -31,7 +31,7 @@ pub(super) async fn handle_factory_message(
             let range_start = factory_data.range_start;
 
             // Update factory addresses for event trigger filtering
-            for (_block, addrs) in &factory_data.addresses_by_block {
+            for addrs in factory_data.addresses_by_block.values() {
                 for (_, addr, collection_name) in addrs {
                     state
                         .factory_addresses

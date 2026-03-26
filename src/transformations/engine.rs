@@ -80,18 +80,15 @@ pub struct ReorgMessage {
 /// Execution mode for the transformation engine.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
+#[derive(Default)]
 pub enum ExecutionMode {
     /// Process data as it arrives (for live/real-time data).
+    #[default]
     Streaming,
     /// Process in larger batches (for historical catchup).
     Batch { batch_size: usize },
 }
 
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::Streaming
-    }
-}
 
 /// The transformation engine processes decoded data and invokes handlers.
 ///
@@ -1256,7 +1253,7 @@ impl TransformationEngine {
                                     self.contracts.get(&c.source_name).and_then(|ct| {
                                         ct.start_block.map(|u| u.try_into().unwrap_or(u64::MAX))
                                     });
-                                start_block.map_or(true, |sb| c.block_number >= sb)
+                                start_block.is_none_or(|sb| c.block_number >= sb)
                             })
                             .collect();
                         tracing::debug!(

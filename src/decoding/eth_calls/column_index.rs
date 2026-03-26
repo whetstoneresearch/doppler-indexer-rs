@@ -150,8 +150,7 @@ pub fn write_decoded_column_index(
         index.len()
     );
     let content = serde_json::to_string_pretty(index).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             format!("JSON serialize error: {}", e),
         )
     })?;

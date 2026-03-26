@@ -468,7 +468,7 @@ pub fn read_block_info_from_parquet(
     let file = File::open(file_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
         .build()
-        .map_err(|e| BlockCollectionError::Parquet(e))?;
+        .map_err(BlockCollectionError::Parquet)?;
 
     let mut blocks = Vec::new();
 

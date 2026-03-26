@@ -53,7 +53,7 @@ pub(crate) async fn process_factory_range(
     storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
-    for (_block, addrs) in &factory_data.addresses_by_block {
+    for addrs in factory_data.addresses_by_block.values() {
         for (_, addr, collection_name) in addrs {
             addresses_by_collection
                 .entry(collection_name.clone())
@@ -350,7 +350,7 @@ pub(crate) async fn process_factory_range_multicall(
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
-    for (_block, addrs) in &factory_data.addresses_by_block {
+    for addrs in factory_data.addresses_by_block.values() {
         for (_, addr, collection_name) in addrs {
             addresses_by_collection
                 .entry(collection_name.clone())
@@ -2398,7 +2398,7 @@ pub(crate) async fn process_range(
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
-            || s3_manifest.as_ref().map_or(false, |m| {
+            || s3_manifest.as_ref().is_some_and(|m| {
                 m.has_raw_eth_calls_granular(
                     contract_name,
                     function_name,
@@ -2661,7 +2661,7 @@ pub(crate) async fn process_range_multicall(
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
         if existing_files.contains(&rel_path)
-            || s3_manifest.as_ref().map_or(false, |m| {
+            || s3_manifest.as_ref().is_some_and(|m| {
                 m.has_raw_eth_calls_granular(
                     contract_name,
                     function_name,

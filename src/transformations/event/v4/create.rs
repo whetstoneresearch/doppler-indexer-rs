@@ -52,7 +52,7 @@ impl TransformationHandler for V4CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let hook = event.extract_address("poolOrHook")?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, &ctx);
+            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
 
             let asset_metadata;
             let numeraire_metadata;
@@ -65,9 +65,7 @@ impl TransformationHandler for V4CreateHandler {
             }
 
             let hook_call = ctx
-                .calls_for_address(hook)
-                .filter(|call| call.function_name == "once")
-                .next()
+                .calls_for_address(hook).find(|call| call.function_name == "once")
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(hook)

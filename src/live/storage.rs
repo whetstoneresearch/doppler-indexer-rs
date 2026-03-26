@@ -331,7 +331,7 @@ impl LiveStorage {
             writer.flush()?;
             writer
                 .into_inner()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .map_err(std::io::Error::other)?
                 .sync_all()?;
             fs::rename(&temp_path, &path)?;
             Ok(())
@@ -386,7 +386,7 @@ impl LiveStorage {
 
         lock_file
             .lock_exclusive()
-            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
 
         // Read current status while holding lock
         let data = fs::read(&path).map_err(|e| map_io_not_found(e, block_number))?;
@@ -412,7 +412,7 @@ impl LiveStorage {
                 writer.flush()?;
                 writer
                     .into_inner()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                    .map_err(std::io::Error::other)?
                     .sync_all()?;
             }
 
@@ -838,7 +838,7 @@ fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), Sto
         writer.flush()?;
         writer
             .into_inner()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
             .sync_all()?;
         fs::rename(&temp_path, path)?;
         Ok(())
@@ -882,7 +882,7 @@ fn map_io_not_found(err: std::io::Error, block_number: u64) -> StorageError {
 fn is_temp_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .map_or(false, |name| name.contains(".tmp."))
+        .is_some_and(|name| name.contains(".tmp."))
 }
 
 fn list_block_numbers(dir: &Path) -> Result<Vec<u64>, StorageError> {

@@ -378,7 +378,7 @@ pub(crate) async fn process_logs(
         }
     }
 
-    for (_, matchers) in factory_matchers {
+    for matchers in factory_matchers.values() {
         for matcher in matchers {
             // Skip if entire range is before contract's start_block (for factories, start_block is None)
             if let Some(sb) = matcher.start_block {

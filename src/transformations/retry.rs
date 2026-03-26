@@ -755,7 +755,7 @@ pub(crate) fn filter_events_by_start_block(
             let start_block = contracts
                 .get(&e.source_name)
                 .and_then(|c| c.start_block.map(|u| u.try_into().unwrap_or(u64::MAX)));
-            start_block.map_or(true, |sb| e.block_number >= sb)
+            start_block.is_none_or(|sb| e.block_number >= sb)
         })
         .collect()
 }
@@ -770,7 +770,7 @@ pub(crate) fn filter_calls_by_start_block(
             let start_block = contracts
                 .get(&c.source_name)
                 .and_then(|ct| ct.start_block.map(|u| u.try_into().unwrap_or(u64::MAX)));
-            start_block.map_or(true, |sb| c.block_number >= sb)
+            start_block.is_none_or(|sb| c.block_number >= sb)
         })
         .collect()
 }

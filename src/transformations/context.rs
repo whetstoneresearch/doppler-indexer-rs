@@ -465,7 +465,7 @@ impl TransformationContext {
         self.events.iter().filter(move |e| {
             e.source_name == source
                 && e.event_name == event_name
-                && start_block.map_or(true, |sb| e.block_number >= sb)
+                && start_block.is_none_or(|sb| e.block_number >= sb)
         })
     }
 
@@ -481,7 +481,7 @@ impl TransformationContext {
             }
             // Look up start_block by source_name
             let start_block = self.get_contract_start_block(&e.source_name);
-            start_block.map_or(true, |sb| e.block_number >= sb)
+            start_block.is_none_or(|sb| e.block_number >= sb)
         })
     }
 
@@ -498,7 +498,7 @@ impl TransformationContext {
         self.calls.iter().filter(move |c| {
             c.source_name == source
                 && c.function_name == function_name
-                && start_block.map_or(true, |sb| c.block_number >= sb)
+                && start_block.is_none_or(|sb| c.block_number >= sb)
         })
     }
 
@@ -511,7 +511,7 @@ impl TransformationContext {
             }
             // Look up start_block by source_name
             let start_block = self.get_contract_start_block(&c.source_name);
-            start_block.map_or(true, |sb| c.block_number >= sb)
+            start_block.is_none_or(|sb| c.block_number >= sb)
         })
     }
 

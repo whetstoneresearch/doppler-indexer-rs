@@ -133,7 +133,7 @@ pub fn build_event_trigger_matchers(contracts: &Contracts) -> Vec<EventTriggerMa
     let mut matchers = Vec::new();
     let mut seen: HashSet<(String, [u8; 32])> = HashSet::new();
 
-    for (_contract_name, contract) in contracts {
+    for contract in contracts.values() {
         // Check contract-level calls for on_events
         if let Some(calls) = &contract.calls {
             for call in calls {
@@ -212,7 +212,7 @@ fn build_matcher_for_source(
     }
 
     // Check if source is a factory collection name
-    for (_, contract) in contracts {
+    for contract in contracts.values() {
         if let Some(factories) = &contract.factories {
             for factory in factories {
                 if factory.collection == source {
@@ -679,7 +679,7 @@ pub(crate) async fn process_range(
             tracing::debug!(
                 "receipts: fetching batch {}/{} (blocks {}-{} of {})",
                 batch_idx + 1,
-                (total_blocks + block_receipt_concurrency - 1) / block_receipt_concurrency,
+                total_blocks.div_ceil(block_receipt_concurrency),
                 batch_start + 1,
                 batch_end,
                 total_blocks
@@ -807,7 +807,7 @@ pub(crate) async fn process_range(
         }
 
         let total_txs = tx_block_info.len();
-        let total_batches = (total_txs + rpc_batch_size - 1) / rpc_batch_size;
+        let total_batches = total_txs.div_ceil(rpc_batch_size);
         tracing::info!(
             "Fetching receipts for blocks {}-{}: {} transactions in {} batches",
             range.start,
@@ -961,8 +961,7 @@ pub(crate) async fn process_range(
         )
         .await
         .map_err(|e| {
-            ReceiptCollectionError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            ReceiptCollectionError::Io(std::io::Error::other(
                 e.to_string(),
             ))
         })?;
@@ -1021,7 +1020,7 @@ fn process_receipts_minimal(
         };
 
         extract_logs(
-            &receipt.inner.logs(),
+            receipt.inner.logs(),
             block_number,
             timestamp,
             tx_hash,
@@ -1057,7 +1056,7 @@ fn process_receipts_full(
         let inner = &receipt.inner;
         let logs = inner.logs();
 
-        extract_logs(&logs, block_number, timestamp, tx_hash, all_logs);
+        extract_logs(logs, block_number, timestamp, tx_hash, all_logs);
 
         records.push(FullReceiptRecord {
             block_number,
@@ -1067,7 +1066,7 @@ fn process_receipts_full(
             from_address: receipt.from.0 .0,
             to_address: receipt.to.map(|a| a.0 .0),
             cumulative_gas_used: inner.cumulative_gas_used(),
-            gas_used: receipt.gas_used as u64,
+            gas_used: receipt.gas_used,
             contract_address: receipt.contract_address.map(|a| a.0 .0),
             status: inner.status(),
             log_count: logs.len() as u32,

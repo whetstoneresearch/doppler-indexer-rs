@@ -25,6 +25,7 @@ pub(crate) struct PendingEventData {
 pub(crate) const PENDING_EVENT_TIMEOUT_SECS: u64 = 300;
 
 /// Live processing state for buffering events with call dependencies.
+#[derive(Default)]
 pub(crate) struct LiveProcessingState {
     /// Track which (source, function) calls have arrived for which ranges.
     /// Key: (source_name, function_name), Value: set of (range_start, range_end)
@@ -43,18 +44,6 @@ pub(crate) struct LiveProcessingState {
     pub finalized_ranges: HashSet<(u64, u64)>,
 }
 
-impl Default for LiveProcessingState {
-    fn default() -> Self {
-        Self {
-            received_calls: HashMap::new(),
-            calls_buffer: HashMap::new(),
-            pending_events: HashMap::new(),
-            completion: HashMap::new(),
-            pending_event_timestamps: HashMap::new(),
-            finalized_ranges: HashSet::new(),
-        }
-    }
-}
 
 impl LiveProcessingState {
     /// Clean up in-memory state for orphaned blocks.

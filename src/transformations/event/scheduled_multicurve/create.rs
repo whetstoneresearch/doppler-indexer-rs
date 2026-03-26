@@ -57,7 +57,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 TransformationError::TypeConversion("numeraire is not an address".to_string())
             })?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, &ctx);
+            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
 
             let asset_metadata;
             let numeraire_metadata;
@@ -70,9 +70,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
             }
 
             let get_state_call = ctx
-                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getState")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getState").find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call for asset {} at block {} tx {}",
@@ -83,9 +81,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 })?;
 
             let num_to_sell = ctx
-                .calls_of_type("DERC20", "once")
-                .filter(|call| call.contract_address == asset)
-                .next()
+                .calls_of_type("DERC20", "once").find(|call| call.contract_address == asset)
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getAssetData call for asset {} at block {} tx {}",
@@ -163,7 +159,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 .eth_call(
                     hook,
                     "startingTimeOf(bytes32)(uint256)",
-                    vec![DynSolValue::FixedBytes(pool_id.into(), 32)],
+                    vec![DynSolValue::FixedBytes(pool_id, 32)],
                     event.block_number,
                 )
                 .await?;
@@ -203,9 +199,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 })?;
 
             let get_positions_call = ctx
-                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getPositions")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getPositions").find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getPositions call for asset {} at block {} tx {}",
@@ -354,9 +348,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 .calls_of_type(
                     "UniswapV4ScheduledMulticurveInitializer",
                     "getBeneficiaries",
-                )
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+                ).find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
                     DecodedValue::Array(elements) => elements

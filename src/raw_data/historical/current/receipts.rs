@@ -107,7 +107,7 @@ pub async fn collect_receipts(
                         let range = BlockRange { start: range_start, end: range_end };
                         let exists_in_s3 = s3_manifest
                             .as_ref()
-                            .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
+                            .is_some_and(|m| m.has_raw_receipts(range.start, range.end - 1));
                         if existing_files.contains(&range.file_name("receipts")) || exists_in_s3 {
                             // Check if range is now complete
                             let expected: HashSet<u64> = (range_start..range_end).collect();
@@ -325,7 +325,7 @@ pub async fn collect_receipts(
                                     range.end - 1,
                                 )
                                 .await
-                                .map_err(|e| ReceiptCollectionError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                                .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
                             }
 
                             send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
@@ -464,7 +464,7 @@ pub async fn collect_receipts(
 
         let exists_in_s3 = s3_manifest
             .as_ref()
-            .map_or(false, |m| m.has_raw_receipts(range.start, range.end - 1));
+            .is_some_and(|m| m.has_raw_receipts(range.start, range.end - 1));
         if existing_files.contains(&range.file_name("receipts")) || exists_in_s3 {
             tracing::info!(
                 "Skipping receipts for blocks {}-{} (already exists)",
@@ -599,8 +599,7 @@ pub async fn collect_receipts(
             )
             .await
             .map_err(|e| {
-                ReceiptCollectionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                ReceiptCollectionError::Io(std::io::Error::other(
                     e.to_string(),
                 ))
             })?;

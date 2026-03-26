@@ -617,7 +617,7 @@ impl CompactionService {
             block_numbers.append_value(call.block_number);
             timestamps.append_value(call.block_timestamp);
             contract_names.append_value(&call.contract_name);
-            addresses.append_value(&call.contract_address)?;
+            addresses.append_value(call.contract_address)?;
             function_names.append_value(&call.function_name);
             results.append_value(&call.result);
         }
@@ -671,8 +671,8 @@ impl CompactionService {
 
         for block in blocks {
             block_numbers.append_value(block.number);
-            block_hashes.append_value(&block.hash);
-            parent_hashes.append_value(&block.parent_hash);
+            block_hashes.append_value(block.hash);
+            parent_hashes.append_value(block.parent_hash);
             timestamps.append_value(block.timestamp);
         }
 
@@ -738,27 +738,27 @@ impl CompactionService {
             timestamps.append_value(*timestamp);
             log_indices.append_value(log.log_index);
             tx_indices.append_value(log.transaction_index);
-            tx_hashes.append_value(&log.transaction_hash)?;
-            addresses.append_value(&log.address);
+            tx_hashes.append_value(log.transaction_hash)?;
+            addresses.append_value(log.address);
 
             // Handle topics (up to 4)
-            if log.topics.len() > 0 {
-                topic0s.append_value(&log.topics[0]);
+            if !log.topics.is_empty() {
+                topic0s.append_value(log.topics[0]);
             } else {
                 topic0s.append_null();
             }
             if log.topics.len() > 1 {
-                topic1s.append_value(&log.topics[1]);
+                topic1s.append_value(log.topics[1]);
             } else {
                 topic1s.append_null();
             }
             if log.topics.len() > 2 {
-                topic2s.append_value(&log.topics[2]);
+                topic2s.append_value(log.topics[2]);
             } else {
                 topic2s.append_null();
             }
             if log.topics.len() > 3 {
-                topic3s.append_value(&log.topics[3]);
+                topic3s.append_value(log.topics[3]);
             } else {
                 topic3s.append_null();
             }

@@ -107,7 +107,7 @@ pub(crate) async fn process_completed_range(
     }
 
     // Check if range exists in S3 manifest
-    if s3_manifest.map_or(false, |m| m.has_raw_logs(range.start, range.end - 1)) {
+    if s3_manifest.is_some_and(|m| m.has_raw_logs(range.start, range.end - 1)) {
         tracing::debug!(
             "Skipping logs range {}-{}: exists in S3 manifest",
             range.start,
@@ -125,12 +125,9 @@ pub(crate) async fn process_completed_range(
 
     if contract_logs_only {
         let before_count = logs.len();
-        logs = logs
-            .into_iter()
-            .filter(|log| {
+        logs.retain(|log| {
                 configured_addresses.contains(&log.address) || factory_addrs.contains(&log.address)
-            })
-            .collect();
+            });
         tracing::debug!(
             "Filtered logs from {} to {} for range {}",
             before_count,
@@ -166,7 +163,7 @@ pub(crate) async fn process_completed_range(
 
 pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
     let mut addresses = HashSet::new();
-    for (_, contract) in contracts {
+    for contract in contracts.values() {
         match &contract.address {
             AddressOrAddresses::Single(addr) => {
                 addresses.insert(addr.0 .0);

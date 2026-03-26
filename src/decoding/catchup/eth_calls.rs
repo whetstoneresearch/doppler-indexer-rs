@@ -476,7 +476,7 @@ pub async fn catchup_decode_eth_calls(
 
             if result.is_ok() {
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 50 == 0 || done == total_files {
+                if done.is_multiple_of(50) || done == total_files {
                     tracing::info!(
                         "Eth_call decoding catchup: decoded {}/{} files",
                         done,

@@ -122,8 +122,7 @@ pub async fn collect_blocks(
             )
             .await
             .map_err(|e| {
-                BlockCollectionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                BlockCollectionError::Io(std::io::Error::other(
                     e.to_string(),
                 ))
             })?;

@@ -492,7 +492,7 @@ pub(super) fn build_event_array_value_array(
                         if let DecodedValue::Address(addr) = elem {
                             builder.values().append_value(addr)?;
                         } else {
-                            builder.values().append_value(&[0u8; 20])?;
+                            builder.values().append_value([0u8; 20])?;
                         }
                     }
                     builder.append(true);
@@ -1027,7 +1027,7 @@ pub(super) fn write_decoded_once_calls_to_parquet(
                 // Named tuple: create a column for each field with {function}_decoded.{field_name}
                 for (field_name, field_type) in tuple_fields {
                     fields.push(Field::new(
-                        &format!("{}.{}", config.function_name, field_name),
+                        format!("{}.{}", config.function_name, field_name),
                         field_type.to_arrow_type(),
                         true,
                     ));
@@ -1037,7 +1037,7 @@ pub(super) fn write_decoded_once_calls_to_parquet(
                 // Simple type or named single value
                 let value_type = config.output_type.to_arrow_type();
                 fields.push(Field::new(
-                    &format!("{}", config.function_name),
+                    config.function_name.to_string(),
                     value_type,
                     true,
                 ));
@@ -1384,7 +1384,7 @@ pub(super) fn build_array_value_array(
                         if let DecodedValue::Address(addr) = elem {
                             builder.values().append_value(addr)?;
                         } else {
-                            builder.values().append_value(&[0u8; 20])?;
+                            builder.values().append_value([0u8; 20])?;
                         }
                     }
                     builder.append(true);

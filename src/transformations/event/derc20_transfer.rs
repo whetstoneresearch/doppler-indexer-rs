@@ -51,8 +51,8 @@ impl TransformationHandler for DERC20TransferHandler {
             let to_address = event.extract_address("to")?;
             let value = event.extract_uint256("value")?;
 
-            ops.push(upsert_user(&from_address, &event.block_timestamp, &ctx));
-            ops.push(upsert_user(&to_address, &event.block_timestamp, &ctx));
+            ops.push(upsert_user(&from_address, &event.block_timestamp, ctx));
+            ops.push(upsert_user(&to_address, &event.block_timestamp, ctx));
             ops.push(insert_transfer(
                 event.block_number,
                 event.block_timestamp,

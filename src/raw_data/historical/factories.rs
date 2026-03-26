@@ -238,7 +238,7 @@ pub(crate) async fn process_range(
                             tracing::warn!(
                                 block_number = log.block_number,
                                 contract = %Address::from(log.address),
-                                topic0 = %hex::encode(&log.topics.first().map(|t| t.as_slice()).unwrap_or(&[])),
+                                topic0 = %hex::encode(log.topics.first().map(|t| t.as_slice()).unwrap_or(&[])),
                                 collection = %matcher.collection_name,
                                 data_len = log.data.len(),
                                 "Failed to decode factory event data: {}",
@@ -507,7 +507,7 @@ async fn write_factory_parquet_files(
         let rel_path = format!("{}/{}", collection_name, file_name);
 
         if existing_files.contains(&rel_path)
-            || s3_manifest.map_or(false, |m| {
+            || s3_manifest.is_some_and(|m| {
                 m.has_factories(&collection_name, range_start, range_end - 1)
             })
         {
@@ -561,7 +561,7 @@ async fn write_factory_parquet_files(
             let rel_path = format!("{}/{}", collection_name, file_name);
 
             if !existing_files.contains(&rel_path)
-                && !s3_manifest.map_or(false, |m| {
+                && !s3_manifest.is_some_and(|m| {
                     m.has_factories(collection_name, range_start, range_end - 1)
                 })
             {
@@ -829,7 +829,7 @@ pub fn get_factory_call_configs(
     let mut configs: HashMap<String, Vec<crate::types::config::eth_call::EthCallConfig>> =
         HashMap::new();
 
-    for (_, contract) in contracts {
+    for contract in contracts.values() {
         if let Some(factories) = &contract.factories {
             for factory in factories {
                 let resolved = resolve_factory_config(factory, factory_collections);
@@ -858,7 +858,7 @@ pub fn get_factory_collection_names(
     let mut names = Vec::new();
 
     // Include collection names from contracts
-    for (_, contract) in contracts {
+    for contract in contracts.values() {
         if let Some(factories) = &contract.factories {
             for factory in factories {
                 if !names.contains(&factory.collection) {

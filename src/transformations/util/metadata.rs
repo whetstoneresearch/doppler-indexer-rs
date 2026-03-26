@@ -12,20 +12,18 @@ pub fn get_metadata(
     event: &DecodedEvent,
     ctx: &TransformationContext,
 ) -> Result<(AssetTokenMetadata, TokenMetadata), TransformationError> {
-    if is_precompile_address(asset.into()) == true {
+    if is_precompile_address(asset.into()) {
         return Err(TransformationError::IncludesPrecompileError(
             "asset address is a precompile".to_string(),
         ));
-    } else if is_precompile_address(numeraire.into()) == true {
+    } else if is_precompile_address(numeraire.into()) {
         return Err(TransformationError::IncludesPrecompileError(
             "numeraire address is a precompile".to_string(),
         ));
     }
 
     let asset_metadata = ctx
-        .calls_of_type("DERC20", "once")
-        .filter(|call| call.contract_address == *asset)
-        .next()
+        .calls_of_type("DERC20", "once").find(|call| call.contract_address == *asset)
         .ok_or_else(|| {
             let available_calls: Vec<_> = ctx
                 .calls_for_address(*asset)
@@ -127,7 +125,7 @@ pub fn get_metadata(
                     .get("getAssetData.migrationPool")
                     .ok_or_else(|| missing_err("getAssetData.migrationPool"))?;
                 if let Some(addr) = val.as_address() {
-                    PoolAddressOrPoolId::Address(addr.into())
+                    PoolAddressOrPoolId::Address(addr)
                 } else {
                     PoolAddressOrPoolId::PoolId(val.as_bytes32().ok_or_else(|| {
                         field_err("getAssetData.migrationPool", "address or bytes32")
@@ -145,9 +143,7 @@ pub fn get_metadata(
             decimals: 18,
         }
     } else {
-        let call = ctx.calls_of_type("Numeraires", "once")
-            .filter(|call| call.contract_address == *numeraire)
-            .next()
+        let call = ctx.calls_of_type("Numeraires", "once").find(|call| call.contract_address == *numeraire)
             .ok_or_else(|| {
                 let available_calls: Vec<_> = ctx.calls_for_address(*numeraire)
                     .map(|c| format!("{}:{}", c.source_name, c.function_name))
@@ -204,5 +200,5 @@ pub fn get_metadata(
         }
     };
 
-    return Ok((asset_metadata, numeraire_metadata));
+    Ok((asset_metadata, numeraire_metadata))
 }

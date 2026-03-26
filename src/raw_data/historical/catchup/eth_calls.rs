@@ -660,7 +660,7 @@ pub async fn collect_eth_calls(
         for (idx, log_range) in log_ranges.iter().enumerate() {
             // Check if output already exists for all event-triggered call configs
             let mut needs_processing = false;
-            for (_, configs) in &event_call_configs {
+            for configs in event_call_configs.values() {
                 for config in configs {
                     // Range is entirely before this config's start_block — no output needed
                     if let Some(sb) = config.start_block {

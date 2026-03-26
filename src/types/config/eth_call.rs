@@ -107,8 +107,10 @@ impl<'de> Deserialize<'de> for EventTriggerConfigs {
 
 /// Frequency at which to make eth_calls
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum Frequency {
     /// Call every block (default)
+    #[default]
     EveryBlock,
     /// Call once per address (at discovery for factory, at start_block for regular)
     Once,
@@ -120,11 +122,6 @@ pub enum Frequency {
     OnEvents(EventTriggerConfigs),
 }
 
-impl Default for Frequency {
-    fn default() -> Self {
-        Frequency::EveryBlock
-    }
-}
 
 #[allow(dead_code)]
 impl Frequency {
@@ -533,8 +530,7 @@ impl EvmType {
         let s = s.trim();
 
         // Check if it's an array (ends with [])
-        if s.ends_with("[]") {
-            let inner_str = &s[..s.len() - 2];
+        if let Some(inner_str) = s.strip_suffix("[]") {
             let inner_type = Self::parse(inner_str)?;
             return Ok(EvmType::Array(Box::new(inner_type)));
         }
