@@ -485,17 +485,12 @@ impl TransformationEngine {
                 let mut skipped_ranges: Vec<(u64, u64)> = Vec::new();
 
                 let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-                let mut join_set:
-                    JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
-                        JoinSet::new();
+                let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+                    JoinSet::new();
 
                 for (range_start, range_end) in &ranges_to_attempt {
                     let events = self
-                        .read_decoded_events_for_triggers(
-                            *range_start,
-                            *range_end,
-                            &event_triggers,
-                        )
+                        .read_decoded_events_for_triggers(*range_start, *range_end, &event_triggers)
                         .await?;
 
                     let events = filter_events_by_start_block(&self.contracts, events);
@@ -535,8 +530,7 @@ impl TransformationEngine {
                         let handler_key = handler_key.clone();
                         let handler_name = handler.name();
                         let handler_version = handler.version();
-                        let tx_addresses =
-                            self.read_receipt_addresses(*range_start, *range_end);
+                        let tx_addresses = self.read_receipt_addresses(*range_start, *range_end);
                         let chain_name = self.chain_name.clone();
                         let chain_id = self.chain_id;
                         let historical = self.historical_reader.clone();
@@ -614,12 +608,9 @@ impl TransformationEngine {
                             break;
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "Handler {} catchup task panicked: {}",
-                                handler_key,
-                                e
-                            );
-                            failed_handlers.push((handler_key.clone(), format!("task panicked: {}", e)));
+                            tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
+                            failed_handlers
+                                .push((handler_key.clone(), format!("task panicked: {}", e)));
                             break;
                         }
                     }
@@ -663,7 +654,8 @@ impl TransformationEngine {
         }
 
         if !failed_handlers.is_empty() {
-            let msg = failed_handlers.iter()
+            let msg = failed_handlers
+                .iter()
                 .map(|(k, e)| format!("{}: {}", k, e))
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -815,7 +807,8 @@ impl TransformationEngine {
                     }
                     Err(e) => {
                         tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                        failed_handlers.push((handler_key.clone(), format!("task panicked: {}", e)));
+                        failed_handlers
+                            .push((handler_key.clone(), format!("task panicked: {}", e)));
                         this_handler_errored = true;
                         break;
                     }
@@ -832,7 +825,8 @@ impl TransformationEngine {
         }
 
         if !failed_handlers.is_empty() {
-            let msg = failed_handlers.iter()
+            let msg = failed_handlers
+                .iter()
                 .map(|(k, e)| format!("{}: {}", k, e))
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -1258,10 +1252,10 @@ impl TransformationEngine {
                         let calls: Vec<_> = calls
                             .into_iter()
                             .filter(|c| {
-                                let start_block = self
-                                    .contracts
-                                    .get(&c.source_name)
-                                    .and_then(|ct| ct.start_block.map(|u| u.try_into().unwrap_or(u64::MAX)));
+                                let start_block =
+                                    self.contracts.get(&c.source_name).and_then(|ct| {
+                                        ct.start_block.map(|u| u.try_into().unwrap_or(u64::MAX))
+                                    });
                                 start_block.map_or(true, |sb| c.block_number >= sb)
                             })
                             .collect();
