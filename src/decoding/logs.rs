@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::event_parsing::{EventParam, ParsedEvent, TupleFieldInfo};
-use super::types::DecoderMessage;
+use super::types::{BuiltMatchers, DecoderMessage, LogDecoderOutputs, LogMatcherConfig};
 use crate::live::{LiveDecodedLog, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
@@ -98,8 +98,6 @@ pub async fn decode_logs(
     let output_base = crate::storage::paths::decoded_logs_dir(&chain.name);
     std::fs::create_dir_all(&output_base)?;
 
-    let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-
     // Build event matchers from contract configs
     tracing::debug!("Building event matchers for chain {}", chain.name);
     let (regular_matchers, factory_matchers) =
@@ -132,15 +130,18 @@ pub async fn decode_logs(
     // =========================================================================
     // Catchup phase: Process existing raw log files
     // =========================================================================
+    let matchers = LogMatcherConfig {
+        regular_matchers: &regular_matchers,
+        factory_matchers: &factory_matchers,
+    };
+
     if !skip_catchup {
         let raw_logs_dir = crate::storage::paths::raw_logs_dir(&chain.name);
         if raw_logs_dir.exists() {
             super::catchup::catchup_decode_logs(
                 &raw_logs_dir,
                 &output_base,
-                range_size,
-                &regular_matchers,
-                &factory_matchers,
+                &matchers,
                 chain,
                 raw_data_config,
                 transform_tx.as_ref(),
@@ -160,14 +161,16 @@ pub async fn decode_logs(
     // =========================================================================
     // Live phase: Process new data as it arrives
     // =========================================================================
+    let log_outputs = LogDecoderOutputs {
+        transform_tx: transform_tx.as_ref(),
+        complete_tx: complete_tx.as_ref(),
+    };
     super::current::decode_logs_live(
         &mut decoder_rx,
-        &regular_matchers,
-        &factory_matchers,
+        &matchers,
         &output_base,
         &chain.name,
-        transform_tx.as_ref(),
-        complete_tx.as_ref(),
+        &log_outputs,
     )
     .await?;
 
@@ -179,7 +182,7 @@ pub async fn decode_logs(
 pub(crate) fn build_event_matchers(
     contracts: &Contracts,
     factory_collections: &FactoryCollections,
-) -> Result<(Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>), LogDecodingError> {
+) -> Result<BuiltMatchers, LogDecodingError> {
     let mut regular = Vec::new();
     let mut factory: HashMap<String, Vec<EventMatcher>> = HashMap::new();
 
@@ -259,13 +262,13 @@ pub(crate) async fn process_logs(
     logs: &[LogData],
     range_start: u64,
     range_end: u64,
-    regular_matchers: &[EventMatcher],
-    factory_matchers: &HashMap<String, Vec<EventMatcher>>,
+    matchers: &LogMatcherConfig<'_>,
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     output_base: &Path,
-    transform_tx: Option<&Sender<DecodedEventsMessage>>,
-    complete_tx: Option<&Sender<RangeCompleteMessage>>,
+    outputs: &LogDecoderOutputs<'_>,
 ) -> Result<(), LogDecodingError> {
+    let regular_matchers = matchers.regular_matchers;
+    let factory_matchers = matchers.factory_matchers;
     // Group decoded logs by (contract_name, event_name)
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
         HashMap::new();
@@ -398,7 +401,7 @@ pub(crate) async fn process_logs(
     }
 
     // Send to transformation channel if enabled
-    if let Some(tx) = transform_tx {
+    if let Some(tx) = outputs.transform_tx {
         // Re-decode and send to transformation engine (we need to iterate again to build the transform messages)
         // Group decoded logs by (contract_name, event_name) for sending
         let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
@@ -495,7 +498,7 @@ pub(crate) async fn process_logs(
     }
 
     // Signal that all events for this range have been sent
-    if let Some(tx) = complete_tx {
+    if let Some(tx) = outputs.complete_tx {
         let msg = RangeCompleteMessage {
             range_start,
             range_end,
@@ -1068,13 +1071,13 @@ fn convert_to_live_decoded_log(record: &DecodedLogRecord) -> LiveDecodedLog {
 pub(crate) async fn process_logs_live(
     logs: &[LogData],
     block_number: u64,
-    regular_matchers: &[EventMatcher],
-    factory_matchers: &HashMap<String, Vec<EventMatcher>>,
+    matchers: &LogMatcherConfig<'_>,
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     storage: &LiveStorage,
-    transform_tx: Option<&Sender<DecodedEventsMessage>>,
-    complete_tx: Option<&Sender<RangeCompleteMessage>>,
+    outputs: &LogDecoderOutputs<'_>,
 ) -> Result<(), LogDecodingError> {
+    let regular_matchers = matchers.regular_matchers;
+    let factory_matchers = matchers.factory_matchers;
     // Group decoded logs by (contract_name, event_name)
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
         HashMap::new();
@@ -1166,7 +1169,7 @@ pub(crate) async fn process_logs_live(
     }
 
     // Send to transformation channel if enabled
-    if let Some(tx) = transform_tx {
+    if let Some(tx) = outputs.transform_tx {
         let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
             HashMap::new();
 
@@ -1275,7 +1278,7 @@ pub(crate) async fn process_logs_live(
     }
 
     // Signal that all events for this block have been sent
-    if let Some(tx) = complete_tx {
+    if let Some(tx) = outputs.complete_tx {
         let msg = RangeCompleteMessage {
             range_start: block_number,
             range_end: block_number + 1,

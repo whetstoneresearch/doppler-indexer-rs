@@ -9,6 +9,7 @@ use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMe
 
 /// Handle a live-mode `EventCallsReady` message: decode results, persist to bincode,
 /// and optionally forward to the transformation engine.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_event_calls_live(
     live_storage: &LiveStorage,
     range_start: u64,

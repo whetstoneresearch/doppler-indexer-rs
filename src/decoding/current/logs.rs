@@ -3,15 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 use crate::decoding::logs::{
-    delete_decoded_logs_for_blocks, process_logs, process_logs_live, EventMatcher, LogDecodingError,
+    delete_decoded_logs_for_blocks, process_logs, process_logs_live, LogDecodingError,
 };
-use crate::decoding::types::DecoderMessage;
+use crate::decoding::types::{DecoderMessage, LogDecoderOutputs, LogMatcherConfig};
 use crate::live::LiveStorage;
 use crate::storage::parquet_readers::read_factory_addresses_from_parquet;
-use crate::transformations::{DecodedEventsMessage, RangeCompleteMessage};
 
 /// Load accumulated factory addresses from both compacted parquet and uncompacted bincode files.
 ///
@@ -93,12 +92,10 @@ fn load_accumulated_factory_addresses(
 /// Returns when AllComplete message is received or channel closes.
 pub async fn decode_logs_live(
     decoder_rx: &mut Receiver<DecoderMessage>,
-    regular_matchers: &[EventMatcher],
-    factory_matchers: &HashMap<String, Vec<EventMatcher>>,
+    matchers: &LogMatcherConfig<'_>,
     output_base: &Path,
     chain_name: &str,
-    transform_tx: Option<&Sender<DecodedEventsMessage>>,
-    complete_tx: Option<&Sender<RangeCompleteMessage>>,
+    outputs: &LogDecoderOutputs<'_>,
 ) -> Result<(), LogDecodingError> {
     // Load accumulated factory addresses from parquet and bincode files
     let mut accumulated_factory_addresses = load_accumulated_factory_addresses(chain_name)?;
@@ -130,12 +127,10 @@ pub async fn decode_logs_live(
                     process_logs_live(
                         &logs,
                         range_start,
-                        regular_matchers,
-                        factory_matchers,
+                        matchers,
                         &accumulated_factory_addresses,
                         &live_storage,
-                        transform_tx,
-                        complete_tx,
+                        outputs,
                     )
                     .await?;
                 } else {
@@ -146,12 +141,10 @@ pub async fn decode_logs_live(
                         &logs,
                         range_start,
                         range_end,
-                        regular_matchers,
-                        factory_matchers,
+                        matchers,
                         &accumulated_factory_addresses,
                         output_base,
-                        transform_tx,
-                        complete_tx,
+                        outputs,
                     )
                     .await?;
                 }

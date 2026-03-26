@@ -396,7 +396,12 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
             async move {
                 let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
                 drop(_tx);
-                decode_eth_calls(&chain, &cfg, rx, None, None, None, None, None, false)
+                let outputs = decoding::EthCallDecoderOutputs {
+                    transform_tx: None,
+                    complete_tx: None,
+                    retry_tx: None,
+                };
+                decode_eth_calls(&chain, &cfg, rx, outputs, None, None, false)
                     .await
                     .context("eth call decoding failed")
             }
@@ -543,13 +548,16 @@ async fn process_chain_live_only(
         let transform_complete_tx = transform_complete_tx.clone();
         let transform_retry_tx = transform_retry_tx.clone();
         tasks.spawn(async move {
+            let outputs = decoding::EthCallDecoderOutputs {
+                transform_tx: transform_calls_tx.as_ref(),
+                complete_tx: transform_complete_tx.as_ref(),
+                retry_tx: transform_retry_tx.as_ref(),
+            };
             decode_eth_calls(
                 &chain,
                 &cfg,
                 rx,
-                transform_calls_tx,
-                transform_complete_tx,
-                transform_retry_tx,
+                outputs,
                 None,
                 None,
                 true,
@@ -1016,13 +1024,16 @@ impl FullPipelineContext {
         let cfg = self.raw_config.clone();
 
         tasks.spawn(async move {
+            let outputs = decoding::EthCallDecoderOutputs {
+                transform_tx: transform_calls_tx.as_ref(),
+                complete_tx: transform_complete_tx.as_ref(),
+                retry_tx: transform_retry_tx.as_ref(),
+            };
             decode_eth_calls(
                 &chain,
                 &cfg,
                 call_decoder_rx,
-                transform_calls_tx,
-                transform_complete_tx,
-                transform_retry_tx,
+                outputs,
                 eth_calls_catchup_done_rx,
                 decode_catchup_done_tx,
                 false,

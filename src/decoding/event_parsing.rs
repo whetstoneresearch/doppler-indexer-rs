@@ -388,7 +388,7 @@ fn parse_indexed_and_name(s: &str) -> (bool, String) {
 /// Returns (field_info, canonical_type_strings)
 fn parse_tuple_fields(
     content: &str,
-) -> Result<(Vec<(String, TupleFieldInfo)>, Vec<String>), EventParseError> {
+) -> Result<super::types::TupleFieldParseResult, EventParseError> {
     let content = content.trim();
     if content.is_empty() {
         return Err(EventParseError::InvalidTuple("empty tuple".to_string()));

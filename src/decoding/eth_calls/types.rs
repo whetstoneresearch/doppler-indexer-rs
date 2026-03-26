@@ -78,9 +78,19 @@ pub struct DecodedOnceRecord {
     pub decoded_values: HashMap<String, DecodedValue>,
 }
 
+/// Grouped decode configs for eth_call decoding (regular, once, event-triggered).
+pub struct EthCallDecodeConfigs<'a> {
+    pub regular: &'a [CallDecodeConfig],
+    pub once: &'a [CallDecodeConfig],
+    pub event: &'a [EventCallDecodeConfig],
+}
+
 /// Result of processing once calls, used to batch update column indexes after all tasks complete.
 pub struct OnceCallsResult {
     pub contract_name: String,
     pub file_name: String,
     pub columns: Vec<String>,
 }
+
+/// Config lookup for parquet columns: column_name -> (config, optional tuple field info).
+pub type ColumnConfigLookup<'a> = HashMap<String, (&'a CallDecodeConfig, Option<(usize, &'a EvmType)>)>;

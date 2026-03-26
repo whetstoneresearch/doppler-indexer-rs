@@ -13,6 +13,7 @@ use crate::transformations::{
 
 /// Handle a live-mode `EthCallsReady` message for regular calls: decode results,
 /// persist to bincode, and optionally forward to the transformation engine.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_regular_calls_live(
     live_storage: &LiveStorage,
     range_start: u64,

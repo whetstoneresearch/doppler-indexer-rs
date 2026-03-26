@@ -15,13 +15,12 @@ pub use transform::{build_result_map, build_result_map_for_merge};
 
 use std::time::Instant;
 
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 
 use super::catchup;
 use super::current;
-use crate::live::TransformRetryRequest;
-use crate::transformations::{DecodedCallsMessage, RangeCompleteMessage};
+use super::types::EthCallDecoderOutputs;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -29,9 +28,7 @@ pub async fn decode_eth_calls(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     decoder_rx: Receiver<super::types::DecoderMessage>,
-    transform_tx: Option<Sender<DecodedCallsMessage>>,
-    complete_tx: Option<Sender<RangeCompleteMessage>>,
-    transform_retry_tx: Option<Sender<TransformRetryRequest>>,
+    outputs: EthCallDecoderOutputs<'_>,
     eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
@@ -119,18 +116,19 @@ pub async fn decode_eth_calls(
     // =========================================================================
     // Live phase: Process new data as it arrives
     // =========================================================================
+    let configs = EthCallDecodeConfigs {
+        regular: &regular_configs,
+        once: &once_configs,
+        event: &event_configs,
+    };
     current::decode_eth_calls_live(
         decoder_rx,
         &raw_calls_dir,
         &output_base,
         &chain.name,
-        &regular_configs,
-        &once_configs,
-        &event_configs,
+        &configs,
         raw_data_config,
-        transform_tx.as_ref(),
-        complete_tx.as_ref(),
-        transform_retry_tx.as_ref(),
+        &outputs,
     )
     .await?;
 
