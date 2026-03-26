@@ -396,6 +396,7 @@ pub fn load_or_build_decoded_column_index(
 /// Decoded columns are named like:
 /// - `name` (simple type) -> returns `name`
 /// - `getAssetData.numeraire` (tuple field) -> returns `getAssetData`
+///
 /// Excludes standard columns like block_number, block_timestamp, address.
 pub fn read_decoded_parquet_function_names(path: &Path) -> HashSet<String> {
     let file = match File::open(path) {

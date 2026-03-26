@@ -743,7 +743,7 @@ impl LiveEthCallCollector {
 /// Simple call encoding for functions without parameters.
 fn encode_call_simple(
     function_name: &str,
-    params: &Vec<crate::types::config::eth_call::ParamConfig>,
+    params: &[crate::types::config::eth_call::ParamConfig],
 ) -> Bytes {
     use alloy::primitives::keccak256;
 

@@ -405,7 +405,7 @@ impl ParamConfig {
 
     /// Get the event field reference if this is a FromEvent param config
     #[allow(dead_code)]
-    pub fn from_event(&self) -> Option<&str> {
+    pub fn event_field(&self) -> Option<&str> {
         match self {
             ParamConfig::FromEvent { from_event, .. } => Some(from_event),
             _ => None,
@@ -487,7 +487,7 @@ pub enum EvmType {
     /// Named tuple: "(uint160 sqrtPriceX96, int24 tick)" → columns "sqrtPriceX96", "tick"
     NamedTuple(Vec<(std::string::String, Box<EvmType>)>),
     /// Unnamed tuple: "(address, uint96)" - no field names
-    UnnamedTuple(Vec<Box<EvmType>>),
+    UnnamedTuple(Vec<EvmType>),
     /// Dynamic array: "address[]" or "(address, uint96)[]"
     Array(Box<EvmType>),
 }
@@ -692,7 +692,7 @@ impl EvmType {
 
             // Field should be just a type
             let field_type = Self::parse(field)?;
-            parsed_fields.push(Box::new(field_type));
+            parsed_fields.push(field_type);
         }
         Ok(EvmType::UnnamedTuple(parsed_fields))
     }
@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(*param.param_type(), EvmType::Address);
         assert!(param.values().is_some());
         assert_eq!(param.values().unwrap().len(), 1);
-        assert!(param.from_event().is_none());
+        assert!(param.event_field().is_none());
         assert!(!param.is_self_address());
     }
 
@@ -1219,7 +1219,7 @@ mod tests {
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
         assert!(param.values().is_none());
-        assert_eq!(param.from_event(), Some("topics[1]"));
+        assert_eq!(param.event_field(), Some("topics[1]"));
         assert!(!param.is_self_address());
     }
 
@@ -1228,7 +1228,7 @@ mod tests {
         let json = r#"{"type": "uint256", "from_event": "data[0]"}"#;
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Uint256);
-        assert_eq!(param.from_event(), Some("data[0]"));
+        assert_eq!(param.event_field(), Some("data[0]"));
     }
 
     #[test]
@@ -1237,7 +1237,7 @@ mod tests {
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
         assert!(param.values().is_none());
-        assert!(param.from_event().is_none());
+        assert!(param.event_field().is_none());
         assert!(param.is_self_address());
     }
 
@@ -1260,7 +1260,7 @@ mod tests {
         assert_eq!(config.function, "balanceOf(address)");
         assert!(config.frequency.is_on_events());
         assert_eq!(config.params.len(), 1);
-        assert_eq!(config.params[0].from_event(), Some("topics[2]"));
+        assert_eq!(config.params[0].event_field(), Some("topics[2]"));
     }
 
     #[test]
@@ -1577,7 +1577,7 @@ mod tests {
         let json = r#"{"type": "address", "from_event": "address"}"#;
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
-        assert_eq!(param.from_event(), Some("address"));
+        assert_eq!(param.event_field(), Some("address"));
         assert!(!param.is_self_address());
     }
 
