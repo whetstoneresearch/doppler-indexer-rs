@@ -216,6 +216,35 @@ impl LiveProcessingState {
             .retain(|(rs, re, _), _| (*rs, *re) != range_key);
     }
 
+    /// Sweep all pending events for timeouts, independent of range completion.
+    /// Returns list of (range_key, handler_key) pairs that were timed out.
+    pub fn sweep_timed_out_events(&mut self) -> Vec<((u64, u64), String)> {
+        let timeout = Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
+        let now = Instant::now();
+        let mut timed_out: Vec<((u64, u64), String)> = Vec::new();
+
+        for ((rs, re, handler_key), &first_seen) in &self.pending_event_timestamps {
+            if now.duration_since(first_seen) >= timeout {
+                timed_out.push(((*rs, *re), handler_key.clone()));
+            }
+        }
+
+        // Remove timed-out entries
+        for ((rs, re), handler_key) in &timed_out {
+            let range_key = (*rs, *re);
+            if let Some(pending_list) = self.pending_events.get_mut(handler_key) {
+                pending_list.retain(|pending| {
+                    (pending.range_start, pending.range_end) != range_key
+                });
+            }
+            self.pending_event_timestamps
+                .remove(&(range_key.0, range_key.1, handler_key.clone()));
+        }
+        self.pending_events.retain(|_, v| !v.is_empty());
+
+        timed_out
+    }
+
     /// Get buffered calls for a range.
     pub fn get_buffered_calls(&self, range_key: (u64, u64)) -> Vec<DecodedCall> {
         self.calls_buffer
@@ -269,5 +298,69 @@ mod tests {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::EthCalls);
         assert!(state.is_ready(false, true));
+    }
+
+    #[test]
+    fn sweep_removes_timed_out_events() {
+        let mut state = LiveProcessingState::default();
+
+        // Add a pending event
+        let handler_key = "test_handler_v1".to_string();
+        state
+            .pending_events
+            .entry(handler_key.clone())
+            .or_default()
+            .push(PendingEventData {
+                range_start: 100,
+                range_end: 101,
+                source_name: "TestSource".to_string(),
+                event_name: "TestEvent".to_string(),
+                events: vec![],
+                required_calls: vec![("source".to_string(), "function".to_string())],
+            });
+
+        // Set timestamp to well in the past (beyond timeout)
+        let past = Instant::now() - Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS + 10);
+        state
+            .pending_event_timestamps
+            .insert((100, 101, handler_key.clone()), past);
+
+        // Sweep should find and remove the timed-out event
+        let timed_out = state.sweep_timed_out_events();
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0], ((100, 101), handler_key.clone()));
+
+        // State should be cleaned up
+        assert!(state.pending_events.is_empty());
+        assert!(state.pending_event_timestamps.is_empty());
+    }
+
+    #[test]
+    fn sweep_preserves_non_timed_out_events() {
+        let mut state = LiveProcessingState::default();
+
+        let handler_key = "test_handler_v1".to_string();
+        state
+            .pending_events
+            .entry(handler_key.clone())
+            .or_default()
+            .push(PendingEventData {
+                range_start: 100,
+                range_end: 101,
+                source_name: "TestSource".to_string(),
+                event_name: "TestEvent".to_string(),
+                events: vec![],
+                required_calls: vec![("source".to_string(), "function".to_string())],
+            });
+
+        // Set timestamp to recent (within timeout)
+        state
+            .pending_event_timestamps
+            .insert((100, 101, handler_key.clone()), Instant::now());
+
+        // Sweep should not remove anything
+        let timed_out = state.sweep_timed_out_events();
+        assert!(timed_out.is_empty());
+        assert_eq!(state.pending_events.len(), 1);
     }
 }
