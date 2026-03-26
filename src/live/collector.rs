@@ -567,6 +567,16 @@ impl LiveCollector {
             event.depth
         );
 
+        if event.is_deep {
+            tracing::error!(
+                "DEEP REORG detected at block {}: reorg goes beyond retention window. \
+                 Orphaning all {} tracked blocks as best-effort cleanup. \
+                 Manual verification may be needed.",
+                event._new_block_number,
+                event.orphaned.len()
+            );
+        }
+
         // Delete orphaned blocks from storage (including decoded data)
         // Only clear progress for blocks that were successfully deleted
         let mut failed_deletions: Vec<u64> = Vec::new();
