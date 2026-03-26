@@ -7,6 +7,7 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::{
     process_factory_once_calls, process_factory_once_calls_multicall, process_factory_range,
     process_factory_range_multicall, BlockRange, EthCallCatchupState, EthCallCollectionError,
+    EthCallContext,
 };
 use crate::raw_data::historical::factories::{FactoryAddressData, FactoryMessage};
 use crate::rpc::UnifiedRpcClient;
@@ -73,39 +74,38 @@ pub(super) async fn handle_factory_message(
                         state.range_data.get(&range_start),
                         state.range_factory_data.get(&range_start),
                     ) {
+                        let ctx = EthCallContext {
+                            client,
+                            output_dir: &state.base_output_dir,
+                            existing_files: &state.existing_files,
+                            rpc_batch_size: state.rpc_batch_size,
+                            decoder_tx,
+                            chain_name,
+                            storage_manager,
+                            s3_manifest: &state.s3_manifest,
+                        };
+
                         if let Some(multicall_addr) = state.multicall3_address {
                             process_factory_range_multicall(
                                 &range,
                                 blocks,
-                                client,
+                                &ctx,
                                 factory_data,
                                 &state.factory_call_configs,
-                                &state.base_output_dir,
-                                &state.existing_files,
-                                state.rpc_batch_size,
                                 state.factory_max_params,
                                 &mut state.frequency_state,
                                 multicall_addr,
-                                decoder_tx,
-                                chain_name,
-                                storage_manager,
                             )
                             .await?;
                         } else {
                             process_factory_range(
                                 &range,
                                 blocks,
-                                client,
+                                &ctx,
                                 factory_data,
                                 &state.factory_call_configs,
-                                &state.base_output_dir,
-                                &state.existing_files,
-                                state.rpc_batch_size,
                                 state.factory_max_params,
                                 &mut state.frequency_state,
-                                decoder_tx,
-                                chain_name,
-                                storage_manager,
                             )
                             .await?;
                         }
@@ -115,31 +115,20 @@ pub(super) async fn handle_factory_message(
                             if let Some(multicall_addr) = state.multicall3_address {
                                 process_factory_once_calls_multicall(
                                     &range,
-                                    client,
+                                    &ctx,
                                     factory_data,
                                     &state.factory_once_configs,
-                                    &state.base_output_dir,
-                                    &state.existing_files,
                                     &empty_index,
                                     multicall_addr,
-                                    state.rpc_batch_size,
-                                    decoder_tx,
-                                    chain_name,
-                                    storage_manager,
                                 )
                                 .await?;
                             } else {
                                 process_factory_once_calls(
                                     &range,
-                                    client,
+                                    &ctx,
                                     factory_data,
                                     &state.factory_once_configs,
-                                    &state.base_output_dir,
-                                    &state.existing_files,
                                     &empty_index,
-                                    decoder_tx,
-                                    chain_name,
-                                    storage_manager,
                                 )
                                 .await?;
                             }

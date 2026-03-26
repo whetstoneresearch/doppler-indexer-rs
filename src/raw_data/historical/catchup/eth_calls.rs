@@ -18,7 +18,7 @@ use crate::raw_data::historical::eth_calls::{
     process_once_calls_regular, process_range, process_range_multicall, process_token_range,
     process_token_range_multicall, read_logs_from_parquet, read_once_column_index,
     scan_existing_parquet_files, BlockInfo, BlockRange, EthCallCatchupState,
-    EthCallCollectionError, FrequencyState,
+    EthCallCollectionError, EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
@@ -370,40 +370,37 @@ pub async fn collect_eth_calls(
 
             range_data.insert(range.start, blocks.clone());
 
+            let catchup_ctx = EthCallContext {
+                client,
+                output_dir: &base_output_dir,
+                existing_files: &existing_files,
+                rpc_batch_size,
+                decoder_tx: &None,
+                chain_name: &chain.name,
+                storage_manager: storage_manager.as_ref(),
+                s3_manifest: &s3_manifest,
+            };
+
             if has_regular_calls {
                 if let Some(multicall_addr) = multicall3_address {
                     process_range_multicall(
                         &range,
                         blocks.clone(),
-                        client,
+                        &catchup_ctx,
                         &call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        &s3_manifest,
-                        rpc_batch_size,
                         max_params,
                         &mut frequency_state,
                         multicall_addr,
-                        &None,
-                        &chain.name,
-                        storage_manager.as_ref(),
                     )
                     .await?;
                 } else {
                     process_range(
                         &range,
                         blocks.clone(),
-                        client,
+                        &catchup_ctx,
                         &call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        &s3_manifest,
-                        rpc_batch_size,
                         max_params,
                         &mut frequency_state,
-                        &None,
-                        &chain.name,
-                        storage_manager.as_ref(),
                     )
                     .await?;
                 }
@@ -414,31 +411,19 @@ pub async fn collect_eth_calls(
                     process_token_range_multicall(
                         &range,
                         blocks.clone(),
-                        client,
+                        &catchup_ctx,
                         &token_call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        rpc_batch_size,
                         &mut frequency_state,
                         multicall_addr,
-                        &None,
-                        &chain.name,
-                        storage_manager.as_ref(),
                     )
                     .await?;
                 } else {
                     process_token_range(
                         &range,
                         blocks.clone(),
-                        client,
+                        &catchup_ctx,
                         &token_call_configs,
-                        &base_output_dir,
-                        &existing_files,
-                        rpc_batch_size,
                         &mut frequency_state,
-                        &None,
-                        &chain.name,
-                        storage_manager.as_ref(),
                     )
                     .await?;
                 }
@@ -449,30 +434,19 @@ pub async fn collect_eth_calls(
                     process_once_calls_multicall(
                         &range,
                         &blocks,
-                        client,
+                        &catchup_ctx,
                         &once_configs,
                         &chain.contracts,
-                        &base_output_dir,
-                        &existing_files,
                         multicall_addr,
-                        rpc_batch_size,
-                        &None,
-                        &chain.name,
-                        storage_manager.as_ref(),
                     )
                     .await?;
                 } else {
                     process_once_calls_regular(
                         &range,
                         &blocks,
-                        client,
+                        &catchup_ctx,
                         &once_configs,
                         &chain.contracts,
-                        &base_output_dir,
-                        &existing_files,
-                        &None,
-                        &chain.name,
-                        storage_manager.as_ref(),
                     )
                     .await?;
                 }
@@ -574,17 +548,22 @@ pub async fn collect_eth_calls(
                     addresses_by_block,
                 };
 
+                let factory_once_ctx = EthCallContext {
+                    client,
+                    output_dir: &base_output_dir,
+                    existing_files: &existing_files,
+                    rpc_batch_size,
+                    decoder_tx,
+                    chain_name: &chain.name,
+                    storage_manager: storage_manager.as_ref(),
+                    s3_manifest: &s3_manifest,
+                };
                 process_factory_once_calls(
                     &range,
-                    client,
+                    &factory_once_ctx,
                     &factory_data,
                     &factory_once_configs,
-                    &base_output_dir,
-                    &existing_files,
                     &factory_once_column_indexes,
-                    decoder_tx,
-                    &chain.name,
-                    storage_manager.as_ref(),
                 )
                 .await?;
 
@@ -736,34 +715,44 @@ pub async fn collect_eth_calls(
             let range_start = log_range.start;
             let range_end = log_range.end - 1;
             if let Some(multicall_addr) = multicall3_address {
+                let event_ctx = EthCallContext {
+                    client,
+                    output_dir: &base_output_dir,
+                    existing_files: &existing_files,
+                    rpc_batch_size,
+                    decoder_tx,
+                    chain_name: &chain.name,
+                    storage_manager: storage_manager.as_ref(),
+                    s3_manifest: &s3_manifest,
+                };
                 process_event_triggers_multicall(
                     triggers,
                     &event_call_configs,
                     &factory_addresses,
-                    client,
-                    &base_output_dir,
-                    rpc_batch_size,
-                    decoder_tx,
+                    &event_ctx,
                     multicall_addr,
                     range_start,
                     range_end,
-                    &chain.name,
-                    storage_manager.as_ref(),
                 )
                 .await?;
             } else {
+                let event_ctx = EthCallContext {
+                    client,
+                    output_dir: &base_output_dir,
+                    existing_files: &existing_files,
+                    rpc_batch_size,
+                    decoder_tx,
+                    chain_name: &chain.name,
+                    storage_manager: storage_manager.as_ref(),
+                    s3_manifest: &s3_manifest,
+                };
                 process_event_triggers(
                     triggers,
                     &event_call_configs,
                     &factory_addresses,
-                    client,
-                    &base_output_dir,
-                    rpc_batch_size,
-                    decoder_tx,
+                    &event_ctx,
                     range_start,
                     range_end,
-                    &chain.name,
-                    storage_manager.as_ref(),
                 )
                 .await?;
             }

@@ -14,17 +14,16 @@ use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use tokio::sync::mpsc::Sender;
 
 use super::config::compute_function_selector;
 use super::types::{
-    EthCallCollectionError, EventCallKey, EventCallResult, EventTriggeredCallConfig,
+    EthCallCollectionError, EthCallContext, EventCallKey, EventCallResult,
+    EventTriggeredCallConfig,
 };
 use super::{execute_multicalls_generic, BlockMulticall, EventCallMeta, MulticallSlotGeneric};
 use crate::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
 use crate::raw_data::historical::receipts::EventTriggerData;
-use crate::rpc::UnifiedRpcClient;
-use crate::storage::{upload_parquet_to_s3, StorageManager};
+use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig};
 
@@ -481,14 +480,9 @@ pub(crate) async fn process_event_triggers(
     triggers: Vec<EventTriggerData>,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
     factory_addresses: &HashMap<String, HashSet<Address>>,
-    client: &UnifiedRpcClient,
-    output_dir: &Path,
-    rpc_batch_size: usize,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
+    ctx: &EthCallContext<'_>,
     range_start: u64,
     range_end: u64,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all configured (contract_name, function_name) pairs so we can write empty files
     // for pairs with no matching events (prevents catchup from retrying)
@@ -502,7 +496,7 @@ pub(crate) async fn process_event_triggers(
         // Write empty files for all configured pairs
         for (contract_name, function_name) in &configured_pairs {
             write_empty_event_call_file(
-                output_dir,
+                ctx.output_dir,
                 contract_name,
                 function_name,
                 range_start,
@@ -673,7 +667,7 @@ pub(crate) async fn process_event_triggers(
                 Vec<Vec<u8>>,
             )>,
         > = pending_calls
-            .chunks(rpc_batch_size)
+            .chunks(ctx.rpc_batch_size)
             .map(|chunk| {
                 chunk
                     .iter()
@@ -700,7 +694,7 @@ pub(crate) async fn process_event_triggers(
                         .map(|(tx, block_id, _, _, _)| (tx.clone(), *block_id))
                         .collect();
 
-                    let results = client.call_batch(batch_calls).await?;
+                    let results = ctx.client.call_batch(batch_calls).await?;
 
                     let mut chunk_results = Vec::with_capacity(results.len());
                     for (i, result) in results.into_iter().enumerate() {
@@ -747,7 +741,7 @@ pub(crate) async fn process_event_triggers(
 
         // Write to parquet and send to decoder
         if !all_results.is_empty() {
-            let sub_dir = output_dir
+            let sub_dir = ctx.output_dir
                 .join(&contract_name)
                 .join(&function_name)
                 .join("on_events");
@@ -768,7 +762,7 @@ pub(crate) async fn process_event_triggers(
             );
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!(
                     "raw/eth_calls/{}/{}/on_events",
                     contract_name, function_name
@@ -776,7 +770,7 @@ pub(crate) async fn process_event_triggers(
                 upload_parquet_to_s3(
                     sm,
                     &output_path,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range_start,
                     range_end,
@@ -786,7 +780,7 @@ pub(crate) async fn process_event_triggers(
             }
 
             // Send to decoder for decoding (range_end + 1 for exclusive convention)
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 let decoder_results: Vec<DecoderEventCallResult> = all_results
                     .iter()
                     .map(|r| DecoderEventCallResult {
@@ -817,7 +811,7 @@ pub(crate) async fn process_event_triggers(
     for (contract_name, function_name) in configured_pairs {
         if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
             write_empty_event_call_file(
-                output_dir,
+                ctx.output_dir,
                 &contract_name,
                 &function_name,
                 range_start,
@@ -862,15 +856,10 @@ pub(crate) async fn process_event_triggers_multicall(
     triggers: Vec<EventTriggerData>,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
     factory_addresses: &HashMap<String, HashSet<Address>>,
-    client: &UnifiedRpcClient,
-    output_dir: &Path,
-    rpc_batch_size: usize,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
+    ctx: &EthCallContext<'_>,
     multicall3_address: Address,
     range_start: u64,
     range_end: u64,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all configured (contract_name, function_name) pairs so we can write empty files
     // for pairs with no matching events (prevents catchup from retrying)
@@ -884,7 +873,7 @@ pub(crate) async fn process_event_triggers_multicall(
         // Write empty files for all configured pairs
         for (contract_name, function_name) in &configured_pairs {
             write_empty_event_call_file(
-                output_dir,
+                ctx.output_dir,
                 contract_name,
                 function_name,
                 range_start,
@@ -1063,7 +1052,7 @@ pub(crate) async fn process_event_triggers_multicall(
 
     // Execute all multicalls
     let results =
-        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
             .await?;
 
     // Distribute results back to groups
@@ -1096,7 +1085,7 @@ pub(crate) async fn process_event_triggers_multicall(
         // Sort by block number, log index
         results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
 
-        let sub_dir = output_dir
+        let sub_dir = ctx.output_dir
             .join(&contract_name)
             .join(&function_name)
             .join("on_events");
@@ -1122,7 +1111,7 @@ pub(crate) async fn process_event_triggers_multicall(
         );
 
         // Upload to S3 if configured
-        if let Some(sm) = storage_manager {
+        if let Some(sm) = ctx.storage_manager {
             let data_type = format!(
                 "raw/eth_calls/{}/{}/on_events",
                 contract_name, function_name
@@ -1130,7 +1119,7 @@ pub(crate) async fn process_event_triggers_multicall(
             upload_parquet_to_s3(
                 sm,
                 &output_path,
-                chain_name,
+                ctx.chain_name,
                 &data_type,
                 range_start,
                 range_end,
@@ -1140,7 +1129,7 @@ pub(crate) async fn process_event_triggers_multicall(
         }
 
         // Send to decoder (range_end + 1 for exclusive convention)
-        if let Some(tx) = decoder_tx {
+        if let Some(tx) = ctx.decoder_tx {
             let decoder_results: Vec<DecoderEventCallResult> = results
                 .iter()
                 .map(|r| DecoderEventCallResult {
@@ -1170,7 +1159,7 @@ pub(crate) async fn process_event_triggers_multicall(
     for (contract_name, function_name) in configured_pairs {
         if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
             write_empty_event_call_file(
-                output_dir,
+                ctx.output_dir,
                 &contract_name,
                 &function_name,
                 range_start,
