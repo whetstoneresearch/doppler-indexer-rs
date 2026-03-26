@@ -163,6 +163,7 @@ pub async fn process_regular_calls(
 /// Process "once" call results.
 /// Returns `OnceCallsResult` with column index info for batch updating (avoids race conditions).
 /// When `return_index_info` is true, skips writing the column index (caller will batch update).
+#[allow(clippy::too_many_arguments)]
 pub async fn process_once_calls(
     results: &[OnceCallResult],
     range_start: u64,

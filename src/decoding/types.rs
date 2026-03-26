@@ -1,8 +1,49 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use alloy::primitives::Address;
+use tokio::sync::mpsc::Sender;
 
+use crate::live::TransformRetryRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::transformations::{DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage};
+
+use super::event_parsing::TupleFieldInfo;
+use super::logs::EventMatcher;
+
+/// Output channels for the eth_call decoder.
+pub struct EthCallDecoderOutputs<'a> {
+    pub transform_tx: Option<&'a Sender<DecodedCallsMessage>>,
+    pub complete_tx: Option<&'a Sender<RangeCompleteMessage>>,
+    pub retry_tx: Option<&'a Sender<TransformRetryRequest>>,
+}
+
+/// Output channels for the log decoder.
+pub struct LogDecoderOutputs<'a> {
+    pub transform_tx: Option<&'a Sender<DecodedEventsMessage>>,
+    pub complete_tx: Option<&'a Sender<RangeCompleteMessage>>,
+}
+
+/// Compiled log matchers for regular contracts and factory collections.
+pub struct LogMatcherConfig<'a> {
+    pub regular_matchers: &'a [EventMatcher],
+    pub factory_matchers: &'a HashMap<String, Vec<EventMatcher>>,
+}
+
+/// Result of building matchers: (regular_matchers, factory_matchers).
+pub type BuiltMatchers = (Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>);
+
+/// A file to process during catchup: (range_start, range_end, path, regular_matchers, factory_matchers).
+pub type FileProcessingEntry = (
+    u64,
+    u64,
+    PathBuf,
+    Vec<EventMatcher>,
+    HashMap<String, Vec<EventMatcher>>,
+);
+
+/// Parse result for tuple fields: (field_info, canonical_type_strings).
+pub type TupleFieldParseResult = (Vec<(String, TupleFieldInfo)>, Vec<String>);
 
 /// Raw eth_call result data for decoding
 #[derive(Debug, Clone)]

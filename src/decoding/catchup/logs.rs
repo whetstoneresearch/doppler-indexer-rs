@@ -9,6 +9,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
+use crate::decoding::types::{FileProcessingEntry, LogDecoderOutputs, LogMatcherConfig};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::factory_data::load_factory_addresses_by_range;
@@ -21,14 +22,14 @@ use crate::types::config::raw_data::RawDataCollectionConfig;
 pub async fn catchup_decode_logs(
     raw_logs_dir: &Path,
     output_base: &Path,
-    _range_size: u64,
-    regular_matchers: &[EventMatcher],
-    factory_matchers: &HashMap<String, Vec<EventMatcher>>,
+    matchers: &LogMatcherConfig<'_>,
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedEventsMessage>>,
     recollect_tx: Option<&Sender<RecollectRequest>>,
 ) -> Result<(), LogDecodingError> {
+    let regular_matchers = matchers.regular_matchers;
+    let factory_matchers = matchers.factory_matchers;
     let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
 
     // Scan existing decoded files
@@ -84,7 +85,7 @@ pub async fn catchup_decode_logs(
     );
 
     // Filter files that need processing and compute per-range missing matchers
-    let files_to_process: Vec<(u64, u64, PathBuf, Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>)> = raw_files
+    let files_to_process: Vec<FileProcessingEntry> = raw_files
         .into_iter()
         .filter_map(|(range_start, range_end, path)| {
             let (missing_regular, missing_factory) = get_missing_matchers(
@@ -200,16 +201,22 @@ pub async fn catchup_decode_logs(
                 .cloned()
                 .unwrap_or_default();
 
+            let matchers = LogMatcherConfig {
+                regular_matchers: &missing_regular,
+                factory_matchers: &missing_factory,
+            };
+            let outputs = LogDecoderOutputs {
+                transform_tx: transform_tx.as_ref(),
+                complete_tx: None, // catchup already handles progress recording correctly
+            };
             process_logs(
                 &logs,
                 range_start,
                 range_end,
-                &missing_regular,
-                &missing_factory,
+                &matchers,
                 &factory_addrs,
                 &output_base,
-                transform_tx.as_ref(),
-                None, // catchup already handles progress recording correctly
+                &outputs,
             )
             .await
         });

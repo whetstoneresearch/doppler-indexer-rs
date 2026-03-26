@@ -7,15 +7,13 @@ mod state;
 
 use std::path::Path;
 
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 use crate::decoding::eth_calls::{
     process_event_calls, process_once_calls, process_regular_calls, CallDecodeConfig,
-    EthCallDecodingError, EventCallDecodeConfig,
+    EthCallDecodeConfigs, EthCallDecodingError,
 };
-use crate::decoding::types::DecoderMessage;
-use crate::live::TransformRetryRequest;
-use crate::transformations::{DecodedCallsMessage, RangeCompleteMessage};
+use crate::decoding::types::{DecoderMessage, EthCallDecoderOutputs};
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 use crate::decoding::catchup::eth_calls::catchup_decode_eth_calls;
@@ -32,14 +30,16 @@ pub async fn decode_eth_calls_live(
     raw_calls_dir: &Path,
     output_base: &Path,
     chain_name: &str,
-    regular_configs: &[CallDecodeConfig],
-    once_configs: &[CallDecodeConfig],
-    event_configs: &[EventCallDecodeConfig],
+    configs: &EthCallDecodeConfigs<'_>,
     raw_data_config: &RawDataCollectionConfig,
-    transform_tx: Option<&Sender<DecodedCallsMessage>>,
-    complete_tx: Option<&Sender<RangeCompleteMessage>>,
-    transform_retry_tx: Option<&Sender<TransformRetryRequest>>,
+    outputs: &EthCallDecoderOutputs<'_>,
 ) -> Result<(), EthCallDecodingError> {
+    let regular_configs = configs.regular;
+    let once_configs = configs.once;
+    let event_configs = configs.event;
+    let transform_tx = outputs.transform_tx;
+    let complete_tx = outputs.complete_tx;
+    let transform_retry_tx = outputs.retry_tx;
     let state = DecoderState::new(chain_name);
 
     loop {
@@ -244,7 +244,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::decode_eth_calls_live;
-    use crate::decoding::eth_calls::{CallDecodeConfig, EventCallDecodeConfig};
+    use crate::decoding::eth_calls::{CallDecodeConfig, EthCallDecodeConfigs, EventCallDecodeConfig};
+    use crate::decoding::types::EthCallDecoderOutputs;
     use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
     use crate::live::{LiveBlockStatus, LiveStorage, TransformRetryRequest};
     use crate::transformations::{DecodedCallsMessage, RangeCompleteKind, RangeCompleteMessage};
@@ -313,18 +314,24 @@ mod tests {
         let output_dir = temp.path().join("decoded");
         tokio::spawn(async move {
             let _temp = temp;
+            let configs = EthCallDecodeConfigs {
+                regular: &regular_configs,
+                once: &once_configs,
+                event: &event_configs,
+            };
+            let outputs = EthCallDecoderOutputs {
+                transform_tx: transform_tx.as_ref(),
+                complete_tx: complete_tx.as_ref(),
+                retry_tx: retry_tx.as_ref(),
+            };
             decode_eth_calls_live(
                 decoder_rx,
                 raw_dir.as_path(),
                 output_dir.as_path(),
                 &chain_name,
-                &regular_configs,
-                &once_configs,
-                &event_configs,
+                &configs,
                 &raw_data_config(),
-                transform_tx.as_ref(),
-                complete_tx.as_ref(),
-                retry_tx.as_ref(),
+                &outputs,
             )
             .await
         })
@@ -336,18 +343,24 @@ mod tests {
         let (complete_tx, mut complete_rx) = mpsc::channel::<RangeCompleteMessage>(4);
 
         let handle = tokio::spawn(async move {
+            let configs = EthCallDecodeConfigs {
+                regular: &[],
+                once: &[],
+                event: &[],
+            };
+            let outputs = EthCallDecoderOutputs {
+                transform_tx: None,
+                complete_tx: Some(&complete_tx),
+                retry_tx: None,
+            };
             decode_eth_calls_live(
                 decoder_rx,
                 Path::new("data/test/raw"),
                 Path::new("data/test/decoded"),
                 "test",
-                &[],
-                &[],
-                &[],
+                &configs,
                 &raw_data_config(),
-                None,
-                Some(&complete_tx),
-                None,
+                &outputs,
             )
             .await
         });
@@ -377,18 +390,24 @@ mod tests {
         let (complete_tx, mut complete_rx) = mpsc::channel::<RangeCompleteMessage>(4);
 
         let handle = tokio::spawn(async move {
+            let configs = EthCallDecodeConfigs {
+                regular: &[],
+                once: &[],
+                event: &[],
+            };
+            let outputs = EthCallDecoderOutputs {
+                transform_tx: None,
+                complete_tx: Some(&complete_tx),
+                retry_tx: Some(&retry_tx),
+            };
             decode_eth_calls_live(
                 decoder_rx,
                 Path::new("data/test/raw"),
                 Path::new("data/test/decoded"),
                 "test",
-                &[],
-                &[],
-                &[],
+                &configs,
                 &raw_data_config(),
-                None,
-                Some(&complete_tx),
-                Some(&retry_tx),
+                &outputs,
             )
             .await
         });

@@ -882,8 +882,7 @@ pub(super) fn merge_decoded_once_calls(
 
     // Build a lookup from column name -> (config, optional tuple field info)
     // This is used to fill nulls in existing columns from new decoded records.
-    let mut col_config_lookup: HashMap<String, (&CallDecodeConfig, Option<(usize, &EvmType)>)> =
-        HashMap::new();
+    let mut col_config_lookup: super::types::ColumnConfigLookup<'_> = HashMap::new();
     for config in new_configs {
         match &config.output_type {
             EvmType::NamedTuple(tuple_fields) => {
