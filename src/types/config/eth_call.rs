@@ -1605,8 +1605,8 @@ mod tests {
         assert!(matches!(parsed, EvmType::UnnamedTuple(_)));
         if let EvmType::UnnamedTuple(fields) = parsed {
             assert_eq!(fields.len(), 2);
-            assert_eq!(*fields[0], EvmType::Address);
-            assert_eq!(*fields[1], EvmType::Uint96);
+            assert_eq!(fields[0], EvmType::Address);
+            assert_eq!(fields[1], EvmType::Uint96);
         }
     }
 
@@ -1618,8 +1618,8 @@ mod tests {
             assert!(matches!(inner.as_ref(), EvmType::UnnamedTuple(_)));
             if let EvmType::UnnamedTuple(fields) = inner.as_ref() {
                 assert_eq!(fields.len(), 2);
-                assert_eq!(*fields[0], EvmType::Address);
-                assert_eq!(*fields[1], EvmType::Uint96);
+                assert_eq!(fields[0], EvmType::Address);
+                assert_eq!(fields[1], EvmType::Uint96);
             }
         }
     }
