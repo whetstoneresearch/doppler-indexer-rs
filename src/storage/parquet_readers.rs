@@ -182,8 +182,6 @@ pub fn read_raw_logs_from_parquet(path: &Path) -> Result<Vec<LogData>, ParquetRe
 /// Read factory addresses from a parquet file, returning a set of raw 20-byte addresses.
 ///
 /// Reads the `factory_address` column from a factory parquet file.
-/// Parquet read errors are logged as warnings and result in an empty set (not a hard error),
-/// matching the original behavior.
 pub fn read_factory_addresses_from_parquet(
     path: &Path,
 ) -> Result<HashSet<[u8; 20]>, ParquetReadError> {
@@ -192,21 +190,11 @@ pub fn read_factory_addresses_from_parquet(
         Ok(builder) => match builder.build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to build parquet reader for {}: {}",
-                    path.display(),
-                    e
-                );
-                return Ok(HashSet::new());
+                return Err(ParquetReadError::Parquet(e));
             }
         },
         Err(e) => {
-            tracing::warn!(
-                "Failed to create parquet reader for {}: {}",
-                path.display(),
-                e
-            );
-            return Ok(HashSet::new());
+            return Err(ParquetReadError::Parquet(e));
         }
     };
 
