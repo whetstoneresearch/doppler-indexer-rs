@@ -304,7 +304,7 @@ pub enum LiveDbValue {
     Bool(bool),
     Int64(i64),
     Int32(i32),
-    Int2(u8),
+    Int2(i16),
     Uint64(u64),
     Text(String),
     VarChar(String),
@@ -315,6 +315,7 @@ pub enum LiveDbValue {
     Timestamp(i64),
     Json(String),  // JSON stored as string for bincode
     JsonB(String), // JSONB stored as string for bincode
+    Float64(f64),
 }
 
 /// Snapshot of a row before modification, for reorg rollback.
@@ -355,6 +356,7 @@ impl LiveDbValue {
             DbValue::Timestamp(v) => LiveDbValue::Timestamp(*v),
             DbValue::Json(v) => LiveDbValue::Json(v.to_string()),
             DbValue::JsonB(v) => LiveDbValue::JsonB(v.to_string()),
+            DbValue::Float64(v) => LiveDbValue::Float64(*v),
         }
     }
 
@@ -375,12 +377,29 @@ impl LiveDbValue {
             LiveDbValue::Bytes32(v) => DbValue::Bytes32(*v),
             LiveDbValue::Numeric(v) => DbValue::Numeric(v.clone()),
             LiveDbValue::Timestamp(v) => DbValue::Timestamp(*v),
-            LiveDbValue::Json(v) => {
-                DbValue::Json(serde_json::from_str(v).unwrap_or(serde_json::Value::Null))
-            }
-            LiveDbValue::JsonB(v) => {
-                DbValue::JsonB(serde_json::from_str(v).unwrap_or(serde_json::Value::Null))
-            }
+            LiveDbValue::Json(v) => match serde_json::from_str(v) {
+                Ok(parsed) => DbValue::Json(parsed),
+                Err(e) => {
+                    tracing::warn!(
+                        json_string = v.as_str(),
+                        error = %e,
+                        "Failed to deserialize stored JSON snapshot, falling back to Null"
+                    );
+                    DbValue::Json(serde_json::Value::Null)
+                }
+            },
+            LiveDbValue::JsonB(v) => match serde_json::from_str(v) {
+                Ok(parsed) => DbValue::JsonB(parsed),
+                Err(e) => {
+                    tracing::warn!(
+                        json_string = v.as_str(),
+                        error = %e,
+                        "Failed to deserialize stored JSONB snapshot, falling back to Null"
+                    );
+                    DbValue::JsonB(serde_json::Value::Null)
+                }
+            },
+            LiveDbValue::Float64(v) => DbValue::Float64(*v),
         }
     }
 }
