@@ -18,7 +18,6 @@ use crate::decoding::eth_calls::{
     process_event_calls, process_once_calls, process_regular_calls, CallDecodeConfig,
     EthCallDecodingError, EventCallDecodeConfig,
 };
-use crate::decoding::types::{EthCallResult, EventCallResult};
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::parquet_readers::{
     read_event_calls_from_parquet, read_regular_calls_from_parquet,
