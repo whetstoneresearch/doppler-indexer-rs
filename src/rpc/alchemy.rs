@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 
 use crate::metrics::{chain_label_from_url, with_metrics, RpcMethod};
-use crate::rpc::rpc::{
+use crate::rpc::provider::{
     error_chain, with_retry, RetryConfig, RpcClient, RpcClientConfig, RpcError, RpcProvider,
 };
 

@@ -8,7 +8,7 @@ use alloy::rpc::types::{
 use async_trait::async_trait;
 
 use crate::rpc::alchemy::{AlchemyClient, SlidingWindowRateLimiter};
-use crate::rpc::rpc::{RpcClient, RpcClientConfig, RpcError, RpcProvider};
+use crate::rpc::provider::{RpcClient, RpcClientConfig, RpcError, RpcProvider};
 
 pub enum UnifiedRpcClient {
     Standard(RpcClient),

@@ -430,7 +430,7 @@ pub(super) fn build_event_array_value_array(
                 }
                 EvmType::UnnamedTuple(fields) => {
                     let names: Vec<String> = (0..fields.len()).map(|i| i.to_string()).collect();
-                    let types: Vec<&EvmType> = fields.iter().map(|t| t.as_ref()).collect();
+                    let types: Vec<&EvmType> = fields.iter().collect();
                     (names, types)
                 }
                 _ => unreachable!(),
@@ -898,9 +898,9 @@ pub(super) fn merge_decoded_once_calls(
     }
 
     // Copy existing columns, filling nulls where possible from new decoded records
-    for i in 0..existing_batch.num_columns() {
+    for (i, field) in existing_schema.fields().iter().enumerate().take(existing_batch.num_columns()) {
         let col = existing_batch.column(i);
-        let col_name = existing_schema.field(i).name().clone();
+        let col_name = field.name().clone();
 
         if col.null_count() > 0 {
             if let Some((config, tuple_info)) = col_config_lookup.get(&col_name) {
@@ -1321,7 +1321,7 @@ pub(super) fn build_array_value_array(
                 }
                 EvmType::UnnamedTuple(fields) => {
                     let names: Vec<String> = (0..fields.len()).map(|i| i.to_string()).collect();
-                    let types: Vec<&EvmType> = fields.iter().map(|t| t.as_ref()).collect();
+                    let types: Vec<&EvmType> = fields.iter().collect();
                     (names, types)
                 }
                 _ => unreachable!(),

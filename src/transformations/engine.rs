@@ -11,7 +11,7 @@
 //! - [`live_state`](super::live_state): Pending event buffering and completion tracking
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -371,7 +371,7 @@ impl TransformationEngine {
 
     fn scan_available_ranges(
         &self,
-        base_dir: &PathBuf,
+        base_dir: &Path,
     ) -> Result<Vec<(u64, u64)>, TransformationError> {
         let mut ranges = HashSet::new();
 
