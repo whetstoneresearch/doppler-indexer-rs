@@ -196,6 +196,7 @@ fn parse_data_signature(sig: &str) -> Vec<DynSolType> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range(
     range_start: u64,
     range_end: u64,
@@ -324,6 +325,7 @@ pub(crate) fn read_log_batches_from_parquet(
 
 /// Process log record batches using Arrow-native column access.
 /// Works directly on Arrow arrays instead of materializing LogData structs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range_batches(
     range_start: u64,
     range_end: u64,
@@ -481,6 +483,7 @@ pub(crate) async fn process_range_batches(
 
 /// Write factory records to parquet files, grouped by collection.
 /// Writes empty parquet files for collections with no matching events.
+#[allow(clippy::too_many_arguments)]
 async fn write_factory_parquet_files(
     range_start: u64,
     range_end: u64,

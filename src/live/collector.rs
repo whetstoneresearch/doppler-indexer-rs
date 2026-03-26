@@ -80,6 +80,7 @@ pub struct LiveCollector {
 
 impl LiveCollector {
     /// Create a new LiveCollector.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chain: Arc<ChainConfig>,
         http_client: Arc<UnifiedRpcClient>,

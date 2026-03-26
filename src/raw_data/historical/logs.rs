@@ -72,6 +72,7 @@ pub(crate) struct MinimalLogRecord {
     pub(crate) data: Vec<u8>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_completed_range(
     range_start: u64,
     range_end: u64,

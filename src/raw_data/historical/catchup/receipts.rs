@@ -9,8 +9,8 @@ use crate::raw_data::historical::blocks::{
 };
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, process_range, scan_existing_logs_files, scan_existing_parquet_files,
-    send_range_complete, BlockInfo, ChannelMetrics, EventTriggerMatcher, EventTriggerMessage,
-    LogMessage, ReceiptCollectionError,
+    send_range_complete, BlockInfo, ChannelMetrics, ChannelMetricsState, EventTriggerMatcher,
+    EventTriggerMessage, LogMessage, ReceiptCollectionError, ReceiptOutputChannels,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::{raw_logs_dir, raw_receipts_dir};
@@ -30,6 +30,7 @@ pub struct ReceiptsCatchupState {
     pub s3_manifest: Option<S3Manifest>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_receipts(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,
@@ -53,14 +54,22 @@ pub async fn collect_receipts(
 
     let has_factories = factory_log_tx.is_some();
 
-    let log_tx_capacity = log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
-    let factory_log_tx_capacity = factory_log_tx
-        .as_ref()
-        .map(|s| s.max_capacity())
-        .unwrap_or(0);
+    let channels = ReceiptOutputChannels {
+        log_tx: log_tx.clone(),
+        factory_log_tx: factory_log_tx.clone(),
+        event_trigger_tx: event_trigger_tx.clone(),
+    };
 
-    let mut log_tx_metrics = ChannelMetrics::default();
-    let mut factory_log_tx_metrics = ChannelMetrics::default();
+    let mut metrics = ChannelMetricsState {
+        log_tx_metrics: ChannelMetrics::default(),
+        factory_log_tx_metrics: ChannelMetrics::default(),
+        log_tx_capacity: log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0),
+        factory_log_tx_capacity: factory_log_tx
+            .as_ref()
+            .map(|s| s.max_capacity())
+            .unwrap_or(0),
+        total_channel_send_time: std::time::Duration::ZERO,
+    };
 
     // =========================================================================
     // Catchup phase: Process any ranges where blocks exist but receipts don't
@@ -98,11 +107,11 @@ pub async fn collect_receipts(
         if receipts_exist && (logs_exist || log_tx.is_none()) {
             // Still need to signal range complete for downstream collectors
             // when catching up, so they know this range is done
-            if has_factories || event_trigger_tx.is_some() {
+            if has_factories || channels.event_trigger_tx.is_some() {
                 send_range_complete(
-                    factory_log_tx,
-                    log_tx,
-                    event_trigger_tx,
+                    &channels.factory_log_tx,
+                    &channels.log_tx,
+                    &channels.event_trigger_tx,
                     range.start,
                     range.end,
                 )
@@ -191,15 +200,10 @@ pub async fn collect_receipts(
             receipt_fields,
             &schema,
             &output_dir,
-            log_tx,
-            factory_log_tx,
-            event_trigger_tx,
+            &channels,
             event_matchers,
             rpc_batch_size,
-            &mut log_tx_metrics,
-            &mut factory_log_tx_metrics,
-            log_tx_capacity,
-            factory_log_tx_capacity,
+            &mut metrics,
             chain.block_receipts_method.as_deref(),
             block_receipt_concurrency,
             storage_manager.as_ref(),
@@ -208,9 +212,9 @@ pub async fn collect_receipts(
         .await?;
 
         send_range_complete(
-            factory_log_tx,
-            log_tx,
-            event_trigger_tx,
+            &channels.factory_log_tx,
+            &channels.log_tx,
+            &channels.event_trigger_tx,
             range.start,
             range.end,
         )
@@ -227,11 +231,11 @@ pub async fn collect_receipts(
     }
 
     // Log channel backpressure summaries for catchup phase
-    if log_tx.is_some() {
-        log_tx_metrics.log_summary("log_tx (catchup)");
+    if channels.log_tx.is_some() {
+        metrics.log_tx_metrics.log_summary("log_tx (catchup)");
     }
-    if factory_log_tx.is_some() {
-        factory_log_tx_metrics.log_summary("factory_log_tx (catchup)");
+    if channels.factory_log_tx.is_some() {
+        metrics.factory_log_tx_metrics.log_summary("factory_log_tx (catchup)");
     }
 
     Ok(ReceiptsCatchupState {

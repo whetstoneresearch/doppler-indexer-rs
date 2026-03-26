@@ -17,6 +17,7 @@ use crate::rpc::UnifiedRpcClient;
 use crate::storage::StorageManager;
 use crate::types::config::chain::ChainConfig;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_eth_calls(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,
