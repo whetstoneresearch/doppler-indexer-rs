@@ -41,7 +41,7 @@ fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
         EvmType::UnnamedTuple(fields) => {
             let field_types: Vec<DynSolType> = fields
                 .iter()
-                .map(|ty| evm_type_to_dyn_sol_type(ty))
+                .map(evm_type_to_dyn_sol_type)
                 .collect();
             DynSolType::Tuple(field_types)
         }

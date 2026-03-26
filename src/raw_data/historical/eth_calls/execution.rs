@@ -23,8 +23,8 @@ use super::parquet_io::{
 };
 use super::types::{
     AddressResults, BlockInfo, BlockRange, CallConfig, CallResult, CollectionResults,
-    ContractProcessingInfo, EthCallCollectionError, EthCallContext, FactoryContractProcessingInfo,
-    FrequencyState, OnceCallConfig, OnceCallResult, TokenCallConfig,
+    ContractProcessingInfo, EncodedParam, EthCallCollectionError, EthCallContext,
+    FactoryContractProcessingInfo, FrequencyState, OnceCallConfig, OnceCallResult, TokenCallConfig,
 };
 use crate::decoding::{
     DecoderMessage, EthCallResult as DecoderEthCallResult, OnceCallResult as DecoderOnceCallResult,
@@ -94,13 +94,15 @@ pub(crate) async fn process_factory_range(
                 for param_combo in &param_combinations {
                     let dyn_values: Vec<DynSolValue> = param_combo
                         .iter()
-                        .map(|(param_type, value, _)| param_type.parse_value(value))
+                        .map(|(param_type, value, _): &EncodedParam| {
+                            param_type.parse_value(value)
+                        })
                         .collect::<Result<_, _>>()?;
 
                     let encoded_calldata = encode_call_with_params(selector, &dyn_values);
                     let param_values: Vec<Vec<u8>> = param_combo
                         .iter()
-                        .map(|(_, _, encoded)| encoded.clone())
+                        .map(|(_, _, encoded): &EncodedParam| encoded.clone())
                         .collect();
 
                     configs.push(CallConfig {
@@ -324,6 +326,7 @@ pub(crate) async fn process_factory_range(
 }
 
 /// Process factory calls using Multicall3 aggregate3 to batch all calls per block
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_factory_range_multicall(
     range: &BlockRange,
     blocks: &[BlockInfo],
@@ -396,13 +399,15 @@ pub(crate) async fn process_factory_range_multicall(
                 for param_combo in &param_combinations {
                     let dyn_values: Vec<DynSolValue> = param_combo
                         .iter()
-                        .map(|(param_type, value, _)| param_type.parse_value(value))
+                        .map(|(param_type, value, _): &EncodedParam| {
+                            param_type.parse_value(value)
+                        })
                         .collect::<Result<_, _>>()?;
 
                     let encoded_calldata = encode_call_with_params(selector, &dyn_values);
                     let param_values: Vec<Vec<u8>> = param_combo
                         .iter()
-                        .map(|(_, _, encoded)| encoded.clone())
+                        .map(|(_, _, encoded): &EncodedParam| encoded.clone())
                         .collect();
 
                     configs.push(CallConfig {
@@ -1210,7 +1215,7 @@ pub(crate) async fn process_factory_once_calls(
         }
 
         // Execute batch calls only if there are pending calls
-        let results_by_address: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> =
+        let results_by_address: AddressResults =
             if !pending_calls.is_empty() {
                 let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
                     .iter()

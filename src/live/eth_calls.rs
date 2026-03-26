@@ -577,6 +577,7 @@ impl LiveEthCallCollector {
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
         // Group calls by (contract_name, function_name) for decoder messages
+        #[allow(clippy::type_complexity)]
         let mut grouped_calls: HashMap<
             (String, String),
             Vec<(Address, u32, Bytes, &EventTriggeredCallConfig)>,

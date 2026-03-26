@@ -6,16 +6,19 @@ use std::collections::HashMap;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::Bytes;
 
-use super::types::{CallConfig, EthCallCollectionError, OnceCallConfig, TokenCallConfig};
+use super::types::{
+    CallConfig, EncodedParam, EthCallCollectionError, OnceCallConfig, ParamCombinations,
+    TokenCallConfig,
+};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{
-    encode_call_with_params, EthCallConfig, EvmType, ParamConfig, ParamError, ParamValue,
+    encode_call_with_params, EthCallConfig, ParamConfig, ParamError,
 };
 use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 
 pub(crate) fn generate_param_combinations(
     params: &[ParamConfig],
-) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
+) -> Result<ParamCombinations, ParamError> {
     if params.is_empty() {
         return Ok(vec![vec![]]);
     }
@@ -103,14 +106,16 @@ pub fn build_call_configs(
                     for param_combo in &param_combinations {
                         let dyn_values: Vec<DynSolValue> = param_combo
                             .iter()
-                            .map(|(param_type, value, _)| param_type.parse_value(value))
+                            .map(|(param_type, value, _): &EncodedParam| {
+                                param_type.parse_value(value)
+                            })
                             .collect::<Result<_, _>>()?;
 
                         let encoded_calldata = encode_call_with_params(selector, &dyn_values);
 
                         let param_values: Vec<Vec<u8>> = param_combo
                             .iter()
-                            .map(|(_, _, encoded)| encoded.clone())
+                            .map(|(_, _, encoded): &EncodedParam| encoded.clone())
                             .collect();
 
                         configs.push(CallConfig {

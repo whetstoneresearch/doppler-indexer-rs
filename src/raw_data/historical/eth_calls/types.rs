@@ -12,7 +12,9 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::{S3Manifest, StorageManager};
-use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency, ParamConfig, ParamError};
+use crate::types::config::eth_call::{
+    EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue,
+};
 use crate::types::config::tokens::PoolType;
 use alloy::primitives::Bytes;
 
@@ -168,6 +170,12 @@ pub struct EventCallResult {
 
 /// Key for grouping event-triggered calls: (source_name, event_signature_hash)
 pub type EventCallKey = (String, [u8; 32]);
+
+/// A single encoded parameter: (evm_type, param_value, abi-encoded bytes).
+pub type EncodedParam = (EvmType, ParamValue, Vec<u8>);
+
+/// All parameter combinations for an eth_call configuration.
+pub type ParamCombinations = Vec<Vec<EncodedParam>>;
 
 #[derive(Debug)]
 pub struct CallResult {

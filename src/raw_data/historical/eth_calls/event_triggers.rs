@@ -27,6 +27,26 @@ use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig};
 
+/// An event-triggered call matched with its config and encoded parameters,
+/// ready to be grouped by output key.
+pub(super) struct PreparedEventCall {
+    pub trigger: EventTriggerData,
+    pub config: EventTriggeredCallConfig,
+    pub target_address: Address,
+    pub decoded_values: Vec<DynSolValue>,
+    pub encoded_params: Vec<Vec<u8>>,
+}
+
+/// A fully-built eth_call ready for RPC batch execution.
+#[derive(Clone)]
+pub(super) struct PendingEventCall {
+    pub request: TransactionRequest,
+    pub block_id: BlockId,
+    pub trigger: EventTriggerData,
+    pub target_address: Address,
+    pub encoded_params: Vec<Vec<u8>>,
+}
+
 /// Build event-triggered call configs from contracts configuration
 /// Returns a map from (source_name, event_signature_hash) -> Vec<EventTriggeredCallConfig>
 pub fn build_event_triggered_call_configs(
@@ -508,16 +528,7 @@ pub(crate) async fn process_event_triggers(
 
     // Group triggers by (source_name, event_signature) and then by (contract_name, function_name)
     // to batch calls together
-    let mut calls_by_output: HashMap<
-        (String, String),
-        Vec<(
-            EventTriggerData,
-            EventTriggeredCallConfig,
-            Address,
-            Vec<DynSolValue>,
-            Vec<Vec<u8>>,
-        )>,
-    > = HashMap::new();
+    let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> = HashMap::new();
 
     for trigger in triggers {
         let key = (trigger.source_name.clone(), trigger.event_signature);
@@ -579,13 +590,15 @@ pub(crate) async fn process_event_triggers(
                     };
 
                 let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output.entry(output_key).or_default().push((
-                    trigger.clone(),
-                    config.clone(),
-                    target_address,
-                    params,
-                    encoded_params,
-                ));
+                calls_by_output.entry(output_key).or_default().push(
+                    PreparedEventCall {
+                        trigger: trigger.clone(),
+                        config: config.clone(),
+                        target_address,
+                        decoded_values: params,
+                        encoded_params,
+                    },
+                );
             }
         }
     }
@@ -605,12 +618,12 @@ pub(crate) async fn process_event_triggers(
         // Get block range for output file naming
         let min_block = calls
             .iter()
-            .map(|(t, _, _, _, _)| t.block_number)
+            .map(|c| c.trigger.block_number)
             .min()
             .unwrap();
         let max_block = calls
             .iter()
-            .map(|(t, _, _, _, _)| t.block_number)
+            .map(|c| c.trigger.block_number)
             .max()
             .unwrap();
 
@@ -623,65 +636,39 @@ pub(crate) async fn process_event_triggers(
             max_block
         );
 
-        // Build RPC calls
-        let mut pending_calls: Vec<(
-            TransactionRequest,
-            BlockId,
-            &EventTriggerData,
-            Address,
-            Vec<Vec<u8>>,
-        )> = Vec::new();
+        // Build RPC calls (owned triggers to avoid lifetime issues with concurrent chunks)
+        let mut pending_calls: Vec<PendingEventCall> = Vec::new();
 
-        for (trigger, config, target_address, params, encoded_params) in &calls {
-            let calldata = encode_call_with_params(config.function_selector, params);
+        for call in &calls {
+            let calldata =
+                encode_call_with_params(call.config.function_selector, &call.decoded_values);
             let tx = TransactionRequest::default()
-                .to(*target_address)
+                .to(call.target_address)
                 .input(calldata.into());
-            let block_id = BlockId::Number(BlockNumberOrTag::Number(trigger.block_number));
-            pending_calls.push((
-                tx,
+            let block_id = BlockId::Number(BlockNumberOrTag::Number(call.trigger.block_number));
+            pending_calls.push(PendingEventCall {
+                request: tx,
                 block_id,
-                trigger,
-                *target_address,
-                encoded_params.clone(),
-            ));
+                trigger: call.trigger.clone(),
+                target_address: call.target_address,
+                encoded_params: call.encoded_params.clone(),
+            });
         }
 
         // Execute calls in batches with concurrent chunk processing
         let max_params = calls
             .iter()
-            .map(|(_, _, _, _, p)| p.len())
+            .map(|c| c.encoded_params.len())
             .max()
             .unwrap_or(0);
 
         // Number of chunks to process concurrently
         let chunk_concurrency = 4;
 
-        // Pre-collect chunks into owned data to avoid lifetime issues
-        let owned_chunks: Vec<
-            Vec<(
-                TransactionRequest,
-                BlockId,
-                EventTriggerData,
-                Address,
-                Vec<Vec<u8>>,
-            )>,
-        > = pending_calls
+        // Collect chunks for concurrent processing
+        let owned_chunks: Vec<Vec<PendingEventCall>> = pending_calls
             .chunks(ctx.rpc_batch_size)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|(tx, block_id, trigger, addr, params)| {
-                        (
-                            tx.clone(),
-                            *block_id,
-                            (*trigger).clone(),
-                            *addr,
-                            params.clone(),
-                        )
-                    })
-                    .collect()
-            })
+            .map(|chunk| chunk.to_vec())
             .collect();
 
         let chunk_results: Vec<Vec<EventCallResult>> = stream::iter(owned_chunks)
@@ -691,34 +678,34 @@ pub(crate) async fn process_event_triggers(
                 async move {
                     let batch_calls: Vec<(TransactionRequest, BlockId)> = chunk
                         .iter()
-                        .map(|(tx, block_id, _, _, _)| (tx.clone(), *block_id))
+                        .map(|c| (c.request.clone(), c.block_id))
                         .collect();
 
                     let results = ctx.client.call_batch(batch_calls).await?;
 
                     let mut chunk_results = Vec::with_capacity(results.len());
                     for (i, result) in results.into_iter().enumerate() {
-                        let (_, _, trigger, target_address, encoded_params) = &chunk[i];
+                        let call = &chunk[i];
 
                         match result {
                             Ok(bytes) => {
                                 chunk_results.push(EventCallResult {
-                                    block_number: trigger.block_number,
-                                    block_timestamp: trigger.block_timestamp,
-                                    log_index: trigger.log_index,
-                                    target_address: target_address.0.0,
+                                    block_number: call.trigger.block_number,
+                                    block_timestamp: call.trigger.block_timestamp,
+                                    log_index: call.trigger.log_index,
+                                    target_address: call.target_address.0.0,
                                     value_bytes: bytes.to_vec(),
-                                    param_values: encoded_params.clone(),
+                                    param_values: call.encoded_params.clone(),
                                 });
                             }
                             Err(e) => {
-                                let params_hex: Vec<String> = encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
+                                let params_hex: Vec<String> = call.encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
                                 tracing::warn!(
                                     "Event-triggered eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
                                     contract_name,
                                     function_name,
-                                    trigger.block_number,
-                                    target_address,
+                                    call.trigger.block_number,
+                                    call.target_address,
                                     params_hex,
                                     e
                                 );
@@ -885,17 +872,7 @@ pub(crate) async fn process_event_triggers_multicall(
 
     // Group triggers by (source_name, event_signature) and prepare call info
     // Key: (contract_name, function_name)
-    // Value: Vec<(EventTriggerData, EventTriggeredCallConfig, Address, params, encoded_params)>
-    let mut calls_by_output: HashMap<
-        (String, String),
-        Vec<(
-            EventTriggerData,
-            EventTriggeredCallConfig,
-            Address,
-            Vec<DynSolValue>,
-            Vec<Vec<u8>>,
-        )>,
-    > = HashMap::new();
+    let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> = HashMap::new();
 
     for trigger in triggers {
         let key = (trigger.source_name.clone(), trigger.event_signature);
@@ -944,13 +921,15 @@ pub(crate) async fn process_event_triggers_multicall(
                     };
 
                 let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output.entry(output_key).or_default().push((
-                    trigger.clone(),
-                    config.clone(),
-                    target_address,
-                    params,
-                    encoded_params,
-                ));
+                calls_by_output.entry(output_key).or_default().push(
+                    PreparedEventCall {
+                        trigger: trigger.clone(),
+                        config: config.clone(),
+                        target_address,
+                        decoded_values: params,
+                        encoded_params,
+                    },
+                );
             }
         }
     }
@@ -960,28 +939,15 @@ pub(crate) async fn process_event_triggers_multicall(
     }
 
     // Group all calls by block number for multicall batching
-    struct EventCallInfo {
-        trigger: EventTriggerData,
-        config: EventTriggeredCallConfig,
-        target_address: Address,
-        params: Vec<DynSolValue>,
-        encoded_params: Vec<Vec<u8>>,
-    }
+    let mut calls_by_block: HashMap<u64, Vec<PreparedEventCall>> = HashMap::new();
 
-    let mut calls_by_block: HashMap<u64, Vec<EventCallInfo>> = HashMap::new();
-
-    for ((_contract_name, _function_name), calls) in &calls_by_output {
-        for (trigger, config, target_address, params, encoded_params) in calls {
+    for ((_contract_name, _function_name), calls) in calls_by_output {
+        for call in calls {
+            let block_number = call.trigger.block_number;
             calls_by_block
-                .entry(trigger.block_number)
+                .entry(block_number)
                 .or_default()
-                .push(EventCallInfo {
-                    trigger: trigger.clone(),
-                    config: config.clone(),
-                    target_address: *target_address,
-                    params: params.clone(),
-                    encoded_params: encoded_params.clone(),
-                });
+                .push(call);
         }
     }
 
@@ -997,7 +963,7 @@ pub(crate) async fn process_event_triggers_multicall(
 
             for call_info in calls {
                 let calldata =
-                    encode_call_with_params(call_info.config.function_selector, &call_info.params);
+                    encode_call_with_params(call_info.config.function_selector, &call_info.decoded_values);
                 slots.push(MulticallSlotGeneric {
                     block_number,
                     block_timestamp: call_info.trigger.block_timestamp,
