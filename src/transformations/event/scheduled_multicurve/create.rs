@@ -276,7 +276,12 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     )))?,
                 min_proceeds: U256::ZERO,
                 max_proceeds: U256::ZERO,
-                starting_time: starting_time.to::<u64>(),
+                starting_time: starting_time.try_into().map_err(|_| {
+                    TransformationError::TypeConversion(format!(
+                        "startingTimeOf overflows u64 for pool {} at block {} tx {}",
+                        B256::from(pool_id), event.block_number, B256::from(event.transaction_hash)
+                    ))
+                })?,
                 ending_time: 0,
                 starting_tick,
                 ending_tick,

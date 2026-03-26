@@ -410,6 +410,8 @@ impl TransformationEngine {
             return Ok(());
         }
 
+        let mut failed_handlers: Vec<(String, String)> = vec![];
+
         for handler_info in self.registry.unique_event_handlers() {
             let handler = &handler_info.handler;
             let handler_key = handler.handler_key();
@@ -448,6 +450,7 @@ impl TransformationEngine {
             let mut ranges_to_attempt = to_process;
             let mut pass = 0u32;
             let mut total_processed = 0usize;
+            let mut handler_errored = false;
 
             loop {
                 pass += 1;
@@ -480,20 +483,14 @@ impl TransformationEngine {
                 let total = ranges_to_attempt.len();
                 let mut processed = 0;
                 let mut skipped_ranges: Vec<(u64, u64)> = Vec::new();
-                let mut errored = false;
 
                 let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-                let mut join_set:
-                    JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
-                        JoinSet::new();
+                let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
+                    JoinSet::new();
 
                 for (range_start, range_end) in &ranges_to_attempt {
                     let events = self
-                        .read_decoded_events_for_triggers(
-                            *range_start,
-                            *range_end,
-                            &event_triggers,
-                        )
+                        .read_decoded_events_for_triggers(*range_start, *range_end, &event_triggers)
                         .await?;
 
                     let events = filter_events_by_start_block(&self.contracts, events);
@@ -533,8 +530,7 @@ impl TransformationEngine {
                         let handler_key = handler_key.clone();
                         let handler_name = handler.name();
                         let handler_version = handler.version();
-                        let tx_addresses =
-                            self.read_receipt_addresses(*range_start, *range_end);
+                        let tx_addresses = self.read_receipt_addresses(*range_start, *range_end);
                         let chain_name = self.chain_name.clone();
                         let chain_id = self.chain_id;
                         let historical = self.historical_reader.clone();
@@ -608,16 +604,13 @@ impl TransformationEngine {
                                 "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
                                 handler_key, e
                             );
-                            errored = true;
+                            failed_handlers.push((handler_key.clone(), e.to_string()));
                             break;
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "Handler {} catchup task panicked: {}",
-                                handler_key,
-                                e
-                            );
-                            errored = true;
+                            tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
+                            failed_handlers
+                                .push((handler_key.clone(), format!("task panicked: {}", e)));
                             break;
                         }
                     }
@@ -625,33 +618,51 @@ impl TransformationEngine {
 
                 total_processed += processed;
 
-                if errored {
+                if !failed_handlers.iter().any(|(k, _)| k == &handler_key) {
+                    if skipped_ranges.is_empty() {
+                        tracing::info!(
+                            "Handler {} catchup complete in {} pass(es): processed {} ranges",
+                            handler_key,
+                            pass,
+                            total_processed
+                        );
+                        break;
+                    }
+
+                    if skipped_ranges.len() == ranges_to_attempt.len() {
+                        tracing::warn!(
+                            "Handler {} catchup: no progress on {} ranges still waiting for call dependencies after {} pass(es). Giving up.",
+                            handler_key,
+                            skipped_ranges.len(),
+                            pass
+                        );
+                        break;
+                    }
+
+                    // Progress was made, retry the skipped ranges
+                    ranges_to_attempt = skipped_ranges;
+                } else {
+                    // Handler errored, skip retry-skipped-ranges and move to next handler
+                    handler_errored = true;
                     break;
                 }
-
-                if skipped_ranges.is_empty() {
-                    tracing::info!(
-                        "Handler {} catchup complete in {} pass(es): processed {} ranges",
-                        handler_key,
-                        pass,
-                        total_processed
-                    );
-                    break;
-                }
-
-                if skipped_ranges.len() == ranges_to_attempt.len() {
-                    tracing::warn!(
-                        "Handler {} catchup: no progress on {} ranges still waiting for call dependencies after {} pass(es). Giving up.",
-                        handler_key,
-                        skipped_ranges.len(),
-                        pass
-                    );
-                    break;
-                }
-
-                // Progress was made, retry the skipped ranges
-                ranges_to_attempt = skipped_ranges;
             }
+
+            if handler_errored {
+                continue;
+            }
+        }
+
+        if !failed_handlers.is_empty() {
+            let msg = failed_handlers
+                .iter()
+                .map(|(k, e)| format!("{}: {}", k, e))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(TransformationError::HandlerError {
+                handler_name: "catchup".to_string(),
+                message: format!("{} handler(s) failed: {}", failed_handlers.len(), msg),
+            });
         }
 
         Ok(())
@@ -667,6 +678,8 @@ impl TransformationEngine {
             );
             return Ok(());
         }
+
+        let mut failed_handlers: Vec<(String, String)> = vec![];
 
         for handler_info in self.registry.unique_call_handlers() {
             let handler = &handler_info.handler;
@@ -702,7 +715,6 @@ impl TransformationEngine {
 
             let total = to_process.len();
             let mut processed = 0;
-            let mut errored = false;
 
             let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
             let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
@@ -775,6 +787,7 @@ impl TransformationEngine {
                 }
             }
 
+            let mut this_handler_errored = false;
             while let Some(result) = join_set.join_next().await {
                 match result {
                     Ok(Ok(Some((hk, rs, re)))) => {
@@ -788,24 +801,39 @@ impl TransformationEngine {
                             "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
                             handler_key, e
                         );
-                        errored = true;
+                        failed_handlers.push((handler_key.clone(), e.to_string()));
+                        this_handler_errored = true;
                         break;
                     }
                     Err(e) => {
                         tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                        errored = true;
+                        failed_handlers
+                            .push((handler_key.clone(), format!("task panicked: {}", e)));
+                        this_handler_errored = true;
                         break;
                     }
                 }
             }
 
-            if !errored {
+            if !this_handler_errored {
                 tracing::info!(
                     "Handler {} catchup complete: processed {} ranges",
                     handler_key,
                     processed
                 );
             }
+        }
+
+        if !failed_handlers.is_empty() {
+            let msg = failed_handlers
+                .iter()
+                .map(|(k, e)| format!("{}: {}", k, e))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(TransformationError::HandlerError {
+                handler_name: "catchup".to_string(),
+                message: format!("{} handler(s) failed: {}", failed_handlers.len(), msg),
+            });
         }
 
         Ok(())
@@ -1224,10 +1252,10 @@ impl TransformationEngine {
                         let calls: Vec<_> = calls
                             .into_iter()
                             .filter(|c| {
-                                let start_block = self
-                                    .contracts
-                                    .get(&c.source_name)
-                                    .and_then(|ct| ct.start_block.map(|u| u.to::<u64>()));
+                                let start_block =
+                                    self.contracts.get(&c.source_name).and_then(|ct| {
+                                        ct.start_block.map(|u| u.try_into().unwrap_or(u64::MAX))
+                                    });
                                 start_block.map_or(true, |sb| c.block_number >= sb)
                             })
                             .collect();
