@@ -140,16 +140,32 @@ fn convert_dyn_sol_value(
     match value {
         DynSolValue::Address(addr) => Ok(DecodedValue::Address(addr.0 .0)),
         DynSolValue::Uint(val, _) => match output_type {
-            EvmType::Uint8 => Ok(DecodedValue::Uint8((*val).try_into().unwrap_or(u8::MAX))),
+            EvmType::Uint8 => {
+                let v: u8 = (*val).try_into().map_err(|_| {
+                    EthCallDecodingError::Decode(format!("Uint value {} overflows u8", val))
+                })?;
+                Ok(DecodedValue::Uint8(v))
+            }
             EvmType::Uint64 | EvmType::Uint32 | EvmType::Uint24 | EvmType::Uint16 => {
-                Ok(DecodedValue::Uint64((*val).try_into().unwrap_or(u64::MAX)))
+                let v: u64 = (*val).try_into().map_err(|_| {
+                    EthCallDecodingError::Decode(format!("Uint value {} overflows u64", val))
+                })?;
+                Ok(DecodedValue::Uint64(v))
             }
             _ => Ok(DecodedValue::Uint256(*val)),
         },
         DynSolValue::Int(val, _) => match output_type {
-            EvmType::Int8 => Ok(DecodedValue::Int8((*val).try_into().unwrap_or(i8::MAX))),
+            EvmType::Int8 => {
+                let v: i8 = (*val).try_into().map_err(|_| {
+                    EthCallDecodingError::Decode(format!("Int value {} overflows i8", val))
+                })?;
+                Ok(DecodedValue::Int8(v))
+            }
             EvmType::Int64 | EvmType::Int32 | EvmType::Int24 | EvmType::Int16 => {
-                Ok(DecodedValue::Int64((*val).try_into().unwrap_or(i64::MAX)))
+                let v: i64 = (*val).try_into().map_err(|_| {
+                    EthCallDecodingError::Decode(format!("Int value {} overflows i64", val))
+                })?;
+                Ok(DecodedValue::Int64(v))
             }
             _ => Ok(DecodedValue::Int256(*val)),
         },
@@ -166,5 +182,108 @@ fn convert_dyn_sol_value(
             "Unsupported value type: {:?}",
             value
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{I256, U256};
+
+    #[test]
+    fn test_uint8_overflow_returns_error() {
+        let val = DynSolValue::Uint(U256::from(256u64), 8);
+        let result = convert_dyn_sol_value(&val, &EvmType::Uint8);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u8"),
+            "Expected overflow error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_uint64_overflow_returns_error() {
+        // U256::MAX is well above u64::MAX
+        let val = DynSolValue::Uint(U256::MAX, 256);
+        let result = convert_dyn_sol_value(&val, &EvmType::Uint64);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("overflows u64"),
+            "Expected overflow error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_int8_overflow_returns_error() {
+        // 128 is outside i8 range [-128, 127]
+        let val = DynSolValue::Int(I256::try_from(128i64).unwrap(), 8);
+        let result = convert_dyn_sol_value(&val, &EvmType::Int8);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("overflows i8"),
+            "Expected overflow error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_int64_overflow_returns_error() {
+        // I256::MAX is well above i64::MAX
+        let val = DynSolValue::Int(I256::MAX, 256);
+        let result = convert_dyn_sol_value(&val, &EvmType::Int64);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("overflows i64"),
+            "Expected overflow error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_valid_values_still_decode() {
+        // Valid u8
+        let val = DynSolValue::Uint(U256::from(255u64), 8);
+        let result = convert_dyn_sol_value(&val, &EvmType::Uint8).unwrap();
+        assert!(matches!(result, DecodedValue::Uint8(255)));
+
+        // Valid u64
+        let val = DynSolValue::Uint(U256::from(u64::MAX), 64);
+        let result = convert_dyn_sol_value(&val, &EvmType::Uint64).unwrap();
+        assert!(matches!(result, DecodedValue::Uint64(v) if v == u64::MAX));
+
+        // Valid i8
+        let val = DynSolValue::Int(I256::try_from(-128i64).unwrap(), 8);
+        let result = convert_dyn_sol_value(&val, &EvmType::Int8).unwrap();
+        assert!(matches!(result, DecodedValue::Int8(-128)));
+
+        // Valid i64
+        let val = DynSolValue::Int(I256::try_from(i64::MAX).unwrap(), 64);
+        let result = convert_dyn_sol_value(&val, &EvmType::Int64).unwrap();
+        assert!(matches!(result, DecodedValue::Int64(v) if v == i64::MAX));
+
+        // Uint256 passthrough
+        let val = DynSolValue::Uint(U256::MAX, 256);
+        let result = convert_dyn_sol_value(&val, &EvmType::Uint256).unwrap();
+        assert!(matches!(result, DecodedValue::Uint256(v) if v == U256::MAX));
+
+        // Int256 passthrough
+        let val = DynSolValue::Int(I256::MIN, 256);
+        let result = convert_dyn_sol_value(&val, &EvmType::Int256).unwrap();
+        assert!(matches!(result, DecodedValue::Int256(v) if v == I256::MIN));
+
+        // Zero values
+        let val = DynSolValue::Uint(U256::ZERO, 8);
+        let result = convert_dyn_sol_value(&val, &EvmType::Uint8).unwrap();
+        assert!(matches!(result, DecodedValue::Uint8(0)));
+
+        let val = DynSolValue::Int(I256::ZERO, 8);
+        let result = convert_dyn_sol_value(&val, &EvmType::Int8).unwrap();
+        assert!(matches!(result, DecodedValue::Int8(0)));
     }
 }
