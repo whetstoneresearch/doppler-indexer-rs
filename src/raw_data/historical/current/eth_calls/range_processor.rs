@@ -8,7 +8,7 @@ use crate::raw_data::historical::eth_calls::{
     process_factory_once_calls, process_factory_once_calls_multicall, process_factory_range,
     process_factory_range_multicall, process_once_calls_multicall, process_once_calls_regular,
     process_range, process_range_multicall, process_token_range, process_token_range_multicall,
-    BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError,
+    BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError, EthCallContext,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::StorageManager;
@@ -38,40 +38,37 @@ pub(super) async fn process_complete_range(
         end: range_start + state.range_size,
     };
 
+    let ctx = EthCallContext {
+        client,
+        output_dir: &state.base_output_dir,
+        existing_files: &state.existing_files,
+        rpc_batch_size: state.rpc_batch_size,
+        decoder_tx,
+        chain_name: &chain.name,
+        storage_manager,
+        s3_manifest: &state.s3_manifest,
+    };
+
     if state.has_regular_calls {
         if let Some(multicall_addr) = state.multicall3_address {
             process_range_multicall(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                &state.s3_manifest,
-                state.rpc_batch_size,
                 state.max_params,
                 &mut state.frequency_state,
                 multicall_addr,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         } else {
             process_range(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                &state.s3_manifest,
-                state.rpc_batch_size,
                 state.max_params,
                 &mut state.frequency_state,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         }
@@ -82,31 +79,19 @@ pub(super) async fn process_complete_range(
             process_token_range_multicall(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.token_call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                state.rpc_batch_size,
                 &mut state.frequency_state,
                 multicall_addr,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         } else {
             process_token_range(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.token_call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                state.rpc_batch_size,
                 &mut state.frequency_state,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         }
@@ -117,30 +102,19 @@ pub(super) async fn process_complete_range(
             process_once_calls_multicall(
                 &range,
                 blocks,
-                client,
+                &ctx,
                 &state.once_configs,
                 &chain.contracts,
-                &state.base_output_dir,
-                &state.existing_files,
                 multicall_addr,
-                state.rpc_batch_size,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         } else {
             process_once_calls_regular(
                 &range,
                 blocks,
-                client,
+                &ctx,
                 &state.once_configs,
                 &chain.contracts,
-                &state.base_output_dir,
-                &state.existing_files,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         }
@@ -153,35 +127,23 @@ pub(super) async fn process_complete_range(
                 process_factory_range_multicall(
                     &range,
                     blocks,
-                    client,
+                    &ctx,
                     factory_data,
                     &state.factory_call_configs,
-                    &state.base_output_dir,
-                    &state.existing_files,
-                    state.rpc_batch_size,
                     state.factory_max_params,
                     &mut state.frequency_state,
                     multicall_addr,
-                    decoder_tx,
-                    &chain.name,
-                    storage_manager,
                 )
                 .await?;
             } else {
                 process_factory_range(
                     &range,
                     blocks,
-                    client,
+                    &ctx,
                     factory_data,
                     &state.factory_call_configs,
-                    &state.base_output_dir,
-                    &state.existing_files,
-                    state.rpc_batch_size,
                     state.factory_max_params,
                     &mut state.frequency_state,
-                    decoder_tx,
-                    &chain.name,
-                    storage_manager,
                 )
                 .await?;
             }
@@ -192,31 +154,20 @@ pub(super) async fn process_complete_range(
             if let Some(multicall_addr) = state.multicall3_address {
                 process_factory_once_calls_multicall(
                     &range,
-                    client,
+                    &ctx,
                     factory_data,
                     &state.factory_once_configs,
-                    &state.base_output_dir,
-                    &state.existing_files,
                     &empty_index,
                     multicall_addr,
-                    state.rpc_batch_size,
-                    decoder_tx,
-                    &chain.name,
-                    storage_manager,
                 )
                 .await?;
             } else {
                 process_factory_once_calls(
                     &range,
-                    client,
+                    &ctx,
                     factory_data,
                     &state.factory_once_configs,
-                    &state.base_output_dir,
-                    &state.existing_files,
                     &empty_index,
-                    decoder_tx,
-                    &chain.name,
-                    storage_manager,
                 )
                 .await?;
             }
@@ -262,40 +213,37 @@ pub(super) async fn process_incomplete_range(
         end: max_block + 1,
     };
 
+    let ctx = EthCallContext {
+        client,
+        output_dir: &state.base_output_dir,
+        existing_files: &state.existing_files,
+        rpc_batch_size: state.rpc_batch_size,
+        decoder_tx,
+        chain_name: &chain.name,
+        storage_manager,
+        s3_manifest: &state.s3_manifest,
+    };
+
     if state.has_regular_calls && !state.range_regular_done.contains(&range_start) {
         if let Some(multicall_addr) = state.multicall3_address {
             process_range_multicall(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                &state.s3_manifest,
-                state.rpc_batch_size,
                 state.max_params,
                 &mut state.frequency_state,
                 multicall_addr,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         } else {
             process_range(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                &state.s3_manifest,
-                state.rpc_batch_size,
                 state.max_params,
                 &mut state.frequency_state,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         }
@@ -306,31 +254,19 @@ pub(super) async fn process_incomplete_range(
             process_token_range_multicall(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.token_call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                state.rpc_batch_size,
                 &mut state.frequency_state,
                 multicall_addr,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         } else {
             process_token_range(
                 &range,
                 blocks.clone(),
-                client,
+                &ctx,
                 &state.token_call_configs,
-                &state.base_output_dir,
-                &state.existing_files,
-                state.rpc_batch_size,
                 &mut state.frequency_state,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         }
@@ -341,30 +277,19 @@ pub(super) async fn process_incomplete_range(
             process_once_calls_multicall(
                 &range,
                 &blocks,
-                client,
+                &ctx,
                 &state.once_configs,
                 &chain.contracts,
-                &state.base_output_dir,
-                &state.existing_files,
                 multicall_addr,
-                state.rpc_batch_size,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         } else {
             process_once_calls_regular(
                 &range,
                 &blocks,
-                client,
+                &ctx,
                 &state.once_configs,
                 &chain.contracts,
-                &state.base_output_dir,
-                &state.existing_files,
-                decoder_tx,
-                &chain.name,
-                storage_manager,
             )
             .await?;
         }
@@ -377,35 +302,23 @@ pub(super) async fn process_incomplete_range(
                     process_factory_range_multicall(
                         &range,
                         &blocks,
-                        client,
+                        &ctx,
                         factory_data,
                         &state.factory_call_configs,
-                        &state.base_output_dir,
-                        &state.existing_files,
-                        state.rpc_batch_size,
                         state.factory_max_params,
                         &mut state.frequency_state,
                         multicall_addr,
-                        decoder_tx,
-                        &chain.name,
-                        storage_manager,
                     )
                     .await?;
                 } else {
                     process_factory_range(
                         &range,
                         &blocks,
-                        client,
+                        &ctx,
                         factory_data,
                         &state.factory_call_configs,
-                        &state.base_output_dir,
-                        &state.existing_files,
-                        state.rpc_batch_size,
                         state.factory_max_params,
                         &mut state.frequency_state,
-                        decoder_tx,
-                        &chain.name,
-                        storage_manager,
                     )
                     .await?;
                 }
@@ -415,31 +328,20 @@ pub(super) async fn process_incomplete_range(
                     if let Some(multicall_addr) = state.multicall3_address {
                         process_factory_once_calls_multicall(
                             &range,
-                            client,
+                            &ctx,
                             factory_data,
                             &state.factory_once_configs,
-                            &state.base_output_dir,
-                            &state.existing_files,
                             &empty_index,
                             multicall_addr,
-                            state.rpc_batch_size,
-                            decoder_tx,
-                            &chain.name,
-                            storage_manager,
                         )
                         .await?;
                     } else {
                         process_factory_once_calls(
                             &range,
-                            client,
+                            &ctx,
                             factory_data,
                             &state.factory_once_configs,
-                            &state.base_output_dir,
-                            &state.existing_files,
                             &empty_index,
-                            decoder_tx,
-                            &chain.name,
-                            storage_manager,
                         )
                         .await?;
                     }

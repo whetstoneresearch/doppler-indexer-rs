@@ -2,8 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
@@ -13,7 +11,6 @@ use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use futures::{stream, StreamExt, TryStreamExt};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use tokio::sync::mpsc::Sender;
 
 use super::config::{compute_function_selector, generate_param_combinations};
 use super::event_triggers::encode_once_call_params;
@@ -25,32 +22,27 @@ use super::parquet_io::{
     write_results_to_parquet,
 };
 use super::types::{
-    BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError, FrequencyState,
-    OnceCallConfig, OnceCallResult, TokenCallConfig,
+    AddressResults, BlockInfo, BlockRange, CallConfig, CallResult, CollectionResults,
+    ContractProcessingInfo, EthCallCollectionError, EthCallContext, FactoryContractProcessingInfo,
+    FrequencyState, OnceCallConfig, OnceCallResult, TokenCallConfig,
 };
 use crate::decoding::{
     DecoderMessage, EthCallResult as DecoderEthCallResult, OnceCallResult as DecoderOnceCallResult,
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::UnifiedRpcClient;
-use crate::storage::{upload_parquet_to_s3, S3Manifest, StorageManager};
+use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig, Frequency};
 
 pub(crate) async fn process_factory_range(
     range: &BlockRange,
     blocks: &[BlockInfo],
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     factory_data: &FactoryAddressData,
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for addrs in factory_data.addresses_by_block.values() {
@@ -84,7 +76,7 @@ pub(crate) async fn process_factory_range(
             let file_name = range.file_name("");
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
-            if existing_files.contains(&rel_path) {
+            if ctx.existing_files.contains(&rel_path) {
                 tracing::debug!(
                     "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
                     collection_name,
@@ -181,7 +173,7 @@ pub(crate) async fn process_factory_range(
                 }
             }
 
-            for chunk in pending_calls.chunks(rpc_batch_size) {
+            for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
                 let calls: Vec<(TransactionRequest, BlockId)> = chunk
                     .iter()
                     .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
@@ -189,7 +181,7 @@ pub(crate) async fn process_factory_range(
 
                 #[cfg(feature = "bench")]
                 let rpc_start = Instant::now();
-                let results = client.call_batch(calls).await?;
+                let results = ctx.client.call_batch(calls).await?;
                 #[cfg(feature = "bench")]
                 {
                     rpc_time += rpc_start.elapsed();
@@ -238,11 +230,11 @@ pub(crate) async fn process_factory_range(
                 .sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let result_count = all_results.len();
-            let sub_dir = output_dir.join(collection_name).join(&function_name);
+            let sub_dir = ctx.output_dir.join(collection_name).join(&function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
-            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
                 Some(
                     all_results
                         .iter()
@@ -287,12 +279,12 @@ pub(crate) async fn process_factory_range(
             );
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!("raw/eth_calls/{}/{}", collection_name, function_name);
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range.start,
                     range.end - 1,
@@ -301,7 +293,7 @@ pub(crate) async fn process_factory_range(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 if let Some(results) = decoder_results {
                     let _ = tx
                         .send(DecoderMessage::EthCallsReady {
@@ -335,18 +327,12 @@ pub(crate) async fn process_factory_range(
 pub(crate) async fn process_factory_range_multicall(
     range: &BlockRange,
     blocks: &[BlockInfo],
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     factory_data: &FactoryAddressData,
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -392,7 +378,7 @@ pub(crate) async fn process_factory_range_multicall(
             let file_name = range.file_name("");
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
-            if existing_files.contains(&rel_path) {
+            if ctx.existing_files.contains(&rel_path) {
                 tracing::debug!(
                     "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
                     collection_name,
@@ -533,7 +519,7 @@ pub(crate) async fn process_factory_range_multicall(
 
     // Execute all multicalls
     let results =
-        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
             .await?;
 
     // Distribute results back to groups
@@ -566,13 +552,13 @@ pub(crate) async fn process_factory_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name("");
-            let sub_dir = output_dir
+            let sub_dir = ctx.output_dir
                 .join(&group.collection_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
-            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
                 Some(
                     results
                         .iter()
@@ -603,7 +589,7 @@ pub(crate) async fn process_factory_range_multicall(
             );
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!(
                     "raw/eth_calls/{}/{}",
                     group.collection_name, group.function_name
@@ -611,7 +597,7 @@ pub(crate) async fn process_factory_range_multicall(
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range.start,
                     range.end - 1,
@@ -620,7 +606,7 @@ pub(crate) async fn process_factory_range_multicall(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 if let Some(results) = decoder_results {
                     let _ = tx
                         .send(DecoderMessage::EthCallsReady {
@@ -652,14 +638,9 @@ pub(crate) async fn process_factory_range_multicall(
 pub(crate) async fn process_once_calls_regular(
     range: &BlockRange,
     blocks: &[BlockInfo],
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
     contracts: &Contracts,
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let first_block = match blocks.first() {
         Some(b) => b,
@@ -673,7 +654,7 @@ pub(crate) async fn process_once_calls_regular(
 
         let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", contract_name, file_name);
-        let sub_dir = output_dir.join(contract_name).join("once");
+        let sub_dir = ctx.output_dir.join(contract_name).join("once");
         let output_path = sub_dir.join(&file_name);
 
         // Determine which function calls are missing from the existing file
@@ -683,7 +664,7 @@ pub(crate) async fn process_once_calls_regular(
             .collect();
 
         let (missing_fn_names, has_existing_file, null_entries) =
-            if existing_files.contains(&rel_path) {
+            if ctx.existing_files.contains(&rel_path) {
                 let index = read_once_column_index(&sub_dir);
                 let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
                     cols.iter().cloned().collect()
@@ -838,7 +819,7 @@ pub(crate) async fn process_once_calls_regular(
             .map(|(tx, bid, _, _)| (tx.clone(), *bid))
             .collect();
 
-        let batch_results = client.call_batch(batch_calls).await?;
+        let batch_results = ctx.client.call_batch(batch_calls).await?;
 
         let mut results_by_address: HashMap<Address, HashMap<String, Vec<u8>>> = HashMap::new();
 
@@ -874,7 +855,7 @@ pub(crate) async fn process_once_calls_regular(
 
         std::fs::create_dir_all(&sub_dir)?;
 
-        let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if decoder_tx.is_some() {
+        let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if ctx.decoder_tx.is_some() {
             Some(
                 results_by_address
                     .iter()
@@ -961,12 +942,12 @@ pub(crate) async fn process_once_calls_regular(
         }
 
         // Upload to S3 if configured
-        if let Some(sm) = storage_manager {
+        if let Some(sm) = ctx.storage_manager {
             let data_type = format!("raw/eth_calls/{}/once", contract_name);
             upload_parquet_to_s3(
                 sm,
                 &output_path,
-                chain_name,
+                ctx.chain_name,
                 &data_type,
                 range.start,
                 range.end - 1,
@@ -990,7 +971,7 @@ pub(crate) async fn process_once_calls_regular(
             actual_cols
         );
 
-        if let Some(tx) = decoder_tx {
+        if let Some(tx) = ctx.decoder_tx {
             if let Some(results) = decoder_once_results {
                 let _ = tx
                     .send(DecoderMessage::OnceCallsReady {
@@ -1011,15 +992,10 @@ pub(crate) async fn process_once_calls_regular(
 
 pub(crate) async fn process_factory_once_calls(
     range: &BlockRange,
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     factory_data: &FactoryAddressData,
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -1028,7 +1004,7 @@ pub(crate) async fn process_factory_once_calls(
 
         let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", collection_name, file_name);
-        let sub_dir = output_dir.join(collection_name).join("once");
+        let sub_dir = ctx.output_dir.join(collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
 
         let all_fn_names: Vec<String> = call_configs
@@ -1036,7 +1012,7 @@ pub(crate) async fn process_factory_once_calls(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if existing_files
+        let (missing_fn_names, has_existing_file, null_entries) = if ctx.existing_files
             .contains(&rel_path)
         {
             let index = column_indexes.get(collection_name);
@@ -1141,7 +1117,7 @@ pub(crate) async fn process_factory_once_calls(
             let mut index = read_once_column_index(&sub_dir);
             index.insert(file_name.clone(), all_fn_names.clone());
             write_once_column_index(&sub_dir, &index)?;
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::OnceFileBackfilled {
                         range_start: range.start,
@@ -1241,10 +1217,9 @@ pub(crate) async fn process_factory_once_calls(
                     .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
                     .collect();
 
-                let batch_results = client.call_batch(batch_calls).await?;
+                let batch_results = ctx.client.call_batch(batch_calls).await?;
 
-                let mut results_map: HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)> =
-                    HashMap::new();
+                let mut results_map: AddressResults = HashMap::new();
 
                 for (i, result) in batch_results.into_iter().enumerate() {
                     let (tx, _, address, block_number, timestamp, function_name) =
@@ -1373,7 +1348,7 @@ pub(crate) async fn process_factory_once_calls(
                         .map(|(tx, bid, _, _)| (tx.clone(), *bid))
                         .collect();
 
-                    let batch_results = client.call_batch(batch_calls).await?;
+                    let batch_results = ctx.client.call_batch(batch_calls).await?;
 
                     for (i, result) in batch_results.into_iter().enumerate() {
                         let (_, _, addr_bytes, function_name) = &backfill_calls[i];
@@ -1446,12 +1421,12 @@ pub(crate) async fn process_factory_once_calls(
         }
 
         // Upload to S3 if configured
-        if let Some(sm) = storage_manager {
+        if let Some(sm) = ctx.storage_manager {
             let data_type = format!("raw/eth_calls/{}/once", collection_name);
             upload_parquet_to_s3(
                 sm,
                 &output_path,
-                chain_name,
+                ctx.chain_name,
                 &data_type,
                 range.start,
                 range.end - 1,
@@ -1476,7 +1451,7 @@ pub(crate) async fn process_factory_once_calls(
         );
 
         // Notify decoder that this file was updated so it can decode new columns
-        if let Some(tx) = decoder_tx {
+        if let Some(tx) = ctx.decoder_tx {
             let _ = tx
                 .send(DecoderMessage::OnceFileBackfilled {
                     range_start: range.start,
@@ -1494,16 +1469,10 @@ pub(crate) async fn process_factory_once_calls(
 pub(crate) async fn process_once_calls_multicall(
     range: &BlockRange,
     blocks: &[BlockInfo],
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
     contracts: &Contracts,
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
     multicall3_address: Address,
-    rpc_batch_size: usize,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let first_block = match blocks.first() {
         Some(b) => b,
@@ -1511,15 +1480,7 @@ pub(crate) async fn process_once_calls_multicall(
     };
 
     let mut all_slots: Vec<MulticallSlotGeneric<OnceCallMeta>> = Vec::new();
-    // (contract_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file)
-    let mut contracts_to_process: Vec<(
-        String,
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        PathBuf,
-        bool,
-    )> = Vec::new();
+    let mut contracts_to_process: Vec<ContractProcessingInfo> = Vec::new();
 
     for (contract_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -1528,7 +1489,7 @@ pub(crate) async fn process_once_calls_multicall(
 
         let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", contract_name, file_name);
-        let sub_dir = output_dir.join(contract_name).join("once");
+        let sub_dir = ctx.output_dir.join(contract_name).join("once");
         let output_path = sub_dir.join(&file_name);
 
         let all_fn_names: Vec<String> = call_configs
@@ -1537,7 +1498,7 @@ pub(crate) async fn process_once_calls_multicall(
             .collect();
 
         let (missing_fn_names, has_existing_file, null_entries) =
-            if existing_files.contains(&rel_path) {
+            if ctx.existing_files.contains(&rel_path) {
                 let index = read_once_column_index(&sub_dir);
                 let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
                     cols.iter().cloned().collect()
@@ -1666,14 +1627,14 @@ pub(crate) async fn process_once_calls_multicall(
         }
 
         let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
-        contracts_to_process.push((
-            contract_name.clone(),
+        contracts_to_process.push(ContractProcessingInfo {
+            name: contract_name.clone(),
             all_fn_names,
             missing_fn_names,
             patch_fn_names,
             output_path,
             has_existing_file,
-        ));
+        });
     }
 
     if all_slots.is_empty() {
@@ -1695,7 +1656,7 @@ pub(crate) async fn process_once_calls_multicall(
 
     // Execute multicall
     let results =
-        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
             .await?;
 
     // Group results by contract_name -> address -> function_name -> value
@@ -1712,20 +1673,20 @@ pub(crate) async fn process_once_calls_multicall(
     }
 
     // Write parquet for each contract
-    for (
-        contract_name,
+    for ContractProcessingInfo {
+        name: contract_name,
         all_fn_names,
         missing_fn_names,
         patch_fn_names,
         output_path,
         has_existing_file,
-    ) in contracts_to_process
+    } in contracts_to_process
     {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
 
         if let Some(results_by_address) = results_by_contract.remove(&contract_name) {
-            let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if decoder_tx.is_some() {
+            let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if ctx.decoder_tx.is_some() {
                 Some(
                     results_by_address
                         .iter()
@@ -1797,12 +1758,12 @@ pub(crate) async fn process_once_calls_multicall(
             }
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!("raw/eth_calls/{}/once", contract_name);
                 upload_parquet_to_s3(
                     sm,
                     &output_path,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range.start,
                     range.end - 1,
@@ -1824,7 +1785,7 @@ pub(crate) async fn process_once_calls_multicall(
             index.insert(file_name.clone(), actual_cols.clone());
             write_once_column_index(sub_dir, &index)?;
 
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 if let Some(results) = decoder_once_results {
                     let _ = tx
                         .send(DecoderMessage::OnceCallsReady {
@@ -1847,17 +1808,11 @@ pub(crate) async fn process_once_calls_multicall(
 /// Process factory once calls using Multicall3 aggregate3
 pub(crate) async fn process_factory_once_calls_multicall(
     range: &BlockRange,
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     factory_data: &FactoryAddressData,
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
     multicall3_address: Address,
-    rpc_batch_size: usize,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all calls across all collections into one multicall
     #[derive(Clone)]
@@ -1870,16 +1825,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
-    // (collection_name, all_fn_names, missing_fn_names, patch_fn_names, output_path, has_existing_file, configs_to_call)
-    let mut collections_to_process: Vec<(
-        String,
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        PathBuf,
-        bool,
-        Vec<OnceCallConfig>,
-    )> = Vec::new();
+    let mut collections_to_process: Vec<FactoryContractProcessingInfo> = Vec::new();
 
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -1888,7 +1834,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
         let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", collection_name, file_name);
-        let sub_dir = output_dir.join(collection_name).join("once");
+        let sub_dir = ctx.output_dir.join(collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
 
         let all_fn_names: Vec<String> = call_configs
@@ -1897,7 +1843,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
             .collect();
 
         let (missing_fn_names, has_existing_file, null_entries) =
-            if existing_files.contains(&rel_path) {
+            if ctx.existing_files.contains(&rel_path) {
                 let index = column_indexes.get(collection_name);
                 let indexed_cols: HashSet<String> = index
                     .and_then(|idx| idx.get(&file_name))
@@ -2057,30 +2003,27 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
         // Always add to collections_to_process - even with empty address_discovery,
         // existing files may need backfill for missing columns
-        collections_to_process.push((
-            collection_name.clone(),
+        collections_to_process.push(FactoryContractProcessingInfo {
+            name: collection_name.clone(),
             all_fn_names,
             missing_fn_names,
             patch_fn_names,
             output_path,
             has_existing_file,
-            configs_for_backfill,
-        ));
+            once_configs: configs_for_backfill,
+        });
     }
 
     // Skip multicall execution only if there are no slots AND no collections need backfill
     let any_need_backfill = collections_to_process
         .iter()
-        .any(|(_, _, _, _, _, has_existing, _)| *has_existing);
+        .any(|info| info.has_existing_file);
     if all_slots.is_empty() && !any_need_backfill {
         return Ok(());
     }
 
     // Group results by collection_name -> address -> (block_num, timestamp, function_results)
-    let mut results_by_collection: HashMap<
-        String,
-        HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)>,
-    > = HashMap::new();
+    let mut results_by_collection: CollectionResults = HashMap::new();
 
     // Execute multicalls only if there are slots to process
     if !all_slots.is_empty() {
@@ -2112,10 +2055,10 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
         // Execute multicalls
         let results = execute_multicalls_generic(
-            client,
+            ctx.client,
             multicall3_address,
             block_multicalls,
-            rpc_batch_size,
+            ctx.rpc_batch_size,
         )
         .await?;
 
@@ -2130,15 +2073,15 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     // Write parquet for each collection
-    for (
-        collection_name,
+    for FactoryContractProcessingInfo {
+        name: collection_name,
         all_fn_names,
         missing_fn_names,
         patch_fn_names,
         output_path,
         has_existing_file,
-        configs_to_call,
-    ) in collections_to_process
+        once_configs: configs_to_call,
+    } in collections_to_process
     {
         let sub_dir = output_path.parent().unwrap();
         std::fs::create_dir_all(sub_dir)?;
@@ -2264,10 +2207,10 @@ pub(crate) async fn process_factory_once_calls_multicall(
                                 .collect();
 
                         let backfill_results = execute_multicalls_generic(
-                            client,
+                            ctx.client,
                             multicall3_address,
                             backfill_multicalls,
-                            rpc_batch_size,
+                            ctx.rpc_batch_size,
                         )
                         .await?;
 
@@ -2328,12 +2271,12 @@ pub(crate) async fn process_factory_once_calls_multicall(
             }
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!("raw/eth_calls/{}/once", collection_name);
                 upload_parquet_to_s3(
                     sm,
                     &output_path,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range.start,
                     range.end - 1,
@@ -2355,7 +2298,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
             index.insert(file_name.clone(), actual_cols.clone());
             write_once_column_index(sub_dir, &index)?;
 
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::OnceFileBackfilled {
                         range_start: range.start,
@@ -2373,17 +2316,10 @@ pub(crate) async fn process_factory_once_calls_multicall(
 pub(crate) async fn process_range(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     call_configs: &[CallConfig],
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    s3_manifest: &Option<S3Manifest>,
-    rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -2397,8 +2333,8 @@ pub(crate) async fn process_range(
         let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
-        if existing_files.contains(&rel_path)
-            || s3_manifest.as_ref().is_some_and(|m| {
+        if ctx.existing_files.contains(&rel_path)
+            || ctx.s3_manifest.as_ref().is_some_and(|m| {
                 m.has_raw_eth_calls_granular(
                     contract_name,
                     function_name,
@@ -2471,7 +2407,7 @@ pub(crate) async fn process_range(
             }
         }
 
-        for chunk in pending_calls.chunks(rpc_batch_size) {
+        for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
             let calls: Vec<(TransactionRequest, BlockId)> = chunk
                 .iter()
                 .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
@@ -2479,7 +2415,7 @@ pub(crate) async fn process_range(
 
             #[cfg(feature = "bench")]
             let rpc_start = Instant::now();
-            let results = client.call_batch(calls).await?;
+            let results = ctx.client.call_batch(calls).await?;
             #[cfg(feature = "bench")]
             {
                 rpc_time += rpc_start.elapsed();
@@ -2527,11 +2463,11 @@ pub(crate) async fn process_range(
         all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
         let result_count = all_results.len();
-        let sub_dir = output_dir.join(contract_name).join(function_name);
+        let sub_dir = ctx.output_dir.join(contract_name).join(function_name);
         std::fs::create_dir_all(&sub_dir)?;
         let output_path = sub_dir.join(&file_name);
 
-        let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+        let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
             Some(
                 all_results
                     .iter()
@@ -2576,12 +2512,12 @@ pub(crate) async fn process_range(
         );
 
         // Upload to S3 if configured
-        if let Some(sm) = storage_manager {
+        if let Some(sm) = ctx.storage_manager {
             let data_type = format!("raw/eth_calls/{}/{}", contract_name, function_name);
             upload_parquet_to_s3(
                 sm,
                 &output_path_for_upload,
-                chain_name,
+                ctx.chain_name,
                 &data_type,
                 range.start,
                 range.end - 1,
@@ -2590,7 +2526,7 @@ pub(crate) async fn process_range(
             .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        if let Some(tx) = decoder_tx {
+        if let Some(tx) = ctx.decoder_tx {
             if let Some(results) = decoder_results {
                 let _ = tx
                     .send(DecoderMessage::EthCallsReady {
@@ -2623,18 +2559,11 @@ pub(crate) async fn process_range(
 pub(crate) async fn process_range_multicall(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     call_configs: &[CallConfig],
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    s3_manifest: &Option<S3Manifest>,
-    rpc_batch_size: usize,
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (contract_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
@@ -2660,8 +2589,8 @@ pub(crate) async fn process_range_multicall(
         let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", contract_name, function_name, file_name);
 
-        if existing_files.contains(&rel_path)
-            || s3_manifest.as_ref().is_some_and(|m| {
+        if ctx.existing_files.contains(&rel_path)
+            || ctx.s3_manifest.as_ref().is_some_and(|m| {
                 m.has_raw_eth_calls_granular(
                     contract_name,
                     function_name,
@@ -2782,7 +2711,7 @@ pub(crate) async fn process_range_multicall(
 
     // Execute all multicalls
     let results =
-        execute_multicalls_generic(client, multicall3_address, block_multicalls, rpc_batch_size)
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
             .await?;
 
     // Distribute results back to groups
@@ -2815,13 +2744,13 @@ pub(crate) async fn process_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name("");
-            let sub_dir = output_dir
+            let sub_dir = ctx.output_dir
                 .join(&group.contract_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
-            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
                 Some(
                     results
                         .iter()
@@ -2852,7 +2781,7 @@ pub(crate) async fn process_range_multicall(
             );
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!(
                     "raw/eth_calls/{}/{}",
                     group.contract_name, group.function_name
@@ -2860,7 +2789,7 @@ pub(crate) async fn process_range_multicall(
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range.start,
                     range.end - 1,
@@ -2869,7 +2798,7 @@ pub(crate) async fn process_range_multicall(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 if let Some(results) = decoder_results {
                     let _ = tx
                         .send(DecoderMessage::EthCallsReady {
@@ -3244,16 +3173,10 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
 pub(crate) async fn process_token_range_multicall(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     token_configs: &[TokenCallConfig],
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    rpc_batch_size: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (token_name, function_name) — same as process_token_range
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
@@ -3281,7 +3204,7 @@ pub(crate) async fn process_token_range_multicall(
         let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
 
-        if existing_files.contains(&rel_path) {
+        if ctx.existing_files.contains(&rel_path) {
             tracing::debug!(
                 "Skipping token calls for {}.{} blocks {}-{} (already exists)",
                 output_name,
@@ -3395,7 +3318,7 @@ pub(crate) async fn process_token_range_multicall(
     }
 
     // Execute multicalls in RPC batch chunks
-    for chunk in pending_multicalls.chunks(rpc_batch_size) {
+    for chunk in pending_multicalls.chunks(ctx.rpc_batch_size) {
         let calls: Vec<(TransactionRequest, BlockId)> = chunk
             .iter()
             .map(|pm| {
@@ -3413,7 +3336,7 @@ pub(crate) async fn process_token_range_multicall(
             })
             .collect();
 
-        let results = client.call_batch(calls).await?;
+        let results = ctx.client.call_batch(calls).await?;
 
         for (i, result) in results.into_iter().enumerate() {
             let pm = &chunk[i];
@@ -3466,13 +3389,13 @@ pub(crate) async fn process_token_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name("");
-            let sub_dir = output_dir
+            let sub_dir = ctx.output_dir
                 .join(&group.output_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
             let output_path = sub_dir.join(&file_name);
 
-            let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+            let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
                 Some(
                     results
                         .iter()
@@ -3503,7 +3426,7 @@ pub(crate) async fn process_token_range_multicall(
             );
 
             // Upload to S3 if configured
-            if let Some(sm) = storage_manager {
+            if let Some(sm) = ctx.storage_manager {
                 let data_type = format!(
                     "raw/eth_calls/{}/{}",
                     group.output_name, group.function_name
@@ -3511,7 +3434,7 @@ pub(crate) async fn process_token_range_multicall(
                 upload_parquet_to_s3(
                     sm,
                     &output_path_for_upload,
-                    chain_name,
+                    ctx.chain_name,
                     &data_type,
                     range.start,
                     range.end - 1,
@@ -3520,7 +3443,7 @@ pub(crate) async fn process_token_range_multicall(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            if let Some(tx) = decoder_tx {
+            if let Some(tx) = ctx.decoder_tx {
                 if let Some(results) = decoder_results {
                     let _ = tx
                         .send(DecoderMessage::EthCallsReady {
@@ -3553,15 +3476,9 @@ pub(crate) async fn process_token_range_multicall(
 pub(crate) async fn process_token_range(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
-    client: &UnifiedRpcClient,
+    ctx: &EthCallContext<'_>,
     token_configs: &[TokenCallConfig],
-    output_dir: &Path,
-    existing_files: &HashSet<String>,
-    rpc_batch_size: usize,
     frequency_state: &mut FrequencyState,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
-    chain_name: &str,
-    storage_manager: Option<&Arc<StorageManager>>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (token_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
@@ -3577,7 +3494,7 @@ pub(crate) async fn process_token_range(
         let file_name = range.file_name("");
         let rel_path = format!("{}/{}/{}", output_name, function_name, file_name);
 
-        if existing_files.contains(&rel_path) {
+        if ctx.existing_files.contains(&rel_path) {
             tracing::debug!(
                 "Skipping token calls for {}.{} blocks {}-{} (already exists)",
                 output_name,
@@ -3628,13 +3545,13 @@ pub(crate) async fn process_token_range(
             }
         }
 
-        for chunk in pending_calls.chunks(rpc_batch_size) {
+        for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
             let calls: Vec<(TransactionRequest, BlockId)> = chunk
                 .iter()
                 .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
                 .collect();
 
-            let results = client.call_batch(calls).await?;
+            let results = ctx.client.call_batch(calls).await?;
 
             for (i, result) in results.into_iter().enumerate() {
                 let (_, _, block, config) = &chunk[i];
@@ -3665,11 +3582,11 @@ pub(crate) async fn process_token_range(
         all_results.sort_by_key(|r| (r.block_number, r.contract_address));
 
         let result_count = all_results.len();
-        let sub_dir = output_dir.join(&output_name).join(function_name);
+        let sub_dir = ctx.output_dir.join(&output_name).join(function_name);
         std::fs::create_dir_all(&sub_dir)?;
         let output_path = sub_dir.join(&file_name);
 
-        let decoder_results: Option<Vec<DecoderEthCallResult>> = if decoder_tx.is_some() {
+        let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
             Some(
                 all_results
                     .iter()
@@ -3699,12 +3616,12 @@ pub(crate) async fn process_token_range(
         );
 
         // Upload to S3 if configured
-        if let Some(sm) = storage_manager {
+        if let Some(sm) = ctx.storage_manager {
             let data_type = format!("raw/eth_calls/{}/{}", output_name, function_name);
             upload_parquet_to_s3(
                 sm,
                 &output_path_for_upload,
-                chain_name,
+                ctx.chain_name,
                 &data_type,
                 range.start,
                 range.end - 1,
@@ -3713,7 +3630,7 @@ pub(crate) async fn process_token_range(
             .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        if let Some(tx) = decoder_tx {
+        if let Some(tx) = ctx.decoder_tx {
             if let Some(results) = decoder_results {
                 let _ = tx
                     .send(DecoderMessage::EthCallsReady {

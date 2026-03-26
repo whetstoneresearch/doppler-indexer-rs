@@ -1,14 +1,17 @@
 //! Types for eth_call collection: error types, config structs, result structs, and state.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use alloy::primitives::Address;
 use thiserror::Error;
+use tokio::sync::mpsc::Sender;
 
+use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryAddressData;
-use crate::rpc::RpcError;
-use crate::storage::S3Manifest;
+use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency, ParamConfig, ParamError};
 use crate::types::config::tokens::PoolType;
 use alloy::primitives::Bytes;
@@ -41,6 +44,53 @@ pub enum EthCallCollectionError {
 }
 
 pub use crate::storage::BlockRange;
+
+/// Shared context for eth_call processing functions.
+///
+/// Bundles the RPC client, output paths, and chain info that are threaded
+/// through every `process_*` function in the execution and event_triggers
+/// modules.
+pub struct EthCallContext<'a> {
+    pub client: &'a UnifiedRpcClient,
+    pub output_dir: &'a Path,
+    pub existing_files: &'a HashSet<String>,
+    pub rpc_batch_size: usize,
+    pub decoder_tx: &'a Option<Sender<DecoderMessage>>,
+    pub chain_name: &'a str,
+    pub storage_manager: Option<&'a Arc<StorageManager>>,
+    pub s3_manifest: &'a Option<S3Manifest>,
+}
+
+/// Results indexed by address: maps `Address -> (block_number, timestamp, function_name -> raw_bytes)`.
+pub type AddressResults = HashMap<Address, (u64, u64, HashMap<String, Vec<u8>>)>;
+
+/// Results indexed by collection name, then by address.
+pub type CollectionResults = HashMap<String, AddressResults>;
+
+/// Info needed to process a single contract's once-calls through the multicall
+/// pipeline. Replaces the six-element tuple that was previously threaded through
+/// `process_once_calls_multicall`.
+pub struct ContractProcessingInfo {
+    pub name: String,
+    pub all_fn_names: Vec<String>,
+    pub missing_fn_names: Vec<String>,
+    pub patch_fn_names: Vec<String>,
+    pub output_path: PathBuf,
+    pub has_existing_file: bool,
+}
+
+/// Info needed to process a factory collection's once-calls through the
+/// multicall pipeline. Extends `ContractProcessingInfo` with the call configs
+/// needed for the backfill phase.
+pub struct FactoryContractProcessingInfo {
+    pub name: String,
+    pub all_fn_names: Vec<String>,
+    pub missing_fn_names: Vec<String>,
+    pub patch_fn_names: Vec<String>,
+    pub output_path: PathBuf,
+    pub has_existing_file: bool,
+    pub once_configs: Vec<OnceCallConfig>,
+}
 
 #[derive(Debug, Clone)]
 pub struct BlockInfo {

@@ -7,7 +7,7 @@ use super::state::CollectorState;
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::{
     process_event_triggers, process_event_triggers_multicall, EthCallCatchupState,
-    EthCallCollectionError,
+    EthCallCollectionError, EthCallContext,
 };
 use crate::raw_data::historical::receipts::EventTriggerMessage;
 use crate::rpc::UnifiedRpcClient;
@@ -42,20 +42,27 @@ pub(super) async fn handle_event_trigger_message(
             // Process all buffered triggers for this range
             if !local_state.pending_event_triggers.is_empty() {
                 let triggers = std::mem::take(&mut local_state.pending_event_triggers);
+
+                let ctx = EthCallContext {
+                    client,
+                    output_dir: &state.base_output_dir,
+                    existing_files: &state.existing_files,
+                    rpc_batch_size: state.rpc_batch_size,
+                    decoder_tx,
+                    chain_name,
+                    storage_manager,
+                    s3_manifest: &state.s3_manifest,
+                };
+
                 if let Some(multicall_addr) = state.multicall3_address {
                     process_event_triggers_multicall(
                         triggers,
                         &state.event_call_configs,
                         &state.factory_addresses,
-                        client,
-                        &state.base_output_dir,
-                        state.rpc_batch_size,
-                        decoder_tx,
+                        &ctx,
                         multicall_addr,
                         range_start,
                         inclusive_end,
-                        chain_name,
-                        storage_manager,
                     )
                     .await?;
                 } else {
@@ -63,14 +70,9 @@ pub(super) async fn handle_event_trigger_message(
                         triggers,
                         &state.event_call_configs,
                         &state.factory_addresses,
-                        client,
-                        &state.base_output_dir,
-                        state.rpc_batch_size,
-                        decoder_tx,
+                        &ctx,
                         range_start,
                         inclusive_end,
-                        chain_name,
-                        storage_manager,
                     )
                     .await?;
                 }
