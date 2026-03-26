@@ -23,6 +23,8 @@ pub struct ReorgEvent {
     pub _new_block_number: u64,
     /// How many blocks deep the reorg was.
     pub depth: u64,
+    /// True when reorg goes beyond retention window; orphaned list is best-effort.
+    pub is_deep: bool,
 }
 
 /// Detects chain reorganizations by tracking recent block hashes.
@@ -85,7 +87,7 @@ impl ReorgDetector {
                     hex::encode(block.hash)
                 );
 
-                let (common_ancestor, orphaned) = self.find_common_ancestor(block);
+                let (common_ancestor, orphaned, is_deep) = self.find_common_ancestor(block);
                 let depth = block.number.saturating_sub(common_ancestor);
 
                 return Some(ReorgEvent {
@@ -93,6 +95,7 @@ impl ReorgDetector {
                     orphaned,
                     _new_block_number: block.number,
                     depth,
+                    is_deep,
                 });
             }
 
@@ -119,7 +122,7 @@ impl ReorgDetector {
             hex::encode(block.parent_hash)
         );
 
-        let (common_ancestor, orphaned) = self.find_common_ancestor(block);
+        let (common_ancestor, orphaned, is_deep) = self.find_common_ancestor(block);
 
         let depth = block.number - common_ancestor;
 
@@ -128,13 +131,16 @@ impl ReorgDetector {
             orphaned,
             _new_block_number: block.number,
             depth,
+            is_deep,
         })
     }
 
     /// Find the common ancestor by walking back through tracked blocks.
     ///
-    /// Returns (common_ancestor_number, orphaned_block_numbers).
-    fn find_common_ancestor(&self, new_block: &LiveBlock) -> (u64, Vec<u64>) {
+    /// Returns (common_ancestor_number, orphaned_block_numbers, is_deep).
+    /// When `is_deep` is true, the reorg exceeds the retention window and the
+    /// orphaned list is best-effort (all tracked blocks are orphaned).
+    fn find_common_ancestor(&self, new_block: &LiveBlock) -> (u64, Vec<u64>, bool) {
         let retained_ancestor = self.recent_blocks.range(..new_block.number).rev().find_map(
             |(&block_number, tracked)| {
                 (tracked.hash == new_block.parent_hash).then_some(block_number)
@@ -148,7 +154,7 @@ impl ReorgDetector {
                     .range((common_ancestor + 1)..)
                     .map(|(&block_number, _)| block_number)
                     .collect();
-                (common_ancestor, orphaned)
+                (common_ancestor, orphaned, false)
             }
             None => {
                 let common_ancestor = self
@@ -166,7 +172,7 @@ impl ReorgDetector {
                     orphaned.len()
                 );
 
-                (common_ancestor, orphaned)
+                (common_ancestor, orphaned, true)
             }
         }
     }
@@ -286,6 +292,7 @@ mod tests {
         assert_eq!(event.common_ancestor, 1);
         assert_eq!(event.orphaned, vec![2, 3]);
         assert_eq!(event.depth, 2);
+        assert!(!event.is_deep);
     }
 
     #[test]
@@ -308,6 +315,7 @@ mod tests {
         let event = detector.process_block(&reorg_block).unwrap();
         assert_eq!(event.common_ancestor, 4);
         assert_eq!(event.orphaned, vec![5, 6]);
+        assert!(!event.is_deep);
         assert!(detector.get_block_hash(4).is_some());
         assert!(detector.get_block_hash(5).is_none());
     }
@@ -406,6 +414,7 @@ mod tests {
         let event = detector.process_block(&replacement).unwrap();
         assert_eq!(event.common_ancestor, 2);
         assert_eq!(event.orphaned, vec![3]);
+        assert!(!event.is_deep);
         assert_eq!(detector.get_block_hash(3), Some([30; 32]));
     }
 
@@ -427,6 +436,7 @@ mod tests {
 
         let event = detector.process_block(&reorg_block).unwrap();
         assert_eq!(event.orphaned, vec![8, 9, 10]);
+        assert!(event.is_deep);
         assert!(detector.get_block_hash(8).is_none());
         assert_eq!(detector.get_block_hash(11), Some([111; 32]));
     }
