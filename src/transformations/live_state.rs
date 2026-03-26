@@ -44,7 +44,6 @@ pub(crate) struct LiveProcessingState {
     pub finalized_ranges: HashSet<(u64, u64)>,
 }
 
-
 impl LiveProcessingState {
     /// Clean up in-memory state for orphaned blocks.
     /// Returns the number of pending events removed.

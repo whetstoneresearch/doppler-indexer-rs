@@ -338,7 +338,11 @@ impl LiveStorage {
         })();
 
         if let Err(e) = &result {
-            tracing::debug!("Cleaning up temp file after status write error: {:?} ({})", temp_path, e);
+            tracing::debug!(
+                "Cleaning up temp file after status write error: {:?} ({})",
+                temp_path,
+                e
+            );
             let _ = fs::remove_file(&temp_path);
         }
 
@@ -421,7 +425,11 @@ impl LiveStorage {
         })();
 
         if let Err(e) = &result {
-            tracing::debug!("Cleaning up temp file after atomic status write error: {:?} ({})", temp_path, e);
+            tracing::debug!(
+                "Cleaning up temp file after atomic status write error: {:?} ({})",
+                temp_path,
+                e
+            );
             let _ = fs::remove_file(&temp_path);
         }
 
@@ -845,7 +853,11 @@ fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), Sto
     })();
 
     if let Err(e) = &result {
-        tracing::debug!("Cleaning up temp file after write error: {:?} ({})", temp_path, e);
+        tracing::debug!(
+            "Cleaning up temp file after write error: {:?} ({})",
+            temp_path,
+            e
+        );
         let _ = fs::remove_file(&temp_path);
     }
 

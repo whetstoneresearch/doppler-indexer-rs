@@ -23,7 +23,8 @@ pub fn get_metadata(
     }
 
     let asset_metadata = ctx
-        .calls_of_type("DERC20", "once").find(|call| call.contract_address == *asset)
+        .calls_of_type("DERC20", "once")
+        .find(|call| call.contract_address == *asset)
         .ok_or_else(|| {
             let available_calls: Vec<_> = ctx
                 .calls_for_address(*asset)

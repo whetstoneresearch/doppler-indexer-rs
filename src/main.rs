@@ -576,17 +576,9 @@ async fn process_chain_live_only(
                 complete_tx: transform_complete_tx.as_ref(),
                 retry_tx: transform_retry_tx.as_ref(),
             };
-            decode_eth_calls(
-                &chain,
-                &cfg,
-                rx,
-                outputs,
-                None,
-                None,
-                true,
-            )
-            .await
-            .context("eth_call decoding failed")
+            decode_eth_calls(&chain, &cfg, rx, outputs, None, None, true)
+                .await
+                .context("eth_call decoding failed")
         });
     }
 

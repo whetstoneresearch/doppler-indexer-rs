@@ -109,14 +109,8 @@ pub(super) async fn process_complete_range(
             )
             .await?;
         } else {
-            process_once_calls_regular(
-                &range,
-                blocks,
-                &ctx,
-                &state.once_configs,
-                &chain.contracts,
-            )
-            .await?;
+            process_once_calls_regular(&range, blocks, &ctx, &state.once_configs, &chain.contracts)
+                .await?;
         }
     }
     state.range_regular_done.insert(range_start);

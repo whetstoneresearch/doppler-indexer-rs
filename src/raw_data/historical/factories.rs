@@ -510,9 +510,8 @@ async fn write_factory_parquet_files(
         let rel_path = format!("{}/{}", collection_name, file_name);
 
         if existing_files.contains(&rel_path)
-            || s3_manifest.is_some_and(|m| {
-                m.has_factories(&collection_name, range_start, range_end - 1)
-            })
+            || s3_manifest
+                .is_some_and(|m| m.has_factories(&collection_name, range_start, range_end - 1))
         {
             tracing::debug!(
                 "Skipping factory parquet for {} blocks {}-{} (already exists)",
@@ -564,9 +563,8 @@ async fn write_factory_parquet_files(
             let rel_path = format!("{}/{}", collection_name, file_name);
 
             if !existing_files.contains(&rel_path)
-                && !s3_manifest.is_some_and(|m| {
-                    m.has_factories(collection_name, range_start, range_end - 1)
-                })
+                && !s3_manifest
+                    .is_some_and(|m| m.has_factories(collection_name, range_start, range_end - 1))
             {
                 let sub_dir = output_dir.join(collection_name);
                 std::fs::create_dir_all(&sub_dir)?;

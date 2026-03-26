@@ -225,7 +225,10 @@ impl RetryQueue {
             let item = {
                 let mut queue = self.queue.write().await;
                 // Find first due item
-                queue.iter().position(|p| p.is_due()).map(|pos| queue.remove(pos).unwrap())
+                queue
+                    .iter()
+                    .position(|p| p.is_due())
+                    .map(|pos| queue.remove(pos).unwrap())
             };
 
             let Some(mut pending) = item else {

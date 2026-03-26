@@ -122,11 +122,7 @@ pub async fn collect_blocks(
                 range.end - 1,
             )
             .await
-            .map_err(|e| {
-                BlockCollectionError::Io(std::io::Error::other(
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| BlockCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
     }
 

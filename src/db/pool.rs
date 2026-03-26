@@ -187,7 +187,13 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
             values,
             conflict_columns,
             update_columns,
-        } => build_upsert_sql(&table, &columns, &values, &conflict_columns, &update_columns),
+        } => build_upsert_sql(
+            &table,
+            &columns,
+            &values,
+            &conflict_columns,
+            &update_columns,
+        ),
         DbOperation::Insert {
             table,
             columns,

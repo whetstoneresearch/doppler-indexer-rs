@@ -244,7 +244,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::decode_eth_calls_live;
-    use crate::decoding::eth_calls::{CallDecodeConfig, EthCallDecodeConfigs, EventCallDecodeConfig};
+    use crate::decoding::eth_calls::{
+        CallDecodeConfig, EthCallDecodeConfigs, EventCallDecodeConfig,
+    };
     use crate::decoding::types::EthCallDecoderOutputs;
     use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
     use crate::live::{LiveBlockStatus, LiveStorage, TransformRetryRequest};

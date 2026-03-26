@@ -93,4 +93,5 @@ pub struct OnceCallsResult {
 }
 
 /// Config lookup for parquet columns: column_name -> (config, optional tuple field info).
-pub type ColumnConfigLookup<'a> = HashMap<String, (&'a CallDecodeConfig, Option<(usize, &'a EvmType)>)>;
+pub type ColumnConfigLookup<'a> =
+    HashMap<String, (&'a CallDecodeConfig, Option<(usize, &'a EvmType)>)>;

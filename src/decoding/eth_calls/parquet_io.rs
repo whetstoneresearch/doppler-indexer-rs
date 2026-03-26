@@ -898,7 +898,12 @@ pub(super) fn merge_decoded_once_calls(
     }
 
     // Copy existing columns, filling nulls where possible from new decoded records
-    for (i, field) in existing_schema.fields().iter().enumerate().take(existing_batch.num_columns()) {
+    for (i, field) in existing_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .take(existing_batch.num_columns())
+    {
         let col = existing_batch.column(i);
         let col_name = field.name().clone();
 

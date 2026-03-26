@@ -61,8 +61,13 @@ pub async fn collect_receipts(
     let mut metrics = ChannelMetricsState {
         log_tx_metrics: ChannelMetrics::default(),
         factory_log_tx_metrics: ChannelMetrics::default(),
-        log_tx_capacity: channels.log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0),
-        factory_log_tx_capacity: channels.factory_log_tx
+        log_tx_capacity: channels
+            .log_tx
+            .as_ref()
+            .map(|s| s.max_capacity())
+            .unwrap_or(0),
+        factory_log_tx_capacity: channels
+            .factory_log_tx
             .as_ref()
             .map(|s| s.max_capacity())
             .unwrap_or(0),
@@ -514,12 +519,7 @@ pub async fn collect_receipts(
                     Vec::new()
                 };
 
-                send_logs_to_channels(
-                    result.logs,
-                    &channels,
-                    &mut metrics,
-                )
-                .await?;
+                send_logs_to_channels(result.logs, &channels, &mut metrics).await?;
 
                 if !triggers.is_empty() {
                     if let Some(tx) = &channels.event_trigger_tx {
@@ -587,11 +587,7 @@ pub async fn collect_receipts(
                 range.end - 1,
             )
             .await
-            .map_err(|e| {
-                ReceiptCollectionError::Io(std::io::Error::other(
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
         send_range_complete(

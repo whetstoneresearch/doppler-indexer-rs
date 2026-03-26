@@ -17,8 +17,7 @@ use parquet::file::properties::WriterProperties;
 
 use super::config::compute_function_selector;
 use super::types::{
-    EthCallCollectionError, EthCallContext, EventCallKey, EventCallResult,
-    EventTriggeredCallConfig,
+    EthCallCollectionError, EthCallContext, EventCallKey, EventCallResult, EventTriggeredCallConfig,
 };
 use super::{execute_multicalls_generic, BlockMulticall, EventCallMeta, MulticallSlotGeneric};
 use crate::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
@@ -590,15 +589,16 @@ pub(crate) async fn process_event_triggers(
                     };
 
                 let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output.entry(output_key).or_default().push(
-                    PreparedEventCall {
+                calls_by_output
+                    .entry(output_key)
+                    .or_default()
+                    .push(PreparedEventCall {
                         trigger: trigger.clone(),
                         config: config.clone(),
                         target_address,
                         decoded_values: params,
                         encoded_params,
-                    },
-                );
+                    });
             }
         }
     }
@@ -616,16 +616,8 @@ pub(crate) async fn process_event_triggers(
         written_pairs.insert((contract_name.clone(), function_name.clone()));
 
         // Get block range for output file naming
-        let min_block = calls
-            .iter()
-            .map(|c| c.trigger.block_number)
-            .min()
-            .unwrap();
-        let max_block = calls
-            .iter()
-            .map(|c| c.trigger.block_number)
-            .max()
-            .unwrap();
+        let min_block = calls.iter().map(|c| c.trigger.block_number).min().unwrap();
+        let max_block = calls.iter().map(|c| c.trigger.block_number).max().unwrap();
 
         tracing::info!(
             "Processing {} event-triggered eth_calls for {}.{} (blocks {}-{})",
@@ -728,7 +720,8 @@ pub(crate) async fn process_event_triggers(
 
         // Write to parquet and send to decoder
         if !all_results.is_empty() {
-            let sub_dir = ctx.output_dir
+            let sub_dir = ctx
+                .output_dir
                 .join(&contract_name)
                 .join(&function_name)
                 .join("on_events");
@@ -921,15 +914,16 @@ pub(crate) async fn process_event_triggers_multicall(
                     };
 
                 let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output.entry(output_key).or_default().push(
-                    PreparedEventCall {
+                calls_by_output
+                    .entry(output_key)
+                    .or_default()
+                    .push(PreparedEventCall {
                         trigger: trigger.clone(),
                         config: config.clone(),
                         target_address,
                         decoded_values: params,
                         encoded_params,
-                    },
-                );
+                    });
             }
         }
     }
@@ -944,10 +938,7 @@ pub(crate) async fn process_event_triggers_multicall(
     for ((_contract_name, _function_name), calls) in calls_by_output {
         for call in calls {
             let block_number = call.trigger.block_number;
-            calls_by_block
-                .entry(block_number)
-                .or_default()
-                .push(call);
+            calls_by_block.entry(block_number).or_default().push(call);
         }
     }
 
@@ -962,8 +953,10 @@ pub(crate) async fn process_event_triggers_multicall(
             let mut slots: Vec<MulticallSlotGeneric<(EventCallMeta, u64, u64)>> = Vec::new();
 
             for call_info in calls {
-                let calldata =
-                    encode_call_with_params(call_info.config.function_selector, &call_info.decoded_values);
+                let calldata = encode_call_with_params(
+                    call_info.config.function_selector,
+                    &call_info.decoded_values,
+                );
                 slots.push(MulticallSlotGeneric {
                     block_number,
                     block_timestamp: call_info.trigger.block_timestamp,
@@ -1017,9 +1010,13 @@ pub(crate) async fn process_event_triggers_multicall(
     );
 
     // Execute all multicalls
-    let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
-            .await?;
+    let results = execute_multicalls_generic(
+        ctx.client,
+        multicall3_address,
+        block_multicalls,
+        ctx.rpc_batch_size,
+    )
+    .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
@@ -1051,7 +1048,8 @@ pub(crate) async fn process_event_triggers_multicall(
         // Sort by block number, log index
         results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
 
-        let sub_dir = ctx.output_dir
+        let sub_dir = ctx
+            .output_dir
             .join(&contract_name)
             .join(&function_name)
             .join("on_events");

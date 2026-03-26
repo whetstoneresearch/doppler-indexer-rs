@@ -65,7 +65,8 @@ impl TransformationHandler for V4CreateHandler {
             }
 
             let hook_call = ctx
-                .calls_for_address(hook).find(|call| call.function_name == "once")
+                .calls_for_address(hook)
+                .find(|call| call.function_name == "once")
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(hook)

@@ -127,8 +127,8 @@ pub(crate) async fn process_completed_range(
     if contract_logs_only {
         let before_count = logs.len();
         logs.retain(|log| {
-                configured_addresses.contains(&log.address) || factory_addrs.contains(&log.address)
-            });
+            configured_addresses.contains(&log.address) || factory_addrs.contains(&log.address)
+        });
         tracing::debug!(
             "Filtered logs from {} to {} for range {}",
             before_count,

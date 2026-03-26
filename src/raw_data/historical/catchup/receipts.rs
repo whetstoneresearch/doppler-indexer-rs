@@ -235,7 +235,9 @@ pub async fn collect_receipts(
         metrics.log_tx_metrics.log_summary("log_tx (catchup)");
     }
     if channels.factory_log_tx.is_some() {
-        metrics.factory_log_tx_metrics.log_summary("factory_log_tx (catchup)");
+        metrics
+            .factory_log_tx_metrics
+            .log_summary("factory_log_tx (catchup)");
     }
 
     Ok(ReceiptsCatchupState {

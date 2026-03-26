@@ -106,8 +106,7 @@ impl<'de> Deserialize<'de> for EventTriggerConfigs {
 }
 
 /// Frequency at which to make eth_calls
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Frequency {
     /// Call every block (default)
     #[default]
@@ -121,7 +120,6 @@ pub enum Frequency {
     /// Call when specific events are emitted (supports single or multiple events)
     OnEvents(EventTriggerConfigs),
 }
-
 
 #[allow(dead_code)]
 impl Frequency {

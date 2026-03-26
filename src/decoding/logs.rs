@@ -898,13 +898,15 @@ fn build_flattened_field_array(
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
             } else {
-                let values: Vec<Option<&[u8]>> = records.iter().map(|r| {
-                    match r.decoded_values.get(field_idx) {
+                let values: Vec<Option<&[u8]>> = records
+                    .iter()
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Address(addr)) => Some(addr.as_slice()),
                         _ => None,
-                    }
-                }).collect();
-                let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 20)?;
+                    })
+                    .collect();
+                let arr =
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 20)?;
                 Ok(Arc::new(arr))
             }
         }
@@ -990,13 +992,15 @@ fn build_flattened_field_array(
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
             } else {
-                let values: Vec<Option<&[u8]>> = records.iter().map(|r| {
-                    match r.decoded_values.get(field_idx) {
+                let values: Vec<Option<&[u8]>> = records
+                    .iter()
+                    .map(|r| match r.decoded_values.get(field_idx) {
                         Some(DecodedValue::Bytes32(b)) => Some(b.as_slice()),
                         _ => None,
-                    }
-                }).collect();
-                let arr = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 32)?;
+                    })
+                    .collect();
+                let arr =
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 32)?;
                 Ok(Arc::new(arr))
             }
         }

@@ -94,9 +94,7 @@ pub(crate) async fn process_factory_range(
                 for param_combo in &param_combinations {
                     let dyn_values: Vec<DynSolValue> = param_combo
                         .iter()
-                        .map(|(param_type, value, _): &EncodedParam| {
-                            param_type.parse_value(value)
-                        })
+                        .map(|(param_type, value, _): &EncodedParam| param_type.parse_value(value))
                         .collect::<Result<_, _>>()?;
 
                     let encoded_calldata = encode_call_with_params(selector, &dyn_values);
@@ -399,9 +397,7 @@ pub(crate) async fn process_factory_range_multicall(
                 for param_combo in &param_combinations {
                     let dyn_values: Vec<DynSolValue> = param_combo
                         .iter()
-                        .map(|(param_type, value, _): &EncodedParam| {
-                            param_type.parse_value(value)
-                        })
+                        .map(|(param_type, value, _): &EncodedParam| param_type.parse_value(value))
                         .collect::<Result<_, _>>()?;
 
                     let encoded_calldata = encode_call_with_params(selector, &dyn_values);
@@ -523,9 +519,13 @@ pub(crate) async fn process_factory_range_multicall(
     );
 
     // Execute all multicalls
-    let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
-            .await?;
+    let results = execute_multicalls_generic(
+        ctx.client,
+        multicall3_address,
+        block_multicalls,
+        ctx.rpc_batch_size,
+    )
+    .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -557,7 +557,8 @@ pub(crate) async fn process_factory_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name("");
-            let sub_dir = ctx.output_dir
+            let sub_dir = ctx
+                .output_dir
                 .join(&group.collection_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
@@ -1017,7 +1018,8 @@ pub(crate) async fn process_factory_once_calls(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if ctx.existing_files
+        let (missing_fn_names, has_existing_file, null_entries) = if ctx
+            .existing_files
             .contains(&rel_path)
         {
             let index = column_indexes.get(collection_name);
@@ -1215,37 +1217,35 @@ pub(crate) async fn process_factory_once_calls(
         }
 
         // Execute batch calls only if there are pending calls
-        let results_by_address: AddressResults =
-            if !pending_calls.is_empty() {
-                let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
-                    .iter()
-                    .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
-                    .collect();
+        let results_by_address: AddressResults = if !pending_calls.is_empty() {
+            let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+                .iter()
+                .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
+                .collect();
 
-                let batch_results = ctx.client.call_batch(batch_calls).await?;
+            let batch_results = ctx.client.call_batch(batch_calls).await?;
 
-                let mut results_map: AddressResults = HashMap::new();
+            let mut results_map: AddressResults = HashMap::new();
 
-                for (i, result) in batch_results.into_iter().enumerate() {
-                    let (tx, _, address, block_number, timestamp, function_name) =
-                        &pending_calls[i];
+            for (i, result) in batch_results.into_iter().enumerate() {
+                let (tx, _, address, block_number, timestamp, function_name) = &pending_calls[i];
 
-                    let entry = results_map
-                        .entry(*address)
-                        .or_insert_with(|| (*block_number, *timestamp, HashMap::new()));
+                let entry = results_map
+                    .entry(*address)
+                    .or_insert_with(|| (*block_number, *timestamp, HashMap::new()));
 
-                    match result {
-                        Ok(bytes) => {
-                            entry.2.insert(function_name.clone(), bytes.to_vec());
-                        }
-                        Err(e) => {
-                            let calldata = tx
-                                .input
-                                .input
-                                .as_ref()
-                                .map(|b| format!("0x{}", hex::encode(b)))
-                                .unwrap_or_default();
-                            tracing::warn!(
+                match result {
+                    Ok(bytes) => {
+                        entry.2.insert(function_name.clone(), bytes.to_vec());
+                    }
+                    Err(e) => {
+                        let calldata = tx
+                            .input
+                            .input
+                            .as_ref()
+                            .map(|b| format!("0x{}", hex::encode(b)))
+                            .unwrap_or_default();
+                        tracing::warn!(
                                 "factory once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
                                 collection_name,
                                 function_name,
@@ -1254,14 +1254,14 @@ pub(crate) async fn process_factory_once_calls(
                                 calldata,
                                 e
                             );
-                            entry.2.insert(function_name.clone(), Vec::new());
-                        }
+                        entry.2.insert(function_name.clone(), Vec::new());
                     }
                 }
-                results_map
-            } else {
-                HashMap::new()
-            };
+            }
+            results_map
+        } else {
+            HashMap::new()
+        };
 
         std::fs::create_dir_all(&sub_dir)?;
 
@@ -1660,9 +1660,13 @@ pub(crate) async fn process_once_calls_multicall(
     );
 
     // Execute multicall
-    let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
-            .await?;
+    let results = execute_multicalls_generic(
+        ctx.client,
+        multicall3_address,
+        block_multicalls,
+        ctx.rpc_batch_size,
+    )
+    .await?;
 
     // Group results by contract_name -> address -> function_name -> value
     let mut results_by_contract: HashMap<String, HashMap<Address, HashMap<String, Vec<u8>>>> =
@@ -1691,21 +1695,22 @@ pub(crate) async fn process_once_calls_multicall(
         std::fs::create_dir_all(sub_dir)?;
 
         if let Some(results_by_address) = results_by_contract.remove(&contract_name) {
-            let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if ctx.decoder_tx.is_some() {
-                Some(
-                    results_by_address
-                        .iter()
-                        .map(|(addr, function_results)| DecoderOnceCallResult {
-                            block_number: first_block.block_number,
-                            block_timestamp: first_block.timestamp,
-                            contract_address: addr.0 .0,
-                            results: function_results.clone(),
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            };
+            let decoder_once_results: Option<Vec<DecoderOnceCallResult>> =
+                if ctx.decoder_tx.is_some() {
+                    Some(
+                        results_by_address
+                            .iter()
+                            .map(|(addr, function_results)| DecoderOnceCallResult {
+                                block_number: first_block.block_number,
+                                block_timestamp: first_block.timestamp,
+                                contract_address: addr.0 .0,
+                                results: function_results.clone(),
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
 
             if has_existing_file {
                 let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
@@ -2715,9 +2720,13 @@ pub(crate) async fn process_range_multicall(
     );
 
     // Execute all multicalls
-    let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.rpc_batch_size)
-            .await?;
+    let results = execute_multicalls_generic(
+        ctx.client,
+        multicall3_address,
+        block_multicalls,
+        ctx.rpc_batch_size,
+    )
+    .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -2749,7 +2758,8 @@ pub(crate) async fn process_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name("");
-            let sub_dir = ctx.output_dir
+            let sub_dir = ctx
+                .output_dir
                 .join(&group.contract_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
@@ -3394,7 +3404,8 @@ pub(crate) async fn process_token_range_multicall(
 
             let result_count = results.len();
             let file_name = range.file_name("");
-            let sub_dir = ctx.output_dir
+            let sub_dir = ctx
+                .output_dir
                 .join(&group.output_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;

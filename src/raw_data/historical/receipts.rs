@@ -461,7 +461,8 @@ pub(crate) async fn send_logs_to_channels(
 
     if let Some(sender) = &channels.factory_log_tx {
         let capacity_before = sender.capacity();
-        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / metrics.factory_log_tx_capacity as f64);
+        let fill_pct =
+            100.0 * (1.0 - capacity_before as f64 / metrics.factory_log_tx_capacity as f64);
 
         if fill_pct > 90.0 {
             tracing::warn!(
@@ -488,7 +489,11 @@ pub(crate) async fn send_logs_to_channels(
         let send_time = send_start.elapsed();
         metrics.total_channel_send_time += send_time;
 
-        metrics.factory_log_tx_metrics.record_send(send_time, capacity_before, metrics.factory_log_tx_capacity);
+        metrics.factory_log_tx_metrics.record_send(
+            send_time,
+            capacity_before,
+            metrics.factory_log_tx_capacity,
+        );
         metrics.factory_log_tx_metrics.total_logs_sent += log_count as u64;
     }
 
@@ -517,7 +522,9 @@ pub(crate) async fn send_logs_to_channels(
         let send_time = send_start.elapsed();
         metrics.total_channel_send_time += send_time;
 
-        metrics.log_tx_metrics.record_send(send_time, capacity_before, metrics.log_tx_capacity);
+        metrics
+            .log_tx_metrics
+            .record_send(send_time, capacity_before, metrics.log_tx_capacity);
         metrics.log_tx_metrics.total_logs_sent += log_count as u64;
     }
 
@@ -781,12 +788,7 @@ pub(crate) async fn process_range(
                     Vec::new()
                 };
 
-                send_logs_to_channels(
-                    batch_logs,
-                    channels,
-                    metrics,
-                )
-                .await?;
+                send_logs_to_channels(batch_logs, channels, metrics).await?;
 
                 // Send event triggers if any
                 if !triggers.is_empty() {
@@ -892,12 +894,7 @@ pub(crate) async fn process_range(
                     Vec::new()
                 };
 
-                send_logs_to_channels(
-                    batch_logs,
-                    channels,
-                    metrics,
-                )
-                .await?;
+                send_logs_to_channels(batch_logs, channels, metrics).await?;
 
                 // Send event triggers if any
                 if !triggers.is_empty() {
@@ -960,11 +957,7 @@ pub(crate) async fn process_range(
             range.end - 1,
         )
         .await
-        .map_err(|e| {
-            ReceiptCollectionError::Io(std::io::Error::other(
-                e.to_string(),
-            ))
-        })?;
+        .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
     }
 
     #[cfg(feature = "bench")]

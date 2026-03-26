@@ -113,7 +113,6 @@ type ReadyHandler = (
     Arc<Vec<DecodedCall>>,
 );
 
-
 /// The transformation engine processes decoded data and invokes handlers.
 ///
 /// Progress is tracked per handler (keyed by `handler_key()`) in the
