@@ -89,6 +89,30 @@ pub enum ExecutionMode {
     Batch { batch_size: usize },
 }
 
+/// Configuration for creating a TransformationEngine.
+///
+/// Groups the chain-specific and behavior-related parameters that configure
+/// the engine, reducing the argument count of `TransformationEngine::new`.
+pub struct TransformationEngineConfig {
+    pub chain_name: String,
+    pub chain_id: u64,
+    pub mode: ExecutionMode,
+    pub contracts: Contracts,
+    pub factory_collections: FactoryCollections,
+    pub handler_concurrency: usize,
+    pub expect_log_completion: bool,
+    pub expect_eth_call_completion: bool,
+}
+
+/// Result type for individual handler task execution during catchup.
+type HandlerTaskResult = Result<Option<(String, u64, u64)>, TransformationError>;
+
+/// A handler paired with the decoded calls it needs to process.
+type ReadyHandler = (
+    Arc<dyn super::traits::TransformationHandler>,
+    Arc<Vec<DecodedCall>>,
+);
+
 
 /// The transformation engine processes decoded data and invokes handlers.
 ///
@@ -121,23 +145,21 @@ impl TransformationEngine {
         registry: Arc<TransformationRegistry>,
         db_pool: Arc<DbPool>,
         rpc_client: Arc<UnifiedRpcClient>,
-        chain_name: String,
-        chain_id: u64,
-        mode: ExecutionMode,
-        contracts: Contracts,
-        factory_collections: FactoryCollections,
-        handler_concurrency: usize,
+        config: TransformationEngineConfig,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
-        expect_log_completion: bool,
-        expect_eth_call_completion: bool,
     ) -> Result<Self, TransformationError> {
+        let chain_name = config.chain_name;
+        let chain_id = config.chain_id;
+        let mode = config.mode;
+        let handler_concurrency = config.handler_concurrency;
+
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
         let decoded_logs_dir = crate::storage::paths::decoded_logs_dir(&chain_name);
         let decoded_calls_dir = crate::storage::paths::decoded_eth_calls_dir(&chain_name);
         let raw_receipts_dir = crate::storage::paths::raw_receipts_dir(&chain_name);
 
-        let contracts = Arc::new(contracts);
-        let factory_collections = Arc::new(factory_collections);
+        let contracts = Arc::new(config.contracts);
+        let factory_collections = Arc::new(config.factory_collections);
 
         let executor = Arc::new(HandlerExecutor {
             db_pool: db_pool.clone(),
@@ -155,8 +177,8 @@ impl TransformationEngine {
             chain_name: chain_name.clone(),
             chain_id,
             progress_tracker: progress_tracker.clone(),
-            expect_log_completion,
-            expect_eth_call_completion,
+            expect_log_completion: config.expect_log_completion,
+            expect_eth_call_completion: config.expect_eth_call_completion,
         });
 
         let retry_processor = RetryProcessor {
@@ -482,8 +504,7 @@ impl TransformationEngine {
                 let mut skipped_ranges: Vec<(u64, u64)> = Vec::new();
 
                 let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-                let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
-                    JoinSet::new();
+                let mut join_set: JoinSet<HandlerTaskResult> = JoinSet::new();
 
                 for (range_start, range_end) in &ranges_to_attempt {
                     let events = self
@@ -714,8 +735,7 @@ impl TransformationEngine {
             let mut processed = 0;
 
             let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-            let mut join_set: JoinSet<Result<Option<(String, u64, u64)>, TransformationError>> =
-                JoinSet::new();
+            let mut join_set: JoinSet<HandlerTaskResult> = JoinSet::new();
 
             for (range_start, range_end) in &to_process {
                 let calls = self
@@ -1223,10 +1243,7 @@ impl TransformationEngine {
 
         // Categorize handlers: ready to run vs needs buffering
         let range_key = (msg.range_start, msg.range_end);
-        let mut ready_handlers: Vec<(
-            Arc<dyn super::traits::TransformationHandler>,
-            Arc<Vec<DecodedCall>>,
-        )> = Vec::new();
+        let mut ready_handlers: Vec<ReadyHandler> = Vec::new();
         {
             let mut state = self.live_state.lock().await;
             for handler in &handlers {

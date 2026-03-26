@@ -70,7 +70,7 @@ pub mod util;
 pub use context::{DecodedCall, DecodedEvent, TransformationContext};
 pub use engine::{
     DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteKind,
-    RangeCompleteMessage, ReorgMessage, TransformationEngine,
+    RangeCompleteMessage, ReorgMessage, TransformationEngine, TransformationEngineConfig,
 };
 pub use error::TransformationError;
 pub use registry::build_registry;
