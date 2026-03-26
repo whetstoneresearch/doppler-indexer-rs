@@ -571,10 +571,12 @@ async fn process_chain_live_only(
         config,
         runtime.http_client.clone(),
         runtime.db_pool.clone(),
-        log_decoder_tx,
-        eth_call_decoder_tx,
-        transform_reorg_tx,
-        transform_retry_tx,
+        LiveModeChannels {
+            log_decoder_tx,
+            eth_call_decoder_tx,
+            transform_reorg_tx,
+            transform_retry_tx,
+        },
         runtime.progress_tracker.clone(),
         Some(storage_manager),
         &mut tasks,
@@ -674,6 +676,7 @@ impl FullPipelineContext {
     }
 
     /// Spawn the receipt collection stage (catchup + current).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_receipts(
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -805,6 +808,7 @@ impl FullPipelineContext {
     }
 
     /// Spawn the eth_call collection stage (catchup + current).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_eth_calls(
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -889,6 +893,7 @@ impl FullPipelineContext {
     }
 
     /// Spawn the factory collection stage (catchup + current).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_factories(
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -996,6 +1001,7 @@ impl FullPipelineContext {
     }
 
     /// Spawn the eth_call decoder stage.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_eth_call_decoder(
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -1340,10 +1346,12 @@ async fn process_chain(
             config,
             http_client_for_live,
             pipeline.runtime.db_pool.clone(),
-            log_decoder_tx_for_live,
-            eth_call_decoder_tx_for_live,
-            transform_reorg_tx,
-            transform_retry_tx,
+            LiveModeChannels {
+                log_decoder_tx: log_decoder_tx_for_live,
+                eth_call_decoder_tx: eth_call_decoder_tx_for_live,
+                transform_reorg_tx,
+                transform_retry_tx,
+            },
             pipeline.runtime.progress_tracker.clone(),
             Some(storage_manager.clone()),
             &mut live_tasks,
@@ -1399,6 +1407,14 @@ fn should_enable_live_mode(config: &IndexerConfig, chain: &ChainConfig) -> bool 
     true
 }
 
+/// Channels for live mode communication with decoders/transformations.
+struct LiveModeChannels {
+    log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+    eth_call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+    transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
+    transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
+}
+
 /// Spawn live mode tasks for a chain.
 ///
 /// This sets up:
@@ -1408,15 +1424,13 @@ fn should_enable_live_mode(config: &IndexerConfig, chain: &ChainConfig) -> bool 
 ///
 /// Note: The transformation engine is NOT spawned here - it continues running from
 /// historical mode via the live_tasks JoinSet, receiving messages via the same channels.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_live_mode(
     chain: Arc<ChainConfig>,
     config: &IndexerConfig,
     http_client: Arc<UnifiedRpcClient>,
     db_pool: Option<Arc<DbPool>>,
-    log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
-    eth_call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
-    transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
-    transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
+    live_channels: LiveModeChannels,
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     storage_manager: Option<Arc<StorageManager>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
@@ -1509,7 +1523,7 @@ async fn spawn_live_mode(
     });
 
     // Build eth_call collector if eth_calls are configured
-    let eth_call_collector = if eth_call_decoder_tx.is_some() {
+    let eth_call_collector = if live_channels.eth_call_decoder_tx.is_some() {
         // Get multicall3 address from contracts if available
         let multicall3_address = chain.contracts.get("Multicall3").and_then(|c| {
             use crate::types::config::contract::AddressOrAddresses;
@@ -1534,10 +1548,10 @@ async fn spawn_live_mode(
     };
 
     let live_expectations = live_pipeline_expectations(
-        log_decoder_tx.is_some(),
+        live_channels.log_decoder_tx.is_some(),
         eth_call_collector.is_some(),
-        eth_call_decoder_tx.is_some() && eth_call_collector.is_some(),
-        transform_retry_tx.is_some(),
+        live_channels.eth_call_decoder_tx.is_some() && eth_call_collector.is_some(),
+        live_channels.transform_retry_tx.is_some(),
     );
 
     // Start live collector
@@ -1550,16 +1564,16 @@ async fn spawn_live_mode(
         eth_call_collector,
         db_pool.clone(),
         live_expectations,
-        transform_retry_tx.clone(),
+        live_channels.transform_retry_tx.clone(),
     );
     tasks.spawn(async move {
         collector
             .run(
                 ws_event_rx,
                 live_msg_tx,
-                log_decoder_tx,
-                eth_call_decoder_tx,
-                transform_reorg_tx,
+                live_channels.log_decoder_tx,
+                live_channels.eth_call_decoder_tx,
+                live_channels.transform_reorg_tx,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Live collector error: {}", e))
@@ -1575,7 +1589,7 @@ async fn spawn_live_mode(
         live_expectations,
         storage_manager,
     );
-    if let Some(retry_tx) = transform_retry_tx {
+    if let Some(retry_tx) = live_channels.transform_retry_tx {
         compaction = compaction.with_retry_tx(retry_tx);
     }
     tasks.spawn(async move {

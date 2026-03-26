@@ -32,6 +32,7 @@ use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::AddressOrAddresses;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_eth_calls(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,

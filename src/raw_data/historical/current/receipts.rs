@@ -11,8 +11,9 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, extract_event_triggers, fetch_receipts_for_blocks, process_range,
     send_logs_to_channels, send_range_complete, write_full_receipts_to_parquet,
-    write_minimal_receipts_to_parquet, BlockInfo, ChannelMetrics, EventTriggerMatcher,
-    EventTriggerMessage, LogMessage, ReceiptBatchState, ReceiptCollectionError,
+    write_minimal_receipts_to_parquet, BlockInfo, ChannelMetrics, ChannelMetricsState,
+    EventTriggerMatcher, EventTriggerMessage, LogMessage, ReceiptBatchState,
+    ReceiptCollectionError, ReceiptOutputChannels,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::raw_receipts_dir;
@@ -20,6 +21,7 @@ use crate::storage::{upload_parquet_to_s3, BlockRange, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_receipts(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,
@@ -49,24 +51,31 @@ pub async fn collect_receipts(
     // Batch states for early RPC fetching - track blocks received vs fetched
     let mut batch_states: HashMap<u64, ReceiptBatchState> = HashMap::new();
 
-    // Get channel capacities for backpressure monitoring
-    let log_tx_capacity = log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0);
-    let factory_log_tx_capacity = factory_log_tx
-        .as_ref()
-        .map(|s| s.max_capacity())
-        .unwrap_or(0);
+    // Build output channels and metrics structs
+    let channels = ReceiptOutputChannels {
+        log_tx,
+        factory_log_tx,
+        event_trigger_tx,
+    };
 
-    // Initialize channel metrics for backpressure tracking
-    let mut log_tx_metrics = ChannelMetrics::default();
-    let mut factory_log_tx_metrics = ChannelMetrics::default();
+    let mut metrics = ChannelMetricsState {
+        log_tx_metrics: ChannelMetrics::default(),
+        factory_log_tx_metrics: ChannelMetrics::default(),
+        log_tx_capacity: channels.log_tx.as_ref().map(|s| s.max_capacity()).unwrap_or(0),
+        factory_log_tx_capacity: channels.factory_log_tx
+            .as_ref()
+            .map(|s| s.max_capacity())
+            .unwrap_or(0),
+        total_channel_send_time: std::time::Duration::ZERO,
+    };
 
     tracing::info!(
         "Starting receipt collection (current mode) for chain {} (log_tx: {}, factory_log_tx: {}, log_tx_capacity: {}, factory_log_tx_capacity: {})",
         chain.name,
-        log_tx.is_some(),
-        factory_log_tx.is_some(),
-        log_tx_capacity,
-        factory_log_tx_capacity
+        channels.log_tx.is_some(),
+        channels.factory_log_tx.is_some(),
+        metrics.log_tx_capacity,
+        metrics.factory_log_tx_capacity
     );
 
     // =========================================================================
@@ -119,7 +128,7 @@ pub async fn collect_receipts(
                                     range.end - 1
                                 );
                                 batch_states.remove(&range_start);
-                                send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                                send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
                             }
                             continue;
                         }
@@ -181,18 +190,13 @@ pub async fn collect_receipts(
 
                                 send_logs_to_channels(
                                     result.logs,
-                                    &log_tx,
-                                    &factory_log_tx,
-                                    &mut log_tx_metrics,
-                                    &mut factory_log_tx_metrics,
-                                    log_tx_capacity,
-                                    factory_log_tx_capacity,
-                                    &mut std::time::Duration::default(),
+                                    &channels,
+                                    &mut metrics,
                                 )
                                 .await?;
 
                                 if !triggers.is_empty() {
-                                    if let Some(tx) = &event_trigger_tx {
+                                    if let Some(tx) = &channels.event_trigger_tx {
                                         tx.send(EventTriggerMessage::Triggers(triggers))
                                             .await
                                             .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
@@ -251,18 +255,13 @@ pub async fn collect_receipts(
 
                                     send_logs_to_channels(
                                         result.logs,
-                                        &log_tx,
-                                        &factory_log_tx,
-                                        &mut log_tx_metrics,
-                                        &mut factory_log_tx_metrics,
-                                        log_tx_capacity,
-                                        factory_log_tx_capacity,
-                                        &mut std::time::Duration::default(),
+                                        &channels,
+                                        &mut metrics,
                                     )
                                     .await?;
 
                                     if !triggers.is_empty() {
-                                        if let Some(tx) = &event_trigger_tx {
+                                        if let Some(tx) = &channels.event_trigger_tx {
                                             tx.send(EventTriggerMessage::Triggers(triggers))
                                                 .await
                                                 .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
@@ -328,7 +327,7 @@ pub async fn collect_receipts(
                                 .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
                             }
 
-                            send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                            send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
                         }
                     }
                     None => {
@@ -401,15 +400,10 @@ pub async fn collect_receipts(
                         receipt_fields,
                         &schema,
                         &output_dir,
-                        &log_tx,
-                        &factory_log_tx,
-                        &event_trigger_tx,
+                        &channels,
                         &event_matchers,
                         rpc_batch_size,
-                        &mut log_tx_metrics,
-                        &mut factory_log_tx_metrics,
-                        log_tx_capacity,
-                        factory_log_tx_capacity,
+                        &mut metrics,
                         chain.block_receipts_method.as_deref(),
                         block_receipt_concurrency,
                         storage_manager.as_ref(),
@@ -417,7 +411,7 @@ pub async fn collect_receipts(
                     )
                     .await?;
 
-                    send_range_complete(&factory_log_tx, &log_tx, &event_trigger_tx, range.start, range.end).await?;
+                    send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
 
                     tracing::info!(
                         "Recollection complete for range {}-{}",
@@ -472,9 +466,9 @@ pub async fn collect_receipts(
                 range.end - 1
             );
             send_range_complete(
-                &factory_log_tx,
-                &log_tx,
-                &event_trigger_tx,
+                &channels.factory_log_tx,
+                &channels.log_tx,
+                &channels.event_trigger_tx,
                 range.start,
                 range.end,
             )
@@ -522,18 +516,13 @@ pub async fn collect_receipts(
 
                 send_logs_to_channels(
                     result.logs,
-                    &log_tx,
-                    &factory_log_tx,
-                    &mut log_tx_metrics,
-                    &mut factory_log_tx_metrics,
-                    log_tx_capacity,
-                    factory_log_tx_capacity,
-                    &mut std::time::Duration::default(),
+                    &channels,
+                    &mut metrics,
                 )
                 .await?;
 
                 if !triggers.is_empty() {
-                    if let Some(tx) = &event_trigger_tx {
+                    if let Some(tx) = &channels.event_trigger_tx {
                         tx.send(EventTriggerMessage::Triggers(triggers))
                             .await
                             .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
@@ -606,16 +595,16 @@ pub async fn collect_receipts(
         }
 
         send_range_complete(
-            &factory_log_tx,
-            &log_tx,
-            &event_trigger_tx,
+            &channels.factory_log_tx,
+            &channels.log_tx,
+            &channels.event_trigger_tx,
             range.start,
             range.end,
         )
         .await?;
     }
 
-    if let Some(sender) = &factory_log_tx {
+    if let Some(sender) = &channels.factory_log_tx {
         if sender.send(LogMessage::AllRangesComplete).await.is_err() {
             tracing::error!(
                 "Failed to send AllRangesComplete to factory_log_tx - receiver dropped"
@@ -625,7 +614,7 @@ pub async fn collect_receipts(
             ));
         }
     }
-    if let Some(sender) = &log_tx {
+    if let Some(sender) = &channels.log_tx {
         if sender.send(LogMessage::AllRangesComplete).await.is_err() {
             tracing::error!("Failed to send AllRangesComplete to log_tx - receiver dropped");
             return Err(ReceiptCollectionError::ChannelSend(
@@ -633,7 +622,7 @@ pub async fn collect_receipts(
             ));
         }
     }
-    if let Some(sender) = &event_trigger_tx {
+    if let Some(sender) = &channels.event_trigger_tx {
         if sender.send(EventTriggerMessage::AllComplete).await.is_err() {
             tracing::error!("Failed to send AllComplete to event_trigger_tx - receiver dropped");
             return Err(ReceiptCollectionError::ChannelSend(
@@ -643,11 +632,11 @@ pub async fn collect_receipts(
     }
 
     // Log channel backpressure summaries
-    if log_tx.is_some() {
-        log_tx_metrics.log_summary("log_tx");
+    if channels.log_tx.is_some() {
+        metrics.log_tx_metrics.log_summary("log_tx");
     }
-    if factory_log_tx.is_some() {
-        factory_log_tx_metrics.log_summary("factory_log_tx");
+    if channels.factory_log_tx.is_some() {
+        metrics.factory_log_tx_metrics.log_summary("factory_log_tx");
     }
 
     tracing::info!("Receipt collection complete for chain {}", chain.name);

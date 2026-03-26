@@ -17,6 +17,7 @@ use crate::storage::{upload_parquet_to_s3, BlockRange, S3Manifest, StorageManage
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{BlockField, RawDataCollectionConfig};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_blocks(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,

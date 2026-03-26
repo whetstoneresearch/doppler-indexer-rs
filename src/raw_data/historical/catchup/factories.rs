@@ -19,6 +19,7 @@ use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,

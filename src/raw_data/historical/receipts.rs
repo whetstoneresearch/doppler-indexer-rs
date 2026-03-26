@@ -312,6 +312,24 @@ pub(crate) struct ReceiptBatchState {
     pub(crate) logs: Vec<LogData>,
 }
 
+/// Channel metrics tracking state for receipt processing.
+/// Bundles the per-channel metrics and capacity info to reduce parameter counts.
+pub(crate) struct ChannelMetricsState {
+    pub(crate) log_tx_metrics: ChannelMetrics,
+    pub(crate) factory_log_tx_metrics: ChannelMetrics,
+    pub(crate) log_tx_capacity: usize,
+    pub(crate) factory_log_tx_capacity: usize,
+    pub(crate) total_channel_send_time: std::time::Duration,
+}
+
+/// Output channels for receipt log distribution.
+/// Bundles the optional output senders to reduce parameter counts.
+pub(crate) struct ReceiptOutputChannels {
+    pub(crate) log_tx: Option<Sender<LogMessage>>,
+    pub(crate) factory_log_tx: Option<Sender<LogMessage>>,
+    pub(crate) event_trigger_tx: Option<Sender<EventTriggerMessage>>,
+}
+
 /// Tracks channel backpressure metrics for monitoring
 #[derive(Debug, Default)]
 pub(crate) struct ChannelMetrics {
@@ -436,19 +454,14 @@ pub(crate) async fn send_range_complete(
 
 pub(crate) async fn send_logs_to_channels(
     batch_logs: Vec<LogData>,
-    log_tx: &Option<Sender<LogMessage>>,
-    factory_log_tx: &Option<Sender<LogMessage>>,
-    log_tx_metrics: &mut ChannelMetrics,
-    factory_log_tx_metrics: &mut ChannelMetrics,
-    log_tx_capacity: usize,
-    factory_log_tx_capacity: usize,
-    total_channel_send_time: &mut std::time::Duration,
+    channels: &ReceiptOutputChannels,
+    metrics: &mut ChannelMetricsState,
 ) -> Result<(), ReceiptCollectionError> {
     let log_count = batch_logs.len();
 
-    if let Some(sender) = factory_log_tx {
+    if let Some(sender) = &channels.factory_log_tx {
         let capacity_before = sender.capacity();
-        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / factory_log_tx_capacity as f64);
+        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / metrics.factory_log_tx_capacity as f64);
 
         if fill_pct > 90.0 {
             tracing::warn!(
@@ -473,15 +486,15 @@ pub(crate) async fn send_logs_to_channels(
             )));
         }
         let send_time = send_start.elapsed();
-        *total_channel_send_time += send_time;
+        metrics.total_channel_send_time += send_time;
 
-        factory_log_tx_metrics.record_send(send_time, capacity_before, factory_log_tx_capacity);
-        factory_log_tx_metrics.total_logs_sent += log_count as u64;
+        metrics.factory_log_tx_metrics.record_send(send_time, capacity_before, metrics.factory_log_tx_capacity);
+        metrics.factory_log_tx_metrics.total_logs_sent += log_count as u64;
     }
 
-    if let Some(sender) = log_tx {
+    if let Some(sender) = &channels.log_tx {
         let capacity_before = sender.capacity();
-        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / log_tx_capacity as f64);
+        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / metrics.log_tx_capacity as f64);
 
         if fill_pct > 90.0 {
             tracing::warn!(
@@ -502,10 +515,10 @@ pub(crate) async fn send_logs_to_channels(
             )));
         }
         let send_time = send_start.elapsed();
-        *total_channel_send_time += send_time;
+        metrics.total_channel_send_time += send_time;
 
-        log_tx_metrics.record_send(send_time, capacity_before, log_tx_capacity);
-        log_tx_metrics.total_logs_sent += log_count as u64;
+        metrics.log_tx_metrics.record_send(send_time, capacity_before, metrics.log_tx_capacity);
+        metrics.log_tx_metrics.total_logs_sent += log_count as u64;
     }
 
     Ok(())
@@ -619,6 +632,7 @@ pub(crate) async fn fetch_receipts_for_blocks(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
@@ -626,15 +640,10 @@ pub(crate) async fn process_range(
     receipt_fields: &Option<Vec<ReceiptField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
-    log_tx: &Option<Sender<LogMessage>>,
-    factory_log_tx: &Option<Sender<LogMessage>>,
-    event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
+    channels: &ReceiptOutputChannels,
     event_matchers: &[EventTriggerMatcher],
     rpc_batch_size: usize,
-    log_tx_metrics: &mut ChannelMetrics,
-    factory_log_tx_metrics: &mut ChannelMetrics,
-    log_tx_capacity: usize,
-    factory_log_tx_capacity: usize,
+    metrics: &mut ChannelMetricsState,
     block_receipts_method: Option<&str>,
     block_receipt_concurrency: usize,
     storage_manager: Option<&Arc<StorageManager>>,
@@ -648,7 +657,8 @@ pub(crate) async fn process_range(
     // Timing metrics (always tracked)
     let mut total_rpc_time = std::time::Duration::ZERO;
     let mut total_process_time = std::time::Duration::ZERO;
-    let mut total_channel_send_time = std::time::Duration::ZERO;
+    // Reset channel send time for this range (tracked via metrics.total_channel_send_time)
+    metrics.total_channel_send_time = std::time::Duration::ZERO;
 
     #[cfg(feature = "bench")]
     let mut rpc_time = std::time::Duration::ZERO;
@@ -773,19 +783,14 @@ pub(crate) async fn process_range(
 
                 send_logs_to_channels(
                     batch_logs,
-                    log_tx,
-                    factory_log_tx,
-                    log_tx_metrics,
-                    factory_log_tx_metrics,
-                    log_tx_capacity,
-                    factory_log_tx_capacity,
-                    &mut total_channel_send_time,
+                    channels,
+                    metrics,
                 )
                 .await?;
 
                 // Send event triggers if any
                 if !triggers.is_empty() {
-                    if let Some(tx) = event_trigger_tx {
+                    if let Some(tx) = &channels.event_trigger_tx {
                         tx.send(EventTriggerMessage::Triggers(triggers))
                             .await
                             .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
@@ -889,19 +894,14 @@ pub(crate) async fn process_range(
 
                 send_logs_to_channels(
                     batch_logs,
-                    log_tx,
-                    factory_log_tx,
-                    log_tx_metrics,
-                    factory_log_tx_metrics,
-                    log_tx_capacity,
-                    factory_log_tx_capacity,
-                    &mut total_channel_send_time,
+                    channels,
+                    metrics,
                 )
                 .await?;
 
                 // Send event triggers if any
                 if !triggers.is_empty() {
-                    if let Some(tx) = event_trigger_tx {
+                    if let Some(tx) = &channels.event_trigger_tx {
                         tx.send(EventTriggerMessage::Triggers(triggers))
                             .await
                             .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
@@ -983,6 +983,7 @@ pub(crate) async fn process_range(
     let total_time = range_start_time.elapsed();
     let rpc_pct = (total_rpc_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
     let process_pct = (total_process_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
+    let total_channel_send_time = metrics.total_channel_send_time;
     let channel_pct = (total_channel_send_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
     let write_pct = (total_write_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
 
