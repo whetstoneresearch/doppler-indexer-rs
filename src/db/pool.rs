@@ -58,36 +58,7 @@ impl DbPool {
         let transaction = client.transaction().await?;
 
         for op in operations {
-            let (sql, params) = match op {
-                DbOperation::Upsert {
-                    table,
-                    columns,
-                    values,
-                    conflict_columns,
-                    update_columns,
-                } => build_upsert_sql(
-                    &table,
-                    &columns,
-                    &values,
-                    &conflict_columns,
-                    &update_columns,
-                ),
-                DbOperation::Insert {
-                    table,
-                    columns,
-                    values,
-                } => build_insert_sql(&table, &columns, &values),
-                DbOperation::Update {
-                    table,
-                    set_columns,
-                    where_clause,
-                } => build_update_sql(&table, &set_columns, &where_clause),
-                DbOperation::Delete {
-                    table,
-                    where_clause,
-                } => build_delete_sql(&table, &where_clause),
-                DbOperation::RawSql { query, params } => (query, convert_values_to_params(&params)),
-            };
+            let (sql, params) = build_operation_sql(op);
 
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -101,6 +72,45 @@ impl DbPool {
 
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// Execute a transaction with pre-queries that run inside the same transaction context.
+    /// Snapshot queries see committed state before any modifications in this transaction.
+    /// Returns the pre-query results after the transaction commits.
+    pub async fn execute_transaction_with_snapshot_reads(
+        &self,
+        snapshot_specs: &[(String, Vec<(String, DbValue)>)],
+        operations: Vec<DbOperation>,
+    ) -> Result<Vec<Option<Vec<(String, DbValue)>>>, DbError> {
+        if operations.is_empty() && snapshot_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+
+        // Run snapshot queries inside the transaction (sees state before our modifications)
+        let mut snapshot_results = Vec::new();
+        for (table, key_columns) in snapshot_specs {
+            let result = query_row_on_transaction(&transaction, table, key_columns).await?;
+            snapshot_results.push(result);
+        }
+
+        // Execute all operations
+        for op in operations {
+            let (sql, params) = build_operation_sql(op);
+            let params_refs: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+
+            if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
+                let db_err: DbError = e.into();
+                tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                return Err(db_err);
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(snapshot_results)
     }
 
     pub async fn run_migrations(&self) -> Result<(), DbError> {
@@ -119,6 +129,7 @@ impl DbPool {
 
     /// Query a single row by key columns.
     /// Returns the row as a list of (column_name, value) pairs if found.
+    #[allow(dead_code)]
     pub async fn query_row(
         &self,
         table: &str,
@@ -167,6 +178,79 @@ impl DbPool {
     }
 }
 
+/// Build SQL and parameters from a DbOperation.
+fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
+    match op {
+        DbOperation::Upsert {
+            table,
+            columns,
+            values,
+            conflict_columns,
+            update_columns,
+        } => build_upsert_sql(&table, &columns, &values, &conflict_columns, &update_columns),
+        DbOperation::Insert {
+            table,
+            columns,
+            values,
+        } => build_insert_sql(&table, &columns, &values),
+        DbOperation::Update {
+            table,
+            set_columns,
+            where_clause,
+        } => build_update_sql(&table, &set_columns, &where_clause),
+        DbOperation::Delete {
+            table,
+            where_clause,
+        } => build_delete_sql(&table, &where_clause),
+        DbOperation::RawSql { query, params } => (query, convert_values_to_params(&params)),
+    }
+}
+
+/// Query a single row by key columns using an existing transaction.
+/// Returns the row as a list of (column_name, value) pairs if found.
+async fn query_row_on_transaction(
+    txn: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    key_columns: &[(String, DbValue)],
+) -> Result<Option<Vec<(String, DbValue)>>, DbError> {
+    if key_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut where_parts = Vec::new();
+    let mut params = Vec::new();
+    for (i, (col, val)) in key_columns.iter().enumerate() {
+        let placeholder = placeholder_for(val, i + 1);
+        where_parts.push(format!("{} = {}", quote_ident(col), placeholder));
+        params.push(convert_db_value(val));
+    }
+
+    let sql = format!(
+        "SELECT * FROM {} WHERE {} LIMIT 1",
+        table,
+        where_parts.join(" AND ")
+    );
+
+    let params_refs: Vec<&(dyn ToSql + Sync)> =
+        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+
+    let rows = txn.query(&sql, &params_refs[..]).await?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let row = &rows[0];
+    let mut result = Vec::new();
+    for col in row.columns() {
+        let col_name = col.name().to_string();
+        let db_value = extract_db_value_from_row(row, col)?;
+        result.push((col_name, db_value));
+    }
+
+    Ok(Some(result))
+}
+
 /// Extract a DbValue from a tokio_postgres row column.
 fn extract_db_value_from_row(
     row: &tokio_postgres::Row,
@@ -208,12 +292,12 @@ fn extract_db_value_from_row(
             Err(_) => Ok(DbValue::Null),
         },
         Type::INT2 => match row.try_get::<_, Option<i16>>(col_name) {
-            Ok(Some(v)) => Ok(DbValue::Int2(v as u8)),
+            Ok(Some(v)) => Ok(DbValue::Int2(v)),
             Ok(None) => Ok(DbValue::Null),
             Err(_) => Ok(DbValue::Null),
         },
         Type::FLOAT8 => match row.try_get::<_, Option<f64>>(col_name) {
-            Ok(Some(v)) => Ok(DbValue::Timestamp(v as i64)),
+            Ok(Some(v)) => Ok(DbValue::Float64(v)),
             Ok(None) => Ok(DbValue::Null),
             Err(_) => Ok(DbValue::Null),
         },
@@ -339,7 +423,7 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::Bool(v) => SqlParam::Bool(*v),
         DbValue::Int64(v) => SqlParam::Int64(*v),
         DbValue::Int32(v) => SqlParam::Int32(*v),
-        DbValue::Int2(v) => SqlParam::Text(v.to_string()),
+        DbValue::Int2(v) => SqlParam::Int16(*v),
         DbValue::Uint64(v) => SqlParam::Int64(*v as i64),
         DbValue::Text(v) => SqlParam::Text(v.clone()),
         DbValue::VarChar(v) => SqlParam::Text(v.clone()),
@@ -350,6 +434,7 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::Timestamp(v) => SqlParam::Float64(*v as f64),
         DbValue::Json(v) => SqlParam::Json(v.clone()),
         DbValue::JsonB(v) => SqlParam::Json(v.clone()),
+        DbValue::Float64(v) => SqlParam::Float64(*v),
     }
 }
 
@@ -366,7 +451,6 @@ fn placeholder_for(value: &DbValue, param_idx: usize) -> String {
         DbValue::Timestamp(_) => format!("to_timestamp(${})", param_idx),
         DbValue::Numeric(_) => format!("${}::text::numeric", param_idx),
         DbValue::JsonB(_) => format!("${}::jsonb", param_idx),
-        DbValue::Int2(_) => format!("${}::text::smallint", param_idx),
         _ => format!("${}", param_idx),
     }
 }
@@ -532,4 +616,107 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
 
     let sql = format!("DELETE FROM {} WHERE {}", table, where_str);
     (sql, builder.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::LiveDbValue;
+
+    /// DbValue::Float64 should convert to SqlParam::Float64 (not Timestamp).
+    #[test]
+    fn float64_converts_to_sql_param_float64() {
+        let value = DbValue::Float64(3.14);
+        let param = convert_db_value(&value);
+        match param {
+            SqlParam::Float64(v) => {
+                assert!((v - 3.14).abs() < f64::EPSILON);
+            }
+            other => panic!("Expected SqlParam::Float64, got {:?}", other),
+        }
+    }
+
+    /// DbValue::Float64 should use the default placeholder (no cast).
+    #[test]
+    fn float64_placeholder_is_plain() {
+        let value = DbValue::Float64(1.0);
+        let ph = placeholder_for(&value, 1);
+        assert_eq!(ph, "$1");
+    }
+
+    /// DbValue::Int2 should convert to SqlParam::Int16 and preserve values
+    /// outside the 0..255 range that the old u8 representation could not hold.
+    #[test]
+    fn int2_converts_to_sql_param_int16() {
+        let value = DbValue::Int2(256);
+        let param = convert_db_value(&value);
+        match param {
+            SqlParam::Int16(v) => assert_eq!(v, 256),
+            other => panic!("Expected SqlParam::Int16(256), got {:?}", other),
+        }
+    }
+
+    /// Negative i16 values should round-trip correctly through DbValue::Int2.
+    #[test]
+    fn int2_handles_negative_values() {
+        let value = DbValue::Int2(-1);
+        let param = convert_db_value(&value);
+        match param {
+            SqlParam::Int16(v) => assert_eq!(v, -1),
+            other => panic!("Expected SqlParam::Int16(-1), got {:?}", other),
+        }
+    }
+
+    /// DbValue::Int2 should use the default placeholder (no text cast needed).
+    #[test]
+    fn int2_placeholder_is_plain() {
+        let value = DbValue::Int2(42);
+        let ph = placeholder_for(&value, 3);
+        assert_eq!(ph, "$3");
+    }
+
+    /// LiveDbValue::Float64 round-trips through DbValue::Float64 correctly.
+    #[test]
+    fn live_db_value_float64_roundtrip() {
+        let original = DbValue::Float64(2.718);
+        let live = LiveDbValue::from_db_value(&original);
+        match &live {
+            LiveDbValue::Float64(v) => assert!((v - 2.718).abs() < f64::EPSILON),
+            other => panic!("Expected LiveDbValue::Float64, got {:?}", other),
+        }
+        let restored = live.to_db_value();
+        match restored {
+            DbValue::Float64(v) => assert!((v - 2.718).abs() < f64::EPSILON),
+            other => panic!("Expected DbValue::Float64, got {:?}", other),
+        }
+    }
+
+    /// LiveDbValue::Int2 round-trips through DbValue::Int2 correctly,
+    /// including values that the old u8 representation would have truncated.
+    #[test]
+    fn live_db_value_int2_roundtrip() {
+        let original = DbValue::Int2(300);
+        let live = LiveDbValue::from_db_value(&original);
+        match &live {
+            LiveDbValue::Int2(v) => assert_eq!(*v, 300),
+            other => panic!("Expected LiveDbValue::Int2(300), got {:?}", other),
+        }
+        let restored = live.to_db_value();
+        match restored {
+            DbValue::Int2(v) => assert_eq!(v, 300),
+            other => panic!("Expected DbValue::Int2(300), got {:?}", other),
+        }
+    }
+
+    /// LiveDbValue::Int2 round-trips negative values correctly.
+    #[test]
+    fn live_db_value_int2_negative_roundtrip() {
+        let original = DbValue::Int2(-128);
+        let live = LiveDbValue::from_db_value(&original);
+        let restored = live.to_db_value();
+        match restored {
+            DbValue::Int2(v) => assert_eq!(v, -128),
+            other => panic!("Expected DbValue::Int2(-128), got {:?}", other),
+        }
+    }
 }

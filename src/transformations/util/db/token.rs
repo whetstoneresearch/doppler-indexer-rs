@@ -73,7 +73,7 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
             },
             DbValue::Text(data.name.to_string()),
             DbValue::Text(data.symbol.to_string()),
-            DbValue::Int2(data.decimals),
+            DbValue::Int2(data.decimals as i16),
             match data.total_supply {
                 Some(supply) => DbValue::Numeric(supply.to_string()),
                 None => DbValue::Null,

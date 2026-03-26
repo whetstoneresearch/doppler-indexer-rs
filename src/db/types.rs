@@ -12,8 +12,8 @@ pub enum DbValue {
     Int64(i64),
     /// Signed 32-bit integer
     Int32(i32),
-    /// Unsigned 8-bit integer (stored as SMALLINT/INT2)
-    Int2(u8),
+    /// Signed 16-bit integer (stored as SMALLINT/INT2)
+    Int2(i16),
     /// Unsigned 64-bit integer (stored as BIGINT)
     Uint64(u64),
     /// Text (unlimited length)
@@ -34,6 +34,8 @@ pub enum DbValue {
     Json(JsonValue),
     /// JSONB value (binary JSON, more efficient for querying)
     JsonB(JsonValue),
+    /// Double-precision floating point (FLOAT8)
+    Float64(f64),
 }
 
 impl DbValue {
