@@ -290,12 +290,13 @@ fn inject_where_clause(clause: WhereClause, source: &str, version: u32) -> Where
 /// Execute a transaction with optional snapshot capture for reorg rollback.
 ///
 /// For live mode (single-block ranges), this function:
-/// 1. Queries current row state for upserts with update_columns
-/// 2. Writes snapshots to storage (before transaction, for crash safety)
-/// 3. Executes the transaction
+/// 1. Collects snapshot specs (table + key columns) for upserts with update_columns
+/// 2. Executes snapshot reads and writes inside the same database transaction
+/// 3. Writes snapshots to storage after the transaction commits
 ///
-/// Writing snapshots before the transaction ensures that if a crash occurs after
-/// the transaction commits, the snapshot is already persisted. Orphan snapshots
+/// Snapshot reads happen inside the transaction so that concurrent handlers cannot
+/// modify a row between the snapshot read and the handler's write.
+/// Snapshots are written to storage after the transaction commits; orphan snapshots
 /// from failed transactions are harmless and cleaned up during compaction.
 pub(crate) async fn execute_with_snapshot_capture(
     ops: Vec<DbOperation>,
@@ -316,8 +317,16 @@ pub(crate) async fn execute_with_snapshot_capture(
         }
     };
 
-    // Collect snapshots for upserts with update_columns (these modify existing rows)
-    let mut snapshots = Vec::new();
+    // Collect snapshot specs from upserts with update_columns
+    let mut snapshot_specs: Vec<(String, Vec<(String, DbValue)>)> = Vec::new();
+    // Track metadata for building LiveUpsertSnapshot after the transaction
+    struct SnapshotMeta {
+        table: String,
+        conflict_columns: Vec<String>,
+        values: Vec<DbValue>,
+        columns: Vec<String>,
+    }
+    let mut snapshot_metas: Vec<SnapshotMeta> = Vec::new();
 
     for op in &ops {
         if let DbOperation::Upsert {
@@ -336,38 +345,72 @@ pub(crate) async fn execute_with_snapshot_capture(
             // Build key columns from conflict_columns
             let mut key_columns: Vec<(String, DbValue)> = Vec::new();
             for conflict_col in conflict_columns {
-                // Find the value for this conflict column
                 if let Some(idx) = columns.iter().position(|c| c == conflict_col) {
                     key_columns.push((conflict_col.clone(), values[idx].clone()));
                 }
             }
 
-            // Query current row state
-            let previous_row = db_pool.query_row(table, &key_columns).await?;
-
-            // Convert to LiveDbValue
-            let live_key_columns: Vec<(String, LiveDbValue)> = key_columns
-                .into_iter()
-                .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
-                .collect();
-
-            let live_previous_row = previous_row.map(|row| {
-                row.into_iter()
-                    .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
-                    .collect()
-            });
-
-            snapshots.push(LiveUpsertSnapshot {
+            snapshot_specs.push((table.clone(), key_columns));
+            snapshot_metas.push(SnapshotMeta {
                 table: table.clone(),
-                source: handler_source.to_string(),
-                source_version: handler_version,
-                key_columns: live_key_columns,
-                previous_row: live_previous_row,
+                conflict_columns: conflict_columns.clone(),
+                values: values.clone(),
+                columns: columns.clone(),
             });
         }
     }
 
-    // Write snapshots to storage BEFORE transaction (for crash safety)
+    if snapshot_specs.is_empty() {
+        // No snapshots needed, just execute normally
+        return db_pool
+            .execute_transaction(ops)
+            .await
+            .map_err(TransformationError::DatabaseError);
+    }
+
+    // Execute transaction with snapshot reads inside the same transaction
+    let snapshot_results = db_pool
+        .execute_transaction_with_snapshot_reads(&snapshot_specs, ops)
+        .await
+        .map_err(TransformationError::DatabaseError)?;
+
+    // Build snapshots from results
+    let mut snapshots = Vec::new();
+    for (i, meta) in snapshot_metas.iter().enumerate() {
+        let previous_row = snapshot_results.get(i).cloned().flatten();
+
+        let key_columns: Vec<(String, DbValue)> = meta
+            .conflict_columns
+            .iter()
+            .filter_map(|col| {
+                meta.columns
+                    .iter()
+                    .position(|c| c == col)
+                    .map(|idx| (col.clone(), meta.values[idx].clone()))
+            })
+            .collect();
+
+        let live_key_columns: Vec<(String, LiveDbValue)> = key_columns
+            .into_iter()
+            .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
+            .collect();
+
+        let live_previous_row = previous_row.map(|row| {
+            row.into_iter()
+                .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
+                .collect()
+        });
+
+        snapshots.push(LiveUpsertSnapshot {
+            table: meta.table.clone(),
+            source: handler_source.to_string(),
+            source_version: handler_version,
+            key_columns: live_key_columns,
+            previous_row: live_previous_row,
+        });
+    }
+
+    // Write snapshots to storage after transaction commits
     if !snapshots.is_empty() {
         let mut all_snapshots = storage.read_snapshots(block_number).unwrap_or_default();
         all_snapshots.extend(snapshots);
@@ -381,9 +424,5 @@ pub(crate) async fn execute_with_snapshot_capture(
         }
     }
 
-    // Execute the transaction
-    db_pool
-        .execute_transaction(ops)
-        .await
-        .map_err(TransformationError::DatabaseError)
+    Ok(())
 }

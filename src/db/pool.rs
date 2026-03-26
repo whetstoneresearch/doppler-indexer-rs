@@ -74,6 +74,45 @@ impl DbPool {
         Ok(())
     }
 
+    /// Execute a transaction with pre-queries that run inside the same transaction context.
+    /// Snapshot queries see committed state before any modifications in this transaction.
+    /// Returns the pre-query results after the transaction commits.
+    pub async fn execute_transaction_with_snapshot_reads(
+        &self,
+        snapshot_specs: &[(String, Vec<(String, DbValue)>)],
+        operations: Vec<DbOperation>,
+    ) -> Result<Vec<Option<Vec<(String, DbValue)>>>, DbError> {
+        if operations.is_empty() && snapshot_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+
+        // Run snapshot queries inside the transaction (sees state before our modifications)
+        let mut snapshot_results = Vec::new();
+        for (table, key_columns) in snapshot_specs {
+            let result = query_row_on_transaction(&transaction, table, key_columns).await?;
+            snapshot_results.push(result);
+        }
+
+        // Execute all operations
+        for op in operations {
+            let (sql, params) = build_operation_sql(op);
+            let params_refs: Vec<&(dyn ToSql + Sync)> =
+                params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+
+            if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
+                let db_err: DbError = e.into();
+                tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                return Err(db_err);
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(snapshot_results)
+    }
+
     pub async fn run_migrations(&self) -> Result<(), DbError> {
         super::migrations::run(&self.pool).await
     }
@@ -175,6 +214,34 @@ impl DbPool {
         }
 
         Ok(Some(result))
+    }
+}
+
+/// Build SQL and parameters from a DbOperation.
+fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
+    match op {
+        DbOperation::Upsert {
+            table,
+            columns,
+            values,
+            conflict_columns,
+            update_columns,
+        } => build_upsert_sql(&table, &columns, &values, &conflict_columns, &update_columns),
+        DbOperation::Insert {
+            table,
+            columns,
+            values,
+        } => build_insert_sql(&table, &columns, &values),
+        DbOperation::Update {
+            table,
+            set_columns,
+            where_clause,
+        } => build_update_sql(&table, &set_columns, &where_clause),
+        DbOperation::Delete {
+            table,
+            where_clause,
+        } => build_delete_sql(&table, &where_clause),
+        DbOperation::RawSql { query, params } => (query, convert_values_to_params(&params)),
     }
 }
 
