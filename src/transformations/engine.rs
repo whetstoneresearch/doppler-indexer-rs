@@ -1084,11 +1084,18 @@ impl TransformationEngine {
             call_triggers,
             |source, function| {
                 let base_dir = calls_dir.join(source).join(function);
-                vec![
+                // Use first-match semantics: only the first existing path is returned,
+                // matching the original behavior where base > on_events > once priority
+                // prevents duplicate data when multiple paths exist.
+                [
                     base_dir.join(&file_name),
                     base_dir.join("on_events").join(&file_name),
                     base_dir.join("once").join(&file_name),
                 ]
+                .into_iter()
+                .find(|p| p.exists())
+                .into_iter()
+                .collect()
             },
             |reader, path, src, func| reader.read_calls_from_file(path, src, func),
         )
