@@ -308,45 +308,10 @@ impl LiveStorage {
         status: &LiveBlockStatus,
     ) -> Result<(), StorageError> {
         let path = self.status_path(block_number);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Write to temp file with unique suffix to avoid race conditions
-        // when multiple writers (collector + decoder) write status for the same block
-        let random_suffix: u32 = rand::random();
-        let temp_name = format!(
-            "{}.tmp.{}",
-            path.file_name().unwrap().to_string_lossy(),
-            random_suffix
-        );
-        let temp_path = path.with_file_name(temp_name);
-
-        let file = fs::File::create(&temp_path)?;
-        let mut writer = BufWriter::new(file);
-
-        // Wrap write+flush+sync+rename so we can clean up the temp file on any failure
-        let result = (|| -> Result<(), StorageError> {
-            serde_json::to_writer_pretty(&mut writer, status)?;
-            writer.flush()?;
-            writer
-                .into_inner()
-                .map_err(std::io::Error::other)?
-                .sync_all()?;
-            fs::rename(&temp_path, &path)?;
+        atomic_write_with(&path, |writer| {
+            serde_json::to_writer_pretty(writer, status)?;
             Ok(())
-        })();
-
-        if let Err(e) = &result {
-            tracing::debug!(
-                "Cleaning up temp file after status write error: {:?} ({})",
-                temp_path,
-                e
-            );
-            let _ = fs::remove_file(&temp_path);
-        }
-
-        result
+        })
     }
 
     /// Read status for a block.
@@ -400,38 +365,10 @@ impl LiveStorage {
         update_fn(&mut status);
 
         // Write to temp file, then rename — all while holding the lock
-        let random_suffix: u32 = rand::random();
-        let temp_name = format!(
-            "{}.tmp.{}",
-            path.file_name().unwrap().to_string_lossy(),
-            random_suffix
-        );
-        let temp_path = path.with_file_name(temp_name);
-
-        let result = (|| -> Result<(), StorageError> {
-            {
-                let temp_file = fs::File::create(&temp_path)?;
-                let mut writer = BufWriter::new(temp_file);
-                serde_json::to_writer_pretty(&mut writer, &status)?;
-                writer.flush()?;
-                writer
-                    .into_inner()
-                    .map_err(std::io::Error::other)?
-                    .sync_all()?;
-            }
-
-            fs::rename(&temp_path, &path)?;
+        let result = atomic_write_with(&path, |writer| {
+            serde_json::to_writer_pretty(writer, &status)?;
             Ok(())
-        })();
-
-        if let Err(e) = &result {
-            tracing::debug!(
-                "Cleaning up temp file after atomic status write error: {:?} ({})",
-                temp_path,
-                e
-            );
-            let _ = fs::remove_file(&temp_path);
-        }
+        });
 
         // lock_file dropped here, releasing the exclusive lock
 
@@ -818,17 +755,18 @@ impl LiveStorage {
 // Helper functions
 // =========================================================================
 
-/// Atomically write bincode-serialized data to a file.
+/// Atomically write to a file using a caller-supplied write function.
 ///
 /// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
-/// Works with any serializable type including slices.
 /// Uses unique temp file names to avoid race conditions between concurrent writers.
-fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
+fn atomic_write_with<F>(path: &Path, write_fn: F) -> Result<(), StorageError>
+where
+    F: FnOnce(&mut BufWriter<fs::File>) -> Result<(), StorageError>,
+{
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Write to temp file with unique suffix to avoid race conditions
     let random_suffix: u32 = rand::random();
     let temp_name = format!(
         "{}.tmp.{}",
@@ -840,9 +778,8 @@ fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), Sto
     let file = fs::File::create(&temp_path)?;
     let mut writer = BufWriter::new(file);
 
-    // Wrap write+flush+sync+rename so we can clean up the temp file on any failure
     let result = (|| -> Result<(), StorageError> {
-        bincode::serialize_into(&mut writer, data)?;
+        write_fn(&mut writer)?;
         writer.flush()?;
         writer
             .into_inner()
@@ -862,6 +799,18 @@ fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), Sto
     }
 
     result
+}
+
+/// Atomically write bincode-serialized data to a file.
+///
+/// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
+/// Works with any serializable type including slices.
+/// Uses unique temp file names to avoid race conditions between concurrent writers.
+fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
+    atomic_write_with(path, |writer| {
+        bincode::serialize_into(writer, data)?;
+        Ok(())
+    })
 }
 
 fn read_bincode<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {

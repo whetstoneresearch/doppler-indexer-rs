@@ -68,6 +68,8 @@ pub struct LiveCollector {
     expected_start_block: Option<u64>,
     /// Factory matchers for extracting new contract addresses from factory events.
     factory_matchers: Arc<Vec<FactoryMatcher>>,
+    /// Pre-built index mapping topic0 -> indices into `factory_matchers` for O(n) extraction.
+    factory_topic_index: HashMap<[u8; 32], Vec<usize>>,
     /// Optional eth_call collector for live mode.
     eth_call_collector: Option<LiveEthCallCollector>,
     /// Database pool for status file reconstruction during catchup.
@@ -141,6 +143,15 @@ impl LiveCollector {
             tracing::info!("Live collector initialized with eth_call collector");
         }
 
+        // Pre-build topic0 -> matcher index map for O(n) factory extraction
+        let mut factory_topic_index: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+        for (idx, matcher) in factory_matchers.iter().enumerate() {
+            factory_topic_index
+                .entry(matcher.event_topic0)
+                .or_default()
+                .push(idx);
+        }
+
         Self {
             chain,
             http_client,
@@ -151,6 +162,7 @@ impl LiveCollector {
             progress_tracker,
             expected_start_block,
             factory_matchers,
+            factory_topic_index,
             eth_call_collector,
             db_pool,
             expectations,
@@ -791,6 +803,8 @@ impl LiveCollector {
     }
 
     /// Extract factory addresses from logs using configured matchers.
+    ///
+    /// Uses a pre-built topic0 index for O(n) lookup instead of O(n*m) nested iteration.
     fn extract_factory_addresses(
         &self,
         logs: &[LiveLog],
@@ -803,22 +817,29 @@ impl LiveCollector {
         }
 
         for log in logs {
-            for matcher in self.factory_matchers.iter() {
+            // Skip logs with no topics
+            if log.topics.is_empty() {
+                continue;
+            }
+
+            // Look up matchers by topic0
+            let Some(matcher_indices) = self.factory_topic_index.get(&log.topics[0]) else {
+                continue;
+            };
+
+            for &idx in matcher_indices {
+                let matcher = &self.factory_matchers[idx];
+
                 // Check if log address matches factory contract
                 if log.address != matcher.factory_contract_address {
                     continue;
                 }
 
-                // Check if topic0 matches the event signature
-                if log.topics.is_empty() || log.topics[0] != matcher.event_topic0 {
-                    continue;
-                }
-
                 // Extract address based on parameter location
                 let extracted_address = match &matcher.param_location {
-                    FactoryParameterLocation::Topic(idx) => {
-                        if *idx < log.topics.len() {
-                            let topic = &log.topics[*idx];
+                    FactoryParameterLocation::Topic(topic_idx) => {
+                        if *topic_idx < log.topics.len() {
+                            let topic = &log.topics[*topic_idx];
                             let mut addr = [0u8; 20];
                             addr.copy_from_slice(&topic[12..32]);
                             Some(addr)
@@ -1624,6 +1645,7 @@ mod tests {
             progress_tracker: None,
             expected_start_block: None,
             factory_matchers: Arc::new(vec![]),
+            factory_topic_index: HashMap::new(),
             eth_call_collector: None,
             db_pool: None,
             expectations: LivePipelineExpectations {
