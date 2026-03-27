@@ -440,6 +440,122 @@ impl TransformationEngine {
         Ok(())
     }
 
+    /// Spawn a single catchup handler task into the provided JoinSet.
+    ///
+    /// Acquires a semaphore permit, clones all shared state, and spawns an
+    /// async task that invokes the handler and executes the resulting database
+    /// operations.
+    async fn spawn_catchup_handler_task<H>(
+        &self,
+        join_set: &mut JoinSet<HandlerTaskResult>,
+        semaphore: &Arc<Semaphore>,
+        handler: &Arc<H>,
+        handler_key: &str,
+        range_start: u64,
+        range_end: u64,
+        events: Vec<DecodedEvent>,
+        calls: Vec<DecodedCall>,
+        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    ) where
+        H: super::traits::TransformationHandler + ?Sized,
+    {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let handler = handler.clone();
+        let db_pool = self.db_pool.clone();
+        let handler_key = handler_key.to_string();
+        let handler_name = handler.name();
+        let handler_version = handler.version();
+        let chain_name = self.chain_name.clone();
+        let chain_id = self.chain_id;
+        let historical = self.historical_reader.clone();
+        let rpc = self.executor.rpc_client.clone();
+        let contracts = self.contracts.clone();
+
+        join_set.spawn(async move {
+            let _permit = permit;
+            let ctx = TransformationContext::new(
+                chain_name,
+                chain_id,
+                range_start,
+                range_end,
+                Arc::new(events),
+                Arc::new(calls),
+                tx_addresses,
+                historical,
+                rpc,
+                contracts,
+            );
+
+            match handler.handle(&ctx).await {
+                Ok(ops) => {
+                    if !ops.is_empty() {
+                        let ops = inject_source_version(ops, handler_name, handler_version);
+                        db_pool.execute_transaction(ops).await?;
+                    }
+                    Ok(Some((handler_key, range_start, range_end)))
+                }
+                Err(e) => Err(e),
+            }
+        });
+    }
+
+    /// Drain completed tasks from a catchup JoinSet, recording completed
+    /// ranges and collecting failures.
+    ///
+    /// Returns `true` if at least one handler errored or panicked.
+    async fn drain_catchup_results(
+        &self,
+        join_set: &mut JoinSet<HandlerTaskResult>,
+        handler_key: &str,
+        failed_handlers: &mut Vec<(String, String)>,
+    ) -> Result<bool, TransformationError> {
+        let mut errored = false;
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(Some((hk, rs, re)))) => {
+                    self.finalizer
+                        .record_completed_range_for_handler(&hk, rs, re)
+                        .await?;
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
+                        handler_key, e
+                    );
+                    failed_handlers.push((handler_key.to_string(), e.to_string()));
+                    errored = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
+                    failed_handlers.push((handler_key.to_string(), format!("task panicked: {}", e)));
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        Ok(errored)
+    }
+
+    /// Format and return a catchup failure error from accumulated handler failures.
+    fn catchup_failure_error(
+        failed_handlers: &[(String, String)],
+    ) -> Result<(), TransformationError> {
+        if failed_handlers.is_empty() {
+            return Ok(());
+        }
+        let msg = failed_handlers
+            .iter()
+            .map(|(k, e)| format!("{}: {}", k, e))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(TransformationError::HandlerError {
+            handler_name: "catchup".to_string(),
+            message: format!("{} handler(s) failed: {}", failed_handlers.len(), msg),
+        })
+    }
+
     async fn run_handler_catchup(
         &self,
         kind: HandlerKind,
@@ -645,59 +761,25 @@ impl TransformationEngine {
                     };
 
                     if has_data {
-                        let permit = semaphore.clone().acquire_owned().await.unwrap();
-                        let handler = handler.clone();
-                        let db_pool = self.db_pool.clone();
-                        let handler_key = handler_key.clone();
-                        let handler_name = handler.name();
-                        let handler_version = handler.version();
-                        let chain_name = self.chain_name.clone();
-                        let chain_id = self.chain_id;
-                        let historical = self.historical_reader.clone();
-                        let rpc = self.executor.rpc_client.clone();
-                        let contracts = self.contracts.clone();
-                        let rs = *range_start;
-                        let re = *range_end;
-                        let handler_kind = ch.kind;
-
                         // Event handlers get tx_addresses; call handlers pass empty map
-                        let tx_addresses = match handler_kind {
+                        let tx_addresses = match ch.kind {
                             HandlerKind::Event => {
                                 self.read_receipt_addresses(*range_start, *range_end)
                             }
                             HandlerKind::Call => HashMap::new(),
                         };
-
-                        join_set.spawn(async move {
-                            let _permit = permit;
-                            let ctx = TransformationContext::new(
-                                chain_name,
-                                chain_id,
-                                rs,
-                                re,
-                                Arc::new(events),
-                                Arc::new(calls),
-                                tx_addresses,
-                                historical,
-                                rpc,
-                                contracts,
-                            );
-
-                            match handler.handle(&ctx).await {
-                                Ok(ops) => {
-                                    if !ops.is_empty() {
-                                        let ops = inject_source_version(
-                                            ops,
-                                            handler_name,
-                                            handler_version,
-                                        );
-                                        db_pool.execute_transaction(ops).await?;
-                                    }
-                                    Ok(Some((handler_key, rs, re)))
-                                }
-                                Err(e) => Err(e),
-                            }
-                        });
+                        self.spawn_catchup_handler_task(
+                            &mut join_set,
+                            &semaphore,
+                            handler,
+                            &handler_key,
+                            *range_start,
+                            *range_end,
+                            events,
+                            calls,
+                            tx_addresses,
+                        )
+                        .await;
                     } else {
                         self.finalizer
                             .record_completed_range_for_handler(
@@ -720,34 +802,13 @@ impl TransformationEngine {
                     }
                 }
 
-                while let Some(result) = join_set.join_next().await {
-                    match result {
-                        Ok(Ok(Some((hk, rs, re)))) => {
-                            self.finalizer
-                                .record_completed_range_for_handler(&hk, rs, re)
-                                .await?;
-                        }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => {
-                            tracing::error!(
-                                "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
-                                handler_key, e
-                            );
-                            failed_handlers.push((handler_key.clone(), e.to_string()));
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                            failed_handlers
-                                .push((handler_key.clone(), format!("task panicked: {}", e)));
-                            break;
-                        }
-                    }
-                }
+                let handler_errored_this_pass = self
+                    .drain_catchup_results(&mut join_set, &handler_key, &mut failed_handlers)
+                    .await?;
 
                 total_processed += processed;
 
-                if !failed_handlers.iter().any(|(k, _)| k == &handler_key) {
+                if !handler_errored_this_pass {
                     if skipped_ranges.is_empty() {
                         tracing::info!(
                             "Handler {} catchup complete in {} pass(es): processed {} ranges",
@@ -782,19 +843,7 @@ impl TransformationEngine {
             }
         }
 
-        if !failed_handlers.is_empty() {
-            let msg = failed_handlers
-                .iter()
-                .map(|(k, e)| format!("{}: {}", k, e))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(TransformationError::HandlerError {
-                handler_name: "catchup".to_string(),
-                message: format!("{} handler(s) failed: {}", failed_handlers.len(), msg),
-            });
-        }
-
-        Ok(())
+        Self::catchup_failure_error(&failed_handlers)
     }
 
     // ─── Receipt Address Reading ────────────────────────────────────
