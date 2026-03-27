@@ -1286,33 +1286,49 @@ impl TransformationEngine {
                     outcome.range_end,
                 )
                 .await?;
-
-            if outcome.range_end - outcome.range_start == 1 {
-                if let Some(ref tracker) = self.progress_tracker {
-                    let mut t = tracker.lock().await;
-                    if let Err(e) = t
-                        .mark_complete(outcome.range_start, &outcome.handler_key)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to mark live progress for block {} handler {}: {}",
-                            outcome.range_start,
-                            outcome.handler_key,
-                            e
-                        );
-                    }
-                }
-            }
         }
 
-        // Persist failed handlers to status file (single-block live mode only)
-        let failed_keys: HashSet<String> = submitted_keys
-            .difference(&succeeded_keys)
-            .cloned()
-            .collect();
-        if !failed_keys.is_empty() && msg.range_end - msg.range_start == 1 {
+        self.record_handler_outcomes(
+            msg.range_start,
+            msg.range_end,
+            &submitted_keys,
+            &succeeded_keys,
+            &outcomes,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    // ─── Shared outcome recording ────────────────────────────────────
+
+    /// Mark a single block as complete for a handler in the live progress tracker.
+    async fn record_live_progress(&self, block_number: u64, handler_key: &str) {
+        if let Some(ref tracker) = self.progress_tracker {
+            let mut t = tracker.lock().await;
+            if let Err(e) = t.mark_complete(block_number, handler_key).await {
+                tracing::warn!(
+                    "Failed to mark live progress for block {} handler {}: {}",
+                    block_number,
+                    handler_key,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Persist the set of failed handlers into the live status file for a block.
+    async fn persist_failed_handlers(
+        &self,
+        block_number: u64,
+        submitted_keys: &HashSet<String>,
+        succeeded_keys: &HashSet<String>,
+    ) {
+        let failed_keys: HashSet<String> =
+            submitted_keys.difference(succeeded_keys).cloned().collect();
+        if !failed_keys.is_empty() {
             let storage = LiveStorage::new(&self.chain_name);
-            if let Err(e) = storage.update_status_atomic(msg.range_start, |status| {
+            if let Err(e) = storage.update_status_atomic(block_number, |status| {
                 status.failed_handlers.extend(failed_keys.iter().cloned());
                 for h in &failed_keys {
                     status.completed_handlers.remove(h);
@@ -1321,14 +1337,33 @@ impl TransformationEngine {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to persist failed handlers for block {}: {}",
-                        msg.range_start,
+                        block_number,
                         e
                     );
                 }
             }
         }
+    }
 
-        Ok(())
+    /// Record progress and persist failures for handler outcomes from a single
+    /// block range execution.  For single-block (live) ranges this records
+    /// per-handler live progress and writes failures to the status file.
+    async fn record_handler_outcomes(
+        &self,
+        range_start: u64,
+        range_end: u64,
+        submitted_keys: &HashSet<String>,
+        succeeded_keys: &HashSet<String>,
+        outcomes: &[super::executor::HandlerOutcome],
+    ) {
+        if range_end - range_start == 1 {
+            for outcome in outcomes {
+                self.record_live_progress(outcome.range_start, &outcome.handler_key)
+                    .await;
+            }
+            self.persist_failed_handlers(range_start, submitted_keys, succeeded_keys)
+                .await;
+        }
     }
 
     /// Process a calls message and check if any pending events can now be processed.
@@ -1546,47 +1581,16 @@ impl TransformationEngine {
                     outcome.range_end,
                 )
                 .await?;
-
-            if outcome.range_end - outcome.range_start == 1 {
-                if let Some(ref tracker) = self.progress_tracker {
-                    let mut t = tracker.lock().await;
-                    if let Err(e) = t
-                        .mark_complete(outcome.range_start, &outcome.handler_key)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to mark live progress for block {} handler {}: {}",
-                            outcome.range_start,
-                            outcome.handler_key,
-                            e
-                        );
-                    }
-                }
-            }
         }
 
-        // Persist failed handlers to status file (single-block live mode only)
-        let failed_keys: HashSet<String> = submitted_keys
-            .difference(&succeeded_keys)
-            .cloned()
-            .collect();
-        if !failed_keys.is_empty() && range_key.1 - range_key.0 == 1 {
-            let storage = LiveStorage::new(&self.chain_name);
-            if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
-                status.failed_handlers.extend(failed_keys.iter().cloned());
-                for h in &failed_keys {
-                    status.completed_handlers.remove(h);
-                }
-            }) {
-                if !matches!(e, StorageError::NotFound(_)) {
-                    tracing::warn!(
-                        "Failed to persist failed handlers for block {}: {}",
-                        range_key.0,
-                        e
-                    );
-                }
-            }
-        }
+        self.record_handler_outcomes(
+            range_key.0,
+            range_key.1,
+            &submitted_keys,
+            &succeeded_keys,
+            &outcomes,
+        )
+        .await;
 
         Ok(())
     }
@@ -1674,47 +1678,16 @@ impl TransformationEngine {
                     outcome.range_end,
                 )
                 .await?;
-
-            if outcome.range_end - outcome.range_start == 1 {
-                if let Some(ref tracker) = self.progress_tracker {
-                    let mut t = tracker.lock().await;
-                    if let Err(e) = t
-                        .mark_complete(outcome.range_start, &outcome.handler_key)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to mark live progress for block {} handler {}: {}",
-                            outcome.range_start,
-                            outcome.handler_key,
-                            e
-                        );
-                    }
-                }
-            }
         }
 
-        // Persist failed handlers to status file (single-block live mode only)
-        let failed_keys: HashSet<String> = submitted_keys
-            .difference(&succeeded_keys)
-            .cloned()
-            .collect();
-        if !failed_keys.is_empty() && range_end - range_start == 1 {
-            let storage = LiveStorage::new(&self.chain_name);
-            if let Err(e) = storage.update_status_atomic(range_start, |status| {
-                status.failed_handlers.extend(failed_keys.iter().cloned());
-                for h in &failed_keys {
-                    status.completed_handlers.remove(h);
-                }
-            }) {
-                if !matches!(e, StorageError::NotFound(_)) {
-                    tracing::warn!(
-                        "Failed to persist failed handlers for block {}: {}",
-                        range_start,
-                        e
-                    );
-                }
-            }
-        }
+        self.record_handler_outcomes(
+            range_start,
+            range_end,
+            &submitted_keys,
+            &succeeded_keys,
+            &outcomes,
+        )
+        .await;
 
         Ok(())
     }
