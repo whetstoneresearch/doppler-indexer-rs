@@ -216,6 +216,32 @@ pub(super) async fn handle_factory_message(
                         }
                     }
                     state.range_factory_done.insert(range_start);
+
+                    // Factory address discovery is complete for this range.
+                    // Any buffered triggers for this range whose emitters still aren't
+                    // in factory_addresses are legitimately not factory instances — drop them.
+                    if !state.factory_skipped_triggers.is_empty() {
+                        let before: usize = state
+                            .factory_skipped_triggers
+                            .iter()
+                            .map(|(t, _, _)| t.len())
+                            .sum();
+                        state
+                            .factory_skipped_triggers
+                            .retain(|(_, buf_start, _)| *buf_start != range_start);
+                        let after: usize = state
+                            .factory_skipped_triggers
+                            .iter()
+                            .map(|(t, _, _)| t.len())
+                            .sum();
+                        let dropped = before - after;
+                        if dropped > 0 {
+                            tracing::debug!(
+                                "Dropped {} buffered triggers for range {} — factory discovery complete, addresses not found",
+                                dropped, range_start
+                            );
+                        }
+                    }
                 }
 
                 if state.range_regular_done.contains(&range_start)
@@ -233,18 +259,10 @@ pub(super) async fn handle_factory_message(
                     .iter()
                     .map(|(t, _, _)| t.len())
                     .sum();
-                let collections: std::collections::HashSet<String> = state
-                    .factory_skipped_triggers
-                    .iter()
-                    .flat_map(|(triggers, _, _)| {
-                        triggers.iter().map(|t| t.trigger.source_name.clone())
-                    })
-                    .collect();
-                tracing::warn!(
-                    "Factory channel closed with {} unresolvable triggers still buffered across {} ranges. Collections: {:?}",
-                    total,
-                    state.factory_skipped_triggers.len(),
-                    collections
+                tracing::error!(
+                    "BUG: {} buffered triggers remain after all factory ranges complete. \
+                     These should have been drained by RangeComplete.",
+                    total
                 );
             }
             tracing::debug!("eth_calls: factory channel closed");

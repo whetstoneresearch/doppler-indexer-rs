@@ -559,9 +559,14 @@ pub(crate) async fn process_event_triggers(
                     match factory_addresses.get(&config.contract_name) {
                         Some(known_addresses) => {
                             if !known_addresses.contains(&emitter) {
-                                // Skip - event emitter is not a known factory address
-                                tracing::trace!(
-                                    "Skipping event trigger: emitter {:?} not in known addresses for {}",
+                                // Emitter not in known addresses — could be not-yet-discovered.
+                                // Buffer for replay; factory RangeComplete will drop if
+                                // this is a legitimate miss.
+                                skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                    trigger: trigger.clone(),
+                                });
+                                tracing::debug!(
+                                    "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
                                     emitter,
                                     config.contract_name
                                 );
@@ -901,6 +906,17 @@ pub(crate) async fn process_event_triggers_multicall(
                     match factory_addresses.get(&config.contract_name) {
                         Some(known_addresses) => {
                             if !known_addresses.contains(&emitter) {
+                                // Emitter not in known addresses — could be not-yet-discovered.
+                                // Buffer for replay; factory RangeComplete will drop if
+                                // this is a legitimate miss.
+                                skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                    trigger: trigger.clone(),
+                                });
+                                tracing::debug!(
+                                    "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
+                                    emitter,
+                                    config.contract_name
+                                );
                                 continue;
                             }
                             emitter
