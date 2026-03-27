@@ -52,7 +52,18 @@ src/
 │       ├── blocks.rs    # Block collection
 │       ├── receipts.rs  # Receipt collection
 │       ├── logs.rs      # Log collection
-│       ├── eth_calls/   # ETH call collection (config, execution, frequency, etc.)
+│       ├── eth_calls/   # ETH call collection
+│       │   ├── config.rs         # Call config building
+│       │   ├── event_triggers.rs # Event-triggered call processing
+│       │   ├── factory.rs        # Factory discovery helpers
+│       │   ├── frequency.rs      # Block frequency filtering
+│       │   ├── multicall.rs      # Multicall3 types, encoding, and executor
+│       │   ├── once_calls.rs     # Once-call processing (regular + factory)
+│       │   ├── parquet_io.rs     # Parquet read/write for eth_calls
+│       │   ├── postprocessing.rs # Shared result finalization helper
+│       │   ├── regular_calls.rs  # Regular/factory range processing
+│       │   ├── token_calls.rs    # Token pool call processing
+│       │   └── types.rs          # Error types, context, configs
 │       └── factories.rs # Factory contract discovery
 ├── decoding/            # ABI decoding (top-level module)
 │   ├── logs.rs          # Log decoder

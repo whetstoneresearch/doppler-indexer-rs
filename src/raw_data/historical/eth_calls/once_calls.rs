@@ -1,6 +1,5 @@
-//! Once-call execution: one-time eth_calls (name, symbol, decimals, etc.)
-//! for both regular contracts and factory-discovered contracts, with and
-//! without multicall batching.
+//! Once-call execution: process_once_calls_regular, process_once_calls_multicall,
+//! process_factory_once_calls, process_factory_once_calls_multicall.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -12,7 +11,8 @@ use parquet::file::properties::WriterProperties;
 
 use super::event_triggers::encode_once_call_params;
 use super::multicall::{
-    execute_multicalls_generic, BlockMulticall, MulticallSlotGeneric, OnceCallMeta,
+    execute_multicalls_generic, BlockMulticall, FactoryOnceSlotMeta, MulticallSlotGeneric,
+    OnceCallMeta,
 };
 use super::parquet_io::{
     extract_addresses_from_once_parquet, extract_existing_results_from_parquet, find_null_entries,
@@ -284,26 +284,18 @@ pub(crate) async fn process_once_calls_regular(
                 let merged =
                     merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
 
-                // NOTE: This File::create -> ArrowWriter is wrapped in spawn_blocking
-                // for consistency with other write paths
-                let output_path_clone = output_path.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), EthCallCollectionError> {
-                    let file = File::create(&output_path_clone)?;
-                    let props = WriterProperties::builder()
-                        .set_compression(parquet::basic::Compression::SNAPPY)
-                        .build();
-                    let mut writer = ArrowWriter::try_new(file, merged.schema(), Some(props))?;
-                    writer.write(&merged)?;
-                    writer.close()?;
-                    Ok(())
-                })
-                .await
-                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+                let file = File::create(&output_path)?;
+                let props = WriterProperties::builder()
+                    .set_compression(parquet::basic::Compression::SNAPPY)
+                    .build();
+                let mut writer = ArrowWriter::try_new(file, merged.schema(), Some(props))?;
+                writer.write(&merged)?;
+                writer.close()?;
 
                 tracing::info!(
                     "Merged {} new + {} patched once columns into {} for {}",
                     missing_fn_names.len(),
-                    null_entries.len(),
+                    patch_fn_names.len(),
                     output_path.display(),
                     contract_name
                 );
@@ -1221,15 +1213,6 @@ pub(crate) async fn process_factory_once_calls_multicall(
     multicall3_address: Address,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all calls across all collections into one multicall
-    #[derive(Clone)]
-    struct FactoryOnceSlotMeta {
-        collection_name: String,
-        function_name: String,
-        address: Address,
-        block_number: u64,
-        block_timestamp: u64,
-    }
-
     let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
     let mut collections_to_process: Vec<FactoryContractProcessingInfo> = Vec::new();
 
