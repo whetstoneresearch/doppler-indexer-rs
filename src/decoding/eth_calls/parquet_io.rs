@@ -23,6 +23,25 @@ use super::types::{
 use crate::types::config::eth_call::EvmType;
 use crate::types::decoded::DecodedValue;
 
+/// Build an Arrow array from an iterator that yields `Option<T>` values for simple types.
+///
+/// Works for both record-based and value-based builders. The caller provides:
+/// - `$iter`: an iterator expression yielding items
+/// - `$pat`: pattern to match each item
+/// - `$extract`: expression to evaluate when the pattern matches (yields `Some(...)`)
+/// - `$array_type`: the Arrow array type to collect into
+macro_rules! build_typed_array {
+    ($iter:expr, $pat:pat => $extract:expr, $array_type:ty) => {{
+        let arr: $array_type = $iter
+            .map(|item| match item {
+                $pat => Some($extract),
+                _ => None,
+            })
+            .collect();
+        Ok(Arc::new(arr))
+    }};
+}
+
 pub(super) fn write_decoded_calls_to_parquet(
     records: &[DecodedCallRecord],
     output_type: &EvmType,
@@ -234,16 +253,11 @@ pub(super) fn build_event_value_array(
                 Ok(Arc::new(arr))
             }
         }
-        EvmType::Uint8 => {
-            let arr: UInt8Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Uint8(v) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Uint8 => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::Uint8(v) => *v,
+            UInt8Array
+        ),
         EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
@@ -292,16 +306,11 @@ pub(super) fn build_event_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int8 => {
-            let arr: Int8Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Int8(v) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Int8 => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::Int8(v) => *v,
+            Int8Array
+        ),
         EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
@@ -346,16 +355,11 @@ pub(super) fn build_event_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Bool => {
-            let arr: BooleanArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Bool(v) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Bool => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::Bool(v) => *v,
+            BooleanArray
+        ),
         EvmType::Bytes32 => {
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
@@ -369,16 +373,11 @@ pub(super) fn build_event_value_array(
                 Ok(Arc::new(arr))
             }
         }
-        EvmType::String => {
-            let arr: StringArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::String(s) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::String => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::String(s) => s.as_str(),
+            StringArray
+        ),
         EvmType::Bytes => {
             let arr: BinaryArray = records
                 .iter()
@@ -643,16 +642,11 @@ fn build_array_from_decoded_values(
                 Ok(Arc::new(arr))
             }
         }
-        EvmType::Uint8 => {
-            let arr: UInt8Array = values
-                .iter()
-                .map(|opt| match opt {
-                    Some(DecodedValue::Uint8(v)) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Uint8 => build_typed_array!(
+            values.iter(),
+            Some(DecodedValue::Uint8(v)) => *v,
+            UInt8Array
+        ),
         EvmType::Uint64 => {
             let arr: UInt64Array = values
                 .iter()
@@ -701,16 +695,11 @@ fn build_array_from_decoded_values(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int8 => {
-            let arr: Int8Array = values
-                .iter()
-                .map(|opt| match opt {
-                    Some(DecodedValue::Int8(v)) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Int8 => build_typed_array!(
+            values.iter(),
+            Some(DecodedValue::Int8(v)) => *v,
+            Int8Array
+        ),
         EvmType::Int64 => {
             let arr: Int64Array = values
                 .iter()
@@ -755,16 +744,11 @@ fn build_array_from_decoded_values(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Bool => {
-            let arr: BooleanArray = values
-                .iter()
-                .map(|opt| match opt {
-                    Some(DecodedValue::Bool(v)) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Bool => build_typed_array!(
+            values.iter(),
+            Some(DecodedValue::Bool(v)) => *v,
+            BooleanArray
+        ),
         EvmType::Bytes32 => {
             if values.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
@@ -777,16 +761,11 @@ fn build_array_from_decoded_values(
                 Ok(Arc::new(arr))
             }
         }
-        EvmType::String => {
-            let arr: StringArray = values
-                .iter()
-                .map(|opt| match opt {
-                    Some(DecodedValue::String(s)) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::String => build_typed_array!(
+            values.iter(),
+            Some(DecodedValue::String(s)) => s.as_str(),
+            StringArray
+        ),
         EvmType::Bytes => {
             let arr: BinaryArray = values
                 .iter()
@@ -1127,16 +1106,11 @@ pub(super) fn build_value_array(
                 Ok(Arc::new(arr))
             }
         }
-        EvmType::Uint8 => {
-            let arr: UInt8Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Uint8(v) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Uint8 => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::Uint8(v) => *v,
+            UInt8Array
+        ),
         EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
@@ -1185,16 +1159,11 @@ pub(super) fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Int8 => {
-            let arr: Int8Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Int8(v) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Int8 => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::Int8(v) => *v,
+            Int8Array
+        ),
         EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
@@ -1239,16 +1208,11 @@ pub(super) fn build_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Bool => {
-            let arr: BooleanArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Bool(v) => Some(*v),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::Bool => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::Bool(v) => *v,
+            BooleanArray
+        ),
         EvmType::Bytes32 => {
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
@@ -1262,16 +1226,11 @@ pub(super) fn build_value_array(
                 Ok(Arc::new(arr))
             }
         }
-        EvmType::String => {
-            let arr: StringArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::String(s) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
+        EvmType::String => build_typed_array!(
+            records.iter().map(|r| &r.decoded_value),
+            DecodedValue::String(s) => s.as_str(),
+            StringArray
+        ),
         EvmType::Bytes => {
             let arr: BinaryArray = records
                 .iter()
