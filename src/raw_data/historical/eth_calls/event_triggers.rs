@@ -26,6 +26,13 @@ use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig};
 
+/// A trigger that was skipped because its factory address wasn't known yet.
+/// Buffered for replay when factory addresses arrive via IncrementalAddresses.
+#[derive(Debug, Clone)]
+pub struct SkippedFactoryTrigger {
+    pub trigger: EventTriggerData,
+}
+
 /// An event-triggered call matched with its config and encoded parameters,
 /// ready to be grouped by output key.
 pub(super) struct PreparedEventCall {
@@ -502,7 +509,9 @@ pub(crate) async fn process_event_triggers(
     ctx: &EthCallContext<'_>,
     range_start: u64,
     range_end: u64,
-) -> Result<(), EthCallCollectionError> {
+) -> Result<Vec<SkippedFactoryTrigger>, EthCallCollectionError> {
+    let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
+
     // Collect all configured (contract_name, function_name) pairs so we can write empty files
     // for pairs with no matching events (prevents catchup from retrying)
     let configured_pairs: HashSet<(String, String)> = event_call_configs
@@ -522,7 +531,7 @@ pub(crate) async fn process_event_triggers(
                 range_end,
             )?;
         }
-        return Ok(());
+        return Ok(skipped_factory_triggers);
     }
 
     // Group triggers by (source_name, event_signature) and then by (contract_name, function_name)
@@ -562,10 +571,12 @@ pub(crate) async fn process_event_triggers(
                         }
                         None => {
                             // No factory addresses known yet for this collection
-                            // Skip this trigger - it will be caught up later when addresses are loaded
-                            // This prevents making calls to random addresses during the race window
+                            // Buffer the trigger for replay when addresses arrive
+                            skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                trigger: trigger.clone(),
+                            });
                             tracing::debug!(
-                                "Skipping event trigger for {}: no factory addresses loaded yet (will be processed during catchup)",
+                                "Buffering event trigger for {}: no factory addresses loaded yet",
                                 config.contract_name
                             );
                             continue;
@@ -800,7 +811,7 @@ pub(crate) async fn process_event_triggers(
         }
     }
 
-    Ok(())
+    Ok(skipped_factory_triggers)
 }
 
 /// Write an empty parquet file for event-triggered calls when no events matched
@@ -840,7 +851,9 @@ pub(crate) async fn process_event_triggers_multicall(
     multicall3_address: Address,
     range_start: u64,
     range_end: u64,
-) -> Result<(), EthCallCollectionError> {
+) -> Result<Vec<SkippedFactoryTrigger>, EthCallCollectionError> {
+    let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
+
     // Collect all configured (contract_name, function_name) pairs so we can write empty files
     // for pairs with no matching events (prevents catchup from retrying)
     let configured_pairs: HashSet<(String, String)> = event_call_configs
@@ -860,7 +873,7 @@ pub(crate) async fn process_event_triggers_multicall(
                 range_end,
             )?;
         }
-        return Ok(());
+        return Ok(skipped_factory_triggers);
     }
 
     // Group triggers by (source_name, event_signature) and prepare call info
@@ -893,6 +906,15 @@ pub(crate) async fn process_event_triggers_multicall(
                             emitter
                         }
                         None => {
+                            // No factory addresses known yet for this collection
+                            // Buffer the trigger for replay when addresses arrive
+                            skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                trigger: trigger.clone(),
+                            });
+                            tracing::debug!(
+                                "Buffering event trigger for {}: no factory addresses loaded yet",
+                                config.contract_name
+                            );
                             continue;
                         }
                     }
@@ -929,7 +951,7 @@ pub(crate) async fn process_event_triggers_multicall(
     }
 
     if calls_by_output.is_empty() {
-        return Ok(());
+        return Ok(skipped_factory_triggers);
     }
 
     // Group all calls by block number for multicall batching
@@ -987,7 +1009,7 @@ pub(crate) async fn process_event_triggers_multicall(
     }
 
     if block_multicalls.is_empty() {
-        return Ok(());
+        return Ok(skipped_factory_triggers);
     }
 
     // Get min/max blocks for logging and file naming
@@ -1132,7 +1154,7 @@ pub(crate) async fn process_event_triggers_multicall(
         }
     }
 
-    Ok(())
+    Ok(skipped_factory_triggers)
 }
 
 /// Write event-triggered call results to parquet

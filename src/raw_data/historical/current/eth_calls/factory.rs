@@ -5,9 +5,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::{
-    process_factory_once_calls, process_factory_once_calls_multicall, process_factory_range,
-    process_factory_range_multicall, BlockRange, EthCallCatchupState, EthCallCollectionError,
-    EthCallContext,
+    process_event_triggers, process_event_triggers_multicall, process_factory_once_calls,
+    process_factory_once_calls_multicall, process_factory_range, process_factory_range_multicall,
+    BlockRange, EthCallCatchupState, EthCallCollectionError, EthCallContext,
 };
 use crate::raw_data::historical::factories::{FactoryAddressData, FactoryMessage};
 use crate::rpc::UnifiedRpcClient;
@@ -40,6 +40,87 @@ pub(super) async fn handle_factory_message(
                         .or_default()
                         .insert(*addr);
                 }
+            }
+
+            // Check if any buffered triggers can now proceed
+            if !state.factory_skipped_triggers.is_empty() {
+                let mut still_skipped = Vec::new();
+                let buffered = std::mem::take(&mut state.factory_skipped_triggers);
+
+                for (skipped_triggers, buf_range_start, buf_range_end) in buffered {
+                    // Check if any of the triggers' factory collections are now known
+                    let has_new_addresses = skipped_triggers.iter().any(|st| {
+                        let key = (st.trigger.source_name.clone(), st.trigger.event_signature);
+                        state
+                            .event_call_configs
+                            .get(&key)
+                            .map(|configs| {
+                                configs.iter().any(|c| {
+                                    c.is_factory
+                                        && state
+                                            .factory_addresses
+                                            .contains_key(&c.contract_name)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+
+                    if has_new_addresses {
+                        let triggers: Vec<_> = skipped_triggers
+                            .iter()
+                            .map(|st| st.trigger.clone())
+                            .collect();
+
+                        tracing::info!(
+                            "Replaying {} previously-skipped triggers for range {}-{} after factory addresses arrived",
+                            triggers.len(), buf_range_start, buf_range_end
+                        );
+
+                        let ctx = EthCallContext {
+                            client,
+                            output_dir: &state.base_output_dir,
+                            existing_files: &state.existing_files,
+                            rpc_batch_size: state.rpc_batch_size,
+                            decoder_tx,
+                            chain_name,
+                            storage_manager,
+                            s3_manifest: &state.s3_manifest,
+                        };
+
+                        let new_skipped = if let Some(multicall_addr) = state.multicall3_address {
+                            process_event_triggers_multicall(
+                                triggers,
+                                &state.event_call_configs,
+                                &state.factory_addresses,
+                                &ctx,
+                                multicall_addr,
+                                buf_range_start,
+                                buf_range_end,
+                            )
+                            .await?
+                        } else {
+                            process_event_triggers(
+                                triggers,
+                                &state.event_call_configs,
+                                &state.factory_addresses,
+                                &ctx,
+                                buf_range_start,
+                                buf_range_end,
+                            )
+                            .await?
+                        };
+
+                        if !new_skipped.is_empty() {
+                            still_skipped
+                                .push((new_skipped, buf_range_start, buf_range_end));
+                        }
+                    } else {
+                        still_skipped
+                            .push((skipped_triggers, buf_range_start, buf_range_end));
+                    }
+                }
+
+                state.factory_skipped_triggers = still_skipped;
             }
 
             // Merge into existing range_factory_data
@@ -146,6 +227,26 @@ pub(super) async fn handle_factory_message(
             }
         }
         Some(FactoryMessage::AllComplete) | None => {
+            if !state.factory_skipped_triggers.is_empty() {
+                let total: usize = state
+                    .factory_skipped_triggers
+                    .iter()
+                    .map(|(t, _, _)| t.len())
+                    .sum();
+                let collections: std::collections::HashSet<String> = state
+                    .factory_skipped_triggers
+                    .iter()
+                    .flat_map(|(triggers, _, _)| {
+                        triggers.iter().map(|t| t.trigger.source_name.clone())
+                    })
+                    .collect();
+                tracing::warn!(
+                    "Factory channel closed with {} unresolvable triggers still buffered across {} ranges. Collections: {:?}",
+                    total,
+                    state.factory_skipped_triggers.len(),
+                    collections
+                );
+            }
             tracing::debug!("eth_calls: factory channel closed");
             *factory_rx = None;
         }

@@ -54,7 +54,7 @@ pub(super) async fn handle_event_trigger_message(
                     s3_manifest: &state.s3_manifest,
                 };
 
-                if let Some(multicall_addr) = state.multicall3_address {
+                let skipped = if let Some(multicall_addr) = state.multicall3_address {
                     process_event_triggers_multicall(
                         triggers,
                         &state.event_call_configs,
@@ -64,7 +64,7 @@ pub(super) async fn handle_event_trigger_message(
                         range_start,
                         inclusive_end,
                     )
-                    .await?;
+                    .await?
                 } else {
                     process_event_triggers(
                         triggers,
@@ -74,7 +74,15 @@ pub(super) async fn handle_event_trigger_message(
                         range_start,
                         inclusive_end,
                     )
-                    .await?;
+                    .await?
+                };
+
+                if !skipped.is_empty() {
+                    tracing::info!(
+                        "Buffered {} triggers skipped due to missing factory addresses for range {}-{}",
+                        skipped.len(), range_start, inclusive_end
+                    );
+                    state.factory_skipped_triggers.push((skipped, range_start, inclusive_end));
                 }
             } else {
                 local_state.pending_event_triggers.clear();
