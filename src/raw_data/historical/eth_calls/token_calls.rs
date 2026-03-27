@@ -1,5 +1,4 @@
-//! Token pool call execution: `process_token_range` and
-//! `process_token_range_multicall`, plus the token-specific `MulticallSlot`.
+//! Token call execution: process_token_range and process_token_range_multicall.
 
 use std::collections::{HashMap, HashSet};
 
@@ -7,22 +6,15 @@ use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
 
 use super::frequency::filter_blocks_for_frequency;
-use super::multicall::{build_multicall_calldata, decode_multicall_results};
-use super::parquet_io::write_results_to_parquet;
+use super::multicall::{
+    build_multicall_calldata, decode_multicall_results, MulticallSlot, PendingTokenMulticall,
+    TokenGroupInfo,
+};
+use super::postprocessing::{finalize_regular_results, FinalizeRegularParams};
 use super::types::{
     BlockInfo, BlockRange, CallResult, EthCallCollectionError, EthCallContext, FrequencyState,
     TokenCallConfig,
 };
-use crate::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult};
-use crate::storage::upload_parquet_to_s3;
-use crate::types::config::eth_call::Frequency;
-
-/// Tracks which group and config index a multicall slot maps back to
-pub(crate) struct MulticallSlot<'a> {
-    pub(crate) group_key: (String, String), // (token_name, function_name)
-    pub(crate) config: &'a TokenCallConfig,
-    pub(crate) block: BlockInfo,
-}
 
 /// Process token pool calls using Multicall3 aggregate3 to batch all calls per block
 pub(crate) async fn process_token_range_multicall(
@@ -33,7 +25,7 @@ pub(crate) async fn process_token_range_multicall(
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
 ) -> Result<(), EthCallCollectionError> {
-    // Group configs by (token_name, function_name) — same as process_token_range
+    // Group configs by (token_name, function_name) -- same as process_token_range
     let mut grouped_configs: HashMap<(String, String), Vec<&TokenCallConfig>> = HashMap::new();
     for config in token_configs {
         grouped_configs
@@ -44,15 +36,7 @@ pub(crate) async fn process_token_range_multicall(
 
     // Determine which groups actually need processing (not already on disk)
     // and compute their filtered blocks
-    struct GroupInfo<'a> {
-        output_name: String,
-        function_name: String,
-        configs: Vec<&'a TokenCallConfig>,
-        filtered_blocks: Vec<BlockInfo>,
-        frequency: Frequency,
-    }
-
-    let mut active_groups: Vec<GroupInfo> = Vec::new();
+    let mut active_groups: Vec<TokenGroupInfo> = Vec::new();
 
     for ((token_name, function_name), configs) in &grouped_configs {
         let output_name = format!("{}_pool", token_name);
@@ -79,7 +63,7 @@ pub(crate) async fn process_token_range_multicall(
             continue;
         }
 
-        active_groups.push(GroupInfo {
+        active_groups.push(TokenGroupInfo {
             output_name,
             function_name: function_name.clone(),
             configs: configs.clone(),
@@ -117,14 +101,7 @@ pub(crate) async fn process_token_range_multicall(
         .collect();
 
     // Build per-block multicalls and track slot mappings
-    // Each "pending multicall" is one aggregate3 call for one block
-    struct PendingMulticall<'a> {
-        block_number: u64,
-        block_id: BlockId,
-        slots: Vec<MulticallSlot<'a>>,
-    }
-
-    let mut pending_multicalls: Vec<PendingMulticall> = Vec::new();
+    let mut pending_multicalls: Vec<PendingTokenMulticall> = Vec::new();
 
     for &block_number in &sorted_blocks {
         let mut sub_calls: Vec<(Address, &Bytes)> = Vec::new();
@@ -153,9 +130,9 @@ pub(crate) async fn process_token_range_multicall(
                 .input(multicall_data.into());
             let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
-            // We store the tx temporarily — we'll batch them below
+            // We store the tx temporarily -- we'll batch them below
             // But we need to associate slots with each multicall
-            pending_multicalls.push(PendingMulticall {
+            pending_multicalls.push(PendingTokenMulticall {
                 block_number,
                 block_id,
                 slots,
@@ -236,92 +213,45 @@ pub(crate) async fn process_token_range_multicall(
         }
     }
 
-    // Write parquet for each group — identical to process_token_range
+    // Write parquet for each group
     for group in &active_groups {
         let key = (group.output_name.clone(), group.function_name.clone());
         if let Some(results) = group_results.get_mut(&key) {
             results.sort_by_key(|r| (r.block_number, r.contract_address));
 
-            let result_count = results.len();
             let file_name = range.file_name("");
             let sub_dir = ctx
                 .output_dir
                 .join(&group.output_name)
                 .join(&group.function_name);
             std::fs::create_dir_all(&sub_dir)?;
-            let output_path = sub_dir.join(&file_name);
 
-            let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
-                Some(
-                    results
-                        .iter()
-                        .map(|r| DecoderEthCallResult {
-                            block_number: r.block_number,
-                            block_timestamp: r.block_timestamp,
-                            contract_address: r.contract_address,
-                            value: r.value_bytes.clone(),
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            };
+            let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
-            let results_owned = std::mem::take(results);
-            tokio::task::spawn_blocking(move || {
-                write_results_to_parquet(&results_owned, &output_path, 0)
-            })
-            .await
-            .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
-
-            let output_path_for_upload = sub_dir.join(&file_name);
-            tracing::info!(
-                "Wrote {} multicall token results to {}",
-                result_count,
-                output_path_for_upload.display()
-            );
-
-            // Upload to S3 if configured
-            if let Some(sm) = ctx.storage_manager {
-                let data_type = format!(
+            finalize_regular_results(FinalizeRegularParams {
+                results: std::mem::take(results),
+                max_params: 0, // Token calls don't have params
+                sub_dir,
+                file_name,
+                log_label: "multicall token".to_string(),
+                s3_data_type: format!(
                     "raw/eth_calls/{}/{}",
                     group.output_name, group.function_name
-                );
-                upload_parquet_to_s3(
-                    sm,
-                    &output_path_for_upload,
-                    ctx.chain_name,
-                    &data_type,
-                    range.start,
-                    range.end - 1,
-                )
-                .await
-                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
-            }
-
-            if let Some(tx) = ctx.decoder_tx {
-                if let Some(results) = decoder_results {
-                    let _ = tx
-                        .send(DecoderMessage::EthCallsReady {
-                            range_start: range.start,
-                            range_end: range.end,
-                            contract_name: group.output_name.clone(),
-                            function_name: group.function_name.clone(),
-                            results,
-                            live_mode: false,
-                            retry_transform_after_decode: false,
-                        })
-                        .await;
-                }
-            }
-
-            if let Frequency::Duration(_) = &group.frequency {
-                if let Some(last_block) = group.filtered_blocks.last() {
-                    frequency_state
-                        .last_call_times
-                        .insert(key.clone(), last_block.timestamp);
-                }
-            }
+                ),
+                chain_name: ctx.chain_name,
+                range_start: range.start,
+                range_end: range.end,
+                storage_manager: ctx.storage_manager,
+                decoder_tx: ctx.decoder_tx,
+                contract_name: group.output_name.clone(),
+                function_name: group.function_name.clone(),
+                frequency: &group.frequency,
+                frequency_state,
+                last_block_timestamp: last_ts,
+                #[cfg(feature = "bench")]
+                bench: None,
+            })
+            .await?;
         }
     }
 
@@ -437,79 +367,32 @@ pub(crate) async fn process_token_range(
 
         all_results.sort_by_key(|r| (r.block_number, r.contract_address));
 
-        let result_count = all_results.len();
         let sub_dir = ctx.output_dir.join(&output_name).join(function_name);
         std::fs::create_dir_all(&sub_dir)?;
-        let output_path = sub_dir.join(&file_name);
 
-        let decoder_results: Option<Vec<DecoderEthCallResult>> = if ctx.decoder_tx.is_some() {
-            Some(
-                all_results
-                    .iter()
-                    .map(|r| DecoderEthCallResult {
-                        block_number: r.block_number,
-                        block_timestamp: r.block_timestamp,
-                        contract_address: r.contract_address,
-                        value: r.value_bytes.clone(),
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
-        tokio::task::spawn_blocking(move || {
-            write_results_to_parquet(&all_results, &output_path, 0) // No params
+        finalize_regular_results(FinalizeRegularParams {
+            results: all_results,
+            max_params: 0, // No params
+            sub_dir,
+            file_name,
+            log_label: "token call".to_string(),
+            s3_data_type: format!("raw/eth_calls/{}/{}", output_name, function_name),
+            chain_name: ctx.chain_name,
+            range_start: range.start,
+            range_end: range.end,
+            storage_manager: ctx.storage_manager,
+            decoder_tx: ctx.decoder_tx,
+            contract_name: output_name.clone(),
+            function_name: function_name.clone(),
+            frequency,
+            frequency_state,
+            last_block_timestamp: last_ts,
+            #[cfg(feature = "bench")]
+            bench: None,
         })
-        .await
-        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
-
-        let output_path_for_upload = sub_dir.join(&file_name);
-        tracing::info!(
-            "Wrote {} token call results to {}",
-            result_count,
-            output_path_for_upload.display()
-        );
-
-        // Upload to S3 if configured
-        if let Some(sm) = ctx.storage_manager {
-            let data_type = format!("raw/eth_calls/{}/{}", output_name, function_name);
-            upload_parquet_to_s3(
-                sm,
-                &output_path_for_upload,
-                ctx.chain_name,
-                &data_type,
-                range.start,
-                range.end - 1,
-            )
-            .await
-            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
-        }
-
-        if let Some(tx) = ctx.decoder_tx {
-            if let Some(results) = decoder_results {
-                let _ = tx
-                    .send(DecoderMessage::EthCallsReady {
-                        range_start: range.start,
-                        range_end: range.end,
-                        contract_name: output_name.clone(),
-                        function_name: function_name.clone(),
-                        results,
-                        live_mode: false,
-                        retry_transform_after_decode: false,
-                    })
-                    .await;
-            }
-        }
-
-        if let Frequency::Duration(_) = frequency {
-            if let Some(last_block) = filtered_blocks.last() {
-                frequency_state.last_call_times.insert(
-                    (output_name.clone(), function_name.clone()),
-                    last_block.timestamp,
-                );
-            }
-        }
+        .await?;
     }
 
     Ok(())
