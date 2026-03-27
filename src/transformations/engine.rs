@@ -113,6 +113,29 @@ type ReadyHandler = (
     Arc<Vec<DecodedCall>>,
 );
 
+/// Discriminates between event-based and call-based handler processing.
+///
+/// Used by the unified catchup and retry logic to handle the three divergent
+/// points: trigger extraction, call dependency checking, and context construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandlerKind {
+    Event,
+    Call,
+}
+
+/// Uniform representation of a handler for catchup processing.
+///
+/// Bridges `EventHandlerInfo` and `CallHandlerInfo` so the catchup loop
+/// can iterate a single collection regardless of handler kind.
+struct CatchupHandler {
+    handler: Arc<dyn super::traits::TransformationHandler>,
+    /// (source, name) pairs — event names for Event, function names for Call.
+    triggers: Vec<(String, String)>,
+    /// Call dependencies (Event handlers only; empty for Call handlers).
+    call_deps: Vec<(String, String)>,
+    kind: HandlerKind,
+}
+
 /// The transformation engine processes decoded data and invokes handlers.
 ///
 /// Progress is tracked per handler (keyed by `handler_key()`) in the
@@ -412,34 +435,83 @@ impl TransformationEngine {
 
     /// Run catchup phase: process decoded parquet files per handler.
     pub async fn run_catchup(&self) -> Result<(), TransformationError> {
-        self.run_event_handler_catchup().await?;
-        self.run_call_handler_catchup().await?;
+        self.run_handler_catchup(HandlerKind::Event).await?;
+        self.run_handler_catchup(HandlerKind::Call).await?;
         Ok(())
     }
 
-    async fn run_event_handler_catchup(&self) -> Result<(), TransformationError> {
-        let available = self.scan_available_ranges(&self.decoded_logs_dir)?;
+    async fn run_handler_catchup(
+        &self,
+        kind: HandlerKind,
+    ) -> Result<(), TransformationError> {
+        let base_dir = match kind {
+            HandlerKind::Event => &self.decoded_logs_dir,
+            HandlerKind::Call => &self.decoded_calls_dir,
+        };
+        let kind_label = match kind {
+            HandlerKind::Event => "Event",
+            HandlerKind::Call => "Call",
+        };
+
+        let available = self.scan_available_ranges(base_dir)?;
 
         if available.is_empty() {
             tracing::info!(
-                "Event handler catchup: no parquet ranges found for chain {}",
+                "{} handler catchup: no parquet ranges found for chain {}",
+                kind_label,
                 self.chain_name
             );
             return Ok(());
         }
 
+        // Collect handler descriptors uniformly across both kinds.
+        let handlers: Vec<CatchupHandler> = match kind {
+            HandlerKind::Event => self
+                .registry
+                .unique_event_handlers()
+                .into_iter()
+                .map(|info| {
+                    let triggers: Vec<(String, String)> = info
+                        .triggers
+                        .iter()
+                        .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
+                        .collect();
+                    let call_deps = info.handler.call_dependencies();
+                    CatchupHandler {
+                        handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
+                        triggers,
+                        call_deps,
+                        kind: HandlerKind::Event,
+                    }
+                })
+                .collect(),
+            HandlerKind::Call => self
+                .registry
+                .unique_call_handlers()
+                .into_iter()
+                .map(|info| {
+                    let triggers: Vec<(String, String)> = info
+                        .triggers
+                        .iter()
+                        .map(|t| (t.source.clone(), t.function_name.clone()))
+                        .collect();
+                    CatchupHandler {
+                        handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
+                        triggers,
+                        call_deps: Vec::new(),
+                        kind: HandlerKind::Call,
+                    }
+                })
+                .collect(),
+        };
+
         let mut failed_handlers: Vec<(String, String)> = vec![];
 
-        for handler_info in self.registry.unique_event_handlers() {
-            let handler = &handler_info.handler;
+        for ch in &handlers {
+            let handler = &ch.handler;
             let handler_key = handler.handler_key();
-            let event_triggers: Vec<(String, String)> = handler_info
-                .triggers
-                .iter()
-                .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
-                .collect();
-
-            let call_deps = handler_info.handler.call_dependencies();
+            let triggers = &ch.triggers;
+            let call_deps = &ch.call_deps;
 
             let completed = self
                 .finalizer
@@ -458,11 +530,15 @@ impl TransformationEngine {
             }
 
             tracing::info!(
-                "Handler {} catchup: processing {} ranges (triggers: {:?}, call_deps: {:?})",
+                "Handler {} catchup: processing {} ranges (triggers: {:?}{})",
                 handler_key,
                 to_process.len(),
-                event_triggers,
-                call_deps
+                triggers,
+                if call_deps.is_empty() {
+                    String::new()
+                } else {
+                    format!(", call_deps: {:?}", call_deps)
+                }
             );
 
             let mut ranges_to_attempt = to_process;
@@ -486,7 +562,7 @@ impl TransformationEngine {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
 
-                // Re-scan available call ranges from filesystem each pass
+                // Re-scan available call ranges from filesystem each pass (event handlers only)
                 let available_call_ranges: Vec<HashSet<(u64, u64)>> = call_deps
                     .iter()
                     .map(|(source, func)| {
@@ -506,13 +582,21 @@ impl TransformationEngine {
                 let mut join_set: JoinSet<HandlerTaskResult> = JoinSet::new();
 
                 for (range_start, range_end) in &ranges_to_attempt {
-                    let events = self
-                        .read_decoded_events_for_triggers(*range_start, *range_end, &event_triggers)
-                        .await?;
+                    // Read primary data: events for event handlers, calls for call handlers
+                    let (events, primary_data_empty) = match ch.kind {
+                        HandlerKind::Event => {
+                            let evts = self
+                                .read_decoded_events_for_triggers(*range_start, *range_end, triggers)
+                                .await?;
+                            let evts = filter_events_by_start_block(&self.contracts, evts);
+                            let empty = evts.is_empty();
+                            (evts, empty)
+                        }
+                        HandlerKind::Call => (Vec::new(), false),
+                    };
 
-                    let events = filter_events_by_start_block(&self.contracts, events);
-
-                    if !events.is_empty() && !call_deps.is_empty() {
+                    // For event handlers: check call dependency readiness and load calls
+                    if !primary_data_empty && !call_deps.is_empty() {
                         let calls_ready = available_call_ranges
                             .iter()
                             .all(|ranges| ranges.contains(&(*range_start, *range_end)));
@@ -529,25 +613,44 @@ impl TransformationEngine {
                         }
                     }
 
-                    let calls = if !events.is_empty() && !call_deps.is_empty() {
-                        let calls = self
-                            .read_decoded_calls_for_triggers(*range_start, *range_end, &call_deps)
-                            .await?;
-                        filter_calls_by_start_block(&self.contracts, calls)
-                    } else {
-                        Vec::new()
+                    let calls = match ch.kind {
+                        HandlerKind::Event => {
+                            if !events.is_empty() && !call_deps.is_empty() {
+                                let calls = self
+                                    .read_decoded_calls_for_triggers(
+                                        *range_start,
+                                        *range_end,
+                                        call_deps,
+                                    )
+                                    .await?;
+                                filter_calls_by_start_block(&self.contracts, calls)
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        HandlerKind::Call => {
+                            let calls = self
+                                .read_decoded_calls_for_triggers(*range_start, *range_end, triggers)
+                                .await?;
+                            filter_calls_by_start_block(&self.contracts, calls)
+                        }
                     };
 
                     processed += 1;
 
-                    if !events.is_empty() {
+                    // Determine whether there is data to process
+                    let has_data = match ch.kind {
+                        HandlerKind::Event => !events.is_empty(),
+                        HandlerKind::Call => !calls.is_empty(),
+                    };
+
+                    if has_data {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
                         let handler = handler.clone();
                         let db_pool = self.db_pool.clone();
                         let handler_key = handler_key.clone();
                         let handler_name = handler.name();
                         let handler_version = handler.version();
-                        let tx_addresses = self.read_receipt_addresses(*range_start, *range_end);
                         let chain_name = self.chain_name.clone();
                         let chain_id = self.chain_id;
                         let historical = self.historical_reader.clone();
@@ -555,6 +658,15 @@ impl TransformationEngine {
                         let contracts = self.contracts.clone();
                         let rs = *range_start;
                         let re = *range_end;
+                        let handler_kind = ch.kind;
+
+                        // Event handlers get tx_addresses; call handlers pass empty map
+                        let tx_addresses = match handler_kind {
+                            HandlerKind::Event => {
+                                self.read_receipt_addresses(*range_start, *range_end)
+                            }
+                            HandlerKind::Call => HashMap::new(),
+                        };
 
                         join_set.spawn(async move {
                             let _permit = permit;
@@ -667,176 +779,6 @@ impl TransformationEngine {
 
             if handler_errored {
                 continue;
-            }
-        }
-
-        if !failed_handlers.is_empty() {
-            let msg = failed_handlers
-                .iter()
-                .map(|(k, e)| format!("{}: {}", k, e))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(TransformationError::HandlerError {
-                handler_name: "catchup".to_string(),
-                message: format!("{} handler(s) failed: {}", failed_handlers.len(), msg),
-            });
-        }
-
-        Ok(())
-    }
-
-    async fn run_call_handler_catchup(&self) -> Result<(), TransformationError> {
-        let available = self.scan_available_ranges(&self.decoded_calls_dir)?;
-
-        if available.is_empty() {
-            tracing::info!(
-                "Call handler catchup: no parquet ranges found for chain {}",
-                self.chain_name
-            );
-            return Ok(());
-        }
-
-        let mut failed_handlers: Vec<(String, String)> = vec![];
-
-        for handler_info in self.registry.unique_call_handlers() {
-            let handler = &handler_info.handler;
-            let handler_key = handler.handler_key();
-            let call_triggers: Vec<(String, String)> = handler_info
-                .triggers
-                .iter()
-                .map(|t| (t.source.clone(), t.function_name.clone()))
-                .collect();
-
-            let completed = self
-                .finalizer
-                .get_completed_ranges_for_handler(&handler_key)
-                .await?;
-
-            let to_process: Vec<_> = available
-                .iter()
-                .filter(|(start, _)| !completed.contains(start))
-                .cloned()
-                .collect();
-
-            if to_process.is_empty() {
-                tracing::info!("Handler {} catchup: already up to date", handler_key);
-                continue;
-            }
-
-            tracing::info!(
-                "Handler {} catchup: processing {} ranges (triggers: {:?})",
-                handler_key,
-                to_process.len(),
-                call_triggers
-            );
-
-            let total = to_process.len();
-            let mut processed = 0;
-
-            let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-            let mut join_set: JoinSet<HandlerTaskResult> = JoinSet::new();
-
-            for (range_start, range_end) in &to_process {
-                let calls = self
-                    .read_decoded_calls_for_triggers(*range_start, *range_end, &call_triggers)
-                    .await?;
-
-                let calls = filter_calls_by_start_block(&self.contracts, calls);
-
-                processed += 1;
-
-                if !calls.is_empty() {
-                    let permit = semaphore.clone().acquire_owned().await.unwrap();
-                    let handler = handler.clone();
-                    let db_pool = self.db_pool.clone();
-                    let handler_key = handler_key.clone();
-                    let handler_name = handler.name();
-                    let handler_version = handler.version();
-                    let chain_name = self.chain_name.clone();
-                    let chain_id = self.chain_id;
-                    let historical = self.historical_reader.clone();
-                    let rpc = self.executor.rpc_client.clone();
-                    let contracts = self.contracts.clone();
-                    let rs = *range_start;
-                    let re = *range_end;
-
-                    join_set.spawn(async move {
-                        let _permit = permit;
-                        let ctx = TransformationContext::new(
-                            chain_name,
-                            chain_id,
-                            rs,
-                            re,
-                            Arc::new(Vec::new()),
-                            Arc::new(calls),
-                            HashMap::new(),
-                            historical,
-                            rpc,
-                            contracts,
-                        );
-
-                        match handler.handle(&ctx).await {
-                            Ok(ops) => {
-                                if !ops.is_empty() {
-                                    let ops =
-                                        inject_source_version(ops, handler_name, handler_version);
-                                    db_pool.execute_transaction(ops).await?;
-                                }
-                                Ok(Some((handler_key, rs, re)))
-                            }
-                            Err(e) => Err(e),
-                        }
-                    });
-                } else {
-                    self.finalizer
-                        .record_completed_range_for_handler(&handler_key, *range_start, *range_end)
-                        .await?;
-                }
-
-                if processed % 50 == 0 {
-                    tracing::info!(
-                        "Handler {} catchup progress: {}/{}",
-                        handler_key,
-                        processed,
-                        total
-                    );
-                }
-            }
-
-            let mut this_handler_errored = false;
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok(Ok(Some((hk, rs, re)))) => {
-                        self.finalizer
-                            .record_completed_range_for_handler(&hk, rs, re)
-                            .await?;
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!(
-                            "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
-                            handler_key, e
-                        );
-                        failed_handlers.push((handler_key.clone(), e.to_string()));
-                        this_handler_errored = true;
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                        failed_handlers
-                            .push((handler_key.clone(), format!("task panicked: {}", e)));
-                        this_handler_errored = true;
-                        break;
-                    }
-                }
-            }
-
-            if !this_handler_errored {
-                tracing::info!(
-                    "Handler {} catchup complete: processed {} ranges",
-                    handler_key,
-                    processed
-                );
             }
         }
 
