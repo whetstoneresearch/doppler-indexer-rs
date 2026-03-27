@@ -32,37 +32,114 @@ pub struct IndexerConfig {
 impl IndexerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let base_dir = path.parent().unwrap_or(Path::new("."));
-        let content = std::fs::read_to_string(path);
-        match content {
-            Ok(content) => {
-                let raw_config: Result<IndexerConfigRaw, _> = serde_json::from_str(&content);
-                match raw_config {
-                    Ok(raw_config) => {
-                        let chains: Vec<ChainConfig> = raw_config
-                            .chains
-                            .into_iter()
-                            .map(|chain| match resolve_chain_config(chain, base_dir) {
-                                Ok(config) => config,
-                                Err(e) => panic!("Failed to resolve chain config: {}", e),
-                            })
-                            .collect();
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read config file at {}: {}", path.display(), e))?;
 
-                        Ok(IndexerConfig {
-                            chains,
-                            raw_data_collection: raw_config.raw_data_collection,
-                            transformations: raw_config.transformations,
-                            metrics: raw_config.metrics,
-                            storage: raw_config.storage,
-                        })
-                    }
-                    Err(e) => {
-                        panic!("Failed to parse config file at {}: {}", path.display(), e);
-                    }
-                }
+        let raw_config: IndexerConfigRaw = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config file at {}: {}", path.display(), e))?;
+
+        let chains: Vec<ChainConfig> = raw_config
+            .chains
+            .into_iter()
+            .map(|chain| resolve_chain_config(chain, base_dir))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(|e| anyhow::anyhow!("Failed to resolve chain config: {}", e))?;
+
+        Ok(IndexerConfig {
+            chains,
+            raw_data_collection: raw_config.raw_data_collection,
+            transformations: raw_config.transformations,
+            metrics: raw_config.metrics,
+            storage: raw_config.storage,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_load_nonexistent_file_returns_err() {
+        let result = IndexerConfig::load(Path::new("/tmp/nonexistent_config_12345.json"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to read config file"));
+    }
+
+    #[test]
+    fn test_load_invalid_json_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, "not valid json").unwrap();
+        let result = IndexerConfig::load(&path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to parse config file"));
+    }
+
+    fn raw_data_collection_json() -> &'static str {
+        r#"{
+            "fields": {
+                "block_fields": ["number", "timestamp"],
+                "receipt_fields": ["block_number"],
+                "log_fields": ["block_number", "address", "topics", "data"]
             }
-            Err(e) => {
-                panic!("Failed to read config file at {}: {}", path.display(), e);
-            }
-        }
+        }"#
+    }
+
+    #[test]
+    fn test_load_valid_config_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let config_json = format!(
+            r#"{{
+                "chains": [
+                    {{
+                        "name": "test",
+                        "chain_id": 1,
+                        "rpc_url_env_var": "RPC_URL",
+                        "contracts": {{}},
+                        "tokens": {{}},
+                        "block_receipts_method": "eth_getBlockReceipts"
+                    }}
+                ],
+                "raw_data_collection": {}
+            }}"#,
+            raw_data_collection_json()
+        );
+        let path = dir.path().join("config.json");
+        fs::write(&path, config_json).unwrap();
+        let result = IndexerConfig::load(&path);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.chains.len(), 1);
+        assert_eq!(config.chains[0].name, "test");
+    }
+
+    #[test]
+    fn test_load_config_with_bad_chain_path_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let config_json = format!(
+            r#"{{
+                "chains": [
+                    {{
+                        "name": "test",
+                        "chain_id": 1,
+                        "rpc_url_env_var": "RPC_URL",
+                        "contracts": "nonexistent/contracts.json",
+                        "tokens": {{}},
+                        "block_receipts_method": "eth_getBlockReceipts"
+                    }}
+                ],
+                "raw_data_collection": {}
+            }}"#,
+            raw_data_collection_json()
+        );
+        let path = dir.path().join("config.json");
+        fs::write(&path, config_json).unwrap();
+        let result = IndexerConfig::load(&path);
+        assert!(result.is_err());
     }
 }

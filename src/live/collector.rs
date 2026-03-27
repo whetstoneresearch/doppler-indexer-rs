@@ -744,7 +744,8 @@ impl LiveCollector {
         let method_name = self
             .chain
             .block_receipts_method
-            .as_deref()
+            .as_ref()
+            .map(|m| m.as_str())
             .unwrap_or("eth_getBlockReceipts");
 
         let receipts = self

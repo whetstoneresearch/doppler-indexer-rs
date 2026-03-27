@@ -204,7 +204,7 @@ pub async fn collect_receipts(
             event_matchers,
             rpc_batch_size,
             &mut metrics,
-            chain.block_receipts_method.as_deref(),
+            chain.block_receipts_method.as_ref().map(|m| m.as_str()),
             block_receipt_concurrency,
             storage_manager.as_ref(),
             &chain.name,
