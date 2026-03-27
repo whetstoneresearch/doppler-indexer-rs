@@ -108,7 +108,7 @@ pub(crate) async fn process_completed_range(
     }
 
     // Check if range exists in S3 manifest
-    if s3_manifest.is_some_and(|m| m.has_raw_logs(range.start, range.end - 1)) {
+    if s3_manifest.is_some_and(|m| m.raw_logs.has(range.start, range.end - 1)) {
         tracing::debug!(
             "Skipping logs range {}-{}: exists in S3 manifest",
             range.start,

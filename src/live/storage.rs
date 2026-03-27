@@ -45,6 +45,70 @@ pub enum StorageError {
     NotFound(u64),
 }
 
+/// Generate path, write, read, and delete methods for a bincode storage entity.
+///
+/// Two forms:
+/// - `slice`: write takes `&[T]`, read returns `Vec<T>`
+/// - `ref`: write takes `&T`, read returns `T`
+macro_rules! storage_entity {
+    // Slice variant: write_foo(block_number, &[T]), read_foo(block_number) -> Vec<T>
+    (slice $name:ident, $type:ty, $subdir:expr) => {
+        paste::paste! {
+            fn [<$name _path>](&self, block_number: u64) -> PathBuf {
+                self.base_dir.join(format!(concat!($subdir, "/{}.bin"), block_number))
+            }
+
+            pub fn [<write_ $name>](
+                &self,
+                block_number: u64,
+                data: &[$type],
+            ) -> Result<(), StorageError> {
+                write_bincode(&self.[<$name _path>](block_number), data)
+            }
+
+            pub fn [<read_ $name>](
+                &self,
+                block_number: u64,
+            ) -> Result<Vec<$type>, StorageError> {
+                read_bincode(&self.[<$name _path>](block_number))
+                    .map_err(|e| map_not_found(e, block_number))
+            }
+
+            pub fn [<delete_ $name>](&self, block_number: u64) -> Result<(), StorageError> {
+                safe_delete(&self.[<$name _path>](block_number))
+            }
+        }
+    };
+    // Ref variant: write_foo(block_number, &T), read_foo(block_number) -> T
+    (ref $name:ident, $type:ty, $subdir:expr) => {
+        paste::paste! {
+            fn [<$name _path>](&self, block_number: u64) -> PathBuf {
+                self.base_dir.join(format!(concat!($subdir, "/{}.bin"), block_number))
+            }
+
+            pub fn [<write_ $name>](
+                &self,
+                block_number: u64,
+                data: &$type,
+            ) -> Result<(), StorageError> {
+                write_bincode(&self.[<$name _path>](block_number), data)
+            }
+
+            pub fn [<read_ $name>](
+                &self,
+                block_number: u64,
+            ) -> Result<$type, StorageError> {
+                read_bincode(&self.[<$name _path>](block_number))
+                    .map_err(|e| map_not_found(e, block_number))
+            }
+
+            pub fn [<delete_ $name>](&self, block_number: u64) -> Result<(), StorageError> {
+                safe_delete(&self.[<$name _path>](block_number))
+            }
+        }
+    };
+}
+
 /// Storage manager for live mode block data.
 #[derive(Debug, Clone)]
 pub struct LiveStorage {
@@ -174,119 +238,28 @@ impl LiveStorage {
     }
 
     // =========================================================================
-    // Receipt operations
+    // Receipt operations (macro-generated)
     // =========================================================================
 
-    fn receipts_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("raw/receipts/{}.bin", block_number))
-    }
-
-    /// Write receipts for a block.
-    pub fn write_receipts(
-        &self,
-        block_number: u64,
-        receipts: &[LiveReceipt],
-    ) -> Result<(), StorageError> {
-        let path = self.receipts_path(block_number);
-        write_bincode(&path, receipts)
-    }
-
-    /// Read receipts for a block.
-    pub fn read_receipts(&self, block_number: u64) -> Result<Vec<LiveReceipt>, StorageError> {
-        let path = self.receipts_path(block_number);
-        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
-    }
-
-    /// Delete receipts for a block.
-    pub fn delete_receipts(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete(&self.receipts_path(block_number))
-    }
+    storage_entity!(slice receipts, LiveReceipt, "raw/receipts");
 
     // =========================================================================
-    // Log operations
+    // Log operations (macro-generated)
     // =========================================================================
 
-    fn logs_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir.join(format!("raw/logs/{}.bin", block_number))
-    }
-
-    /// Write logs for a block.
-    pub fn write_logs(&self, block_number: u64, logs: &[LiveLog]) -> Result<(), StorageError> {
-        let path = self.logs_path(block_number);
-        write_bincode(&path, logs)
-    }
-
-    /// Read logs for a block.
-    pub fn read_logs(&self, block_number: u64) -> Result<Vec<LiveLog>, StorageError> {
-        let path = self.logs_path(block_number);
-        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
-    }
-
-    /// Delete logs for a block.
-    pub fn delete_logs(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete(&self.logs_path(block_number))
-    }
+    storage_entity!(slice logs, LiveLog, "raw/logs");
 
     // =========================================================================
-    // Eth call operations
+    // Eth call operations (macro-generated)
     // =========================================================================
 
-    fn eth_calls_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("raw/eth_calls/{}.bin", block_number))
-    }
-
-    /// Write eth call results for a block.
-    pub fn write_eth_calls(
-        &self,
-        block_number: u64,
-        calls: &[LiveEthCall],
-    ) -> Result<(), StorageError> {
-        let path = self.eth_calls_path(block_number);
-        write_bincode(&path, calls)
-    }
-
-    /// Read eth call results for a block.
-    pub fn read_eth_calls(&self, block_number: u64) -> Result<Vec<LiveEthCall>, StorageError> {
-        let path = self.eth_calls_path(block_number);
-        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
-    }
-
-    /// Delete eth call results for a block.
-    pub fn delete_eth_calls(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete(&self.eth_calls_path(block_number))
-    }
+    storage_entity!(slice eth_calls, LiveEthCall, "raw/eth_calls");
 
     // =========================================================================
-    // Factory address operations
+    // Factory address operations (macro-generated)
     // =========================================================================
 
-    fn factories_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir
-            .join(format!("factories/{}.bin", block_number))
-    }
-
-    /// Write factory addresses for a block.
-    pub fn write_factories(
-        &self,
-        block_number: u64,
-        factories: &LiveFactoryAddresses,
-    ) -> Result<(), StorageError> {
-        let path = self.factories_path(block_number);
-        write_bincode(&path, factories)
-    }
-
-    /// Read factory addresses for a block.
-    pub fn read_factories(&self, block_number: u64) -> Result<LiveFactoryAddresses, StorageError> {
-        let path = self.factories_path(block_number);
-        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
-    }
-
-    /// Delete factory addresses for a block.
-    pub fn delete_factories(&self, block_number: u64) -> Result<(), StorageError> {
-        safe_delete(&self.factories_path(block_number))
-    }
+    storage_entity!(ref factories, LiveFactoryAddresses, "factories");
 
     /// List all block numbers with factory address files.
     pub fn list_factory_blocks(&self) -> Result<Vec<u64>, StorageError> {
@@ -625,6 +598,7 @@ impl LiveStorage {
 
     // =========================================================================
     // Snapshot operations (for reorg rollback)
+    // Manual: write_snapshots has an early-return-on-empty guard.
     // =========================================================================
 
     fn snapshots_path(&self, block_number: u64) -> PathBuf {
@@ -632,7 +606,7 @@ impl LiveStorage {
             .join(format!("snapshots/{}.bin", block_number))
     }
 
-    /// Write upsert snapshots for a block.
+    /// Write upsert snapshots for a block. No-op when the slice is empty.
     pub fn write_snapshots(
         &self,
         block_number: u64,
@@ -641,8 +615,7 @@ impl LiveStorage {
         if snapshots.is_empty() {
             return Ok(());
         }
-        let path = self.snapshots_path(block_number);
-        write_bincode(&path, snapshots)
+        write_bincode(&self.snapshots_path(block_number), snapshots)
     }
 
     /// Read upsert snapshots for a block.
@@ -650,8 +623,8 @@ impl LiveStorage {
         &self,
         block_number: u64,
     ) -> Result<Vec<LiveUpsertSnapshot>, StorageError> {
-        let path = self.snapshots_path(block_number);
-        read_bincode(&path).map_err(|e| map_not_found(e, block_number))
+        read_bincode(&self.snapshots_path(block_number))
+            .map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete upsert snapshots for a block.

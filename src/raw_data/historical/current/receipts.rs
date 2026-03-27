@@ -121,7 +121,7 @@ pub async fn collect_receipts(
                         let range = BlockRange { start: range_start, end: range_end };
                         let exists_in_s3 = s3_manifest
                             .as_ref()
-                            .is_some_and(|m| m.has_raw_receipts(range.start, range.end - 1));
+                            .is_some_and(|m| m.raw_receipts.has(range.start, range.end - 1));
                         if existing_files.contains(&range.file_name("receipts")) || exists_in_s3 {
                             // Check if range is now complete
                             let expected: HashSet<u64> = (range_start..range_end).collect();
@@ -463,7 +463,7 @@ pub async fn collect_receipts(
 
         let exists_in_s3 = s3_manifest
             .as_ref()
-            .is_some_and(|m| m.has_raw_receipts(range.start, range.end - 1));
+            .is_some_and(|m| m.raw_receipts.has(range.start, range.end - 1));
         if existing_files.contains(&range.file_name("receipts")) || exists_in_s3 {
             tracing::info!(
                 "Skipping receipts for blocks {}-{} (already exists)",

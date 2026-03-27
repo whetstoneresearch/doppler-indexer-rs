@@ -17,6 +17,57 @@ use super::s3::S3Backend;
 use super::{StorageBackend, StorageError};
 use crate::types::config::storage::SyncConfig;
 
+/// A sorted, deduplicated set of `(start, end)` block ranges.
+///
+/// Serializes transparently as `Vec<(u64, u64)>` for backward compatibility
+/// with existing S3 manifest JSON.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RangeSet(Vec<(u64, u64)>);
+
+impl RangeSet {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Check if a specific `(start, end)` range exists in the set.
+    pub fn has(&self, start: u64, end: u64) -> bool {
+        self.0.iter().any(|(s, e)| *s == start && *e == end)
+    }
+
+    /// Add a range. Duplicates are ignored and the set stays sorted by start.
+    pub fn add(&mut self, start: u64, end: u64) {
+        if !self.has(start, end) {
+            self.0.push((start, end));
+            self.0.sort_by_key(|(s, _)| *s);
+        }
+    }
+
+    /// Iterate over all ranges.
+    pub fn iter(&self) -> impl Iterator<Item = &(u64, u64)> {
+        self.0.iter()
+    }
+
+    /// Returns `true` if the set contains no ranges.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the number of ranges in the set.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a> IntoIterator for &'a RangeSet {
+    type Item = &'a (u64, u64);
+    type IntoIter = std::slice::Iter<'a, (u64, u64)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// Marker file written after each successful S3 upload.
 ///
 /// Markers are small (~100 bytes) and signal that a particular range is available.
@@ -70,20 +121,20 @@ pub struct S3Manifest {
     /// Unix timestamp when this manifest was generated
     pub generated_at: u64,
     /// Raw blocks ranges: [(start, end), ...]
-    pub raw_blocks: Vec<(u64, u64)>,
+    pub raw_blocks: RangeSet,
     /// Raw logs ranges
-    pub raw_logs: Vec<(u64, u64)>,
+    pub raw_logs: RangeSet,
     /// Raw receipts ranges
-    pub raw_receipts: Vec<(u64, u64)>,
+    pub raw_receipts: RangeSet,
     /// Raw eth_calls by contract/function: "contract/function" -> [(start, end), ...]
     #[serde(default)]
-    pub raw_eth_calls: HashMap<String, Vec<(u64, u64)>>,
+    pub raw_eth_calls: HashMap<String, RangeSet>,
     /// Decoded logs by source/event: "source/event" -> [(start, end), ...]
-    pub decoded_logs: HashMap<String, Vec<(u64, u64)>>,
+    pub decoded_logs: HashMap<String, RangeSet>,
     /// Decoded eth_calls by source/function
-    pub decoded_eth_calls: HashMap<String, Vec<(u64, u64)>>,
+    pub decoded_eth_calls: HashMap<String, RangeSet>,
     /// Factory ranges by collection name
-    pub factories: HashMap<String, Vec<(u64, u64)>>,
+    pub factories: HashMap<String, RangeSet>,
 }
 
 #[allow(dead_code)]
@@ -109,25 +160,6 @@ impl S3Manifest {
         serde_json::from_slice(bytes).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
-    /// Check if a raw blocks range exists in the manifest.
-    pub fn has_raw_blocks(&self, start: u64, end: u64) -> bool {
-        self.raw_blocks
-            .iter()
-            .any(|(s, e)| *s == start && *e == end)
-    }
-
-    /// Check if a raw logs range exists.
-    pub fn has_raw_logs(&self, start: u64, end: u64) -> bool {
-        self.raw_logs.iter().any(|(s, e)| *s == start && *e == end)
-    }
-
-    /// Check if a raw receipts range exists.
-    pub fn has_raw_receipts(&self, start: u64, end: u64) -> bool {
-        self.raw_receipts
-            .iter()
-            .any(|(s, e)| *s == start && *e == end)
-    }
-
     /// Check if a raw eth_calls range exists for a specific contract/function.
     pub fn has_raw_eth_calls_granular(
         &self,
@@ -139,8 +171,7 @@ impl S3Manifest {
         let key = format!("{}/{}", contract, func);
         self.raw_eth_calls
             .get(&key)
-            .map(|ranges| ranges.iter().any(|(s, e)| *s == start && *e == end))
-            .unwrap_or(false)
+            .is_some_and(|rs| rs.has(start, end))
     }
 
     /// Check if a decoded logs range exists for a source/event.
@@ -148,16 +179,14 @@ impl S3Manifest {
         let key = format!("{}/{}", source, event);
         self.decoded_logs
             .get(&key)
-            .map(|ranges| ranges.iter().any(|(s, e)| *s == start && *e == end))
-            .unwrap_or(false)
+            .is_some_and(|rs| rs.has(start, end))
     }
 
     /// Check if a factory range exists.
     pub fn has_factories(&self, collection: &str, start: u64, end: u64) -> bool {
         self.factories
             .get(collection)
-            .map(|ranges| ranges.iter().any(|(s, e)| *s == start && *e == end))
-            .unwrap_or(false)
+            .is_some_and(|rs| rs.has(start, end))
     }
 
     /// Check if a decoded eth_calls range exists for a source/function.
@@ -165,8 +194,7 @@ impl S3Manifest {
         let key = format!("{}/{}", source, func);
         self.decoded_eth_calls
             .get(&key)
-            .map(|ranges| ranges.iter().any(|(s, e)| *s == start && *e == end))
-            .unwrap_or(false)
+            .is_some_and(|rs| rs.has(start, end))
     }
 
     /// Return the highest block number across all raw_blocks ranges, if any.
@@ -174,67 +202,33 @@ impl S3Manifest {
         self.raw_blocks.iter().map(|(_, end)| *end).max()
     }
 
-    /// Add a raw blocks range.
-    pub fn add_raw_blocks(&mut self, start: u64, end: u64) {
-        if !self.has_raw_blocks(start, end) {
-            self.raw_blocks.push((start, end));
-            self.raw_blocks.sort_by_key(|(s, _)| *s);
-        }
-    }
-
-    /// Add a raw logs range.
-    pub fn add_raw_logs(&mut self, start: u64, end: u64) {
-        if !self.has_raw_logs(start, end) {
-            self.raw_logs.push((start, end));
-            self.raw_logs.sort_by_key(|(s, _)| *s);
-        }
-    }
-
-    /// Add a raw receipts range.
-    pub fn add_raw_receipts(&mut self, start: u64, end: u64) {
-        if !self.has_raw_receipts(start, end) {
-            self.raw_receipts.push((start, end));
-            self.raw_receipts.sort_by_key(|(s, _)| *s);
-        }
-    }
-
     /// Add a raw eth_calls range for a specific contract/function.
     pub fn add_raw_eth_calls_granular(&mut self, contract: &str, func: &str, start: u64, end: u64) {
         let key = format!("{}/{}", contract, func);
-        let ranges = self.raw_eth_calls.entry(key).or_default();
-        if !ranges.iter().any(|(s, e)| *s == start && *e == end) {
-            ranges.push((start, end));
-            ranges.sort_by_key(|(s, _)| *s);
-        }
+        self.raw_eth_calls.entry(key).or_default().add(start, end);
     }
 
     /// Add a decoded logs range.
     pub fn add_decoded_logs(&mut self, source: &str, event: &str, start: u64, end: u64) {
         let key = format!("{}/{}", source, event);
-        let ranges = self.decoded_logs.entry(key).or_default();
-        if !ranges.iter().any(|(s, e)| *s == start && *e == end) {
-            ranges.push((start, end));
-            ranges.sort_by_key(|(s, _)| *s);
-        }
+        self.decoded_logs.entry(key).or_default().add(start, end);
     }
 
     /// Add a factory range.
     pub fn add_factories(&mut self, collection: &str, start: u64, end: u64) {
-        let ranges = self.factories.entry(collection.to_string()).or_default();
-        if !ranges.iter().any(|(s, e)| *s == start && *e == end) {
-            ranges.push((start, end));
-            ranges.sort_by_key(|(s, _)| *s);
-        }
+        self.factories
+            .entry(collection.to_string())
+            .or_default()
+            .add(start, end);
     }
 
     /// Add a decoded eth_calls range.
     pub fn add_decoded_eth_calls(&mut self, source: &str, func: &str, start: u64, end: u64) {
         let key = format!("{}/{}", source, func);
-        let ranges = self.decoded_eth_calls.entry(key).or_default();
-        if !ranges.iter().any(|(s, e)| *s == start && *e == end) {
-            ranges.push((start, end));
-            ranges.sort_by_key(|(s, _)| *s);
-        }
+        self.decoded_eth_calls
+            .entry(key)
+            .or_default()
+            .add(start, end);
     }
 }
 
@@ -471,171 +465,105 @@ impl ManifestManager {
     pub async fn aggregate_markers(&self, chain: &str) -> Result<S3Manifest, StorageError> {
         let mut manifest = S3Manifest::new();
 
-        // List and parse raw block markers
-        let marker_prefix = format!("{}/markers/raw/blocks", chain);
-        self.aggregate_raw_markers(&marker_prefix, |start, end| {
-            manifest.add_raw_blocks(start, end);
+        // Raw blocks: {chain}/markers/raw/blocks/{start}_{end}.marker  (0 segments)
+        let prefix = format!("{}/markers/raw/blocks", chain);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            if segments.is_empty() {
+                manifest.raw_blocks.add(start, end);
+            }
         })
         .await?;
 
-        // List and parse raw log markers
-        let marker_prefix = format!("{}/markers/raw/logs", chain);
-        self.aggregate_raw_markers(&marker_prefix, |start, end| {
-            manifest.add_raw_logs(start, end);
+        // Raw logs: {chain}/markers/raw/logs/{start}_{end}.marker  (0 segments)
+        let prefix = format!("{}/markers/raw/logs", chain);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            if segments.is_empty() {
+                manifest.raw_logs.add(start, end);
+            }
         })
         .await?;
 
-        // List and parse raw receipt markers
-        let marker_prefix = format!("{}/markers/raw/receipts", chain);
-        self.aggregate_raw_markers(&marker_prefix, |start, end| {
-            manifest.add_raw_receipts(start, end);
+        // Raw receipts: {chain}/markers/raw/receipts/{start}_{end}.marker  (0 segments)
+        let prefix = format!("{}/markers/raw/receipts", chain);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            if segments.is_empty() {
+                manifest.raw_receipts.add(start, end);
+            }
         })
         .await?;
 
-        // Aggregate raw eth_calls: {chain}/markers/raw/eth_calls/{contract}/{function}/
-        // Also handles on_events: {chain}/markers/raw/eth_calls/{contract}/{function}/on_events/
+        // Raw eth_calls: contract/function/{start}_{end}.marker  (2 segments)
+        // Or on_events: contract/function/on_events/{start}_{end}.marker  (3 segments)
         let prefix = format!("{}/markers/raw/eth_calls", chain);
-        self.aggregate_eth_call_markers(&prefix, &mut |contract, func, start, end| {
-            manifest.add_raw_eth_calls_granular(contract, func, start, end);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            match segments.len() {
+                2 => manifest.add_raw_eth_calls_granular(segments[0], segments[1], start, end),
+                3 if segments[2] == "on_events" => {
+                    let combined = format!("{}/on_events", segments[1]);
+                    manifest.add_raw_eth_calls_granular(segments[0], &combined, start, end);
+                }
+                _ => {}
+            }
         })
         .await?;
 
-        // Aggregate decoded logs: {chain}/markers/decoded/logs/{source}/{event}/
+        // Decoded logs: source/event/{start}_{end}.marker  (2 segments)
         let prefix = format!("{}/markers/decoded/logs", chain);
-        self.aggregate_nested_markers(&prefix, &mut |source, event, start, end| {
-            manifest.add_decoded_logs(source, event, start, end);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            if segments.len() == 2 {
+                manifest.add_decoded_logs(segments[0], segments[1], start, end);
+            }
         })
         .await?;
 
-        // Aggregate decoded eth_calls: {chain}/markers/decoded/eth_calls/{source}/{fn}/
+        // Decoded eth_calls: source/function/{start}_{end}.marker  (2 segments)
         let prefix = format!("{}/markers/decoded/eth_calls", chain);
-        self.aggregate_nested_markers(&prefix, &mut |source, func, start, end| {
-            manifest.add_decoded_eth_calls(source, func, start, end);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            if segments.len() == 2 {
+                manifest.add_decoded_eth_calls(segments[0], segments[1], start, end);
+            }
         })
         .await?;
 
-        // Aggregate factories: {chain}/markers/factories/{collection}/
+        // Factories: collection/{start}_{end}.marker  (1 segment)
         let prefix = format!("{}/markers/factories", chain);
-        self.aggregate_factory_markers(&prefix, &mut |collection, start, end| {
-            manifest.add_factories(collection, start, end);
+        self.aggregate_markers_generic(&prefix, |segments, start, end| {
+            if segments.len() == 1 {
+                manifest.add_factories(segments[0], start, end);
+            }
         })
         .await?;
 
         Ok(manifest)
     }
 
-    /// Helper to aggregate markers for a single data type.
+    /// Generic helper to list S3 markers under a prefix and invoke a callback
+    /// with the parsed path segments (excluding the marker filename) and the
+    /// `(start, end)` range extracted from the filename.
     ///
-    /// Lists all entries under the prefix and parses marker filenames directly.
-    /// The S3 list call returns flat relative paths like "0_999.marker".
-    async fn aggregate_raw_markers<F>(
+    /// The callback receives `(&[&str], u64, u64)` where the slice contains the
+    /// path segments between the prefix and the marker file.  Each aggregation
+    /// call-site filters on the expected segment count and extracts names as
+    /// needed, keeping the S3-list + parse logic in one place.
+    async fn aggregate_markers_generic<F>(
         &self,
         prefix: &str,
-        mut add_fn: F,
+        mut on_marker: F,
     ) -> Result<(), StorageError>
     where
-        F: FnMut(u64, u64),
-    {
-        let markers = self.s3.list(prefix).await?;
-
-        for marker_file in markers {
-            // Parse range from filename like "0_999.marker"
-            if let Some(range) = parse_marker_filename(&marker_file) {
-                add_fn(range.0, range.1);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Helper to aggregate nested markers (source/item structure like decoded logs).
-    ///
-    /// Uses a single flat list call and parses paths locally.
-    /// S3 list returns flat relative paths like "v3/Swap/0_999.marker",
-    /// which we split into source ("v3"), item ("Swap"), and marker filename.
-    async fn aggregate_nested_markers<F>(
-        &self,
-        prefix: &str,
-        add_fn: &mut F,
-    ) -> Result<(), StorageError>
-    where
-        F: FnMut(&str, &str, u64, u64),
+        F: FnMut(&[&str], u64, u64),
     {
         let all_entries = self.s3.list(prefix).await?;
         for entry in all_entries {
             let parts: Vec<&str> = entry.split('/').collect();
-            // Expect: source/item/start_end.marker
-            if parts.len() == 3 {
-                if let Some((start, end)) = parse_marker_filename(parts[2]) {
-                    add_fn(parts[0], parts[1], start, end);
-                }
+            if parts.is_empty() {
+                continue;
             }
-        }
-        Ok(())
-    }
-
-    /// Helper to aggregate factory markers (collection structure).
-    ///
-    /// Uses a single flat list call and parses paths locally.
-    /// S3 list returns flat relative paths like "poolcollection/0_999.marker",
-    /// which we split into collection name and marker filename.
-    async fn aggregate_factory_markers<F>(
-        &self,
-        prefix: &str,
-        add_fn: &mut F,
-    ) -> Result<(), StorageError>
-    where
-        F: FnMut(&str, u64, u64),
-    {
-        let all_entries = self.s3.list(prefix).await?;
-        for entry in all_entries {
-            let parts: Vec<&str> = entry.split('/').collect();
-            // Expect: collection/start_end.marker
-            if parts.len() == 2 {
-                if let Some((start, end)) = parse_marker_filename(parts[1]) {
-                    add_fn(parts[0], start, end);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Helper to aggregate eth_call markers with up to 4 levels of nesting.
-    ///
-    /// Uses a single flat list call and parses paths locally.
-    /// S3 list returns flat relative paths, which we split by '/'.
-    ///
-    /// Handles both:
-    /// - Regular (3 parts): contract/function/start_end.marker
-    /// - On events (4 parts): contract/function/on_events/start_end.marker
-    ///
-    /// Keys are formatted as "contract/function" or "contract/function/on_events".
-    async fn aggregate_eth_call_markers<F>(
-        &self,
-        prefix: &str,
-        add_fn: &mut F,
-    ) -> Result<(), StorageError>
-    where
-        F: FnMut(&str, &str, u64, u64),
-    {
-        let all_entries = self.s3.list(prefix).await?;
-        for entry in all_entries {
-            let parts: Vec<&str> = entry.split('/').collect();
-            match parts.len() {
-                // contract/function/start_end.marker
-                3 => {
-                    if let Some((start, end)) = parse_marker_filename(parts[2]) {
-                        add_fn(parts[0], parts[1], start, end);
-                    }
-                }
-                // contract/function/on_events/start_end.marker
-                4 if parts[2] == "on_events" => {
-                    if let Some((start, end)) = parse_marker_filename(parts[3]) {
-                        let combined_func = format!("{}/on_events", parts[1]);
-                        add_fn(parts[0], &combined_func, start, end);
-                    }
-                }
-                _ => {}
+            // The last segment is always the marker filename
+            let marker_filename = parts[parts.len() - 1];
+            if let Some((start, end)) = parse_marker_filename(marker_filename) {
+                let segments = &parts[..parts.len() - 1];
+                on_marker(segments, start, end);
             }
         }
         Ok(())
@@ -672,18 +600,70 @@ mod tests {
         assert_eq!(parsed.uploader, marker.uploader);
     }
 
+    // =========================================================================
+    // RangeSet tests
+    // =========================================================================
+
+    #[test]
+    fn test_range_set_has() {
+        let mut rs = RangeSet::new();
+        rs.add(0, 100);
+        assert!(rs.has(0, 100));
+        assert!(!rs.has(0, 50));
+    }
+
+    #[test]
+    fn test_range_set_add_idempotent() {
+        let mut rs = RangeSet::new();
+        rs.add(0, 100);
+        rs.add(0, 100);
+        assert_eq!(rs.len(), 1);
+    }
+
+    #[test]
+    fn test_range_set_sorted() {
+        let mut rs = RangeSet::new();
+        rs.add(200, 300);
+        rs.add(0, 100);
+        let ranges: Vec<_> = rs.iter().collect();
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges[1].0, 200);
+    }
+
+    #[test]
+    fn test_range_set_serde_roundtrip() {
+        let mut rs = RangeSet::new();
+        rs.add(0, 100);
+        rs.add(200, 300);
+        let json = serde_json::to_string(&rs).unwrap();
+        let deserialized: RangeSet = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.has(0, 100));
+        assert!(deserialized.has(200, 300));
+        // Verify it serializes as a plain array (transparent)
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.is_array());
+    }
+
+    #[test]
+    fn test_range_set_empty() {
+        let rs = RangeSet::new();
+        assert!(rs.is_empty());
+        assert_eq!(rs.len(), 0);
+        assert!(!rs.has(0, 100));
+    }
+
     #[test]
     fn test_manifest_add_ranges() {
         let mut manifest = S3Manifest::new();
 
-        manifest.add_raw_blocks(0, 999);
-        manifest.add_raw_blocks(1000, 1999);
-        manifest.add_raw_blocks(0, 999); // Duplicate
+        manifest.raw_blocks.add(0, 999);
+        manifest.raw_blocks.add(1000, 1999);
+        manifest.raw_blocks.add(0, 999); // Duplicate
 
         assert_eq!(manifest.raw_blocks.len(), 2);
-        assert!(manifest.has_raw_blocks(0, 999));
-        assert!(manifest.has_raw_blocks(1000, 1999));
-        assert!(!manifest.has_raw_blocks(2000, 2999));
+        assert!(manifest.raw_blocks.has(0, 999));
+        assert!(manifest.raw_blocks.has(1000, 1999));
+        assert!(!manifest.raw_blocks.has(2000, 2999));
     }
 
     #[test]
@@ -744,8 +724,10 @@ mod tests {
 
         let mut results: Vec<(String, String, u64, u64)> = Vec::new();
         manager
-            .aggregate_nested_markers(prefix, &mut |source, item, start, end| {
-                results.push((source.to_string(), item.to_string(), start, end));
+            .aggregate_markers_generic(prefix, |segments, start, end| {
+                if segments.len() == 2 {
+                    results.push((segments[0].to_string(), segments[1].to_string(), start, end));
+                }
             })
             .await
             .unwrap();
@@ -784,8 +766,10 @@ mod tests {
 
         let mut results: Vec<(String, u64, u64)> = Vec::new();
         manager
-            .aggregate_factory_markers(prefix, &mut |collection, start, end| {
-                results.push((collection.to_string(), start, end));
+            .aggregate_markers_generic(prefix, |segments, start, end| {
+                if segments.len() == 1 {
+                    results.push((segments[0].to_string(), start, end));
+                }
             })
             .await
             .unwrap();
@@ -824,8 +808,20 @@ mod tests {
 
         let mut results: Vec<(String, String, u64, u64)> = Vec::new();
         manager
-            .aggregate_eth_call_markers(prefix, &mut |contract, func, start, end| {
-                results.push((contract.to_string(), func.to_string(), start, end));
+            .aggregate_markers_generic(prefix, |segments, start, end| {
+                match segments.len() {
+                    2 => results.push((
+                        segments[0].to_string(),
+                        segments[1].to_string(),
+                        start,
+                        end,
+                    )),
+                    3 if segments[2] == "on_events" => {
+                        let combined = format!("{}/on_events", segments[1]);
+                        results.push((segments[0].to_string(), combined, start, end));
+                    }
+                    _ => {}
+                }
             })
             .await
             .unwrap();
@@ -862,7 +858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aggregate_raw_markers_propagates_errors() {
+    async fn test_aggregate_markers_generic_propagates_errors() {
         // The InMemory store returns an empty list (not an error) for empty prefix,
         // so we test that the `?` propagation works by verifying non-error case succeeds.
         // The key behavioral change is that unwrap_or_default() is replaced with ?,
@@ -872,8 +868,10 @@ mod tests {
         // No markers written - should return Ok with empty results
         let mut results: Vec<(u64, u64)> = Vec::new();
         let result = manager
-            .aggregate_raw_markers("nonexistent/prefix", |start, end| {
-                results.push((start, end));
+            .aggregate_markers_generic("nonexistent/prefix", |segments, start, end| {
+                if segments.is_empty() {
+                    results.push((start, end));
+                }
             })
             .await;
 
@@ -944,11 +942,11 @@ mod tests {
         let manifest = manager.aggregate_markers(chain).await.unwrap();
 
         assert_eq!(manifest.raw_blocks.len(), 2);
-        assert!(manifest.has_raw_blocks(0, 999));
-        assert!(manifest.has_raw_blocks(1000, 1999));
+        assert!(manifest.raw_blocks.has(0, 999));
+        assert!(manifest.raw_blocks.has(1000, 1999));
 
         assert_eq!(manifest.raw_logs.len(), 1);
-        assert!(manifest.has_raw_logs(0, 999));
+        assert!(manifest.raw_logs.has(0, 999));
 
         assert!(manifest.has_decoded_logs("v3", "Swap", 0, 999));
         assert!(manifest.has_decoded_logs("v3", "Burn", 0, 999));
@@ -984,8 +982,8 @@ mod tests {
 
         let manifest = cached.unwrap();
         assert_eq!(manifest.raw_blocks.len(), 2);
-        assert!(manifest.has_raw_blocks(0, 999));
-        assert!(manifest.has_raw_blocks(1000, 1999));
+        assert!(manifest.raw_blocks.has(0, 999));
+        assert!(manifest.raw_blocks.has(1000, 1999));
 
         // Verify manifest.json was saved to S3
         let key = ManifestManager::manifest_key(chain);
@@ -999,15 +997,17 @@ mod tests {
         let manager = create_test_manager();
 
         let prefix = "eth/markers/decoded/logs";
-        // Correct depth (3 parts)
+        // Correct depth (2 segments: source/item)
         write_marker_at(&manager, &format!("{}/v3/Swap/0_999.marker", prefix)).await;
-        // Wrong depth (1 part - just a marker at root level)
+        // Wrong depth (0 segments - just a marker at root level)
         write_marker_at(&manager, &format!("{}/0_999.marker", prefix)).await;
 
         let mut results: Vec<(String, String, u64, u64)> = Vec::new();
         manager
-            .aggregate_nested_markers(prefix, &mut |source, item, start, end| {
-                results.push((source.to_string(), item.to_string(), start, end));
+            .aggregate_markers_generic(prefix, |segments, start, end| {
+                if segments.len() == 2 {
+                    results.push((segments[0].to_string(), segments[1].to_string(), start, end));
+                }
             })
             .await
             .unwrap();
