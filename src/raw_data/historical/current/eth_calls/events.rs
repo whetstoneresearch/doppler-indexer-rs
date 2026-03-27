@@ -82,7 +82,9 @@ pub(super) async fn handle_event_trigger_message(
                         "Buffered {} triggers skipped due to missing factory addresses for range {}-{}",
                         skipped.len(), range_start, inclusive_end
                     );
-                    state.factory_skipped_triggers.push((skipped, range_start, inclusive_end));
+                    state
+                        .factory_skipped_triggers
+                        .push((skipped, range_start, inclusive_end));
                 }
             } else {
                 local_state.pending_event_triggers.clear();

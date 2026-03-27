@@ -1253,10 +1253,7 @@ pub(crate) fn write_event_call_results_to_parquet(
     arrays.push(Arc::new(arr));
 
     // revert_reason
-    let arr: StringArray = results
-        .iter()
-        .map(|r| r.revert_reason.as_deref())
-        .collect();
+    let arr: StringArray = results.iter().map(|r| r.revert_reason.as_deref()).collect();
     arrays.push(Arc::new(arr));
 
     // param columns

@@ -199,10 +199,7 @@ pub fn validate_call_dependencies(
     // Regular periodic calls: (contract_name, function_name)
     if let Ok(call_configs) = build_call_configs(contracts) {
         for config in &call_configs {
-            available.insert((
-                config.contract_name.clone(),
-                config.function_name.clone(),
-            ));
+            available.insert((config.contract_name.clone(), config.function_name.clone()));
         }
     }
 
@@ -216,8 +213,7 @@ pub fn validate_call_dependencies(
     let factory_call_configs = get_factory_call_configs(contracts, factory_collections);
 
     // Factory once calls: (collection_name, "once")
-    let factory_once_configs =
-        build_factory_once_call_configs(&factory_call_configs, contracts);
+    let factory_once_configs = build_factory_once_call_configs(&factory_call_configs, contracts);
     for collection_name in factory_once_configs.keys() {
         available.insert((collection_name.clone(), "once".to_string()));
     }
@@ -226,10 +222,7 @@ pub fn validate_call_dependencies(
     let event_triggered_configs = build_event_triggered_call_configs(contracts);
     for configs in event_triggered_configs.values() {
         for config in configs {
-            available.insert((
-                config.contract_name.clone(),
-                config.function_name.clone(),
-            ));
+            available.insert((config.contract_name.clone(), config.function_name.clone()));
         }
     }
 
@@ -282,9 +275,7 @@ pub fn validate_call_dependencies(
         for (source, function) in &sorted_available {
             msg.push_str(&format!("    - ({}, {})\n", source, function));
         }
-        msg.push_str(
-            "\nCheck your config files to ensure all required eth_calls are configured.",
-        );
+        msg.push_str("\nCheck your config files to ensure all required eth_calls are configured.");
         panic!("{}", msg);
     }
 }
@@ -375,7 +366,10 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
             name: "test_handler",
-            triggers: vec![EventTrigger::new("TestContract", "Transfer(address,address,uint256)")],
+            triggers: vec![EventTrigger::new(
+                "TestContract",
+                "Transfer(address,address,uint256)",
+            )],
             call_deps: vec![],
         });
 
@@ -388,10 +382,10 @@ mod tests {
 
     #[test]
     fn validate_handler_with_satisfied_periodic_dep_passes() {
-        use alloy_primitives::Address;
-        use crate::types::config::contract::ContractConfig;
         use crate::types::config::contract::AddressOrAddresses;
+        use crate::types::config::contract::ContractConfig;
         use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency};
+        use alloy_primitives::Address;
 
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
@@ -444,10 +438,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "missing call dependency")]
     fn validate_handler_with_wrong_function_name_panics() {
-        use alloy_primitives::Address;
-        use crate::types::config::contract::ContractConfig;
         use crate::types::config::contract::AddressOrAddresses;
+        use crate::types::config::contract::ContractConfig;
         use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency};
+        use alloy_primitives::Address;
 
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {
@@ -482,10 +476,10 @@ mod tests {
 
     #[test]
     fn validate_handler_with_once_dep_passes() {
-        use alloy_primitives::Address;
-        use crate::types::config::contract::ContractConfig;
         use crate::types::config::contract::AddressOrAddresses;
+        use crate::types::config::contract::ContractConfig;
         use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency};
+        use alloy_primitives::Address;
 
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(MockEventHandler {

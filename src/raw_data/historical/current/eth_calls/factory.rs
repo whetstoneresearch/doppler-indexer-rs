@@ -57,9 +57,7 @@ pub(super) async fn handle_factory_message(
                             .map(|configs| {
                                 configs.iter().any(|c| {
                                     c.is_factory
-                                        && state
-                                            .factory_addresses
-                                            .contains_key(&c.contract_name)
+                                        && state.factory_addresses.contains_key(&c.contract_name)
                                 })
                             })
                             .unwrap_or(false)
@@ -111,12 +109,10 @@ pub(super) async fn handle_factory_message(
                         };
 
                         if !new_skipped.is_empty() {
-                            still_skipped
-                                .push((new_skipped, buf_range_start, buf_range_end));
+                            still_skipped.push((new_skipped, buf_range_start, buf_range_end));
                         }
                     } else {
-                        still_skipped
-                            .push((skipped_triggers, buf_range_start, buf_range_end));
+                        still_skipped.push((skipped_triggers, buf_range_start, buf_range_end));
                     }
                 }
 
