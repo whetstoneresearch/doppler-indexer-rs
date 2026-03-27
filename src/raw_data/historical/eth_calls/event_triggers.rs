@@ -27,7 +27,9 @@ use crate::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult}
 use crate::raw_data::historical::receipts::EventTriggerData;
 use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
-use crate::types::config::eth_call::{encode_call_with_params, EvmType, ParamConfig};
+use crate::types::config::eth_call::{
+    encode_call_with_params, EventFieldLocation, EvmType, ParamConfig,
+};
 
 /// A trigger that was skipped because its factory address wasn't known yet.
 /// Buffered for replay when factory addresses arrive via IncrementalAddresses.
@@ -183,82 +185,53 @@ pub(crate) fn compute_event_signature_hash(signature: &str) -> [u8; 32] {
 /// Extract a parameter value from event data (topics or data fields)
 pub(crate) fn extract_param_from_event(
     trigger: &EventTriggerData,
-    from_event: &str,
+    from_event: &EventFieldLocation,
     param_type: &EvmType,
 ) -> Result<(DynSolValue, Vec<u8>), EthCallCollectionError> {
-    let from_event = from_event.trim();
-
-    // Handle "address" - extract the event emitter address
-    if from_event == "address" {
-        // Validate that the expected type is Address
-        if !matches!(param_type, EvmType::Address) {
-            return Err(EthCallCollectionError::EventParamExtraction(format!(
-                "from_event: \"address\" requires param type to be address, got {:?}",
-                param_type
-            )));
+    match from_event {
+        EventFieldLocation::Address => {
+            // Validate that the expected type is Address
+            if !matches!(param_type, EvmType::Address) {
+                return Err(EthCallCollectionError::EventParamExtraction(format!(
+                    "from_event: \"address\" requires param type to be address, got {:?}",
+                    param_type
+                )));
+            }
+            let addr = Address::from(trigger.emitter_address);
+            let encoded = DynSolValue::Address(addr).abi_encode();
+            Ok((DynSolValue::Address(addr), encoded))
         }
-        let addr = Address::from(trigger.emitter_address);
-        let encoded = DynSolValue::Address(addr).abi_encode();
-        return Ok((DynSolValue::Address(addr), encoded));
-    }
+        EventFieldLocation::Topic(idx) => {
+            let idx = *idx;
+            if idx >= trigger.topics.len() {
+                return Err(EthCallCollectionError::EventParamExtraction(format!(
+                    "Topic index {} out of bounds (event has {} topics)",
+                    idx,
+                    trigger.topics.len()
+                )));
+            }
 
-    if let Some(rest) = from_event.strip_prefix("topics[") {
-        // Extract topic index
-        let idx_str = rest.strip_suffix(']').ok_or_else(|| {
-            EthCallCollectionError::EventParamExtraction(format!(
-                "Invalid from_event format: {}",
-                from_event
-            ))
-        })?;
-        let idx: usize = idx_str.parse().map_err(|_| {
-            EthCallCollectionError::EventParamExtraction(format!(
-                "Invalid topic index: {}",
-                idx_str
-            ))
-        })?;
-
-        if idx >= trigger.topics.len() {
-            return Err(EthCallCollectionError::EventParamExtraction(format!(
-                "Topic index {} out of bounds (event has {} topics)",
-                idx,
-                trigger.topics.len()
-            )));
+            let topic_bytes = &trigger.topics[idx];
+            extract_value_from_32_bytes(topic_bytes, param_type)
         }
+        EventFieldLocation::Data(idx) => {
+            let idx = *idx;
+            // Data is stored as 32-byte words
+            let start = idx * 32;
+            let end = start + 32;
 
-        let topic_bytes = &trigger.topics[idx];
-        extract_value_from_32_bytes(topic_bytes, param_type)
-    } else if let Some(rest) = from_event.strip_prefix("data[") {
-        // Extract data word index
-        let idx_str = rest.strip_suffix(']').ok_or_else(|| {
-            EthCallCollectionError::EventParamExtraction(format!(
-                "Invalid from_event format: {}",
-                from_event
-            ))
-        })?;
-        let idx: usize = idx_str.parse().map_err(|_| {
-            EthCallCollectionError::EventParamExtraction(format!("Invalid data index: {}", idx_str))
-        })?;
+            if end > trigger.data.len() {
+                return Err(EthCallCollectionError::EventParamExtraction(format!(
+                    "Data index {} out of bounds (event data is {} bytes)",
+                    idx,
+                    trigger.data.len()
+                )));
+            }
 
-        // Data is stored as 32-byte words
-        let start = idx * 32;
-        let end = start + 32;
-
-        if end > trigger.data.len() {
-            return Err(EthCallCollectionError::EventParamExtraction(format!(
-                "Data index {} out of bounds (event data is {} bytes)",
-                idx,
-                trigger.data.len()
-            )));
+            let mut word = [0u8; 32];
+            word.copy_from_slice(&trigger.data[start..end]);
+            extract_value_from_32_bytes(&word, param_type)
         }
-
-        let mut word = [0u8; 32];
-        word.copy_from_slice(&trigger.data[start..end]);
-        extract_value_from_32_bytes(&word, param_type)
-    } else {
-        Err(EthCallCollectionError::EventParamExtraction(format!(
-            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", or \"data[N]\")",
-            from_event
-        )))
     }
 }
 

@@ -9,6 +9,84 @@ use thiserror::Error;
 
 use crate::types::config::generic::SingleOrMultiple;
 
+/// Location within an event's data from which to extract a parameter value.
+///
+/// Supports three forms:
+/// - `"address"` - the address that emitted the event
+/// - `"topics[N]"` - topic at index N (e.g., `"topics[1]"`)
+/// - `"data[N]"` - data word at index N (e.g., `"data[0]"`)
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventFieldLocation {
+    /// The address that emitted the event
+    Address,
+    /// A specific topic by index (e.g., topics[1])
+    Topic(usize),
+    /// A specific data word by index (e.g., data[0])
+    Data(usize),
+}
+
+impl EventFieldLocation {
+    /// Convert back to the canonical string representation.
+    pub fn as_str_repr(&self) -> String {
+        match self {
+            Self::Address => "address".to_string(),
+            Self::Topic(idx) => format!("topics[{}]", idx),
+            Self::Data(idx) => format!("data[{}]", idx),
+        }
+    }
+}
+
+impl fmt::Display for EventFieldLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str_repr())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventFieldLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let s = s.trim();
+
+        if s == "address" {
+            return Ok(EventFieldLocation::Address);
+        }
+
+        if let Some(rest) = s.strip_prefix("topics[") {
+            let idx_str = rest.strip_suffix(']').ok_or_else(|| {
+                de::Error::custom(format!(
+                    "Invalid from_event format: {} (expected \"topics[N]\")",
+                    s
+                ))
+            })?;
+            let idx: usize = idx_str.parse().map_err(|_| {
+                de::Error::custom(format!("Invalid topic index in from_event: {}", idx_str))
+            })?;
+            return Ok(EventFieldLocation::Topic(idx));
+        }
+
+        if let Some(rest) = s.strip_prefix("data[") {
+            let idx_str = rest.strip_suffix(']').ok_or_else(|| {
+                de::Error::custom(format!(
+                    "Invalid from_event format: {} (expected \"data[N]\")",
+                    s
+                ))
+            })?;
+            let idx: usize = idx_str.parse().map_err(|_| {
+                de::Error::custom(format!("Invalid data index in from_event: {}", idx_str))
+            })?;
+            return Ok(EventFieldLocation::Data(idx));
+        }
+
+        Err(de::Error::custom(format!(
+            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", or \"data[N]\")",
+            s
+        )))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ParamError {
     #[error("Invalid address format: {0}")]
@@ -373,7 +451,7 @@ pub enum ParamConfig {
     FromEvent {
         #[serde(rename = "type")]
         param_type: EvmType,
-        from_event: String,
+        from_event: EventFieldLocation,
     },
     /// Self address (event emitter, for factory collections): {"type": "address", "source": "self"}
     SelfAddress {
@@ -401,9 +479,9 @@ impl ParamConfig {
         }
     }
 
-    /// Get the event field reference if this is a FromEvent param config
+    /// Get the event field location if this is a FromEvent param config
     #[allow(dead_code)]
-    pub fn event_field(&self) -> Option<&str> {
+    pub fn event_field(&self) -> Option<&EventFieldLocation> {
         match self {
             ParamConfig::FromEvent { from_event, .. } => Some(from_event),
             _ => None,
@@ -1163,7 +1241,10 @@ mod tests {
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
         assert!(param.values().is_none());
-        assert_eq!(param.event_field(), Some("topics[1]"));
+        assert_eq!(
+            param.event_field(),
+            Some(&EventFieldLocation::Topic(1))
+        );
         assert!(!param.is_self_address());
     }
 
@@ -1172,7 +1253,10 @@ mod tests {
         let json = r#"{"type": "uint256", "from_event": "data[0]"}"#;
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Uint256);
-        assert_eq!(param.event_field(), Some("data[0]"));
+        assert_eq!(
+            param.event_field(),
+            Some(&EventFieldLocation::Data(0))
+        );
     }
 
     #[test]
@@ -1204,7 +1288,10 @@ mod tests {
         assert_eq!(config.function, "balanceOf(address)");
         assert!(config.frequency.is_on_events());
         assert_eq!(config.params.len(), 1);
-        assert_eq!(config.params[0].event_field(), Some("topics[2]"));
+        assert_eq!(
+            config.params[0].event_field(),
+            Some(&EventFieldLocation::Topic(2))
+        );
     }
 
     #[test]
@@ -1521,7 +1608,7 @@ mod tests {
         let json = r#"{"type": "address", "from_event": "address"}"#;
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
-        assert_eq!(param.event_field(), Some("address"));
+        assert_eq!(param.event_field(), Some(&EventFieldLocation::Address));
         assert!(!param.is_self_address());
     }
 
@@ -1657,5 +1744,54 @@ mod tests {
             assert_eq!(fields[3].0, "farTick");
             assert_eq!(*fields[3].1, EvmType::Int24);
         }
+    }
+
+    // EventFieldLocation deserialization tests
+
+    #[test]
+    fn test_event_field_location_address() {
+        let json = r#""address""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::Address);
+    }
+
+    #[test]
+    fn test_event_field_location_topic() {
+        let json = r#""topics[1]""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::Topic(1));
+
+        let json = r#""topics[0]""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::Topic(0));
+
+        let json = r#""topics[3]""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::Topic(3));
+    }
+
+    #[test]
+    fn test_event_field_location_data() {
+        let json = r#""data[0]""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::Data(0));
+
+        let json = r#""data[5]""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::Data(5));
+    }
+
+    #[test]
+    fn test_event_field_location_invalid() {
+        let json = r#""invalid_format""#;
+        let result = serde_json::from_str::<EventFieldLocation>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_event_field_location_display() {
+        assert_eq!(EventFieldLocation::Address.as_str_repr(), "address");
+        assert_eq!(EventFieldLocation::Topic(2).as_str_repr(), "topics[2]");
+        assert_eq!(EventFieldLocation::Data(0).as_str_repr(), "data[0]");
     }
 }
