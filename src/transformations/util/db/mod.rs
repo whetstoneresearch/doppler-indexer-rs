@@ -1,3 +1,4 @@
+pub mod dhook_pool_configs;
 pub mod pool;
 pub mod token;
 pub mod transfers;
