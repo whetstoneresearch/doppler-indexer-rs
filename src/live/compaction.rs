@@ -539,10 +539,6 @@ impl CompactionService {
         records: &[(u64, u64, [u8; 20])],
         path: &PathBuf,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_timestamp", DataType::UInt64, false),
@@ -559,24 +555,15 @@ impl CompactionService {
             addresses.append_value(addr)?;
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
                 Arc::new(addresses.finish()) as ArrayRef,
             ],
-        )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        Ok(())
+        )
     }
 
     /// Get path for eth_calls parquet file.
@@ -593,10 +580,6 @@ impl CompactionService {
         calls: &[super::types::LiveEthCall],
         path: &PathBuf,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_timestamp", DataType::UInt64, false),
@@ -622,8 +605,9 @@ impl CompactionService {
             results.append_value(&call.result);
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
@@ -633,14 +617,6 @@ impl CompactionService {
                 Arc::new(results.finish()) as ArrayRef,
             ],
         )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
 
         tracing::debug!("Wrote {} eth_calls to {}", calls.len(), path.display());
 
@@ -653,10 +629,6 @@ impl CompactionService {
         blocks: &[super::types::LiveBlock],
         path: &PathBuf,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_hash", DataType::Binary, false),
@@ -676,25 +648,16 @@ impl CompactionService {
             timestamps.append_value(block.timestamp);
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(block_hashes.finish()) as ArrayRef,
                 Arc::new(parent_hashes.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
             ],
-        )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        Ok(())
+        )
     }
 
     /// Write logs to parquet file.
@@ -703,10 +666,6 @@ impl CompactionService {
         logs: &[(u64, u64, super::types::LiveLog)],
         path: &PathBuf,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_timestamp", DataType::UInt64, false),
@@ -766,8 +725,9 @@ impl CompactionService {
             datas.append_value(&log.data);
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
@@ -781,17 +741,7 @@ impl CompactionService {
                 Arc::new(topic3s.finish()) as ArrayRef,
                 Arc::new(datas.finish()) as ArrayRef,
             ],
-        )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        Ok(())
+        )
     }
 
     /// Migrate progress entries from _live_progress to _handler_progress.
@@ -942,6 +892,28 @@ impl CompactionService {
 
         Ok(())
     }
+}
+
+/// Write a RecordBatch to a Snappy-compressed parquet file.
+///
+/// Creates parent directories if needed.
+fn write_compaction_parquet(
+    path: &std::path::Path,
+    schema: Arc<Schema>,
+    columns: Vec<ArrayRef>,
+) -> Result<(), CompactionError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let batch = RecordBatch::try_new(schema, columns)?;
+    let file = std::fs::File::create(path)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(())
 }
 
 impl std::fmt::Debug for CompactionService {
