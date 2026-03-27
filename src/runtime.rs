@@ -334,6 +334,15 @@ impl ChainRuntime {
         let registry = build_registry();
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
+        // Validate that all handler call dependencies are satisfied by config
+        if transformations_enabled {
+            crate::transformations::registry::validate_call_dependencies(
+                &registry,
+                &chain.contracts,
+                &chain.factory_collections,
+            );
+        }
+
         // Setup database if transformations enabled
         let db_pool = if let Some(ref tc) = config.transformations {
             if transformations_enabled {

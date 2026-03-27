@@ -2,12 +2,18 @@
 //!
 //! The registry maintains a mapping from event/call triggers to their handlers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::traits::{
     EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler,
 };
+use crate::raw_data::historical::eth_calls::{
+    build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
+    build_once_call_configs,
+};
+use crate::raw_data::historical::factories::get_factory_call_configs;
+use crate::types::config::contract::{Contracts, FactoryCollections};
 
 /// Generic helper to deduplicate handlers by their `handler_key()`.
 ///
@@ -179,6 +185,110 @@ pub fn extract_event_name(signature: &str) -> String {
     signature.split('(').next().unwrap_or(signature).to_string()
 }
 
+/// Validate that all handler call_dependencies are satisfied by the eth_call configs.
+///
+/// Panics at startup with a descriptive message if any handler declares a
+/// `call_dependencies()` entry that is not configured for eth_call collection.
+pub fn validate_call_dependencies(
+    registry: &TransformationRegistry,
+    contracts: &Contracts,
+    factory_collections: &FactoryCollections,
+) {
+    let mut available: HashSet<(String, String)> = HashSet::new();
+
+    // Regular periodic calls: (contract_name, function_name)
+    if let Ok(call_configs) = build_call_configs(contracts) {
+        for config in &call_configs {
+            available.insert((
+                config.contract_name.clone(),
+                config.function_name.clone(),
+            ));
+        }
+    }
+
+    // Once calls: (contract_name, "once")
+    let once_configs = build_once_call_configs(contracts);
+    for contract_name in once_configs.keys() {
+        available.insert((contract_name.clone(), "once".to_string()));
+    }
+
+    // Factory call configs (needed for both factory periodic and factory once)
+    let factory_call_configs = get_factory_call_configs(contracts, factory_collections);
+
+    // Factory once calls: (collection_name, "once")
+    let factory_once_configs =
+        build_factory_once_call_configs(&factory_call_configs, contracts);
+    for collection_name in factory_once_configs.keys() {
+        available.insert((collection_name.clone(), "once".to_string()));
+    }
+
+    // Event-triggered calls: (contract_name, function_name)
+    let event_triggered_configs = build_event_triggered_call_configs(contracts);
+    for configs in event_triggered_configs.values() {
+        for config in configs {
+            available.insert((
+                config.contract_name.clone(),
+                config.function_name.clone(),
+            ));
+        }
+    }
+
+    // Factory periodic calls: (collection_name, function_name)
+    for (collection_name, configs) in &factory_call_configs {
+        for call in configs {
+            let function_name = call
+                .function
+                .split('(')
+                .next()
+                .unwrap_or(&call.function)
+                .to_string();
+            available.insert((collection_name.clone(), function_name));
+        }
+    }
+
+    // Validate each handler's call_dependencies
+    let mut all_missing: Vec<(String, Vec<(String, String)>)> = Vec::new();
+
+    for handler_info in registry.unique_event_handlers() {
+        let deps = handler_info.handler.call_dependencies();
+        if deps.is_empty() {
+            continue;
+        }
+
+        let missing: Vec<(String, String)> = deps
+            .into_iter()
+            .filter(|dep| !available.contains(dep))
+            .collect();
+
+        if !missing.is_empty() {
+            all_missing.push((handler_info.handler.handler_key(), missing));
+        }
+    }
+
+    if !all_missing.is_empty() {
+        let mut msg = String::from(
+            "missing call dependency: one or more handlers declare call_dependencies \
+             that are not configured for eth_call collection:\n",
+        );
+        for (handler_key, missing) in &all_missing {
+            msg.push_str(&format!("\n  Handler '{}':\n", handler_key));
+            for (source, function) in missing {
+                msg.push_str(&format!("    - ({}, {})\n", source, function));
+            }
+        }
+        msg.push_str("\nAvailable call configs:\n");
+        let mut sorted_available: Vec<_> = available.iter().collect();
+        sorted_available.sort();
+        for (source, function) in &sorted_available {
+            msg.push_str(&format!("    - ({}, {})\n", source, function));
+        }
+        msg.push_str(
+            "\nCheck your config files to ensure all required eth_calls are configured.",
+        );
+        panic!("{}", msg);
+    }
+}
+
 /// Build the transformation registry with all handlers.
 ///
 /// This is where handlers are registered at compile-time.
@@ -200,4 +310,211 @@ pub fn build_registry() -> TransformationRegistry {
     );
 
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbOperation;
+    use crate::transformations::context::TransformationContext;
+    use crate::transformations::error::TransformationError;
+    use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+    use async_trait::async_trait;
+
+    /// A mock event handler for testing call dependency validation.
+    struct MockEventHandler {
+        name: &'static str,
+        triggers: Vec<EventTrigger>,
+        call_deps: Vec<(String, String)>,
+    }
+
+    #[async_trait]
+    impl TransformationHandler for MockEventHandler {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &TransformationContext,
+        ) -> Result<Vec<DbOperation>, TransformationError> {
+            Ok(vec![])
+        }
+    }
+
+    impl EventHandler for MockEventHandler {
+        fn triggers(&self) -> Vec<EventTrigger> {
+            self.triggers.clone()
+        }
+
+        fn call_dependencies(&self) -> Vec<(String, String)> {
+            self.call_deps.clone()
+        }
+    }
+
+    fn empty_contracts() -> Contracts {
+        Contracts::new()
+    }
+
+    fn empty_factory_collections() -> FactoryCollections {
+        FactoryCollections::new()
+    }
+
+    #[test]
+    fn validate_empty_registry_passes() {
+        let registry = TransformationRegistry::new();
+        let contracts = empty_contracts();
+        let factory_collections = empty_factory_collections();
+
+        // Should not panic
+        validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    fn validate_handler_with_no_deps_passes() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "test_handler",
+            triggers: vec![EventTrigger::new("TestContract", "Transfer(address,address,uint256)")],
+            call_deps: vec![],
+        });
+
+        let contracts = empty_contracts();
+        let factory_collections = empty_factory_collections();
+
+        // Should not panic — no dependencies declared
+        validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    fn validate_handler_with_satisfied_periodic_dep_passes() {
+        use alloy_primitives::Address;
+        use crate::types::config::contract::ContractConfig;
+        use crate::types::config::contract::AddressOrAddresses;
+        use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency};
+
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "test_handler",
+            triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
+            call_deps: vec![("TestContract".to_string(), "getState".to_string())],
+        });
+
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "TestContract".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::ZERO),
+                start_block: None,
+                calls: Some(vec![EthCallConfig {
+                    function: "getState(address)".to_string(),
+                    output_type: EvmType::Uint256,
+                    params: vec![],
+                    frequency: Frequency::default(),
+                    target: None,
+                }]),
+                factories: None,
+                events: None,
+            },
+        );
+
+        let factory_collections = empty_factory_collections();
+
+        // Should not panic — dependency is satisfied by periodic call config
+        validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing call dependency")]
+    fn validate_handler_with_missing_dep_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "test_handler",
+            triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
+            call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
+        });
+
+        let contracts = empty_contracts();
+        let factory_collections = empty_factory_collections();
+
+        // Should panic — dependency is not configured
+        validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing call dependency")]
+    fn validate_handler_with_wrong_function_name_panics() {
+        use alloy_primitives::Address;
+        use crate::types::config::contract::ContractConfig;
+        use crate::types::config::contract::AddressOrAddresses;
+        use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency};
+
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "test_handler",
+            triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
+            call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
+        });
+
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "TestContract".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::ZERO),
+                start_block: None,
+                calls: Some(vec![EthCallConfig {
+                    function: "getState(address)".to_string(),
+                    output_type: EvmType::Uint256,
+                    params: vec![],
+                    frequency: Frequency::default(),
+                    target: None,
+                }]),
+                factories: None,
+                events: None,
+            },
+        );
+
+        let factory_collections = empty_factory_collections();
+
+        // Should panic — function name doesn't match
+        validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    fn validate_handler_with_once_dep_passes() {
+        use alloy_primitives::Address;
+        use crate::types::config::contract::ContractConfig;
+        use crate::types::config::contract::AddressOrAddresses;
+        use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency};
+
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "test_handler",
+            triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
+            call_deps: vec![("TestContract".to_string(), "once".to_string())],
+        });
+
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "TestContract".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::ZERO),
+                start_block: None,
+                calls: Some(vec![EthCallConfig {
+                    function: "decimals()".to_string(),
+                    output_type: EvmType::Uint256,
+                    params: vec![],
+                    frequency: Frequency::Once,
+                    target: None,
+                }]),
+                factories: None,
+                events: None,
+            },
+        );
+
+        let factory_collections = empty_factory_collections();
+
+        // Should not panic — once dependency is satisfied
+        validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
 }
