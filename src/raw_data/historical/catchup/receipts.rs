@@ -95,12 +95,12 @@ pub async fn collect_receipts(
         let receipts_exist = existing_files.contains(&range.file_name("receipts"))
             || s3_manifest
                 .as_ref()
-                .is_some_and(|m| m.has_raw_receipts(range.start, range.end - 1));
+                .is_some_and(|m| m.raw_receipts.has(range.start, range.end - 1));
         let logs_file_name = format!("logs_{}-{}.parquet", range.start, range.end - 1);
         let logs_exist = existing_logs_files.contains(&logs_file_name)
             || s3_manifest
                 .as_ref()
-                .is_some_and(|m| m.has_raw_logs(range.start, range.end - 1));
+                .is_some_and(|m| m.raw_logs.has(range.start, range.end - 1));
 
         // Skip if receipts and logs both exist (or logs aren't needed)
         // Factory catchup is handled separately by factories.rs reading from logs files

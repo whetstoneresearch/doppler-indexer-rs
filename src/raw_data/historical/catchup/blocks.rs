@@ -371,7 +371,7 @@ fn compute_ranges_to_fetch(
             }
             // Skip if range exists in S3 manifest
             if let Some(manifest) = s3_manifest {
-                if manifest.has_raw_blocks(range.start, range.end - 1) {
+                if manifest.raw_blocks.has(range.start, range.end - 1) {
                     tracing::debug!(
                         "Skipping blocks range {}-{}: exists in S3 manifest",
                         range.start,
