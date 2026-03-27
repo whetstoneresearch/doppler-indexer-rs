@@ -179,7 +179,7 @@ impl CompactionService {
             return;
         }
 
-        let blocks = match self.storage.list_blocks() {
+        let blocks = match self.storage.list_blocks().await {
             Ok(b) => b,
             Err(_) => return,
         };
@@ -192,7 +192,7 @@ impl CompactionService {
         for block_number in blocks {
             seen_blocks.insert(block_number);
 
-            let status = match self.storage.read_status(block_number) {
+            let status = match self.storage.read_status(block_number).await {
                 Ok(s) => s,
                 Err(_) => {
                     stuck_blocks.remove(&block_number);
@@ -258,7 +258,7 @@ impl CompactionService {
 
     /// Find ranges that are ready for compaction.
     pub async fn find_compactable_ranges(&self) -> Result<Vec<CompactableRange>, CompactionError> {
-        let blocks = self.storage.list_blocks()?;
+        let blocks = self.storage.list_blocks().await?;
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
@@ -314,7 +314,7 @@ impl CompactionService {
             let mut all_complete = true;
             for &block_number in &block_numbers {
                 // Check status file
-                if let Ok(status) = self.storage.read_status(block_number) {
+                if let Ok(status) = self.storage.read_status(block_number).await {
                     if !status.is_complete_with(&self.expectations) {
                         all_complete = false;
                         break;
@@ -333,7 +333,7 @@ impl CompactionService {
 
             if all_complete {
                 // Only compact ranges safely beyond reorg depth
-                if let Ok(Some(latest_block)) = self.storage.max_block_number() {
+                if let Ok(Some(latest_block)) = self.storage.max_block_number().await {
                     let safe_boundary = latest_block.saturating_sub(self.config.reorg_depth);
                     if range_end >= safe_boundary {
                         tracing::debug!(
@@ -363,7 +363,7 @@ impl CompactionService {
         // Read all blocks in range
         let mut blocks = Vec::new();
         for block_number in range.start..=range.end {
-            match self.storage.read_block(block_number) {
+            match self.storage.read_block(block_number).await {
                 Ok(block) => blocks.push(block),
                 Err(StorageError::NotFound(_)) => {
                     // Block was deleted during compaction (likely due to reorg), skip this range
@@ -388,7 +388,7 @@ impl CompactionService {
         // Read and write logs parquet
         let mut all_logs = Vec::new();
         for block_number in range.start..=range.end {
-            if let Ok(logs) = self.storage.read_logs(block_number) {
+            if let Ok(logs) = self.storage.read_logs(block_number).await {
                 let block = &blocks[(block_number - range.start) as usize];
                 for log in logs {
                     all_logs.push((block_number, block.timestamp, log));
@@ -407,7 +407,7 @@ impl CompactionService {
         // Factory records: (block_number, block_timestamp, address)
         let mut factory_records: HashMap<String, Vec<(u64, u64, [u8; 20])>> = HashMap::new();
         for block_number in range.start..=range.end {
-            if let Ok(factories) = self.storage.read_factories(block_number) {
+            if let Ok(factories) = self.storage.read_factories(block_number).await {
                 for (collection_name, addresses) in factories.addresses_by_collection {
                     let records = factory_records.entry(collection_name).or_default();
                     for (timestamp, addr) in addresses {
@@ -441,7 +441,7 @@ impl CompactionService {
         // Read and write eth_calls parquet
         let mut all_eth_calls = Vec::new();
         for block_number in range.start..=range.end {
-            if let Ok(calls) = self.storage.read_eth_calls(block_number) {
+            if let Ok(calls) = self.storage.read_eth_calls(block_number).await {
                 all_eth_calls.extend(calls);
             }
         }
@@ -465,7 +465,9 @@ impl CompactionService {
         // parser. For now, we just delete the decoded bincode files when compacting.
         // The historical decoder will re-decode from the raw parquet files as needed.
         // TODO: Implement full decoded data compaction in Phase 7.
-        let decoded_log_types = self.collect_decoded_log_types(range.start, range.end)?;
+        let decoded_log_types = self
+            .collect_decoded_log_types(range.start, range.end)
+            .await?;
         if !decoded_log_types.is_empty() {
             tracing::debug!(
                 "Found {} decoded log types in range {}-{}, will be re-decoded from raw parquet",
@@ -483,7 +485,7 @@ impl CompactionService {
 
         // Clean up live storage (including decoded data)
         for block_number in range.start..=range.end {
-            self.storage.delete_all(block_number)?;
+            self.storage.delete_all(block_number).await?;
         }
 
         // Clean up progress tracker
@@ -814,7 +816,7 @@ impl CompactionService {
     }
 
     /// Collect all (contract_name, event_name) pairs with decoded logs in a range.
-    fn collect_decoded_log_types(
+    async fn collect_decoded_log_types(
         &self,
         start: u64,
         end: u64,
@@ -822,7 +824,7 @@ impl CompactionService {
         let mut all_types = std::collections::HashSet::new();
 
         for block_number in start..=end {
-            if let Ok(types) = self.storage.list_decoded_log_types(block_number) {
+            if let Ok(types) = self.storage.list_decoded_log_types(block_number).await {
                 for (contract, event) in types {
                     all_types.insert((contract, event));
                 }
@@ -957,44 +959,44 @@ mod tests {
         !has_gap
     }
 
-    #[test]
-    fn test_validate_range_complete_sequential() {
+    #[tokio::test]
+    async fn test_validate_range_complete_sequential() {
         // Complete sequential range 0-9
         let blocks: Vec<u64> = (0..10).collect();
         assert!(validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_complete_shuffled() {
+    #[tokio::test]
+    async fn test_validate_range_complete_shuffled() {
         // Complete but shuffled range 0-9
         let blocks = vec![5, 2, 8, 0, 9, 3, 7, 1, 4, 6];
         assert!(validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_sparse_blocks() {
+    #[tokio::test]
+    async fn test_validate_range_sparse_blocks() {
         // Sparse blocks [0,2,4,6,8,10,12,14,16,18] - correct count but gaps
         let blocks: Vec<u64> = (0..10).map(|x| x * 2).collect();
         assert!(!validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_wrong_start() {
+    #[tokio::test]
+    async fn test_validate_range_wrong_start() {
         // Wrong start: 1-10 instead of 0-9
         let blocks: Vec<u64> = (1..11).collect();
         assert!(!validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_wrong_end() {
+    #[tokio::test]
+    async fn test_validate_range_wrong_end() {
         // Wrong end: 0-8 + 10 (missing 9)
         let mut blocks: Vec<u64> = (0..9).collect();
         blocks.push(10);
         assert!(!validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_gap_in_middle() {
+    #[tokio::test]
+    async fn test_validate_range_gap_in_middle() {
         // Gap in middle: 0-4, 6-10 (missing 5)
         let mut blocks: Vec<u64> = (0..5).collect();
         blocks.extend(6..11);
@@ -1002,22 +1004,22 @@ mod tests {
         assert!(!validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_insufficient_count() {
+    #[tokio::test]
+    async fn test_validate_range_insufficient_count() {
         // Only 5 blocks in range that needs 10
         let blocks: Vec<u64> = (0..5).collect();
         assert!(!validate_range(blocks, 0, 10));
     }
 
-    #[test]
-    fn test_validate_range_higher_offset() {
+    #[tokio::test]
+    async fn test_validate_range_higher_offset() {
         // Complete range 1000-1009
         let blocks: Vec<u64> = (1000..1010).collect();
         assert!(validate_range(blocks, 1000, 10));
     }
 
-    #[test]
-    fn test_progress_migration_value() {
+    #[tokio::test]
+    async fn test_progress_migration_value() {
         // After compacting range 0-999, the next range starts at 1000
         let _range_start: i64 = 0;
         let range_end: i64 = 999;
@@ -1036,7 +1038,7 @@ mod tests {
     async fn test_find_compactable_ranges_honors_expectations() {
         let tmp = TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
 
         for block_number in [0_u64, 1, 10] {
             storage
@@ -1047,6 +1049,7 @@ mod tests {
                     timestamp: block_number * 12,
                     tx_hashes: vec![],
                 })
+                .await
                 .unwrap();
         }
 
@@ -1057,7 +1060,7 @@ mod tests {
             status.receipts_collected = true;
             status.logs_collected = true;
             status.factories_extracted = true;
-            storage.write_status(block_number, &status).unwrap();
+            storage.write_status(block_number, &status).await.unwrap();
         }
 
         let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
@@ -1116,7 +1119,7 @@ mod tests {
     async fn test_check_for_stuck_blocks_skips_decode_incomplete_blocks() {
         let tmp = TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
 
         storage
             .write_block(&LiveBlock {
@@ -1126,6 +1129,7 @@ mod tests {
                 timestamp: 1200,
                 tx_hashes: vec![],
             })
+            .await
             .unwrap();
 
         let mut status = LiveBlockStatus::default();
@@ -1137,7 +1141,7 @@ mod tests {
         status.logs_decoded = true;
         status.eth_calls_decoded = false;
         status.transformed = false;
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
             1,
@@ -1174,7 +1178,7 @@ mod tests {
     async fn test_check_for_stuck_blocks_retries_transform_ready_blocks_after_grace() {
         let tmp = TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
 
         storage
             .write_block(&LiveBlock {
@@ -1184,6 +1188,7 @@ mod tests {
                 timestamp: 1200,
                 tx_hashes: vec![],
             })
+            .await
             .unwrap();
 
         let mut status = LiveBlockStatus::default();
@@ -1195,7 +1200,7 @@ mod tests {
         status.logs_decoded = true;
         status.eth_calls_decoded = true;
         status.transformed = false;
-        storage.write_status(101, &status).unwrap();
+        storage.write_status(101, &status).await.unwrap();
 
         let progress_tracker = Arc::new(Mutex::new(LiveProgressTracker::new(
             1,

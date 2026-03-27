@@ -83,7 +83,7 @@ pub struct LiveCollector {
 impl LiveCollector {
     /// Create a new LiveCollector.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub async fn new(
         chain: Arc<ChainConfig>,
         http_client: Arc<UnifiedRpcClient>,
         config: LiveModeConfig,
@@ -98,7 +98,7 @@ impl LiveCollector {
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
 
         // Get expected start block from storage (max block + 1)
-        let expected_start_block = match storage.max_block_number() {
+        let expected_start_block = match storage.max_block_number().await {
             Ok(Some(max)) => {
                 tracing::info!(
                     "Live storage has blocks up to {}, expecting next block to be {}",
@@ -118,7 +118,10 @@ impl LiveCollector {
         };
 
         // Seed reorg detector from existing storage on restart
-        match storage.get_recent_blocks_for_reorg(config.reorg_depth) {
+        match storage
+            .get_recent_blocks_for_reorg(config.reorg_depth)
+            .await
+        {
             Ok(recent) if !recent.is_empty() => {
                 tracing::info!(
                     "Seeding reorg detector with {} blocks from storage",
@@ -184,7 +187,7 @@ impl LiveCollector {
         transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         // Ensure storage directories exist
-        self.storage.ensure_dirs()?;
+        self.storage.ensure_dirs().await?;
 
         tracing::info!(
             "Live collector started for chain {} with reorg_depth={}",
@@ -359,9 +362,10 @@ impl LiveCollector {
         }
 
         // Store the block header
-        self.storage.write_block(&block)?;
+        self.storage.write_block(&block).await?;
         self.storage
-            .write_status(block_number, &LiveBlockStatus::collected())?;
+            .write_status(block_number, &LiveBlockStatus::collected())
+            .await?;
 
         // Fetch full block with transactions
         let full_block = self.fetch_full_block(block_number).await?;
@@ -369,12 +373,12 @@ impl LiveCollector {
         // Use the fetched block with all its transaction hashes
         let updated_block = full_block;
 
-        self.storage.write_block(&updated_block)?;
+        self.storage.write_block(&updated_block).await?;
 
         // Update status
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.block_fetched = true;
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         tracing::info!(
             "Block {} collected: {} txs",
@@ -385,8 +389,8 @@ impl LiveCollector {
         // Fetch receipts and logs
         let (receipts, logs) = self.fetch_receipts_and_logs(block_number).await?;
 
-        self.storage.write_receipts(block_number, &receipts)?;
-        self.storage.write_logs(block_number, &logs)?;
+        self.storage.write_receipts(block_number, &receipts).await?;
+        self.storage.write_logs(block_number, &logs).await?;
 
         tracing::info!(
             "Block {} receipts collected: {} logs",
@@ -400,7 +404,8 @@ impl LiveCollector {
 
         if has_factory_addresses {
             self.storage
-                .write_factories(block_number, &factory_addresses)?;
+                .write_factories(block_number, &factory_addresses)
+                .await?;
             tracing::debug!(
                 "Extracted {} factory addresses from block {}",
                 factory_addresses
@@ -413,12 +418,12 @@ impl LiveCollector {
         }
 
         // Update status
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.receipts_collected = true;
         status.logs_collected = true;
         // Factory extraction is always done at this point (even if no factories found)
         status.factories_extracted = true;
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         // Send to live message channel
         live_tx
@@ -491,9 +496,9 @@ impl LiveCollector {
 
         // If no log decoder is configured, mark logs as decoded
         if log_decoder_tx.is_none() {
-            let mut status = self.storage.read_status(block_number)?;
+            let mut status = self.storage.read_status(block_number).await?;
             status.logs_decoded = true;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.write_status(block_number, &status).await?;
         }
 
         // Collect eth_calls if configured
@@ -545,10 +550,10 @@ impl LiveCollector {
             }
         } else {
             // No eth_call collector configured - mark as collected and decoded
-            let mut status = self.storage.read_status(block_number)?;
+            let mut status = self.storage.read_status(block_number).await?;
             status.eth_calls_collected = true;
             status.eth_calls_decoded = true;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.write_status(block_number, &status).await?;
         };
 
         // If no handlers are registered, mark transformed=true
@@ -557,7 +562,8 @@ impl LiveCollector {
             tracker
                 .lock()
                 .await
-                .mark_transformed_if_no_handlers(block_number);
+                .mark_transformed_if_no_handlers(block_number)
+                .await;
         }
 
         Ok(())
@@ -593,7 +599,7 @@ impl LiveCollector {
         // Only clear progress for blocks that were successfully deleted
         let mut failed_deletions: Vec<u64> = Vec::new();
         for &orphaned_number in &event.orphaned {
-            match self.storage.delete_all(orphaned_number) {
+            match self.storage.delete_all(orphaned_number).await {
                 Ok(()) => {
                     // Only clear progress if deletion succeeded
                     if let Some(ref tracker) = self.progress_tracker {
@@ -699,7 +705,7 @@ impl LiveCollector {
         eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
-        let gaps = self.storage.find_gaps()?;
+        let gaps = self.storage.find_gaps().await?;
         if gaps.is_empty() {
             return Ok(());
         }
@@ -765,7 +771,7 @@ impl LiveCollector {
             .get_block_receipts(method_name, BlockNumberOrTag::Number(block_number))
             .await?;
 
-        let block = self.storage.read_block(block_number)?;
+        let block = self.storage.read_block(block_number).await?;
 
         let mut live_receipts = Vec::new();
         let mut all_logs = Vec::new();
@@ -931,16 +937,16 @@ impl LiveCollector {
         &mut self,
         block_number: u64,
     ) -> Result<(), CollectorError> {
-        self.storage.delete_receipts(block_number)?;
-        self.storage.delete_logs(block_number)?;
-        self.storage.delete_factories(block_number)?;
-        self.storage.delete_eth_calls(block_number)?;
-        self.storage.delete_all_decoded_logs(block_number)?;
-        self.storage.delete_all_decoded_calls(block_number)?;
-        self.storage.delete_snapshots(block_number)?;
+        self.storage.delete_receipts(block_number).await?;
+        self.storage.delete_logs(block_number).await?;
+        self.storage.delete_factories(block_number).await?;
+        self.storage.delete_eth_calls(block_number).await?;
+        self.storage.delete_all_decoded_logs(block_number).await?;
+        self.storage.delete_all_decoded_calls(block_number).await?;
+        self.storage.delete_snapshots(block_number).await?;
         self.clear_persisted_progress(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.block_fetched = false;
         status.receipts_collected = false;
         status.logs_collected = false;
@@ -952,7 +958,7 @@ impl LiveCollector {
         status.completed_handlers.clear();
         status.failed_handlers.clear();
         status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         Ok(())
     }
@@ -961,14 +967,14 @@ impl LiveCollector {
         &mut self,
         block_number: u64,
     ) -> Result<(), CollectorError> {
-        self.storage.delete_factories(block_number)?;
-        self.storage.delete_eth_calls(block_number)?;
-        self.storage.delete_all_decoded_logs(block_number)?;
-        self.storage.delete_all_decoded_calls(block_number)?;
-        self.storage.delete_snapshots(block_number)?;
+        self.storage.delete_factories(block_number).await?;
+        self.storage.delete_eth_calls(block_number).await?;
+        self.storage.delete_all_decoded_logs(block_number).await?;
+        self.storage.delete_all_decoded_calls(block_number).await?;
+        self.storage.delete_snapshots(block_number).await?;
         self.clear_persisted_progress(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.receipts_collected = false;
         status.logs_collected = false;
         status.factories_extracted = false;
@@ -979,23 +985,23 @@ impl LiveCollector {
         status.completed_handlers.clear();
         status.failed_handlers.clear();
         status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         Ok(())
     }
 
     async fn reset_eth_call_state(&mut self, block_number: u64) -> Result<(), CollectorError> {
-        self.storage.delete_eth_calls(block_number)?;
-        self.storage.delete_all_decoded_calls(block_number)?;
-        self.storage.delete_snapshots(block_number)?;
+        self.storage.delete_eth_calls(block_number).await?;
+        self.storage.delete_all_decoded_calls(block_number).await?;
+        self.storage.delete_snapshots(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.eth_calls_collected = false;
         status.eth_calls_decoded = false;
         status.transformed = false;
         status.failed_handlers.clear();
         status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         Ok(())
     }
@@ -1038,13 +1044,13 @@ impl LiveCollector {
         self.reorg_detector
             .update_block_hash(block_number, full_block.hash);
 
-        self.storage.write_block(&full_block)?;
+        self.storage.write_block(&full_block).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.collected = true;
         status.block_fetched = true;
         status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         self.resume_from_receipts_and_logs(block_number, log_decoder_tx, eth_call_decoder_tx)
             .await
@@ -1056,28 +1062,29 @@ impl LiveCollector {
         log_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
     ) -> Result<(), CollectorError> {
-        let block = self.storage.read_block(block_number)?;
+        let block = self.storage.read_block(block_number).await?;
         let (receipts, logs) = self.fetch_receipts_and_logs(block_number).await?;
 
         // Fetch succeeded — now safe to reset downstream state.
         // Harmless if already reset by reset_downstream_from_block_fetch.
         self.reset_downstream_from_logs(block_number).await?;
 
-        self.storage.write_receipts(block_number, &receipts)?;
-        self.storage.write_logs(block_number, &logs)?;
+        self.storage.write_receipts(block_number, &receipts).await?;
+        self.storage.write_logs(block_number, &logs).await?;
 
         let factory_addresses = self.extract_factory_addresses(&logs, block.timestamp);
         if !factory_addresses.addresses_by_collection.is_empty() {
             self.storage
-                .write_factories(block_number, &factory_addresses)?;
+                .write_factories(block_number, &factory_addresses)
+                .await?;
         }
 
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.receipts_collected = true;
         status.logs_collected = true;
         status.factories_extracted = true;
         status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         self.dispatch_logs_for_block(
             block_number,
@@ -1089,10 +1096,10 @@ impl LiveCollector {
         .await?;
 
         if log_decoder_tx.is_none() {
-            let mut status = self.storage.read_status(block_number)?;
+            let mut status = self.storage.read_status(block_number).await?;
             status.logs_decoded = true;
             status.apply_expectations(&self.expectations);
-            self.storage.write_status(block_number, &status)?;
+            self.storage.write_status(block_number, &status).await?;
         }
 
         // retry_transform_after_decode=false: logs were re-dispatched through the
@@ -1178,11 +1185,13 @@ impl LiveCollector {
             self.reset_eth_call_state(block_number).await?;
         }
 
-        let mut status = self.storage.read_status(block_number)?;
+        let mut status = self.storage.read_status(block_number).await?;
         status.eth_calls_collected = true;
 
         if !batch.calls.is_empty() {
-            self.storage.write_eth_calls(block_number, &batch.calls)?;
+            self.storage
+                .write_eth_calls(block_number, &batch.calls)
+                .await?;
         } else {
             status.eth_calls_decoded = true;
         }
@@ -1192,7 +1201,7 @@ impl LiveCollector {
         }
 
         status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        self.storage.write_status(block_number, &status).await?;
 
         if let Some(ref mut eth_collector) = self.eth_call_collector {
             eth_collector.apply_collected_batch(&batch);
@@ -1236,11 +1245,12 @@ impl LiveCollector {
         eth_call_decoder_tx: &Option<mpsc::Sender<DecoderMessage>>,
         retry_transform_after_decode: bool,
     ) -> Result<(), CollectorError> {
-        let block = self.storage.read_block(block_number)?;
-        let logs = self.storage.read_logs(block_number)?;
+        let block = self.storage.read_block(block_number).await?;
+        let logs = self.storage.read_logs(block_number).await?;
         let factory_addresses = self
             .storage
             .read_factories(block_number)
+            .await
             .unwrap_or_default();
 
         if self.eth_call_collector.is_some() {
@@ -1284,11 +1294,11 @@ impl LiveCollector {
                 }
             }
         } else {
-            let mut status = self.storage.read_status(block_number)?;
+            let mut status = self.storage.read_status(block_number).await?;
             status.eth_calls_collected = true;
             status.eth_calls_decoded = true;
             status.apply_expectations(&self.expectations);
-            self.storage.write_status(block_number, &status)?;
+            self.storage.write_status(block_number, &status).await?;
 
             if retry_transform_after_decode {
                 self.queue_transform_retry(block_number, None).await;
@@ -1299,7 +1309,8 @@ impl LiveCollector {
             tracker
                 .lock()
                 .await
-                .mark_transformed_if_no_handlers(block_number);
+                .mark_transformed_if_no_handlers(block_number)
+                .await;
         }
 
         Ok(())
@@ -1381,13 +1392,13 @@ impl LiveCollector {
         // Load progress from storage files for accurate catchup detection
         if let Some(ref tracker) = self.progress_tracker {
             let mut tracker = tracker.lock().await;
-            if let Err(e) = tracker.load_from_storage(&self.storage) {
+            if let Err(e) = tracker.load_from_storage(&self.storage).await {
                 tracing::warn!("Failed to load progress from storage: {}", e);
             }
         }
 
         // Scan for incomplete blocks
-        let scan_result = match catchup_service.scan_incomplete_blocks() {
+        let scan_result = match catchup_service.scan_incomplete_blocks().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Failed to scan for incomplete blocks: {}", e);
@@ -1658,8 +1669,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gap_detection_range() {
+    #[tokio::test]
+    async fn test_gap_detection_range() {
         // Last processed: 100, received: 103
         // Should backfill blocks 101, 102 (2 blocks)
         let (gap_start, gap_end) = compute_gap_range(100, 103).unwrap();
@@ -1668,8 +1679,8 @@ mod tests {
         assert_eq!(gap_end - gap_start + 1, 2);
     }
 
-    #[test]
-    fn test_gap_detection_single_block_gap() {
+    #[tokio::test]
+    async fn test_gap_detection_single_block_gap() {
         // Last processed: 100, received: 102
         // Should backfill block 101 (1 block)
         let (gap_start, gap_end) = compute_gap_range(100, 102).unwrap();
@@ -1678,16 +1689,16 @@ mod tests {
         assert_eq!(gap_end - gap_start + 1, 1);
     }
 
-    #[test]
-    fn test_gap_detection_no_gap() {
+    #[tokio::test]
+    async fn test_gap_detection_no_gap() {
         // Last processed: 100, received: 101
         // No gap - this is the expected next block
         let result = compute_gap_range(100, 101);
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_gap_detection_large_gap() {
+    #[tokio::test]
+    async fn test_gap_detection_large_gap() {
         // Last processed: 1000, received: 1010
         // Should backfill blocks 1001-1009 (9 blocks)
         let (gap_start, gap_end) = compute_gap_range(1000, 1010).unwrap();
@@ -1700,11 +1711,12 @@ mod tests {
     async fn commit_eth_call_batch_clears_old_decoded_state_before_messages_are_observable() {
         let tmp = TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().join("live"));
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
 
         let block_number = 77;
         storage
             .write_status(block_number, &LiveBlockStatus::collected())
+            .await
             .unwrap();
         storage
             .write_decoded_calls(
@@ -1718,6 +1730,7 @@ mod tests {
                     decoded_value: DecodedValue::Uint256(U256::from(1)),
                 }],
             )
+            .await
             .unwrap();
 
         let mut batch = CollectedEthCallBatch::default();
@@ -1765,12 +1778,14 @@ mod tests {
         let first_msg = decoder_rx.recv().await.unwrap();
         assert!(matches!(first_msg, DecoderMessage::EthCallsReady { .. }));
         assert!(matches!(
-            storage.read_decoded_calls(block_number, "contract", "foo"),
+            storage
+                .read_decoded_calls(block_number, "contract", "foo")
+                .await,
             Err(StorageError::NotFound(_))
         ));
-        assert_eq!(storage.read_eth_calls(block_number).unwrap().len(), 1);
+        assert_eq!(storage.read_eth_calls(block_number).await.unwrap().len(), 1);
 
-        let status = storage.read_status(block_number).unwrap();
+        let status = storage.read_status(block_number).await.unwrap();
         assert!(status.eth_calls_collected);
         assert!(!status.eth_calls_decoded);
 

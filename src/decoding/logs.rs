@@ -1122,6 +1122,7 @@ pub(crate) async fn process_logs_live(
 
         storage
             .write_decoded_logs(block_number, contract_name, event_name, &live_records)
+            .await
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
 
         tracing::debug!(
@@ -1227,9 +1228,9 @@ pub(crate) async fn process_logs_live(
     }
 
     // Update block status to mark log decoding complete
-    if let Ok(mut status) = storage.read_status(block_number) {
+    if let Ok(mut status) = storage.read_status(block_number).await {
         status.logs_decoded = true;
-        if let Err(e) = storage.write_status(block_number, &status) {
+        if let Err(e) = storage.write_status(block_number, &status).await {
             tracing::warn!("Failed to update block status after log decoding: {}", e);
         } else {
             tracing::info!("Block {} logs decoded", block_number);
@@ -1257,13 +1258,14 @@ pub(crate) async fn process_logs_live(
 }
 
 /// Delete decoded log data for orphaned blocks (reorg cleanup).
-pub(crate) fn delete_decoded_logs_for_blocks(
+pub(crate) async fn delete_decoded_logs_for_blocks(
     storage: &LiveStorage,
     blocks: &[u64],
 ) -> Result<(), LogDecodingError> {
     for &block_number in blocks {
         storage
             .delete_all_decoded_logs(block_number)
+            .await
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
     }
     Ok(())

@@ -1535,7 +1535,8 @@ async fn spawn_live_mode(
         db_pool.clone(),
         live_expectations,
         live_channels.transform_retry_tx.clone(),
-    );
+    )
+    .await;
     tasks.spawn(async move {
         collector
             .run(

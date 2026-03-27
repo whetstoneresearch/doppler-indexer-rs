@@ -282,11 +282,12 @@ mod tests {
         format!("{}-{}", prefix, rand::random::<u64>())
     }
 
-    fn seed_live_status(chain_name: &str, block_number: u64) -> LiveStorage {
+    async fn seed_live_status(chain_name: &str, block_number: u64) -> LiveStorage {
         let storage = LiveStorage::new(chain_name);
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
         storage
             .write_status(block_number, &LiveBlockStatus::collected())
+            .await
             .unwrap();
         storage
     }
@@ -435,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_regular_calls_persist_without_forwarding_transforms() {
         let chain_name = unique_chain_name("deferred-regular");
-        let storage = seed_live_status(&chain_name, 42);
+        let storage = seed_live_status(&chain_name, 42).await;
         let temp = TempDir::new().unwrap();
         let (decoder_tx, decoder_rx) = mpsc::channel(8);
         let (transform_tx, mut transform_rx) = mpsc::channel::<DecodedCallsMessage>(8);
@@ -495,7 +496,10 @@ mod tests {
 
         handle.await.unwrap().unwrap();
 
-        let decoded = storage.read_decoded_calls(42, "contract", "foo").unwrap();
+        let decoded = storage
+            .read_decoded_calls(42, "contract", "foo")
+            .await
+            .unwrap();
         assert_eq!(decoded.len(), 1);
         assert!(matches!(
             decoded[0].decoded_value,
@@ -508,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_once_calls_persist_without_forwarding_transforms() {
         let chain_name = unique_chain_name("deferred-once");
-        let storage = seed_live_status(&chain_name, 51);
+        let storage = seed_live_status(&chain_name, 51).await;
         let temp = TempDir::new().unwrap();
         let (decoder_tx, decoder_rx) = mpsc::channel(8);
         let (transform_tx, mut transform_rx) = mpsc::channel::<DecodedCallsMessage>(8);
@@ -564,7 +568,10 @@ mod tests {
 
         handle.await.unwrap().unwrap();
 
-        let decoded = storage.read_decoded_once_calls(51, "factory").unwrap();
+        let decoded = storage
+            .read_decoded_once_calls(51, "factory")
+            .await
+            .unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].decoded_values.len(), 1);
         assert_eq!(decoded[0].decoded_values[0].0, "once");
@@ -579,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_event_calls_persist_without_forwarding_transforms() {
         let chain_name = unique_chain_name("deferred-event");
-        let storage = seed_live_status(&chain_name, 61);
+        let storage = seed_live_status(&chain_name, 61).await;
         let temp = TempDir::new().unwrap();
         let (decoder_tx, decoder_rx) = mpsc::channel(8);
         let (transform_tx, mut transform_rx) = mpsc::channel::<DecodedCallsMessage>(8);
@@ -640,6 +647,7 @@ mod tests {
 
         let decoded = storage
             .read_decoded_event_calls(61, "contract", "bar")
+            .await
             .unwrap();
         assert_eq!(decoded.len(), 1);
         assert!(matches!(
@@ -653,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn non_deferred_regular_calls_still_forward_transforms() {
         let chain_name = unique_chain_name("nondeferred-regular");
-        let storage = seed_live_status(&chain_name, 71);
+        let storage = seed_live_status(&chain_name, 71).await;
         let temp = TempDir::new().unwrap();
         let (decoder_tx, decoder_rx) = mpsc::channel(8);
         let (transform_tx, mut transform_rx) = mpsc::channel::<DecodedCallsMessage>(8);
@@ -711,7 +719,10 @@ mod tests {
 
         handle.await.unwrap().unwrap();
 
-        let decoded = storage.read_decoded_calls(71, "contract", "foo").unwrap();
+        let decoded = storage
+            .read_decoded_calls(71, "contract", "foo")
+            .await
+            .unwrap();
         assert_eq!(decoded.len(), 1);
         cleanup_chain_storage(&chain_name);
     }

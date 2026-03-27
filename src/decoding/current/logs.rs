@@ -16,7 +16,7 @@ use crate::storage::parquet_readers::read_factory_addresses_from_parquet;
 ///
 /// This loads all known factory addresses discovered so far, so they can be used
 /// for decoding logs from any block, not just the block where they were discovered.
-fn load_accumulated_factory_addresses(
+async fn load_accumulated_factory_addresses(
     chain_name: &str,
 ) -> Result<HashMap<String, HashSet<[u8; 20]>>, LogDecodingError> {
     let mut result: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
@@ -64,9 +64,9 @@ fn load_accumulated_factory_addresses(
 
     // 2. Load from uncompacted bincode files: data/{chain}/live/factories/{block}.bin
     let live_storage = LiveStorage::new(chain_name);
-    if let Ok(factory_blocks) = live_storage.list_factory_blocks() {
+    if let Ok(factory_blocks) = live_storage.list_factory_blocks().await {
         for block_number in factory_blocks {
-            if let Ok(live_factories) = live_storage.read_factories(block_number) {
+            if let Ok(live_factories) = live_storage.read_factories(block_number).await {
                 for (collection_name, addresses) in live_factories.addresses_by_collection {
                     let addrs: HashSet<[u8; 20]> =
                         addresses.into_iter().map(|(_, addr)| addr).collect();
@@ -98,7 +98,7 @@ pub async fn decode_logs_live(
     outputs: &LogDecoderOutputs<'_>,
 ) -> Result<(), LogDecodingError> {
     // Load accumulated factory addresses from parquet and bincode files
-    let mut accumulated_factory_addresses = load_accumulated_factory_addresses(chain_name)?;
+    let mut accumulated_factory_addresses = load_accumulated_factory_addresses(chain_name).await?;
 
     // Live storage for live_mode=true messages
     let live_storage = LiveStorage::new(chain_name);
@@ -179,7 +179,7 @@ pub async fn decode_logs_live(
                     "Handling reorg in log decoder, deleting {} orphaned blocks",
                     orphaned.len()
                 );
-                delete_decoded_logs_for_blocks(&live_storage, &orphaned)?;
+                delete_decoded_logs_for_blocks(&live_storage, &orphaned).await?;
             }
             Some(DecoderMessage::AllComplete) => {
                 break;

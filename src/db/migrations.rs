@@ -30,18 +30,31 @@ pub async fn run(pool: &Pool) -> Result<(), DbError> {
         return Ok(());
     }
 
-    let mut entries: Vec<_> = std::fs::read_dir(migrations_path)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "sql").unwrap_or(false))
-        .collect();
+    // Read all migration files in a blocking task to avoid blocking the async runtime.
+    let migration_files: Vec<(String, String)> = {
+        let migrations_path = migrations_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, DbError> {
+            let mut entries: Vec<_> = std::fs::read_dir(&migrations_path)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map(|x| x == "sql").unwrap_or(false))
+                .collect();
 
-    entries.sort_by_key(|e| e.file_name());
+            entries.sort_by_key(|e| e.file_name());
 
-    for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
+            let mut files = Vec::new();
+            for entry in entries {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let sql = std::fs::read_to_string(entry.path())?;
+                files.push((name, sql));
+            }
+            Ok(files)
+        })
+        .await
+        .map_err(|e| DbError::MigrationError(format!("Failed to read migration files: {}", e)))??
+    };
+
+    for (name, sql) in migration_files {
         if !applied.contains(&name) {
-            let sql = std::fs::read_to_string(entry.path())?;
-
             let mut client = pool.get().await?;
             let tx = client.transaction().await?;
 

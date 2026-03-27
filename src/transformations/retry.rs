@@ -206,7 +206,7 @@ impl RetryProcessor {
             }
         }
 
-        for (source_name, event_name) in storage.list_decoded_log_types(block_number)? {
+        for (source_name, event_name) in storage.list_decoded_log_types(block_number).await? {
             let parsed_event = event_schemas
                 .get(&(source_name.clone(), event_name.clone()))
                 .ok_or_else(|| {
@@ -216,7 +216,10 @@ impl RetryProcessor {
                     ))
                 })?;
 
-            for log in storage.read_decoded_logs(block_number, &source_name, &event_name)? {
+            for log in storage
+                .read_decoded_logs(block_number, &source_name, &event_name)
+                .await?
+            {
                 events.push(live_log_to_decoded_event(
                     &log,
                     parsed_event,
@@ -257,7 +260,7 @@ impl RetryProcessor {
         let regular_keys: HashSet<(String, String)> = regular_map.keys().cloned().collect();
         let event_keys: HashSet<(String, String)> = event_map.keys().cloned().collect();
 
-        for (source_name, function_name) in storage.list_decoded_call_types(block_number)? {
+        for (source_name, function_name) in storage.list_decoded_call_types(block_number).await? {
             match classify_live_retry_call_artifact(
                 &source_name,
                 &function_name,
@@ -274,8 +277,9 @@ impl RetryProcessor {
                             ))
                         })?;
 
-                    for call in
-                        storage.read_decoded_calls(block_number, &source_name, &function_name)?
+                    for call in storage
+                        .read_decoded_calls(block_number, &source_name, &function_name)
+                        .await?
                     {
                         calls.push(live_call_to_decoded_call(
                             &call,
@@ -295,8 +299,9 @@ impl RetryProcessor {
                             ))
                         })?;
 
-                    for call in
-                        storage.read_decoded_event_calls(block_number, &source_name, &base_name)?
+                    for call in storage
+                        .read_decoded_event_calls(block_number, &source_name, &base_name)
+                        .await?
                     {
                         calls.push(live_event_call_to_decoded_call(
                             &call,
@@ -317,7 +322,10 @@ impl RetryProcessor {
         }
 
         for source_name in once_sources {
-            let Ok(once_calls) = storage.read_decoded_once_calls(block_number, &source_name) else {
+            let Ok(once_calls) = storage
+                .read_decoded_once_calls(block_number, &source_name)
+                .await
+            else {
                 continue;
             };
 
@@ -360,7 +368,8 @@ impl RetryProcessor {
     ) -> Result<HashSet<String>, TransformationError> {
         let range_start = block_number;
         let range_end = block_number + 1;
-        let tx_addresses = Arc::new(read_live_receipt_addresses(&self.chain_name, block_number)?);
+        let tx_addresses =
+            Arc::new(read_live_receipt_addresses(&self.chain_name, block_number).await?);
         let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
         let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
         let mut blocked_handlers = HashSet::new();
@@ -567,7 +576,9 @@ impl RetryProcessor {
             &attempted_keys,
             &succeeded_keys,
             &blocked_handlers,
-        ) {
+        )
+        .await
+        {
             if !matches!(e, StorageError::NotFound(_)) {
                 tracing::warn!(
                     "Failed to update status for block {} after retry: {}",
@@ -624,7 +635,7 @@ impl RetryProcessor {
 /// mark failed (non-blocked) handlers as failed. Never sets `transformed` —
 /// that is `finalize_range()`'s responsibility after all `_handler_progress`
 /// rows are recorded.
-pub(crate) fn update_retry_status(
+pub(crate) async fn update_retry_status(
     storage: &LiveStorage,
     block_number: u64,
     attempted_keys: &HashSet<String>,
@@ -637,18 +648,21 @@ pub(crate) fn update_retry_status(
         .cloned()
         .collect();
 
-    storage.update_status_atomic(block_number, |status| {
-        for key in succeeded_keys {
-            status.failed_handlers.remove(key);
-            status.completed_handlers.insert(key.clone());
-        }
-        for key in &failed_keys {
-            status.failed_handlers.insert(key.clone());
-            status.completed_handlers.remove(key);
-        }
-        // Don't set transformed=true here — finalize_range() handles that
-        // after recording _handler_progress for all handlers.
-    })
+    let succeeded_keys = succeeded_keys.clone();
+    storage
+        .update_status_atomic(block_number, move |status| {
+            for key in &succeeded_keys {
+                status.failed_handlers.remove(key);
+                status.completed_handlers.insert(key.clone());
+            }
+            for key in &failed_keys {
+                status.failed_handlers.insert(key.clone());
+                status.completed_handlers.remove(key);
+            }
+            // Don't set transformed=true here — finalize_range() handles that
+            // after recording _handler_progress for all handlers.
+        })
+        .await
 }
 
 // ─── Trait for finalization callback ────────────────────────────────
@@ -731,14 +745,14 @@ fn live_event_call_to_decoded_call(
     }
 }
 
-fn read_live_receipt_addresses(
+async fn read_live_receipt_addresses(
     chain_name: &str,
     block_number: u64,
 ) -> Result<HashMap<[u8; 32], TransactionAddresses>, TransformationError> {
     let storage = LiveStorage::new(chain_name);
     let mut tx_addresses = HashMap::new();
 
-    for receipt in storage.read_receipts(block_number)? {
+    for receipt in storage.read_receipts(block_number).await? {
         tx_addresses.insert(
             receipt.transaction_hash,
             TransactionAddresses {
@@ -789,8 +803,8 @@ mod tests {
     use crate::live::{LiveBlockStatus, LiveStorage};
     use crate::transformations::context::DecodedValue;
 
-    #[test]
-    fn retry_missing_handlers_prefers_current_tracker_state() {
+    #[tokio::test]
+    async fn retry_missing_handlers_prefers_current_tracker_state() {
         let requested = Some(HashSet::from([
             "handler_a_v1".to_string(),
             "handler_b_v1".to_string(),
@@ -806,8 +820,8 @@ mod tests {
         assert_eq!(resolved, HashSet::from(["handler_b_v1".to_string()]));
     }
 
-    #[test]
-    fn retry_dependency_check_detects_missing_calls() {
+    #[tokio::test]
+    async fn retry_dependency_check_detects_missing_calls() {
         let required = HashSet::from([
             ("Pool".to_string(), "slot0".to_string()),
             ("Pool".to_string(), "liquidity".to_string()),
@@ -831,8 +845,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_retry_call_artifact_prefers_regular_name_over_event_suffix() {
+    #[tokio::test]
+    async fn live_retry_call_artifact_prefers_regular_name_over_event_suffix() {
         let regular = HashSet::from([("Pool".to_string(), "foo_event".to_string())]);
         let event = HashSet::from([("Pool".to_string(), "foo".to_string())]);
 
@@ -842,8 +856,8 @@ mod tests {
         assert_eq!(kind, LiveRetryCallArtifactKind::Regular);
     }
 
-    #[test]
-    fn live_retry_call_artifact_still_recognizes_event_triggered_suffix() {
+    #[tokio::test]
+    async fn live_retry_call_artifact_still_recognizes_event_triggered_suffix() {
         let regular = HashSet::new();
         let event = HashSet::from([("Pool".to_string(), "foo".to_string())]);
 
@@ -862,24 +876,26 @@ mod tests {
     /// must record handler outcomes but never set `transformed`. That flag is
     /// `finalize_range`'s responsibility; setting it early would let blocks be
     /// skipped on restart if finalization fails afterward.
-    #[test]
-    fn retry_status_update_records_completed_without_setting_transformed() {
+    #[tokio::test]
+    async fn retry_status_update_records_completed_without_setting_transformed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.logs_decoded = true;
         status.eth_calls_decoded = true;
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         // Call the production function used by execute_live_retry_handlers
         let attempted = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
         let succeeded = HashSet::from(["handler_a".to_string()]);
         let blocked = HashSet::new();
-        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked)
+            .await
+            .unwrap();
 
-        let s = storage.read_status(100).unwrap();
+        let s = storage.read_status(100).await.unwrap();
         assert!(
             !s.transformed,
             "retry must not set transformed; finalization owns that flag"
@@ -910,18 +926,18 @@ mod tests {
     /// 2. `update_finalization_status` (from finalizer.rs) refuses to set
     ///    `transformed` because `failed_handlers` is non-empty
     /// 3. After retry clears the failure, finalization sets `transformed`
-    #[test]
-    fn retry_then_finalize_interaction_gates_transformed_on_failures() {
+    #[tokio::test]
+    async fn retry_then_finalize_interaction_gates_transformed_on_failures() {
         use super::super::finalizer::update_finalization_status;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.logs_decoded = true;
         status.eth_calls_decoded = true;
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let registered_keys = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
 
@@ -929,12 +945,16 @@ mod tests {
         let attempted = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
         let succeeded = HashSet::from(["handler_a".to_string()]);
         let blocked = HashSet::new();
-        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked)
+            .await
+            .unwrap();
 
         // Phase 2: Finalization runs but handler_b still failed → transformed stays false
-        update_finalization_status(&storage, 100, &registered_keys).unwrap();
+        update_finalization_status(&storage, 100, &registered_keys)
+            .await
+            .unwrap();
 
-        let s = storage.read_status(100).unwrap();
+        let s = storage.read_status(100).await.unwrap();
         assert!(
             !s.transformed,
             "finalization must not set transformed when failed_handlers is non-empty"
@@ -944,12 +964,16 @@ mod tests {
         // Phase 3: Second retry succeeds for handler_b
         let attempted = HashSet::from(["handler_b".to_string()]);
         let succeeded = HashSet::from(["handler_b".to_string()]);
-        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked)
+            .await
+            .unwrap();
 
         // Phase 4: Finalization runs again — no failures remain → transformed set
-        update_finalization_status(&storage, 100, &registered_keys).unwrap();
+        update_finalization_status(&storage, 100, &registered_keys)
+            .await
+            .unwrap();
 
-        let s = storage.read_status(100).unwrap();
+        let s = storage.read_status(100).await.unwrap();
         assert!(
             s.transformed,
             "finalization must set transformed once all failures are cleared"
