@@ -1595,6 +1595,44 @@ impl TransformationEngine {
         Ok(())
     }
 
+    /// Build handler tasks for all event and call triggers in a block range.
+    fn build_handler_tasks(
+        &self,
+        event_triggers: &[(String, String)],
+        call_triggers: &[(String, String)],
+        events: Arc<Vec<DecodedEvent>>,
+        calls: Arc<Vec<DecodedCall>>,
+        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    ) -> Vec<HandlerTask> {
+        let mut tasks = Vec::new();
+
+        for (source, event_name) in event_triggers {
+            for handler in self.registry.handlers_for_event(source, event_name) {
+                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
+                tasks.push(HandlerTask {
+                    handler,
+                    events: events.clone(),
+                    calls: calls.clone(),
+                    tx_addresses: tx_addresses.clone(),
+                });
+            }
+        }
+
+        for (source, function_name) in call_triggers {
+            for handler in self.registry.handlers_for_call(source, function_name) {
+                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
+                tasks.push(HandlerTask {
+                    handler,
+                    events: events.clone(),
+                    calls: calls.clone(),
+                    tx_addresses: tx_addresses.clone(),
+                });
+            }
+        }
+
+        tasks
+    }
+
     /// Process a block range with per-handler transactions.
     async fn process_range(
         &self,
@@ -1633,31 +1671,13 @@ impl TransformationEngine {
             DbExecMode::Direct
         };
 
-        let mut tasks = Vec::new();
-
-        for (source, event_name) in &event_triggers {
-            for handler in self.registry.handlers_for_event(source, event_name) {
-                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
-                tasks.push(HandlerTask {
-                    handler,
-                    events: events.clone(),
-                    calls: calls.clone(),
-                    tx_addresses: tx_addresses.clone(),
-                });
-            }
-        }
-
-        for (source, function_name) in &call_triggers {
-            for handler in self.registry.handlers_for_call(source, function_name) {
-                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
-                tasks.push(HandlerTask {
-                    handler,
-                    events: events.clone(),
-                    calls: calls.clone(),
-                    tx_addresses: tx_addresses.clone(),
-                });
-            }
-        }
+        let tasks = self.build_handler_tasks(
+            &event_triggers.into_iter().collect::<Vec<_>>(),
+            &call_triggers.into_iter().collect::<Vec<_>>(),
+            events,
+            calls,
+            tx_addresses,
+        );
 
         let submitted_keys: HashSet<String> =
             tasks.iter().map(|t| t.handler.handler_key()).collect();
