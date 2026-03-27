@@ -473,6 +473,8 @@ fn batch_to_calls(
             function_name: function_name.to_string(),
             trigger_log_index: log_indices.as_ref().map(|indices| indices[row]),
             result,
+            is_reverted: false,
+            revert_reason: None,
         });
     }
 

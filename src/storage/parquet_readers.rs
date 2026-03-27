@@ -9,7 +9,10 @@ use std::fs::File;
 use std::path::Path;
 
 use alloy::primitives::Address;
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, ListArray, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, ListArray, StringArray, UInt32Array,
+    UInt64Array,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use thiserror::Error;
 
@@ -416,6 +419,8 @@ pub fn read_event_calls_from_parquet(
         let log_index_idx = schema.index_of("log_index").ok();
         let address_idx = schema.index_of("target_address").ok();
         let value_idx = schema.index_of("value").ok();
+        let is_reverted_idx = schema.index_of("is_reverted").ok();
+        let revert_reason_idx = schema.index_of("revert_reason").ok();
 
         for row in 0..batch.num_rows() {
             let block_number = block_number_idx
@@ -477,12 +482,38 @@ pub fn read_event_calls_from_parquet(
                 })
                 .unwrap_or_default();
 
+            let is_reverted = is_reverted_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(false);
+
+            let revert_reason = revert_reason_idx.and_then(|i| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .and_then(|a| {
+                        if a.is_null(row) {
+                            None
+                        } else {
+                            Some(a.value(row).to_string())
+                        }
+                    })
+            });
+
             results.push(EventCallResult {
                 block_number,
                 block_timestamp,
                 log_index,
                 target_address,
                 value,
+                is_reverted,
+                revert_reason,
             });
         }
     }

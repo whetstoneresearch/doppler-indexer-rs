@@ -167,6 +167,8 @@ pub struct EventCallResult {
     pub target_address: [u8; 20],
     pub value_bytes: Vec<u8>,
     pub param_values: Vec<Vec<u8>>,
+    pub is_reverted: bool,
+    pub revert_reason: Option<String>,
 }
 
 /// Key for grouping event-triggered calls: (source_name, event_signature_hash)

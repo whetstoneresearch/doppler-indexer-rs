@@ -39,6 +39,8 @@ pub(super) async fn handle_regular_calls_live(
                     function_name: function_name.to_string(),
                     trigger_log_index: None,
                     result: build_result_map(&decoded, &config.output_type, function_name),
+                    is_reverted: false,
+                    revert_reason: None,
                 });
 
                 decoded_calls.push(LiveDecodedCall {

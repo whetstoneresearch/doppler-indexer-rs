@@ -8,7 +8,10 @@ use std::sync::Arc;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
-use arrow::array::{ArrayRef, BinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array};
+use arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryBuilder, StringArray, UInt32Array,
+    UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -704,20 +707,32 @@ pub(crate) async fn process_event_triggers(
                                     target_address: call.target_address.0.0,
                                     value_bytes: bytes.to_vec(),
                                     param_values: call.encoded_params.clone(),
+                                    is_reverted: false,
+                                    revert_reason: None,
                                 });
                             }
                             Err(e) => {
+                                let reason = e.to_string();
                                 let params_hex: Vec<String> = call.encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
                                 tracing::warn!(
-                                    "Event-triggered eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
+                                    "Event-triggered eth_call reverted for {}.{} at block {} (address {}, params {:?}): {}",
                                     contract_name,
                                     function_name,
                                     call.trigger.block_number,
                                     call.target_address,
                                     params_hex,
-                                    e
+                                    reason
                                 );
-                                // Skip reverted calls - don't store empty results
+                                chunk_results.push(EventCallResult {
+                                    block_number: call.trigger.block_number,
+                                    block_timestamp: call.trigger.block_timestamp,
+                                    log_index: call.trigger.log_index,
+                                    target_address: call.target_address.0.0,
+                                    value_bytes: Vec::new(),
+                                    param_values: call.encoded_params.clone(),
+                                    is_reverted: true,
+                                    revert_reason: Some(reason),
+                                });
                             }
                         }
                     }
@@ -785,6 +800,8 @@ pub(crate) async fn process_event_triggers(
                         log_index: r.log_index,
                         target_address: r.target_address,
                         value: r.value_bytes.clone(),
+                        is_reverted: r.is_reverted,
+                        revert_reason: r.revert_reason.clone(),
                     })
                     .collect();
 
@@ -1059,15 +1076,36 @@ pub(crate) async fn process_event_triggers_multicall(
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
 
-    for ((meta, block_number, block_timestamp), return_data, _success) in results {
+    for ((meta, block_number, block_timestamp), return_data, success) in results {
         let key = (meta.contract_name.clone(), meta.function_name.clone());
+        let is_reverted = !success;
+        let revert_reason = if is_reverted {
+            Some(format!(
+                "Multicall3 reported failure for {}.{} at block {}",
+                meta.contract_name, meta.function_name, block_number
+            ))
+        } else {
+            None
+        };
+        if is_reverted {
+            tracing::warn!(
+                "Multicall event-triggered eth_call reverted for {}.{} at block {} (address {}, log_index {})",
+                meta.contract_name,
+                meta.function_name,
+                block_number,
+                meta.target_address,
+                meta.log_index
+            );
+        }
         group_results.entry(key).or_default().push(EventCallResult {
             block_number,
             block_timestamp,
             log_index: meta.log_index,
             target_address: meta.target_address.0 .0,
-            value_bytes: return_data,
+            value_bytes: if is_reverted { Vec::new() } else { return_data },
             param_values: meta.param_values,
+            is_reverted,
+            revert_reason,
         });
     }
 
@@ -1140,6 +1178,8 @@ pub(crate) async fn process_event_triggers_multicall(
                     log_index: r.log_index,
                     target_address: r.target_address,
                     value: r.value_bytes.clone(),
+                    is_reverted: r.is_reverted,
+                    revert_reason: r.revert_reason.clone(),
                 })
                 .collect();
 
@@ -1208,6 +1248,17 @@ pub(crate) fn write_event_call_results_to_parquet(
         .collect();
     arrays.push(Arc::new(arr));
 
+    // is_reverted
+    let arr: BooleanArray = results.iter().map(|r| Some(r.is_reverted)).collect();
+    arrays.push(Arc::new(arr));
+
+    // revert_reason
+    let arr: StringArray = results
+        .iter()
+        .map(|r| r.revert_reason.as_deref())
+        .collect();
+    arrays.push(Arc::new(arr));
+
     // param columns
     for i in 0..num_params {
         let arr: BinaryArray = results
@@ -1239,6 +1290,8 @@ pub(crate) fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
         Field::new("log_index", DataType::UInt32, false),
         Field::new("target_address", DataType::FixedSizeBinary(20), false),
         Field::new("value", DataType::Binary, false),
+        Field::new("is_reverted", DataType::Boolean, false),
+        Field::new("revert_reason", DataType::Utf8, true),
     ];
 
     for i in 0..num_params {

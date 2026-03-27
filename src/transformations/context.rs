@@ -300,6 +300,10 @@ pub struct DecodedCall {
     /// For single return values, the key is the function name or "result".
     /// For tuples, uses field names from the output type.
     pub result: HashMap<String, DecodedValue>,
+    /// Whether this call reverted during execution
+    pub is_reverted: bool,
+    /// If the call reverted, the reason string
+    pub revert_reason: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -816,6 +820,8 @@ mod tests {
             function_name: "testFunction".to_string(),
             trigger_log_index: None,
             result,
+            is_reverted: false,
+            revert_reason: None,
         }
     }
 

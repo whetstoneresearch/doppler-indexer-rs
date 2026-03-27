@@ -590,9 +590,10 @@ if 'param_0' in df.columns:
 
 ## Error Handling
 
-- **Without Multicall3:** If an eth_call reverts or fails (e.g., contract doesn't exist at that block), the result is skipped entirely — no row is written for that call
-- **With Multicall3:** Individual sub-call failures return empty bytes (due to `allowFailure=true`), so a row with an empty `value` is stored
-- Failed calls are logged with a warning but don't stop collection
+- **Event-triggered calls** (both with and without Multicall3): Reverted calls are stored with `is_reverted=true`, `revert_reason` set to the error message, and an empty `value`. This ensures the transformation engine receives the call (unblocking pending events) and can log the revert to the `_call_revert_log` table for debugging.
+- **Regular calls without Multicall3:** If an eth_call reverts or fails (e.g., contract doesn't exist at that block), the result is skipped entirely — no row is written for that call.
+- **Regular calls with Multicall3:** Individual sub-call failures return empty bytes (due to `allowFailure=true`), so a row with an empty `value` is stored.
+- Failed calls are logged with a warning but don't stop collection.
 - If the Multicall3 RPC call itself fails, all sub-calls for that block are treated as failed
 
 ## Performance Considerations
