@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
+use super::engine::HandlerKind;
 use super::error::TransformationError;
 use super::executor::{execute_with_snapshot_capture, inject_source_version};
 use super::historical::HistoricalDataReader;
@@ -31,6 +32,19 @@ use crate::types::config::eth_call::EvmType;
 pub(crate) enum LiveRetryCallArtifactKind {
     Regular,
     EventTriggered { base_name: String },
+}
+
+/// Uniform representation of a handler for retry processing.
+///
+/// Bridges `EventHandlerInfo` and `CallHandlerInfo` so the retry loop
+/// can iterate a single collection regardless of handler kind.
+struct RetryHandler {
+    handler: Arc<dyn super::traits::TransformationHandler>,
+    /// (source, name) trigger pairs — event names for Event, function names for Call.
+    triggers: HashSet<(String, String)>,
+    /// Call dependencies (Event handlers only; empty for Call handlers).
+    call_deps: HashSet<(String, String)>,
+    kind: HandlerKind,
 }
 
 pub(crate) fn resolve_retry_missing_handlers(
@@ -352,55 +366,73 @@ impl RetryProcessor {
         let mut blocked_handlers = HashSet::new();
         let mut attempted_keys = HashSet::new();
 
-        for handler_info in self.registry.unique_event_handlers() {
-            let handler = handler_info.handler;
-            let handler_key = handler.handler_key();
+        // Build a uniform list of retry handler descriptors from both kinds.
+        let retry_handlers = self.build_retry_handler_list();
+
+        for rh in &retry_handlers {
+            let handler_key = rh.handler.handler_key();
             if !missing_handlers.contains(&handler_key) {
                 continue;
             }
 
-            let triggers: HashSet<(String, String)> = handler_info
-                .triggers
-                .iter()
-                .map(|trigger| {
-                    (
-                        trigger.source.clone(),
-                        extract_event_name(&trigger.event_signature),
-                    )
-                })
-                .collect();
-            let handler_events: Vec<DecodedEvent> = events
-                .iter()
-                .filter(|event| {
-                    triggers.contains(&(event.source_name.clone(), event.event_name.clone()))
-                })
-                .cloned()
-                .collect();
+            // Filter primary data by trigger match
+            let (handler_events, handler_calls) = match rh.kind {
+                HandlerKind::Event => {
+                    let handler_events: Vec<DecodedEvent> = events
+                        .iter()
+                        .filter(|event| {
+                            rh.triggers
+                                .contains(&(event.source_name.clone(), event.event_name.clone()))
+                        })
+                        .cloned()
+                        .collect();
 
-            if handler_events.is_empty() {
-                continue;
-            }
+                    if handler_events.is_empty() {
+                        continue;
+                    }
 
-            let call_deps: HashSet<(String, String)> =
-                handler.call_dependencies().into_iter().collect();
-            let missing_deps = missing_retry_call_dependencies(&call_deps, &calls);
-            if !missing_deps.is_empty() {
-                tracing::warn!(
-                    "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
-                    handler_key,
-                    block_number,
-                    missing_deps
-                );
-                blocked_handlers.insert(handler_key);
-                continue;
-            }
-            let handler_calls: Vec<DecodedCall> = calls
-                .iter()
-                .filter(|call| {
-                    call_deps.contains(&(call.source_name.clone(), call.function_name.clone()))
-                })
-                .cloned()
-                .collect();
+                    // Check call dependencies
+                    let missing_deps =
+                        missing_retry_call_dependencies(&rh.call_deps, &calls);
+                    if !missing_deps.is_empty() {
+                        tracing::warn!(
+                            "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
+                            handler_key,
+                            block_number,
+                            missing_deps
+                        );
+                        blocked_handlers.insert(handler_key);
+                        continue;
+                    }
+
+                    let handler_calls: Vec<DecodedCall> = calls
+                        .iter()
+                        .filter(|call| {
+                            rh.call_deps
+                                .contains(&(call.source_name.clone(), call.function_name.clone()))
+                        })
+                        .cloned()
+                        .collect();
+
+                    (handler_events, handler_calls)
+                }
+                HandlerKind::Call => {
+                    let handler_calls: Vec<DecodedCall> = calls
+                        .iter()
+                        .filter(|call| {
+                            rh.triggers
+                                .contains(&(call.source_name.clone(), call.function_name.clone()))
+                        })
+                        .cloned()
+                        .collect();
+
+                    if handler_calls.is_empty() {
+                        continue;
+                    }
+
+                    (Vec::new(), handler_calls)
+                }
+            };
 
             attempted_keys.insert(handler_key.clone());
 
@@ -411,9 +443,15 @@ impl RetryProcessor {
             let historical = self.historical_reader.clone();
             let rpc = self.rpc_client.clone();
             let contracts = self.contracts.clone();
-            let tx_addresses = tx_addresses.clone();
+            let handler = rh.handler.clone();
             let handler_name = handler.name();
             let handler_version = handler.version();
+
+            // Event handlers get tx_addresses; call handlers pass empty map
+            let task_tx_addresses = match rh.kind {
+                HandlerKind::Event => (*tx_addresses).clone(),
+                HandlerKind::Call => HashMap::new(),
+            };
 
             join_set.spawn(async move {
                 let _permit = permit;
@@ -425,80 +463,7 @@ impl RetryProcessor {
                     range_end,
                     Arc::new(handler_events),
                     Arc::new(handler_calls),
-                    (*tx_addresses).clone(),
-                    historical,
-                    rpc,
-                    contracts,
-                );
-
-                match handler.handle(&ctx).await {
-                    Ok(ops) => {
-                        if !ops.is_empty() {
-                            let ops = inject_source_version(ops, handler_name, handler_version);
-                            execute_with_snapshot_capture(
-                                ops,
-                                &db_pool,
-                                Some(&live_storage),
-                                range_start,
-                                handler_name,
-                                handler_version,
-                            )
-                            .await?;
-                        }
-                        Ok(Some(handler_key))
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-        }
-
-        for handler_info in self.registry.unique_call_handlers() {
-            let handler = handler_info.handler;
-            let handler_key = handler.handler_key();
-            if !missing_handlers.contains(&handler_key) {
-                continue;
-            }
-
-            let triggers: HashSet<(String, String)> = handler_info
-                .triggers
-                .iter()
-                .map(|trigger| (trigger.source.clone(), trigger.function_name.clone()))
-                .collect();
-            let handler_calls: Vec<DecodedCall> = calls
-                .iter()
-                .filter(|call| {
-                    triggers.contains(&(call.source_name.clone(), call.function_name.clone()))
-                })
-                .cloned()
-                .collect();
-
-            if handler_calls.is_empty() {
-                continue;
-            }
-
-            attempted_keys.insert(handler_key.clone());
-
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let db_pool = self.db_pool.clone();
-            let chain_name = self.chain_name.clone();
-            let chain_id = self.chain_id;
-            let historical = self.historical_reader.clone();
-            let rpc = self.rpc_client.clone();
-            let contracts = self.contracts.clone();
-            let handler_name = handler.name();
-            let handler_version = handler.version();
-
-            join_set.spawn(async move {
-                let _permit = permit;
-                let live_storage = LiveStorage::new(&chain_name);
-                let ctx = TransformationContext::new(
-                    chain_name,
-                    chain_id,
-                    range_start,
-                    range_end,
-                    Arc::new(Vec::new()),
-                    Arc::new(handler_calls),
-                    HashMap::new(),
+                    task_tx_addresses,
                     historical,
                     rpc,
                     contracts,
@@ -613,6 +578,43 @@ impl RetryProcessor {
         }
 
         Ok(blocked_handlers)
+    }
+
+    /// Build a uniform list of retry handler descriptors from both event and call handlers.
+    fn build_retry_handler_list(&self) -> Vec<RetryHandler> {
+        let mut handlers = Vec::new();
+
+        for info in self.registry.unique_event_handlers() {
+            let triggers: HashSet<(String, String)> = info
+                .triggers
+                .iter()
+                .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
+                .collect();
+            let call_deps: HashSet<(String, String)> =
+                info.handler.call_dependencies().into_iter().collect();
+            handlers.push(RetryHandler {
+                handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
+                triggers,
+                call_deps,
+                kind: HandlerKind::Event,
+            });
+        }
+
+        for info in self.registry.unique_call_handlers() {
+            let triggers: HashSet<(String, String)> = info
+                .triggers
+                .iter()
+                .map(|t| (t.source.clone(), t.function_name.clone()))
+                .collect();
+            handlers.push(RetryHandler {
+                handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
+                triggers,
+                call_deps: HashSet::new(),
+                kind: HandlerKind::Call,
+            });
+        }
+
+        handlers
     }
 }
 

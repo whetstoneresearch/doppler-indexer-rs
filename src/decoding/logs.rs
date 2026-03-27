@@ -269,8 +269,13 @@ pub(crate) async fn process_logs(
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
-    // Group decoded logs by (contract_name, event_name)
+    let build_transform = outputs.transform_tx.is_some();
+
+    // Group decoded logs by (contract_name, event_name) — for parquet storage
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
+        HashMap::new();
+    // Also build transform events in the same pass when the channel is present
+    let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
         HashMap::new();
 
     for log in logs {
@@ -296,6 +301,20 @@ pub(crate) async fn process_logs(
             }
 
             if let Some(decoded) = decode_log(log, &matcher.event)? {
+                if build_transform {
+                    let transform_event = convert_to_transform_event(
+                        &decoded,
+                        &matcher.event,
+                        &matcher.name,
+                        &matcher.event_name,
+                    );
+                    let key = (matcher.name.clone(), matcher.event_name.clone());
+                    transform_events_by_type
+                        .entry(key)
+                        .or_default()
+                        .push(transform_event);
+                }
+
                 let key = (matcher.name.clone(), matcher.event_name.clone());
                 decoded_by_event
                     .entry(key)
@@ -322,6 +341,20 @@ pub(crate) async fn process_logs(
                 }
 
                 if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    if build_transform {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            collection_name,
+                            &matcher.event_name,
+                        );
+                        let key = (collection_name.clone(), matcher.event_name.clone());
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
+                    }
+
                     let key = (collection_name.clone(), matcher.event_name.clone());
                     decoded_by_event
                         .entry(key)
@@ -400,83 +433,8 @@ pub(crate) async fn process_logs(
         }
     }
 
-    // Send to transformation channel if enabled
+    // Send transform events to the transformation channel (built during the single pass above)
     if let Some(tx) = outputs.transform_tx {
-        // Re-decode and send to transformation engine (we need to iterate again to build the transform messages)
-        // Group decoded logs by (contract_name, event_name) for sending
-        let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
-            HashMap::new();
-
-        for log in logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-            let topic0 = log.topics[0];
-
-            // Try regular matchers
-            for matcher in regular_matchers {
-                // Skip if block is before contract's start_block
-                if let Some(sb) = matcher.start_block {
-                    if log.block_number < sb {
-                        continue;
-                    }
-                }
-                if !matcher.addresses.contains(&log.address) {
-                    continue;
-                }
-                if topic0 != matcher.event.topic0 {
-                    continue;
-                }
-
-                if let Some(decoded) = decode_log(log, &matcher.event)? {
-                    let transform_event = convert_to_transform_event(
-                        &decoded,
-                        &matcher.event,
-                        &matcher.name,
-                        &matcher.event_name,
-                    );
-                    let key = (matcher.name.clone(), matcher.event_name.clone());
-                    transform_events_by_type
-                        .entry(key)
-                        .or_default()
-                        .push(transform_event);
-                }
-            }
-
-            // Try factory matchers
-            for (collection_name, matchers) in factory_matchers {
-                let addrs = match factory_addresses.get(collection_name) {
-                    Some(addrs) => addrs,
-                    None => continue,
-                };
-
-                if !addrs.contains(&log.address) {
-                    continue;
-                }
-
-                for matcher in matchers {
-                    if topic0 != matcher.event.topic0 {
-                        continue;
-                    }
-
-                    if let Some(decoded) = decode_log(log, &matcher.event)? {
-                        let transform_event = convert_to_transform_event(
-                            &decoded,
-                            &matcher.event,
-                            collection_name,
-                            &matcher.event_name,
-                        );
-                        let key = (collection_name.clone(), matcher.event_name.clone());
-                        transform_events_by_type
-                            .entry(key)
-                            .or_default()
-                            .push(transform_event);
-                    }
-                }
-            }
-        }
-
-        // Send each event type as a message
         for ((source_name, event_name), events) in transform_events_by_type {
             if events.is_empty() {
                 continue;
