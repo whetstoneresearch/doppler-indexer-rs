@@ -932,57 +932,67 @@ impl TransformationEngine {
 
     // ─── Parquet Reading ─────────────────────────────────────────────
 
-    async fn read_decoded_events_for_triggers(
+    /// Read decoded parquet files for a set of triggers, spawning one blocking
+    /// read task per trigger.
+    ///
+    /// `resolve_paths` turns each `(source, name)` trigger into zero or more
+    /// file paths to read.  `read_file` performs the actual parquet read.
+    async fn read_decoded_parquet_for_triggers<T>(
         &self,
-        range_start: u64,
-        range_end: u64,
-        event_triggers: &[(String, String)],
-    ) -> Result<Vec<DecodedEvent>, TransformationError> {
-        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+        triggers: &[(String, String)],
+        resolve_paths: impl Fn(&str, &str) -> Vec<PathBuf>,
+        read_file: impl Fn(Arc<HistoricalDataReader>, &Path, &str, &str) -> Result<Vec<T>, TransformationError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Result<Vec<T>, TransformationError>
+    where
+        T: Send + 'static,
+    {
         let mut read_tasks = JoinSet::new();
+        let read_fn = Arc::new(read_file);
 
-        for (source_name, event_name) in event_triggers {
-            let file_path = self
-                .decoded_logs_dir
-                .join(source_name)
-                .join(event_name)
-                .join(&file_name);
+        for (source_name, secondary_name) in triggers {
+            let paths = resolve_paths(source_name, secondary_name);
 
-            if !file_path.exists() {
-                continue;
-            }
-
-            let reader = self.historical_reader.clone();
-            let src = source_name.clone();
-            let evt = event_name.clone();
-
-            read_tasks.spawn_blocking(move || {
-                tracing::debug!("Reading decoded events from {}", file_path.display());
-                match reader.read_events_from_file(&file_path, &src, &evt) {
-                    Ok(events) => {
-                        tracing::debug!(
-                            "Read {} events from {}",
-                            events.len(),
-                            file_path.display()
-                        );
-                        Ok(events)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to read decoded events from {}: {}",
-                            file_path.display(),
-                            e
-                        );
-                        Ok(Vec::new())
-                    }
+            for file_path in paths {
+                if !file_path.exists() {
+                    continue;
                 }
-            });
+
+                let reader = self.historical_reader.clone();
+                let src = source_name.clone();
+                let name = secondary_name.clone();
+                let read_fn = read_fn.clone();
+
+                read_tasks.spawn_blocking(move || {
+                    tracing::debug!("Reading decoded data from {}", file_path.display());
+                    match read_fn(reader, &file_path, &src, &name) {
+                        Ok(items) => {
+                            tracing::debug!(
+                                "Read {} items from {}",
+                                items.len(),
+                                file_path.display()
+                            );
+                            Ok(items)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to read decoded data from {}: {}",
+                                file_path.display(),
+                                e
+                            );
+                            Ok(Vec::new())
+                        }
+                    }
+                });
+            }
         }
 
-        let mut all_events = Vec::new();
+        let mut all_items = Vec::new();
         while let Some(result) = read_tasks.join_next().await {
             match result {
-                Ok(Ok(events)) => all_events.extend(events),
+                Ok(Ok(items)) => all_items.extend(items),
                 Ok(Err(e)) => return Err(e),
                 Err(e) => {
                     return Err(TransformationError::IoError(std::io::Error::other(
@@ -992,7 +1002,24 @@ impl TransformationEngine {
             }
         }
 
-        Ok(all_events)
+        Ok(all_items)
+    }
+
+    async fn read_decoded_events_for_triggers(
+        &self,
+        range_start: u64,
+        range_end: u64,
+        event_triggers: &[(String, String)],
+    ) -> Result<Vec<DecodedEvent>, TransformationError> {
+        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+        let logs_dir = self.decoded_logs_dir.clone();
+
+        self.read_decoded_parquet_for_triggers(
+            event_triggers,
+            |source, event| vec![logs_dir.join(source).join(event).join(&file_name)],
+            |reader, path, src, evt| reader.read_events_from_file(path, src, evt),
+        )
+        .await
     }
 
     async fn read_decoded_calls_for_triggers(
@@ -1002,62 +1029,21 @@ impl TransformationEngine {
         call_triggers: &[(String, String)],
     ) -> Result<Vec<DecodedCall>, TransformationError> {
         let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-        let mut read_tasks = JoinSet::new();
+        let calls_dir = self.decoded_calls_dir.clone();
 
-        for (source_name, function_name) in call_triggers {
-            let base_dir = self.decoded_calls_dir.join(source_name).join(function_name);
-
-            // Check base path, then subdirectories (on_events/, once/)
-            let file_path = [
-                base_dir.join(&file_name),
-                base_dir.join("on_events").join(&file_name),
-                base_dir.join("once").join(&file_name),
-            ]
-            .into_iter()
-            .find(|p| p.exists());
-
-            let file_path = match file_path {
-                Some(p) => p,
-                None => continue,
-            };
-
-            let reader = self.historical_reader.clone();
-            let src = source_name.clone();
-            let func = function_name.clone();
-
-            read_tasks.spawn_blocking(move || {
-                tracing::debug!("Reading decoded calls from {}", file_path.display());
-                match reader.read_calls_from_file(&file_path, &src, &func) {
-                    Ok(calls) => {
-                        tracing::debug!("Read {} calls from {}", calls.len(), file_path.display());
-                        Ok(calls)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to read decoded calls from {}: {}",
-                            file_path.display(),
-                            e
-                        );
-                        Ok(Vec::new())
-                    }
-                }
-            });
-        }
-
-        let mut all_calls = Vec::new();
-        while let Some(result) = read_tasks.join_next().await {
-            match result {
-                Ok(Ok(calls)) => all_calls.extend(calls),
-                Ok(Err(e)) => return Err(e),
-                Err(e) => {
-                    return Err(TransformationError::IoError(std::io::Error::other(
-                        e.to_string(),
-                    )))
-                }
-            }
-        }
-
-        Ok(all_calls)
+        self.read_decoded_parquet_for_triggers(
+            call_triggers,
+            |source, function| {
+                let base_dir = calls_dir.join(source).join(function);
+                vec![
+                    base_dir.join(&file_name),
+                    base_dir.join("on_events").join(&file_name),
+                    base_dir.join("once").join(&file_name),
+                ]
+            },
+            |reader, path, src, func| reader.read_calls_from_file(path, src, func),
+        )
+        .await
     }
 
     // ─── Live Processing ─────────────────────────────────────────────
