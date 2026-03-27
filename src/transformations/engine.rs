@@ -1405,6 +1405,22 @@ impl TransformationEngine {
             msg.range_start
         );
 
+        // Log reverted calls to the database for debugging
+        let reverted: Vec<_> = msg.calls.iter().filter(|c| c.is_reverted).collect();
+        if !reverted.is_empty() {
+            tracing::warn!(
+                "{} reverted eth_calls for {}/{} in range {}-{}",
+                reverted.len(),
+                msg.source_name,
+                msg.function_name,
+                msg.range_start,
+                msg.range_end
+            );
+            if let Err(e) = self.log_reverted_calls(&reverted, msg.range_start).await {
+                tracing::warn!("Failed to log reverted calls to DB: {}", e);
+            }
+        }
+
         {
             let mut state = self.live_state.lock().await;
             state
@@ -1427,6 +1443,48 @@ impl TransformationEngine {
         self.finalizer
             .maybe_finalize_range(range_key, &self.live_state)
             .await?;
+
+        Ok(())
+    }
+
+    /// Batch-insert reverted call information into the `_call_revert_log` table.
+    async fn log_reverted_calls(
+        &self,
+        calls: &[&DecodedCall],
+        _range_start: u64,
+    ) -> Result<(), TransformationError> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+
+        let pool = self.db_pool.inner();
+        let client = pool.get().await?;
+
+        for call in calls {
+            let chain_id = self.chain_id as i64;
+            let block_number = call.block_number as i64;
+            let log_index = call.trigger_log_index.map(|i| i as i32);
+            let source_name = &call.source_name;
+            let function_name = &call.function_name;
+            let target_address = call.contract_address.as_slice();
+            let revert_reason = call.revert_reason.as_deref();
+
+            client
+                .execute(
+                    "INSERT INTO _call_revert_log (chain_id, block_number, log_index, source_name, function_name, target_address, revert_reason)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    &[
+                        &chain_id,
+                        &block_number,
+                        &log_index,
+                        &source_name,
+                        &function_name,
+                        &target_address,
+                        &revert_reason,
+                    ],
+                )
+                .await?;
+        }
 
         Ok(())
     }

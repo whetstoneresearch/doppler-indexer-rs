@@ -72,6 +72,8 @@ pub struct EventCallResult {
     pub log_index: u32,
     pub target_address: [u8; 20],
     pub value: Vec<u8>,
+    pub is_reverted: bool,
+    pub revert_reason: Option<String>,
 }
 
 /// Message sent through decoder channels

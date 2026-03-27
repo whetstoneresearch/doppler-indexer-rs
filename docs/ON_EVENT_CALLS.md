@@ -523,7 +523,7 @@ The `target` field in call configuration allows routing event-triggered calls to
 
 2. **Factory collection race window:** During live processing, there may be a brief window where events from newly-created factory contracts are skipped because the factory address hasn't been discovered yet. These events will be processed during the next catchup phase.
 
-3. **Failed calls skipped:** If an eth_call fails (e.g., contract reverted), the result is skipped entirely rather than stored. Failed calls during catchup are not automatically retried on subsequent runs. Decode failures are logged with warnings.
+3. **Reverted calls tracked:** If an event-triggered eth_call reverts, the result is stored with `is_reverted=true` and `revert_reason` in both parquet and the decoder pipeline. This ensures the transformation engine can unblock pending events that depend on the call. Reverts are also logged to the `_call_revert_log` database table for debugging. Handlers should check `call.is_reverted` and skip gracefully.
 
 4. **No cross-event parameter passing:** Parameters can only be extracted from the triggering event itself, not from other events in the same block or transaction.
 

@@ -1,5 +1,7 @@
 //! Event-triggered call message handling for live mode.
 
+use std::collections::HashMap;
+
 use tokio::sync::mpsc::Sender;
 
 use crate::decoding::eth_calls::EthCallDecodingError;
@@ -25,6 +27,22 @@ pub(super) async fn handle_event_calls_live(
     let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
 
     for result in results {
+        if result.is_reverted {
+            // Don't try to decode reverted calls, but still forward to transformation engine
+            transform_calls.push(TransformDecodedCall {
+                block_number: result.block_number,
+                block_timestamp: result.block_timestamp,
+                contract_address: result.target_address,
+                source_name: contract_name.to_string(),
+                function_name: function_name.to_string(),
+                trigger_log_index: Some(result.log_index),
+                result: HashMap::new(),
+                is_reverted: true,
+                revert_reason: result.revert_reason.clone(),
+            });
+            continue;
+        }
+
         match decode_value(&result.value, &config.output_type) {
             Ok(decoded) => {
                 transform_calls.push(TransformDecodedCall {
@@ -35,6 +53,8 @@ pub(super) async fn handle_event_calls_live(
                     function_name: function_name.to_string(),
                     trigger_log_index: Some(result.log_index),
                     result: build_result_map(&decoded, &config.output_type, function_name),
+                    is_reverted: false,
+                    revert_reason: None,
                 });
 
                 decoded_event_calls.push(LiveDecodedEventCall {

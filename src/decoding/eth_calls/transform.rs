@@ -89,6 +89,8 @@ pub(super) fn convert_to_transform_call(
         function_name: function_name.to_string(),
         trigger_log_index: None,
         result: build_result_map(&record.decoded_value, output_type, function_name),
+        is_reverted: false,
+        revert_reason: None,
     }
 }
 
@@ -107,5 +109,7 @@ pub(super) fn convert_event_call_to_transform_call(
         function_name: function_name.to_string(),
         trigger_log_index: Some(record.log_index),
         result: build_result_map(&record.decoded_value, output_type, function_name),
+        is_reverted: false,
+        revert_reason: None,
     }
 }

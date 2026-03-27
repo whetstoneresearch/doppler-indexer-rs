@@ -695,6 +695,8 @@ impl LiveEthCallCollector {
                         log_index: *log_index,
                         target_address: target_address.0 .0,
                         value: result_bytes,
+                        is_reverted: false,
+                        revert_reason: None,
                     });
                 }
             }

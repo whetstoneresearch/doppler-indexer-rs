@@ -614,6 +614,8 @@ mod tests {
                     log_index: 7,
                     target_address: [3u8; 20],
                     value: encode_uint256(7),
+                    is_reverted: false,
+                    revert_reason: None,
                 }],
                 live_mode: true,
                 retry_transform_after_decode: true,

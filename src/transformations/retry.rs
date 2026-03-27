@@ -327,6 +327,8 @@ impl RetryProcessor {
                         function_name: "once".to_string(),
                         trigger_log_index: None,
                         result: merged_result,
+                        is_reverted: false,
+                        revert_reason: None,
                     });
                 }
             }
@@ -703,6 +705,8 @@ fn live_call_to_decoded_call(
         function_name: function_name.to_string(),
         trigger_log_index: None,
         result: build_result_map(&call.decoded_value, output_type, function_name),
+        is_reverted: false,
+        revert_reason: None,
     }
 }
 
@@ -720,6 +724,8 @@ fn live_event_call_to_decoded_call(
         function_name: function_name.to_string(),
         trigger_log_index: Some(call.log_index),
         result: build_result_map(&call.decoded_value, output_type, function_name),
+        is_reverted: false,
+        revert_reason: None,
     }
 }
 
@@ -812,6 +818,8 @@ mod tests {
             function_name: "slot0".to_string(),
             trigger_log_index: None,
             result: HashMap::from([("result".to_string(), DecodedValue::Uint64(1))]),
+            is_reverted: false,
+            revert_reason: None,
         }];
 
         let missing = missing_retry_call_dependencies(&required, &calls);

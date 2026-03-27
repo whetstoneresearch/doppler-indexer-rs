@@ -341,6 +341,8 @@ pub async fn process_once_calls(
                     function_name: "once".to_string(),
                     trigger_log_index: None,
                     result: merged_result,
+                    is_reverted: false,
+                    revert_reason: None,
                 }
             })
             .filter(|call| !call.result.is_empty())
@@ -406,6 +408,8 @@ pub async fn process_event_calls(
     let mut decode_failures = 0u64;
     let mut non_empty_count = 0u64;
 
+    let mut reverted_calls: Vec<TransformDecodedCall> = Vec::new();
+
     for result in results {
         // Skip if block is before contract's start_block
         if let Some(sb) = config.start_block {
@@ -413,6 +417,23 @@ pub async fn process_event_calls(
                 continue;
             }
         }
+
+        // Handle reverted results: skip decode, create transform call with empty result
+        if result.is_reverted {
+            reverted_calls.push(TransformDecodedCall {
+                block_number: result.block_number,
+                block_timestamp: result.block_timestamp,
+                contract_address: result.target_address,
+                source_name: config.contract_name.clone(),
+                function_name: config.function_name.clone(),
+                trigger_log_index: Some(result.log_index),
+                result: HashMap::new(),
+                is_reverted: true,
+                revert_reason: result.revert_reason.clone(),
+            });
+            continue;
+        }
+
         if result.value.is_empty() {
             continue;
         }
@@ -495,7 +516,7 @@ pub async fn process_event_calls(
 
     // Send to transformation channel if enabled
     if let Some(tx) = transform_tx {
-        let transform_calls: Vec<TransformDecodedCall> = decoded_records
+        let mut transform_calls: Vec<TransformDecodedCall> = decoded_records
             .iter()
             .map(|r| {
                 convert_event_call_to_transform_call(
@@ -506,6 +527,9 @@ pub async fn process_event_calls(
                 )
             })
             .collect();
+
+        // Include reverted calls so the engine can unblock pending events
+        transform_calls.extend(reverted_calls);
 
         if !transform_calls.is_empty() {
             let msg = DecodedCallsMessage {
