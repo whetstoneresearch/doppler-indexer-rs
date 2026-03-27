@@ -9,6 +9,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
 use crate::decoding::DecoderMessage;
+use crate::raw_data::historical::eth_calls::event_triggers::SkippedFactoryTrigger;
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::{S3Manifest, StorageManager};
@@ -219,6 +220,9 @@ pub struct EthCallCatchupState {
     pub range_factory_data: HashMap<u64, FactoryAddressData>,
     pub range_regular_done: HashSet<u64>,
     pub range_factory_done: HashSet<u64>,
+    /// Buffered triggers skipped because factory addresses weren't known yet.
+    /// Each entry: (skipped_triggers, range_start, range_end_inclusive)
+    pub factory_skipped_triggers: Vec<(Vec<SkippedFactoryTrigger>, u64, u64)>,
 }
 
 /// Configuration for a token pool call

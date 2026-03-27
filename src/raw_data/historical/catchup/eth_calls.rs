@@ -125,6 +125,7 @@ pub async fn collect_eth_calls(
             range_factory_data: HashMap::new(),
             range_regular_done: HashSet::new(),
             range_factory_done: HashSet::new(),
+            factory_skipped_triggers: Vec::new(),
         });
     }
 
@@ -714,7 +715,7 @@ pub async fn collect_eth_calls(
             // Process the triggers (or write empty files if no triggers)
             let range_start = log_range.start;
             let range_end = log_range.end - 1;
-            if let Some(multicall_addr) = multicall3_address {
+            let skipped = if let Some(multicall_addr) = multicall3_address {
                 let event_ctx = EthCallContext {
                     client,
                     output_dir: &base_output_dir,
@@ -734,7 +735,7 @@ pub async fn collect_eth_calls(
                     range_start,
                     range_end,
                 )
-                .await?;
+                .await?
             } else {
                 let event_ctx = EthCallContext {
                     client,
@@ -754,7 +755,13 @@ pub async fn collect_eth_calls(
                     range_start,
                     range_end,
                 )
-                .await?;
+                .await?
+            };
+            if !skipped.is_empty() {
+                tracing::warn!(
+                    "Unexpected skipped factory triggers during catchup ({} triggers) — factory addresses should be pre-loaded",
+                    skipped.len()
+                );
             }
 
             event_catchup_count += 1;
@@ -819,5 +826,6 @@ pub async fn collect_eth_calls(
         range_factory_data,
         range_regular_done,
         range_factory_done,
+        factory_skipped_triggers: Vec::new(),
     })
 }
