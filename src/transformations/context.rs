@@ -34,6 +34,26 @@ pub use crate::types::decoded::DecodedValue;
 /// // After (concise):
 /// let asset = event.extract_address("asset")?;
 /// ```
+/// Generates a typed field extraction method on FieldExtractor.
+///
+/// Each invocation produces a method that calls `get_field(name)?.$as_method()`
+/// and wraps the `None` case in a `TransformationError::TypeConversion` with
+/// the provided `$type_name` in the message.
+macro_rules! impl_field_extractor {
+    ($method:ident, $as_method:ident, $ret:ty, $type_name:expr) => {
+        fn $method(&self, name: &str) -> Result<$ret, TransformationError> {
+            self.get_field(name)?.$as_method().ok_or_else(|| {
+                TransformationError::TypeConversion(format!(
+                    "'{}' is not {} in {}",
+                    name,
+                    $type_name,
+                    self.context_info()
+                ))
+            })
+        }
+    };
+}
+
 #[allow(dead_code)]
 pub trait FieldExtractor {
     /// Returns the underlying field values map.
@@ -54,137 +74,18 @@ pub trait FieldExtractor {
         self.field_values().get(name)
     }
 
-    /// Extract an address field with a descriptive error on failure.
-    fn extract_address(&self, name: &str) -> Result<[u8; 20], TransformationError> {
-        self.get_field(name)?.as_address().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not an address in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a U256 field with a descriptive error on failure.
-    fn extract_uint256(&self, name: &str) -> Result<U256, TransformationError> {
-        self.get_field(name)?.as_uint256().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not a uint256 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract an I256 field with a descriptive error on failure.
-    fn extract_int256(&self, name: &str) -> Result<I256, TransformationError> {
-        self.get_field(name)?.as_int256().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not an int256 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a u64 field with a descriptive error on failure.
-    fn extract_u64(&self, name: &str) -> Result<u64, TransformationError> {
-        self.get_field(name)?.as_u64().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not a u64 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract an i64 field with a descriptive error on failure.
-    fn extract_i64(&self, name: &str) -> Result<i64, TransformationError> {
-        self.get_field(name)?.as_i64().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not an i64 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a u32 field with a descriptive error on failure.
-    fn extract_u32(&self, name: &str) -> Result<u32, TransformationError> {
-        self.get_field(name)?.as_u32().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not a u32 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract an i32 field with a descriptive error on failure.
-    fn extract_i32(&self, name: &str) -> Result<i32, TransformationError> {
-        self.get_field(name)?.as_i32().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not an i32 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a u8 field with a descriptive error on failure.
-    fn extract_u8(&self, name: &str) -> Result<u8, TransformationError> {
-        self.get_field(name)?.as_u8().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not a u8 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a bool field with a descriptive error on failure.
-    fn extract_bool(&self, name: &str) -> Result<bool, TransformationError> {
-        self.get_field(name)?.as_bool().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not a bool in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a string field with a descriptive error on failure.
-    fn extract_string(&self, name: &str) -> Result<&str, TransformationError> {
-        self.get_field(name)?.as_string().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not a string in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a bytes32 field with a descriptive error on failure.
-    fn extract_bytes32(&self, name: &str) -> Result<[u8; 32], TransformationError> {
-        self.get_field(name)?.as_bytes32().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not bytes32 in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
-
-    /// Extract a bytes field with a descriptive error on failure.
-    fn extract_bytes(&self, name: &str) -> Result<&[u8], TransformationError> {
-        self.get_field(name)?.as_bytes().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not bytes in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
+    impl_field_extractor!(extract_address, as_address, [u8; 20], "an address");
+    impl_field_extractor!(extract_uint256, as_uint256, U256, "a uint256");
+    impl_field_extractor!(extract_int256, as_int256, I256, "an int256");
+    impl_field_extractor!(extract_u64, as_u64, u64, "a u64");
+    impl_field_extractor!(extract_i64, as_i64, i64, "an i64");
+    impl_field_extractor!(extract_u32, as_u32, u32, "a u32");
+    impl_field_extractor!(extract_i32, as_i32, i32, "an i32");
+    impl_field_extractor!(extract_u8, as_u8, u8, "a u8");
+    impl_field_extractor!(extract_bool, as_bool, bool, "a bool");
+    impl_field_extractor!(extract_string, as_string, &str, "a string");
+    impl_field_extractor!(extract_bytes32, as_bytes32, [u8; 32], "bytes32");
+    impl_field_extractor!(extract_bytes, as_bytes, &[u8], "bytes");
 
     /// Extract a u64 field with flexible parsing (handles i64, u64, or numeric strings).
     /// This is useful for timestamp fields that may come from different encoding formats.

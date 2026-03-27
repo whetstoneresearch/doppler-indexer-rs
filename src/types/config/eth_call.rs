@@ -802,84 +802,40 @@ impl<'de> Deserialize<'de> for EvmType {
     }
 }
 
+/// Parse a ParamValue as an unsigned integer with the given bit width.
+fn parse_uint_value(value: &ParamValue, bits: usize) -> Result<DynSolValue, ParamError> {
+    let s = value.as_string()?;
+    let val = parse_uint256(&s)?;
+    Ok(DynSolValue::Uint(val, bits))
+}
+
+/// Parse a ParamValue as a signed integer with the given bit width.
+fn parse_int_value(value: &ParamValue, bits: usize) -> Result<DynSolValue, ParamError> {
+    let s = value.as_string()?;
+    let val = parse_int256(&s)?;
+    Ok(DynSolValue::Int(val, bits))
+}
+
 impl EvmType {
     pub fn parse_value(&self, value: &ParamValue) -> Result<DynSolValue, ParamError> {
         match self {
-            EvmType::Uint256 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 256))
-            }
-            EvmType::Uint128 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 128))
-            }
-            EvmType::Uint80 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 80))
-            }
-            EvmType::Uint64 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 64))
-            }
-            EvmType::Uint32 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 32))
-            }
-            EvmType::Uint24 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 24))
-            }
-            EvmType::Uint16 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 16))
-            }
-            EvmType::Uint8 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 8))
-            }
-            EvmType::Int256 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 256))
-            }
-            EvmType::Int128 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 128))
-            }
-            EvmType::Int64 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 64))
-            }
-            EvmType::Int32 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 32))
-            }
-            EvmType::Int24 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 24))
-            }
-            EvmType::Int16 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 16))
-            }
-            EvmType::Int8 => {
-                let s = value.as_string()?;
-                let val = parse_int256(&s)?;
-                Ok(DynSolValue::Int(val, 8))
-            }
+            EvmType::Uint256 => parse_uint_value(value, 256),
+            EvmType::Uint160 => parse_uint_value(value, 160),
+            EvmType::Uint128 => parse_uint_value(value, 128),
+            EvmType::Uint96 => parse_uint_value(value, 96),
+            EvmType::Uint80 => parse_uint_value(value, 80),
+            EvmType::Uint64 => parse_uint_value(value, 64),
+            EvmType::Uint32 => parse_uint_value(value, 32),
+            EvmType::Uint24 => parse_uint_value(value, 24),
+            EvmType::Uint16 => parse_uint_value(value, 16),
+            EvmType::Uint8 => parse_uint_value(value, 8),
+            EvmType::Int256 => parse_int_value(value, 256),
+            EvmType::Int128 => parse_int_value(value, 128),
+            EvmType::Int64 => parse_int_value(value, 64),
+            EvmType::Int32 => parse_int_value(value, 32),
+            EvmType::Int24 => parse_int_value(value, 24),
+            EvmType::Int16 => parse_int_value(value, 16),
+            EvmType::Int8 => parse_int_value(value, 8),
             EvmType::Address => {
                 let s = value.as_string()?;
                 let addr = s
@@ -905,16 +861,6 @@ impl EvmType {
             EvmType::String => {
                 let s = value.as_string()?;
                 Ok(DynSolValue::String(s))
-            }
-            EvmType::Uint160 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 160))
-            }
-            EvmType::Uint96 => {
-                let s = value.as_string()?;
-                let val = parse_uint256(&s)?;
-                Ok(DynSolValue::Uint(val, 96))
             }
             // Named types delegate to their inner type
             EvmType::Named { inner, .. } => inner.parse_value(value),
