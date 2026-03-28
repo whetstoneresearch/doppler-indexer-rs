@@ -174,7 +174,7 @@ pub async fn decode_eth_calls_live(
                     orphaned.len()
                 );
                 for block_number in orphaned {
-                    let _ = state.live_storage.delete_all_decoded_calls(block_number);
+                    let _ = state.live_storage.delete_all_decoded_calls(block_number).await;
                 }
             }
             Some(DecoderMessage::EthCallsBlockComplete {
