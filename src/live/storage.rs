@@ -53,7 +53,8 @@ pub enum StorageError {
 /// Generate path, write, read, and delete methods for a bincode storage entity.
 ///
 /// All generated public methods are `async fn`, wrapping blocking I/O via
-/// `write_bincode_async`, `read_bincode_async`, and `safe_delete_async`.
+/// `spawn_blocking` with `write_bincode_sync` (which uses `serialize_into`
+/// to stream directly to disk without an intermediate `Vec<u8>` buffer).
 ///
 /// Two forms:
 /// - `slice`: write takes `&[T]`, read returns `Vec<T>`
@@ -71,7 +72,9 @@ macro_rules! storage_entity {
                 block_number: u64,
                 data: &[$type],
             ) -> Result<(), StorageError> {
-                write_bincode_async(&self.[<$name _path>](block_number), data).await
+                let path = self.[<$name _path>](block_number);
+                let owned = data.to_vec();
+                tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
             }
 
             pub async fn [<read_ $name>](
@@ -100,7 +103,9 @@ macro_rules! storage_entity {
                 block_number: u64,
                 data: &$type,
             ) -> Result<(), StorageError> {
-                write_bincode_async(&self.[<$name _path>](block_number), data).await
+                let path = self.[<$name _path>](block_number);
+                let owned = data.clone();
+                tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
             }
 
             pub async fn [<read_ $name>](
@@ -184,7 +189,8 @@ impl LiveStorage {
     /// Write a live block to storage.
     pub async fn write_block(&self, block: &LiveBlock) -> Result<(), StorageError> {
         let path = self.block_path(block.number);
-        write_bincode_async(&path, block).await
+        let owned = block.clone();
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
     }
 
     /// Read a live block from storage.
@@ -326,7 +332,8 @@ impl LiveStorage {
         logs: &[LiveDecodedLog],
     ) -> Result<(), StorageError> {
         let path = self.decoded_logs_path(block_number, contract_name, event_name);
-        write_bincode_async(&path, logs).await
+        let owned = logs.to_vec();
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
     }
 
     /// Read decoded logs for a specific event type.
@@ -399,7 +406,8 @@ impl LiveStorage {
         calls: &[LiveDecodedCall],
     ) -> Result<(), StorageError> {
         let path = self.decoded_calls_path(block_number, contract_name, function_name);
-        write_bincode_async(&path, calls).await
+        let owned = calls.to_vec();
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
     }
 
     /// Read decoded eth_calls for a specific function.
@@ -449,7 +457,8 @@ impl LiveStorage {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join(format!("{}_event.bin", function_name));
-        write_bincode_async(&path, calls).await
+        let owned = calls.to_vec();
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
     }
 
     /// Read decoded event-triggered eth_calls.
@@ -478,7 +487,8 @@ impl LiveStorage {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join("_once.bin");
-        write_bincode_async(&path, calls).await
+        let owned = calls.to_vec();
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
     }
 
     /// Read decoded "once" calls.
@@ -527,7 +537,8 @@ impl LiveStorage {
             return Ok(());
         }
         let path = self.snapshots_path(block_number);
-        write_bincode_async(&path, snapshots).await
+        let owned = snapshots.to_vec();
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
     }
 
     /// Read upsert snapshots for a block.
@@ -645,21 +656,13 @@ impl LiveStorage {
 // Helper functions
 // =========================================================================
 
-/// Async wrapper: serialize data to bytes, then write to disk in a blocking task.
+/// Synchronous helper: serialize data directly to disk via BufWriter (no intermediate
+/// `Vec<u8>` buffer). Uses `serialize_into` to stream the serialized form straight to
+/// the file, keeping peak RSS low for large artifacts.
 ///
-/// Serialization happens outside the blocking closure so T doesn't need to be Send.
-/// The blocking closure handles mkdir, file write, flush, sync_all, and rename.
-async fn write_bincode_async<T: Serialize + ?Sized>(
-    path: &Path,
-    data: &T,
-) -> Result<(), StorageError> {
-    let bytes = bincode::serialize(data)?;
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || write_bytes_sync(&path, &bytes)).await?
-}
-
-/// Synchronous helper: write pre-serialized bytes to a file atomically.
-fn write_bytes_sync(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+/// All callers clone/own the data and move it into `spawn_blocking`, so serialization
+/// never runs on the async runtime.
+fn write_bincode_sync<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -676,7 +679,7 @@ fn write_bytes_sync(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let mut writer = BufWriter::new(file);
 
     let result = (|| -> Result<(), StorageError> {
-        writer.write_all(bytes)?;
+        bincode::serialize_into(&mut writer, data)?;
         writer.flush()?;
         writer
             .into_inner()
