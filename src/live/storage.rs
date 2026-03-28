@@ -60,7 +60,7 @@ pub enum StorageError {
 /// - `slice`: write takes `&[T]`, read returns `Vec<T>`
 /// - `ref`: write takes `&T`, read returns `T`
 macro_rules! storage_entity {
-    // Slice variant: write_foo(block_number, &[T]), read_foo(block_number) -> Vec<T>
+    // Slice variant: write_foo(block_number, Vec<T>), read_foo(block_number) -> Vec<T>
     (slice $name:ident, $type:ty, $subdir:expr) => {
         paste::paste! {
             fn [<$name _path>](&self, block_number: u64) -> PathBuf {
@@ -70,11 +70,10 @@ macro_rules! storage_entity {
             pub async fn [<write_ $name>](
                 &self,
                 block_number: u64,
-                data: &[$type],
+                data: Vec<$type>,
             ) -> Result<(), StorageError> {
                 let path = self.[<$name _path>](block_number);
-                let owned = data.to_vec();
-                tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+                tokio::task::spawn_blocking(move || write_bincode_sync(&path, &data)).await?
             }
 
             pub async fn [<read_ $name>](
@@ -91,7 +90,7 @@ macro_rules! storage_entity {
             }
         }
     };
-    // Ref variant: write_foo(block_number, &T), read_foo(block_number) -> T
+    // Ref variant: write_foo(block_number, T), read_foo(block_number) -> T
     (ref $name:ident, $type:ty, $subdir:expr) => {
         paste::paste! {
             fn [<$name _path>](&self, block_number: u64) -> PathBuf {
@@ -101,11 +100,10 @@ macro_rules! storage_entity {
             pub async fn [<write_ $name>](
                 &self,
                 block_number: u64,
-                data: &$type,
+                data: $type,
             ) -> Result<(), StorageError> {
                 let path = self.[<$name _path>](block_number);
-                let owned = data.clone();
-                tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+                tokio::task::spawn_blocking(move || write_bincode_sync(&path, &data)).await?
             }
 
             pub async fn [<read_ $name>](
@@ -187,10 +185,9 @@ impl LiveStorage {
     }
 
     /// Write a live block to storage.
-    pub async fn write_block(&self, block: &LiveBlock) -> Result<(), StorageError> {
+    pub async fn write_block(&self, block: LiveBlock) -> Result<(), StorageError> {
         let path = self.block_path(block.number);
-        let owned = block.clone();
-        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &block)).await?
     }
 
     /// Read a live block from storage.
@@ -329,11 +326,10 @@ impl LiveStorage {
         block_number: u64,
         contract_name: &str,
         event_name: &str,
-        logs: &[LiveDecodedLog],
+        logs: Vec<LiveDecodedLog>,
     ) -> Result<(), StorageError> {
         let path = self.decoded_logs_path(block_number, contract_name, event_name);
-        let owned = logs.to_vec();
-        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &logs)).await?
     }
 
     /// Read decoded logs for a specific event type.
@@ -403,11 +399,10 @@ impl LiveStorage {
         block_number: u64,
         contract_name: &str,
         function_name: &str,
-        calls: &[LiveDecodedCall],
+        calls: Vec<LiveDecodedCall>,
     ) -> Result<(), StorageError> {
         let path = self.decoded_calls_path(block_number, contract_name, function_name);
-        let owned = calls.to_vec();
-        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &calls)).await?
     }
 
     /// Read decoded eth_calls for a specific function.
@@ -452,13 +447,12 @@ impl LiveStorage {
         block_number: u64,
         contract_name: &str,
         function_name: &str,
-        calls: &[LiveDecodedEventCall],
+        calls: Vec<LiveDecodedEventCall>,
     ) -> Result<(), StorageError> {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join(format!("{}_event.bin", function_name));
-        let owned = calls.to_vec();
-        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &calls)).await?
     }
 
     /// Read decoded event-triggered eth_calls.
@@ -482,13 +476,12 @@ impl LiveStorage {
         &self,
         block_number: u64,
         contract_name: &str,
-        calls: &[LiveDecodedOnceCall],
+        calls: Vec<LiveDecodedOnceCall>,
     ) -> Result<(), StorageError> {
         let path = self
             .decoded_calls_dir(block_number, contract_name)
             .join("_once.bin");
-        let owned = calls.to_vec();
-        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &calls)).await?
     }
 
     /// Read decoded "once" calls.
@@ -527,18 +520,17 @@ impl LiveStorage {
             .join(format!("snapshots/{}.bin", block_number))
     }
 
-    /// Write upsert snapshots for a block. No-op when the slice is empty.
+    /// Write upsert snapshots for a block. No-op when the vec is empty.
     pub async fn write_snapshots(
         &self,
         block_number: u64,
-        snapshots: &[LiveUpsertSnapshot],
+        snapshots: Vec<LiveUpsertSnapshot>,
     ) -> Result<(), StorageError> {
         if snapshots.is_empty() {
             return Ok(());
         }
         let path = self.snapshots_path(block_number);
-        let owned = snapshots.to_vec();
-        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &owned)).await?
+        tokio::task::spawn_blocking(move || write_bincode_sync(&path, &snapshots)).await?
     }
 
     /// Read upsert snapshots for a block.
@@ -1022,11 +1014,13 @@ mod tests {
             tx_hashes: vec![[3u8; 32], [4u8; 32]],
         };
 
-        storage.write_block(&block).await.unwrap();
+        let expected_number = block.number;
+        let expected_hash = block.hash;
+        storage.write_block(block).await.unwrap();
         let read_block = storage.read_block(12345).await.unwrap();
 
-        assert_eq!(read_block.number, block.number);
-        assert_eq!(read_block.hash, block.hash);
+        assert_eq!(read_block.number, expected_number);
+        assert_eq!(read_block.hash, expected_hash);
         assert_eq!(read_block.tx_hashes.len(), 2);
     }
 
@@ -1062,7 +1056,7 @@ mod tests {
                 timestamp: 0,
                 tx_hashes: vec![],
             };
-            storage.write_block(&block).await.unwrap();
+            storage.write_block(block).await.unwrap();
         }
 
         let blocks = storage.list_blocks().await.unwrap();
@@ -1080,7 +1074,7 @@ mod tests {
             timestamp: 0,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
         storage
             .write_status(999, &LiveBlockStatus::default())
             .await
@@ -1104,7 +1098,7 @@ mod tests {
                 timestamp: 0,
                 tx_hashes: vec![],
             };
-            storage.write_block(&block).await.unwrap();
+            storage.write_block(block).await.unwrap();
         }
 
         let gaps = storage.find_gaps().await.unwrap();
@@ -1125,7 +1119,7 @@ mod tests {
                 timestamp: 0,
                 tx_hashes: vec![],
             };
-            storage.write_block(&block).await.unwrap();
+            storage.write_block(block).await.unwrap();
         }
 
         let gaps = storage.find_gaps().await.unwrap();
@@ -1150,7 +1144,7 @@ mod tests {
             timestamp: 0,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let gaps = storage.find_gaps().await.unwrap();
         assert!(gaps.is_empty());
@@ -1168,7 +1162,7 @@ mod tests {
             timestamp: 1234567890,
             tx_hashes: vec![[5u8; 32]],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         // Create logs with transaction_hash field
         let logs = vec![
@@ -1190,7 +1184,7 @@ mod tests {
             },
         ];
 
-        storage.write_logs(1000, &logs).await.unwrap();
+        storage.write_logs(1000, logs).await.unwrap();
         let read_logs = storage.read_logs(1000).await.unwrap();
 
         assert_eq!(read_logs.len(), 2);

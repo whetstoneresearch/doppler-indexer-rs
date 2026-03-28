@@ -84,7 +84,7 @@ pub(super) async fn handle_event_calls_live(
                 range_start,
                 contract_name,
                 function_name,
-                &decoded_event_calls,
+                decoded_event_calls,
             )
             .await
         {

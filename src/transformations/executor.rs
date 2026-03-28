@@ -418,7 +418,7 @@ pub(crate) async fn execute_with_snapshot_capture(
             .unwrap_or_default();
         all_snapshots.extend(snapshots);
 
-        if let Err(e) = storage.write_snapshots(block_number, &all_snapshots).await {
+        if let Err(e) = storage.write_snapshots(block_number, all_snapshots).await {
             tracing::warn!(
                 "Failed to write upsert snapshots for block {}: {}",
                 block_number,

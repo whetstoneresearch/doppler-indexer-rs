@@ -88,7 +88,7 @@ pub(super) async fn handle_once_calls_live(
 
     if !decoded_once_calls.is_empty() {
         if let Err(e) = live_storage
-            .write_decoded_once_calls(range_start, contract_name, &decoded_once_calls)
+            .write_decoded_once_calls(range_start, contract_name, decoded_once_calls)
             .await
         {
             tracing::warn!(

@@ -696,7 +696,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -738,7 +738,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -780,7 +780,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -819,7 +819,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -870,7 +870,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -921,7 +921,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -971,7 +971,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -1020,9 +1020,9 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
-        storage.write_receipts(100, &[]).await.unwrap();
-        storage.write_logs(100, &[]).await.unwrap();
+        storage.write_block(block).await.unwrap();
+        storage.write_receipts(100, vec![]).await.unwrap();
+        storage.write_logs(100, vec![]).await.unwrap();
 
         // Verify no status file exists
         assert!(storage.read_status(100).await.is_err());
@@ -1060,9 +1060,9 @@ mod tests {
             timestamp: 1010,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).await.unwrap();
-        storage.write_receipts(101, &[]).await.unwrap();
-        storage.write_logs(101, &[]).await.unwrap();
+        storage.write_block(block).await.unwrap();
+        storage.write_receipts(101, vec![]).await.unwrap();
+        storage.write_logs(101, vec![]).await.unwrap();
 
         let service = LiveCatchupService {
             storage: storage.clone(),

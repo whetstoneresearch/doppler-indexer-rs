@@ -1119,15 +1119,16 @@ pub(crate) async fn process_logs_live(
     for ((contract_name, event_name), (records, _parsed_event)) in &decoded_by_event {
         let live_records: Vec<LiveDecodedLog> =
             records.iter().map(convert_to_live_decoded_log).collect();
+        let live_record_count = live_records.len();
 
         storage
-            .write_decoded_logs(block_number, contract_name, event_name, &live_records)
+            .write_decoded_logs(block_number, contract_name, event_name, live_records)
             .await
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
 
         tracing::debug!(
             "Wrote {} decoded {} events to live storage for block {}",
-            live_records.len(),
+            live_record_count,
             event_name,
             block_number
         );

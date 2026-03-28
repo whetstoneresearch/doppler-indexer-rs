@@ -1042,7 +1042,7 @@ mod tests {
 
         for block_number in [0_u64, 1, 10] {
             storage
-                .write_block(&LiveBlock {
+                .write_block(LiveBlock {
                     number: block_number,
                     hash: [block_number as u8; 32],
                     parent_hash: [block_number.saturating_sub(1) as u8; 32],
@@ -1122,7 +1122,7 @@ mod tests {
         storage.ensure_dirs().await.unwrap();
 
         storage
-            .write_block(&LiveBlock {
+            .write_block(LiveBlock {
                 number: 100,
                 hash: [1; 32],
                 parent_hash: [0; 32],
@@ -1181,7 +1181,7 @@ mod tests {
         storage.ensure_dirs().await.unwrap();
 
         storage
-            .write_block(&LiveBlock {
+            .write_block(LiveBlock {
                 number: 101,
                 hash: [2; 32],
                 parent_hash: [1; 32],

@@ -362,57 +362,122 @@ impl LiveCollector {
         }
 
         // Store the block header
-        self.storage.write_block(&block).await?;
+        self.storage.write_block(block).await?;
         self.storage
             .write_status(block_number, &LiveBlockStatus::collected())
             .await?;
 
         // Fetch full block with transactions
-        let full_block = self.fetch_full_block(block_number).await?;
+        let updated_block = self.fetch_full_block(block_number).await?;
 
-        // Use the fetched block with all its transaction hashes
-        let updated_block = full_block;
+        // Extract metadata before moving the block into storage
+        let tx_count = updated_block.tx_hashes.len();
+        let block_timestamp = updated_block.timestamp;
+        // Clone for channel send and downstream use before writing
+        let block_for_channel = updated_block.clone();
 
-        self.storage.write_block(&updated_block).await?;
+        self.storage.write_block(updated_block).await?;
 
         // Update status
         let mut status = self.storage.read_status(block_number).await?;
         status.block_fetched = true;
         self.storage.write_status(block_number, &status).await?;
 
-        tracing::info!(
-            "Block {} collected: {} txs",
-            block_number,
-            updated_block.tx_hashes.len()
-        );
+        tracing::info!("Block {} collected: {} txs", block_number, tx_count);
 
         // Fetch receipts and logs
         let (receipts, logs) = self.fetch_receipts_and_logs(block_number).await?;
 
-        self.storage.write_receipts(block_number, &receipts).await?;
-        self.storage.write_logs(block_number, &logs).await?;
+        let log_count = logs.len();
+
+        // Extract factory addresses before moving logs into storage
+        let factory_addresses = self.extract_factory_addresses(&logs, block_timestamp);
+        let has_factory_addresses = !factory_addresses.addresses_by_collection.is_empty();
+
+        // Build decoder data before moving logs/factories into storage
+        let log_data_for_decoder: Option<Vec<LogData>> = if log_decoder_tx.is_some() {
+            Some(
+                logs.iter()
+                    .map(|log| LogData {
+                        block_number,
+                        block_timestamp,
+                        transaction_hash: B256::from(log.transaction_hash),
+                        log_index: log.log_index,
+                        address: log.address,
+                        topics: log.topics.clone(),
+                        data: log.data.clone(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        // Build factory decoder addresses before moving factory_addresses into storage
+        let factory_addrs_for_decoder: Option<HashMap<String, Vec<Address>>> =
+            if has_factory_addresses && log_decoder_tx.is_some() {
+                Some(
+                    factory_addresses
+                        .addresses_by_collection
+                        .iter()
+                        .map(|(name, addrs)| {
+                            (
+                                name.clone(),
+                                addrs.iter().map(|(_, addr)| Address::from(*addr)).collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
+        // Collect eth_calls before moving logs (needs &logs and &factory_addresses)
+        let batch_result = if self.eth_call_collector.is_some() {
+            if let Some(ref mut eth_collector) = self.eth_call_collector {
+                eth_collector.update_factory_addresses(&factory_addresses);
+            }
+            let eth_collector = self
+                .eth_call_collector
+                .as_ref()
+                .expect("checked eth_call_collector above");
+            Some(
+                eth_collector
+                    .collect_for_block(
+                        block_number,
+                        block_timestamp,
+                        &logs,
+                        &factory_addresses,
+                        false,
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        // Now write receipts, logs, and factories — moving owned data into storage
+        self.storage.write_receipts(block_number, receipts).await?;
+        self.storage.write_logs(block_number, logs).await?;
 
         tracing::info!(
             "Block {} receipts collected: {} logs",
             block_number,
-            logs.len()
+            log_count
         );
 
-        // Extract factory addresses if we have matchers configured
-        let factory_addresses = self.extract_factory_addresses(&logs, updated_block.timestamp);
-        let has_factory_addresses = !factory_addresses.addresses_by_collection.is_empty();
-
         if has_factory_addresses {
+            let factory_count: usize = factory_addresses
+                .addresses_by_collection
+                .values()
+                .map(|v| v.len())
+                .sum();
             self.storage
-                .write_factories(block_number, &factory_addresses)
+                .write_factories(block_number, factory_addresses)
                 .await?;
             tracing::debug!(
                 "Extracted {} factory addresses from block {}",
-                factory_addresses
-                    .addresses_by_collection
-                    .values()
-                    .map(|v| v.len())
-                    .sum::<usize>(),
+                factory_count,
                 block_number
             );
         }
@@ -427,25 +492,14 @@ impl LiveCollector {
 
         // Send to live message channel
         live_tx
-            .send(LiveMessage::Block(updated_block.clone()))
+            .send(LiveMessage::Block(block_for_channel))
             .await
             .map_err(|_| CollectorError::ChannelClosed)?;
 
         // Send logs to decoder if configured
         if let Some(decoder_tx) = log_decoder_tx {
             // Send factory addresses first so decoder can use them when processing logs
-            if has_factory_addresses {
-                let factory_addrs: HashMap<String, Vec<Address>> = factory_addresses
-                    .addresses_by_collection
-                    .iter()
-                    .map(|(name, addrs)| {
-                        (
-                            name.clone(),
-                            addrs.iter().map(|(_, addr)| Address::from(*addr)).collect(),
-                        )
-                    })
-                    .collect();
-
+            if let Some(factory_addrs) = factory_addrs_for_decoder {
                 if let Err(e) = decoder_tx
                     .send(DecoderMessage::FactoryAddresses {
                         range_start: block_number,
@@ -462,35 +516,24 @@ impl LiveCollector {
                 }
             }
 
-            // Send logs (even if empty, for consistency)
-            let log_data: Vec<LogData> = logs
-                .iter()
-                .map(|log| LogData {
-                    block_number,
-                    block_timestamp: updated_block.timestamp,
-                    transaction_hash: B256::from(log.transaction_hash),
-                    log_index: log.log_index,
-                    address: log.address,
-                    topics: log.topics.clone(),
-                    data: log.data.clone(),
-                })
-                .collect();
-
-            if let Err(e) = decoder_tx
-                .send(DecoderMessage::LogsReady {
-                    range_start: block_number,
-                    range_end: block_number + 1, // Exclusive end for single block
-                    logs: log_data,
-                    live_mode: true, // Live mode: write to bincode
-                    has_factory_matchers: !self.factory_matchers.is_empty(),
-                })
-                .await
-            {
-                tracing::warn!(
-                    "Failed to send logs for block {} to decoder: {}",
-                    block_number,
-                    e
-                );
+            // Send pre-built log data to decoder
+            if let Some(log_data) = log_data_for_decoder {
+                if let Err(e) = decoder_tx
+                    .send(DecoderMessage::LogsReady {
+                        range_start: block_number,
+                        range_end: block_number + 1, // Exclusive end for single block
+                        logs: log_data,
+                        live_mode: true, // Live mode: write to bincode
+                        has_factory_matchers: !self.factory_matchers.is_empty(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to send logs for block {} to decoder: {}",
+                        block_number,
+                        e
+                    );
+                }
             }
         }
 
@@ -501,29 +544,8 @@ impl LiveCollector {
             self.storage.write_status(block_number, &status).await?;
         }
 
-        // Collect eth_calls if configured
-        if self.eth_call_collector.is_some() {
-            // Update factory addresses in collector
-            if let Some(ref mut eth_collector) = self.eth_call_collector {
-                eth_collector.update_factory_addresses(&factory_addresses);
-            }
-
-            // Collect eth_calls for this block
-            let batch_result = {
-                let eth_collector = self
-                    .eth_call_collector
-                    .as_ref()
-                    .expect("checked eth_call_collector above");
-                eth_collector
-                    .collect_for_block(
-                        block_number,
-                        updated_block.timestamp,
-                        &logs,
-                        &factory_addresses,
-                        false,
-                    )
-                    .await
-            };
+        // Commit eth_calls if we collected them
+        if let Some(batch_result) = batch_result {
 
             match batch_result {
                 Ok(batch) => {
@@ -1041,10 +1063,11 @@ impl LiveCollector {
 
         // Update reorg detector so the first live head after restart is
         // compared against the canonical hash, not the stale pre-catchup one.
+        let block_hash = full_block.hash;
         self.reorg_detector
-            .update_block_hash(block_number, full_block.hash);
+            .update_block_hash(block_number, block_hash);
 
-        self.storage.write_block(&full_block).await?;
+        self.storage.write_block(full_block).await?;
 
         let mut status = self.storage.read_status(block_number).await?;
         status.collected = true;
@@ -1069,22 +1092,9 @@ impl LiveCollector {
         // Harmless if already reset by reset_downstream_from_block_fetch.
         self.reset_downstream_from_logs(block_number).await?;
 
-        self.storage.write_receipts(block_number, &receipts).await?;
-        self.storage.write_logs(block_number, &logs).await?;
-
+        // Extract factory addresses and dispatch logs before moving data into storage
         let factory_addresses = self.extract_factory_addresses(&logs, block.timestamp);
-        if !factory_addresses.addresses_by_collection.is_empty() {
-            self.storage
-                .write_factories(block_number, &factory_addresses)
-                .await?;
-        }
-
-        let mut status = self.storage.read_status(block_number).await?;
-        status.receipts_collected = true;
-        status.logs_collected = true;
-        status.factories_extracted = true;
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status).await?;
+        let has_factories = !factory_addresses.addresses_by_collection.is_empty();
 
         self.dispatch_logs_for_block(
             block_number,
@@ -1094,6 +1104,23 @@ impl LiveCollector {
             log_decoder_tx,
         )
         .await?;
+
+        // Now write to storage, moving owned data
+        self.storage.write_receipts(block_number, receipts).await?;
+        self.storage.write_logs(block_number, logs).await?;
+
+        if has_factories {
+            self.storage
+                .write_factories(block_number, factory_addresses)
+                .await?;
+        }
+
+        let mut status = self.storage.read_status(block_number).await?;
+        status.receipts_collected = true;
+        status.logs_collected = true;
+        status.factories_extracted = true;
+        status.apply_expectations(&self.expectations);
+        self.storage.write_status(block_number, &status).await?;
 
         if log_decoder_tx.is_none() {
             let mut status = self.storage.read_status(block_number).await?;
@@ -1188,9 +1215,19 @@ impl LiveCollector {
         let mut status = self.storage.read_status(block_number).await?;
         status.eth_calls_collected = true;
 
-        if !batch.calls.is_empty() {
+        // Apply batch state before taking fields out
+        if let Some(ref mut eth_collector) = self.eth_call_collector {
+            eth_collector.apply_collected_batch(&batch);
+        }
+
+        let has_calls = !batch.calls.is_empty();
+        let mut batch = batch;
+        let calls = std::mem::take(&mut batch.calls);
+        let decoder_messages = std::mem::take(&mut batch.decoder_messages);
+
+        if has_calls {
             self.storage
-                .write_eth_calls(block_number, &batch.calls)
+                .write_eth_calls(block_number, calls)
                 .await?;
         } else {
             status.eth_calls_decoded = true;
@@ -1203,11 +1240,7 @@ impl LiveCollector {
         status.apply_expectations(&self.expectations);
         self.storage.write_status(block_number, &status).await?;
 
-        if let Some(ref mut eth_collector) = self.eth_call_collector {
-            eth_collector.apply_collected_batch(&batch);
-        }
-
-        self.dispatch_eth_call_messages(block_number, batch.decoder_messages, eth_call_decoder_tx)
+        self.dispatch_eth_call_messages(block_number, decoder_messages, eth_call_decoder_tx)
             .await;
 
         if retry_transform_after_decode && eth_call_decoder_tx.is_none() {
@@ -1723,7 +1756,7 @@ mod tests {
                 block_number,
                 "contract",
                 "foo",
-                &[LiveDecodedCall {
+                vec![LiveDecodedCall {
                     block_number,
                     block_timestamp: 1_000,
                     contract_address: [9u8; 20],
