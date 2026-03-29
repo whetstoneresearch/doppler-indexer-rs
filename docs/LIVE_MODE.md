@@ -553,7 +553,7 @@ On startup, `ensure_dirs()` cleans up any leftover `.tmp` files from interrupted
 
 ### Atomic Status Updates
 
-Status files support atomic read-modify-write via `update_status_atomic()`, which uses a separate `.json.lock` file with exclusive file locking to prevent concurrent updates from overwriting each other:
+All status mutations (except the initial `write_status` that creates the file) go through `update_status_atomic()`, which uses a separate `.json.lock` file with exclusive file locking to prevent concurrent updates from overwriting each other:
 
 ```rust
 storage.update_status_atomic(block_number, |status| {
