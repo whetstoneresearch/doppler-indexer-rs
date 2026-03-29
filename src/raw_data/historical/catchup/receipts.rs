@@ -5,12 +5,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::raw_data::historical::blocks::{
-    get_existing_block_ranges, read_block_info_from_parquet,
+    get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
 use crate::raw_data::historical::receipts::{
-    build_receipt_schema, process_range, scan_existing_logs_files, scan_existing_parquet_files,
-    send_range_complete, BlockInfo, ChannelMetrics, ChannelMetricsState, EventTriggerMatcher,
-    EventTriggerMessage, LogMessage, ReceiptCollectionError, ReceiptOutputChannels,
+    build_receipt_schema, process_range, scan_existing_logs_files_async,
+    scan_existing_parquet_files_async, send_range_complete, BlockInfo, ChannelMetrics,
+    ChannelMetricsState, EventTriggerMatcher, EventTriggerMessage, LogMessage,
+    ReceiptCollectionError, ReceiptOutputChannels,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::{raw_logs_dir, raw_receipts_dir};
@@ -43,14 +44,14 @@ pub async fn collect_receipts(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<ReceiptsCatchupState, ReceiptCollectionError> {
     let output_dir = raw_receipts_dir(&chain.name);
-    std::fs::create_dir_all(&output_dir)?;
+    tokio::fs::create_dir_all(&output_dir).await?;
 
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
     let block_receipt_concurrency = raw_data_config.block_receipt_concurrency.unwrap_or(10);
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
 
-    let existing_files = scan_existing_parquet_files(&output_dir);
+    let existing_files = scan_existing_parquet_files_async(output_dir.clone()).await?;
 
     let has_factories = factory_log_tx.is_some();
 
@@ -76,12 +77,16 @@ pub async fn collect_receipts(
     // Also check for missing logs files - if receipts exist but logs don't, we
     // need to re-process to regenerate the logs data
     // =========================================================================
-    let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
+    let block_ranges = get_existing_block_ranges_async(
+        chain.name.clone(),
+        s3_manifest.as_ref().cloned(),
+    )
+    .await;
     let mut catchup_count = 0;
 
     // Check existing logs files
     let logs_dir = raw_logs_dir(&chain.name);
-    let existing_logs_files = scan_existing_logs_files(&logs_dir);
+    let existing_logs_files = scan_existing_logs_files_async(logs_dir).await?;
 
     // Note: Factory catchup is handled by the factories module reading from logs files directly.
     // Receipts catchup only needs to check for receipts and logs.
@@ -162,17 +167,18 @@ pub async fn collect_receipts(
         }
 
         // Read block info from the existing parquet file
-        let block_infos = match read_block_info_from_parquet(&block_range.file_path) {
-            Ok(infos) => infos,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read block info from {}: {}",
-                    block_range.file_path.display(),
-                    e
-                );
-                continue;
-            }
-        };
+        let block_infos =
+            match read_block_info_from_parquet_async(block_range.file_path.clone()).await {
+                Ok(infos) => infos,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read block info from {}: {}",
+                        block_range.file_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
 
         if block_infos.is_empty() {
             continue;

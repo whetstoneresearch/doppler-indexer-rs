@@ -209,14 +209,14 @@ pub(crate) async fn process_range(
                     data: l.data,
                 })
                 .collect();
-            let schema_clone = schema.clone();
-            let fields_vec = fields.to_vec();
             let output_path = output_dir.join(range.file_name("logs"));
-            tokio::task::spawn_blocking(move || {
-                write_minimal_logs_to_parquet(&records, &schema_clone, &fields_vec, &output_path)
-            })
-            .await
-            .map_err(|e| LogCollectionError::JoinError(e.to_string()))??;
+            write_minimal_logs_to_parquet_async(
+                records,
+                schema.clone(),
+                fields.to_vec(),
+                output_path,
+            )
+            .await?;
         }
         None => {
             let records: Vec<FullLogRecord> = logs
@@ -231,13 +231,8 @@ pub(crate) async fn process_range(
                     data: l.data,
                 })
                 .collect();
-            let schema_clone = schema.clone();
             let output_path = output_dir.join(range.file_name("logs"));
-            tokio::task::spawn_blocking(move || {
-                write_full_logs_to_parquet(&records, &schema_clone, &output_path)
-            })
-            .await
-            .map_err(|e| LogCollectionError::JoinError(e.to_string()))??;
+            write_full_logs_to_parquet_async(records, schema.clone(), output_path).await?;
         }
     }
 
@@ -465,4 +460,29 @@ pub(crate) fn write_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+pub(crate) async fn write_minimal_logs_to_parquet_async(
+    records: Vec<MinimalLogRecord>,
+    schema: Arc<Schema>,
+    fields: Vec<LogField>,
+    output_path: PathBuf,
+) -> Result<(), LogCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_minimal_logs_to_parquet(&records, &schema, &fields, &output_path)
+    })
+    .await
+    .map_err(|e| LogCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_full_logs_to_parquet_async(
+    records: Vec<FullLogRecord>,
+    schema: Arc<Schema>,
+    output_path: PathBuf,
+) -> Result<(), LogCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_full_logs_to_parquet(&records, &schema, &output_path)
+    })
+    .await
+    .map_err(|e| LogCollectionError::JoinError(e.to_string()))?
 }

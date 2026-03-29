@@ -224,7 +224,7 @@ pub(crate) async fn process_token_range_multicall(
                 .output_dir
                 .join(&group.output_name)
                 .join(&group.function_name);
-            std::fs::create_dir_all(&sub_dir)?;
+            tokio::fs::create_dir_all(&sub_dir).await?;
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
@@ -368,7 +368,7 @@ pub(crate) async fn process_token_range(
         all_results.sort_by_key(|r| (r.block_number, r.contract_address));
 
         let sub_dir = ctx.output_dir.join(&output_name).join(function_name);
-        std::fs::create_dir_all(&sub_dir)?;
+        tokio::fs::create_dir_all(&sub_dir).await?;
 
         let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 

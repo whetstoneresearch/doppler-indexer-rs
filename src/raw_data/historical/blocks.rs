@@ -459,6 +459,50 @@ pub fn get_existing_block_ranges(
     ranges
 }
 
+pub(crate) async fn write_minimal_blocks_to_parquet_async(
+    records: Vec<MinimalBlockRecord>,
+    schema: Arc<Schema>,
+    fields: Vec<BlockField>,
+    output_path: PathBuf,
+) -> Result<(), BlockCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_minimal_blocks_to_parquet(&records, &schema, &fields, &output_path)
+    })
+    .await
+    .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_full_blocks_to_parquet_async(
+    records: Vec<FullBlockRecord>,
+    schema: Arc<Schema>,
+    output_path: PathBuf,
+) -> Result<(), BlockCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_full_blocks_to_parquet(&records, &schema, &output_path)
+    })
+    .await
+    .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?
+}
+
+pub async fn get_existing_block_ranges_async(
+    chain_name: String,
+    s3_manifest: Option<S3Manifest>,
+) -> Vec<ExistingBlockRange> {
+    tokio::task::spawn_blocking(move || {
+        get_existing_block_ranges(&chain_name, s3_manifest.as_ref())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+pub async fn read_block_info_from_parquet_async(
+    file_path: PathBuf,
+) -> Result<Vec<BlockInfoForDownstream>, BlockCollectionError> {
+    tokio::task::spawn_blocking(move || read_block_info_from_parquet(&file_path))
+        .await
+        .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?
+}
+
 pub fn read_block_info_from_parquet(
     file_path: &Path,
 ) -> Result<Vec<BlockInfoForDownstream>, BlockCollectionError> {

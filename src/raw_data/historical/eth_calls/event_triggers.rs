@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy::dyn_abi::DynSolValue;
@@ -505,7 +505,8 @@ pub(crate) async fn process_event_triggers(
                 function_name,
                 range_start,
                 range_end,
-            )?;
+            )
+            .await?;
         }
         return Ok(skipped_factory_triggers);
     }
@@ -729,13 +730,34 @@ pub(crate) async fn process_event_triggers(
                 .join(&contract_name)
                 .join(&function_name)
                 .join("on_events");
-            std::fs::create_dir_all(&sub_dir)?;
+            tokio::fs::create_dir_all(&sub_dir).await?;
 
             let file_name = format!("{}-{}.parquet", range_start, range_end);
             let output_path = sub_dir.join(&file_name);
 
             let result_count = all_results.len();
-            write_event_call_results_to_parquet(&all_results, &output_path, max_params)?;
+
+            // Build decoder results before moving all_results into the async write
+            let decoder_results: Option<Vec<DecoderEventCallResult>> = if ctx.decoder_tx.is_some() {
+                Some(
+                    all_results
+                        .iter()
+                        .map(|r| DecoderEventCallResult {
+                            block_number: r.block_number,
+                            block_timestamp: r.block_timestamp,
+                            log_index: r.log_index,
+                            target_address: r.target_address,
+                            value: r.value_bytes.clone(),
+                            is_reverted: r.is_reverted,
+                            revert_reason: r.revert_reason.clone(),
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
+            write_event_call_results_to_parquet_async(all_results, output_path.clone(), max_params).await?;
 
             tracing::info!(
                 "Wrote {} event-triggered eth_call results to {} (event blocks {}-{})",
@@ -765,30 +787,19 @@ pub(crate) async fn process_event_triggers(
 
             // Send to decoder for decoding (range_end + 1 for exclusive convention)
             if let Some(tx) = ctx.decoder_tx {
-                let decoder_results: Vec<DecoderEventCallResult> = all_results
-                    .iter()
-                    .map(|r| DecoderEventCallResult {
-                        block_number: r.block_number,
-                        block_timestamp: r.block_timestamp,
-                        log_index: r.log_index,
-                        target_address: r.target_address,
-                        value: r.value_bytes.clone(),
-                        is_reverted: r.is_reverted,
-                        revert_reason: r.revert_reason.clone(),
-                    })
-                    .collect();
-
-                let _ = tx
-                    .send(DecoderMessage::EventCallsReady {
-                        range_start,
-                        range_end: range_end + 1,
-                        contract_name: contract_name.clone(),
-                        function_name: function_name.clone(),
-                        results: decoder_results,
-                        live_mode: false,
-                        retry_transform_after_decode: false,
-                    })
-                    .await;
+                if let Some(decoder_results) = decoder_results {
+                    let _ = tx
+                        .send(DecoderMessage::EventCallsReady {
+                            range_start,
+                            range_end: range_end + 1,
+                            contract_name: contract_name.clone(),
+                            function_name: function_name.clone(),
+                            results: decoder_results,
+                            live_mode: false,
+                            retry_transform_after_decode: false,
+                        })
+                        .await;
+                }
             }
         }
     }
@@ -802,7 +813,8 @@ pub(crate) async fn process_event_triggers(
                 &function_name,
                 range_start,
                 range_end,
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -810,7 +822,7 @@ pub(crate) async fn process_event_triggers(
 }
 
 /// Write an empty parquet file for event-triggered calls when no events matched
-fn write_empty_event_call_file(
+async fn write_empty_event_call_file(
     output_dir: &Path,
     contract_name: &str,
     function_name: &str,
@@ -821,13 +833,13 @@ fn write_empty_event_call_file(
         .join(contract_name)
         .join(function_name)
         .join("on_events");
-    std::fs::create_dir_all(&sub_dir)?;
+    tokio::fs::create_dir_all(&sub_dir).await?;
 
     let file_name = format!("{}-{}.parquet", range_start, range_end);
     let output_path = sub_dir.join(&file_name);
 
     // Write empty parquet with 0 params
-    write_event_call_results_to_parquet(&[], &output_path, 0)?;
+    write_event_call_results_to_parquet_async(vec![], output_path.clone(), 0).await?;
 
     tracing::debug!(
         "Wrote empty event-triggered eth_call file to {} (no matching events)",
@@ -866,7 +878,8 @@ pub(crate) async fn process_event_triggers_multicall(
                 function_name,
                 range_start,
                 range_end,
-            )?;
+            )
+            .await?;
         }
         return Ok(skipped_factory_triggers);
     }
@@ -1102,7 +1115,7 @@ pub(crate) async fn process_event_triggers_multicall(
             .join(&contract_name)
             .join(&function_name)
             .join("on_events");
-        std::fs::create_dir_all(&sub_dir)?;
+        tokio::fs::create_dir_all(&sub_dir).await?;
 
         let file_name = format!("{}-{}.parquet", range_start, range_end);
         let output_path = sub_dir.join(&file_name);
@@ -1113,7 +1126,28 @@ pub(crate) async fn process_event_triggers_multicall(
             .map(|r| r.param_values.len())
             .max()
             .unwrap_or(0);
-        write_event_call_results_to_parquet(&results, &output_path, max_params)?;
+
+        // Build decoder results before moving results into the async write
+        let decoder_results: Option<Vec<DecoderEventCallResult>> = if ctx.decoder_tx.is_some() {
+            Some(
+                results
+                    .iter()
+                    .map(|r| DecoderEventCallResult {
+                        block_number: r.block_number,
+                        block_timestamp: r.block_timestamp,
+                        log_index: r.log_index,
+                        target_address: r.target_address,
+                        value: r.value_bytes.clone(),
+                        is_reverted: r.is_reverted,
+                        revert_reason: r.revert_reason.clone(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        write_event_call_results_to_parquet_async(results, output_path.clone(), max_params).await?;
 
         tracing::info!(
             "Wrote {} multicall event-triggered eth_call results to {} (event blocks {}-{})",
@@ -1143,30 +1177,19 @@ pub(crate) async fn process_event_triggers_multicall(
 
         // Send to decoder (range_end + 1 for exclusive convention)
         if let Some(tx) = ctx.decoder_tx {
-            let decoder_results: Vec<DecoderEventCallResult> = results
-                .iter()
-                .map(|r| DecoderEventCallResult {
-                    block_number: r.block_number,
-                    block_timestamp: r.block_timestamp,
-                    log_index: r.log_index,
-                    target_address: r.target_address,
-                    value: r.value_bytes.clone(),
-                    is_reverted: r.is_reverted,
-                    revert_reason: r.revert_reason.clone(),
-                })
-                .collect();
-
-            let _ = tx
-                .send(DecoderMessage::EventCallsReady {
-                    range_start,
-                    range_end: range_end + 1,
-                    contract_name: contract_name.clone(),
-                    function_name: function_name.clone(),
-                    results: decoder_results,
-                    live_mode: false,
-                    retry_transform_after_decode: false,
-                })
-                .await;
+            if let Some(decoder_results) = decoder_results {
+                let _ = tx
+                    .send(DecoderMessage::EventCallsReady {
+                        range_start,
+                        range_end: range_end + 1,
+                        contract_name: contract_name.clone(),
+                        function_name: function_name.clone(),
+                        results: decoder_results,
+                        live_mode: false,
+                        retry_transform_after_decode: false,
+                    })
+                    .await;
+            }
         }
     }
 
@@ -1179,7 +1202,8 @@ pub(crate) async fn process_event_triggers_multicall(
                 &function_name,
                 range_start,
                 range_end,
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -1250,6 +1274,19 @@ pub(crate) fn write_event_call_results_to_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+/// Async wrapper for write_event_call_results_to_parquet
+pub(crate) async fn write_event_call_results_to_parquet_async(
+    results: Vec<EventCallResult>,
+    output_path: PathBuf,
+    num_params: usize,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_event_call_results_to_parquet(&results, &output_path, num_params)
+    })
+    .await
+    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
 }
 
 /// Build schema for event-triggered call results

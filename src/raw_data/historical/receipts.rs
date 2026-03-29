@@ -917,30 +917,23 @@ pub(crate) async fn process_range(
     let total_receipts = match receipt_fields {
         Some(fields) => {
             let count = all_minimal_records.len();
-            let schema_clone = schema.clone();
-            let fields_vec = fields.to_vec();
-            let output_path_clone = output_path.clone();
-            tokio::task::spawn_blocking(move || {
-                write_minimal_receipts_to_parquet(
-                    &all_minimal_records,
-                    &schema_clone,
-                    &fields_vec,
-                    &output_path_clone,
-                )
-            })
-            .await
-            .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+            write_minimal_receipts_to_parquet_async(
+                all_minimal_records,
+                schema.clone(),
+                fields.to_vec(),
+                output_path.clone(),
+            )
+            .await?;
             count
         }
         None => {
             let count = all_full_records.len();
-            let schema_clone = schema.clone();
-            let output_path_clone = output_path.clone();
-            tokio::task::spawn_blocking(move || {
-                write_full_receipts_to_parquet(&all_full_records, &schema_clone, &output_path_clone)
-            })
-            .await
-            .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+            write_full_receipts_to_parquet_async(
+                all_full_records,
+                schema.clone(),
+                output_path.clone(),
+            )
+            .await?;
             count
         }
     };
@@ -1098,6 +1091,22 @@ pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
 
 pub(crate) fn scan_existing_logs_files(dir: &Path) -> HashSet<String> {
     scan_parquet_filenames(dir, "logs_")
+}
+
+pub(crate) async fn scan_existing_parquet_files_async(
+    dir: std::path::PathBuf,
+) -> Result<HashSet<String>, ReceiptCollectionError> {
+    tokio::task::spawn_blocking(move || scan_existing_parquet_files(&dir))
+        .await
+        .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))
+}
+
+pub(crate) async fn scan_existing_logs_files_async(
+    dir: std::path::PathBuf,
+) -> Result<HashSet<String>, ReceiptCollectionError> {
+    tokio::task::spawn_blocking(move || scan_existing_logs_files(&dir))
+        .await
+        .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))
 }
 
 pub(crate) fn build_receipt_schema(fields: &Option<Vec<ReceiptField>>) -> Arc<Schema> {
@@ -1282,4 +1291,29 @@ fn write_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+pub(crate) async fn write_minimal_receipts_to_parquet_async(
+    records: Vec<MinimalReceiptRecord>,
+    schema: Arc<Schema>,
+    fields: Vec<ReceiptField>,
+    output_path: std::path::PathBuf,
+) -> Result<(), ReceiptCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_minimal_receipts_to_parquet(&records, &schema, &fields, &output_path)
+    })
+    .await
+    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_full_receipts_to_parquet_async(
+    records: Vec<FullReceiptRecord>,
+    schema: Arc<Schema>,
+    output_path: std::path::PathBuf,
+) -> Result<(), ReceiptCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_full_receipts_to_parquet(&records, &schema, &output_path)
+    })
+    .await
+    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))?
 }

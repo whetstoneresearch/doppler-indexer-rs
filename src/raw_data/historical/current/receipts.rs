@@ -5,13 +5,13 @@ use std::sync::Arc;
 use alloy::primitives::B256;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::raw_data::historical::blocks::read_block_info_from_parquet;
+use crate::raw_data::historical::blocks::read_block_info_from_parquet_async;
 use crate::raw_data::historical::catchup::receipts::ReceiptsCatchupState;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, extract_event_triggers, fetch_receipts_for_blocks, process_range,
-    send_logs_to_channels, send_range_complete, write_full_receipts_to_parquet,
-    write_minimal_receipts_to_parquet, BlockInfo, ChannelMetrics, ChannelMetricsState,
+    send_logs_to_channels, send_range_complete, write_full_receipts_to_parquet_async,
+    write_minimal_receipts_to_parquet_async, BlockInfo, ChannelMetrics, ChannelMetricsState,
     EventTriggerMatcher, EventTriggerMessage, LogMessage, ReceiptBatchState,
     ReceiptCollectionError, ReceiptOutputChannels,
 };
@@ -36,7 +36,7 @@ pub async fn collect_receipts(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), ReceiptCollectionError> {
     let output_dir = raw_receipts_dir(&chain.name);
-    std::fs::create_dir_all(&output_dir)?;
+    tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
@@ -288,25 +288,23 @@ pub async fn collect_receipts(
                             let total_receipts = match receipt_fields {
                                 Some(fields) => {
                                     let count = minimal_records.len();
-                                    let schema_clone = schema.clone();
-                                    let fields_vec = fields.to_vec();
-                                    let output_path_clone = output_path.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        write_minimal_receipts_to_parquet(&minimal_records, &schema_clone, &fields_vec, &output_path_clone)
-                                    })
-                                    .await
-                                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                                    write_minimal_receipts_to_parquet_async(
+                                        minimal_records,
+                                        schema.clone(),
+                                        fields.to_vec(),
+                                        output_path.clone(),
+                                    )
+                                    .await?;
                                     count
                                 }
                                 None => {
                                     let count = full_records.len();
-                                    let schema_clone = schema.clone();
-                                    let output_path_clone = output_path.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path_clone)
-                                    })
-                                    .await
-                                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                                    write_full_receipts_to_parquet_async(
+                                        full_records,
+                                        schema.clone(),
+                                        output_path.clone(),
+                                    )
+                                    .await?;
                                     count
                                 }
                             };
@@ -362,7 +360,7 @@ pub async fn collect_receipts(
                         request.range_end - 1
                     ));
 
-                    let block_infos = match read_block_info_from_parquet(&block_file_path) {
+                    let block_infos = match read_block_info_from_parquet_async(block_file_path).await {
                         Ok(infos) => infos,
                         Err(e) => {
                             tracing::error!(
@@ -539,32 +537,23 @@ pub async fn collect_receipts(
         let total_receipts = match receipt_fields {
             Some(fields) => {
                 let count = state.minimal_records.len();
-                let schema_clone = schema.clone();
-                let fields_vec = fields.to_vec();
-                let output_path_clone = output_path.clone();
-                let minimal_records = state.minimal_records;
-                tokio::task::spawn_blocking(move || {
-                    write_minimal_receipts_to_parquet(
-                        &minimal_records,
-                        &schema_clone,
-                        &fields_vec,
-                        &output_path_clone,
-                    )
-                })
-                .await
-                .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                write_minimal_receipts_to_parquet_async(
+                    state.minimal_records,
+                    schema.clone(),
+                    fields.to_vec(),
+                    output_path.clone(),
+                )
+                .await?;
                 count
             }
             None => {
                 let count = state.full_records.len();
-                let schema_clone = schema.clone();
-                let output_path_clone = output_path.clone();
-                let full_records = state.full_records;
-                tokio::task::spawn_blocking(move || {
-                    write_full_receipts_to_parquet(&full_records, &schema_clone, &output_path_clone)
-                })
-                .await
-                .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+                write_full_receipts_to_parquet_async(
+                    state.full_records,
+                    schema.clone(),
+                    output_path.clone(),
+                )
+                .await?;
                 count
             }
         };

@@ -218,7 +218,7 @@ pub(crate) async fn process_factory_range(
                 .sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
             let sub_dir = ctx.output_dir.join(collection_name).join(&function_name);
-            std::fs::create_dir_all(&sub_dir)?;
+            tokio::fs::create_dir_all(&sub_dir).await?;
 
             let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
@@ -482,7 +482,7 @@ pub(crate) async fn process_factory_range_multicall(
                 .output_dir
                 .join(&group.collection_name)
                 .join(&group.function_name);
-            std::fs::create_dir_all(&sub_dir)?;
+            tokio::fs::create_dir_all(&sub_dir).await?;
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
@@ -666,7 +666,7 @@ pub(crate) async fn process_range(
         all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
 
         let sub_dir = ctx.output_dir.join(contract_name).join(function_name);
-        std::fs::create_dir_all(&sub_dir)?;
+        tokio::fs::create_dir_all(&sub_dir).await?;
 
         let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
@@ -888,7 +888,7 @@ pub(crate) async fn process_range_multicall(
                 .output_dir
                 .join(&group.contract_name)
                 .join(&group.function_name);
-            std::fs::create_dir_all(&sub_dir)?;
+            tokio::fs::create_dir_all(&sub_dir).await?;
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
