@@ -1229,18 +1229,21 @@ pub(crate) async fn process_logs_live(
     }
 
     // Update block status to mark log decoding complete
-    if let Ok(mut status) = storage.read_status(block_number).await {
-        status.logs_decoded = true;
-        if let Err(e) = storage.write_status(block_number, &status).await {
-            tracing::warn!("Failed to update block status after log decoding: {}", e);
-        } else {
+    match storage
+        .update_status_atomic(block_number, move |status| {
+            status.logs_decoded = true;
+        })
+        .await
+    {
+        Ok(()) => {
             tracing::info!("Block {} logs decoded", block_number);
         }
-    } else {
-        tracing::warn!(
-            "Block {} status file not found for log decode completion",
-            block_number
-        );
+        Err(e) => {
+            tracing::warn!(
+                "Failed to update block status after log decoding: {}",
+                e
+            );
+        }
     }
 
     // Signal that all events for this block have been sent
