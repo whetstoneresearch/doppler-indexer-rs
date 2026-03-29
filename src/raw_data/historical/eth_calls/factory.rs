@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::types::EthCallCollectionError;
 use crate::storage::paths::{parse_range_from_filename, raw_logs_dir};
@@ -178,7 +179,7 @@ pub(crate) async fn event_output_exists_async(
     function_name: String,
     range_start: u64,
     range_end: u64,
-    s3_manifest: Option<S3Manifest>,
+    s3_manifest: Option<Arc<S3Manifest>>,
 ) -> Result<bool, EthCallCollectionError> {
     tokio::task::spawn_blocking(move || {
         event_output_exists(
@@ -187,7 +188,7 @@ pub(crate) async fn event_output_exists_async(
             &function_name,
             range_start,
             range_end,
-            s3_manifest.as_ref(),
+            s3_manifest.as_deref(),
         )
     })
     .await

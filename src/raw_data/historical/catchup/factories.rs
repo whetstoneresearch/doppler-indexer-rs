@@ -232,6 +232,11 @@ pub async fn collect_factories(
 
                 let batches = match read_log_batches_from_parquet_async(file_path.clone()).await {
                     Ok(b) => b,
+                    Err(e @ FactoryCollectionError::JoinError(_)) => {
+                        // spawn_blocking failure (panic/cancellation) — not file corruption.
+                        // Propagate so the caller can abort catchup instead of deleting valid data.
+                        return Err(e);
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "Corrupted log file {}: {} - deleting and requesting recollection for range {}-{}",

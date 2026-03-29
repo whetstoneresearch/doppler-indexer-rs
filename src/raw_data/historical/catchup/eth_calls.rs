@@ -634,6 +634,7 @@ pub async fn collect_eth_calls(
         let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let total_log_ranges = log_ranges.len();
         let mut event_catchup_count = 0;
+        let s3_manifest_arc = s3_manifest.as_ref().map(|m| Arc::new(m.clone()));
 
         tracing::info!(
             "Event-triggered calls catchup: checking {} log ranges for chain {}",
@@ -658,7 +659,7 @@ pub async fn collect_eth_calls(
                         config.function_name.clone(),
                         log_range.start,
                         log_range.end,
-                        s3_manifest.as_ref().cloned(),
+                        s3_manifest_arc.clone(),
                     )
                     .await? {
                         needs_processing = true;
