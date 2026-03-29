@@ -372,9 +372,9 @@ impl LiveCollector {
         self.storage.write_block(&updated_block)?;
 
         // Update status
-        let mut status = self.storage.read_status(block_number)?;
-        status.block_fetched = true;
-        self.storage.write_status(block_number, &status)?;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.block_fetched = true;
+        })?;
 
         tracing::info!(
             "Block {} collected: {} txs",
@@ -413,12 +413,12 @@ impl LiveCollector {
         }
 
         // Update status
-        let mut status = self.storage.read_status(block_number)?;
-        status.receipts_collected = true;
-        status.logs_collected = true;
-        // Factory extraction is always done at this point (even if no factories found)
-        status.factories_extracted = true;
-        self.storage.write_status(block_number, &status)?;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.receipts_collected = true;
+            status.logs_collected = true;
+            // Factory extraction is always done at this point (even if no factories found)
+            status.factories_extracted = true;
+        })?;
 
         // Send to live message channel
         live_tx
@@ -491,9 +491,9 @@ impl LiveCollector {
 
         // If no log decoder is configured, mark logs as decoded
         if log_decoder_tx.is_none() {
-            let mut status = self.storage.read_status(block_number)?;
-            status.logs_decoded = true;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.logs_decoded = true;
+            })?;
         }
 
         // Collect eth_calls if configured
@@ -545,10 +545,10 @@ impl LiveCollector {
             }
         } else {
             // No eth_call collector configured - mark as collected and decoded
-            let mut status = self.storage.read_status(block_number)?;
-            status.eth_calls_collected = true;
-            status.eth_calls_decoded = true;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.eth_calls_collected = true;
+                status.eth_calls_decoded = true;
+            })?;
         };
 
         // If no handlers are registered, mark transformed=true
@@ -940,19 +940,20 @@ impl LiveCollector {
         self.storage.delete_snapshots(block_number)?;
         self.clear_persisted_progress(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.block_fetched = false;
-        status.receipts_collected = false;
-        status.logs_collected = false;
-        status.factories_extracted = false;
-        status.eth_calls_collected = false;
-        status.logs_decoded = false;
-        status.eth_calls_decoded = false;
-        status.transformed = false;
-        status.completed_handlers.clear();
-        status.failed_handlers.clear();
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.block_fetched = false;
+            status.receipts_collected = false;
+            status.logs_collected = false;
+            status.factories_extracted = false;
+            status.eth_calls_collected = false;
+            status.logs_decoded = false;
+            status.eth_calls_decoded = false;
+            status.transformed = false;
+            status.completed_handlers.clear();
+            status.failed_handlers.clear();
+            status.apply_expectations(expectations);
+        })?;
 
         Ok(())
     }
@@ -968,18 +969,19 @@ impl LiveCollector {
         self.storage.delete_snapshots(block_number)?;
         self.clear_persisted_progress(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.receipts_collected = false;
-        status.logs_collected = false;
-        status.factories_extracted = false;
-        status.eth_calls_collected = false;
-        status.logs_decoded = false;
-        status.eth_calls_decoded = false;
-        status.transformed = false;
-        status.completed_handlers.clear();
-        status.failed_handlers.clear();
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.receipts_collected = false;
+            status.logs_collected = false;
+            status.factories_extracted = false;
+            status.eth_calls_collected = false;
+            status.logs_decoded = false;
+            status.eth_calls_decoded = false;
+            status.transformed = false;
+            status.completed_handlers.clear();
+            status.failed_handlers.clear();
+            status.apply_expectations(expectations);
+        })?;
 
         Ok(())
     }
@@ -989,13 +991,14 @@ impl LiveCollector {
         self.storage.delete_all_decoded_calls(block_number)?;
         self.storage.delete_snapshots(block_number)?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.eth_calls_collected = false;
-        status.eth_calls_decoded = false;
-        status.transformed = false;
-        status.failed_handlers.clear();
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.eth_calls_collected = false;
+            status.eth_calls_decoded = false;
+            status.transformed = false;
+            status.failed_handlers.clear();
+            status.apply_expectations(expectations);
+        })?;
 
         Ok(())
     }
@@ -1040,11 +1043,12 @@ impl LiveCollector {
 
         self.storage.write_block(&full_block)?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.collected = true;
-        status.block_fetched = true;
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.collected = true;
+            status.block_fetched = true;
+            status.apply_expectations(expectations);
+        })?;
 
         self.resume_from_receipts_and_logs(block_number, log_decoder_tx, eth_call_decoder_tx)
             .await
@@ -1072,12 +1076,13 @@ impl LiveCollector {
                 .write_factories(block_number, &factory_addresses)?;
         }
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.receipts_collected = true;
-        status.logs_collected = true;
-        status.factories_extracted = true;
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.receipts_collected = true;
+            status.logs_collected = true;
+            status.factories_extracted = true;
+            status.apply_expectations(expectations);
+        })?;
 
         self.dispatch_logs_for_block(
             block_number,
@@ -1089,10 +1094,11 @@ impl LiveCollector {
         .await?;
 
         if log_decoder_tx.is_none() {
-            let mut status = self.storage.read_status(block_number)?;
-            status.logs_decoded = true;
-            status.apply_expectations(&self.expectations);
-            self.storage.write_status(block_number, &status)?;
+            let expectations = &self.expectations;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.logs_decoded = true;
+                status.apply_expectations(expectations);
+            })?;
         }
 
         // retry_transform_after_decode=false: logs were re-dispatched through the
@@ -1178,21 +1184,28 @@ impl LiveCollector {
             self.reset_eth_call_state(block_number).await?;
         }
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.eth_calls_collected = true;
-
-        if !batch.calls.is_empty() {
+        // Write data before updating status to preserve invariant:
+        // data exists before status says it's collected.
+        let empty_batch = batch.calls.is_empty();
+        if !empty_batch {
             self.storage.write_eth_calls(block_number, &batch.calls)?;
-        } else {
-            status.eth_calls_decoded = true;
         }
 
-        if eth_call_decoder_tx.is_none() {
-            status.eth_calls_decoded = true;
-        }
+        let no_decoder = eth_call_decoder_tx.is_none();
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.eth_calls_collected = true;
 
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+            if empty_batch {
+                status.eth_calls_decoded = true;
+            }
+
+            if no_decoder {
+                status.eth_calls_decoded = true;
+            }
+
+            status.apply_expectations(expectations);
+        })?;
 
         if let Some(ref mut eth_collector) = self.eth_call_collector {
             eth_collector.apply_collected_batch(&batch);
@@ -1284,11 +1297,12 @@ impl LiveCollector {
                 }
             }
         } else {
-            let mut status = self.storage.read_status(block_number)?;
-            status.eth_calls_collected = true;
-            status.eth_calls_decoded = true;
-            status.apply_expectations(&self.expectations);
-            self.storage.write_status(block_number, &status)?;
+            let expectations = &self.expectations;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.eth_calls_collected = true;
+                status.eth_calls_decoded = true;
+                status.apply_expectations(expectations);
+            })?;
 
             if retry_transform_after_decode {
                 self.queue_transform_retry(block_number, None).await;

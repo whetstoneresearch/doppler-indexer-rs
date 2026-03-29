@@ -149,11 +149,10 @@ impl LiveProgressTracker {
         }
 
         let storage = LiveStorage::new(&self.chain_name);
-        if let Ok(mut status) = storage.read_status(block_number) {
+        if let Err(e) = storage.update_status_atomic(block_number, |status| {
             status.transformed = true;
-            if let Err(e) = storage.write_status(block_number, &status) {
-                tracing::warn!("Failed to update block status (no handlers): {}", e);
-            }
+        }) {
+            tracing::warn!("Failed to update block status (no handlers): {}", e);
         }
     }
 
