@@ -8,8 +8,9 @@ use arrow::datatypes::Schema;
 use tokio::sync::mpsc::{self, Sender};
 
 use crate::raw_data::historical::blocks::{
-    build_block_schema, process_single_block_full, write_full_blocks_to_parquet,
-    write_minimal_blocks_to_parquet, BlockCollectionError, FullBlockRecord, MinimalBlockRecord,
+    build_block_schema, process_single_block_full, write_full_blocks_to_parquet_async,
+    write_minimal_blocks_to_parquet_async, BlockCollectionError, FullBlockRecord,
+    MinimalBlockRecord,
 };
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::paths::{parse_range_from_filename, raw_blocks_dir, scan_parquet_filenames};
@@ -29,7 +30,7 @@ pub async fn collect_blocks(
     catch_up_only: bool,
 ) -> Result<(), BlockCollectionError> {
     let output_dir = raw_blocks_dir(&chain.name);
-    std::fs::create_dir_all(&output_dir)?;
+    tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let start_block = chain.start_block.map(|u| u.to::<u64>()).unwrap_or(0);
@@ -46,7 +47,10 @@ pub async fn collect_blocks(
     // In catch-up-only mode, only fill gaps within existing data — don't extend
     // to chain head. The upper bound is the highest block in existing files.
     let effective_head = if catch_up_only {
-        let existing = scan_existing_parquet_files(&output_dir);
+        let dir = output_dir.clone();
+        let existing = tokio::task::spawn_blocking(move || scan_existing_parquet_files(&dir))
+            .await
+            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
         let max_existing = highest_block_from_files(&existing, s3_manifest);
         match max_existing {
             Some(max) => {
@@ -67,13 +71,19 @@ pub async fn collect_blocks(
         chain_head
     };
 
-    let ranges = compute_ranges_to_fetch(
-        start_block,
-        effective_head,
-        range_size,
-        &output_dir,
-        s3_manifest,
-    );
+    let dir = output_dir.clone();
+    let s3_manifest_owned = s3_manifest.cloned();
+    let ranges = tokio::task::spawn_blocking(move || {
+        compute_ranges_to_fetch(
+            start_block,
+            effective_head,
+            range_size,
+            &dir,
+            s3_manifest_owned.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
 
     if ranges.is_empty() {
         tracing::info!(
@@ -242,19 +252,14 @@ async fn collect_blocks_streaming(
             }
 
             // Write to parquet
-            let schema_clone = schema.clone();
-            let fields_vec = fields.to_vec();
             let output_path = output_dir.join(range.file_name("blocks"));
-            tokio::task::spawn_blocking(move || {
-                write_minimal_blocks_to_parquet(
-                    &all_records,
-                    &schema_clone,
-                    &fields_vec,
-                    &output_path,
-                )
-            })
-            .await
-            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+            write_minimal_blocks_to_parquet_async(
+                all_records,
+                schema.clone(),
+                fields.to_vec(),
+                output_path,
+            )
+            .await?;
 
             Ok(count)
         }
@@ -327,13 +332,8 @@ async fn collect_blocks_streaming(
             let count = all_records.len();
 
             // Write to parquet
-            let schema_clone = schema.clone();
             let output_path = output_dir.join(range.file_name("blocks"));
-            tokio::task::spawn_blocking(move || {
-                write_full_blocks_to_parquet(&all_records, &schema_clone, &output_path)
-            })
-            .await
-            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+            write_full_blocks_to_parquet_async(all_records, schema.clone(), output_path).await?;
 
             Ok(count)
         }

@@ -10,8 +10,8 @@ use tokio::task::JoinSet;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::{
-    build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet,
-    process_range_batches, read_log_batches_from_parquet, scan_existing_parquet_files,
+    build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet_async,
+    process_range_batches, read_log_batches_from_parquet_async, scan_existing_parquet_files,
     FactoryAddressData, FactoryCatchupState, FactoryCollectionError, RecollectRequest,
 };
 use crate::storage::paths::factories_dir as factories_dir_path;
@@ -31,9 +31,9 @@ pub async fn collect_factories(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
     let output_dir = factories_dir_path(&chain.name);
-    std::fs::create_dir_all(&output_dir)?;
+    tokio::fs::create_dir_all(&output_dir).await?;
 
-    let existing_factory_data = load_factory_addresses_from_parquet(&output_dir)?;
+    let existing_factory_data = load_factory_addresses_from_parquet_async(output_dir.clone()).await?;
     if !existing_factory_data.is_empty() {
         tracing::info!(
             "Loaded {} existing factory ranges from parquet for chain {}",
@@ -117,7 +117,12 @@ pub async fn collect_factories(
         });
     }
 
-    let existing_files = scan_existing_parquet_files(&output_dir);
+    let existing_files = {
+        let output_dir_clone = output_dir.clone();
+        tokio::task::spawn_blocking(move || scan_existing_parquet_files(&output_dir_clone))
+            .await
+            .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+    };
 
     // Get the factory collection names from matchers
     let factory_collection_names: HashSet<String> =
@@ -127,7 +132,15 @@ pub async fn collect_factories(
     // Catchup phase: Process existing logs files where factory files are missing
     // This avoids re-fetching receipts when logs already exist
     // =========================================================================
-    let log_ranges = get_existing_log_ranges(&chain.name, s3_manifest.as_ref());
+    let log_ranges = {
+        let chain_name = chain.name.clone();
+        let s3_manifest_clone = s3_manifest.clone();
+        tokio::task::spawn_blocking(move || {
+            get_existing_log_ranges(&chain_name, s3_manifest_clone.as_ref())
+        })
+        .await
+        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+    };
     let mut catchup_count = 0;
 
     let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(4);
@@ -217,25 +230,24 @@ pub async fn collect_factories(
                     }
                 }
 
-                let file_path_for_read = file_path.clone();
-                let file_path_display = file_path.display().to_string();
-                let batches = match tokio::task::spawn_blocking(move || {
-                    read_log_batches_from_parquet(&file_path_for_read)
-                })
-                .await
-                {
-                    Ok(Ok(b)) => b,
-                    Ok(Err(e)) => {
+                let batches = match read_log_batches_from_parquet_async(file_path.clone()).await {
+                    Ok(b) => b,
+                    Err(e @ FactoryCollectionError::JoinError(_)) => {
+                        // spawn_blocking failure (panic/cancellation) — not file corruption.
+                        // Propagate so the caller can abort catchup instead of deleting valid data.
+                        return Err(e);
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             "Corrupted log file {}: {} - deleting and requesting recollection for range {}-{}",
-                            file_path_display,
+                            file_path.display(),
                             e,
                             start,
                             end - 1
                         );
 
                         // Delete the corrupted file
-                        if let Err(del_err) = std::fs::remove_file(&file_path) {
+                        if let Err(del_err) = tokio::fs::remove_file(&file_path).await {
                             tracing::error!(
                                 "Failed to delete corrupted log file {}: {}",
                                 file_path.display(),
@@ -263,9 +275,6 @@ pub async fn collect_factories(
                         }
 
                         return Ok(None);
-                    }
-                    Err(e) => {
-                        return Err(FactoryCollectionError::JoinError(e.to_string()));
                     }
                 };
 

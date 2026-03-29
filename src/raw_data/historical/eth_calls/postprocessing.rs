@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::Sender;
 
-use super::parquet_io::write_results_to_parquet;
+use super::parquet_io::write_results_to_parquet_async;
 use super::types::{CallResult, EthCallCollectionError, FrequencyState};
 use crate::decoding::{DecoderMessage, EthCallResult as DecoderEthCallResult};
 use crate::storage::{upload_parquet_to_s3, StorageManager};
@@ -85,16 +85,12 @@ pub(crate) async fn finalize_regular_results(
         None
     };
 
-    // 1. Parquet write via spawn_blocking
+    // 1. Parquet write via async wrapper
     let max_params = params.max_params;
     let results = params.results;
     #[cfg(feature = "bench")]
     let write_start = std::time::Instant::now();
-    tokio::task::spawn_blocking(move || {
-        write_results_to_parquet(&results, &output_path, max_params)
-    })
-    .await
-    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+    write_results_to_parquet_async(results, output_path.clone(), max_params).await?;
 
     // 2. Bench recording
     #[cfg(feature = "bench")]

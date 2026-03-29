@@ -2,7 +2,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use super::types::EthCallCollectionError;
 use crate::storage::paths::{parse_range_from_filename, raw_logs_dir};
 use crate::storage::S3Manifest;
 
@@ -142,4 +144,53 @@ pub(crate) fn event_output_exists(
     }
 
     false
+}
+
+/// Async wrapper for read_logs_from_parquet
+pub(crate) async fn read_logs_from_parquet_async(
+    file_path: PathBuf,
+) -> Result<Vec<crate::raw_data::historical::receipts::LogData>, crate::storage::parquet_readers::ParquetReadError>
+{
+    tokio::task::spawn_blocking(move || read_logs_from_parquet(&file_path))
+        .await
+        .map_err(|e| {
+            crate::storage::parquet_readers::ParquetReadError::Io(std::io::Error::other(
+                e.to_string(),
+            ))
+        })?
+}
+
+/// Async wrapper for get_existing_log_ranges
+pub(crate) async fn get_existing_log_ranges_async(
+    chain_name: String,
+    s3_manifest: Option<S3Manifest>,
+) -> Vec<ExistingLogRange> {
+    tokio::task::spawn_blocking(move || {
+        get_existing_log_ranges(&chain_name, s3_manifest.as_ref())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Async wrapper for event_output_exists
+pub(crate) async fn event_output_exists_async(
+    output_dir: PathBuf,
+    contract_name: String,
+    function_name: String,
+    range_start: u64,
+    range_end: u64,
+    s3_manifest: Option<Arc<S3Manifest>>,
+) -> Result<bool, EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        event_output_exists(
+            &output_dir,
+            &contract_name,
+            &function_name,
+            range_start,
+            range_end,
+            s3_manifest.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))
 }

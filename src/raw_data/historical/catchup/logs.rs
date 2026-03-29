@@ -17,7 +17,7 @@ pub async fn collect_logs(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<LogsCatchupState, LogCollectionError> {
     let output_dir = raw_logs_dir(&chain.name);
-    std::fs::create_dir_all(&output_dir)?;
+    tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let log_fields = &raw_data_config.fields.log_fields;
@@ -30,7 +30,12 @@ pub async fn collect_logs(
         HashSet::new()
     };
 
-    let existing_files = scan_existing_parquet_files(&output_dir);
+    let existing_files = {
+        let dir = output_dir.clone();
+        tokio::task::spawn_blocking(move || scan_existing_parquet_files(&dir))
+            .await
+            .map_err(|e| LogCollectionError::JoinError(e.to_string()))?
+    };
 
     Ok(LogsCatchupState {
         output_dir,

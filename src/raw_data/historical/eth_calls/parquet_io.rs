@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -18,6 +18,12 @@ use crate::storage::paths::scan_nested_parquet_files_2;
 
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     scan_nested_parquet_files_2(dir)
+}
+
+pub(crate) async fn scan_existing_parquet_files_async(dir: PathBuf) -> HashSet<String> {
+    tokio::task::spawn_blocking(move || scan_existing_parquet_files(&dir))
+        .await
+        .unwrap_or_default()
 }
 
 pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
@@ -614,4 +620,106 @@ pub(crate) fn write_once_results_to_parquet(
     writer.close()?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sync helper: write a RecordBatch directly to a parquet file
+// ---------------------------------------------------------------------------
+
+pub(crate) fn write_record_batch_to_parquet(
+    batch: &RecordBatch,
+    output_path: &Path,
+) -> Result<(), EthCallCollectionError> {
+    let file = File::create(output_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
+    writer.write(batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Async wrappers: offload blocking file I/O to spawn_blocking
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn write_results_to_parquet_async(
+    results: Vec<CallResult>,
+    output_path: PathBuf,
+    num_params: usize,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_results_to_parquet(&results, &output_path, num_params)
+    })
+    .await
+    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_once_results_to_parquet_async(
+    results: Vec<OnceCallResult>,
+    output_path: PathBuf,
+    function_names: Vec<String>,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_once_results_to_parquet(&results, &output_path, &function_names)
+    })
+    .await
+    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_record_batch_to_parquet_async(
+    batch: RecordBatch,
+    output_path: PathBuf,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || write_record_batch_to_parquet(&batch, &output_path))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn read_parquet_column_names_async(path: PathBuf) -> HashSet<String> {
+    tokio::task::spawn_blocking(move || read_parquet_column_names(&path))
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn read_existing_once_parquet_async(
+    path: PathBuf,
+) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || read_existing_once_parquet(&path))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn load_or_build_once_column_index_async(
+    once_dir: PathBuf,
+) -> HashMap<String, Vec<String>> {
+    tokio::task::spawn_blocking(move || load_or_build_once_column_index(&once_dir))
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn read_once_column_index_async(
+    once_dir: PathBuf,
+) -> HashMap<String, Vec<String>> {
+    tokio::task::spawn_blocking(move || read_once_column_index(&once_dir))
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn write_once_column_index_async(
+    once_dir: PathBuf,
+    index: HashMap<String, Vec<String>>,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || write_once_column_index(&once_dir, &index))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn find_null_entries_async(
+    path: PathBuf,
+) -> HashMap<String, HashSet<[u8; 20]>> {
+    tokio::task::spawn_blocking(move || find_null_entries(&path))
+        .await
+        .unwrap_or_default()
 }

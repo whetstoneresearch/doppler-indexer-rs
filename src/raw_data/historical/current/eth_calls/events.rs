@@ -112,16 +112,17 @@ pub(super) async fn handle_event_trigger_message(
                 let output_path = sub_dir.join(&file_name);
                 // Only write if file doesn't exist (don't overwrite if we already wrote results)
                 if !output_path.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&sub_dir) {
+                    if let Err(e) = tokio::fs::create_dir_all(&sub_dir).await {
                         tracing::warn!("Failed to create dir for empty event file: {}", e);
                         continue;
                     }
                     if let Err(e) =
-                        crate::raw_data::historical::eth_calls::write_event_call_results_to_parquet(
-                            &[],
-                            &output_path,
+                        crate::raw_data::historical::eth_calls::event_triggers::write_event_call_results_to_parquet_async(
+                            vec![],
+                            output_path.clone(),
                             0,
                         )
+                        .await
                     {
                         tracing::warn!("Failed to write empty event file: {}", e);
                     } else {

@@ -291,6 +291,15 @@ pub(crate) async fn process_range(
     })
 }
 
+/// Async wrapper for `read_log_batches_from_parquet` that runs on the blocking threadpool.
+pub(crate) async fn read_log_batches_from_parquet_async(
+    file_path: PathBuf,
+) -> Result<Vec<RecordBatch>, FactoryCollectionError> {
+    tokio::task::spawn_blocking(move || read_log_batches_from_parquet(&file_path))
+        .await
+        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+}
+
 /// Read log batches from a parquet file with column projection.
 /// Only reads block_number, block_timestamp, address, topics, data — skips transaction_hash and log_index.
 pub(crate) fn read_log_batches_from_parquet(
@@ -524,14 +533,9 @@ async fn write_factory_parquet_files(
 
         let record_count = collection_records.len();
         let sub_dir = output_dir.join(&collection_name);
-        std::fs::create_dir_all(&sub_dir)?;
+        tokio::fs::create_dir_all(&sub_dir).await?;
         let output_path = sub_dir.join(&file_name);
-        let output_path_clone = output_path.clone();
-        tokio::task::spawn_blocking(move || {
-            write_factory_records_to_parquet(&collection_records, &output_path_clone)
-        })
-        .await
-        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+        write_factory_records_to_parquet_async(collection_records, output_path.clone()).await?;
 
         tracing::info!(
             "Wrote {} factory addresses for {} to {}",
@@ -567,14 +571,9 @@ async fn write_factory_parquet_files(
                     .is_some_and(|m| m.has_factories(collection_name, range_start, range_end - 1))
             {
                 let sub_dir = output_dir.join(collection_name);
-                std::fs::create_dir_all(&sub_dir)?;
+                tokio::fs::create_dir_all(&sub_dir).await?;
                 let output_path = sub_dir.join(&file_name);
-                let output_path_clone = output_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    write_empty_factory_parquet(&output_path_clone)
-                })
-                .await
-                .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+                write_empty_factory_parquet_async(output_path.clone()).await?;
 
                 tracing::debug!(
                     "Wrote empty factory file for {} range {}-{}",
@@ -652,6 +651,17 @@ fn decode_address_from_data(
     }
 }
 
+pub(crate) async fn write_factory_records_to_parquet_async(
+    records: Vec<FactoryRecord>,
+    output_path: PathBuf,
+) -> Result<(), FactoryCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_factory_records_to_parquet(&records, &output_path)
+    })
+    .await
+    .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+}
+
 fn write_factory_records_to_parquet(
     records: &[FactoryRecord],
     output_path: &Path,
@@ -696,6 +706,14 @@ fn write_factory_records_to_parquet(
 
 pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     scan_nested_parquet_files_1(dir)
+}
+
+pub(crate) async fn load_factory_addresses_from_parquet_async(
+    dir: PathBuf,
+) -> Result<Vec<FactoryAddressData>, FactoryCollectionError> {
+    tokio::task::spawn_blocking(move || load_factory_addresses_from_parquet(&dir))
+        .await
+        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
 }
 
 pub(crate) fn load_factory_addresses_from_parquet(
@@ -877,6 +895,14 @@ pub fn get_factory_collection_names(
     }
 
     names
+}
+
+pub(crate) async fn write_empty_factory_parquet_async(
+    output_path: PathBuf,
+) -> Result<(), FactoryCollectionError> {
+    tokio::task::spawn_blocking(move || write_empty_factory_parquet(&output_path))
+        .await
+        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
 }
 
 fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollectionError> {

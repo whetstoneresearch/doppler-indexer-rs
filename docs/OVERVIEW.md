@@ -571,6 +571,7 @@ The indexer is designed for high throughput:
 - **Rate limit aware** - Sliding window rate limiter matches Alchemy's 10-second window
 - **Shared rate limiter** - Single limiter across all clients for account-level limiting
 - **Semaphore-bounded concurrency** - `rpc.concurrency` config controls in-flight requests
+- **Non-blocking file I/O** - All file operations use `spawn_blocking` or `tokio::fs` to keep the async runtime responsive
 - **Efficient storage** - Snappy-compressed Parquet with configurable schemas
 - **Resumable** - Automatic catchup skips already-processed ranges
 - **Incremental decoding** - New events/calls only process what's missing

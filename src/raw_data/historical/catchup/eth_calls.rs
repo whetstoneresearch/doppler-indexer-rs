@@ -8,17 +8,20 @@ use tokio::sync::oneshot;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
-    get_existing_block_ranges, read_block_info_from_parquet,
+    get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
-    build_once_call_configs, build_token_call_configs, event_output_exists,
-    get_existing_log_ranges, load_or_build_once_column_index, process_event_triggers,
+    build_once_call_configs, build_token_call_configs, event_output_exists_async,
+    get_existing_log_ranges_async, process_event_triggers,
     process_event_triggers_multicall, process_factory_once_calls, process_once_calls_multicall,
     process_once_calls_regular, process_range, process_range_multicall, process_token_range,
-    process_token_range_multicall, read_logs_from_parquet, read_once_column_index,
-    scan_existing_parquet_files, BlockInfo, BlockRange, EthCallCatchupState,
+    process_token_range_multicall, read_logs_from_parquet_async,
+    scan_existing_parquet_files_async, BlockInfo, BlockRange, EthCallCatchupState,
     EthCallCollectionError, EthCallContext, FrequencyState,
+};
+use crate::raw_data::historical::eth_calls::parquet_io::{
+    load_or_build_once_column_index_async, read_once_column_index_async,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
@@ -46,7 +49,7 @@ pub async fn collect_eth_calls(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<EthCallCatchupState, EthCallCollectionError> {
     let base_output_dir = raw_eth_calls_dir(&chain.name);
-    std::fs::create_dir_all(&base_output_dir)?;
+    tokio::fs::create_dir_all(&base_output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
@@ -159,7 +162,7 @@ pub async fn collect_eth_calls(
         token_call_configs.len()
     );
 
-    let existing_files = scan_existing_parquet_files(&base_output_dir);
+    let existing_files = scan_existing_parquet_files_async(base_output_dir.clone()).await;
 
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
     let range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
@@ -167,7 +170,7 @@ pub async fn collect_eth_calls(
     let range_factory_done: HashSet<u64> = HashSet::new();
 
     if has_regular_calls || has_token_calls || has_once_calls {
-        let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
+        let block_ranges = get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
         tracing::info!(
             "eth_calls catchup: checking {} block ranges (regular={}, token={}, once={})",
             block_ranges.len(),
@@ -180,7 +183,7 @@ pub async fn collect_eth_calls(
         let mut once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         for contract_name in once_configs.keys() {
             let once_dir = base_output_dir.join(contract_name).join("once");
-            let index = load_or_build_once_column_index(&once_dir);
+            let index = load_or_build_once_column_index_async(once_dir).await;
             once_column_indexes.insert(contract_name.clone(), index);
         }
 
@@ -337,7 +340,7 @@ pub async fn collect_eth_calls(
                 }
             }
 
-            let block_infos = match read_block_info_from_parquet(&block_range.file_path) {
+            let block_infos = match read_block_info_from_parquet_async(block_range.file_path.clone()).await {
                 Ok(infos) => infos,
                 Err(e) => {
                     tracing::warn!(
@@ -499,7 +502,7 @@ pub async fn collect_eth_calls(
             HashMap::new();
         for collection_name in factory_once_configs.keys() {
             let once_dir = base_output_dir.join(collection_name).join("once");
-            let index = read_once_column_index(&once_dir);
+            let index = read_once_column_index_async(once_dir).await;
             factory_once_column_indexes.insert(collection_name.clone(), index);
         }
 
@@ -514,7 +517,7 @@ pub async fn collect_eth_calls(
         .await;
 
         if !factory_catchup_data.is_empty() {
-            let block_ranges = get_existing_block_ranges(&chain.name, s3_manifest.as_ref());
+            let block_ranges = get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
             let total_factory_ranges = block_ranges.len();
             let mut factory_once_catchup_count = 0;
 
@@ -627,10 +630,11 @@ pub async fn collect_eth_calls(
                 .extend(addrs);
         }
 
-        let log_ranges = get_existing_log_ranges(&chain.name, s3_manifest.as_ref());
+        let log_ranges = get_existing_log_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
         let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let total_log_ranges = log_ranges.len();
         let mut event_catchup_count = 0;
+        let s3_manifest_arc = s3_manifest.as_ref().map(|m| Arc::new(m.clone()));
 
         tracing::info!(
             "Event-triggered calls catchup: checking {} log ranges for chain {}",
@@ -649,14 +653,15 @@ pub async fn collect_eth_calls(
                             continue;
                         }
                     }
-                    if !event_output_exists(
-                        &base_output_dir,
-                        &config.contract_name,
-                        &config.function_name,
+                    if !event_output_exists_async(
+                        base_output_dir.clone(),
+                        config.contract_name.clone(),
+                        config.function_name.clone(),
                         log_range.start,
                         log_range.end,
-                        s3_manifest.as_ref(),
-                    ) {
+                        s3_manifest_arc.clone(),
+                    )
+                    .await? {
                         needs_processing = true;
                         break;
                     }
@@ -676,7 +681,7 @@ pub async fn collect_eth_calls(
             }
 
             // Read logs from parquet file
-            let logs = match read_logs_from_parquet(&log_range.file_path) {
+            let logs = match read_logs_from_parquet_async(log_range.file_path.clone()).await {
                 Ok(logs) => logs,
                 Err(e) => {
                     tracing::warn!(
