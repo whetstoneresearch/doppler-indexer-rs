@@ -199,6 +199,34 @@ fn insert_pool_config(
 
 Upserts a V4 pool configuration record with Doppler-specific parameters.
 
+### `db/dhook_pool_configs.rs`
+
+#### `DhookPoolConfigData`
+
+```rust
+pub struct DhookPoolConfigData {
+    pub pool_id: [u8; 32],
+    pub hook_address: [u8; 20],
+    pub numeraire: [u8; 20],
+    pub total_tokens_on_bonding_curve: U256,
+    pub doppler_hook: [u8; 20],
+    pub status: u8,
+    pub far_tick: i32,
+    pub is_token_0: bool,
+}
+```
+
+#### `insert_dhook_pool_config`
+
+```rust
+fn insert_dhook_pool_config(
+    data: &DhookPoolConfigData,
+    ctx: &TransformationContext,
+) -> DbOperation
+```
+
+Upserts a DopplerHook pool configuration record. Conflicts on `(chain_id, hook_address)` and does not update existing records.
+
 ---
 
 ## TransformationContext

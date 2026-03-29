@@ -392,19 +392,27 @@ Note: For non-Alchemy URLs, `from_url_with_options()` ignores the CU, concurrenc
 
 The `AlchemyClient` wraps `RpcClient` and adds compute unit (CU) based rate limiting, which is how Alchemy tracks API usage.
 
-### Environment Variables
+### Per-Chain RPC Configuration
 
-The Alchemy client behavior can be configured via environment variables:
+RPC parameters are configured per-chain in the `rpc` block of the chain config:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ALCHEMY_CU_PER_SECOND` | 7500 | Compute units per second (match your Alchemy plan) |
-| `RPC_CONCURRENCY` | 100 | Max concurrent in-flight RPC requests |
-| `RPC_BATCH_SIZE` | from config | Override config's `rpc_batch_size` |
+| Config Field | Default | Description |
+|--------------|---------|-------------|
+| `rpc.concurrency` | 100 | Max concurrent in-flight RPC requests |
+| `rpc.compute_units_per_second` | 7500 | Compute units per second (match your Alchemy plan) |
+| `rpc.batch_size` | 100 | Max batch size for RPC requests |
 
 Example:
-```bash
-ALCHEMY_CU_PER_SECOND=7500 RPC_CONCURRENCY=500 cargo run
+```json
+{
+    "name": "base",
+    "rpc_url_env_var": "BASE_RPC_URL",
+    "rpc": {
+        "concurrency": 100,
+        "compute_units_per_second": 7500,
+        "batch_size": 1000
+    }
+}
 ```
 
 ### Sliding Window Rate Limiter
@@ -481,7 +489,7 @@ This approach provides:
 - **Non-blocking task spawning** - 1000 requests spawn instantly, then compete for permits
 - **Continuous rate limit acquisition** instead of chunk-based batching
 - **Better throughput** by keeping the RPC pipeline full
-- **Configurable concurrency** via `RPC_CONCURRENCY` environment variable
+- **Configurable concurrency** via the per-chain `rpc.concurrency` config field
 - **Order preservation** - results are sorted by index before returning
 
 ### Panic Handling
