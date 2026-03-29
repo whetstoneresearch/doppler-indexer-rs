@@ -376,6 +376,41 @@ pub(crate) async fn process_logs(
         decoded_by_event.len()
     );
 
+    // Send transform events to the transformation channel FIRST (before parquet I/O)
+    // to unblock the transformation engine while parquet writes happen.
+    if let Some(tx) = outputs.transform_tx {
+        for ((source_name, event_name), events) in transform_events_by_type {
+            if events.is_empty() {
+                continue;
+            }
+            let msg = DecodedEventsMessage {
+                range_start,
+                range_end,
+                source_name,
+                event_name,
+                events,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(
+                    "Failed to send decoded events to transformation channel: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Signal that all events for this range have been sent
+    if let Some(tx) = outputs.complete_tx {
+        let msg = RangeCompleteMessage {
+            range_start,
+            range_end,
+            kind: RangeCompleteKind::Logs,
+        };
+        if let Err(e) = tx.send(msg).await {
+            tracing::warn!("Failed to send range complete: {}", e);
+        }
+    }
+
     // Write decoded data to parquet files
     for ((contract_name, event_name), (records, parsed_event)) in decoded_by_event {
         let output_dir = output_base.join(&contract_name).join(&event_name);
@@ -430,40 +465,6 @@ pub(crate) async fn process_logs(
                 std::fs::create_dir_all(&output_dir)?;
                 write_decoded_logs_to_parquet(&[], &matcher.event, &output_path)?;
             }
-        }
-    }
-
-    // Send transform events to the transformation channel (built during the single pass above)
-    if let Some(tx) = outputs.transform_tx {
-        for ((source_name, event_name), events) in transform_events_by_type {
-            if events.is_empty() {
-                continue;
-            }
-            let msg = DecodedEventsMessage {
-                range_start,
-                range_end,
-                source_name,
-                event_name,
-                events,
-            };
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(
-                    "Failed to send decoded events to transformation channel: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    // Signal that all events for this range have been sent
-    if let Some(tx) = outputs.complete_tx {
-        let msg = RangeCompleteMessage {
-            range_start,
-            range_end,
-            kind: RangeCompleteKind::Logs,
-        };
-        if let Err(e) = tx.send(msg).await {
-            tracing::warn!("Failed to send range complete: {}", e);
         }
     }
 
