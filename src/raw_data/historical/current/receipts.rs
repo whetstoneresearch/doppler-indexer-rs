@@ -284,6 +284,11 @@ pub async fn collect_receipts(
                             minimal_records.sort_by_key(|r| r.block_number);
                             full_records.sort_by_key(|r| r.block_number);
 
+                            // Signal range complete before parquet write/S3 upload.
+                            // All log data has already been sent via send_logs_to_channels,
+                            // so downstream can start processing immediately.
+                            send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
+
                             let output_path = output_dir.join(range.file_name("receipts"));
                             let total_receipts = match receipt_fields {
                                 Some(fields) => {
@@ -329,8 +334,6 @@ pub async fn collect_receipts(
                                 .await
                                 .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
                             }
-
-                            send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
                         }
                     }
                     None => {
@@ -533,6 +536,18 @@ pub async fn collect_receipts(
         state.minimal_records.sort_by_key(|r| r.block_number);
         state.full_records.sort_by_key(|r| r.block_number);
 
+        // Signal range complete before parquet write/S3 upload.
+        // All log data has already been sent via send_logs_to_channels,
+        // so downstream can start processing immediately.
+        send_range_complete(
+            &channels.factory_log_tx,
+            &channels.log_tx,
+            &channels.event_trigger_tx,
+            range.start,
+            range.end,
+        )
+        .await?;
+
         let output_path = output_dir.join(range.file_name("receipts"));
         let total_receipts = match receipt_fields {
             Some(fields) => {
@@ -578,15 +593,6 @@ pub async fn collect_receipts(
             .await
             .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
-
-        send_range_complete(
-            &channels.factory_log_tx,
-            &channels.log_tx,
-            &channels.event_trigger_tx,
-            range.start,
-            range.end,
-        )
-        .await?;
     }
 
     if let Some(sender) = &channels.factory_log_tx {
