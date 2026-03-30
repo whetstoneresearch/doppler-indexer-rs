@@ -480,9 +480,7 @@ pub(crate) async fn write_full_logs_to_parquet_async(
     schema: Arc<Schema>,
     output_path: PathBuf,
 ) -> Result<(), LogCollectionError> {
-    tokio::task::spawn_blocking(move || {
-        write_full_logs_to_parquet(&records, &schema, &output_path)
-    })
-    .await
-    .map_err(|e| LogCollectionError::JoinError(e.to_string()))?
+    tokio::task::spawn_blocking(move || write_full_logs_to_parquet(&records, &schema, &output_path))
+        .await
+        .map_err(|e| LogCollectionError::JoinError(e.to_string()))?
 }

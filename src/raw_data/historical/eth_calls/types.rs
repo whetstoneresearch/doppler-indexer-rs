@@ -262,4 +262,3 @@ pub struct EthCallCatchupState {
     /// Each entry: (skipped_triggers, range_start, range_end_inclusive)
     pub factory_skipped_triggers: Vec<(Vec<SkippedFactoryTrigger>, u64, u64)>,
 }
-

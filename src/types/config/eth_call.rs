@@ -1241,10 +1241,7 @@ mod tests {
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Address);
         assert!(param.values().is_none());
-        assert_eq!(
-            param.event_field(),
-            Some(&EventFieldLocation::Topic(1))
-        );
+        assert_eq!(param.event_field(), Some(&EventFieldLocation::Topic(1)));
         assert!(!param.is_self_address());
     }
 
@@ -1253,10 +1250,7 @@ mod tests {
         let json = r#"{"type": "uint256", "from_event": "data[0]"}"#;
         let param: ParamConfig = serde_json::from_str(json).unwrap();
         assert_eq!(*param.param_type(), EvmType::Uint256);
-        assert_eq!(
-            param.event_field(),
-            Some(&EventFieldLocation::Data(0))
-        );
+        assert_eq!(param.event_field(), Some(&EventFieldLocation::Data(0)));
     }
 
     #[test]

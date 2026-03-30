@@ -338,14 +338,13 @@ impl LiveStorage {
         update_fn(&mut status);
 
         // Write to temp file, then rename — all while holding the lock
-        let result = atomic_write_with(&path, |writer| {
-            serde_json::to_writer_pretty(writer, &status)?;
-            Ok(())
-        });
 
         // lock_file dropped here, releasing the exclusive lock
 
-        result
+        atomic_write_with(&path, |writer| {
+            serde_json::to_writer_pretty(writer, &status)?;
+            Ok(())
+        })
     }
 
     /// Delete status for a block.
@@ -623,8 +622,7 @@ impl LiveStorage {
         &self,
         block_number: u64,
     ) -> Result<Vec<LiveUpsertSnapshot>, StorageError> {
-        read_bincode(&self.snapshots_path(block_number))
-            .map_err(|e| map_not_found(e, block_number))
+        read_bincode(&self.snapshots_path(block_number)).map_err(|e| map_not_found(e, block_number))
     }
 
     /// Delete upsert snapshots for a block.

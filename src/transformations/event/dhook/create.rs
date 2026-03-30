@@ -8,8 +8,12 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
-use crate::transformations::util::db::dhook_pool_configs::{insert_dhook_pool_config, DhookPoolConfigData};
-use crate::transformations::util::db::pool::{insert_pool, Beneficiary, BeneficiariesData, PoolData};
+use crate::transformations::util::db::dhook_pool_configs::{
+    insert_dhook_pool_config, DhookPoolConfigData,
+};
+use crate::transformations::util::db::pool::{
+    insert_pool, BeneficiariesData, Beneficiary, PoolData,
+};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::metadata::get_metadata;
 use crate::types::decoded::DecodedValue;
@@ -49,19 +53,23 @@ impl TransformationHandler for DopplerHookCreateHandler {
             let asset = event.extract_address("asset")?;
             let numeraire = event.extract_address("numeraire")?;
 
-            let (asset_metadata, numeraire_metadata) = get_metadata(&asset, &numeraire, event, ctx)?;
+            let (asset_metadata, numeraire_metadata) =
+                get_metadata(&asset, &numeraire, event, ctx)?;
 
-            let get_state_call = ctx.calls_of_type("DopplerHookInitializer", "getState")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
-                .ok_or_else(|| TransformationError::MissingData(format!(
-                    "No getState call at block {} tx index {}",
-                    event.block_number, event.log_index
-                )))?;
+            let get_state_call = ctx
+                .calls_of_type("DopplerHookInitializer", "getState")
+                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .ok_or_else(|| {
+                    TransformationError::MissingData(format!(
+                        "No getState call at block {} tx index {}",
+                        event.block_number, event.log_index
+                    ))
+                })?;
 
             // Extract dhook-specific fields from getState
             let gs_numeraire = get_state_call.extract_address("numeraire")?;
-            let total_tokens_on_bonding_curve = get_state_call.extract_uint256("totalTokensOnBondingCurve")?;
+            let total_tokens_on_bonding_curve =
+                get_state_call.extract_uint256("totalTokensOnBondingCurve")?;
             let doppler_hook = get_state_call.extract_address("dopplerHook")?;
             let status = get_state_call.extract_u8("status")?;
             let far_tick = get_state_call.extract_i32_flexible("farTick")?;
@@ -139,25 +147,24 @@ impl TransformationHandler for DopplerHookCreateHandler {
                 ctx,
             ));
 
-            let beneficiaries: Option<BeneficiariesData> = ctx.calls_of_type("DopplerHookInitializer", "getBeneficiaries")
-                .filter(|call| call.trigger_log_index.unwrap() == event.log_index)
-                .next()
+            let beneficiaries: Option<BeneficiariesData> = ctx
+                .calls_of_type("DopplerHookInitializer", "getBeneficiaries")
+                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
                 .and_then(|call| call.result.get("getBeneficiaries"))
-                .map(|val| {
-                    match val {
-                        DecodedValue::Array(elements) => {
-                            elements.iter().filter_map(|elem| {
-                                if let DecodedValue::UnnamedTuple(fields) = elem {
-                                    let address = fields.first()?.as_address()?;
-                                    let shares = fields.get(1)?.as_u64()?;
-                                    Some(Beneficiary::new(address, shares))
-                                } else {
-                                    None
-                                }
-                            }).collect()
-                        }
-                        _ => Vec::new(),
-                    }
+                .map(|val| match val {
+                    DecodedValue::Array(elements) => elements
+                        .iter()
+                        .filter_map(|elem| {
+                            if let DecodedValue::UnnamedTuple(fields) = elem {
+                                let address = fields.first()?.as_address()?;
+                                let shares = fields.get(1)?.as_u64()?;
+                                Some(Beneficiary::new(address, shares))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    _ => Vec::new(),
                 });
 
             let migration_type = ctx
@@ -165,8 +172,10 @@ impl TransformationHandler for DopplerHookCreateHandler {
                     asset_metadata.migrator.into(),
                     &[
                         "UniswapV4Migrator",
-                        "UniswapV2Migrator", "NimCustomV2Migrator",
-                        "UniswapV3Migrator", "NimCustomV3Migrator",
+                        "UniswapV2Migrator",
+                        "NimCustomV2Migrator",
+                        "UniswapV3Migrator",
+                        "NimCustomV3Migrator",
                         "DopplerHookMigrator",
                         "RehypeDopplerHookMigrator",
                     ],
@@ -181,10 +190,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
                 })
                 .unwrap_or("unknown");
 
-            let pool_type = if ctx.match_contract_address(
-                hook,
-                &["RehypeHook"],
-            ).is_some() {
+            let pool_type = if ctx.match_contract_address(hook, &["RehypeHook"]).is_some() {
                 "rehype"
             } else {
                 "dhook"
@@ -240,7 +246,10 @@ impl EventHandler for DopplerHookCreateHandler {
             ("DERC20".to_string(), "once".to_string()),
             ("Numeraires".to_string(), "once".to_string()),
             ("DopplerHookInitializer".to_string(), "getState".to_string()),
-            ("DopplerHookInitializer".to_string(), "getBeneficiaries".to_string()),
+            (
+                "DopplerHookInitializer".to_string(),
+                "getBeneficiaries".to_string(),
+            ),
         ]
     }
 }

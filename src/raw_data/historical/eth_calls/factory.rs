@@ -149,8 +149,10 @@ pub(crate) fn event_output_exists(
 /// Async wrapper for read_logs_from_parquet
 pub(crate) async fn read_logs_from_parquet_async(
     file_path: PathBuf,
-) -> Result<Vec<crate::raw_data::historical::receipts::LogData>, crate::storage::parquet_readers::ParquetReadError>
-{
+) -> Result<
+    Vec<crate::raw_data::historical::receipts::LogData>,
+    crate::storage::parquet_readers::ParquetReadError,
+> {
     tokio::task::spawn_blocking(move || read_logs_from_parquet(&file_path))
         .await
         .map_err(|e| {
@@ -165,11 +167,9 @@ pub(crate) async fn get_existing_log_ranges_async(
     chain_name: String,
     s3_manifest: Option<S3Manifest>,
 ) -> Vec<ExistingLogRange> {
-    tokio::task::spawn_blocking(move || {
-        get_existing_log_ranges(&chain_name, s3_manifest.as_ref())
-    })
-    .await
-    .unwrap_or_default()
+    tokio::task::spawn_blocking(move || get_existing_log_ranges(&chain_name, s3_manifest.as_ref()))
+        .await
+        .unwrap_or_default()
 }
 
 /// Async wrapper for event_output_exists

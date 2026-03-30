@@ -4,10 +4,10 @@
 
 pub mod decay_multicurve;
 pub mod derc20_transfer;
+pub mod dhook;
 pub mod multicurve;
 pub mod scheduled_multicurve;
 pub mod v4;
-pub mod dhook;
 
 use super::registry::TransformationRegistry;
 

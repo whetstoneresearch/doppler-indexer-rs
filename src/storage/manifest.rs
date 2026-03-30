@@ -495,15 +495,13 @@ impl ManifestManager {
         // Raw eth_calls: contract/function/{start}_{end}.marker  (2 segments)
         // Or on_events: contract/function/on_events/{start}_{end}.marker  (3 segments)
         let prefix = format!("{}/markers/raw/eth_calls", chain);
-        self.aggregate_markers_generic(&prefix, |segments, start, end| {
-            match segments.len() {
-                2 => manifest.add_raw_eth_calls_granular(segments[0], segments[1], start, end),
-                3 if segments[2] == "on_events" => {
-                    let combined = format!("{}/on_events", segments[1]);
-                    manifest.add_raw_eth_calls_granular(segments[0], &combined, start, end);
-                }
-                _ => {}
+        self.aggregate_markers_generic(&prefix, |segments, start, end| match segments.len() {
+            2 => manifest.add_raw_eth_calls_granular(segments[0], segments[1], start, end),
+            3 if segments[2] == "on_events" => {
+                let combined = format!("{}/on_events", segments[1]);
+                manifest.add_raw_eth_calls_granular(segments[0], &combined, start, end);
             }
+            _ => {}
         })
         .await?;
 
@@ -808,20 +806,13 @@ mod tests {
 
         let mut results: Vec<(String, String, u64, u64)> = Vec::new();
         manager
-            .aggregate_markers_generic(prefix, |segments, start, end| {
-                match segments.len() {
-                    2 => results.push((
-                        segments[0].to_string(),
-                        segments[1].to_string(),
-                        start,
-                        end,
-                    )),
-                    3 if segments[2] == "on_events" => {
-                        let combined = format!("{}/on_events", segments[1]);
-                        results.push((segments[0].to_string(), combined, start, end));
-                    }
-                    _ => {}
+            .aggregate_markers_generic(prefix, |segments, start, end| match segments.len() {
+                2 => results.push((segments[0].to_string(), segments[1].to_string(), start, end)),
+                3 if segments[2] == "on_events" => {
+                    let combined = format!("{}/on_events", segments[1]);
+                    results.push((segments[0].to_string(), combined, start, end));
                 }
+                _ => {}
             })
             .await
             .unwrap();

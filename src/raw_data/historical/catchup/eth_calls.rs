@@ -10,6 +10,9 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
+use crate::raw_data::historical::eth_calls::parquet_io::{
+    load_or_build_once_column_index_async, read_once_column_index_async,
+};
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, event_output_exists_async, get_existing_log_ranges_async,
@@ -18,9 +21,6 @@ use crate::raw_data::historical::eth_calls::{
     process_range_multicall, read_logs_from_parquet_async, scan_existing_parquet_files_async,
     AbortOnDropHandles, BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError,
     EthCallContext, FrequencyState,
-};
-use crate::raw_data::historical::eth_calls::parquet_io::{
-    load_or_build_once_column_index_async, read_once_column_index_async,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
@@ -162,7 +162,9 @@ pub async fn collect_eth_calls(
     let range_factory_done: HashSet<u64> = HashSet::new();
 
     if has_regular_calls || has_once_calls {
-        let block_ranges = get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
+        let block_ranges =
+            get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned())
+                .await;
         tracing::info!(
             "eth_calls catchup: checking {} block ranges (regular={}, once={})",
             block_ranges.len(),
@@ -324,17 +326,18 @@ pub async fn collect_eth_calls(
                 }
             }
 
-            let block_infos = match read_block_info_from_parquet_async(block_range.file_path.clone()).await {
-                Ok(infos) => infos,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read block info from {}: {}",
-                        block_range.file_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            };
+            let block_infos =
+                match read_block_info_from_parquet_async(block_range.file_path.clone()).await {
+                    Ok(infos) => infos,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read block info from {}: {}",
+                            block_range.file_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
 
             if block_infos.is_empty() {
                 continue;
@@ -483,7 +486,9 @@ pub async fn collect_eth_calls(
         .await;
 
         if !factory_catchup_data.is_empty() {
-            let block_ranges = get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
+            let block_ranges =
+                get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned())
+                    .await;
             let total_factory_ranges = block_ranges.len();
             let mut factory_once_catchup_count = 0;
 
@@ -596,7 +601,8 @@ pub async fn collect_eth_calls(
                 .extend(addrs);
         }
 
-        let log_ranges = get_existing_log_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
+        let log_ranges =
+            get_existing_log_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
         let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let total_log_ranges = log_ranges.len();
         let mut event_catchup_count = 0;
@@ -627,7 +633,8 @@ pub async fn collect_eth_calls(
                         log_range.end,
                         s3_manifest_arc.clone(),
                     )
-                    .await? {
+                    .await?
+                    {
                         needs_processing = true;
                         break;
                     }

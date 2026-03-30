@@ -294,4 +294,3 @@ pub(crate) async fn finalize_regular_results_deferred(
 
     Ok(handle)
 }
-

@@ -33,7 +33,8 @@ pub async fn collect_factories(
     let output_dir = factories_dir_path(&chain.name);
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    let existing_factory_data = load_factory_addresses_from_parquet_async(output_dir.clone()).await?;
+    let existing_factory_data =
+        load_factory_addresses_from_parquet_async(output_dir.clone()).await?;
     if !existing_factory_data.is_empty() {
         tracing::info!(
             "Loaded {} existing factory ranges from parquet for chain {}",

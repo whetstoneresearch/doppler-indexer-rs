@@ -185,10 +185,7 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
 }
 
 /// Build the SQL and parameters for a single-row query by key columns.
-fn build_query_row_sql(
-    table: &str,
-    key_columns: &[(String, DbValue)],
-) -> (String, Vec<SqlParam>) {
+fn build_query_row_sql(table: &str, key_columns: &[(String, DbValue)]) -> (String, Vec<SqlParam>) {
     let mut where_parts = Vec::new();
     let mut params = Vec::new();
     for (i, (col, val)) in key_columns.iter().enumerate() {
@@ -332,11 +329,9 @@ fn extract_db_value_from_row(
                 Err(_) => Ok(DbValue::Null),
             }
         }
-        Type::JSON | Type::JSONB => Ok(
-            try_extract_column::<serde_json::Value>(row, col_name)
-                .map(DbValue::JsonB)
-                .unwrap_or(DbValue::Null),
-        ),
+        Type::JSON | Type::JSONB => Ok(try_extract_column::<serde_json::Value>(row, col_name)
+            .map(DbValue::JsonB)
+            .unwrap_or(DbValue::Null)),
         _ => {
             // Unknown type - try as bytes, then text, then null
             if let Ok(Some(v)) = row.try_get::<_, Option<Vec<u8>>>(col_name) {

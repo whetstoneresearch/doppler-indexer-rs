@@ -19,12 +19,13 @@ use super::postprocessing::{
     finalize_regular_results, finalize_regular_results_deferred, FinalizeRegularParams,
 };
 use super::types::{
-    AbortOnDropHandles, BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError,
-    EthCallContext, EncodedParam, FrequencyState,
+    AbortOnDropHandles, BlockInfo, BlockRange, CallConfig, CallResult, EncodedParam,
+    EthCallCollectionError, EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_factory_range(
     range: &BlockRange,
     blocks: &[BlockInfo],
@@ -712,6 +713,7 @@ pub(crate) async fn process_range(
 }
 
 /// Process regular calls using Multicall3 aggregate3 to batch all calls per block
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range_multicall(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,

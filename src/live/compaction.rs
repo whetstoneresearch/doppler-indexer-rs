@@ -8,7 +8,7 @@
 //! 5. Cleans up live storage
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -537,7 +537,7 @@ impl CompactionService {
     fn write_factories_parquet(
         &self,
         records: &[(u64, u64, [u8; 20])],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
@@ -578,7 +578,7 @@ impl CompactionService {
     fn write_eth_calls_parquet(
         &self,
         calls: &[super::types::LiveEthCall],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
@@ -627,7 +627,7 @@ impl CompactionService {
     fn write_blocks_parquet(
         &self,
         blocks: &[super::types::LiveBlock],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
@@ -664,7 +664,7 @@ impl CompactionService {
     fn write_logs_parquet(
         &self,
         logs: &[(u64, u64, super::types::LiveLog)],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),

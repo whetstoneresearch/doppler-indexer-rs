@@ -20,8 +20,7 @@ pub(crate) use multicall::{
 
 // Re-export from regular_calls
 pub(crate) use regular_calls::{
-    process_factory_range, process_factory_range_multicall, process_range,
-    process_range_multicall,
+    process_factory_range, process_factory_range_multicall, process_range, process_range_multicall,
 };
 
 // Re-export from once_calls

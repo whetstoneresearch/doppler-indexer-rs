@@ -1,12 +1,12 @@
 //! Multicall3 infrastructure: types, calldata encoding/decoding, and generic executor.
 
-use alloy::dyn_abi::{DynSolType, DynSolValue};
-use alloy::primitives::{Address, Bytes};
-use alloy::rpc::types::{BlockId, TransactionRequest};
 use super::config::compute_function_selector;
 use super::types::{BlockInfo, EthCallCollectionError};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::eth_call::{encode_call_with_params, Frequency};
+use alloy::dyn_abi::{DynSolType, DynSolValue};
+use alloy::primitives::{Address, Bytes};
+use alloy::rpc::types::{BlockId, TransactionRequest};
 
 // =============================================================================
 // Multicall Types
@@ -396,10 +396,7 @@ mod tests {
                 DynSolValue::Bool(true),
                 DynSolValue::Bytes(vec![0x01]),
             ]),
-            DynSolValue::Tuple(vec![
-                DynSolValue::Bool(false),
-                DynSolValue::Bytes(vec![]),
-            ]),
+            DynSolValue::Tuple(vec![DynSolValue::Bool(false), DynSolValue::Bytes(vec![])]),
         ]);
         let encoded = value.abi_encode();
 

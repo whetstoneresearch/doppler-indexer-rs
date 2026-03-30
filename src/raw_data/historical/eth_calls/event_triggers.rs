@@ -737,7 +737,8 @@ pub(crate) async fn process_event_triggers(
                 None
             };
 
-            write_event_call_results_to_parquet_async(all_results, output_path.clone(), max_params).await?;
+            write_event_call_results_to_parquet_async(all_results, output_path.clone(), max_params)
+                .await?;
 
             tracing::info!(
                 "Wrote {} event-triggered eth_call results to {} (event blocks {}-{})",

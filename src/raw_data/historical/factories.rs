@@ -655,11 +655,9 @@ pub(crate) async fn write_factory_records_to_parquet_async(
     records: Vec<FactoryRecord>,
     output_path: PathBuf,
 ) -> Result<(), FactoryCollectionError> {
-    tokio::task::spawn_blocking(move || {
-        write_factory_records_to_parquet(&records, &output_path)
-    })
-    .await
-    .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+    tokio::task::spawn_blocking(move || write_factory_records_to_parquet(&records, &output_path))
+        .await
+        .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
 }
 
 fn write_factory_records_to_parquet(

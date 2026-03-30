@@ -89,14 +89,11 @@ pub fn resolve_chain_config(
 
     let factory_collections = match raw_config.factory_collections {
         Some(InlineOrPath::Inline(collections)) => collections,
-        Some(InlineOrPath::Path(p)) => load_factory_collections_from_path(base_dir, &p)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to load factory collections from path {}: {}",
-                    p,
-                    e
-                )
-            })?,
+        Some(InlineOrPath::Path(p)) => {
+            load_factory_collections_from_path(base_dir, &p).map_err(|e| {
+                anyhow::anyhow!("Failed to load factory collections from path {}: {}", p, e)
+            })?
+        }
         None => FactoryCollections::new(),
     };
 

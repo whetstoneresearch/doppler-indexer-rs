@@ -142,11 +142,7 @@ impl TransformationHandler for PriceHandler {
                         DbValue::Address(quote_token_address),
                         DbValue::Numeric(format!("{:.18}", price)),
                     ],
-                    conflict_columns: vec![
-                        "timestamp".into(),
-                        "chain_id".into(),
-                        "token".into(),
-                    ],
+                    conflict_columns: vec!["timestamp".into(), "chain_id".into(), "token".into()],
                     update_columns: vec![
                         "block_number".into(),
                         "quote_token".into(),

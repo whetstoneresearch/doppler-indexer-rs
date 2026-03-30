@@ -15,7 +15,10 @@ pub struct DhookPoolConfigData {
     pub is_token_0: bool,
 }
 
-pub fn insert_dhook_pool_config(data: &DhookPoolConfigData, ctx: &TransformationContext) -> DbOperation {
+pub fn insert_dhook_pool_config(
+    data: &DhookPoolConfigData,
+    ctx: &TransformationContext,
+) -> DbOperation {
     DbOperation::Upsert {
         table: "dhook_pool_configs".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "hook_address".to_string()],

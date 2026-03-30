@@ -32,11 +32,13 @@ pub struct IndexerConfig {
 impl IndexerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let base_dir = path.parent().unwrap_or(Path::new("."));
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read config file at {}: {}", path.display(), e))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!("Failed to read config file at {}: {}", path.display(), e)
+        })?;
 
-        let raw_config: IndexerConfigRaw = serde_json::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse config file at {}: {}", path.display(), e))?;
+        let raw_config: IndexerConfigRaw = serde_json::from_str(&content).map_err(|e| {
+            anyhow::anyhow!("Failed to parse config file at {}: {}", path.display(), e)
+        })?;
 
         let chains: Vec<ChainConfig> = raw_config
             .chains
