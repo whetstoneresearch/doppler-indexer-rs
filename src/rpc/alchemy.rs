@@ -390,7 +390,7 @@ impl AlchemyClient {
             semaphore: Arc::new(Semaphore::new(self.config.rpc_concurrency)),
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
-            max_in_flight: self.config.rpc_concurrency * 2,
+            max_in_flight: (self.config.rpc_concurrency * 2).max(1),
         }
     }
 
