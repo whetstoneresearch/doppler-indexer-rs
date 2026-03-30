@@ -7,7 +7,6 @@
             "ws_url_env_var": "BASE_WS_URL",            
             "start_block": 26602741,
             "contracts": "contracts/base",
-            "tokens": "tokens/base.json",
             "block_receipts_method": "eth_getBlockReceipts"
         }
     ],

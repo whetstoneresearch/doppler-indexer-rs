@@ -6,20 +6,13 @@ use alloy::rpc::types::{BlockId, TransactionRequest};
 use futures::{stream, StreamExt, TryStreamExt};
 
 use super::config::compute_function_selector;
-use super::types::{BlockInfo, EthCallCollectionError, TokenCallConfig};
+use super::types::{BlockInfo, EthCallCollectionError};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::eth_call::{encode_call_with_params, Frequency};
 
 // =============================================================================
 // Multicall Types
 // =============================================================================
-
-/// Tracks which group and config index a multicall slot maps back to (token calls).
-pub(crate) struct MulticallSlot<'a> {
-    pub(crate) group_key: (String, String), // (token_name, function_name)
-    pub(crate) config: &'a TokenCallConfig,
-    pub(crate) block: BlockInfo,
-}
 
 /// Generic slot for tracking call metadata through multicall execution.
 #[derive(Clone)]
@@ -102,22 +95,6 @@ pub(crate) struct RegularGroupInfo<'a> {
     pub(crate) configs: Vec<&'a super::types::CallConfig>,
     pub(crate) filtered_blocks: Vec<BlockInfo>,
     pub(crate) frequency: Frequency,
-}
-
-/// Group info for token multicall processing.
-pub(crate) struct TokenGroupInfo<'a> {
-    pub(crate) output_name: String,
-    pub(crate) function_name: String,
-    pub(crate) configs: Vec<&'a TokenCallConfig>,
-    pub(crate) filtered_blocks: Vec<BlockInfo>,
-    pub(crate) frequency: Frequency,
-}
-
-/// Pending multicall for token range processing.
-pub(crate) struct PendingTokenMulticall<'a> {
-    pub(crate) block_number: u64,
-    pub(crate) block_id: BlockId,
-    pub(crate) slots: Vec<MulticallSlot<'a>>,
 }
 
 // =============================================================================

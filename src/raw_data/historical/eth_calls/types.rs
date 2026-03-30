@@ -16,7 +16,6 @@ use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::eth_call::{
     EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue,
 };
-use crate::types::config::tokens::PoolType;
 use alloy::primitives::Bytes;
 
 #[derive(Debug, Error)]
@@ -199,7 +198,6 @@ pub struct EthCallCatchupState {
     pub call_configs: Vec<CallConfig>,
     pub factory_call_configs: HashMap<String, Vec<EthCallConfig>>,
     pub event_call_configs: HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
-    pub token_call_configs: Vec<TokenCallConfig>,
     pub once_configs: HashMap<String, Vec<OnceCallConfig>>,
     pub factory_once_configs: HashMap<String, Vec<OnceCallConfig>>,
     // Feature flags
@@ -208,7 +206,6 @@ pub struct EthCallCatchupState {
     pub has_factory_calls: bool,
     pub has_factory_once_calls: bool,
     pub has_event_triggered_calls: bool,
-    pub has_token_calls: bool,
     // Derived constants
     pub max_params: usize,
     pub factory_max_params: usize,
@@ -227,22 +224,3 @@ pub struct EthCallCatchupState {
     pub factory_skipped_triggers: Vec<(Vec<SkippedFactoryTrigger>, u64, u64)>,
 }
 
-/// Configuration for a token pool call
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TokenCallConfig {
-    /// Token name (used for output directory naming as {token_name}_pool)
-    pub token_name: String,
-    /// Pool type (v2, v3, v4)
-    pub pool_type: PoolType,
-    /// Target address for the call (pool address for v2/v3, StateView for v4)
-    pub target_address: Address,
-    /// Function name (e.g., "slot0")
-    pub function_name: String,
-    /// Encoded calldata including selector and any params
-    pub encoded_calldata: Bytes,
-    /// Call frequency
-    pub frequency: Frequency,
-    /// Output type for decoding
-    pub output_type: EvmType,
-}
