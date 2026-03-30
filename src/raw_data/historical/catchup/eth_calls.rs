@@ -12,13 +12,12 @@ use crate::raw_data::historical::blocks::{
 };
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
-    build_once_call_configs, build_token_call_configs, event_output_exists_async,
-    get_existing_log_ranges_async, process_event_triggers,
-    process_event_triggers_multicall, process_factory_once_calls, process_once_calls_multicall,
-    process_once_calls_regular, process_range, process_range_multicall, process_token_range,
-    process_token_range_multicall, read_logs_from_parquet_async,
-    scan_existing_parquet_files_async, BlockInfo, BlockRange, EthCallCatchupState,
-    EthCallCollectionError, EthCallContext, FrequencyState,
+    build_once_call_configs, event_output_exists_async, get_existing_log_ranges_async,
+    process_event_triggers, process_event_triggers_multicall, process_factory_once_calls,
+    process_once_calls_multicall, process_once_calls_regular, process_range,
+    process_range_multicall, read_logs_from_parquet_async, scan_existing_parquet_files_async,
+    BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError, EthCallContext,
+    FrequencyState,
 };
 use crate::raw_data::historical::eth_calls::parquet_io::{
     load_or_build_once_column_index_async, read_once_column_index_async,
@@ -58,8 +57,6 @@ pub async fn collect_eth_calls(
     let factory_call_configs =
         get_factory_call_configs(&chain.contracts, &chain.factory_collections);
     let event_call_configs = build_event_triggered_call_configs(&chain.contracts);
-    let token_call_configs = build_token_call_configs(&chain.tokens, &chain.contracts)?;
-
     let multicall3_address: Option<Address> =
         chain
             .contracts
@@ -85,14 +82,12 @@ pub async fn collect_eth_calls(
     let has_factory_calls = !factory_call_configs.is_empty() && has_factory_rx;
     let has_factory_once_calls = !factory_once_configs.is_empty() && has_factory_rx;
     let has_event_triggered_calls = !event_call_configs.is_empty() && has_event_trigger_rx;
-    let has_token_calls = !token_call_configs.is_empty();
 
     if !has_regular_calls
         && !has_once_calls
         && !has_factory_calls
         && !has_factory_once_calls
         && !has_event_triggered_calls
-        && !has_token_calls
     {
         tracing::info!("No eth_calls configured for chain {}", chain.name);
         // Signal catchup done immediately
@@ -107,7 +102,6 @@ pub async fn collect_eth_calls(
             call_configs,
             factory_call_configs,
             event_call_configs,
-            token_call_configs,
             once_configs,
             factory_once_configs,
             has_regular_calls,
@@ -115,7 +109,6 @@ pub async fn collect_eth_calls(
             has_factory_calls,
             has_factory_once_calls,
             has_event_triggered_calls,
-            has_token_calls,
             max_params: 0,
             factory_max_params: 0,
             existing_files: HashSet::new(),
@@ -152,14 +145,13 @@ pub async fn collect_eth_calls(
     };
 
     tracing::info!(
-        "Starting eth_call collection for chain {} with {} regular configs, {} once configs, {} factory collections, {} factory once configs, {} event trigger configs, {} token pool configs",
+        "Starting eth_call collection for chain {} with {} regular configs, {} once configs, {} factory collections, {} factory once configs, {} event trigger configs",
         chain.name,
         call_configs.len(),
         once_configs.len(),
         factory_call_configs.len(),
         factory_once_configs.len(),
-        event_call_configs.len(),
-        token_call_configs.len()
+        event_call_configs.len()
     );
 
     let existing_files = scan_existing_parquet_files_async(base_output_dir.clone()).await;
@@ -169,13 +161,12 @@ pub async fn collect_eth_calls(
     let mut range_regular_done: HashSet<u64> = HashSet::new();
     let range_factory_done: HashSet<u64> = HashSet::new();
 
-    if has_regular_calls || has_token_calls || has_once_calls {
+    if has_regular_calls || has_once_calls {
         let block_ranges = get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
         tracing::info!(
-            "eth_calls catchup: checking {} block ranges (regular={}, token={}, once={})",
+            "eth_calls catchup: checking {} block ranges (regular={}, once={})",
             block_ranges.len(),
             has_regular_calls,
-            has_token_calls,
             has_once_calls
         );
 
@@ -208,18 +199,6 @@ pub async fn collect_eth_calls(
                     let rel_path = format!(
                         "{}/{}/{}",
                         config.contract_name,
-                        config.function_name,
-                        range.file_name("")
-                    );
-                    existing_files.contains(&rel_path)
-                });
-
-            // Check if all token pool call files exist for this range
-            let token_calls_done = !has_token_calls
-                || token_call_configs.iter().all(|config| {
-                    let rel_path = format!(
-                        "{}_pool/{}/{}",
-                        config.token_name,
                         config.function_name,
                         range.file_name("")
                     );
@@ -294,7 +273,7 @@ pub async fn collect_eth_calls(
                 });
 
             // Skip this range only if ALL call types have their files
-            if regular_calls_done && token_calls_done && once_calls_done {
+            if regular_calls_done && once_calls_done {
                 range_regular_done.insert(range.start);
                 continue;
             }
@@ -404,29 +383,6 @@ pub async fn collect_eth_calls(
                         &catchup_ctx,
                         &call_configs,
                         max_params,
-                        &mut frequency_state,
-                    )
-                    .await?;
-                }
-            }
-
-            if has_token_calls {
-                if let Some(multicall_addr) = multicall3_address {
-                    process_token_range_multicall(
-                        &range,
-                        blocks.clone(),
-                        &catchup_ctx,
-                        &token_call_configs,
-                        &mut frequency_state,
-                        multicall_addr,
-                    )
-                    .await?;
-                } else {
-                    process_token_range(
-                        &range,
-                        blocks.clone(),
-                        &catchup_ctx,
-                        &token_call_configs,
                         &mut frequency_state,
                     )
                     .await?;
@@ -812,7 +768,6 @@ pub async fn collect_eth_calls(
         call_configs,
         factory_call_configs,
         event_call_configs,
-        token_call_configs,
         once_configs,
         factory_once_configs,
         has_regular_calls,
@@ -820,7 +775,6 @@ pub async fn collect_eth_calls(
         has_factory_calls,
         has_factory_once_calls,
         has_event_triggered_calls,
-        has_token_calls,
         max_params,
         factory_max_params,
         existing_files,

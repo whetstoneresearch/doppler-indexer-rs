@@ -101,7 +101,6 @@ mod tests {
                         "chain_id": 1,
                         "rpc_url_env_var": "RPC_URL",
                         "contracts": {{}},
-                        "tokens": {{}},
                         "block_receipts_method": "eth_getBlockReceipts"
                     }}
                 ],
@@ -129,7 +128,6 @@ mod tests {
                         "chain_id": 1,
                         "rpc_url_env_var": "RPC_URL",
                         "contracts": "nonexistent/contracts.json",
-                        "tokens": {{}},
                         "block_receipts_method": "eth_getBlockReceipts"
                     }}
                 ],

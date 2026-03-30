@@ -7,7 +7,6 @@ pub(crate) mod once_calls;
 pub(crate) mod parquet_io;
 pub(crate) mod postprocessing;
 pub(crate) mod regular_calls;
-pub(crate) mod token_calls;
 pub(crate) mod types;
 
 pub use config::*;
@@ -30,9 +29,6 @@ pub(crate) use once_calls::{
     process_factory_once_calls, process_factory_once_calls_multicall, process_once_calls_multicall,
     process_once_calls_regular,
 };
-
-// Re-export from token_calls
-pub(crate) use token_calls::{process_token_range, process_token_range_multicall};
 
 pub(crate) use factory::*;
 pub(crate) use parquet_io::*;

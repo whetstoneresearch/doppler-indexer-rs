@@ -34,7 +34,6 @@ pub async fn collect_eth_calls(
         && !state.has_factory_calls
         && !state.has_factory_once_calls
         && !state.has_event_triggered_calls
-        && !state.has_token_calls
     {
         while block_rx.recv().await.is_some() {}
         return Ok(());

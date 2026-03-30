@@ -7,8 +7,8 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::{
     process_factory_once_calls, process_factory_once_calls_multicall, process_factory_range,
     process_factory_range_multicall, process_once_calls_multicall, process_once_calls_regular,
-    process_range, process_range_multicall, process_token_range, process_token_range_multicall,
-    BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError, EthCallContext,
+    process_range, process_range_multicall, BlockInfo, BlockRange, EthCallCatchupState,
+    EthCallCollectionError, EthCallContext,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::StorageManager;
@@ -68,29 +68,6 @@ pub(super) async fn process_complete_range(
                 &ctx,
                 &state.call_configs,
                 state.max_params,
-                &mut state.frequency_state,
-            )
-            .await?;
-        }
-    }
-
-    if state.has_token_calls {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_token_range_multicall(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.token_call_configs,
-                &mut state.frequency_state,
-                multicall_addr,
-            )
-            .await?;
-        } else {
-            process_token_range(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.token_call_configs,
                 &mut state.frequency_state,
             )
             .await?;
@@ -237,29 +214,6 @@ pub(super) async fn process_incomplete_range(
                 &ctx,
                 &state.call_configs,
                 state.max_params,
-                &mut state.frequency_state,
-            )
-            .await?;
-        }
-    }
-
-    if state.has_token_calls && !state.range_regular_done.contains(&range_start) {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_token_range_multicall(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.token_call_configs,
-                &mut state.frequency_state,
-                multicall_addr,
-            )
-            .await?;
-        } else {
-            process_token_range(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.token_call_configs,
                 &mut state.frequency_state,
             )
             .await?;
