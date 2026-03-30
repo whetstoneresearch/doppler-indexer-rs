@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use alloy::primitives::B256;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
 
 use crate::raw_data::historical::blocks::read_block_info_from_parquet_async;
 use crate::raw_data::historical::catchup::receipts::ReceiptsCatchupState;
@@ -11,9 +12,10 @@ use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::{
     build_receipt_schema, execute_receipt_write, extract_event_triggers,
     fetch_receipts_for_blocks, process_range, send_logs_to_channels, send_range_complete,
-    write_full_receipts_to_parquet_async, write_minimal_receipts_to_parquet_async, BlockInfo,
-    ChannelMetrics, ChannelMetricsState, EventTriggerMatcher, EventTriggerMessage, LogMessage,
-    ReceiptBatchState, ReceiptCollectionError, ReceiptOutputChannels,
+    write_full_receipts_to_parquet_async, write_minimal_receipts_to_parquet_async,
+    BatchFetchResult, BlockInfo, ChannelMetrics, ChannelMetricsState, EventTriggerMatcher,
+    EventTriggerMessage, LogMessage, PendingReceiptWrite, ReceiptBatchState,
+    ReceiptCollectionError, ReceiptOutputChannels,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::raw_receipts_dir;
@@ -21,10 +23,25 @@ use crate::storage::{upload_parquet_to_s3, BlockRange, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
+/// Result of a single-block receipt fetch dispatched into the JoinSet.
+struct BlockReceiptResult {
+    range_start: u64,
+    block_number: u64,
+    result: Result<BatchFetchResult, ReceiptCollectionError>,
+}
+
+/// Result of a completed parquet write + its S3 metadata.
+struct WriteCompleteResult {
+    result: Result<(), ReceiptCollectionError>,
+    output_path: PathBuf,
+    range_start: u64,
+    range_end: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_receipts(
     chain: &ChainConfig,
-    client: &UnifiedRpcClient,
+    client: Arc<UnifiedRpcClient>,
     raw_data_config: &RawDataCollectionConfig,
     mut block_rx: Receiver<(u64, u64, Vec<B256>)>,
     log_tx: Option<Sender<LogMessage>>,
@@ -46,7 +63,7 @@ pub async fn collect_receipts(
     let existing_files = catchup_state.existing_files;
     let s3_manifest = catchup_state.s3_manifest;
 
-    // Batch states for early RPC fetching - track blocks received vs fetched
+    // Batch states for per-block receipt fetching
     let mut batch_states: HashMap<u64, ReceiptBatchState> = HashMap::new();
 
     // Build output channels and metrics structs
@@ -82,13 +99,24 @@ pub async fn collect_receipts(
     );
 
     // =========================================================================
-    // Current phase: Process new blocks from the channel and handle recollect requests
-    // Uses batch-based early fetching to start RPC work before full range is ready
+    // Current phase: Eager dispatch - spawn receipt fetches per-block as blocks
+    // arrive, select on completions so the loop never blocks on RPC work.
     // =========================================================================
     let mut block_rx_closed = false;
+    let mut recollect_closed = recollect_rx.is_none();
+
+    // JoinSet for in-flight per-block receipt fetches
+    let mut receipt_join_set: JoinSet<BlockReceiptResult> = JoinSet::new();
+    // JoinSet for background parquet writes
+    let mut write_join_set: JoinSet<WriteCompleteResult> = JoinSet::new();
+
+    let block_receipts_method = chain.block_receipts_method.clone();
 
     loop {
         tokio::select! {
+            // -----------------------------------------------------------------
+            // Branch 1: A new block arrives from upstream
+            // -----------------------------------------------------------------
             block_result = block_rx.recv(), if !block_rx_closed => {
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
@@ -101,18 +129,12 @@ pub async fn collect_receipts(
                                 range_start,
                                 range_end,
                                 blocks_received: HashMap::new(),
-                                blocks_fetched: HashSet::new(),
+                                blocks_dispatched: HashSet::new(),
+                                blocks_completed: HashSet::new(),
                                 minimal_records: Vec::new(),
                                 full_records: Vec::new(),
                                 logs: Vec::new(),
                             }
-                        });
-
-                        // Add block to received set
-                        state.blocks_received.insert(block_number, BlockInfo {
-                            block_number,
-                            timestamp,
-                            tx_hashes,
                         });
 
                         // Check if we should skip this range (file already exists locally or in S3)
@@ -121,6 +143,14 @@ pub async fn collect_receipts(
                             .as_ref()
                             .is_some_and(|m| m.raw_receipts.has(range.start, range.end - 1));
                         if existing_files.contains(&range.file_name("receipts")) || exists_in_s3 {
+                            state.blocks_received.insert(block_number, BlockInfo {
+                                block_number,
+                                timestamp,
+                                tx_hashes,
+                            });
+                            state.blocks_dispatched.insert(block_number);
+                            state.blocks_completed.insert(block_number);
+
                             // Check if range is now complete
                             let expected: HashSet<u64> = (range_start..range_end).collect();
                             let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
@@ -136,200 +166,53 @@ pub async fn collect_receipts(
                             continue;
                         }
 
-                        // Calculate unfetched blocks
-                        let unfetched_blocks: Vec<u64> = state.blocks_received.keys()
-                            .filter(|bn| !state.blocks_fetched.contains(bn))
-                            .copied()
-                            .collect();
+                        let has_txs = !tx_hashes.is_empty();
 
-                        // Early fetch: dispatch all unfetched blocks when we have a
-                        // reasonable batch.  The executor's rate limiter and semaphore
-                        // handle pacing and concurrency.
-                        let early_fetch_threshold = 100;
-                        if unfetched_blocks.len() >= early_fetch_threshold {
-                            let mut blocks_to_fetch: Vec<u64> = unfetched_blocks
-                                .into_iter()
-                                .collect();
-                            blocks_to_fetch.sort();
+                        // Clone tx_hashes for the spawned task before moving into state
+                        let tx_hashes_for_fetch = if has_txs {
+                            Some(tx_hashes.clone())
+                        } else {
+                            None
+                        };
 
-                            let block_refs: Vec<&BlockInfo> = blocks_to_fetch
-                                .iter()
-                                .filter_map(|bn| state.blocks_received.get(bn))
-                                .collect();
+                        // Add block to received set
+                        state.blocks_received.insert(block_number, BlockInfo {
+                            block_number,
+                            timestamp,
+                            tx_hashes,
+                        });
 
-                            tracing::debug!(
-                                "Early fetch: {} blocks for range {}-{} ({} of {} blocks received)",
-                                block_refs.len(),
-                                range_start,
-                                range_end - 1,
-                                state.blocks_received.len(),
-                                range_size
-                            );
+                        // Mark as dispatched
+                        state.blocks_dispatched.insert(block_number);
 
-                            let result = fetch_receipts_for_blocks(
-                                &block_refs,
-                                client,
-                                receipt_fields,
-                                chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                            )
-                            .await?;
-
-                            // Mark blocks as fetched
-                            for bn in &blocks_to_fetch {
-                                state.blocks_fetched.insert(*bn);
-                            }
-
-                            // Accumulate results
-                            state.minimal_records.extend(result.minimal_records);
-                            state.full_records.extend(result.full_records);
-
-                            // Send logs immediately for early processing by downstream collectors
-                            if !result.logs.is_empty() {
-                                let triggers = if !event_matchers.is_empty() {
-                                    extract_event_triggers(&result.logs, &event_matchers)
-                                } else {
-                                    Vec::new()
+                        if let Some(fetch_tx_hashes) = tx_hashes_for_fetch {
+                            // Spawn receipt fetch for this block into the JoinSet
+                            let client = client.clone();
+                            let receipt_fields = receipt_fields.clone();
+                            let method = block_receipts_method.clone();
+                            receipt_join_set.spawn(async move {
+                                let block_info = BlockInfo {
+                                    block_number,
+                                    timestamp,
+                                    tx_hashes: fetch_tx_hashes,
                                 };
-
-                                send_logs_to_channels(
-                                    result.logs,
-                                    &channels,
-                                    &mut metrics,
-                                )
-                                .await?;
-
-                                if !triggers.is_empty() {
-                                    if let Some(tx) = &channels.event_trigger_tx {
-                                        tx.send(EventTriggerMessage::Triggers(triggers))
-                                            .await
-                                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check if range is complete
-                        let expected: HashSet<u64> = (range_start..range_end).collect();
-                        let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
-
-                        if expected.is_subset(&received) {
-                            // Process any remaining unfetched blocks
-                            let remaining_unfetched: Vec<u64> = state.blocks_received.keys()
-                                .filter(|bn| !state.blocks_fetched.contains(bn))
-                                .copied()
-                                .collect();
-
-                            if !remaining_unfetched.is_empty() {
-                                let mut remaining_sorted = remaining_unfetched;
-                                remaining_sorted.sort();
-
-                                let block_refs: Vec<&BlockInfo> = remaining_sorted
-                                    .iter()
-                                    .filter_map(|bn| state.blocks_received.get(bn))
-                                    .collect();
-
-                                tracing::debug!(
-                                    "Final fetch: {} remaining blocks for range {}-{}",
-                                    block_refs.len(),
-                                    range_start,
-                                    range_end - 1
-                                );
-
+                                let block_refs: Vec<&BlockInfo> = vec![&block_info];
                                 let result = fetch_receipts_for_blocks(
                                     &block_refs,
-                                    client,
-                                    receipt_fields,
-                                    chain.block_receipts_method.as_ref().map(|m| m.as_str()),
+                                    &*client,
+                                    &receipt_fields,
+                                    method.as_ref().map(|m| m.as_str()),
                                 )
-                                .await?;
-
-                                state.minimal_records.extend(result.minimal_records);
-                                state.full_records.extend(result.full_records);
-
-                                // Send remaining logs
-                                if !result.logs.is_empty() {
-                                    let triggers = if !event_matchers.is_empty() {
-                                        extract_event_triggers(&result.logs, &event_matchers)
-                                    } else {
-                                        Vec::new()
-                                    };
-
-                                    send_logs_to_channels(
-                                        result.logs,
-                                        &channels,
-                                        &mut metrics,
-                                    )
-                                    .await?;
-
-                                    if !triggers.is_empty() {
-                                        if let Some(tx) = &channels.event_trigger_tx {
-                                            tx.send(EventTriggerMessage::Triggers(triggers))
-                                                .await
-                                                .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
-                                        }
-                                    }
+                                .await;
+                                BlockReceiptResult {
+                                    range_start,
+                                    block_number,
+                                    result,
                                 }
-                            }
-
-                            // Remove state and write parquet
-                            let final_state = batch_states.remove(&range_start).unwrap();
-
-                            // Sort records by block number before writing
-                            let mut minimal_records = final_state.minimal_records;
-                            let mut full_records = final_state.full_records;
-                            minimal_records.sort_by_key(|r| r.block_number);
-                            full_records.sort_by_key(|r| r.block_number);
-
-                            // Signal range complete before parquet write/S3 upload.
-                            // All log data has already been sent via send_logs_to_channels,
-                            // so downstream can start processing immediately.
-                            send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
-
-                            let output_path = output_dir.join(range.file_name("receipts"));
-                            let total_receipts = match receipt_fields {
-                                Some(fields) => {
-                                    let count = minimal_records.len();
-                                    write_minimal_receipts_to_parquet_async(
-                                        minimal_records,
-                                        schema.clone(),
-                                        fields.to_vec(),
-                                        output_path.clone(),
-                                    )
-                                    .await?;
-                                    count
-                                }
-                                None => {
-                                    let count = full_records.len();
-                                    write_full_receipts_to_parquet_async(
-                                        full_records,
-                                        schema.clone(),
-                                        output_path.clone(),
-                                    )
-                                    .await?;
-                                    count
-                                }
-                            };
-
-                            tracing::info!(
-                                "Receipts {}-{}: {} receipts written (early batch mode)",
-                                range.start,
-                                range.end - 1,
-                                total_receipts
-                            );
-
-                            // Upload to S3 if configured
-                            if let Some(ref sm) = storage_manager {
-                                upload_parquet_to_s3(
-                                    sm,
-                                    &output_path,
-                                    &chain.name,
-                                    "raw/receipts",
-                                    range.start,
-                                    range.end - 1,
-                                )
-                                .await
-                                .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
-                            }
+                            });
+                        } else {
+                            // No transactions: mark completed immediately
+                            state.blocks_completed.insert(block_number);
                         }
                     }
                     None => {
@@ -338,12 +221,145 @@ pub async fn collect_receipts(
                 }
             }
 
+            // -----------------------------------------------------------------
+            // Branch 2: A receipt fetch completed
+            // -----------------------------------------------------------------
+            Some(join_result) = receipt_join_set.join_next() => {
+                let block_result = join_result
+                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))?;
+
+                let range_start = block_result.range_start;
+                let block_number = block_result.block_number;
+
+                let fetch_result = block_result.result?;
+
+                if let Some(state) = batch_states.get_mut(&range_start) {
+                    // Store results
+                    state.minimal_records.extend(fetch_result.minimal_records);
+                    state.full_records.extend(fetch_result.full_records);
+
+                    // Send logs immediately
+                    if !fetch_result.logs.is_empty() {
+                        let triggers = if !event_matchers.is_empty() {
+                            extract_event_triggers(&fetch_result.logs, &event_matchers)
+                        } else {
+                            Vec::new()
+                        };
+
+                        send_logs_to_channels(fetch_result.logs, &channels, &mut metrics).await?;
+
+                        if !triggers.is_empty() {
+                            if let Some(tx) = &channels.event_trigger_tx {
+                                tx.send(EventTriggerMessage::Triggers(triggers))
+                                    .await
+                                    .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                            }
+                        }
+                    }
+
+                    // Mark block as completed
+                    state.blocks_completed.insert(block_number);
+
+                    // Check if range is complete (all blocks received AND all completed)
+                    let range_end = state.range_end;
+                    let expected: HashSet<u64> = (range_start..range_end).collect();
+                    let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
+                    let all_received = expected.is_subset(&received);
+                    let all_completed = all_received && expected.is_subset(&state.blocks_completed);
+
+                    if all_completed {
+                        let final_state = batch_states.remove(&range_start).unwrap();
+                        let range = BlockRange { start: range_start, end: range_end };
+
+                        // Sort records by block number before writing
+                        let mut minimal_records = final_state.minimal_records;
+                        let mut full_records = final_state.full_records;
+                        minimal_records.sort_by_key(|r| r.block_number);
+                        full_records.sort_by_key(|r| r.block_number);
+
+                        // Signal range complete before parquet write.
+                        send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
+
+                        // Build pending write
+                        let output_path = output_dir.join(range.file_name("receipts"));
+                        let total_receipts;
+                        let pending_write = match receipt_fields {
+                            Some(fields) => {
+                                total_receipts = minimal_records.len();
+                                PendingReceiptWrite::Minimal {
+                                    records: minimal_records,
+                                    schema: schema.clone(),
+                                    fields: fields.to_vec(),
+                                    output_path: output_path.clone(),
+                                }
+                            }
+                            None => {
+                                total_receipts = full_records.len();
+                                PendingReceiptWrite::Full {
+                                    records: full_records,
+                                    schema: schema.clone(),
+                                    output_path: output_path.clone(),
+                                }
+                            }
+                        };
+
+                        tracing::info!(
+                            "Receipts {}-{}: {} receipts, spawning write",
+                            range.start,
+                            range.end - 1,
+                            total_receipts
+                        );
+
+                        // Spawn parquet write as background task
+                        let wr_start = range.start;
+                        let wr_end = range.end - 1;
+                        let wr_path = output_path;
+                        write_join_set.spawn(async move {
+                            let result = execute_receipt_write(pending_write).await;
+                            WriteCompleteResult {
+                                result,
+                                output_path: wr_path,
+                                range_start: wr_start,
+                                range_end: wr_end,
+                            }
+                        });
+                    }
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // Branch 3: A parquet write completed
+            // -----------------------------------------------------------------
+            Some(join_result) = write_join_set.join_next() => {
+                let write_result = join_result
+                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))?;
+
+                write_result.result?;
+
+                // Upload to S3 if configured
+                if let Some(ref sm) = storage_manager {
+                    upload_parquet_to_s3(
+                        sm,
+                        &write_result.output_path,
+                        &chain.name,
+                        "raw/receipts",
+                        write_result.range_start,
+                        write_result.range_end,
+                    )
+                    .await
+                    .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
+                }
+            }
+
+            // -----------------------------------------------------------------
+            // Branch 4: A recollect request
+            // -----------------------------------------------------------------
             recollect_result = async {
                 match &mut recollect_rx {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
-            } => {
+            }, if !recollect_closed => {
                 if let Some(request) = recollect_result {
                     tracing::info!(
                         "Recollecting range {}-{} (corrupted file was deleted)",
@@ -398,7 +414,7 @@ pub async fn collect_receipts(
                     let pr = process_range(
                         &range,
                         blocks,
-                        client,
+                        &*client,
                         receipt_fields,
                         &schema,
                         &output_dir,
@@ -436,21 +452,18 @@ pub async fn collect_receipts(
                 } else {
                     // recollect_rx closed
                     recollect_rx = None;
+                    recollect_closed = true;
                 }
             }
         }
 
-        // Exit loop when block_rx is closed and no more recollect requests are expected
-        if block_rx_closed && recollect_rx.is_none() {
+        // Exit when all work is done
+        if block_rx_closed
+            && receipt_join_set.is_empty()
+            && write_join_set.is_empty()
+            && (recollect_rx.is_none() || recollect_closed)
+        {
             break;
-        }
-
-        // If block_rx is closed but we might still get recollect requests, continue
-        // (recollect_rx will be set to None when it closes)
-        if block_rx_closed && recollect_rx.is_some() {
-            // Keep waiting for recollect requests with a timeout
-            // to avoid indefinite waiting if no more requests come
-            continue;
         }
     }
 
@@ -495,7 +508,7 @@ pub async fn collect_receipts(
         let remaining_unfetched: Vec<u64> = state
             .blocks_received
             .keys()
-            .filter(|bn| !state.blocks_fetched.contains(bn))
+            .filter(|bn| !state.blocks_completed.contains(bn))
             .copied()
             .collect();
 
@@ -510,7 +523,7 @@ pub async fn collect_receipts(
 
             let result = fetch_receipts_for_blocks(
                 &block_refs,
-                client,
+                &*client,
                 receipt_fields,
                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
             )
@@ -544,8 +557,6 @@ pub async fn collect_receipts(
         state.full_records.sort_by_key(|r| r.block_number);
 
         // Signal range complete before parquet write/S3 upload.
-        // All log data has already been sent via send_logs_to_channels,
-        // so downstream can start processing immediately.
         send_range_complete(
             &channels.factory_log_tx,
             &channels.log_tx,

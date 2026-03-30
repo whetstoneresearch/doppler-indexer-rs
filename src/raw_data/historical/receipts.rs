@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::paths::scan_parquet_filenames;
-use crate::storage::{upload_parquet_to_s3, BlockRange, StorageManager};
+use crate::storage::BlockRange;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::ReceiptField;
 use alloy::primitives::{keccak256, B256};
@@ -309,6 +309,7 @@ pub(crate) enum PendingReceiptWrite {
     },
 }
 
+#[allow(dead_code)]
 pub(crate) struct ProcessRangeResult {
     pub(crate) pending_write: PendingReceiptWrite,
     pub(crate) total_receipts: usize,
@@ -335,17 +336,19 @@ pub(crate) async fn execute_receipt_write(
     }
 }
 
-/// State for batch-based receipt fetching within a range
-/// Enables early RPC fetching before the full range is complete
+/// State for batch-based receipt fetching within a range.
+/// Tracks blocks received, dispatched for RPC fetch, and completed.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ReceiptBatchState {
     pub(crate) range_start: u64,
     pub(crate) range_end: u64,
-    /// Blocks received from upstream but not yet fetched
+    /// Blocks received from upstream
     pub(crate) blocks_received: HashMap<u64, BlockInfo>,
-    /// Block numbers that have already been fetched
-    pub(crate) blocks_fetched: HashSet<u64>,
+    /// Block numbers dispatched for receipt fetch (task spawned)
+    pub(crate) blocks_dispatched: HashSet<u64>,
+    /// Block numbers whose receipt fetch has completed
+    pub(crate) blocks_completed: HashSet<u64>,
     /// Accumulated minimal receipt records (sorted before write)
     pub(crate) minimal_records: Vec<MinimalReceiptRecord>,
     /// Accumulated full receipt records (sorted before write)
