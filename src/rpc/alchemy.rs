@@ -262,11 +262,11 @@ impl ConcurrentExecutor {
         let cost = self.cost_per_request;
 
         join_set.spawn(async move {
+            rate_limiter.acquire(cost).await;
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("semaphore should never be closed during operation");
-            rate_limiter.acquire(cost).await;
             let result = fut.await;
             drop(permit);
             (idx, result)
@@ -288,11 +288,11 @@ impl ConcurrentExecutor {
         let cost = self.cost_per_request;
 
         join_set.spawn(async move {
+            rate_limiter.acquire(cost).await;
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("semaphore should never be closed during operation");
-            rate_limiter.acquire(cost).await;
             let result = fut.await;
             drop(permit);
             let _ = result_tx.send(result).await;
