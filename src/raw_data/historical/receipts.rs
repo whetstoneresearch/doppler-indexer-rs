@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -291,6 +291,48 @@ pub(crate) struct BlockInfo {
     pub(crate) block_number: u64,
     pub(crate) timestamp: u64,
     pub(crate) tx_hashes: Vec<B256>,
+}
+
+/// Holds owned data for a deferred parquet write, allowing the next range's
+/// RPC fetch to proceed while the previous range's I/O completes in the background.
+pub(crate) enum PendingReceiptWrite {
+    Minimal {
+        records: Vec<MinimalReceiptRecord>,
+        schema: Arc<Schema>,
+        fields: Vec<ReceiptField>,
+        output_path: PathBuf,
+    },
+    Full {
+        records: Vec<FullReceiptRecord>,
+        schema: Arc<Schema>,
+        output_path: PathBuf,
+    },
+}
+
+pub(crate) struct ProcessRangeResult {
+    pub(crate) pending_write: PendingReceiptWrite,
+    pub(crate) total_receipts: usize,
+    pub(crate) output_path: PathBuf,
+}
+
+pub(crate) async fn execute_receipt_write(
+    write: PendingReceiptWrite,
+) -> Result<(), ReceiptCollectionError> {
+    match write {
+        PendingReceiptWrite::Minimal {
+            records,
+            schema,
+            fields,
+            output_path,
+        } => {
+            write_minimal_receipts_to_parquet_async(records, schema, fields, output_path).await
+        }
+        PendingReceiptWrite::Full {
+            records,
+            schema,
+            output_path,
+        } => write_full_receipts_to_parquet_async(records, schema, output_path).await,
+    }
 }
 
 /// State for batch-based receipt fetching within a range
@@ -650,9 +692,7 @@ pub(crate) async fn process_range(
     event_matchers: &[EventTriggerMatcher],
     metrics: &mut ChannelMetricsState,
     block_receipts_method: Option<&str>,
-    storage_manager: Option<&Arc<StorageManager>>,
-    chain_name: &str,
-) -> Result<(), ReceiptCollectionError> {
+) -> Result<ProcessRangeResult, ReceiptCollectionError> {
     let range_start_time = Instant::now();
 
     // Reset channel send time for this range (tracked via metrics.total_channel_send_time)
@@ -681,11 +721,6 @@ pub(crate) async fn process_range(
     let total_rpc_time = result.rpc_time;
     let total_process_time = result.process_time;
 
-    #[cfg(feature = "bench")]
-    let rpc_time = result.rpc_time;
-    #[cfg(feature = "bench")]
-    let process_time = result.process_time;
-
     // Send logs to channels
     if !result.logs.is_empty() {
         let triggers = if !event_matchers.is_empty() {
@@ -705,69 +740,41 @@ pub(crate) async fn process_range(
         }
     }
 
-    let write_start = Instant::now();
     let output_path = output_dir.join(range.file_name("receipts"));
-    let total_receipts = match receipt_fields {
+    let (total_receipts, pending_write) = match receipt_fields {
         Some(fields) => {
             let count = result.minimal_records.len();
-            write_minimal_receipts_to_parquet_async(
-                result.minimal_records,
-                schema.clone(),
-                fields.to_vec(),
-                output_path.clone(),
+            (
+                count,
+                PendingReceiptWrite::Minimal {
+                    records: result.minimal_records,
+                    schema: schema.clone(),
+                    fields: fields.to_vec(),
+                    output_path: output_path.clone(),
+                },
             )
-            .await?;
-            count
         }
         None => {
             let count = result.full_records.len();
-            write_full_receipts_to_parquet_async(
-                result.full_records,
-                schema.clone(),
-                output_path.clone(),
+            (
+                count,
+                PendingReceiptWrite::Full {
+                    records: result.full_records,
+                    schema: schema.clone(),
+                    output_path: output_path.clone(),
+                },
             )
-            .await?;
-            count
         }
     };
-    let total_write_time = write_start.elapsed();
-
-    // Upload to S3 if configured
-    if let Some(sm) = storage_manager {
-        upload_parquet_to_s3(
-            sm,
-            &output_path,
-            chain_name,
-            "raw/receipts",
-            range.start,
-            range.end - 1,
-        )
-        .await
-        .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
-    }
-
-    #[cfg(feature = "bench")]
-    {
-        crate::bench::record(
-            "receipts",
-            range.start,
-            range.end,
-            total_receipts,
-            rpc_time,
-            process_time,
-            total_write_time,
-        );
-    }
 
     let total_time = range_start_time.elapsed();
     let rpc_pct = (total_rpc_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
     let process_pct = (total_process_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
     let total_channel_send_time = metrics.total_channel_send_time;
     let channel_pct = (total_channel_send_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
-    let write_pct = (total_write_time.as_secs_f64() / total_time.as_secs_f64()) * 100.0;
 
     tracing::info!(
-        "Receipts {}-{}: {} receipts in {:.1}s | RPC: {:.1}s ({:.0}%) | Process: {:.1}s ({:.0}%) | Channel: {:.1}s ({:.0}%) | Write: {:.1}s ({:.0}%)",
+        "Receipts {}-{}: {} receipts in {:.1}s | RPC: {:.1}s ({:.0}%) | Process: {:.1}s ({:.0}%) | Channel: {:.1}s ({:.0}%)",
         range.start,
         range.end - 1,
         total_receipts,
@@ -778,11 +785,13 @@ pub(crate) async fn process_range(
         process_pct,
         total_channel_send_time.as_secs_f64(),
         channel_pct,
-        total_write_time.as_secs_f64(),
-        write_pct
     );
 
-    Ok(())
+    Ok(ProcessRangeResult {
+        pending_write,
+        total_receipts,
+        output_path,
+    })
 }
 
 fn process_receipts_minimal(

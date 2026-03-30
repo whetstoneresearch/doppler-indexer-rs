@@ -9,11 +9,11 @@ use crate::raw_data::historical::blocks::read_block_info_from_parquet_async;
 use crate::raw_data::historical::catchup::receipts::ReceiptsCatchupState;
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::{
-    build_receipt_schema, extract_event_triggers, fetch_receipts_for_blocks, process_range,
-    send_logs_to_channels, send_range_complete, write_full_receipts_to_parquet_async,
-    write_minimal_receipts_to_parquet_async, BlockInfo, ChannelMetrics, ChannelMetricsState,
-    EventTriggerMatcher, EventTriggerMessage, LogMessage, ReceiptBatchState,
-    ReceiptCollectionError, ReceiptOutputChannels,
+    build_receipt_schema, execute_receipt_write, extract_event_triggers,
+    fetch_receipts_for_blocks, process_range, send_logs_to_channels, send_range_complete,
+    write_full_receipts_to_parquet_async, write_minimal_receipts_to_parquet_async, BlockInfo,
+    ChannelMetrics, ChannelMetricsState, EventTriggerMatcher, EventTriggerMessage, LogMessage,
+    ReceiptBatchState, ReceiptCollectionError, ReceiptOutputChannels,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::raw_receipts_dir;
@@ -395,7 +395,7 @@ pub async fn collect_receipts(
                         })
                         .collect();
 
-                    process_range(
+                    let pr = process_range(
                         &range,
                         blocks,
                         client,
@@ -406,10 +406,25 @@ pub async fn collect_receipts(
                         &event_matchers,
                         &mut metrics,
                         chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                        storage_manager.as_ref(),
-                        &chain.name,
                     )
                     .await?;
+
+                    // Recollect is a one-off - write immediately.
+                    execute_receipt_write(pr.pending_write).await?;
+
+                    // Upload to S3 if configured
+                    if let Some(ref sm) = storage_manager {
+                        upload_parquet_to_s3(
+                            sm,
+                            &pr.output_path,
+                            &chain.name,
+                            "raw/receipts",
+                            range.start,
+                            range.end - 1,
+                        )
+                        .await
+                        .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
+                    }
 
                     send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
 
