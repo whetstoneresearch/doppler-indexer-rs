@@ -46,8 +46,6 @@ pub async fn collect_receipts(
     let output_dir = raw_receipts_dir(&chain.name);
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
-    let block_receipt_concurrency = raw_data_config.block_receipt_concurrency.unwrap_or(10);
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
 
@@ -208,10 +206,8 @@ pub async fn collect_receipts(
             &output_dir,
             &channels,
             event_matchers,
-            rpc_batch_size,
             &mut metrics,
             chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-            block_receipt_concurrency,
             storage_manager.as_ref(),
             &chain.name,
         )

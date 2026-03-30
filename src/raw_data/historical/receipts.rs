@@ -543,13 +543,13 @@ pub(crate) struct BatchFetchResult {
 
 /// Fetch receipts for a batch of blocks and return the results.
 /// This enables early RPC fetching before the full range is complete.
+/// All requests are dispatched at once; the executor's rate limiter and
+/// semaphore handle pacing and concurrency.
 pub(crate) async fn fetch_receipts_for_blocks(
     blocks: &[&BlockInfo],
     client: &UnifiedRpcClient,
     receipt_fields: &Option<Vec<ReceiptField>>,
     block_receipts_method: Option<&str>,
-    block_receipt_concurrency: usize,
-    rpc_batch_size: usize,
 ) -> Result<BatchFetchResult, ReceiptCollectionError> {
     let mut minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut full_records: Vec<FullReceiptRecord> = Vec::new();
@@ -562,43 +562,42 @@ pub(crate) async fn fetch_receipts_for_blocks(
         let blocks_with_txs: Vec<&&BlockInfo> =
             blocks.iter().filter(|b| !b.tx_hashes.is_empty()).collect();
 
-        for batch in blocks_with_txs.chunks(block_receipt_concurrency) {
-            let block_numbers: Vec<alloy::rpc::types::BlockNumberOrTag> = batch
+        let block_numbers: Vec<alloy::rpc::types::BlockNumberOrTag> = blocks_with_txs
+            .iter()
+            .map(|b| alloy::rpc::types::BlockNumberOrTag::Number(b.block_number))
+            .collect();
+
+        let concurrency = block_numbers.len();
+        let rpc_start = Instant::now();
+        let all_receipts = client
+            .get_block_receipts_concurrent(method, block_numbers, concurrency)
+            .await?;
+        total_rpc_time += rpc_start.elapsed();
+
+        let process_start = Instant::now();
+        for (block, receipts) in blocks_with_txs.iter().zip(all_receipts.into_iter()) {
+            let tx_block_info: Vec<(B256, u64, u64)> = receipts
                 .iter()
-                .map(|b| alloy::rpc::types::BlockNumberOrTag::Number(b.block_number))
+                .map(|r| {
+                    let tx_hash = r.as_ref().map_or(B256::ZERO, |r| r.transaction_hash);
+                    (tx_hash, block.block_number, block.timestamp)
+                })
                 .collect();
 
-            let rpc_start = Instant::now();
-            let all_receipts = client
-                .get_block_receipts_concurrent(method, block_numbers, block_receipt_concurrency)
-                .await?;
-            total_rpc_time += rpc_start.elapsed();
-
-            let process_start = Instant::now();
-            for (block, receipts) in batch.iter().zip(all_receipts.into_iter()) {
-                let tx_block_info: Vec<(B256, u64, u64)> = receipts
-                    .iter()
-                    .map(|r| {
-                        let tx_hash = r.as_ref().map_or(B256::ZERO, |r| r.transaction_hash);
-                        (tx_hash, block.block_number, block.timestamp)
-                    })
-                    .collect();
-
-                match receipt_fields {
-                    Some(_) => {
-                        let records =
-                            process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
-                        minimal_records.extend(records);
-                    }
-                    None => {
-                        let records =
-                            process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
-                        full_records.extend(records);
-                    }
+            match receipt_fields {
+                Some(_) => {
+                    let records =
+                        process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
+                    minimal_records.extend(records);
+                }
+                None => {
+                    let records =
+                        process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+                    full_records.extend(records);
                 }
             }
-            total_process_time += process_start.elapsed();
         }
+        total_process_time += process_start.elapsed();
     } else {
         // Using individual transaction receipt fetches
         let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
@@ -608,26 +607,26 @@ pub(crate) async fn fetch_receipts_for_blocks(
             }
         }
 
-        for chunk in tx_block_info.chunks(rpc_batch_size) {
-            let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
+        let tx_hashes: Vec<B256> = tx_block_info.iter().map(|(h, _, _)| *h).collect();
 
-            let rpc_start = Instant::now();
-            let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
-            total_rpc_time += rpc_start.elapsed();
+        let rpc_start = Instant::now();
+        let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
+        total_rpc_time += rpc_start.elapsed();
 
-            let process_start = Instant::now();
-            match receipt_fields {
-                Some(_) => {
-                    let records = process_receipts_minimal(&receipts, chunk, &mut all_logs)?;
-                    minimal_records.extend(records);
-                }
-                None => {
-                    let records = process_receipts_full(&receipts, chunk, &mut all_logs)?;
-                    full_records.extend(records);
-                }
+        let process_start = Instant::now();
+        match receipt_fields {
+            Some(_) => {
+                let records =
+                    process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
+                minimal_records.extend(records);
             }
-            total_process_time += process_start.elapsed();
+            None => {
+                let records =
+                    process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+                full_records.extend(records);
+            }
         }
+        total_process_time += process_start.elapsed();
     }
 
     Ok(BatchFetchResult {
@@ -649,265 +648,59 @@ pub(crate) async fn process_range(
     output_dir: &Path,
     channels: &ReceiptOutputChannels,
     event_matchers: &[EventTriggerMatcher],
-    rpc_batch_size: usize,
     metrics: &mut ChannelMetricsState,
     block_receipts_method: Option<&str>,
-    block_receipt_concurrency: usize,
     storage_manager: Option<&Arc<StorageManager>>,
     chain_name: &str,
 ) -> Result<(), ReceiptCollectionError> {
     let range_start_time = Instant::now();
 
-    let mut all_minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
-    let mut all_full_records: Vec<FullReceiptRecord> = Vec::new();
-
-    // Timing metrics (always tracked)
-    let mut total_rpc_time = std::time::Duration::ZERO;
-    let mut total_process_time = std::time::Duration::ZERO;
     // Reset channel send time for this range (tracked via metrics.total_channel_send_time)
     metrics.total_channel_send_time = std::time::Duration::ZERO;
 
+    let block_refs: Vec<&BlockInfo> = blocks.iter().collect();
+
+    tracing::info!(
+        "Fetching receipts for blocks {}-{}: {} blocks{}",
+        range.start,
+        range.end - 1,
+        block_refs.len(),
+        block_receipts_method
+            .map(|m| format!(" using {}", m))
+            .unwrap_or_default()
+    );
+
+    let result = fetch_receipts_for_blocks(
+        &block_refs,
+        client,
+        receipt_fields,
+        block_receipts_method,
+    )
+    .await?;
+
+    let total_rpc_time = result.rpc_time;
+    let total_process_time = result.process_time;
+
     #[cfg(feature = "bench")]
-    let mut rpc_time = std::time::Duration::ZERO;
+    let rpc_time = result.rpc_time;
     #[cfg(feature = "bench")]
-    let mut process_time = std::time::Duration::ZERO;
+    let process_time = result.process_time;
 
-    if let Some(method) = block_receipts_method {
-        let blocks_with_txs: Vec<&BlockInfo> =
-            blocks.iter().filter(|b| !b.tx_hashes.is_empty()).collect();
+    // Send logs to channels
+    if !result.logs.is_empty() {
+        let triggers = if !event_matchers.is_empty() {
+            extract_event_triggers(&result.logs, event_matchers)
+        } else {
+            Vec::new()
+        };
 
-        let total_blocks = blocks_with_txs.len();
-        tracing::info!(
-            "Fetching receipts for blocks {}-{}: {} blocks with txs using {} (concurrency: {})",
-            range.start,
-            range.end - 1,
-            total_blocks,
-            method,
-            block_receipt_concurrency
-        );
+        send_logs_to_channels(result.logs, channels, metrics).await?;
 
-        for (batch_idx, batch) in blocks_with_txs
-            .chunks(block_receipt_concurrency)
-            .enumerate()
-        {
-            let batch_start = batch_idx * block_receipt_concurrency;
-            let batch_end = std::cmp::min(batch_start + batch.len(), total_blocks);
-
-            tracing::debug!(
-                "receipts: fetching batch {}/{} (blocks {}-{} of {})",
-                batch_idx + 1,
-                total_blocks.div_ceil(block_receipt_concurrency),
-                batch_start + 1,
-                batch_end,
-                total_blocks
-            );
-
-            let block_numbers: Vec<alloy::rpc::types::BlockNumberOrTag> = batch
-                .iter()
-                .map(|b| alloy::rpc::types::BlockNumberOrTag::Number(b.block_number))
-                .collect();
-
-            let rpc_start = Instant::now();
-            let all_receipts = match client
-                .get_block_receipts_concurrent(method, block_numbers, block_receipt_concurrency)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(
-                        "receipts: RPC error fetching block receipts for batch starting at block {}: {:?}",
-                        batch[0].block_number,
-                        e
-                    );
-                    return Err(e.into());
-                }
-            };
-            let rpc_elapsed = rpc_start.elapsed();
-            total_rpc_time += rpc_elapsed;
-            #[cfg(feature = "bench")]
-            {
-                rpc_time += rpc_elapsed;
-            }
-
-            let process_start = Instant::now();
-            let mut batch_logs: Vec<LogData> = Vec::new();
-
-            for (block, receipts) in batch.iter().zip(all_receipts.into_iter()) {
-                let tx_block_info: Vec<(B256, u64, u64)> = receipts
-                    .iter()
-                    .map(|r| {
-                        let tx_hash = r.as_ref().map_or(B256::ZERO, |r| r.transaction_hash);
-                        (tx_hash, block.block_number, block.timestamp)
-                    })
-                    .collect();
-
-                match receipt_fields {
-                    Some(_) => {
-                        let records = match process_receipts_minimal(
-                            &receipts,
-                            &tx_block_info,
-                            &mut batch_logs,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::error!(
-                                    "receipts: error processing minimal receipts: {:?}",
-                                    e
-                                );
-                                return Err(e);
-                            }
-                        };
-                        all_minimal_records.extend(records);
-                    }
-                    None => {
-                        let records =
-                            match process_receipts_full(&receipts, &tx_block_info, &mut batch_logs)
-                            {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    tracing::error!(
-                                        "receipts: error processing full receipts: {:?}",
-                                        e
-                                    );
-                                    return Err(e);
-                                }
-                            };
-                        all_full_records.extend(records);
-                    }
-                }
-            }
-
-            let process_elapsed = process_start.elapsed();
-            total_process_time += process_elapsed;
-
-            if !batch_logs.is_empty() {
-                // Extract event triggers before sending logs (logs are consumed by send)
-                let triggers = if !event_matchers.is_empty() {
-                    extract_event_triggers(&batch_logs, event_matchers)
-                } else {
-                    Vec::new()
-                };
-
-                send_logs_to_channels(batch_logs, channels, metrics).await?;
-
-                // Send event triggers if any
-                if !triggers.is_empty() {
-                    if let Some(tx) = &channels.event_trigger_tx {
-                        tx.send(EventTriggerMessage::Triggers(triggers))
-                            .await
-                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
-                    }
-                }
-            }
-
-            #[cfg(feature = "bench")]
-            {
-                process_time += process_elapsed;
-            }
-        }
-    } else {
-        let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
-        for block in &blocks {
-            for tx_hash in &block.tx_hashes {
-                tx_block_info.push((*tx_hash, block.block_number, block.timestamp));
-            }
-        }
-
-        let total_txs = tx_block_info.len();
-        let total_batches = total_txs.div_ceil(rpc_batch_size);
-        tracing::info!(
-            "Fetching receipts for blocks {}-{}: {} transactions in {} batches",
-            range.start,
-            range.end - 1,
-            total_txs,
-            total_batches
-        );
-
-        if tx_block_info.is_empty() {
-            tracing::info!(
-                "No transactions in blocks {}-{}, writing empty receipts file",
-                range.start,
-                range.end - 1
-            );
-        }
-
-        for (chunk_idx, chunk) in tx_block_info.chunks(rpc_batch_size).enumerate() {
-            let tx_hashes: Vec<B256> = chunk.iter().map(|(h, _, _)| *h).collect();
-
-            tracing::debug!(
-                "receipts: fetching batch {}/{}, {} transactions",
-                chunk_idx + 1,
-                total_batches,
-                tx_hashes.len()
-            );
-
-            let rpc_start = Instant::now();
-            let receipts = match client.get_transaction_receipts_batch(tx_hashes).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("receipts: RPC error fetching receipts: {:?}", e);
-                    return Err(e.into());
-                }
-            };
-            let rpc_elapsed = rpc_start.elapsed();
-            total_rpc_time += rpc_elapsed;
-            #[cfg(feature = "bench")]
-            {
-                rpc_time += rpc_elapsed;
-            }
-
-            let process_start = Instant::now();
-            let mut batch_logs: Vec<LogData> = Vec::new();
-
-            match receipt_fields {
-                Some(_) => {
-                    let records = match process_receipts_minimal(&receipts, chunk, &mut batch_logs)
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("receipts: error processing minimal receipts: {:?}", e);
-                            return Err(e);
-                        }
-                    };
-                    all_minimal_records.extend(records);
-                }
-                None => {
-                    let records = match process_receipts_full(&receipts, chunk, &mut batch_logs) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!("receipts: error processing full receipts: {:?}", e);
-                            return Err(e);
-                        }
-                    };
-                    all_full_records.extend(records);
-                }
-            }
-
-            let process_elapsed = process_start.elapsed();
-            total_process_time += process_elapsed;
-
-            if !batch_logs.is_empty() {
-                // Extract event triggers before sending logs (logs are consumed by send)
-                let triggers = if !event_matchers.is_empty() {
-                    extract_event_triggers(&batch_logs, event_matchers)
-                } else {
-                    Vec::new()
-                };
-
-                send_logs_to_channels(batch_logs, channels, metrics).await?;
-
-                // Send event triggers if any
-                if !triggers.is_empty() {
-                    if let Some(tx) = &channels.event_trigger_tx {
-                        tx.send(EventTriggerMessage::Triggers(triggers))
-                            .await
-                            .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
-                    }
-                }
-            }
-            #[cfg(feature = "bench")]
-            {
-                process_time += process_elapsed;
+        if !triggers.is_empty() {
+            if let Some(tx) = &channels.event_trigger_tx {
+                tx.send(EventTriggerMessage::Triggers(triggers))
+                    .await
+                    .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
             }
         }
     }
@@ -916,9 +709,9 @@ pub(crate) async fn process_range(
     let output_path = output_dir.join(range.file_name("receipts"));
     let total_receipts = match receipt_fields {
         Some(fields) => {
-            let count = all_minimal_records.len();
+            let count = result.minimal_records.len();
             write_minimal_receipts_to_parquet_async(
-                all_minimal_records,
+                result.minimal_records,
                 schema.clone(),
                 fields.to_vec(),
                 output_path.clone(),
@@ -927,9 +720,9 @@ pub(crate) async fn process_range(
             count
         }
         None => {
-            let count = all_full_records.len();
+            let count = result.full_records.len();
             write_full_receipts_to_parquet_async(
-                all_full_records,
+                result.full_records,
                 schema.clone(),
                 output_path.clone(),
             )

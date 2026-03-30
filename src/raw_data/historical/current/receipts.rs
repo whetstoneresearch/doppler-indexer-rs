@@ -39,8 +39,6 @@ pub async fn collect_receipts(
     tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-    let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
-    let block_receipt_concurrency = raw_data_config.block_receipt_concurrency.unwrap_or(10);
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
 
@@ -144,11 +142,13 @@ pub async fn collect_receipts(
                             .copied()
                             .collect();
 
-                        // Early fetch: if we have enough unfetched blocks, fetch now
-                        if unfetched_blocks.len() >= rpc_batch_size {
+                        // Early fetch: dispatch all unfetched blocks when we have a
+                        // reasonable batch.  The executor's rate limiter and semaphore
+                        // handle pacing and concurrency.
+                        let early_fetch_threshold = 100;
+                        if unfetched_blocks.len() >= early_fetch_threshold {
                             let mut blocks_to_fetch: Vec<u64> = unfetched_blocks
                                 .into_iter()
-                                .take(rpc_batch_size)
                                 .collect();
                             blocks_to_fetch.sort();
 
@@ -171,8 +171,6 @@ pub async fn collect_receipts(
                                 client,
                                 receipt_fields,
                                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                                block_receipt_concurrency,
-                                rpc_batch_size,
                             )
                             .await?;
 
@@ -242,8 +240,6 @@ pub async fn collect_receipts(
                                     client,
                                     receipt_fields,
                                     chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                                    block_receipt_concurrency,
-                                    rpc_batch_size,
                                 )
                                 .await?;
 
@@ -408,10 +404,8 @@ pub async fn collect_receipts(
                         &output_dir,
                         &channels,
                         &event_matchers,
-                        rpc_batch_size,
                         &mut metrics,
                         chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                        block_receipt_concurrency,
                         storage_manager.as_ref(),
                         &chain.name,
                     )
@@ -504,8 +498,6 @@ pub async fn collect_receipts(
                 client,
                 receipt_fields,
                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                block_receipt_concurrency,
-                rpc_batch_size,
             )
             .await?;
 
