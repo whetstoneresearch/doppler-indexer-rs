@@ -588,13 +588,14 @@ pub(crate) struct BatchFetchResult {
 
 /// Fetch receipts for a batch of blocks and return the results.
 /// This enables early RPC fetching before the full range is complete.
-/// All requests are dispatched at once; the executor's rate limiter and
-/// semaphore handle pacing and concurrency.
+/// For Alchemy the executor's rate limiter and semaphore handle pacing;
+/// for standard providers `block_receipt_concurrency` caps the chunk size.
 pub(crate) async fn fetch_receipts_for_blocks(
     blocks: &[&BlockInfo],
     client: &UnifiedRpcClient,
     receipt_fields: &Option<Vec<ReceiptField>>,
     block_receipts_method: Option<&str>,
+    block_receipt_concurrency: usize,
 ) -> Result<BatchFetchResult, ReceiptCollectionError> {
     let mut minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut full_records: Vec<FullReceiptRecord> = Vec::new();
@@ -612,7 +613,7 @@ pub(crate) async fn fetch_receipts_for_blocks(
             .map(|b| alloy::rpc::types::BlockNumberOrTag::Number(b.block_number))
             .collect();
 
-        let concurrency = block_numbers.len();
+        let concurrency = block_receipt_concurrency;
         let rpc_start = Instant::now();
         let all_receipts = client
             .get_block_receipts_concurrent(method, block_numbers, concurrency)
@@ -695,6 +696,7 @@ pub(crate) async fn process_range(
     event_matchers: &[EventTriggerMatcher],
     metrics: &mut ChannelMetricsState,
     block_receipts_method: Option<&str>,
+    block_receipt_concurrency: usize,
 ) -> Result<ProcessRangeResult, ReceiptCollectionError> {
     let range_start_time = Instant::now();
 
@@ -718,6 +720,7 @@ pub(crate) async fn process_range(
         client,
         receipt_fields,
         block_receipts_method,
+        block_receipt_concurrency,
     )
     .await?;
 

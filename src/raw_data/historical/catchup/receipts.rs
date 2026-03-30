@@ -48,6 +48,7 @@ pub async fn collect_receipts(
 
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
+    let block_receipt_concurrency = raw_data_config.block_receipt_concurrency.unwrap_or(10);
 
     let existing_files = scan_existing_parquet_files_async(output_dir.clone()).await?;
 
@@ -93,7 +94,8 @@ pub async fn collect_receipts(
     let mut pending_write_handle: Option<
         tokio::task::JoinHandle<Result<(), ReceiptCollectionError>>,
     > = None;
-    let mut pending_s3_info: Option<(PathBuf, u64, u64)> = None;
+    // (output_path, range_start, range_end_exclusive)
+    let mut pending_write_info: Option<(PathBuf, u64, u64)> = None;
 
     for block_range in &block_ranges {
         let range = BlockRange {
@@ -135,15 +137,32 @@ pub async fn collect_receipts(
                 .await
                 .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
 
-            // Upload the now-written file to S3 if configured.
-            if let (Some(ref sm), Some((ref path, s3_start, s3_end))) =
-                (&storage_manager, &pending_s3_info)
-            {
-                upload_parquet_to_s3(sm, path, &chain.name, "raw/receipts", *s3_start, *s3_end)
+            if let Some((ref path, wr_start, wr_end)) = pending_write_info {
+                // Upload the now-written file to S3 if configured.
+                if let Some(ref sm) = storage_manager {
+                    upload_parquet_to_s3(
+                        sm,
+                        path,
+                        &chain.name,
+                        "raw/receipts",
+                        wr_start,
+                        wr_end - 1,
+                    )
                     .await
                     .map_err(|e| {
                         ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
                     })?;
+                }
+
+                // Signal range complete now that the parquet file exists.
+                send_range_complete(
+                    &channels.factory_log_tx,
+                    &channels.log_tx,
+                    &channels.event_trigger_tx,
+                    wr_start,
+                    wr_end,
+                )
+                .await?;
             }
         }
 
@@ -232,23 +251,15 @@ pub async fn collect_receipts(
             event_matchers,
             &mut metrics,
             chain.block_receipts_method.as_ref().map(|m| m.as_str()),
+            block_receipt_concurrency,
         )
         .await?;
 
-        // Signal range complete after RPC + log sending (but before parquet write).
-        send_range_complete(
-            &channels.factory_log_tx,
-            &channels.log_tx,
-            &channels.event_trigger_tx,
-            range.start,
-            range.end,
-        )
-        .await?;
         catchup_count += 1;
 
-        // Spawn background write and record S3 metadata for the next drain.
+        // Spawn background write; RangeComplete deferred until drain confirms the write.
         let output_path = result.output_path.clone();
-        pending_s3_info = Some((output_path, range.start, range.end - 1));
+        pending_write_info = Some((output_path, range.start, range.end));
         pending_write_handle =
             Some(tokio::spawn(execute_receipt_write(result.pending_write)));
     }
@@ -259,14 +270,30 @@ pub async fn collect_receipts(
             .await
             .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
 
-        if let (Some(ref sm), Some((ref path, s3_start, s3_end))) =
-            (&storage_manager, &pending_s3_info)
-        {
-            upload_parquet_to_s3(sm, path, &chain.name, "raw/receipts", *s3_start, *s3_end)
+        if let Some((ref path, wr_start, wr_end)) = pending_write_info {
+            if let Some(ref sm) = storage_manager {
+                upload_parquet_to_s3(
+                    sm,
+                    path,
+                    &chain.name,
+                    "raw/receipts",
+                    wr_start,
+                    wr_end - 1,
+                )
                 .await
                 .map_err(|e| {
                     ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
                 })?;
+            }
+
+            send_range_complete(
+                &channels.factory_log_tx,
+                &channels.log_tx,
+                &channels.event_trigger_tx,
+                wr_start,
+                wr_end,
+            )
+            .await?;
         }
     }
 

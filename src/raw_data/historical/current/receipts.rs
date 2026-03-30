@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use arrow::datatypes::Schema;
 
 use alloy::primitives::B256;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -21,7 +23,7 @@ use crate::rpc::UnifiedRpcClient;
 use crate::storage::paths::raw_receipts_dir;
 use crate::storage::{upload_parquet_to_s3, BlockRange, StorageManager};
 use crate::types::config::chain::ChainConfig;
-use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::config::raw_data::{RawDataCollectionConfig, ReceiptField};
 
 /// Result of a single-block receipt fetch dispatched into the JoinSet.
 struct BlockReceiptResult {
@@ -35,7 +37,90 @@ struct WriteCompleteResult {
     result: Result<(), ReceiptCollectionError>,
     output_path: PathBuf,
     range_start: u64,
-    range_end: u64,
+    range_end: u64, // exclusive
+}
+
+/// Check if all blocks in a range have been received and completed.
+/// If so, remove the state, sort records, build a pending write, and spawn it.
+#[allow(clippy::too_many_arguments)]
+async fn try_finalize_range(
+    range_start: u64,
+    batch_states: &mut HashMap<u64, ReceiptBatchState>,
+    write_join_set: &mut JoinSet<WriteCompleteResult>,
+    receipt_fields: &Option<Vec<ReceiptField>>,
+    schema: &Arc<Schema>,
+    output_dir: &Path,
+) -> Result<bool, ReceiptCollectionError> {
+    let state = match batch_states.get(&range_start) {
+        Some(s) => s,
+        None => return Ok(false),
+    };
+
+    let range_end = state.range_end;
+    let expected: HashSet<u64> = (range_start..range_end).collect();
+    let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
+    let all_received = expected.is_subset(&received);
+    let all_completed = all_received && expected.is_subset(&state.blocks_completed);
+
+    if !all_completed {
+        return Ok(false);
+    }
+
+    let final_state = batch_states.remove(&range_start).unwrap();
+    let range = BlockRange {
+        start: range_start,
+        end: range_end,
+    };
+
+    let mut minimal_records = final_state.minimal_records;
+    let mut full_records = final_state.full_records;
+    minimal_records.sort_by_key(|r| r.block_number);
+    full_records.sort_by_key(|r| r.block_number);
+
+    let output_path = output_dir.join(range.file_name("receipts"));
+    let total_receipts;
+    let pending_write = match receipt_fields {
+        Some(fields) => {
+            total_receipts = minimal_records.len();
+            PendingReceiptWrite::Minimal {
+                records: minimal_records,
+                schema: schema.clone(),
+                fields: fields.to_vec(),
+                output_path: output_path.clone(),
+            }
+        }
+        None => {
+            total_receipts = full_records.len();
+            PendingReceiptWrite::Full {
+                records: full_records,
+                schema: schema.clone(),
+                output_path: output_path.clone(),
+            }
+        }
+    };
+
+    tracing::info!(
+        "Receipts {}-{}: {} receipts, spawning write",
+        range.start,
+        range.end - 1,
+        total_receipts
+    );
+
+    // Spawn parquet write; RangeComplete deferred to Branch 3.
+    let wr_start = range.start;
+    let wr_end = range.end;
+    let wr_path = output_path;
+    write_join_set.spawn(async move {
+        let result = execute_receipt_write(pending_write).await;
+        WriteCompleteResult {
+            result,
+            output_path: wr_path,
+            range_start: wr_start,
+            range_end: wr_end,
+        }
+    });
+
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +143,7 @@ pub async fn collect_receipts(
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
+    let block_receipt_concurrency = raw_data_config.block_receipt_concurrency.unwrap_or(10);
 
     // Use the existing files from catchup state (already scanned)
     let existing_files = catchup_state.existing_files;
@@ -185,7 +271,7 @@ pub async fn collect_receipts(
                         // Mark as dispatched
                         state.blocks_dispatched.insert(block_number);
 
-                        if let Some(fetch_tx_hashes) = tx_hashes_for_fetch {
+                        let is_empty_block = if let Some(fetch_tx_hashes) = tx_hashes_for_fetch {
                             // Spawn receipt fetch for this block into the JoinSet
                             let client = client.clone();
                             let receipt_fields = receipt_fields.clone();
@@ -202,6 +288,7 @@ pub async fn collect_receipts(
                                     &*client,
                                     &receipt_fields,
                                     method.as_ref().map(|m| m.as_str()),
+                                    1, // single-block fetch
                                 )
                                 .await;
                                 BlockReceiptResult {
@@ -210,9 +297,23 @@ pub async fn collect_receipts(
                                     result,
                                 }
                             });
+                            false
                         } else {
                             // No transactions: mark completed immediately
                             state.blocks_completed.insert(block_number);
+                            true
+                        };
+
+                        // Drop `state` borrow before calling try_finalize_range
+                        if is_empty_block {
+                            try_finalize_range(
+                                range_start,
+                                &mut batch_states,
+                                &mut write_join_set,
+                                receipt_fields,
+                                &schema,
+                                &output_dir,
+                            ).await?;
                         }
                     }
                     None => {
@@ -259,72 +360,17 @@ pub async fn collect_receipts(
 
                     // Mark block as completed
                     state.blocks_completed.insert(block_number);
-
-                    // Check if range is complete (all blocks received AND all completed)
-                    let range_end = state.range_end;
-                    let expected: HashSet<u64> = (range_start..range_end).collect();
-                    let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
-                    let all_received = expected.is_subset(&received);
-                    let all_completed = all_received && expected.is_subset(&state.blocks_completed);
-
-                    if all_completed {
-                        let final_state = batch_states.remove(&range_start).unwrap();
-                        let range = BlockRange { start: range_start, end: range_end };
-
-                        // Sort records by block number before writing
-                        let mut minimal_records = final_state.minimal_records;
-                        let mut full_records = final_state.full_records;
-                        minimal_records.sort_by_key(|r| r.block_number);
-                        full_records.sort_by_key(|r| r.block_number);
-
-                        // Signal range complete before parquet write.
-                        send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
-
-                        // Build pending write
-                        let output_path = output_dir.join(range.file_name("receipts"));
-                        let total_receipts;
-                        let pending_write = match receipt_fields {
-                            Some(fields) => {
-                                total_receipts = minimal_records.len();
-                                PendingReceiptWrite::Minimal {
-                                    records: minimal_records,
-                                    schema: schema.clone(),
-                                    fields: fields.to_vec(),
-                                    output_path: output_path.clone(),
-                                }
-                            }
-                            None => {
-                                total_receipts = full_records.len();
-                                PendingReceiptWrite::Full {
-                                    records: full_records,
-                                    schema: schema.clone(),
-                                    output_path: output_path.clone(),
-                                }
-                            }
-                        };
-
-                        tracing::info!(
-                            "Receipts {}-{}: {} receipts, spawning write",
-                            range.start,
-                            range.end - 1,
-                            total_receipts
-                        );
-
-                        // Spawn parquet write as background task
-                        let wr_start = range.start;
-                        let wr_end = range.end - 1;
-                        let wr_path = output_path;
-                        write_join_set.spawn(async move {
-                            let result = execute_receipt_write(pending_write).await;
-                            WriteCompleteResult {
-                                result,
-                                output_path: wr_path,
-                                range_start: wr_start,
-                                range_end: wr_end,
-                            }
-                        });
-                    }
                 }
+
+                // Check if range is now complete and finalize
+                try_finalize_range(
+                    range_start,
+                    &mut batch_states,
+                    &mut write_join_set,
+                    receipt_fields,
+                    &schema,
+                    &output_dir,
+                ).await?;
             }
 
             // -----------------------------------------------------------------
@@ -344,11 +390,20 @@ pub async fn collect_receipts(
                         &chain.name,
                         "raw/receipts",
                         write_result.range_start,
-                        write_result.range_end,
+                        write_result.range_end - 1,
                     )
                     .await
                     .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
                 }
+
+                // Signal range complete now that the parquet file exists.
+                send_range_complete(
+                    &channels.factory_log_tx,
+                    &channels.log_tx,
+                    &channels.event_trigger_tx,
+                    write_result.range_start,
+                    write_result.range_end,
+                ).await?;
             }
 
             // -----------------------------------------------------------------
@@ -422,6 +477,7 @@ pub async fn collect_receipts(
                         &event_matchers,
                         &mut metrics,
                         chain.block_receipts_method.as_ref().map(|m| m.as_str()),
+                        block_receipt_concurrency,
                     )
                     .await?;
 
@@ -526,6 +582,7 @@ pub async fn collect_receipts(
                 &*client,
                 receipt_fields,
                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
+                block_receipt_concurrency,
             )
             .await?;
 
@@ -555,16 +612,6 @@ pub async fn collect_receipts(
         // Sort and write parquet
         state.minimal_records.sort_by_key(|r| r.block_number);
         state.full_records.sort_by_key(|r| r.block_number);
-
-        // Signal range complete before parquet write/S3 upload.
-        send_range_complete(
-            &channels.factory_log_tx,
-            &channels.log_tx,
-            &channels.event_trigger_tx,
-            range.start,
-            range.end,
-        )
-        .await?;
 
         let output_path = output_dir.join(range.file_name("receipts"));
         let total_receipts = match receipt_fields {
@@ -611,6 +658,16 @@ pub async fn collect_receipts(
             .await
             .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
+
+        // Signal range complete after parquet write + S3 upload.
+        send_range_complete(
+            &channels.factory_log_tx,
+            &channels.log_tx,
+            &channels.event_trigger_tx,
+            range.start,
+            range.end,
+        )
+        .await?;
     }
 
     if let Some(sender) = &channels.factory_log_tx {
