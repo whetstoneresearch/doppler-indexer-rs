@@ -15,10 +15,12 @@ use super::multicall::{
     execute_multicalls_generic, BlockMulticall, FactoryCallMeta, FactoryGroupInfo,
     MulticallSlotGeneric, RegularCallMeta, RegularGroupInfo,
 };
-use super::postprocessing::{finalize_regular_results, FinalizeRegularParams};
+use super::postprocessing::{
+    finalize_regular_results, finalize_regular_results_deferred, FinalizeRegularParams,
+};
 use super::types::{
-    BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError, EthCallContext,
-    EncodedParam, FrequencyState,
+    AbortOnDropHandles, BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError,
+    EthCallContext, EncodedParam, FrequencyState,
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig};
@@ -31,6 +33,7 @@ pub(crate) async fn process_factory_range(
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
     max_params: usize,
     frequency_state: &mut FrequencyState,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for addrs in factory_data.addresses_by_block.values() {
@@ -220,7 +223,7 @@ pub(crate) async fn process_factory_range(
 
             let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
-            finalize_regular_results(FinalizeRegularParams {
+            let finalize_params = FinalizeRegularParams {
                 results: all_results,
                 max_params,
                 sub_dir,
@@ -243,8 +246,13 @@ pub(crate) async fn process_factory_range(
                     rpc_time,
                     process_time,
                 )),
-            })
-            .await?;
+            };
+            if let Some(ref mut writes) = pending_writes {
+                let handle = finalize_regular_results_deferred(finalize_params).await?;
+                writes.push(handle);
+            } else {
+                finalize_regular_results(finalize_params).await?;
+            }
         }
     }
 
@@ -262,6 +270,7 @@ pub(crate) async fn process_factory_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -479,7 +488,7 @@ pub(crate) async fn process_factory_range_multicall(
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
-            finalize_regular_results(FinalizeRegularParams {
+            let finalize_params = FinalizeRegularParams {
                 results: std::mem::take(results),
                 max_params,
                 sub_dir,
@@ -501,8 +510,13 @@ pub(crate) async fn process_factory_range_multicall(
                 last_block_timestamp: last_ts,
                 #[cfg(feature = "bench")]
                 bench: None,
-            })
-            .await?;
+            };
+            if let Some(ref mut writes) = pending_writes {
+                let handle = finalize_regular_results_deferred(finalize_params).await?;
+                writes.push(handle);
+            } else {
+                finalize_regular_results(finalize_params).await?;
+            }
         }
     }
 
@@ -516,6 +530,7 @@ pub(crate) async fn process_range(
     call_configs: &[CallConfig],
     max_params: usize,
     frequency_state: &mut FrequencyState,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -661,7 +676,7 @@ pub(crate) async fn process_range(
 
         let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
-        finalize_regular_results(FinalizeRegularParams {
+        let finalize_params = FinalizeRegularParams {
             results: all_results,
             max_params,
             sub_dir,
@@ -684,8 +699,13 @@ pub(crate) async fn process_range(
                 rpc_time,
                 process_time,
             )),
-        })
-        .await?;
+        };
+        if let Some(ref mut writes) = pending_writes {
+            let handle = finalize_regular_results_deferred(finalize_params).await?;
+            writes.push(handle);
+        } else {
+            finalize_regular_results(finalize_params).await?;
+        }
     }
 
     Ok(())
@@ -700,6 +720,7 @@ pub(crate) async fn process_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (contract_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
@@ -878,7 +899,7 @@ pub(crate) async fn process_range_multicall(
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
-            finalize_regular_results(FinalizeRegularParams {
+            let finalize_params = FinalizeRegularParams {
                 results: std::mem::take(results),
                 max_params,
                 sub_dir,
@@ -900,8 +921,13 @@ pub(crate) async fn process_range_multicall(
                 last_block_timestamp: last_ts,
                 #[cfg(feature = "bench")]
                 bench: None,
-            })
-            .await?;
+            };
+            if let Some(ref mut writes) = pending_writes {
+                let handle = finalize_regular_results_deferred(finalize_params).await?;
+                writes.push(handle);
+            } else {
+                finalize_regular_results(finalize_params).await?;
+            }
         }
     }
 

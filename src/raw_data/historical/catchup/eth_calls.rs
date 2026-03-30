@@ -16,8 +16,8 @@ use crate::raw_data::historical::eth_calls::{
     process_event_triggers, process_event_triggers_multicall, process_factory_once_calls,
     process_once_calls_multicall, process_once_calls_regular, process_range,
     process_range_multicall, read_logs_from_parquet_async, scan_existing_parquet_files_async,
-    BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError, EthCallContext,
-    FrequencyState,
+    AbortOnDropHandles, BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError,
+    EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::eth_calls::parquet_io::{
     load_or_build_once_column_index_async, read_once_column_index_async,
@@ -180,8 +180,13 @@ pub async fn collect_eth_calls(
 
         let mut catchup_count = 0;
         let total_ranges = block_ranges.len();
+        let mut pending_writes = AbortOnDropHandles::new();
 
         for (idx, block_range) in block_ranges.iter().enumerate() {
+            // Drain writes from the previous range before starting the next one.
+            // This ensures writes from range N complete before range N+1 finishes
+            // its RPC work, overlapping I/O with RPC for maximum throughput.
+            pending_writes.drain_all().await?;
             let range = BlockRange {
                 start: block_range.start,
                 end: block_range.end,
@@ -374,6 +379,7 @@ pub async fn collect_eth_calls(
                         max_params,
                         &mut frequency_state,
                         multicall_addr,
+                        Some(&mut pending_writes),
                     )
                     .await?;
                 } else {
@@ -384,6 +390,7 @@ pub async fn collect_eth_calls(
                         &call_configs,
                         max_params,
                         &mut frequency_state,
+                        Some(&mut pending_writes),
                     )
                     .await?;
                 }
@@ -415,6 +422,9 @@ pub async fn collect_eth_calls(
             range_regular_done.insert(range.start);
             catchup_count += 1;
         }
+
+        // Drain any remaining writes from the final range
+        pending_writes.drain_all().await?;
 
         if catchup_count > 0 {
             tracing::info!(
