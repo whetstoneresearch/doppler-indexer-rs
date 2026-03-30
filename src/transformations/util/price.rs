@@ -4,7 +4,7 @@
 ///
 /// - is_token0 = true:  price = (sqrtPriceX96 / 2^96)^2 * 10^(token_dec - quote_dec)
 /// - is_token0 = false: price = (2^96 / sqrtPriceX96)^2 * 10^(token_dec - quote_dec)
-fn sqrt_price_x96_to_price(
+pub fn sqrt_price_x96_to_price(
     sqrt_price_x96: &alloy_primitives::U256,
     token_decimals: u8,
     quote_decimals: u8,
