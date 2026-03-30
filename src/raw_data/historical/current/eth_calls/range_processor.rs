@@ -59,6 +59,7 @@ pub(super) async fn process_complete_range(
                 state.max_params,
                 &mut state.frequency_state,
                 multicall_addr,
+                None,
             )
             .await?;
         } else {
@@ -69,6 +70,7 @@ pub(super) async fn process_complete_range(
                 &state.call_configs,
                 state.max_params,
                 &mut state.frequency_state,
+                None,
             )
             .await?;
         }
@@ -104,6 +106,7 @@ pub(super) async fn process_complete_range(
                     state.factory_max_params,
                     &mut state.frequency_state,
                     multicall_addr,
+                    None,
                 )
                 .await?;
             } else {
@@ -115,6 +118,7 @@ pub(super) async fn process_complete_range(
                     &state.factory_call_configs,
                     state.factory_max_params,
                     &mut state.frequency_state,
+                    None,
                 )
                 .await?;
             }
@@ -205,6 +209,7 @@ pub(super) async fn process_incomplete_range(
                 state.max_params,
                 &mut state.frequency_state,
                 multicall_addr,
+                None,
             )
             .await?;
         } else {
@@ -215,6 +220,7 @@ pub(super) async fn process_incomplete_range(
                 &state.call_configs,
                 state.max_params,
                 &mut state.frequency_state,
+                None,
             )
             .await?;
         }
@@ -256,6 +262,7 @@ pub(super) async fn process_incomplete_range(
                         state.factory_max_params,
                         &mut state.frequency_state,
                         multicall_addr,
+                        None,
                     )
                     .await?;
                 } else {
@@ -267,6 +274,7 @@ pub(super) async fn process_incomplete_range(
                         &state.factory_call_configs,
                         state.factory_max_params,
                         &mut state.frequency_state,
+                        None,
                     )
                     .await?;
                 }

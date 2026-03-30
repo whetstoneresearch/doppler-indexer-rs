@@ -172,6 +172,7 @@ pub(super) async fn handle_factory_message(
                                 state.factory_max_params,
                                 &mut state.frequency_state,
                                 multicall_addr,
+                                None,
                             )
                             .await?;
                         } else {
@@ -183,6 +184,7 @@ pub(super) async fn handle_factory_message(
                                 &state.factory_call_configs,
                                 state.factory_max_params,
                                 &mut state.frequency_state,
+                                None,
                             )
                             .await?;
                         }

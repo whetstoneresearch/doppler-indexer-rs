@@ -10,6 +10,8 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
+use tokio::task::JoinHandle;
+
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs, event_output_exists_async, get_existing_log_ranges_async,
@@ -180,8 +182,17 @@ pub async fn collect_eth_calls(
 
         let mut catchup_count = 0;
         let total_ranges = block_ranges.len();
+        let mut pending_writes: Vec<JoinHandle<Result<(), EthCallCollectionError>>> = Vec::new();
 
         for (idx, block_range) in block_ranges.iter().enumerate() {
+            // Drain writes from the previous range before starting the next one.
+            // This ensures writes from range N complete before range N+1 finishes
+            // its RPC work, overlapping I/O with RPC for maximum throughput.
+            for handle in pending_writes.drain(..) {
+                handle
+                    .await
+                    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+            }
             let range = BlockRange {
                 start: block_range.start,
                 end: block_range.end,
@@ -374,6 +385,7 @@ pub async fn collect_eth_calls(
                         max_params,
                         &mut frequency_state,
                         multicall_addr,
+                        Some(&mut pending_writes),
                     )
                     .await?;
                 } else {
@@ -384,6 +396,7 @@ pub async fn collect_eth_calls(
                         &call_configs,
                         max_params,
                         &mut frequency_state,
+                        Some(&mut pending_writes),
                     )
                     .await?;
                 }
@@ -414,6 +427,13 @@ pub async fn collect_eth_calls(
 
             range_regular_done.insert(range.start);
             catchup_count += 1;
+        }
+
+        // Drain any remaining writes from the final range
+        for handle in pending_writes {
+            handle
+                .await
+                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
         }
 
         if catchup_count > 0 {
