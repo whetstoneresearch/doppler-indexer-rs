@@ -3,5 +3,6 @@
 //! Common helpers for working with decoded values, addresses, hashes, etc.
 
 pub mod db;
+pub mod price;
 pub mod metadata;
 pub mod sanitize;
