@@ -1051,13 +1051,8 @@ pub(crate) async fn process_event_triggers_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
