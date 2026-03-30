@@ -52,6 +52,7 @@ pub use crate::storage::BlockRange;
 /// Bundles the RPC client, output paths, and chain info that are threaded
 /// through every `process_*` function in the execution and event_triggers
 /// modules.
+#[allow(dead_code)]
 pub struct EthCallContext<'a> {
     pub client: &'a UnifiedRpcClient,
     pub output_dir: &'a Path,
