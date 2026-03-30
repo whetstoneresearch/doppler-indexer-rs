@@ -8,3 +8,4 @@ scripts/
 bench/*.log
 bench/*.csv
 bench/wt-*/
+docs/handlers/
