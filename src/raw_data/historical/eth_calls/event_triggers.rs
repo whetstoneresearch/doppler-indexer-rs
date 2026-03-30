@@ -640,85 +640,66 @@ pub(crate) async fn process_event_triggers(
             });
         }
 
-        // Execute calls in batches with concurrent chunk processing
+        // Execute all calls in a single batch
         let max_params = calls
             .iter()
             .map(|c| c.encoded_params.len())
             .max()
             .unwrap_or(0);
 
-        // Number of chunks to process concurrently
-        let chunk_concurrency = 4;
-
-        // Collect chunks for concurrent processing
-        let owned_chunks: Vec<Vec<PendingEventCall>> = pending_calls
-            .chunks(ctx.rpc_batch_size)
-            .map(|chunk| chunk.to_vec())
+        let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+            .iter()
+            .map(|c| (c.request.clone(), c.block_id))
             .collect();
 
-        let chunk_results: Vec<Vec<EventCallResult>> = stream::iter(owned_chunks)
-            .map(|chunk| {
-                let contract_name = contract_name.clone();
-                let function_name = function_name.clone();
-                async move {
-                    let batch_calls: Vec<(TransactionRequest, BlockId)> = chunk
-                        .iter()
-                        .map(|c| (c.request.clone(), c.block_id))
-                        .collect();
+        let results = ctx.client.call_batch(batch_calls).await?;
 
-                    let results = ctx.client.call_batch(batch_calls).await?;
+        let mut all_results: Vec<EventCallResult> = Vec::with_capacity(results.len());
+        for (i, result) in results.into_iter().enumerate() {
+            let call = &pending_calls[i];
 
-                    let mut chunk_results = Vec::with_capacity(results.len());
-                    for (i, result) in results.into_iter().enumerate() {
-                        let call = &chunk[i];
-
-                        match result {
-                            Ok(bytes) => {
-                                chunk_results.push(EventCallResult {
-                                    block_number: call.trigger.block_number,
-                                    block_timestamp: call.trigger.block_timestamp,
-                                    log_index: call.trigger.log_index,
-                                    target_address: call.target_address.0.0,
-                                    value_bytes: bytes.to_vec(),
-                                    param_values: call.encoded_params.clone(),
-                                    is_reverted: false,
-                                    revert_reason: None,
-                                });
-                            }
-                            Err(e) => {
-                                let reason = e.to_string();
-                                let params_hex: Vec<String> = call.encoded_params.iter().map(|p| format!("0x{}", hex::encode(p))).collect();
-                                tracing::warn!(
-                                    "Event-triggered eth_call reverted for {}.{} at block {} (address {}, params {:?}): {}",
-                                    contract_name,
-                                    function_name,
-                                    call.trigger.block_number,
-                                    call.target_address,
-                                    params_hex,
-                                    reason
-                                );
-                                chunk_results.push(EventCallResult {
-                                    block_number: call.trigger.block_number,
-                                    block_timestamp: call.trigger.block_timestamp,
-                                    log_index: call.trigger.log_index,
-                                    target_address: call.target_address.0.0,
-                                    value_bytes: Vec::new(),
-                                    param_values: call.encoded_params.clone(),
-                                    is_reverted: true,
-                                    revert_reason: Some(reason),
-                                });
-                            }
-                        }
-                    }
-                    Ok::<_, EthCallCollectionError>(chunk_results)
+            match result {
+                Ok(bytes) => {
+                    all_results.push(EventCallResult {
+                        block_number: call.trigger.block_number,
+                        block_timestamp: call.trigger.block_timestamp,
+                        log_index: call.trigger.log_index,
+                        target_address: call.target_address.0 .0,
+                        value_bytes: bytes.to_vec(),
+                        param_values: call.encoded_params.clone(),
+                        is_reverted: false,
+                        revert_reason: None,
+                    });
                 }
-            })
-            .buffer_unordered(chunk_concurrency)
-            .try_collect()
-            .await?;
-
-        // Flatten chunk results
-        let mut all_results: Vec<EventCallResult> = chunk_results.into_iter().flatten().collect();
+                Err(e) => {
+                    let reason = e.to_string();
+                    let params_hex: Vec<String> = call
+                        .encoded_params
+                        .iter()
+                        .map(|p| format!("0x{}", hex::encode(p)))
+                        .collect();
+                    tracing::warn!(
+                        "Event-triggered eth_call reverted for {}.{} at block {} (address {}, params {:?}): {}",
+                        contract_name,
+                        function_name,
+                        call.trigger.block_number,
+                        call.target_address,
+                        params_hex,
+                        reason
+                    );
+                    all_results.push(EventCallResult {
+                        block_number: call.trigger.block_number,
+                        block_timestamp: call.trigger.block_timestamp,
+                        log_index: call.trigger.log_index,
+                        target_address: call.target_address.0 .0,
+                        value_bytes: Vec::new(),
+                        param_values: call.encoded_params.clone(),
+                        is_reverted: true,
+                        revert_reason: Some(reason),
+                    });
+                }
+            }
+        }
 
         // Sort by block number, log index
         all_results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
