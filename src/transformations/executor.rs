@@ -412,10 +412,13 @@ pub(crate) async fn execute_with_snapshot_capture(
 
     // Write snapshots to storage after transaction commits
     if !snapshots.is_empty() {
-        let mut all_snapshots = storage.read_snapshots(block_number).unwrap_or_default();
+        let mut all_snapshots = storage
+            .read_snapshots(block_number)
+            .await
+            .unwrap_or_default();
         all_snapshots.extend(snapshots);
 
-        if let Err(e) = storage.write_snapshots(block_number, &all_snapshots) {
+        if let Err(e) = storage.write_snapshots(block_number, all_snapshots).await {
             tracing::warn!(
                 "Failed to write upsert snapshots for block {}: {}",
                 block_number,

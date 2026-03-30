@@ -90,13 +90,15 @@ impl LiveProgressTracker {
         let handler_count = self.handler_keys.len();
         let pending = self.get_pending_handlers(block_number);
 
-        let update_result = storage.update_status_atomic(block_number, |status| {
-            status.completed_handlers.insert(handler_key_owned.clone());
+        let update_result = storage
+            .update_status_atomic(block_number, move |status| {
+                status.completed_handlers.insert(handler_key_owned);
 
-            if all_complete {
-                status.transformed = true;
-            }
-        });
+                if all_complete {
+                    status.transformed = true;
+                }
+            })
+            .await;
 
         match update_result {
             Ok(()) => {
@@ -143,15 +145,18 @@ impl LiveProgressTracker {
 
     /// Mark a block as transformed when no handlers are registered.
     /// This should be called after all collection/decoding is done.
-    pub fn mark_transformed_if_no_handlers(&self, block_number: u64) {
+    pub async fn mark_transformed_if_no_handlers(&self, block_number: u64) {
         if !self.handler_keys.is_empty() {
             return;
         }
 
         let storage = LiveStorage::new(&self.chain_name);
-        if let Err(e) = storage.update_status_atomic(block_number, |status| {
-            status.transformed = true;
-        }) {
+        if let Err(e) = storage
+            .update_status_atomic(block_number, move |status| {
+                status.transformed = true;
+            })
+            .await
+        {
             tracing::warn!("Failed to update block status (no handlers): {}", e);
         }
     }
@@ -214,11 +219,11 @@ impl LiveProgressTracker {
     ///
     /// Reads completed_handlers from each block's status file to seed the
     /// in-memory state on restart. This enables catchup without database queries.
-    pub fn load_from_storage(&mut self, storage: &LiveStorage) -> Result<(), LiveError> {
-        let blocks = storage.list_blocks()?;
+    pub async fn load_from_storage(&mut self, storage: &LiveStorage) -> Result<(), LiveError> {
+        let blocks = storage.list_blocks().await?;
 
         for block_number in blocks {
-            match storage.read_status(block_number) {
+            match storage.read_status(block_number).await {
                 Ok(status) => {
                     if !status.completed_handlers.is_empty() {
                         self.completed

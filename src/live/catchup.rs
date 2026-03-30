@@ -131,12 +131,12 @@ impl LiveCatchupService {
     /// for completed handler progress. This enables recovery after status files
     /// are lost or deleted.
     pub async fn reconstruct_missing_status_files(&self) -> Result<usize, StorageError> {
-        let blocks = self.storage.list_blocks()?;
+        let blocks = self.storage.list_blocks().await?;
         let mut reconstructed = 0;
 
         for block_number in blocks {
             // Check if status file exists
-            match self.storage.read_status(block_number) {
+            match self.storage.read_status(block_number).await {
                 Ok(_) => continue, // Status exists, skip
                 Err(StorageError::NotFound(_)) => {
                     // Status missing, reconstruct it
@@ -146,7 +146,7 @@ impl LiveCatchupService {
 
             // Build status from what data exists
             let status = self.reconstruct_status(block_number).await?;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.write_status(block_number, &status).await?;
 
             tracing::info!(
                 "Reconstructed status file for block {} (collected={}, logs_decoded={}, eth_calls_decoded={}, transformed={})",
@@ -174,12 +174,12 @@ impl LiveCatchupService {
         let mut status = LiveBlockStatus::default();
 
         // Check raw data presence
-        let block = self.storage.read_block(block_number).ok();
+        let block = self.storage.read_block(block_number).await.ok();
         let block_exists = block.is_some();
-        let receipts_exist = self.storage.read_receipts(block_number).is_ok();
-        let logs_exist = self.storage.read_logs(block_number).is_ok();
-        let eth_calls_exist = self.storage.read_eth_calls(block_number).is_ok();
-        let factories_exist = self.storage.read_factories(block_number).is_ok();
+        let receipts_exist = self.storage.read_receipts(block_number).await.is_ok();
+        let logs_exist = self.storage.read_logs(block_number).await.is_ok();
+        let eth_calls_exist = self.storage.read_eth_calls(block_number).await.is_ok();
+        let factories_exist = self.storage.read_factories(block_number).await.is_ok();
 
         // If we have the block, mark collection phases as complete
         if block_exists {
@@ -201,17 +201,20 @@ impl LiveCatchupService {
         // Check for decoded data
         let decoded_logs_exist = !self
             .storage
-            .list_decoded_log_types(block_number)?
+            .list_decoded_log_types(block_number)
+            .await?
             .is_empty();
         let decoded_calls_exist = !self
             .storage
-            .list_decoded_call_types(block_number)?
+            .list_decoded_call_types(block_number)
+            .await?
             .is_empty();
 
         // Check if raw logs are empty (no events to decode)
         let logs_empty = if logs_exist {
             self.storage
                 .read_logs(block_number)
+                .await
                 .map(|l| l.is_empty())
                 .unwrap_or(false)
         } else {
@@ -228,6 +231,7 @@ impl LiveCatchupService {
         let eth_calls_empty = if eth_calls_exist {
             self.storage
                 .read_eth_calls(block_number)
+                .await
                 .map(|c| c.is_empty())
                 .unwrap_or(false)
         } else {
@@ -294,10 +298,10 @@ impl LiveCatchupService {
     /// Scan storage to identify blocks that need catchup.
     ///
     /// Checks each block's status to determine what pipeline stages are incomplete.
-    pub fn scan_incomplete_blocks(&self) -> Result<CatchupScanResult, StorageError> {
+    pub async fn scan_incomplete_blocks(&self) -> Result<CatchupScanResult, StorageError> {
         let mut result = CatchupScanResult::default();
 
-        let blocks = self.storage.list_blocks()?;
+        let blocks = self.storage.list_blocks().await?;
         if blocks.is_empty() {
             tracing::debug!("Catchup scan: no blocks in storage");
             return Ok(result);
@@ -311,7 +315,7 @@ impl LiveCatchupService {
         );
 
         for block_number in blocks {
-            let status = match self.storage.read_status(block_number) {
+            let status = match self.storage.read_status(block_number).await {
                 Ok(s) => s,
                 Err(StorageError::NotFound(_)) => {
                     // Block exists but no status - needs full processing
@@ -447,7 +451,7 @@ impl LiveCatchupService {
 
         for &block_number in blocks {
             // Read raw logs
-            let logs = match self.storage.read_logs(block_number) {
+            let logs = match self.storage.read_logs(block_number).await {
                 Ok(l) => l,
                 Err(StorageError::NotFound(_)) => {
                     tracing::warn!(
@@ -460,12 +464,13 @@ impl LiveCatchupService {
             };
 
             // Read block for timestamp
-            let block = self.storage.read_block(block_number)?;
+            let block = self.storage.read_block(block_number).await?;
 
             // Check for factory addresses
             let factory_addresses = self
                 .storage
                 .read_factories(block_number)
+                .await
                 .unwrap_or_default();
 
             // Send factory addresses first if present
@@ -565,7 +570,7 @@ impl LiveCatchupService {
         for request in blocks {
             let block_number = request.block_number;
             // Read raw eth_calls
-            let calls = match self.storage.read_eth_calls(block_number) {
+            let calls = match self.storage.read_eth_calls(block_number).await {
                 Ok(c) => c,
                 Err(StorageError::NotFound(_)) => {
                     tracing::debug!(
@@ -653,16 +658,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_storage() -> (LiveStorage, TempDir) {
+    async fn test_storage() -> (LiveStorage, TempDir) {
         let tmp = TempDir::new().unwrap();
         let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
-        storage.ensure_dirs().unwrap();
+        storage.ensure_dirs().await.unwrap();
         (storage, tmp)
     }
 
-    #[test]
-    fn test_scan_empty_storage() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_empty_storage() {
+        let (storage, _tmp) = test_storage().await;
         // Override storage with test storage
         let service = LiveCatchupService {
             storage,
@@ -675,13 +680,13 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_scan_complete_blocks() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_complete_blocks() {
+        let (storage, _tmp) = test_storage().await;
 
         // Write a complete block
         let block = super::super::types::LiveBlock {
@@ -691,7 +696,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -704,7 +709,7 @@ mod tests {
         status.eth_calls_decoded = true;
         status.transformed = true;
         status.completed_handlers.insert("handler_a".to_string());
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -717,13 +722,13 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_scan_needs_log_decode() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_needs_log_decode() {
+        let (storage, _tmp) = test_storage().await;
 
         // Write a block needing log decode
         let block = super::super::types::LiveBlock {
@@ -733,7 +738,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -745,7 +750,7 @@ mod tests {
         status.logs_decoded = false; // Not decoded
         status.eth_calls_decoded = true;
         status.transformed = false;
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -758,15 +763,15 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert_eq!(result.blocks_needing_log_decode, vec![100]);
         assert!(result.blocks_needing_call_decode.is_empty());
         assert!(result.blocks_needing_transform.is_empty());
     }
 
-    #[test]
-    fn test_scan_needs_collection_resume_from_block_fetch() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_needs_collection_resume_from_block_fetch() {
+        let (storage, _tmp) = test_storage().await;
 
         let block = super::super::types::LiveBlock {
             number: 100,
@@ -775,11 +780,11 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -789,7 +794,7 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert_eq!(
             result.blocks_needing_collection_resume,
             vec![CollectionResumeRequest {
@@ -803,9 +808,9 @@ mod tests {
         assert!(result.blocks_needing_transform.is_empty());
     }
 
-    #[test]
-    fn test_scan_needs_collection_resume_for_eth_calls_when_expected() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_needs_collection_resume_for_eth_calls_when_expected() {
+        let (storage, _tmp) = test_storage().await;
 
         let block = super::super::types::LiveBlock {
             number: 100,
@@ -814,7 +819,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -825,7 +830,7 @@ mod tests {
         status.logs_decoded = true;
         status.eth_calls_decoded = false;
         status.transformed = false;
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -840,7 +845,7 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert_eq!(
             result.blocks_needing_collection_resume,
             vec![CollectionResumeRequest {
@@ -854,9 +859,9 @@ mod tests {
         assert!(result.blocks_needing_transform.is_empty());
     }
 
-    #[test]
-    fn test_scan_collect_eth_calls_also_replays_logs_when_not_decoded() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_collect_eth_calls_also_replays_logs_when_not_decoded() {
+        let (storage, _tmp) = test_storage().await;
 
         let block = super::super::types::LiveBlock {
             number: 101,
@@ -865,7 +870,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -876,7 +881,7 @@ mod tests {
         status.logs_decoded = false;
         status.eth_calls_decoded = false;
         status.transformed = false;
-        storage.write_status(101, &status).unwrap();
+        storage.write_status(101, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -891,7 +896,7 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert_eq!(
             result.blocks_needing_collection_resume,
             vec![CollectionResumeRequest {
@@ -905,9 +910,9 @@ mod tests {
         assert!(result.blocks_needing_transform.is_empty());
     }
 
-    #[test]
-    fn test_scan_call_decode_defers_transform_retry_until_after_decode() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_call_decode_defers_transform_retry_until_after_decode() {
+        let (storage, _tmp) = test_storage().await;
 
         let block = super::super::types::LiveBlock {
             number: 102,
@@ -916,7 +921,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -928,7 +933,7 @@ mod tests {
         status.logs_decoded = true;
         status.eth_calls_decoded = false;
         status.transformed = false;
-        storage.write_status(102, &status).unwrap();
+        storage.write_status(102, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -943,7 +948,7 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert_eq!(
             result.blocks_needing_call_decode,
             vec![CallDecodeReplayRequest {
@@ -954,9 +959,9 @@ mod tests {
         assert!(result.blocks_needing_transform.is_empty());
     }
 
-    #[test]
-    fn test_scan_needs_transform() {
-        let (storage, _tmp) = test_storage();
+    #[tokio::test]
+    async fn test_scan_needs_transform() {
+        let (storage, _tmp) = test_storage().await;
 
         // Write a block needing transformation
         let block = super::super::types::LiveBlock {
@@ -966,7 +971,7 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
+        storage.write_block(block).await.unwrap();
 
         let mut status = LiveBlockStatus::default();
         status.collected = true;
@@ -979,7 +984,7 @@ mod tests {
         status.eth_calls_decoded = true;
         status.transformed = false;
         status.completed_handlers.insert("handler_a".to_string());
-        storage.write_status(100, &status).unwrap();
+        storage.write_status(100, &status).await.unwrap();
 
         let service = LiveCatchupService {
             storage,
@@ -992,7 +997,7 @@ mod tests {
             db_pool: None,
         };
 
-        let result = service.scan_incomplete_blocks().unwrap();
+        let result = service.scan_incomplete_blocks().await.unwrap();
         assert!(result.blocks_needing_log_decode.is_empty());
         assert!(result.blocks_needing_call_decode.is_empty());
         assert_eq!(result.blocks_needing_transform.len(), 1);
@@ -1005,7 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruct_missing_status() {
-        let (storage, _tmp) = test_storage();
+        let (storage, _tmp) = test_storage().await;
 
         // Create a block with data but no status file
         let block = super::super::types::LiveBlock {
@@ -1015,12 +1020,12 @@ mod tests {
             timestamp: 1000,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
-        storage.write_receipts(100, &[]).unwrap();
-        storage.write_logs(100, &[]).unwrap();
+        storage.write_block(block).await.unwrap();
+        storage.write_receipts(100, vec![]).await.unwrap();
+        storage.write_logs(100, vec![]).await.unwrap();
 
         // Verify no status file exists
-        assert!(storage.read_status(100).is_err());
+        assert!(storage.read_status(100).await.is_err());
 
         let service = LiveCatchupService {
             storage: storage.clone(),
@@ -1035,7 +1040,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // Verify status file was created
-        let status = storage.read_status(100).unwrap();
+        let status = storage.read_status(100).await.unwrap();
         assert!(status.collected);
         assert!(status.block_fetched);
         assert!(status.receipts_collected);
@@ -1046,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruct_missing_status_applies_disabled_expectations() {
-        let (storage, _tmp) = test_storage();
+        let (storage, _tmp) = test_storage().await;
 
         let block = super::super::types::LiveBlock {
             number: 101,
@@ -1055,9 +1060,9 @@ mod tests {
             timestamp: 1010,
             tx_hashes: vec![],
         };
-        storage.write_block(&block).unwrap();
-        storage.write_receipts(101, &[]).unwrap();
-        storage.write_logs(101, &[]).unwrap();
+        storage.write_block(block).await.unwrap();
+        storage.write_receipts(101, vec![]).await.unwrap();
+        storage.write_logs(101, vec![]).await.unwrap();
 
         let service = LiveCatchupService {
             storage: storage.clone(),
@@ -1070,7 +1075,7 @@ mod tests {
         let count = service.reconstruct_missing_status_files().await.unwrap();
         assert_eq!(count, 1);
 
-        let status = storage.read_status(101).unwrap();
+        let status = storage.read_status(101).await.unwrap();
         assert!(status.collected);
         assert!(status.logs_decoded);
         assert!(status.eth_calls_collected);

@@ -79,12 +79,15 @@ pub(super) async fn handle_event_calls_live(
     }
 
     if !decoded_event_calls.is_empty() {
-        if let Err(e) = live_storage.write_decoded_event_calls(
-            range_start,
-            contract_name,
-            function_name,
-            &decoded_event_calls,
-        ) {
+        if let Err(e) = live_storage
+            .write_decoded_event_calls(
+                range_start,
+                contract_name,
+                function_name,
+                decoded_event_calls,
+            )
+            .await
+        {
             tracing::warn!(
                 "Failed to write decoded event_calls for {}/{} at block {}: {}",
                 contract_name,

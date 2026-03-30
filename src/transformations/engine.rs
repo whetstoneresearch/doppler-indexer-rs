@@ -1370,12 +1370,15 @@ impl TransformationEngine {
             submitted_keys.difference(succeeded_keys).cloned().collect();
         if !failed_keys.is_empty() {
             let storage = LiveStorage::new(&self.chain_name);
-            if let Err(e) = storage.update_status_atomic(block_number, |status| {
-                status.failed_handlers.extend(failed_keys.iter().cloned());
-                for h in &failed_keys {
-                    status.completed_handlers.remove(h);
-                }
-            }) {
+            if let Err(e) = storage
+                .update_status_atomic(block_number, move |status| {
+                    status.failed_handlers.extend(failed_keys.iter().cloned());
+                    for h in &failed_keys {
+                        status.completed_handlers.remove(h);
+                    }
+                })
+                .await
+            {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to persist failed handlers for block {}: {}",

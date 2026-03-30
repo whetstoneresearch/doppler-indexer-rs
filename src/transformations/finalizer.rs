@@ -161,7 +161,7 @@ impl RangeFinalizer {
         // Read failed/completed handlers from status file (single-block only)
         let (failed_handlers, completed_handlers) = if is_single_block {
             let storage = LiveStorage::new(&self.chain_name);
-            match storage.read_status(range_start) {
+            match storage.read_status(range_start).await {
                 Ok(status) => (status.failed_handlers, status.completed_handlers),
                 Err(StorageError::NotFound(_)) => (HashSet::new(), HashSet::new()),
                 Err(e) => {
@@ -243,7 +243,9 @@ impl RangeFinalizer {
                 .iter()
                 .map(|h| h.handler_key())
                 .collect();
-            if let Err(e) = update_finalization_status(&storage, range_start, &registered_keys) {
+            if let Err(e) =
+                update_finalization_status(&storage, range_start, &registered_keys).await
+            {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to update status for block {} during finalization: {}",
@@ -321,7 +323,7 @@ impl RangeFinalizer {
 
         // Phase 2a: Read snapshots and generate restore operations
         for &block_number in orphaned {
-            match storage.read_snapshots(block_number) {
+            match storage.read_snapshots(block_number).await {
                 Ok(snapshots) => {
                     for snapshot in snapshots {
                         tables_with_snapshots.insert(snapshot.table.clone());
@@ -427,7 +429,7 @@ impl RangeFinalizer {
 
         // Delete snapshot files for orphaned blocks
         for &block_number in orphaned {
-            if let Err(e) = storage.delete_snapshots(block_number) {
+            if let Err(e) = storage.delete_snapshots(block_number).await {
                 tracing::warn!(
                     "Failed to delete snapshots for block {}: {}",
                     block_number,
@@ -476,19 +478,22 @@ impl RangeFinalizer {
 /// then set `transformed=true` only when no failures remain. This is the second
 /// half of the two-phase protocol — retry records handler outcomes, finalization
 /// gates the `transformed` flag.
-pub(crate) fn update_finalization_status(
+pub(crate) async fn update_finalization_status(
     storage: &LiveStorage,
     block_number: u64,
     registered_keys: &HashSet<String>,
 ) -> Result<(), StorageError> {
-    storage.update_status_atomic(block_number, |status| {
-        // Filter stale keys: only keep failed handlers that are still registered
-        status
-            .failed_handlers
-            .retain(|k| registered_keys.contains(k));
+    let registered_keys = registered_keys.clone();
+    storage
+        .update_status_atomic(block_number, move |status| {
+            // Filter stale keys: only keep failed handlers that are still registered
+            status
+                .failed_handlers
+                .retain(|k| registered_keys.contains(k));
 
-        if status.failed_handlers.is_empty() {
-            status.transformed = true;
-        }
-    })
+            if status.failed_handlers.is_empty() {
+                status.transformed = true;
+            }
+        })
+        .await
 }

@@ -1120,14 +1120,16 @@ pub(crate) async fn process_logs_live(
     for ((contract_name, event_name), (records, _parsed_event)) in &decoded_by_event {
         let live_records: Vec<LiveDecodedLog> =
             records.iter().map(convert_to_live_decoded_log).collect();
+        let live_record_count = live_records.len();
 
         storage
-            .write_decoded_logs(block_number, contract_name, event_name, &live_records)
+            .write_decoded_logs(block_number, contract_name, event_name, live_records)
+            .await
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
 
         tracing::debug!(
             "Wrote {} decoded {} events to live storage for block {}",
-            live_records.len(),
+            live_record_count,
             event_name,
             block_number
         );
@@ -1228,9 +1230,12 @@ pub(crate) async fn process_logs_live(
     }
 
     // Update block status to mark log decoding complete
-    match storage.update_status_atomic(block_number, |status| {
-        status.logs_decoded = true;
-    }) {
+    match storage
+        .update_status_atomic(block_number, move |status| {
+            status.logs_decoded = true;
+        })
+        .await
+    {
         Ok(()) => {
             tracing::info!("Block {} logs decoded", block_number);
         }
@@ -1258,13 +1263,14 @@ pub(crate) async fn process_logs_live(
 }
 
 /// Delete decoded log data for orphaned blocks (reorg cleanup).
-pub(crate) fn delete_decoded_logs_for_blocks(
+pub(crate) async fn delete_decoded_logs_for_blocks(
     storage: &LiveStorage,
     blocks: &[u64],
 ) -> Result<(), LogDecodingError> {
     for &block_number in blocks {
         storage
             .delete_all_decoded_logs(block_number)
+            .await
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
     }
     Ok(())

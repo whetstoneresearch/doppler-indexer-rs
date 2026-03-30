@@ -1,6 +1,10 @@
 /target
 .env
 data/
+prod_data/
 output.log
 scripts/
 .claude
+bench/*.log
+bench/*.csv
+bench/wt-*/

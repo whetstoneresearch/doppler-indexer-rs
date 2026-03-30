@@ -63,12 +63,10 @@ pub(super) async fn handle_regular_calls_live(
     }
 
     if !decoded_calls.is_empty() {
-        if let Err(e) = live_storage.write_decoded_calls(
-            range_start,
-            contract_name,
-            function_name,
-            &decoded_calls,
-        ) {
+        if let Err(e) = live_storage
+            .write_decoded_calls(range_start, contract_name, function_name, decoded_calls)
+            .await
+        {
             tracing::warn!(
                 "Failed to write decoded eth_calls for {}/{} at block {}: {}",
                 contract_name,
@@ -108,9 +106,12 @@ pub(super) async fn handle_block_complete(
     complete_tx: Option<&Sender<RangeCompleteMessage>>,
     transform_retry_tx: Option<&Sender<TransformRetryRequest>>,
 ) {
-    match live_storage.update_status_atomic(range_start, |status| {
-        status.eth_calls_decoded = true;
-    }) {
+    match live_storage
+        .update_status_atomic(range_start, move |status| {
+            status.eth_calls_decoded = true;
+        })
+        .await
+    {
         Ok(()) => {
             tracing::debug!("Block {} eth_calls decoded", range_start);
         }
