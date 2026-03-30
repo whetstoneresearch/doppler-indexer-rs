@@ -868,7 +868,8 @@ src/transformations/
         ├── token.rs     # insert_token helper
         ├── users.rs     # upsert_user helper
         ├── transfers.rs # insert_transfer helper
-        └── v4_pool_configs.rs  # insert_pool_config helper
+        ├── v4_pool_configs.rs  # insert_pool_config helper
+        └── dhook_pool_configs.rs  # insert_dhook_pool_config helper
 
 migrations/
 ├── 000_handler_progress.sql  # _handler_progress table
