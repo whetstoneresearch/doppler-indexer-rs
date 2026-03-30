@@ -1,12 +1,13 @@
 //! Types for eth_call collection: error types, config structs, result structs, and state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy::primitives::Address;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::event_triggers::SkippedFactoryTrigger;
@@ -43,6 +44,43 @@ pub enum EthCallCollectionError {
 
     #[error("Event parameter extraction error: {0}")]
     EventParamExtraction(String),
+}
+
+/// A collection of spawned write-task handles that aborts all remaining
+/// tasks when dropped. Prevents silent detached writes on error paths.
+pub(crate) struct AbortOnDropHandles {
+    handles: VecDeque<JoinHandle<Result<(), EthCallCollectionError>>>,
+}
+
+impl AbortOnDropHandles {
+    pub fn new() -> Self {
+        Self {
+            handles: VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, handle: JoinHandle<Result<(), EthCallCollectionError>>) {
+        self.handles.push_back(handle);
+    }
+
+    /// Await all handles front-to-back. On error, remaining handles stay in
+    /// `self` and are aborted by `Drop`.
+    pub async fn drain_all(&mut self) -> Result<(), EthCallCollectionError> {
+        while let Some(handle) = self.handles.pop_front() {
+            handle
+                .await
+                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AbortOnDropHandles {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
 }
 
 pub use crate::storage::BlockRange;

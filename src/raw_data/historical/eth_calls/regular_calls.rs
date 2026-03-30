@@ -9,8 +9,6 @@ use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::Address;
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
 
-use tokio::task::JoinHandle;
-
 use super::config::{compute_function_selector, generate_param_combinations};
 use super::frequency::filter_blocks_for_frequency;
 use super::multicall::{
@@ -21,8 +19,8 @@ use super::postprocessing::{
     finalize_regular_results, finalize_regular_results_deferred, FinalizeRegularParams,
 };
 use super::types::{
-    BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError, EthCallContext,
-    EncodedParam, FrequencyState,
+    AbortOnDropHandles, BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError,
+    EthCallContext, EncodedParam, FrequencyState,
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig};
@@ -35,7 +33,7 @@ pub(crate) async fn process_factory_range(
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
     max_params: usize,
     frequency_state: &mut FrequencyState,
-    mut pending_writes: Option<&mut Vec<JoinHandle<Result<(), EthCallCollectionError>>>>,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for addrs in factory_data.addresses_by_block.values() {
@@ -272,7 +270,7 @@ pub(crate) async fn process_factory_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
-    mut pending_writes: Option<&mut Vec<JoinHandle<Result<(), EthCallCollectionError>>>>,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -532,7 +530,7 @@ pub(crate) async fn process_range(
     call_configs: &[CallConfig],
     max_params: usize,
     frequency_state: &mut FrequencyState,
-    mut pending_writes: Option<&mut Vec<JoinHandle<Result<(), EthCallCollectionError>>>>,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -722,7 +720,7 @@ pub(crate) async fn process_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
-    mut pending_writes: Option<&mut Vec<JoinHandle<Result<(), EthCallCollectionError>>>>,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (contract_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
