@@ -42,6 +42,11 @@ struct WriteCompleteResult {
 
 /// Check if all blocks in a range have been received and completed.
 /// If so, remove the state, sort records, build a pending write, and spawn it.
+///
+/// Sends `EventTriggerMessage::RangeComplete` immediately so event-triggered
+/// eth_call buffers stay aligned per-range. `LogMessage::RangeComplete` is
+/// deferred to Branch 3 (after parquet write) so the transformation engine
+/// can read the receipt file.
 #[allow(clippy::too_many_arguments)]
 async fn try_finalize_range(
     range_start: u64,
@@ -50,6 +55,7 @@ async fn try_finalize_range(
     receipt_fields: &Option<Vec<ReceiptField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
+    event_trigger_tx: &Option<Sender<EventTriggerMessage>>,
 ) -> Result<bool, ReceiptCollectionError> {
     let state = match batch_states.get(&range_start) {
         Some(s) => s,
@@ -106,7 +112,7 @@ async fn try_finalize_range(
         total_receipts
     );
 
-    // Spawn parquet write; RangeComplete deferred to Branch 3.
+    // Spawn parquet write; LogMessage::RangeComplete deferred to Branch 3.
     let wr_start = range.start;
     let wr_end = range.end;
     let wr_path = output_path;
@@ -119,6 +125,17 @@ async fn try_finalize_range(
             range_end: wr_end,
         }
     });
+
+    // Send EventTriggerMessage::RangeComplete immediately so the event-triggered
+    // eth_call buffer is flushed before triggers from the next range arrive.
+    if let Some(tx) = event_trigger_tx {
+        tx.send(EventTriggerMessage::RangeComplete {
+            range_start: range.start,
+            range_end: range.end,
+        })
+        .await
+        .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+    }
 
     Ok(true)
 }
@@ -313,6 +330,7 @@ pub async fn collect_receipts(
                                 receipt_fields,
                                 &schema,
                                 &output_dir,
+                                &channels.event_trigger_tx,
                             ).await?;
                         }
                     }
@@ -370,6 +388,7 @@ pub async fn collect_receipts(
                     receipt_fields,
                     &schema,
                     &output_dir,
+                    &channels.event_trigger_tx,
                 ).await?;
             }
 
@@ -396,14 +415,25 @@ pub async fn collect_receipts(
                     .map_err(|e| ReceiptCollectionError::Io(std::io::Error::other(e.to_string())))?;
                 }
 
-                // Signal range complete now that the parquet file exists.
-                send_range_complete(
-                    &channels.factory_log_tx,
-                    &channels.log_tx,
-                    &channels.event_trigger_tx,
-                    write_result.range_start,
-                    write_result.range_end,
-                ).await?;
+                // Signal log/factory RangeComplete now that the parquet file exists.
+                // EventTriggerMessage::RangeComplete was already sent in try_finalize_range
+                // to keep trigger batches aligned per-range.
+                let log_message = LogMessage::RangeComplete {
+                    range_start: write_result.range_start,
+                    range_end: write_result.range_end,
+                };
+                if let Some(sender) = &channels.factory_log_tx {
+                    sender.send(log_message.clone()).await
+                        .map_err(|_| ReceiptCollectionError::ChannelSend(
+                            format!("factory_log_tx (RangeComplete {}-{}) - receiver dropped",
+                                write_result.range_start, write_result.range_end)))?;
+                }
+                if let Some(sender) = &channels.log_tx {
+                    sender.send(log_message).await
+                        .map_err(|_| ReceiptCollectionError::ChannelSend(
+                            format!("log_tx (RangeComplete {}-{}) - receiver dropped",
+                                write_result.range_start, write_result.range_end)))?;
+                }
             }
 
             // -----------------------------------------------------------------
