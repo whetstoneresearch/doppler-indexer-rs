@@ -161,57 +161,55 @@ pub(crate) async fn process_factory_range(
                 }
             }
 
-            for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
-                let calls: Vec<(TransactionRequest, BlockId)> = chunk
-                    .iter()
-                    .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
-                    .collect();
+            let calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+                .iter()
+                .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
+                .collect();
 
-                #[cfg(feature = "bench")]
-                let rpc_start = Instant::now();
-                let results = ctx.client.call_batch(calls).await?;
-                #[cfg(feature = "bench")]
-                {
-                    rpc_time += rpc_start.elapsed();
-                }
+            #[cfg(feature = "bench")]
+            let rpc_start = Instant::now();
+            let results = ctx.client.call_batch(calls).await?;
+            #[cfg(feature = "bench")]
+            {
+                rpc_time += rpc_start.elapsed();
+            }
 
-                #[cfg(feature = "bench")]
-                let process_start = Instant::now();
-                for (i, result) in results.into_iter().enumerate() {
-                    let (_, _, block, config) = &chunk[i];
-                    match result {
-                        Ok(bytes) => {
-                            all_results.push(CallResult {
-                                block_number: block.block_number,
-                                block_timestamp: block.timestamp,
-                                contract_address: config.address.0 .0,
-                                value_bytes: bytes.to_vec(),
-                                param_values: config.param_values.clone(),
-                            });
-                        }
-                        Err(e) => {
-                            let params_hex: Vec<String> = config
-                                .param_values
-                                .iter()
-                                .map(|p| format!("0x{}", hex::encode(p)))
-                                .collect();
-                            tracing::warn!(
-                                "Factory eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
-                                collection_name,
-                                function_name,
-                                block.block_number,
-                                config.address,
-                                params_hex,
-                                e
-                            );
-                            // Skip reverted calls - don't store empty results
-                        }
+            #[cfg(feature = "bench")]
+            let process_start = Instant::now();
+            for (i, result) in results.into_iter().enumerate() {
+                let (_, _, block, config) = &pending_calls[i];
+                match result {
+                    Ok(bytes) => {
+                        all_results.push(CallResult {
+                            block_number: block.block_number,
+                            block_timestamp: block.timestamp,
+                            contract_address: config.address.0 .0,
+                            value_bytes: bytes.to_vec(),
+                            param_values: config.param_values.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let params_hex: Vec<String> = config
+                            .param_values
+                            .iter()
+                            .map(|p| format!("0x{}", hex::encode(p)))
+                            .collect();
+                        tracing::warn!(
+                            "Factory eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
+                            collection_name,
+                            function_name,
+                            block.block_number,
+                            config.address,
+                            params_hex,
+                            e
+                        );
+                        // Skip reverted calls - don't store empty results
                     }
                 }
-                #[cfg(feature = "bench")]
-                {
-                    process_time += process_start.elapsed();
-                }
+            }
+            #[cfg(feature = "bench")]
+            {
+                process_time += process_start.elapsed();
             }
 
             all_results
@@ -441,13 +439,8 @@ pub(crate) async fn process_factory_range_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -610,57 +603,55 @@ pub(crate) async fn process_range(
             }
         }
 
-        for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
-            let calls: Vec<(TransactionRequest, BlockId)> = chunk
-                .iter()
-                .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
-                .collect();
+        let calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+            .iter()
+            .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
+            .collect();
 
-            #[cfg(feature = "bench")]
-            let rpc_start = Instant::now();
-            let results = ctx.client.call_batch(calls).await?;
-            #[cfg(feature = "bench")]
-            {
-                rpc_time += rpc_start.elapsed();
-            }
+        #[cfg(feature = "bench")]
+        let rpc_start = Instant::now();
+        let results = ctx.client.call_batch(calls).await?;
+        #[cfg(feature = "bench")]
+        {
+            rpc_time += rpc_start.elapsed();
+        }
 
-            #[cfg(feature = "bench")]
-            let process_start = Instant::now();
-            for (i, result) in results.into_iter().enumerate() {
-                let (_, _, block, config) = &chunk[i];
-                match result {
-                    Ok(bytes) => {
-                        all_results.push(CallResult {
-                            block_number: block.block_number,
-                            block_timestamp: block.timestamp,
-                            contract_address: config.address.0 .0,
-                            value_bytes: bytes.to_vec(),
-                            param_values: config.param_values.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        let params_hex: Vec<String> = config
-                            .param_values
-                            .iter()
-                            .map(|p| format!("0x{}", hex::encode(p)))
-                            .collect();
-                        tracing::warn!(
-                            "eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
-                            contract_name,
-                            function_name,
-                            block.block_number,
-                            config.address,
-                            params_hex,
-                            e
-                        );
-                        // Skip reverted calls - don't store empty results
-                    }
+        #[cfg(feature = "bench")]
+        let process_start = Instant::now();
+        for (i, result) in results.into_iter().enumerate() {
+            let (_, _, block, config) = &pending_calls[i];
+            match result {
+                Ok(bytes) => {
+                    all_results.push(CallResult {
+                        block_number: block.block_number,
+                        block_timestamp: block.timestamp,
+                        contract_address: config.address.0 .0,
+                        value_bytes: bytes.to_vec(),
+                        param_values: config.param_values.clone(),
+                    });
+                }
+                Err(e) => {
+                    let params_hex: Vec<String> = config
+                        .param_values
+                        .iter()
+                        .map(|p| format!("0x{}", hex::encode(p)))
+                        .collect();
+                    tracing::warn!(
+                        "eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
+                        contract_name,
+                        function_name,
+                        block.block_number,
+                        config.address,
+                        params_hex,
+                        e
+                    );
+                    // Skip reverted calls - don't store empty results
                 }
             }
-            #[cfg(feature = "bench")]
-            {
-                process_time += process_start.elapsed();
-            }
+        }
+        #[cfg(feature = "bench")]
+        {
+            process_time += process_start.elapsed();
         }
 
         all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
@@ -847,13 +838,8 @@ pub(crate) async fn process_range_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
