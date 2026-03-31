@@ -12,3 +12,4 @@ CREATE TABLE IF NOT EXISTS liquidity_deltas (
 );
 
 CREATE INDEX IF NOT EXISTS idx_liq_deltas_pool ON liquidity_deltas (pool_id);
+CREATE INDEX IF NOT EXISTS idx_liq_deltas_reorg ON liquidity_deltas (chain_id, block_number);

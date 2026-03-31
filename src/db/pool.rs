@@ -159,12 +159,14 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
             values,
             conflict_columns,
             update_columns,
+            update_condition,
         } => build_upsert_sql(
             &table,
             &columns,
             &values,
             &conflict_columns,
             &update_columns,
+            update_condition.as_deref(),
         ),
         DbOperation::Insert {
             table,
@@ -558,6 +560,7 @@ fn build_upsert_sql(
     values: &[DbValue],
     conflict_columns: &[String],
     update_columns: &[String],
+    update_condition: Option<&str>,
 ) -> (String, Vec<SqlParam>) {
     let mut builder = QueryBuilder::new();
     let cols = quote_cols(columns);
@@ -574,6 +577,11 @@ fn build_upsert_sql(
         format!(
             "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
             table, cols, placeholders_str, conflict_cols
+        )
+    } else if let Some(condition) = update_condition {
+        format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            table, cols, placeholders_str, conflict_cols, updates_str, condition
         )
     } else {
         format!(

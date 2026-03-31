@@ -331,7 +331,7 @@ impl ChainRuntime {
         let (rate_limiter, http_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
 
         // Build transformation registry
-        let registry = build_registry();
+        let registry = build_registry(chain.chain_id);
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
         // Validate that all handler call dependencies are satisfied by config

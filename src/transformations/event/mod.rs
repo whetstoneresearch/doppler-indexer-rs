@@ -14,7 +14,7 @@ pub mod v4;
 use super::registry::TransformationRegistry;
 
 /// Register all event handlers with the registry.
-pub fn register_handlers(registry: &mut TransformationRegistry) {
+pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     derc20_transfer::register_handlers(registry);
     v4::create::register_handlers(registry);
     multicurve::create::register_handlers(registry);
@@ -24,5 +24,5 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
     v3::create::register_handlers(registry);
 
     // Metrics handlers
-    v3::metrics::register_handlers(registry);
+    v3::metrics::register_handlers(registry, chain_id);
 }

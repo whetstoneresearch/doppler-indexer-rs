@@ -137,6 +137,7 @@ fn extract_v3_liquidity(
 pub struct V3MetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
     decimals_resolved: AtomicBool,
+    chain_id: u64,
 }
 
 #[async_trait]
@@ -182,9 +183,9 @@ impl TransformationHandler for V3MetricsHandler {
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
-        // Load existing pool metadata; chain_id 8453 = Base (only chain for now)
-        // Pools created after this point are discovered via Create events in handle()
-        self.metadata_cache.load_into(db_pool, 8453).await?;
+        self.metadata_cache
+            .load_into(db_pool, self.chain_id)
+            .await?;
         tracing::info!("V3MetricsHandler initialized");
         Ok(())
     }
@@ -214,6 +215,7 @@ impl EventHandler for V3MetricsHandler {
 pub struct LockableV3MetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
     decimals_resolved: AtomicBool,
+    chain_id: u64,
 }
 
 #[async_trait]
@@ -263,7 +265,9 @@ impl TransformationHandler for LockableV3MetricsHandler {
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
-        self.metadata_cache.load_into(db_pool, 8453).await?;
+        self.metadata_cache
+            .load_into(db_pool, self.chain_id)
+            .await?;
         tracing::info!("LockableV3MetricsHandler initialized");
         Ok(())
     }
@@ -290,14 +294,16 @@ impl EventHandler for LockableV3MetricsHandler {
 
 // --- Registration ---
 
-pub fn register_handlers(registry: &mut TransformationRegistry) {
+pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     let cache = Arc::new(PoolMetadataCache::new());
     registry.register_event_handler(V3MetricsHandler {
         metadata_cache: cache.clone(),
         decimals_resolved: AtomicBool::new(false),
+        chain_id,
     });
     registry.register_event_handler(LockableV3MetricsHandler {
         metadata_cache: cache,
         decimals_resolved: AtomicBool::new(false),
+        chain_id,
     });
 }

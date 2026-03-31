@@ -4,6 +4,7 @@
 //! provides fast lookups by pool_id during event processing.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use alloy_primitives::Address;
@@ -27,6 +28,7 @@ pub struct PoolMetadata {
 /// Thread-safe cache of pool metadata keyed by pool_id bytes.
 pub struct PoolMetadataCache {
     inner: RwLock<HashMap<Vec<u8>, PoolMetadata>>,
+    loaded: AtomicBool,
 }
 
 impl PoolMetadataCache {
@@ -34,6 +36,7 @@ impl PoolMetadataCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            loaded: AtomicBool::new(false),
         }
     }
 
@@ -100,24 +103,38 @@ impl PoolMetadataCache {
 
         Ok(Self {
             inner: RwLock::new(map),
+            loaded: AtomicBool::new(true),
         })
     }
 
     /// Load metadata from DB into an existing (shared) cache instance.
-    /// Skips loading if the cache already has entries.
+    /// Uses atomic compare-exchange to ensure exactly one concurrent caller loads.
     pub async fn load_into(
         &self,
         db_pool: &DbPool,
         chain_id: u64,
     ) -> Result<(), TransformationError> {
-        if !self.is_empty() {
+        if self
+            .loaded
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return Ok(());
         }
-        let loaded = Self::load_from_db(db_pool, chain_id).await?;
-        let entries = loaded.inner.into_inner().unwrap();
-        let mut inner = self.inner.write().unwrap();
-        inner.extend(entries);
-        Ok(())
+        let result = Self::load_from_db(db_pool, chain_id).await;
+        match result {
+            Ok(loaded_cache) => {
+                let entries = loaded_cache.inner.into_inner().unwrap();
+                let mut inner = self.inner.write().unwrap();
+                inner.extend(entries);
+                Ok(())
+            }
+            Err(e) => {
+                // Reset flag so a subsequent call can retry
+                self.loaded.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 
     /// Update quote token decimals for all cached entries using contracts config.

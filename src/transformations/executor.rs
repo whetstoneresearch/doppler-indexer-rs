@@ -195,6 +195,7 @@ pub(crate) fn inject_source_version(
                 mut values,
                 mut conflict_columns,
                 mut update_columns,
+                update_condition,
             } => {
                 columns.push("source".to_string());
                 columns.push("source_version".to_string());
@@ -210,6 +211,7 @@ pub(crate) fn inject_source_version(
                     values,
                     conflict_columns,
                     update_columns,
+                    update_condition,
                 }
             }
             DbOperation::Insert {
@@ -335,6 +337,7 @@ pub(crate) async fn execute_with_snapshot_capture(
             values,
             conflict_columns,
             update_columns,
+            ..
         } = op
         {
             // Only capture snapshots for upserts that update existing rows

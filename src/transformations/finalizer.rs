@@ -79,6 +79,7 @@ impl RangeFinalizer {
                     "range_start".to_string(),
                 ],
                 update_columns: vec!["range_end".to_string()],
+                update_condition: None,
             }])
             .await?;
 
@@ -350,6 +351,7 @@ impl RangeFinalizer {
                                     values,
                                     conflict_columns: conflict_cols,
                                     update_columns: update_cols,
+                                    update_condition: None,
                                 });
                             }
                             None => {

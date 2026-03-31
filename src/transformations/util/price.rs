@@ -10,6 +10,9 @@ pub fn sqrt_price_x96_to_price(
     quote_decimals: u8,
     is_token0: bool,
 ) -> f64 {
+    if sqrt_price_x96.is_zero() {
+        return 0.0;
+    }
     let sqrt_price_f64: f64 = sqrt_price_x96.to_string().parse().unwrap_or(0.0);
     let two_96: f64 = 2.0_f64.powi(96);
 

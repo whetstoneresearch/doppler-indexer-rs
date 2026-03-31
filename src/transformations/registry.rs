@@ -284,11 +284,11 @@ pub fn validate_call_dependencies(
 ///
 /// This is where handlers are registered at compile-time.
 /// Add new handler registrations here as they are implemented.
-pub fn build_registry() -> TransformationRegistry {
+pub fn build_registry(chain_id: u64) -> TransformationRegistry {
     let mut registry = TransformationRegistry::new();
 
     // Register event handlers
-    super::event::register_handlers(&mut registry);
+    super::event::register_handlers(&mut registry, chain_id);
 
     // Register eth_call handlers
     super::eth_call::register_handlers(&mut registry);

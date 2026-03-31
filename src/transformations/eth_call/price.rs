@@ -148,6 +148,7 @@ impl TransformationHandler for PriceHandler {
                         "quote_token".into(),
                         "price".into(),
                     ],
+                    update_condition: None,
                 });
             }
         }

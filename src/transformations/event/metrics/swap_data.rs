@@ -100,6 +100,9 @@ pub fn process_swaps(
                 meta.quote_decimals,
                 meta.is_token_0,
             );
+            if !price.is_finite() {
+                continue;
+            }
             acc.record_swap(
                 price,
                 swap.amount0,
@@ -132,7 +135,7 @@ pub fn process_swaps(
             active_liquidity: acc.last_liquidity.to_string(),
             volume0: acc.volume0.to_string(),
             volume1: acc.volume1.to_string(),
-            swap_count: acc.swap_count as i32,
+            swap_count: i32::try_from(acc.swap_count).unwrap_or(i32::MAX),
         }));
 
         // Track latest block for pool_state
