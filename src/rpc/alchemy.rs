@@ -243,6 +243,10 @@ struct ConcurrentExecutor {
     semaphore: Arc<Semaphore>,
     rate_limiter: Arc<SlidingWindowRateLimiter>,
     cost_per_request: u32,
+    /// Maximum number of spawned tasks allowed in a JoinSet at once.
+    /// Tasks beyond this limit are spawned only as earlier tasks complete,
+    /// preventing unbounded task creation for large request sets.
+    max_in_flight: usize,
 }
 
 impl ConcurrentExecutor {
@@ -386,6 +390,7 @@ impl AlchemyClient {
             semaphore: Arc::new(Semaphore::new(self.config.rpc_concurrency)),
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
+            max_in_flight: (self.config.rpc_concurrency * 2).max(1),
         }
     }
 
@@ -421,9 +426,11 @@ impl AlchemyClient {
         let executor = self.create_concurrent_executor(cost_per_request);
         let make_request = Arc::new(make_request);
         let mut join_set = JoinSet::new();
+        let mut requests_iter = requests.into_iter().enumerate().peekable();
 
-        // Spawn all tasks immediately - permit acquisition happens inside each task.
-        for (idx, request) in requests.into_iter().enumerate() {
+        // Seed the initial batch up to the spawn window
+        while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+            let (idx, request) = requests_iter.next().unwrap();
             let make_request = make_request.clone();
             executor.spawn_indexed(
                 &mut join_set,
@@ -432,7 +439,7 @@ impl AlchemyClient {
             );
         }
 
-        // Collect results and sort by index to preserve order
+        // Collect results and spawn replacements as tasks complete
         let mut indexed_results: Vec<(usize, T)> = Vec::with_capacity(num_requests);
         let mut had_panic = false;
 
@@ -443,6 +450,17 @@ impl AlchemyClient {
                     tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
                     had_panic = true;
                 }
+            }
+
+            // Spawn replacements to keep the pipeline full
+            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                let (idx, request) = requests_iter.next().unwrap();
+                let make_request = make_request.clone();
+                executor.spawn_indexed(
+                    &mut join_set,
+                    idx,
+                    async move { make_request(request).await },
+                );
             }
         }
 
@@ -486,9 +504,11 @@ impl AlchemyClient {
             }
 
             let mut join_set = JoinSet::new();
+            let mut requests_iter = requests.into_iter().peekable();
 
-            // Spawn all tasks immediately - permit acquisition happens inside each task.
-            for request in requests {
+            // Seed the initial batch up to the spawn window
+            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                let request = requests_iter.next().unwrap();
                 let make_request = make_request.clone();
                 let result_tx = result_tx.clone();
                 executor.spawn_streaming(&mut join_set, result_tx, async move {
@@ -496,10 +516,20 @@ impl AlchemyClient {
                 });
             }
 
-            // Wait for all tasks to complete, logging any panics
+            // Wait for tasks to complete, spawning replacements to keep the pipeline full
             while let Some(result) = join_set.join_next().await {
                 if let Err(e) = result {
                     tracing::error!("Task panicked in execute_streaming: {:?}", e);
+                }
+
+                // Spawn replacements
+                while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                    let request = requests_iter.next().unwrap();
+                    let make_request = make_request.clone();
+                    let result_tx = result_tx.clone();
+                    executor.spawn_streaming(&mut join_set, result_tx, async move {
+                        make_request(request).await
+                    });
                 }
             }
         })

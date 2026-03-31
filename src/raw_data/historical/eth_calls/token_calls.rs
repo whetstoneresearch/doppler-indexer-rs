@@ -124,14 +124,7 @@ pub(crate) async fn process_token_range_multicall(
         }
 
         if !sub_calls.is_empty() {
-            let multicall_data = build_multicall_calldata(&sub_calls);
-            let _tx = TransactionRequest::default()
-                .to(multicall3_address)
-                .input(multicall_data.into());
             let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
-
-            // We store the tx temporarily -- we'll batch them below
-            // But we need to associate slots with each multicall
             pending_multicalls.push(PendingTokenMulticall {
                 block_number,
                 block_id,
