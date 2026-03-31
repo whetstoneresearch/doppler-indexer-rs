@@ -1642,6 +1642,9 @@ impl TransformationEngine {
     }
 
     /// Build handler tasks for all event and call triggers in a block range.
+    ///
+    /// Deduplicates by handler_key so that multi-trigger handlers produce
+    /// exactly one task even when multiple triggers match the same block.
     fn build_handler_tasks(
         &self,
         event_triggers: &[(String, String)],
@@ -1651,9 +1654,13 @@ impl TransformationEngine {
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
     ) -> Vec<HandlerTask> {
         let mut tasks = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
 
         for (source, event_name) in event_triggers {
             for handler in self.registry.handlers_for_event(source, event_name) {
+                if !seen_keys.insert(handler.handler_key()) {
+                    continue;
+                }
                 let handler: Arc<dyn super::traits::TransformationHandler> = handler;
                 tasks.push(HandlerTask {
                     handler,
@@ -1666,6 +1673,9 @@ impl TransformationEngine {
 
         for (source, function_name) in call_triggers {
             for handler in self.registry.handlers_for_call(source, function_name) {
+                if !seen_keys.insert(handler.handler_key()) {
+                    continue;
+                }
                 let handler: Arc<dyn super::traits::TransformationHandler> = handler;
                 tasks.push(HandlerTask {
                     handler,

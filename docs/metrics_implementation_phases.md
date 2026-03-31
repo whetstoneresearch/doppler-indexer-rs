@@ -28,8 +28,10 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 
 | Handler | Source | Swap Event | Liquidity Event | sqrtPriceX96 Source | Pool ID Source | Special |
 |---------|--------|-----------|-----------------|--------------------|----|---------|
-| V3MetricsHandler | DopplerV3Pool | V3 Swap (has sqrtPriceX96) | Mint/Burn | From event | contract_address (20 bytes) | — |
-| LockableV3MetricsHandler | DopplerLockableV3Pool | V3 Swap (has sqrtPriceX96) | Mint/Burn | From event | contract_address (20 bytes) | — |
+| V3SwapMetricsHandler | DopplerV3Pool | V3 Swap (has sqrtPriceX96) | — | From event | contract_address (20 bytes) | — |
+| V3LiquidityMetricsHandler | DopplerV3Pool | — | Mint/Burn | — | contract_address (20 bytes) | Insert-only |
+| LockableV3SwapMetricsHandler | DopplerLockableV3Pool | V3 Swap (has sqrtPriceX96) | — | From event | contract_address (20 bytes) | — |
+| LockableV3LiquidityMetricsHandler | DopplerLockableV3Pool | — | Mint/Burn | — | contract_address (20 bytes) | Insert-only |
 | V4BaseMetricsHandler | DopplerV4Hook | `Swap(int24, uint256, uint256)` | None (liquidity changes on swap) | Derived from tick via `tick_to_sqrt_price_x96()` | hook_address → pool_id via `v4_pool_configs` table | **Sequential**: in-memory proceeds tracker |
 | MulticurveMetricsHandler | UniswapV4MulticurveInitializerHook | V4 hook Swap (int128 amounts) | ModifyLiquidity (tuple PoolKey format) | getSlot0 on_event call | topics[3] (poolId) | — |
 | DecayMulticurveMetricsHandler | DecayMulticurveHook | V4 hook Swap (int128 amounts) | ModifyLiquidity (flat format, id in topics[1]) | getSlot0 on_event call | topics[3] (poolId) | — |
@@ -181,8 +183,8 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 **Status**: Complete — `feat/pool-metrics-phase2` branch
 
 **Delivered**:
-- `src/transformations/event/v3/metrics.rs` — V3MetricsHandler + LockableV3MetricsHandler
-- Fixed `PoolMetadataCache` API: `load_from_db()` no longer requires contracts, added `load_into()` for shared caches, added `resolve_quote_decimals()` for lazy decimal resolution
+- `src/transformations/event/v3/metrics.rs` — Split into V3SwapMetricsHandler + V3LiquidityMetricsHandler (and Lockable variants) to prevent duplicate live executions from multi-trigger registration
+- `PoolMetadataCache`: `load_from_db()` no longer requires contracts, added `load_into()` for shared caches, `resolve_quote_decimals()` for lazy decimal resolution, `refresh()` for DB re-query on cache miss
 - Fixed `liquidity_deltas` from INSERT to Upsert with empty update_columns (ON CONFLICT DO NOTHING) to prevent duplicate key errors on re-runs
 - Updated DDL: `liquidity_deltas` changed from PRIMARY KEY to UNIQUE constraint including source/source_version
 - Registered in `v3/mod.rs` and `event/mod.rs`

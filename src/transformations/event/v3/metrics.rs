@@ -3,12 +3,19 @@
 //! Processes Swap, Mint, and Burn events from DopplerV3Pool and
 //! DopplerLockableV3Pool factory collections into pool_state,
 //! pool_snapshots, and liquidity_deltas tables.
+//!
+//! Split into separate handlers for swap metrics (pool_state/pool_snapshots)
+//! and liquidity metrics (liquidity_deltas) so that each handler has a
+//! single primary trigger, avoiding duplicate live executions and snapshot
+//! capture issues with multi-trigger handlers.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use alloy_primitives::I256;
 use async_trait::async_trait;
+use deadpool_postgres::Pool;
 
 use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::{FieldExtractor, TransformationContext};
@@ -18,63 +25,7 @@ use crate::transformations::event::metrics::swap_data::{
 };
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
-use crate::transformations::util::pool_metadata::{
-    quote_token_decimals, PoolMetadata, PoolMetadataCache,
-};
-
-// --- Pool discovery from Create events ---
-
-/// Scan Create events from an initializer and insert any new pools into the
-/// metadata cache. This ensures pools created during the current run (including
-/// fresh catchup and live mode) are available for swap/liquidity processing
-/// within the same block range.
-fn discover_pools_from_create_events(
-    ctx: &TransformationContext,
-    initializer_source: &str,
-    cache: &PoolMetadataCache,
-) {
-    for event in ctx.events_of_type(initializer_source, "Create") {
-        let pool_or_hook = match event.try_get("poolOrHook").and_then(|v| v.as_address()) {
-            Some(addr) => addr,
-            None => continue,
-        };
-        let pool_id = pool_or_hook.to_vec();
-
-        // Skip if already cached
-        if cache.get(&pool_id).is_some() {
-            continue;
-        }
-
-        let asset = match event.try_get("asset").and_then(|v| v.as_address()) {
-            Some(addr) => addr,
-            None => continue,
-        };
-        let numeraire = match event.try_get("numeraire").and_then(|v| v.as_address()) {
-            Some(addr) => addr,
-            None => continue,
-        };
-
-        let is_token_0 = asset < numeraire;
-        let quote_decimals =
-            quote_token_decimals(&numeraire, &ctx.contracts).unwrap_or(18);
-
-        // base_decimals = 18: all tokens launched by Doppler initializers are 18 decimals.
-        // If this invariant ever changes, base_decimals should be read from the
-        // DERC20 once call or the tokens table.
-        cache.insert(
-            pool_id,
-            PoolMetadata {
-                pool_id: pool_or_hook.to_vec(),
-                base_token: asset,
-                quote_token: numeraire,
-                is_token_0,
-                pool_type: "v3".to_string(),
-                base_decimals: 18,
-                quote_decimals,
-            },
-        );
-    }
-}
+use crate::transformations::util::pool_metadata::PoolMetadataCache;
 
 // --- Shared extraction functions ---
 
@@ -132,18 +83,63 @@ fn extract_v3_liquidity(
     Ok(deltas)
 }
 
-// --- V3MetricsHandler ---
+/// Refresh the metadata cache from DB if any pool IDs in the batch are missing.
+async fn refresh_cache_if_needed(
+    pool_ids: impl Iterator<Item = &Vec<u8>>,
+    cache: &PoolMetadataCache,
+    db_pool: &OnceLock<Pool>,
+    chain_id: u64,
+    contracts: &crate::types::config::contract::Contracts,
+) {
+    let missing: Vec<_> = {
+        let unique: HashSet<&Vec<u8>> = pool_ids.collect();
+        unique
+            .into_iter()
+            .filter(|id| cache.get(id).is_none())
+            .collect()
+    };
+    if missing.is_empty() {
+        return;
+    }
 
-pub struct V3MetricsHandler {
+    let Some(pool) = db_pool.get() else {
+        return;
+    };
+
+    match cache.refresh(pool, chain_id).await {
+        Ok(new_count) if new_count > 0 => {
+            cache.resolve_quote_decimals(contracts);
+            tracing::info!(
+                "Metadata cache refreshed: {} new pool(s) discovered ({} were missing)",
+                new_count,
+                missing.len()
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                "{} pool(s) still missing from DB after refresh",
+                missing.len()
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to refresh metadata cache: {}", e);
+        }
+    }
+}
+
+// --- V3SwapMetricsHandler ---
+
+pub struct V3SwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
     decimals_resolved: AtomicBool,
     chain_id: u64,
+    db_pool: OnceLock<Pool>,
 }
 
 #[async_trait]
-impl TransformationHandler for V3MetricsHandler {
+impl TransformationHandler for V3SwapMetricsHandler {
     fn name(&self) -> &'static str {
-        "V3MetricsHandler"
+        "V3SwapMetricsHandler"
     }
 
     fn version(&self) -> u32 {
@@ -154,12 +150,11 @@ impl TransformationHandler for V3MetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
-            "migrations/tables/liquidity_deltas.sql",
         ]
     }
 
     fn reorg_tables(&self) -> Vec<&'static str> {
-        vec!["pool_state", "pool_snapshots", "liquidity_deltas"]
+        vec!["pool_state", "pool_snapshots"]
     }
 
     async fn handle(
@@ -171,33 +166,75 @@ impl TransformationHandler for V3MetricsHandler {
                 .resolve_quote_decimals(&ctx.contracts);
         }
 
-        // Discover any pools created in this range
-        discover_pools_from_create_events(ctx, "UniswapV3Initializer", &self.metadata_cache);
-
         let swaps = extract_v3_swaps(ctx, "DopplerV3Pool")?;
-        let deltas = extract_v3_liquidity(ctx, "DopplerV3Pool")?;
 
-        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id);
-        ops.extend(process_liquidity_deltas(&deltas, ctx.chain_id));
-        Ok(ops)
+        refresh_cache_if_needed(
+            swaps.iter().map(|s| &s.pool_id),
+            &self.metadata_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+
+        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
+        self.db_pool.set(db_pool.inner().clone()).ok();
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
-        tracing::info!("V3MetricsHandler initialized");
+        tracing::info!("V3SwapMetricsHandler initialized");
         Ok(())
     }
 }
 
-impl EventHandler for V3MetricsHandler {
+impl EventHandler for V3SwapMetricsHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![EventTrigger::new(
+            "DopplerV3Pool",
+            "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        )]
+    }
+}
+
+// --- V3LiquidityMetricsHandler ---
+
+pub struct V3LiquidityMetricsHandler {
+    chain_id: u64,
+}
+
+#[async_trait]
+impl TransformationHandler for V3LiquidityMetricsHandler {
+    fn name(&self) -> &'static str {
+        "V3LiquidityMetricsHandler"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec!["migrations/tables/liquidity_deltas.sql"]
+    }
+
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec!["liquidity_deltas"]
+    }
+
+    async fn handle(
+        &self,
+        ctx: &TransformationContext,
+    ) -> Result<Vec<DbOperation>, TransformationError> {
+        let deltas = extract_v3_liquidity(ctx, "DopplerV3Pool")?;
+        Ok(process_liquidity_deltas(&deltas, self.chain_id))
+    }
+}
+
+impl EventHandler for V3LiquidityMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![
-            EventTrigger::new(
-                "DopplerV3Pool",
-                "Swap(address,address,int256,int256,uint160,uint128,int24)",
-            ),
             EventTrigger::new(
                 "DopplerV3Pool",
                 "Mint(address,address,int24,int24,uint128,uint256,uint256)",
@@ -210,18 +247,19 @@ impl EventHandler for V3MetricsHandler {
     }
 }
 
-// --- LockableV3MetricsHandler ---
+// --- LockableV3SwapMetricsHandler ---
 
-pub struct LockableV3MetricsHandler {
+pub struct LockableV3SwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
     decimals_resolved: AtomicBool,
     chain_id: u64,
+    db_pool: OnceLock<Pool>,
 }
 
 #[async_trait]
-impl TransformationHandler for LockableV3MetricsHandler {
+impl TransformationHandler for LockableV3SwapMetricsHandler {
     fn name(&self) -> &'static str {
-        "LockableV3MetricsHandler"
+        "LockableV3SwapMetricsHandler"
     }
 
     fn version(&self) -> u32 {
@@ -232,12 +270,11 @@ impl TransformationHandler for LockableV3MetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
-            "migrations/tables/liquidity_deltas.sql",
         ]
     }
 
     fn reorg_tables(&self) -> Vec<&'static str> {
-        vec!["pool_state", "pool_snapshots", "liquidity_deltas"]
+        vec!["pool_state", "pool_snapshots"]
     }
 
     async fn handle(
@@ -249,37 +286,75 @@ impl TransformationHandler for LockableV3MetricsHandler {
                 .resolve_quote_decimals(&ctx.contracts);
         }
 
-        // Discover any pools created in this range
-        discover_pools_from_create_events(
-            ctx,
-            "LockableUniswapV3Initializer",
-            &self.metadata_cache,
-        );
-
         let swaps = extract_v3_swaps(ctx, "DopplerLockableV3Pool")?;
-        let deltas = extract_v3_liquidity(ctx, "DopplerLockableV3Pool")?;
 
-        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id);
-        ops.extend(process_liquidity_deltas(&deltas, ctx.chain_id));
-        Ok(ops)
+        refresh_cache_if_needed(
+            swaps.iter().map(|s| &s.pool_id),
+            &self.metadata_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+
+        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
+        self.db_pool.set(db_pool.inner().clone()).ok();
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
-        tracing::info!("LockableV3MetricsHandler initialized");
+        tracing::info!("LockableV3SwapMetricsHandler initialized");
         Ok(())
     }
 }
 
-impl EventHandler for LockableV3MetricsHandler {
+impl EventHandler for LockableV3SwapMetricsHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![EventTrigger::new(
+            "DopplerLockableV3Pool",
+            "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        )]
+    }
+}
+
+// --- LockableV3LiquidityMetricsHandler ---
+
+pub struct LockableV3LiquidityMetricsHandler {
+    chain_id: u64,
+}
+
+#[async_trait]
+impl TransformationHandler for LockableV3LiquidityMetricsHandler {
+    fn name(&self) -> &'static str {
+        "LockableV3LiquidityMetricsHandler"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec!["migrations/tables/liquidity_deltas.sql"]
+    }
+
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec!["liquidity_deltas"]
+    }
+
+    async fn handle(
+        &self,
+        ctx: &TransformationContext,
+    ) -> Result<Vec<DbOperation>, TransformationError> {
+        let deltas = extract_v3_liquidity(ctx, "DopplerLockableV3Pool")?;
+        Ok(process_liquidity_deltas(&deltas, self.chain_id))
+    }
+}
+
+impl EventHandler for LockableV3LiquidityMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![
-            EventTrigger::new(
-                "DopplerLockableV3Pool",
-                "Swap(address,address,int256,int256,uint160,uint128,int24)",
-            ),
             EventTrigger::new(
                 "DopplerLockableV3Pool",
                 "Mint(address,address,int24,int24,uint128,uint256,uint256)",
@@ -296,14 +371,22 @@ impl EventHandler for LockableV3MetricsHandler {
 
 pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     let cache = Arc::new(PoolMetadataCache::new());
-    registry.register_event_handler(V3MetricsHandler {
+
+    // Swap metrics: pool_state + pool_snapshots (single-trigger, captures snapshots)
+    registry.register_event_handler(V3SwapMetricsHandler {
         metadata_cache: cache.clone(),
         decimals_resolved: AtomicBool::new(false),
         chain_id,
+        db_pool: OnceLock::new(),
     });
-    registry.register_event_handler(LockableV3MetricsHandler {
+    registry.register_event_handler(LockableV3SwapMetricsHandler {
         metadata_cache: cache,
         decimals_resolved: AtomicBool::new(false),
         chain_id,
+        db_pool: OnceLock::new(),
     });
+
+    // Liquidity metrics: liquidity_deltas (insert-only, no snapshot concerns)
+    registry.register_event_handler(V3LiquidityMetricsHandler { chain_id });
+    registry.register_event_handler(LockableV3LiquidityMetricsHandler { chain_id });
 }

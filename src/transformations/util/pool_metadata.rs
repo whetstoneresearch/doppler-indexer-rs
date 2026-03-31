@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use alloy_primitives::Address;
+use deadpool_postgres::Pool;
 
 use crate::db::DbPool;
 use crate::transformations::error::TransformationError;
@@ -153,19 +154,66 @@ impl PoolMetadataCache {
         self.inner.read().unwrap().get(pool_id).cloned()
     }
 
-    /// Insert or update metadata for a pool.
-    pub fn insert(&self, pool_id: Vec<u8>, meta: PoolMetadata) {
-        self.inner.write().unwrap().insert(pool_id, meta);
-    }
+    /// Re-query the `pools` table and insert any pools not already cached.
+    /// Returns the number of newly discovered pools.
+    pub async fn refresh(
+        &self,
+        pool: &Pool,
+        chain_id: u64,
+    ) -> Result<usize, TransformationError> {
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
-    /// Number of cached entries.
-    pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
-    }
+        let rows = client
+            .query(
+                "SELECT address, base_token, quote_token, is_token_0, type \
+                 FROM pools WHERE chain_id = $1",
+                &[&(chain_id as i64)],
+            )
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
-    /// Whether the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        let mut inner = self.inner.write().unwrap();
+        let mut new_count = 0;
+
+        for row in &rows {
+            let pool_id: Vec<u8> = row.get("address");
+            if inner.contains_key(&pool_id) {
+                continue;
+            }
+
+            let base_token_bytes: Vec<u8> = row.get("base_token");
+            let quote_token_bytes: Vec<u8> = row.get("quote_token");
+            let is_token_0: bool = row.get("is_token_0");
+            let pool_type: String = row.get("type");
+
+            if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
+                continue;
+            }
+
+            let mut base_token = [0u8; 20];
+            let mut quote_token = [0u8; 20];
+            base_token.copy_from_slice(&base_token_bytes);
+            quote_token.copy_from_slice(&quote_token_bytes);
+
+            inner.insert(
+                pool_id.clone(),
+                PoolMetadata {
+                    pool_id,
+                    base_token,
+                    quote_token,
+                    is_token_0,
+                    pool_type,
+                    base_decimals: 18,
+                    quote_decimals: 18,
+                },
+            );
+            new_count += 1;
+        }
+
+        Ok(new_count)
     }
 }
 
