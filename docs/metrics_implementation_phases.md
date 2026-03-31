@@ -155,24 +155,24 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 
 ---
 
-## Phase 1: Foundation
+## Phase 1: Foundation ✅
 
-**Goal**: Build all shared infrastructure. No handlers yet.
+**Status**: Complete — PR #79
 
-### Tasks
-1. Write SQL migrations: `pool_state.sql`, `pool_snapshots.sql`, populate `liquidity_deltas.sql`
-2. Implement `src/transformations/util/tick_math.rs` — port of Uniswap TickMath.getSqrtRatioAtTick()
-3. Implement `src/transformations/util/pool_metadata.rs` — PoolMetadataCache, quote_token_decimals()
-4. Implement `src/transformations/util/db/pool_metrics.rs` — DB operation builders
-5. Implement `src/transformations/event/metrics/` — accumulator.rs, swap_data.rs, mod.rs
-6. Wire new modules in util/mod.rs, util/db/mod.rs, event/mod.rs
-7. Unit tests for tick_math, accumulator, process_swaps
+**Delivered**:
+- SQL migrations: `pool_state.sql`, `pool_snapshots.sql`, `liquidity_deltas.sql`
+- `src/transformations/util/tick_math.rs` — `tick_to_sqrt_price_x96()` with 8 passing tests
+- `src/transformations/util/pool_metadata.rs` — `PoolMetadataCache` + `quote_token_decimals()`
+- `src/transformations/util/db/pool_metrics.rs` — `upsert_pool_state()`, `insert_pool_snapshot()`, `insert_liquidity_delta()`
+- `src/transformations/event/metrics/accumulator.rs` — `BlockAccumulator` with 2 passing tests
+- `src/transformations/event/metrics/swap_data.rs` — `SwapInput`, `LiquidityInput`, `process_swaps()`, `process_liquidity_deltas()`
+- All modules wired in `util/mod.rs`, `util/db/mod.rs`, `event/mod.rs`
 
-### Key design decisions
+### Key design decisions (for reference by later phases)
 - `pool_state` uses `RawSql` for conditional upsert (`WHERE block_number < EXCLUDED.block_number`). Handler must include source/source_version manually since RawSql skips auto-injection.
-- `pool_snapshots` uses standard `Upsert` with all columns as update_columns (idempotent).
-- `liquidity_deltas` uses standard `Insert`.
-- Quote token decimals hardcoded: WETH=18, USDC=6, USDT=6, EURC=6. Extracted to a shared function from existing price handler pattern.
+- `pool_snapshots` uses standard `Upsert` with all columns as update_columns (idempotent). source/source_version are auto-injected by the executor.
+- `liquidity_deltas` uses standard `Insert`. source/source_version are auto-injected.
+- Quote token decimals hardcoded: WETH=18, USDC=6, USDT=6, EURC=6. Implemented in `pool_metadata::quote_token_decimals()`.
 
 ---
 
@@ -183,15 +183,171 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 ### Tasks
 1. Implement `src/transformations/event/v3/metrics.rs` — V3MetricsHandler + LockableV3MetricsHandler
 2. Register in `v3/mod.rs` and `event/mod.rs`
-3. Test: run against a block range with known V3 swap/mint/burn events, verify pool_state + pool_snapshots + liquidity_deltas
+3. Test: `cargo build`, `cargo test`, run indexer against a block range with known V3 events
 
-### Handler specifics
-- Source: `DopplerV3Pool` / `DopplerLockableV3Pool`
-- Pool ID = `event.contract_address` (20 bytes, stored as BYTEA)
-- Swap: sqrtPriceX96, tick, liquidity all in event params
-- Mint → LiquidityInput with positive liquidity_delta
-- Burn → LiquidityInput with negative liquidity_delta (negate the `amount`)
-- call_dependencies: none (all data in events)
+### How to implement a handler using Phase 1 infrastructure
+
+Each handler follows this pattern:
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use crate::db::{DbOperation, DbPool};
+use crate::transformations::context::{FieldExtractor, TransformationContext};
+use crate::transformations::error::TransformationError;
+use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+use crate::transformations::event::metrics::swap_data::{
+    SwapInput, LiquidityInput, process_swaps, process_liquidity_deltas,
+};
+use crate::transformations::util::pool_metadata::PoolMetadataCache;
+
+pub struct MyMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,
+}
+
+#[async_trait]
+impl TransformationHandler for MyMetricsHandler {
+    fn name(&self) -> &'static str { "MyMetricsHandler" }
+    fn version(&self) -> u32 { 1 }
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![
+            "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/liquidity_deltas.sql",
+        ]
+    }
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec!["pool_state", "pool_snapshots", "liquidity_deltas"]
+    }
+
+    async fn handle(&self, ctx: &TransformationContext) -> Result<Vec<DbOperation>, TransformationError> {
+        let mut swaps = Vec::new();
+        let mut deltas = Vec::new();
+
+        // 1. Extract events → normalize to SwapInput / LiquidityInput
+        for event in ctx.events_of_type("SourceName", "Swap") {
+            // extract fields from event using FieldExtractor
+            swaps.push(SwapInput { /* ... */ });
+        }
+        for event in ctx.events_of_type("SourceName", "Mint") {
+            deltas.push(LiquidityInput { /* ... */ });
+        }
+
+        // 2. Delegate to shared processing
+        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id, self.name(), self.version());
+        ops.extend(process_liquidity_deltas(&deltas, ctx.chain_id));
+        Ok(ops)
+    }
+
+    async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
+        // PoolMetadataCache is loaded by the first handler that initializes.
+        // Subsequent handlers sharing the same Arc see the already-loaded cache.
+        Ok(())
+    }
+}
+
+impl EventHandler for MyMetricsHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![
+            EventTrigger::new("SourceName", "Swap(...)"),
+            EventTrigger::new("SourceName", "Mint(...)"),
+        ]
+    }
+}
+```
+
+### V3 handler specifics
+
+**Sources**: `DopplerV3Pool` (V3) and `DopplerLockableV3Pool` (Lockable V3). Two separate handler structs sharing one `Arc<PoolMetadataCache>`.
+
+**Pool ID**: `event.contract_address` (20 bytes). Use `event.contract_address.to_vec()` for the pool_id field.
+
+**Swap event** — `Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)`:
+```rust
+for event in ctx.events_of_type("DopplerV3Pool", "Swap") {
+    let amount0 = event.extract_int256("amount0")?;      // I256
+    let amount1 = event.extract_int256("amount1")?;       // I256
+    let sqrt_price_x96 = event.extract_uint256("sqrtPriceX96")?;  // U256
+    let liquidity_u128 = event.extract_uint256("liquidity")?;     // arrives as U256
+    let tick = event.extract_i32("tick")?;                 // i32 (may need extract_i32_flexible)
+
+    swaps.push(SwapInput {
+        pool_id: event.contract_address.to_vec(),
+        block_number: event.block_number,
+        block_timestamp: event.block_timestamp,
+        log_index: event.log_index,
+        amount0,
+        amount1,
+        sqrt_price_x96,
+        tick,
+        liquidity: liquidity_u128,
+    });
+}
+```
+
+**Mint event** — `Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)`:
+```rust
+for event in ctx.events_of_type("DopplerV3Pool", "Mint") {
+    let tick_lower = event.extract_i32("tickLower")?;  // may need extract_i32_flexible
+    let tick_upper = event.extract_i32("tickUpper")?;
+    let amount = event.extract_uint256("amount")?;      // liquidity amount (u128 range)
+
+    deltas.push(LiquidityInput {
+        pool_id: event.contract_address.to_vec(),
+        block_number: event.block_number,
+        log_index: event.log_index,
+        tick_lower,
+        tick_upper,
+        liquidity_delta: I256::try_from(amount).unwrap_or(I256::MAX),  // positive = add
+    });
+}
+```
+
+**Burn event** — same fields as Mint, but negate the liquidity:
+```rust
+for event in ctx.events_of_type("DopplerV3Pool", "Burn") {
+    let tick_lower = event.extract_i32("tickLower")?;
+    let tick_upper = event.extract_i32("tickUpper")?;
+    let amount = event.extract_uint256("amount")?;
+
+    deltas.push(LiquidityInput {
+        pool_id: event.contract_address.to_vec(),
+        block_number: event.block_number,
+        log_index: event.log_index,
+        tick_lower,
+        tick_upper,
+        liquidity_delta: -I256::try_from(amount).unwrap_or(I256::MAX),  // negative = remove
+    });
+}
+```
+
+**EventTrigger signatures** (must match the config in `config/contracts/base/v3.json`):
+```rust
+fn triggers(&self) -> Vec<EventTrigger> {
+    vec![
+        EventTrigger::new("DopplerV3Pool", "Swap(address,address,int256,int256,uint160,uint128,int24)"),
+        EventTrigger::new("DopplerV3Pool", "Mint(address,address,int24,int24,uint128,uint256,uint256)"),
+        EventTrigger::new("DopplerV3Pool", "Burn(address,int24,int24,uint128,uint256,uint256)"),
+    ]
+}
+```
+
+**call_dependencies**: none (sqrtPriceX96/tick/liquidity all in the Swap event).
+
+**PoolMetadataCache initialization**: Both V3MetricsHandler and LockableV3MetricsHandler should share one `Arc<PoolMetadataCache>`. Create it in `register_handlers()`:
+```rust
+pub fn register_handlers(registry: &mut TransformationRegistry) {
+    let cache = Arc::new(PoolMetadataCache::new());
+    registry.register_event_handler(V3MetricsHandler { metadata_cache: cache.clone() });
+    registry.register_event_handler(LockableV3MetricsHandler { metadata_cache: cache });
+}
+```
+
+The cache starts empty and is populated in `initialize()` by calling `PoolMetadataCache::load_from_db()`. Since `initialize()` receives `&DbPool`, the first handler to initialize loads the data. Use a `tokio::sync::OnceCell` or a bool flag to avoid loading twice.
+
+**Registration** in `src/transformations/event/mod.rs` — add `v3::metrics::register_handlers(registry);` to the `register_handlers()` function.
+
+**Registration** in `src/transformations/event/v3/mod.rs` — add `pub mod metrics;`.
 
 ---
 
