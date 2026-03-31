@@ -355,6 +355,8 @@ pub(crate) struct ReceiptBatchState {
     pub(crate) full_records: Vec<FullReceiptRecord>,
     /// Accumulated logs (sorted before write)
     pub(crate) logs: Vec<LogData>,
+    /// Accumulated event triggers (sent atomically with RangeComplete)
+    pub(crate) event_triggers: Vec<EventTriggerData>,
 }
 
 /// Channel metrics tracking state for receipt processing.

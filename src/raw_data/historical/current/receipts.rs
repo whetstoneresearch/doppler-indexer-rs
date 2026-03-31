@@ -43,10 +43,11 @@ struct WriteCompleteResult {
 /// Check if all blocks in a range have been received and completed.
 /// If so, remove the state, sort records, build a pending write, and spawn it.
 ///
-/// Sends `EventTriggerMessage::RangeComplete` immediately so event-triggered
-/// eth_call buffers stay aligned per-range. `LogMessage::RangeComplete` is
-/// deferred to Branch 3 (after parquet write) so the transformation engine
-/// can read the receipt file.
+/// Sends accumulated `EventTriggerMessage::Triggers` followed by
+/// `EventTriggerMessage::RangeComplete` atomically so triggers cannot leak
+/// across range boundaries. `LogMessage::RangeComplete` is deferred to
+/// Branch 3 (after parquet write) so the transformation engine can read
+/// the receipt file.
 #[allow(clippy::too_many_arguments)]
 async fn try_finalize_range(
     range_start: u64,
@@ -77,6 +78,17 @@ async fn try_finalize_range(
         start: range_start,
         end: range_end,
     };
+
+    // Send all accumulated event triggers atomically before RangeComplete.
+    // Triggers are buffered per-range in ReceiptBatchState so that out-of-order
+    // JoinSet completions cannot leak triggers from one range into another.
+    if !final_state.event_triggers.is_empty() {
+        if let Some(tx) = event_trigger_tx {
+            tx.send(EventTriggerMessage::Triggers(final_state.event_triggers))
+                .await
+                .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+        }
+    }
 
     let mut minimal_records = final_state.minimal_records;
     let mut full_records = final_state.full_records;
@@ -220,7 +232,7 @@ pub async fn collect_receipts(
             // -----------------------------------------------------------------
             // Branch 1: A new block arrives from upstream
             // -----------------------------------------------------------------
-            block_result = block_rx.recv(), if !block_rx_closed => {
+            block_result = block_rx.recv(), if !block_rx_closed && receipt_join_set.len() < block_receipt_concurrency => {
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
                         let range_start = (block_number / range_size) * range_size;
@@ -237,6 +249,7 @@ pub async fn collect_receipts(
                                 minimal_records: Vec::new(),
                                 full_records: Vec::new(),
                                 logs: Vec::new(),
+                                event_triggers: Vec::new(),
                             }
                         });
 
@@ -357,23 +370,20 @@ pub async fn collect_receipts(
                     state.minimal_records.extend(fetch_result.minimal_records);
                     state.full_records.extend(fetch_result.full_records);
 
-                    // Send logs immediately
+                    // Send logs immediately (log consumers are range-independent)
                     if !fetch_result.logs.is_empty() {
-                        let triggers = if !event_matchers.is_empty() {
-                            extract_event_triggers(&fetch_result.logs, &event_matchers)
-                        } else {
-                            Vec::new()
-                        };
-
-                        send_logs_to_channels(fetch_result.logs, &channels, &mut metrics).await?;
-
-                        if !triggers.is_empty() {
-                            if let Some(tx) = &channels.event_trigger_tx {
-                                tx.send(EventTriggerMessage::Triggers(triggers))
-                                    .await
-                                    .map_err(|e| ReceiptCollectionError::ChannelSend(e.to_string()))?;
+                        // Buffer triggers per-range so they are sent atomically
+                        // with RangeComplete in try_finalize_range, preventing
+                        // out-of-order JoinSet completions from leaking triggers
+                        // across range boundaries.
+                        if !event_matchers.is_empty() {
+                            let triggers = extract_event_triggers(&fetch_result.logs, &event_matchers);
+                            if !triggers.is_empty() {
+                                state.event_triggers.extend(triggers);
                             }
                         }
+
+                        send_logs_to_channels(fetch_result.logs, &channels, &mut metrics).await?;
                     }
 
                     // Mark block as completed
