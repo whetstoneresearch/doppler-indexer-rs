@@ -18,7 +18,63 @@ use crate::transformations::event::metrics::swap_data::{
 };
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
-use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::pool_metadata::{
+    quote_token_decimals, PoolMetadata, PoolMetadataCache,
+};
+
+// --- Pool discovery from Create events ---
+
+/// Scan Create events from an initializer and insert any new pools into the
+/// metadata cache. This ensures pools created during the current run (including
+/// fresh catchup and live mode) are available for swap/liquidity processing
+/// within the same block range.
+fn discover_pools_from_create_events(
+    ctx: &TransformationContext,
+    initializer_source: &str,
+    cache: &PoolMetadataCache,
+) {
+    for event in ctx.events_of_type(initializer_source, "Create") {
+        let pool_or_hook = match event.try_get("poolOrHook").and_then(|v| v.as_address()) {
+            Some(addr) => addr,
+            None => continue,
+        };
+        let pool_id = pool_or_hook.to_vec();
+
+        // Skip if already cached
+        if cache.get(&pool_id).is_some() {
+            continue;
+        }
+
+        let asset = match event.try_get("asset").and_then(|v| v.as_address()) {
+            Some(addr) => addr,
+            None => continue,
+        };
+        let numeraire = match event.try_get("numeraire").and_then(|v| v.as_address()) {
+            Some(addr) => addr,
+            None => continue,
+        };
+
+        let is_token_0 = asset < numeraire;
+        let quote_decimals =
+            quote_token_decimals(&numeraire, &ctx.contracts).unwrap_or(18);
+
+        // base_decimals = 18: all tokens launched by Doppler initializers are 18 decimals.
+        // If this invariant ever changes, base_decimals should be read from the
+        // DERC20 once call or the tokens table.
+        cache.insert(
+            pool_id,
+            PoolMetadata {
+                pool_id: pool_or_hook.to_vec(),
+                base_token: asset,
+                quote_token: numeraire,
+                is_token_0,
+                pool_type: "v3".to_string(),
+                base_decimals: 18,
+                quote_decimals,
+            },
+        );
+    }
+}
 
 // --- Shared extraction functions ---
 
@@ -114,23 +170,20 @@ impl TransformationHandler for V3MetricsHandler {
                 .resolve_quote_decimals(&ctx.contracts);
         }
 
+        // Discover any pools created in this range
+        discover_pools_from_create_events(ctx, "UniswapV3Initializer", &self.metadata_cache);
+
         let swaps = extract_v3_swaps(ctx, "DopplerV3Pool")?;
         let deltas = extract_v3_liquidity(ctx, "DopplerV3Pool")?;
 
-        let mut ops = process_swaps(
-            &swaps,
-            &self.metadata_cache,
-            ctx.chain_id,
-            self.name(),
-            self.version(),
-        );
+        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id);
         ops.extend(process_liquidity_deltas(&deltas, ctx.chain_id));
         Ok(ops)
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
-        // Load pool metadata; chain_id 8453 = Base (only chain for now)
-        // TODO: parameterize chain_id when multi-chain support is added
+        // Load existing pool metadata; chain_id 8453 = Base (only chain for now)
+        // Pools created after this point are discovered via Create events in handle()
         self.metadata_cache.load_into(db_pool, 8453).await?;
         tracing::info!("V3MetricsHandler initialized");
         Ok(())
@@ -194,16 +247,17 @@ impl TransformationHandler for LockableV3MetricsHandler {
                 .resolve_quote_decimals(&ctx.contracts);
         }
 
+        // Discover any pools created in this range
+        discover_pools_from_create_events(
+            ctx,
+            "LockableUniswapV3Initializer",
+            &self.metadata_cache,
+        );
+
         let swaps = extract_v3_swaps(ctx, "DopplerLockableV3Pool")?;
         let deltas = extract_v3_liquidity(ctx, "DopplerLockableV3Pool")?;
 
-        let mut ops = process_swaps(
-            &swaps,
-            &self.metadata_cache,
-            ctx.chain_id,
-            self.name(),
-            self.version(),
-        );
+        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id);
         ops.extend(process_liquidity_deltas(&deltas, ctx.chain_id));
         Ok(ops)
     }

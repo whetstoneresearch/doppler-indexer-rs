@@ -50,8 +50,6 @@ pub fn process_swaps(
     swaps: &[SwapInput],
     metadata_cache: &PoolMetadataCache,
     chain_id: u64,
-    handler_name: &str,
-    handler_version: u32,
 ) -> Vec<DbOperation> {
     if swaps.is_empty() {
         return Vec::new();
@@ -150,20 +148,16 @@ pub fn process_swaps(
     for (pool_id, (block_number, acc)) in &latest_per_pool {
         let price_close = acc.price_close.unwrap_or(0.0);
 
-        ops.push(upsert_pool_state(
-            &PoolStateData {
-                chain_id,
-                pool_id: pool_id.clone(),
-                block_number: *block_number,
-                block_timestamp: acc.block_timestamp,
-                tick: acc.last_tick,
-                sqrt_price_x96: acc.last_sqrt_price_x96.to_string(),
-                price: format!("{:.18}", price_close),
-                active_liquidity: acc.last_liquidity.to_string(),
-            },
-            handler_name,
-            handler_version,
-        ));
+        ops.push(upsert_pool_state(&PoolStateData {
+            chain_id,
+            pool_id: pool_id.clone(),
+            block_number: *block_number,
+            block_timestamp: acc.block_timestamp,
+            tick: acc.last_tick,
+            sqrt_price_x96: acc.last_sqrt_price_x96.to_string(),
+            price: format!("{:.18}", price_close),
+            active_liquidity: acc.last_liquidity.to_string(),
+        }));
     }
 
     ops

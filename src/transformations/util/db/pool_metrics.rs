@@ -44,36 +44,28 @@ pub struct LiquidityDeltaData {
     pub liquidity_delta: String,
 }
 
-/// Build a conditional pool_state upsert using RawSql.
+/// Build a pool_state upsert.
 ///
-/// Uses `INSERT ... ON CONFLICT DO UPDATE SET ... WHERE pool_state.block_number < EXCLUDED.block_number`
-/// so older blocks never overwrite newer state. RawSql is needed because the standard
-/// Upsert DbOperation doesn't support a WHERE clause on the DO UPDATE.
+/// Uses standard DbOperation::Upsert so that live-mode snapshot capture
+/// (execute_with_snapshot_capture) can record the previous row state before
+/// overwriting. This enables correct rollback on reorg.
 ///
-/// source/source_version are included manually since RawSql skips auto-injection.
-pub fn upsert_pool_state(
-    data: &PoolStateData,
-    handler_name: &str,
-    handler_version: u32,
-) -> DbOperation {
-    let query = "\
-        INSERT INTO pool_state (chain_id, pool_id, block_number, block_timestamp, \
-            tick, sqrt_price_x96, price, active_liquidity, source, source_version) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-        ON CONFLICT (chain_id, pool_id, source, source_version) \
-        DO UPDATE SET \
-            block_number = EXCLUDED.block_number, \
-            block_timestamp = EXCLUDED.block_timestamp, \
-            tick = EXCLUDED.tick, \
-            sqrt_price_x96 = EXCLUDED.sqrt_price_x96, \
-            price = EXCLUDED.price, \
-            active_liquidity = EXCLUDED.active_liquidity \
-        WHERE pool_state.block_number < EXCLUDED.block_number"
-        .to_string();
-
-    DbOperation::RawSql {
-        query,
-        params: vec![
+/// The engine processes block ranges sequentially per handler, so the
+/// unconditional update is safe — newer blocks always arrive after older ones.
+pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
+    DbOperation::Upsert {
+        table: "pool_state".to_string(),
+        columns: vec![
+            "chain_id".into(),
+            "pool_id".into(),
+            "block_number".into(),
+            "block_timestamp".into(),
+            "tick".into(),
+            "sqrt_price_x96".into(),
+            "price".into(),
+            "active_liquidity".into(),
+        ],
+        values: vec![
             DbValue::Int64(data.chain_id as i64),
             DbValue::Bytes(data.pool_id.clone()),
             DbValue::Int64(data.block_number as i64),
@@ -82,8 +74,15 @@ pub fn upsert_pool_state(
             DbValue::Numeric(data.sqrt_price_x96.clone()),
             DbValue::Numeric(data.price.clone()),
             DbValue::Numeric(data.active_liquidity.clone()),
-            DbValue::Text(handler_name.to_string()),
-            DbValue::Int32(handler_version as i32),
+        ],
+        conflict_columns: vec!["chain_id".into(), "pool_id".into()],
+        update_columns: vec![
+            "block_number".into(),
+            "block_timestamp".into(),
+            "tick".into(),
+            "sqrt_price_x96".into(),
+            "price".into(),
+            "active_liquidity".into(),
         ],
     }
 }
