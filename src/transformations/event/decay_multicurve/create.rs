@@ -14,6 +14,7 @@ use crate::transformations::util::db::pool::{
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
 use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
 
@@ -347,24 +348,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                     _ => Vec::new(),
                 });
 
-            let migration_type = ctx
-                .match_contract_address(
-                    asset_metadata.migrator.into(),
-                    &[
-                        "UniswapV4Migrator",
-                        "UniswapV2Migrator",
-                        "NimCustomV2Migrator",
-                        "UniswapV3Migrator",
-                        "NimCustomV3Migrator",
-                    ],
-                )
-                .map(|contract_name| match contract_name {
-                    "UniswapV4Migrator" => "v4",
-                    "UniswapV2Migrator" | "NimCustomV2Migrator" => "v2",
-                    "UniswapV3Migrator" | "NimCustomV3Migrator" => "v3",
-                    _ => "unknown",
-                })
-                .unwrap_or("unknown");
+            let migration_type = resolve_migration_type(ctx, asset_metadata.migrator.into());
 
             ops.push(insert_pool(
                 &PoolData {
@@ -386,7 +370,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                     migration_type: migration_type.to_string(),
                     lock_duration: None,
                     beneficiaries,
-                    pool_key,
+                    pool_key: Some(pool_key),
                     starting_time: pool_config.starting_time,
                     ending_time: pool_config.ending_time,
                 },

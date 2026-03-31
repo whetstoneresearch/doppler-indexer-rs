@@ -4,5 +4,6 @@
 
 pub mod db;
 pub mod metadata;
+pub mod migration;
 pub mod price;
 pub mod sanitize;

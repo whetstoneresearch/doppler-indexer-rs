@@ -16,6 +16,7 @@ use crate::transformations::util::db::pool::{
 };
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
 
@@ -167,28 +168,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
                     _ => Vec::new(),
                 });
 
-            let migration_type = ctx
-                .match_contract_address(
-                    asset_metadata.migrator.into(),
-                    &[
-                        "UniswapV4Migrator",
-                        "UniswapV2Migrator",
-                        "NimCustomV2Migrator",
-                        "UniswapV3Migrator",
-                        "NimCustomV3Migrator",
-                        "DopplerHookMigrator",
-                        "RehypeDopplerHookMigrator",
-                    ],
-                )
-                .map(|contract_name| match contract_name {
-                    "UniswapV4Migrator" => "v4",
-                    "UniswapV2Migrator" | "NimCustomV2Migrator" => "v2",
-                    "UniswapV3Migrator" | "NimCustomV3Migrator" => "v3",
-                    "DopplerHookMigrator" => "dhook",
-                    "RehypeDopplerHookMigrator" => "rehype",
-                    _ => "unknown",
-                })
-                .unwrap_or("unknown");
+            let migration_type = resolve_migration_type(ctx, asset_metadata.migrator.into());
 
             let pool_type = if ctx.match_contract_address(hook, &["RehypeHook"]).is_some() {
                 "rehype"
@@ -216,7 +196,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
                     migration_type: migration_type.to_string(),
                     lock_duration: None,
                     beneficiaries,
-                    pool_key,
+                    pool_key: Some(pool_key),
                     starting_time: 0,
                     ending_time: 0,
                 },
