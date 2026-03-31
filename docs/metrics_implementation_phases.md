@@ -176,178 +176,43 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 
 ---
 
-## Phase 2: V3 Handlers
+## Phase 2: V3 Handlers ✅
 
-**Goal**: Validate the full pipeline end-to-end with the simplest pool type.
+**Status**: Complete — `feat/pool-metrics-phase2` branch
 
-### Tasks
-1. Implement `src/transformations/event/v3/metrics.rs` — V3MetricsHandler + LockableV3MetricsHandler
-2. Register in `v3/mod.rs` and `event/mod.rs`
-3. Test: `cargo build`, `cargo test`, run indexer against a block range with known V3 events
+**Delivered**:
+- `src/transformations/event/v3/metrics.rs` — V3MetricsHandler + LockableV3MetricsHandler
+- Fixed `PoolMetadataCache` API: `load_from_db()` no longer requires contracts, added `load_into()` for shared caches, added `resolve_quote_decimals()` for lazy decimal resolution
+- Fixed `liquidity_deltas` from INSERT to Upsert with empty update_columns (ON CONFLICT DO NOTHING) to prevent duplicate key errors on re-runs
+- Updated DDL: `liquidity_deltas` changed from PRIMARY KEY to UNIQUE constraint including source/source_version
+- Registered in `v3/mod.rs` and `event/mod.rs`
 
-### How to implement a handler using Phase 1 infrastructure
+### Established patterns (reference for all future handlers)
 
-Each handler follows this pattern:
-
+**Handler struct pattern**:
 ```rust
-use std::sync::Arc;
-use async_trait::async_trait;
-use crate::db::{DbOperation, DbPool};
-use crate::transformations::context::{FieldExtractor, TransformationContext};
-use crate::transformations::error::TransformationError;
-use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
-use crate::transformations::event::metrics::swap_data::{
-    SwapInput, LiquidityInput, process_swaps, process_liquidity_deltas,
-};
-use crate::transformations::util::pool_metadata::PoolMetadataCache;
-
 pub struct MyMetricsHandler {
-    metadata_cache: Arc<PoolMetadataCache>,
-}
-
-#[async_trait]
-impl TransformationHandler for MyMetricsHandler {
-    fn name(&self) -> &'static str { "MyMetricsHandler" }
-    fn version(&self) -> u32 { 1 }
-    fn migration_paths(&self) -> Vec<&'static str> {
-        vec![
-            "migrations/tables/pool_state.sql",
-            "migrations/tables/pool_snapshots.sql",
-            "migrations/tables/liquidity_deltas.sql",
-        ]
-    }
-    fn reorg_tables(&self) -> Vec<&'static str> {
-        vec!["pool_state", "pool_snapshots", "liquidity_deltas"]
-    }
-
-    async fn handle(&self, ctx: &TransformationContext) -> Result<Vec<DbOperation>, TransformationError> {
-        let mut swaps = Vec::new();
-        let mut deltas = Vec::new();
-
-        // 1. Extract events → normalize to SwapInput / LiquidityInput
-        for event in ctx.events_of_type("SourceName", "Swap") {
-            // extract fields from event using FieldExtractor
-            swaps.push(SwapInput { /* ... */ });
-        }
-        for event in ctx.events_of_type("SourceName", "Mint") {
-            deltas.push(LiquidityInput { /* ... */ });
-        }
-
-        // 2. Delegate to shared processing
-        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id, self.name(), self.version());
-        ops.extend(process_liquidity_deltas(&deltas, ctx.chain_id));
-        Ok(ops)
-    }
-
-    async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
-        // PoolMetadataCache is loaded by the first handler that initializes.
-        // Subsequent handlers sharing the same Arc see the already-loaded cache.
-        Ok(())
-    }
-}
-
-impl EventHandler for MyMetricsHandler {
-    fn triggers(&self) -> Vec<EventTrigger> {
-        vec![
-            EventTrigger::new("SourceName", "Swap(...)"),
-            EventTrigger::new("SourceName", "Mint(...)"),
-        ]
-    }
+    metadata_cache: Arc<PoolMetadataCache>,   // shared across related handlers
+    decimals_resolved: AtomicBool,            // guards one-time resolve in handle()
 }
 ```
 
-### V3 handler specifics
+**Lifecycle**:
+1. `register_handlers()`: create shared `Arc<PoolMetadataCache>`, construct handlers
+2. `initialize(&self, db_pool)`: call `self.metadata_cache.load_into(db_pool, 8453)` — loads pools from DB, skips if already loaded by sibling handler
+3. First `handle()`: call `self.metadata_cache.resolve_quote_decimals(&ctx.contracts)` guarded by `AtomicBool` — resolves WETH=18, USDC=6, USDT=6, EURC=6
+4. Every `handle()`: extract events → normalize to `SwapInput`/`LiquidityInput` → delegate to `process_swaps()`/`process_liquidity_deltas()`
 
-**Sources**: `DopplerV3Pool` (V3) and `DopplerLockableV3Pool` (Lockable V3). Two separate handler structs sharing one `Arc<PoolMetadataCache>`.
-
-**Pool ID**: `event.contract_address` (20 bytes). Use `event.contract_address.to_vec()` for the pool_id field.
-
-**Swap event** — `Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)`:
+**Extraction helpers**: defined as module-level `fn` (not methods) to share between two handler structs:
 ```rust
-for event in ctx.events_of_type("DopplerV3Pool", "Swap") {
-    let amount0 = event.extract_int256("amount0")?;      // I256
-    let amount1 = event.extract_int256("amount1")?;       // I256
-    let sqrt_price_x96 = event.extract_uint256("sqrtPriceX96")?;  // U256
-    let liquidity_u128 = event.extract_uint256("liquidity")?;     // arrives as U256
-    let tick = event.extract_i32("tick")?;                 // i32 (may need extract_i32_flexible)
-
-    swaps.push(SwapInput {
-        pool_id: event.contract_address.to_vec(),
-        block_number: event.block_number,
-        block_timestamp: event.block_timestamp,
-        log_index: event.log_index,
-        amount0,
-        amount1,
-        sqrt_price_x96,
-        tick,
-        liquidity: liquidity_u128,
-    });
-}
+fn extract_v3_swaps(ctx: &TransformationContext, source: &str) -> Result<Vec<SwapInput>, TransformationError>
+fn extract_v3_liquidity(ctx: &TransformationContext, source: &str) -> Result<Vec<LiquidityInput>, TransformationError>
 ```
 
-**Mint event** — `Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)`:
+**Registration pattern** in `event/mod.rs`:
 ```rust
-for event in ctx.events_of_type("DopplerV3Pool", "Mint") {
-    let tick_lower = event.extract_i32("tickLower")?;  // may need extract_i32_flexible
-    let tick_upper = event.extract_i32("tickUpper")?;
-    let amount = event.extract_uint256("amount")?;      // liquidity amount (u128 range)
-
-    deltas.push(LiquidityInput {
-        pool_id: event.contract_address.to_vec(),
-        block_number: event.block_number,
-        log_index: event.log_index,
-        tick_lower,
-        tick_upper,
-        liquidity_delta: I256::try_from(amount).unwrap_or(I256::MAX),  // positive = add
-    });
-}
+v3::metrics::register_handlers(registry);
 ```
-
-**Burn event** — same fields as Mint, but negate the liquidity:
-```rust
-for event in ctx.events_of_type("DopplerV3Pool", "Burn") {
-    let tick_lower = event.extract_i32("tickLower")?;
-    let tick_upper = event.extract_i32("tickUpper")?;
-    let amount = event.extract_uint256("amount")?;
-
-    deltas.push(LiquidityInput {
-        pool_id: event.contract_address.to_vec(),
-        block_number: event.block_number,
-        log_index: event.log_index,
-        tick_lower,
-        tick_upper,
-        liquidity_delta: -I256::try_from(amount).unwrap_or(I256::MAX),  // negative = remove
-    });
-}
-```
-
-**EventTrigger signatures** (must match the config in `config/contracts/base/v3.json`):
-```rust
-fn triggers(&self) -> Vec<EventTrigger> {
-    vec![
-        EventTrigger::new("DopplerV3Pool", "Swap(address,address,int256,int256,uint160,uint128,int24)"),
-        EventTrigger::new("DopplerV3Pool", "Mint(address,address,int24,int24,uint128,uint256,uint256)"),
-        EventTrigger::new("DopplerV3Pool", "Burn(address,int24,int24,uint128,uint256,uint256)"),
-    ]
-}
-```
-
-**call_dependencies**: none (sqrtPriceX96/tick/liquidity all in the Swap event).
-
-**PoolMetadataCache initialization**: Both V3MetricsHandler and LockableV3MetricsHandler should share one `Arc<PoolMetadataCache>`. Create it in `register_handlers()`:
-```rust
-pub fn register_handlers(registry: &mut TransformationRegistry) {
-    let cache = Arc::new(PoolMetadataCache::new());
-    registry.register_event_handler(V3MetricsHandler { metadata_cache: cache.clone() });
-    registry.register_event_handler(LockableV3MetricsHandler { metadata_cache: cache });
-}
-```
-
-The cache starts empty and is populated in `initialize()` by calling `PoolMetadataCache::load_from_db()`. Since `initialize()` receives `&DbPool`, the first handler to initialize loads the data. Use a `tokio::sync::OnceCell` or a bool flag to avoid loading twice.
-
-**Registration** in `src/transformations/event/mod.rs` — add `v3::metrics::register_handlers(registry);` to the `register_handlers()` function.
-
-**Registration** in `src/transformations/event/v3/mod.rs` — add `pub mod metrics;`.
 
 ---
 
@@ -356,24 +221,270 @@ The cache starts empty and is populated in `initialize()` by calling `PoolMetada
 **Goal**: Add metrics for multicurve, decay, scheduled, and dhook pools.
 
 ### Tasks
-1. Config changes: add getSlot0 on_event calls to multicurve.json, decay_multicurve.json, scheduled_multicurve.json, dhook.json
+1. Config changes: add getSlot0 on_event calls to 4 config files
 2. Config change: add Swap + ModifyLiquidity events to DopplerHookInitializer in dhook.json
 3. Implement `multicurve/metrics.rs` — MulticurveMetricsHandler
 4. Implement `decay_multicurve/metrics.rs` — DecayMulticurveMetricsHandler
 5. Implement `scheduled_multicurve/metrics.rs` — ScheduledMulticurveMetricsHandler
 6. Implement `dhook/metrics.rs` — DhookMetricsHandler
-7. Register all handlers
+7. Register all handlers in their respective `mod.rs` + `event/mod.rs`
+8. Test: `cargo build`, `cargo test`, verify on_event call configs work
 
-### Handler specifics
-- Swap event: `int128 amount0, amount1` (need I256 conversion), poolId from topics[3]
-- sqrtPriceX96 from getSlot0 call matched by `trigger_log_index == event.log_index`
-- ModifyLiquidity: two formats (tuple vs flat) — extract tick_lower/upper/liquidityDelta accordingly
-- Tuple format (multicurve, dhook): compute poolId from PoolKey via keccak hash
-- Flat format (decay, scheduled): poolId from topics[1] (`id`)
-- call_dependencies: `("UniswapV4StateView", "getSlot0")`
+### Config changes needed
 
-### Verify on_event call format
-Test with one hook (e.g., DecayMulticurveHook) first. The `event` field in `frequency.on_events` is keccak-hashed and matched against log topic0. The ABI-canonical form (types only) is: `Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)`
+**Add getSlot0 on_event call** to each hook contract config. The call targets `UniswapV4StateView` and passes the pool ID from the Swap event's topics[3]. Add a `"calls"` array to contracts that currently only have `"events"`.
+
+**`config/contracts/base/multicurve.json`** — add to `UniswapV4MulticurveInitializerHook`:
+```json
+"calls": [{
+    "function": "getSlot0(bytes32)",
+    "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+    "frequency": { "on_events": {
+        "source": "UniswapV4MulticurveInitializerHook",
+        "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
+    }},
+    "target": "UniswapV4StateView",
+    "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+}]
+```
+
+**`config/contracts/base/decay_multicurve.json`** — add to `DecayMulticurveHook`:
+Same call config but `"source": "DecayMulticurveHook"`.
+
+**`config/contracts/base/scheduled_multicurve.json`** — add to `UniswapV4ScheduledMulticurveInitializerHook`:
+Same call config but `"source": "UniswapV4ScheduledMulticurveInitializerHook"`.
+
+**`config/contracts/base/dhook.json`** — add events AND call to `DopplerHookInitializer`:
+```json
+"events": [
+    { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
+    { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },
+    { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
+],
+"calls": [
+    // ... existing getState, getBeneficiaries calls ...
+    {
+        "function": "getSlot0(bytes32)",
+        "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+        "frequency": { "on_events": {
+            "source": "DopplerHookInitializer",
+            "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
+        }},
+        "target": "UniswapV4StateView",
+        "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+    }
+]
+```
+
+**Important**: The `"event"` field in `frequency.on_events` is keccak-hashed by `compute_event_signature_hash()` in `src/raw_data/historical/eth_calls/event_triggers.rs` and matched against log topic0. It must be the ABI-canonical form (types only, no names, no `indexed`). Test with one hook first (e.g., DecayMulticurveHook) to verify the format works before applying to all 4 configs.
+
+### How to implement V4 hook handlers using Phase 2 patterns
+
+Each handler follows the same struct + lifecycle pattern from Phase 2 (see `src/transformations/event/v3/metrics.rs`). The key differences are in event extraction.
+
+**Handler struct** (identical to V3):
+```rust
+pub struct MulticurveMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,
+    decimals_resolved: AtomicBool,
+}
+```
+
+**Swap extraction** — V4 hooks emit a different Swap signature. The key differences from V3:
+- `amount0`/`amount1` are `int128` (decoded as I256 by the decoder — use `extract_int256`)
+- No sqrtPriceX96/tick/liquidity in the event itself — get from the getSlot0 on_event call
+- Pool ID from the `poolId` param (bytes32), not from `contract_address`
+
+```rust
+fn extract_v4_hook_swaps(
+    ctx: &TransformationContext,
+    source: &str,         // e.g., "DecayMulticurveHook"
+    call_source: &str,    // e.g., "DecayMulticurveHook" (where getSlot0 is configured)
+) -> Result<Vec<SwapInput>, TransformationError> {
+    let mut swaps = Vec::new();
+    for event in ctx.events_of_type(source, "Swap") {
+        let pool_id = event.extract_bytes32("poolId")?;
+
+        // Find the matching getSlot0 call for this swap event
+        let slot0 = ctx.calls_of_type(call_source, "getSlot0")
+            .find(|call| call.trigger_log_index == Some(event.log_index))
+            .ok_or_else(|| TransformationError::MissingData(format!(
+                "No getSlot0 call for swap at block {} log_index {}",
+                event.block_number, event.log_index
+            )))?;
+
+        if slot0.is_reverted {
+            tracing::warn!(
+                "getSlot0 reverted for pool {} at block {}, skipping",
+                hex::encode(pool_id), event.block_number
+            );
+            continue;
+        }
+
+        let sqrt_price_x96 = slot0.extract_uint256("sqrtPriceX96")?;
+        let tick = slot0.extract_i32_flexible("tick")?;
+
+        swaps.push(SwapInput {
+            pool_id: pool_id.to_vec(),
+            block_number: event.block_number,
+            block_timestamp: event.block_timestamp,
+            log_index: event.log_index,
+            amount0: event.extract_int256("amount0")?,
+            amount1: event.extract_int256("amount1")?,
+            sqrt_price_x96,
+            tick,
+            liquidity: U256::ZERO,  // not in event; populated by TVL pass later
+        });
+    }
+    Ok(swaps)
+}
+```
+
+**Note on `call_source`**: The getSlot0 on_event call is configured on the hook contract (e.g., `DecayMulticurveHook`). But the executor stores the call result under the *target* contract name (`UniswapV4StateView`) with the function name `getSlot0`. So the lookup should be:
+```rust
+ctx.calls_of_type("UniswapV4StateView", "getSlot0")
+```
+Wait — this is wrong. On-event calls are stored under the source contract name, not the target. Need to verify. Check `src/raw_data/historical/eth_calls/event_triggers.rs` to see what `source_name` is set to on the decoded call result. The `contract_name` on `EventTriggeredCallConfig` is the contract where the call config is defined (the hook), but the call is executed against the target address. The decoded result's `source_name` is set from the config's contract_name. So the lookup uses the hook's contract name as source, not `UniswapV4StateView`.
+
+**Actually**: look at how the existing on_event calls work. In `DecayMulticurveInitializer`, the getState call has no target override — it calls itself. The source_name on the decoded call matches the contract name. For getSlot0 with `"target": "UniswapV4StateView"`, the source_name is still the contract where the call is configured (e.g., `DecayMulticurveHook`). So the lookup is:
+```rust
+ctx.calls_of_type("DecayMulticurveHook", "getSlot0")
+```
+
+**Verify this** by checking what `source_name` is set to in the on_event call collection code. Look at `EventTriggeredCallConfig.contract_name` and how it flows to `DecodedCall.source_name`.
+
+**ModifyLiquidity extraction** — two different event formats:
+
+**Tuple format** (multicurve, dhook) — `ModifyLiquidity((PoolKey) key, (Params) params)`:
+```rust
+fn extract_tuple_modify_liquidity(
+    ctx: &TransformationContext,
+    source: &str,
+) -> Result<Vec<LiquidityInput>, TransformationError> {
+    let mut deltas = Vec::new();
+    for event in ctx.events_of_type(source, "ModifyLiquidity") {
+        // Compute pool_id from PoolKey fields
+        let pool_key = PoolKey {
+            currency0: event.extract_address("key.currency0")?.into(),
+            currency1: event.extract_address("key.currency1")?.into(),
+            fee: event.extract_u32("key.fee")?,
+            tick_spacing: event.extract_i32_flexible("key.tickSpacing")?,
+            hooks: event.extract_address("key.hooks")?.into(),
+        };
+        let pool_id = pool_key.pool_id();
+
+        deltas.push(LiquidityInput {
+            pool_id: pool_id.to_vec(),
+            block_number: event.block_number,
+            log_index: event.log_index,
+            tick_lower: event.extract_i32_flexible("params.tickLower")?,
+            tick_upper: event.extract_i32_flexible("params.tickUpper")?,
+            liquidity_delta: event.extract_int256("params.liquidityDelta")?,
+        });
+    }
+    Ok(deltas)
+}
+```
+
+**Flat format** (decay, scheduled) — `ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)`:
+```rust
+fn extract_flat_modify_liquidity(
+    ctx: &TransformationContext,
+    source: &str,
+) -> Result<Vec<LiquidityInput>, TransformationError> {
+    let mut deltas = Vec::new();
+    for event in ctx.events_of_type(source, "ModifyLiquidity") {
+        let pool_id = event.extract_bytes32("id")?;
+
+        deltas.push(LiquidityInput {
+            pool_id: pool_id.to_vec(),
+            block_number: event.block_number,
+            log_index: event.log_index,
+            tick_lower: event.extract_i32_flexible("tickLower")?,
+            tick_upper: event.extract_i32_flexible("tickUpper")?,
+            liquidity_delta: event.extract_int256("liquidityDelta")?,
+        });
+    }
+    Ok(deltas)
+}
+```
+
+### Per-handler summary
+
+| Handler | Source | Swap extraction | ModifyLiquidity extraction | getSlot0 call_source |
+|---------|--------|----------------|---------------------------|---------------------|
+| MulticurveMetricsHandler | UniswapV4MulticurveInitializerHook | `extract_v4_hook_swaps` | `extract_tuple_modify_liquidity` | UniswapV4MulticurveInitializerHook |
+| DecayMulticurveMetricsHandler | DecayMulticurveHook | `extract_v4_hook_swaps` | `extract_flat_modify_liquidity` | DecayMulticurveHook |
+| ScheduledMulticurveMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | `extract_v4_hook_swaps` | `extract_flat_modify_liquidity` | UniswapV4ScheduledMulticurveInitializerHook |
+| DhookMetricsHandler | DopplerHookInitializer | `extract_v4_hook_swaps` | `extract_tuple_modify_liquidity` | DopplerHookInitializer |
+
+### EventTrigger signatures
+
+Must match what's in the config JSON files. The registry uses `extract_event_name()` which takes the part before `(` as the event name for dispatch.
+
+**Multicurve + DHook (tuple ModifyLiquidity)**:
+```rust
+fn triggers(&self) -> Vec<EventTrigger> {
+    vec![
+        EventTrigger::new("UniswapV4MulticurveInitializerHook",
+            "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"),
+        EventTrigger::new("UniswapV4MulticurveInitializerHook",
+            "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))"),
+    ]
+}
+```
+
+**Decay + Scheduled (flat ModifyLiquidity)**:
+```rust
+fn triggers(&self) -> Vec<EventTrigger> {
+    vec![
+        EventTrigger::new("DecayMulticurveHook",
+            "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"),
+        EventTrigger::new("DecayMulticurveHook",
+            "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"),
+    ]
+}
+```
+
+### call_dependencies
+
+All 4 handlers declare the getSlot0 dependency so the validation at startup passes:
+```rust
+fn call_dependencies(&self) -> Vec<(String, String)> {
+    vec![("UniswapV4MulticurveInitializerHook".to_string(), "getSlot0".to_string())]
+}
+```
+
+**Note**: The `call_dependencies` source name must match the contract where the call is configured in the JSON, not the target. Verify this matches what `validate_call_dependencies()` checks against.
+
+### Shared extraction functions location
+
+The V4 hook extraction functions (`extract_v4_hook_swaps`, `extract_tuple_modify_liquidity`, `extract_flat_modify_liquidity`) are shared across 4 handlers. They should live in a shared location. Options:
+- `src/transformations/event/metrics/v4_hook.rs` — new file in the shared metrics module
+- Or inline in each handler's file (more duplication but simpler)
+
+Recommended: add `src/transformations/event/metrics/v4_hook.rs` with the shared extraction functions, and `pub mod v4_hook;` in `metrics/mod.rs`.
+
+### Registration
+
+In each handler module's `mod.rs` — add `pub mod metrics;`
+
+In `src/transformations/event/mod.rs` — add to `register_handlers()`:
+```rust
+multicurve::metrics::register_handlers(registry);
+decay_multicurve::metrics::register_handlers(registry);
+scheduled_multicurve::metrics::register_handlers(registry);
+dhook::metrics::register_handlers(registry);
+```
+
+Each handler's `register_handlers()` creates its own `Arc<PoolMetadataCache>` (not shared across pool types — each pool type may initialize at different times).
+
+### Key verification steps
+
+1. **on_event call format**: Start with one config (e.g., `decay_multicurve.json`), run the indexer for a small block range, and verify that getSlot0 calls appear in the decoded call parquet files. If the event signature hash doesn't match, no calls will be collected.
+2. **call source_name**: After getSlot0 calls are collected, verify the `source_name` on the `DecodedCall` matches what `ctx.calls_of_type(source, "getSlot0")` expects.
+3. **PoolKey field paths**: Verify that flattened field names like `"key.currency0"`, `"params.tickLower"` match what the decoder produces. Check existing tuple-format events in other handlers for the exact naming convention.
+4. **int128 amounts**: The Swap event has `int128 amount0, int128 amount1`. Verify the decoder produces these as values compatible with `extract_int256()` (the decoder likely widens them to I256).
 
 ---
 
