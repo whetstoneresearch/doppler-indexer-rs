@@ -11,7 +11,10 @@ pub mod scheduled_multicurve;
 pub mod v3;
 pub mod v4;
 
+use std::sync::Arc;
+
 use super::registry::TransformationRegistry;
+use super::util::pool_metadata::PoolMetadataCache;
 
 /// Register all event handlers with the registry.
 pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
@@ -21,8 +24,11 @@ pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     scheduled_multicurve::create::register_handlers(registry);
     decay_multicurve::create::register_handlers(registry);
     dhook::create::register_handlers(registry);
-    v3::create::register_handlers(registry);
 
-    // Metrics handlers
-    v3::metrics::register_handlers(registry, chain_id);
+    // V3 Create and Metrics handlers share a PoolMetadataCache so that
+    // pools created in the same range/block are visible to swap handlers
+    // in-memory before the Create handler's DB transaction commits.
+    let v3_cache = Arc::new(PoolMetadataCache::new());
+    v3::create::register_handlers(registry, v3_cache.clone());
+    v3::metrics::register_handlers(registry, chain_id, v3_cache);
 }

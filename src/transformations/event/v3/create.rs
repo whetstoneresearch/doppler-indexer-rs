@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use alloy_primitives::{Address, B256, U256};
@@ -12,10 +14,13 @@ use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::metadata::get_metadata;
 use crate::transformations::util::migration::resolve_migration_type;
+use crate::transformations::util::pool_metadata::{quote_token_decimals, PoolMetadata, PoolMetadataCache};
 
 use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
-pub struct V3CreateHandler;
+pub struct V3CreateHandler {
+    pub(crate) metadata_cache: Arc<PoolMetadataCache>,
+}
 
 #[async_trait]
 impl TransformationHandler for V3CreateHandler {
@@ -146,6 +151,24 @@ impl TransformationHandler for V3CreateHandler {
                 },
                 ctx,
             ));
+
+            // Populate shared metadata cache in-memory so that swap metrics
+            // handlers in the same range/block can find this pool without
+            // waiting for the DB transaction to commit.
+            let quote_decimals =
+                quote_token_decimals(&numeraire, &ctx.contracts).unwrap_or(18);
+            self.metadata_cache.insert_if_absent(
+                pool_or_hook.to_vec(),
+                PoolMetadata {
+                    pool_id: pool_or_hook.to_vec(),
+                    base_token: asset,
+                    quote_token: numeraire,
+                    is_token_0,
+                    pool_type: "v3".to_string(),
+                    base_decimals: 18,
+                    quote_decimals,
+                },
+            );
         }
 
         Ok(ops)
@@ -174,7 +197,9 @@ impl EventHandler for V3CreateHandler {
     }
 }
 
-pub struct LockableV3CreateHandler;
+pub struct LockableV3CreateHandler {
+    pub(crate) metadata_cache: Arc<PoolMetadataCache>,
+}
 
 #[async_trait]
 impl TransformationHandler for LockableV3CreateHandler {
@@ -305,6 +330,21 @@ impl TransformationHandler for LockableV3CreateHandler {
                 },
                 ctx,
             ));
+
+            let quote_decimals =
+                quote_token_decimals(&numeraire, &ctx.contracts).unwrap_or(18);
+            self.metadata_cache.insert_if_absent(
+                pool_or_hook.to_vec(),
+                PoolMetadata {
+                    pool_id: pool_or_hook.to_vec(),
+                    base_token: asset,
+                    quote_token: numeraire,
+                    is_token_0,
+                    pool_type: "lockable_v3".to_string(),
+                    base_decimals: 18,
+                    quote_decimals,
+                },
+            );
         }
 
         Ok(ops)
@@ -333,7 +373,11 @@ impl EventHandler for LockableV3CreateHandler {
     }
 }
 
-pub fn register_handlers(registry: &mut TransformationRegistry) {
-    registry.register_event_handler(V3CreateHandler);
-    registry.register_event_handler(LockableV3CreateHandler);
+pub fn register_handlers(registry: &mut TransformationRegistry, metadata_cache: Arc<PoolMetadataCache>) {
+    registry.register_event_handler(V3CreateHandler {
+        metadata_cache: metadata_cache.clone(),
+    });
+    registry.register_event_handler(LockableV3CreateHandler {
+        metadata_cache,
+    });
 }

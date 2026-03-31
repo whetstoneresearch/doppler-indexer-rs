@@ -369,9 +369,11 @@ impl EventHandler for LockableV3LiquidityMetricsHandler {
 
 // --- Registration ---
 
-pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
-    let cache = Arc::new(PoolMetadataCache::new());
-
+pub fn register_handlers(
+    registry: &mut TransformationRegistry,
+    chain_id: u64,
+    cache: Arc<PoolMetadataCache>,
+) {
     // Swap metrics: pool_state + pool_snapshots (single-trigger, captures snapshots)
     registry.register_event_handler(V3SwapMetricsHandler {
         metadata_cache: cache.clone(),

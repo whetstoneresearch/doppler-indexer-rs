@@ -154,6 +154,15 @@ impl PoolMetadataCache {
         self.inner.read().unwrap().get(pool_id).cloned()
     }
 
+    /// Insert metadata for a pool if not already cached.
+    /// Used by Create handlers to populate the cache in-memory before their
+    /// DB transaction commits, so Swap handlers in the same range/block can
+    /// find newly created pools without a DB round-trip.
+    pub fn insert_if_absent(&self, pool_id: Vec<u8>, meta: PoolMetadata) {
+        let mut inner = self.inner.write().unwrap();
+        inner.entry(pool_id).or_insert(meta);
+    }
+
     /// Re-query the `pools` table and insert any pools not already cached.
     /// Returns the number of newly discovered pools.
     pub async fn refresh(
