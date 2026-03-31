@@ -51,7 +51,7 @@ pub struct PoolData {
     pub migration_type: String,
     pub lock_duration: Option<u32>,
     pub beneficiaries: Option<BeneficiariesData>,
-    pub pool_key: PoolKey,
+    pub pool_key: Option<PoolKey>,
     pub starting_time: u64,
     pub ending_time: u64,
 }
@@ -120,7 +120,10 @@ pub fn insert_pool(data: &PoolData, ctx: &TransformationContext) -> DbOperation 
                 Some(beneficiaries_data) => DbValue::jsonb(beneficiaries_data),
                 None => DbValue::Null,
             },
-            DbValue::jsonb(&data.pool_key),
+            match &data.pool_key {
+                Some(pk) => DbValue::jsonb(pk),
+                None => DbValue::Null,
+            },
             DbValue::Timestamp(data.starting_time as i64),
             DbValue::Timestamp(data.ending_time as i64),
         ],
