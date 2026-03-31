@@ -139,9 +139,12 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
     }
 }
 
-/// Build a liquidity_deltas insert (append-only).
+/// Build a liquidity_deltas upsert (append-only, idempotent on re-runs).
+///
+/// Uses Upsert with empty update_columns to generate ON CONFLICT DO NOTHING.
+/// This prevents duplicate key errors if a handler re-processes the same block range.
 pub fn insert_liquidity_delta(data: &LiquidityDeltaData) -> DbOperation {
-    DbOperation::Insert {
+    DbOperation::Upsert {
         table: "liquidity_deltas".to_string(),
         columns: vec![
             "chain_id".into(),
@@ -161,5 +164,12 @@ pub fn insert_liquidity_delta(data: &LiquidityDeltaData) -> DbOperation {
             DbValue::Int32(data.tick_upper),
             DbValue::Numeric(data.liquidity_delta.clone()),
         ],
+        conflict_columns: vec![
+            "chain_id".into(),
+            "pool_id".into(),
+            "block_number".into(),
+            "log_index".into(),
+        ],
+        update_columns: vec![],
     }
 }

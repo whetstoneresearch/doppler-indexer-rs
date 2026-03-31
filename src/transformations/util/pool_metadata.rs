@@ -38,10 +38,12 @@ impl PoolMetadataCache {
     }
 
     /// Load all pool metadata from the `pools` table for a given chain.
+    ///
+    /// Quote token decimals default to 18. Call `resolve_quote_decimals()`
+    /// with the contracts config to set correct values.
     pub async fn load_from_db(
         db_pool: &DbPool,
         chain_id: u64,
-        contracts: &Contracts,
     ) -> Result<Self, TransformationError> {
         let client = db_pool
             .inner()
@@ -76,10 +78,6 @@ impl PoolMetadataCache {
             base_token.copy_from_slice(&base_token_bytes);
             quote_token.copy_from_slice(&quote_token_bytes);
 
-            let base_decimals = 18; // all launched tokens are 18 decimals
-            let quote_decimals =
-                quote_token_decimals(&quote_token, contracts).unwrap_or(18);
-
             map.insert(
                 pool_id.clone(),
                 PoolMetadata {
@@ -88,8 +86,8 @@ impl PoolMetadataCache {
                     quote_token,
                     is_token_0,
                     pool_type,
-                    base_decimals,
-                    quote_decimals,
+                    base_decimals: 18,
+                    quote_decimals: 18,
                 },
             );
         }
@@ -103,6 +101,34 @@ impl PoolMetadataCache {
         Ok(Self {
             inner: RwLock::new(map),
         })
+    }
+
+    /// Load metadata from DB into an existing (shared) cache instance.
+    /// Skips loading if the cache already has entries.
+    pub async fn load_into(
+        &self,
+        db_pool: &DbPool,
+        chain_id: u64,
+    ) -> Result<(), TransformationError> {
+        if !self.is_empty() {
+            return Ok(());
+        }
+        let loaded = Self::load_from_db(db_pool, chain_id).await?;
+        let entries = loaded.inner.into_inner().unwrap();
+        let mut inner = self.inner.write().unwrap();
+        inner.extend(entries);
+        Ok(())
+    }
+
+    /// Update quote token decimals for all cached entries using contracts config.
+    /// Called on first handle() when the TransformationContext is available.
+    pub fn resolve_quote_decimals(&self, contracts: &Contracts) {
+        let mut inner = self.inner.write().unwrap();
+        for meta in inner.values_mut() {
+            if let Some(decimals) = quote_token_decimals(&meta.quote_token, contracts) {
+                meta.quote_decimals = decimals;
+            }
+        }
     }
 
     /// Look up metadata by pool_id.

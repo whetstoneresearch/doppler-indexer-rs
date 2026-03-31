@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS liquidity_deltas (
     liquidity_delta NUMERIC NOT NULL,
     source          VARCHAR(255) NOT NULL,
     source_version  INT NOT NULL,
-    PRIMARY KEY (chain_id, pool_id, block_number, log_index)
+    UNIQUE (chain_id, pool_id, block_number, log_index, source, source_version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_liq_deltas_pool ON liquidity_deltas (pool_id);

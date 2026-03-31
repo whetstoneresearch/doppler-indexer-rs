@@ -22,4 +22,7 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
     decay_multicurve::create::register_handlers(registry);
     dhook::create::register_handlers(registry);
     v3::create::register_handlers(registry);
+
+    // Metrics handlers
+    v3::metrics::register_handlers(registry);
 }
