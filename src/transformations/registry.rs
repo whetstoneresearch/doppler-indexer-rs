@@ -317,6 +317,7 @@ mod tests {
         name: &'static str,
         triggers: Vec<EventTrigger>,
         call_deps: Vec<(String, String)>,
+        handler_deps: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -341,6 +342,10 @@ mod tests {
         fn call_dependencies(&self) -> Vec<(String, String)> {
             self.call_deps.clone()
         }
+
+        fn handler_dependencies(&self) -> Vec<&'static str> {
+            self.handler_deps.clone()
+        }
     }
 
     fn empty_contracts() -> Contracts {
@@ -349,6 +354,15 @@ mod tests {
 
     fn empty_factory_collections() -> FactoryCollections {
         FactoryCollections::new()
+    }
+
+    fn mock_handler(name: &'static str, handler_deps: Vec<&'static str>) -> MockEventHandler {
+        MockEventHandler {
+            name,
+            triggers: vec![EventTrigger::new("Test", format!("{}()", name))],
+            call_deps: vec![],
+            handler_deps,
+        }
     }
 
     #[test]
@@ -371,6 +385,7 @@ mod tests {
                 "Transfer(address,address,uint256)",
             )],
             call_deps: vec![],
+            handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -392,6 +407,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "getState".to_string())],
+            handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -426,6 +442,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
+            handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -448,6 +465,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
+            handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -486,6 +504,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "once".to_string())],
+            handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -510,5 +529,108 @@ mod tests {
 
         // Should not panic — once dependency is satisfied
         validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    fn handler_deps_empty_registry_passes() {
+        let mut registry = TransformationRegistry::new();
+        // Should not panic — no handlers, no deps
+        registry.validate_and_sort_handler_dependencies();
+        assert!(registry.handler_topological_order().is_empty());
+    }
+
+    #[test]
+    fn handler_deps_no_deps_passes() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec![]));
+        registry.validate_and_sort_handler_dependencies();
+        assert_eq!(registry.handler_topological_order().len(), 2);
+    }
+
+    #[test]
+    fn handler_deps_linear_chain() {
+        let mut registry = TransformationRegistry::new();
+        // C depends on B, B depends on A
+        registry.register_event_handler(mock_handler("C", vec!["B"]));
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+        let order = registry.handler_topological_order();
+        let pos_a = order.iter().position(|n| n == "A").unwrap();
+        let pos_b = order.iter().position(|n| n == "B").unwrap();
+        let pos_c = order.iter().position(|n| n == "C").unwrap();
+        assert!(pos_a < pos_b, "A must come before B");
+        assert!(pos_b < pos_c, "B must come before C");
+    }
+
+    #[test]
+    fn handler_deps_diamond() {
+        let mut registry = TransformationRegistry::new();
+        // Diamond: A -> B, A -> C, B -> D, C -> D
+        registry.register_event_handler(mock_handler("D", vec!["B", "C"]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.register_event_handler(mock_handler("C", vec!["A"]));
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.validate_and_sort_handler_dependencies();
+        let order = registry.handler_topological_order();
+        let pos_a = order.iter().position(|n| n == "A").unwrap();
+        let pos_b = order.iter().position(|n| n == "B").unwrap();
+        let pos_c = order.iter().position(|n| n == "C").unwrap();
+        let pos_d = order.iter().position(|n| n == "D").unwrap();
+        assert!(pos_a < pos_b, "A must come before B");
+        assert!(pos_a < pos_c, "A must come before C");
+        assert!(pos_b < pos_d, "B must come before D");
+        assert!(pos_c < pos_d, "C must come before D");
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn handler_deps_two_node_cycle_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["B"]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn handler_deps_three_node_cycle_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["C"]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.register_event_handler(mock_handler("C", vec!["B"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn handler_deps_self_cycle_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    #[should_panic(expected = "missing handler dependency")]
+    fn handler_deps_missing_dep_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["NonExistent"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    fn handler_deps_deterministic_ordering() {
+        // Run twice to verify determinism
+        for _ in 0..2 {
+            let mut registry = TransformationRegistry::new();
+            // All independent — should sort alphabetically
+            registry.register_event_handler(mock_handler("C", vec![]));
+            registry.register_event_handler(mock_handler("A", vec![]));
+            registry.register_event_handler(mock_handler("B", vec![]));
+            registry.validate_and_sort_handler_dependencies();
+            let order = registry.handler_topological_order();
+            assert_eq!(order, &["A", "B", "C"]);
+        }
     }
 }
