@@ -7,8 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinSet;
+use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
 use super::engine::HandlerKind;
@@ -360,14 +359,23 @@ impl RetryProcessor {
     ) -> Result<HashSet<String>, TransformationError> {
         let range_start = block_number;
         let range_end = block_number + 1;
-        let tx_addresses = Arc::new(read_live_receipt_addresses(&self.chain_name, block_number)?);
-        let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
+        let tx_addresses = read_live_receipt_addresses(&self.chain_name, block_number)?;
         let mut blocked_handlers = HashSet::new();
         let mut attempted_keys = HashSet::new();
+        let mut succeeded_keys = HashSet::new();
 
-        // Build a uniform list of retry handler descriptors from both kinds.
-        let retry_handlers = self.build_retry_handler_list();
+        // Build a uniform list of retry handler descriptors, sorted by
+        // topological order so dependencies execute before dependents.
+        let mut retry_handlers = self.build_retry_handler_list();
+        let topo_order = self.registry.handler_topological_order();
+        let position: HashMap<&str, usize> = topo_order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        retry_handlers.sort_by_key(|rh| {
+            position.get(rh.handler.name()).copied().unwrap_or(usize::MAX)
+        });
 
         for rh in &retry_handlers {
             let handler_key = rh.handler.handler_key();
@@ -435,64 +443,44 @@ impl RetryProcessor {
 
             attempted_keys.insert(handler_key.clone());
 
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let db_pool = self.db_pool.clone();
-            let chain_name = self.chain_name.clone();
-            let chain_id = self.chain_id;
-            let historical = self.historical_reader.clone();
-            let rpc = self.rpc_client.clone();
-            let contracts = self.contracts.clone();
-            let handler = rh.handler.clone();
-            let handler_name = handler.name();
-            let handler_version = handler.version();
+            let handler_name = rh.handler.name();
+            let handler_version = rh.handler.version();
 
             // Event handlers get tx_addresses; call handlers pass empty map
             let task_tx_addresses = match rh.kind {
-                HandlerKind::Event => (*tx_addresses).clone(),
+                HandlerKind::Event => tx_addresses.clone(),
                 HandlerKind::Call => HashMap::new(),
             };
 
-            join_set.spawn(async move {
-                let _permit = permit;
-                let live_storage = LiveStorage::new(&chain_name);
-                let ctx = TransformationContext::new(
-                    chain_name,
-                    chain_id,
-                    range_start,
-                    range_end,
-                    Arc::new(handler_events),
-                    Arc::new(handler_calls),
-                    task_tx_addresses,
-                    historical,
-                    rpc,
-                    contracts,
-                );
+            let live_storage = LiveStorage::new(&self.chain_name);
+            let ctx = TransformationContext::new(
+                self.chain_name.clone(),
+                self.chain_id,
+                range_start,
+                range_end,
+                Arc::new(handler_events),
+                Arc::new(handler_calls),
+                task_tx_addresses,
+                self.historical_reader.clone(),
+                self.rpc_client.clone(),
+                self.contracts.clone(),
+            );
 
-                match handler.handle(&ctx).await {
-                    Ok(ops) => {
-                        if !ops.is_empty() {
-                            let ops = inject_source_version(ops, handler_name, handler_version);
-                            execute_with_snapshot_capture(
-                                ops,
-                                &db_pool,
-                                Some(&live_storage),
-                                range_start,
-                                handler_name,
-                                handler_version,
-                            )
-                            .await?;
-                        }
-                        Ok(Some(handler_key))
+            match rh.handler.handle(&ctx).await {
+                Ok(ops) => {
+                    if !ops.is_empty() {
+                        let ops = inject_source_version(ops, handler_name, handler_version);
+                        execute_with_snapshot_capture(
+                            ops,
+                            &self.db_pool,
+                            Some(&live_storage),
+                            range_start,
+                            handler_name,
+                            handler_version,
+                        )
+                        .await?;
                     }
-                    Err(e) => Err(e),
-                }
-            });
-        }
 
-        let mut succeeded_keys = HashSet::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(Some(handler_key))) => {
                     succeeded_keys.insert(handler_key.clone());
 
                     if let Err(e) = self
@@ -540,17 +528,10 @@ impl RetryProcessor {
                         }
                     }
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        "Handler failed during live retry for block {}: {}",
-                        block_number,
-                        e
-                    );
-                }
                 Err(e) => {
                     tracing::error!(
-                        "Handler task panicked during live retry for block {}: {}",
+                        "Handler {} failed during live retry for block {}: {}",
+                        handler_key,
                         block_number,
                         e
                     );
