@@ -1168,12 +1168,32 @@ impl TransformationEngine {
                 }
 
                 Some(msg) = complete_rx.recv() => {
+                    let range_key = (msg.range_start, msg.range_end);
+
+                    // When all log events have been sent, mark untriggered dependency
+                    // handlers as completed-no-op so dependent handlers can proceed.
+                    if msg.kind == RangeCompleteKind::Logs {
+                        let dep_names = self.registry.dependency_handler_names();
+                        if !dep_names.is_empty() {
+                            let mut state = self.live_state.lock().await;
+                            let completed = state.completed_handlers
+                                .entry(range_key)
+                                .or_default();
+                            for name in dep_names {
+                                if !completed.contains(name) {
+                                    tracing::debug!(
+                                        "Marking handler {} as completed-no-op for block {} (not triggered)",
+                                        name, range_key.0
+                                    );
+                                    completed.insert(name.clone());
+                                }
+                            }
+                        }
+                        self.try_process_pending_events(range_key).await?;
+                    }
+
                     self.finalizer
-                        .process_range_complete(
-                            (msg.range_start, msg.range_end),
-                            msg.kind,
-                            &self.live_state,
-                        )
+                        .process_range_complete(range_key, msg.kind, &self.live_state)
                         .await?;
                 }
 

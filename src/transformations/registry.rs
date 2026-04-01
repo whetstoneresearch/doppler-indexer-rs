@@ -61,6 +61,8 @@ pub struct TransformationRegistry {
     handler_dependency_graph: HashMap<String, Vec<String>>,
     /// Topological ordering of handler names (computed after all handlers registered)
     handler_topological_order: Vec<String>,
+    /// Set of all handler names that appear as a dependency of another handler
+    dependency_handler_names: HashSet<String>,
 }
 
 impl TransformationRegistry {
@@ -72,6 +74,7 @@ impl TransformationRegistry {
             all_handlers: Vec::new(),
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
+            dependency_handler_names: HashSet::new(),
         }
     }
 
@@ -298,6 +301,17 @@ impl TransformationRegistry {
         }
 
         self.handler_topological_order = order;
+        self.dependency_handler_names = self
+            .handler_dependency_graph
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+    }
+
+    /// Get the set of all handler names that are declared as a dependency by another handler.
+    pub fn dependency_handler_names(&self) -> &HashSet<String> {
+        &self.dependency_handler_names
     }
 
     /// Get all unique call handlers with their triggers grouped.
