@@ -136,6 +136,12 @@ pub trait EventHandler: TransformationHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![]
     }
+
+    /// Handler names (via `TransformationHandler::name()`) that must complete
+    /// before this handler can execute for a given block range.
+    fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec![]
+    }
 }
 
 /// Marker trait for handlers that respond to eth_call results.
