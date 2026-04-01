@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use super::context::{DecodedCall, DecodedEvent};
 use super::engine::RangeCompleteKind;
 
-/// Buffered event data waiting for call dependencies.
+/// Buffered event data waiting for call dependencies and/or handler dependencies.
 #[derive(Debug)]
 pub(crate) struct PendingEventData {
     pub range_start: u64,
@@ -26,7 +26,7 @@ pub(crate) struct PendingEventData {
 /// Default timeout for stuck pending events (5 minutes).
 pub(crate) const PENDING_EVENT_TIMEOUT_SECS: u64 = 300;
 
-/// Live processing state for buffering events with call dependencies.
+/// Live processing state for buffering events with call and handler dependencies.
 #[derive(Default)]
 pub(crate) struct LiveProcessingState {
     /// Track which (source, function) calls have arrived for which ranges.
@@ -63,6 +63,7 @@ impl LiveProcessingState {
                 tracing::debug!("Removed calls buffer for orphaned range {:?}", range_key);
             }
             self.completion.remove(&range_key);
+            self.completed_handlers.remove(&range_key);
 
             // Remove from finalized_ranges to allow re-finalization if block is re-processed
             self.finalized_ranges.remove(&range_key);
