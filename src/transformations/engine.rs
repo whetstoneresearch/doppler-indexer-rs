@@ -1294,6 +1294,7 @@ impl TransformationEngine {
                             event_name: msg.event_name.clone(),
                             events: filtered_events.clone(),
                             required_calls: call_deps.clone(),
+                            required_handlers: vec![],
                         };
                         let timestamp_key = (msg.range_start, msg.range_end, handler_key.clone());
                         state

@@ -19,6 +19,8 @@ pub(crate) struct PendingEventData {
     pub events: Vec<DecodedEvent>,
     /// Call dependencies needed: (source, function_name)
     pub required_calls: Vec<(String, String)>,
+    /// Handler dependencies needed: handler name() strings
+    pub required_handlers: Vec<String>,
 }
 
 /// Default timeout for stuck pending events (5 minutes).
@@ -42,6 +44,9 @@ pub(crate) struct LiveProcessingState {
     pub pending_event_timestamps: HashMap<(u64, u64, String), Instant>,
     /// Ranges that have been finalized (to prevent double finalization).
     pub finalized_ranges: HashSet<(u64, u64)>,
+    /// Handlers that have completed for a given range.
+    /// Key: (range_start, range_end), Value: set of handler names (from name(), not handler_key())
+    pub completed_handlers: HashMap<(u64, u64), HashSet<String>>,
 }
 
 impl LiveProcessingState {
@@ -61,6 +66,7 @@ impl LiveProcessingState {
 
             // Remove from finalized_ranges to allow re-finalization if block is re-processed
             self.finalized_ranges.remove(&range_key);
+            self.completed_handlers.remove(&range_key);
 
             // Remove from received_calls
             for ranges in self.received_calls.values_mut() {
@@ -100,6 +106,7 @@ impl LiveProcessingState {
         self.calls_buffer.remove(&range_key);
         self.completion.remove(&range_key);
         self.finalized_ranges.remove(&range_key);
+        self.completed_handlers.remove(&range_key);
         self.pending_event_timestamps
             .retain(|(rs, re, _), _| (*rs, *re) != range_key);
         for ranges in self.received_calls.values_mut() {
@@ -133,7 +140,7 @@ impl LiveProcessingState {
                     if let Some(&first_seen) = self.pending_event_timestamps.get(&timestamp_key) {
                         if now.duration_since(first_seen) >= timeout {
                             tracing::error!(
-                                "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for={:?}. \
+                                "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
                                  Force-finalizing range to unblock progress.",
                                 now.duration_since(first_seen),
                                 handler_key,
@@ -141,7 +148,8 @@ impl LiveProcessingState {
                                 pending.range_end,
                                 pending.source_name,
                                 pending.event_name,
-                                pending.required_calls
+                                pending.required_calls,
+                                pending.required_handlers
                             );
                             timed_out.push(handler_key.clone());
                         }
@@ -172,14 +180,15 @@ impl LiveProcessingState {
                 for pending in pending_list {
                     if (pending.range_start, pending.range_end) == range_key {
                         tracing::warn!(
-                            "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for={:?}. \
-                             This may indicate missing eth_call configuration or RPC failure.",
+                            "Stuck pending event detected: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
+                             This may indicate missing eth_call configuration, handler dependency issue, or RPC failure.",
                             handler_key,
                             pending.range_start,
                             pending.range_end,
                             pending.source_name,
                             pending.event_name,
-                            pending.required_calls
+                            pending.required_calls,
+                            pending.required_handlers
                         );
                     }
                 }
@@ -208,6 +217,7 @@ impl LiveProcessingState {
     pub fn cleanup_after_finalize(&mut self, range_key: (u64, u64)) {
         self.calls_buffer.remove(&range_key);
         self.completion.remove(&range_key);
+        self.completed_handlers.remove(&range_key);
         for ranges in self.received_calls.values_mut() {
             ranges.remove(&range_key);
         }
