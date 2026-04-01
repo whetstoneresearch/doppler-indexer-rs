@@ -397,30 +397,11 @@ impl RetryProcessor {
                 continue;
             }
 
-            // Check handler dependencies: a dep blocks only if it is itself
-            // being retried (in missing_names) and hasn't succeeded yet.
-            // Deps not in missing_names already completed in a prior run.
-            if !rh.handler_deps.is_empty() {
-                let unmet: Vec<&str> = rh
-                    .handler_deps
-                    .iter()
-                    .filter(|dep| missing_names.contains(*dep) && !succeeded_names.contains(*dep))
-                    .map(|s| s.as_str())
-                    .collect();
-                if !unmet.is_empty() {
-                    tracing::warn!(
-                        "Skipping live retry for handler {} on block {}: handler deps not met {:?}",
-                        handler_key,
-                        block_number,
-                        unmet
-                    );
-                    blocked_handlers.insert(handler_key);
-                    continue;
-                }
-            }
-
-            // Filter primary data by trigger match
-            let (handler_events, handler_calls) = match rh.kind {
+            // Filter primary data by trigger match BEFORE checking handler
+            // deps. If the handler has no matching events/calls, it's a no-op
+            // regardless of whether its deps are met — blocking it would
+            // prevent finalization for no reason.
+            let trigger_data = match rh.kind {
                 HandlerKind::Event => {
                     let handler_events: Vec<DecodedEvent> = events
                         .iter()
@@ -453,29 +434,7 @@ impl RetryProcessor {
                         continue;
                     }
 
-                    // Check call dependencies
-                    let missing_deps = missing_retry_call_dependencies(&rh.call_deps, &calls);
-                    if !missing_deps.is_empty() {
-                        tracing::warn!(
-                            "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
-                            handler_key,
-                            block_number,
-                            missing_deps
-                        );
-                        blocked_handlers.insert(handler_key);
-                        continue;
-                    }
-
-                    let handler_calls: Vec<DecodedCall> = calls
-                        .iter()
-                        .filter(|call| {
-                            rh.call_deps
-                                .contains(&(call.source_name.clone(), call.function_name.clone()))
-                        })
-                        .cloned()
-                        .collect();
-
-                    (handler_events, handler_calls)
+                    Some((handler_events, Vec::new()))
                 }
                 HandlerKind::Call => {
                     let handler_calls: Vec<DecodedCall> = calls
@@ -509,9 +468,60 @@ impl RetryProcessor {
                         continue;
                     }
 
-                    (Vec::new(), handler_calls)
+                    Some((Vec::new(), handler_calls))
                 }
             };
+
+            // Unwrap trigger data (both no-match branches continue above)
+            let (handler_events, mut handler_calls) = trigger_data.unwrap();
+
+            // Check handler dependencies: a dep blocks only if it is itself
+            // being retried (in missing_names) and hasn't succeeded yet.
+            // Deps not in missing_names already completed in a prior run.
+            if !rh.handler_deps.is_empty() {
+                let unmet: Vec<&str> = rh
+                    .handler_deps
+                    .iter()
+                    .filter(|dep| missing_names.contains(*dep) && !succeeded_names.contains(*dep))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !unmet.is_empty() {
+                    tracing::warn!(
+                        "Skipping live retry for handler {} on block {}: handler deps not met {:?}",
+                        handler_key,
+                        block_number,
+                        unmet
+                    );
+                    blocked_handlers.insert(handler_key);
+                    continue;
+                }
+            }
+
+            // For event handlers: check call dependencies and filter calls
+            if rh.kind == HandlerKind::Event {
+                let missing_deps = missing_retry_call_dependencies(&rh.call_deps, &calls);
+                if !missing_deps.is_empty() {
+                    tracing::warn!(
+                        "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
+                        handler_key,
+                        block_number,
+                        missing_deps
+                    );
+                    blocked_handlers.insert(handler_key);
+                    continue;
+                }
+
+                handler_calls = calls
+                    .iter()
+                    .filter(|call| {
+                        rh.call_deps
+                            .contains(&(call.source_name.clone(), call.function_name.clone()))
+                    })
+                    .cloned()
+                    .collect();
+            }
+
+            // handler_events and handler_calls are now ready for execution
 
             attempted_keys.insert(handler_key.clone());
 

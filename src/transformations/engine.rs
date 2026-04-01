@@ -1208,7 +1208,7 @@ impl TransformationEngine {
                                     && !failed_names.contains(name)
                                 {
                                     tracing::debug!(
-                                        "Marking handler {} as completed-no-op for block {} (not triggered)",
+                                        "Marking dep handler {} as completed for block {} (all batches dispatched)",
                                         name, range_key.0
                                     );
                                     completed.insert(name.clone());
@@ -1430,15 +1430,23 @@ impl TransformationEngine {
         )
         .await;
 
-        // Record handler completions and failures for dependency tracking
+        // Record handler completions and failures for dependency tracking.
+        // Dependency handlers are NOT marked as completed here because this
+        // method runs per (source, event_name) batch — a multi-trigger dep
+        // handler would prematurely unblock dependents after its first batch.
+        // Dep handlers are completed at RangeCompleteKind::Logs time when all
+        // event batches for the block have been dispatched.
         {
+            let dep_names = self.registry.dependency_handler_names();
             let mut state = self.live_state.lock().await;
             for outcome in &outcomes {
-                state
-                    .completed_handlers
-                    .entry(range_key)
-                    .or_default()
-                    .insert(outcome.handler_name.clone());
+                if !dep_names.contains(&outcome.handler_name) {
+                    state
+                        .completed_handlers
+                        .entry(range_key)
+                        .or_default()
+                        .insert(outcome.handler_name.clone());
+                }
             }
             for key in submitted_keys.difference(&succeeded_keys) {
                 if let Some(name) = self.registry.handler_name_for_key(key) {
@@ -1451,7 +1459,8 @@ impl TransformationEngine {
             }
         }
 
-        // Try to unblock handlers waiting on these completions
+        // Try to unblock handlers waiting on call deps (handler dep
+        // unblocking for dep handlers is deferred until Logs fires).
         self.try_process_pending_events(range_key).await?;
 
         Ok(())
@@ -1763,15 +1772,25 @@ impl TransformationEngine {
             )
             .await;
 
-            // Record handler completions and failures for cascading
+            // Record handler completions and failures for cascading.
+            // Dep handlers are only completed post-Logs (all batches dispatched);
+            // pre-Logs they are deferred to avoid premature dependent unblocking.
             {
+                let dep_names = self.registry.dependency_handler_names();
                 let mut state = self.live_state.lock().await;
+                let logs_complete = state
+                    .completion
+                    .get(&range_key)
+                    .map(|c| c.logs_complete)
+                    .unwrap_or(false);
                 for outcome in &outcomes {
-                    state
-                        .completed_handlers
-                        .entry(range_key)
-                        .or_default()
-                        .insert(outcome.handler_name.clone());
+                    if logs_complete || !dep_names.contains(&outcome.handler_name) {
+                        state
+                            .completed_handlers
+                            .entry(range_key)
+                            .or_default()
+                            .insert(outcome.handler_name.clone());
+                    }
                 }
                 for key in submitted_keys.difference(&succeeded_keys) {
                     if let Some(name) = self.registry.handler_name_for_key(key) {
