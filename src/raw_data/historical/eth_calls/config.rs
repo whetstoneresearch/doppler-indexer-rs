@@ -1,4 +1,4 @@
-//! Config builders for eth_call collection: build_call_configs, build_token_call_configs,
+//! Config builders for eth_call collection: build_call_configs,
 //! build_once_call_configs, build_factory_once_call_configs, compute_function_selector.
 
 use std::collections::HashMap;
@@ -8,13 +8,11 @@ use alloy::primitives::Bytes;
 
 use super::types::{
     CallConfig, EncodedParam, EthCallCollectionError, OnceCallConfig, ParamCombinations,
-    TokenCallConfig,
 };
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{
     encode_call_with_params, EthCallConfig, ParamConfig, ParamError,
 };
-use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 
 pub(crate) fn generate_param_combinations(
     params: &[ParamConfig],
@@ -128,100 +126,6 @@ pub fn build_call_configs(
                             start_block,
                         });
                     }
-                }
-            }
-        }
-    }
-
-    Ok(configs)
-}
-
-/// Build call configs from token pool configurations
-pub(crate) fn build_token_call_configs(
-    tokens: &Tokens,
-    contracts: &Contracts,
-) -> Result<Vec<TokenCallConfig>, EthCallCollectionError> {
-    let mut configs = Vec::new();
-
-    // Look up UniswapV4StateView address from contracts config
-    let state_view_address = contracts
-        .get("UniswapV4StateView")
-        .and_then(|c| match &c.address {
-            AddressOrAddresses::Single(addr) => Some(*addr),
-            AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
-        });
-
-    for (token_name, token_config) in tokens {
-        if let Some(pool) = &token_config.pool {
-            if let Some(calls) = &pool.calls {
-                for call in calls {
-                    // Skip once and on_events calls for now
-                    if call.frequency.is_once() || call.frequency.is_on_events() {
-                        continue;
-                    }
-
-                    let selector = compute_function_selector(&call.function);
-                    let function_name = call
-                        .function
-                        .split('(')
-                        .next()
-                        .unwrap_or(&call.function)
-                        .to_string();
-
-                    let (target_address, encoded_calldata) = match pool.pool_type {
-                        PoolType::V2 | PoolType::V3 => {
-                            // Target the pool address directly
-                            let addr = match &pool.address {
-                                AddressOrPoolId::Address(a) => *a,
-                                AddressOrPoolId::PoolId(_) => {
-                                    tracing::warn!(
-                                        "V2/V3 pool {} has PoolId instead of Address, skipping",
-                                        token_name
-                                    );
-                                    continue;
-                                }
-                            };
-                            let calldata = Bytes::copy_from_slice(&selector);
-                            (addr, calldata)
-                        }
-                        PoolType::V4 => {
-                            // Target StateView with pool ID as parameter
-                            let state_view = match state_view_address {
-                                Some(addr) => addr,
-                                None => {
-                                    tracing::warn!(
-                                        "No UniswapV4StateView configured, skipping V4 pool calls for {}",
-                                        token_name
-                                    );
-                                    continue;
-                                }
-                            };
-                            let pool_id_bytes = match &pool.address {
-                                AddressOrPoolId::PoolId(id) => *id,
-                                AddressOrPoolId::Address(_) => {
-                                    tracing::warn!(
-                                        "V4 pool {} has Address instead of PoolId, skipping",
-                                        token_name
-                                    );
-                                    continue;
-                                }
-                            };
-                            // Encode call: selector + abi-encoded pool_id (bytes32)
-                            let pool_id_value = DynSolValue::FixedBytes(pool_id_bytes, 32);
-                            let calldata = encode_call_with_params(selector, &[pool_id_value]);
-                            (state_view, calldata)
-                        }
-                    };
-
-                    configs.push(TokenCallConfig {
-                        token_name: token_name.clone(),
-                        pool_type: pool.pool_type.clone(),
-                        target_address,
-                        function_name,
-                        encoded_calldata,
-                        frequency: call.frequency.clone(),
-                        output_type: call.output_type.clone(),
-                    });
                 }
             }
         }

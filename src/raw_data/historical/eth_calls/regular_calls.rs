@@ -15,14 +15,17 @@ use super::multicall::{
     execute_multicalls_generic, BlockMulticall, FactoryCallMeta, FactoryGroupInfo,
     MulticallSlotGeneric, RegularCallMeta, RegularGroupInfo,
 };
-use super::postprocessing::{finalize_regular_results, FinalizeRegularParams};
+use super::postprocessing::{
+    finalize_regular_results, finalize_regular_results_deferred, FinalizeRegularParams,
+};
 use super::types::{
-    BlockInfo, BlockRange, CallConfig, CallResult, EthCallCollectionError, EthCallContext,
-    EncodedParam, FrequencyState,
+    AbortOnDropHandles, BlockInfo, BlockRange, CallConfig, CallResult, EncodedParam,
+    EthCallCollectionError, EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_factory_range(
     range: &BlockRange,
     blocks: &[BlockInfo],
@@ -31,6 +34,7 @@ pub(crate) async fn process_factory_range(
     factory_call_configs: &HashMap<String, Vec<EthCallConfig>>,
     max_params: usize,
     frequency_state: &mut FrequencyState,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for addrs in factory_data.addresses_by_block.values() {
@@ -161,57 +165,55 @@ pub(crate) async fn process_factory_range(
                 }
             }
 
-            for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
-                let calls: Vec<(TransactionRequest, BlockId)> = chunk
-                    .iter()
-                    .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
-                    .collect();
+            let calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+                .iter()
+                .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
+                .collect();
 
-                #[cfg(feature = "bench")]
-                let rpc_start = Instant::now();
-                let results = ctx.client.call_batch(calls).await?;
-                #[cfg(feature = "bench")]
-                {
-                    rpc_time += rpc_start.elapsed();
-                }
+            #[cfg(feature = "bench")]
+            let rpc_start = Instant::now();
+            let results = ctx.client.call_batch(calls).await?;
+            #[cfg(feature = "bench")]
+            {
+                rpc_time += rpc_start.elapsed();
+            }
 
-                #[cfg(feature = "bench")]
-                let process_start = Instant::now();
-                for (i, result) in results.into_iter().enumerate() {
-                    let (_, _, block, config) = &chunk[i];
-                    match result {
-                        Ok(bytes) => {
-                            all_results.push(CallResult {
-                                block_number: block.block_number,
-                                block_timestamp: block.timestamp,
-                                contract_address: config.address.0 .0,
-                                value_bytes: bytes.to_vec(),
-                                param_values: config.param_values.clone(),
-                            });
-                        }
-                        Err(e) => {
-                            let params_hex: Vec<String> = config
-                                .param_values
-                                .iter()
-                                .map(|p| format!("0x{}", hex::encode(p)))
-                                .collect();
-                            tracing::warn!(
-                                "Factory eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
-                                collection_name,
-                                function_name,
-                                block.block_number,
-                                config.address,
-                                params_hex,
-                                e
-                            );
-                            // Skip reverted calls - don't store empty results
-                        }
+            #[cfg(feature = "bench")]
+            let process_start = Instant::now();
+            for (i, result) in results.into_iter().enumerate() {
+                let (_, _, block, config) = &pending_calls[i];
+                match result {
+                    Ok(bytes) => {
+                        all_results.push(CallResult {
+                            block_number: block.block_number,
+                            block_timestamp: block.timestamp,
+                            contract_address: config.address.0 .0,
+                            value_bytes: bytes.to_vec(),
+                            param_values: config.param_values.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let params_hex: Vec<String> = config
+                            .param_values
+                            .iter()
+                            .map(|p| format!("0x{}", hex::encode(p)))
+                            .collect();
+                        tracing::warn!(
+                            "Factory eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
+                            collection_name,
+                            function_name,
+                            block.block_number,
+                            config.address,
+                            params_hex,
+                            e
+                        );
+                        // Skip reverted calls - don't store empty results
                     }
                 }
-                #[cfg(feature = "bench")]
-                {
-                    process_time += process_start.elapsed();
-                }
+            }
+            #[cfg(feature = "bench")]
+            {
+                process_time += process_start.elapsed();
             }
 
             all_results
@@ -222,7 +224,7 @@ pub(crate) async fn process_factory_range(
 
             let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
-            finalize_regular_results(FinalizeRegularParams {
+            let finalize_params = FinalizeRegularParams {
                 results: all_results,
                 max_params,
                 sub_dir,
@@ -245,8 +247,13 @@ pub(crate) async fn process_factory_range(
                     rpc_time,
                     process_time,
                 )),
-            })
-            .await?;
+            };
+            if let Some(ref mut writes) = pending_writes {
+                let handle = finalize_regular_results_deferred(finalize_params).await?;
+                writes.push(handle);
+            } else {
+                finalize_regular_results(finalize_params).await?;
+            }
         }
     }
 
@@ -264,6 +271,7 @@ pub(crate) async fn process_factory_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -441,13 +449,8 @@ pub(crate) async fn process_factory_range_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -486,7 +489,7 @@ pub(crate) async fn process_factory_range_multicall(
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
-            finalize_regular_results(FinalizeRegularParams {
+            let finalize_params = FinalizeRegularParams {
                 results: std::mem::take(results),
                 max_params,
                 sub_dir,
@@ -508,8 +511,13 @@ pub(crate) async fn process_factory_range_multicall(
                 last_block_timestamp: last_ts,
                 #[cfg(feature = "bench")]
                 bench: None,
-            })
-            .await?;
+            };
+            if let Some(ref mut writes) = pending_writes {
+                let handle = finalize_regular_results_deferred(finalize_params).await?;
+                writes.push(handle);
+            } else {
+                finalize_regular_results(finalize_params).await?;
+            }
         }
     }
 
@@ -523,6 +531,7 @@ pub(crate) async fn process_range(
     call_configs: &[CallConfig],
     max_params: usize,
     frequency_state: &mut FrequencyState,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
     for config in call_configs {
@@ -610,57 +619,55 @@ pub(crate) async fn process_range(
             }
         }
 
-        for chunk in pending_calls.chunks(ctx.rpc_batch_size) {
-            let calls: Vec<(TransactionRequest, BlockId)> = chunk
-                .iter()
-                .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
-                .collect();
+        let calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+            .iter()
+            .map(|(tx, block_id, _, _)| (tx.clone(), *block_id))
+            .collect();
 
-            #[cfg(feature = "bench")]
-            let rpc_start = Instant::now();
-            let results = ctx.client.call_batch(calls).await?;
-            #[cfg(feature = "bench")]
-            {
-                rpc_time += rpc_start.elapsed();
-            }
+        #[cfg(feature = "bench")]
+        let rpc_start = Instant::now();
+        let results = ctx.client.call_batch(calls).await?;
+        #[cfg(feature = "bench")]
+        {
+            rpc_time += rpc_start.elapsed();
+        }
 
-            #[cfg(feature = "bench")]
-            let process_start = Instant::now();
-            for (i, result) in results.into_iter().enumerate() {
-                let (_, _, block, config) = &chunk[i];
-                match result {
-                    Ok(bytes) => {
-                        all_results.push(CallResult {
-                            block_number: block.block_number,
-                            block_timestamp: block.timestamp,
-                            contract_address: config.address.0 .0,
-                            value_bytes: bytes.to_vec(),
-                            param_values: config.param_values.clone(),
-                        });
-                    }
-                    Err(e) => {
-                        let params_hex: Vec<String> = config
-                            .param_values
-                            .iter()
-                            .map(|p| format!("0x{}", hex::encode(p)))
-                            .collect();
-                        tracing::warn!(
-                            "eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
-                            contract_name,
-                            function_name,
-                            block.block_number,
-                            config.address,
-                            params_hex,
-                            e
-                        );
-                        // Skip reverted calls - don't store empty results
-                    }
+        #[cfg(feature = "bench")]
+        let process_start = Instant::now();
+        for (i, result) in results.into_iter().enumerate() {
+            let (_, _, block, config) = &pending_calls[i];
+            match result {
+                Ok(bytes) => {
+                    all_results.push(CallResult {
+                        block_number: block.block_number,
+                        block_timestamp: block.timestamp,
+                        contract_address: config.address.0 .0,
+                        value_bytes: bytes.to_vec(),
+                        param_values: config.param_values.clone(),
+                    });
+                }
+                Err(e) => {
+                    let params_hex: Vec<String> = config
+                        .param_values
+                        .iter()
+                        .map(|p| format!("0x{}", hex::encode(p)))
+                        .collect();
+                    tracing::warn!(
+                        "eth_call failed for {}.{} at block {} (address {}, params {:?}): {}",
+                        contract_name,
+                        function_name,
+                        block.block_number,
+                        config.address,
+                        params_hex,
+                        e
+                    );
+                    // Skip reverted calls - don't store empty results
                 }
             }
-            #[cfg(feature = "bench")]
-            {
-                process_time += process_start.elapsed();
-            }
+        }
+        #[cfg(feature = "bench")]
+        {
+            process_time += process_start.elapsed();
         }
 
         all_results.sort_by_key(|r| (r.block_number, r.contract_address, r.param_values.clone()));
@@ -670,7 +677,7 @@ pub(crate) async fn process_range(
 
         let last_ts = filtered_blocks.last().map(|b| b.timestamp);
 
-        finalize_regular_results(FinalizeRegularParams {
+        let finalize_params = FinalizeRegularParams {
             results: all_results,
             max_params,
             sub_dir,
@@ -693,14 +700,20 @@ pub(crate) async fn process_range(
                 rpc_time,
                 process_time,
             )),
-        })
-        .await?;
+        };
+        if let Some(ref mut writes) = pending_writes {
+            let handle = finalize_regular_results_deferred(finalize_params).await?;
+            writes.push(handle);
+        } else {
+            finalize_regular_results(finalize_params).await?;
+        }
     }
 
     Ok(())
 }
 
 /// Process regular calls using Multicall3 aggregate3 to batch all calls per block
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range_multicall(
     range: &BlockRange,
     blocks: Vec<BlockInfo>,
@@ -709,6 +722,7 @@ pub(crate) async fn process_range_multicall(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
+    mut pending_writes: Option<&mut AbortOnDropHandles>,
 ) -> Result<(), EthCallCollectionError> {
     // Group configs by (contract_name, function_name)
     let mut grouped_configs: HashMap<(String, String), Vec<&CallConfig>> = HashMap::new();
@@ -847,13 +861,8 @@ pub(crate) async fn process_range_multicall(
     );
 
     // Execute all multicalls
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -892,7 +901,7 @@ pub(crate) async fn process_range_multicall(
 
             let last_ts = group.filtered_blocks.last().map(|b| b.timestamp);
 
-            finalize_regular_results(FinalizeRegularParams {
+            let finalize_params = FinalizeRegularParams {
                 results: std::mem::take(results),
                 max_params,
                 sub_dir,
@@ -914,8 +923,13 @@ pub(crate) async fn process_range_multicall(
                 last_block_timestamp: last_ts,
                 #[cfg(feature = "bench")]
                 bench: None,
-            })
-            .await?;
+            };
+            if let Some(ref mut writes) = pending_writes {
+                let handle = finalize_regular_results_deferred(finalize_params).await?;
+                writes.push(handle);
+            } else {
+                finalize_regular_results(finalize_params).await?;
+            }
         }
     }
 

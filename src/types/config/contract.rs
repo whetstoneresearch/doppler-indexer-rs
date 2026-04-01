@@ -154,7 +154,10 @@ impl<'de> Deserialize<'de> for FactoryParameterLocation {
                     ))
                 })?;
             let idx = idx_str.parse::<usize>().map_err(|_| {
-                de::Error::custom(format!("Invalid topic index in factory_parameters: {}", idx_str))
+                de::Error::custom(format!(
+                    "Invalid topic index in factory_parameters: {}",
+                    idx_str
+                ))
             })?;
             Ok(FactoryParameterLocation::Topic(idx))
         } else if param.starts_with("data[") {

@@ -1638,7 +1638,6 @@ mod tests {
             ws_url_env_var: None,
             start_block: None,
             contracts: HashMap::new(),
-            tokens: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),
             rpc: Default::default(),

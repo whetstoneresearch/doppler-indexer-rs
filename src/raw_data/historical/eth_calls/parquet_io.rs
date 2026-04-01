@@ -716,9 +716,7 @@ pub(crate) async fn write_once_column_index_async(
         .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
 }
 
-pub(crate) async fn find_null_entries_async(
-    path: PathBuf,
-) -> HashMap<String, HashSet<[u8; 20]>> {
+pub(crate) async fn find_null_entries_async(path: PathBuf) -> HashMap<String, HashSet<[u8; 20]>> {
     tokio::task::spawn_blocking(move || find_null_entries(&path))
         .await
         .unwrap_or_default()

@@ -140,9 +140,7 @@ pub async fn collect_blocks(
             {
                 upload_parquet_to_s3(sm, path, &chain.name, "raw/blocks", *s3_start, *s3_end)
                     .await
-                    .map_err(|e| {
-                        BlockCollectionError::Io(std::io::Error::other(e.to_string()))
-                    })?;
+                    .map_err(|e| BlockCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
         }
 

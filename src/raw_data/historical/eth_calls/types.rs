@@ -1,12 +1,13 @@
 //! Types for eth_call collection: error types, config structs, result structs, and state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy::primitives::Address;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::event_triggers::SkippedFactoryTrigger;
@@ -16,7 +17,6 @@ use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::eth_call::{
     EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue,
 };
-use crate::types::config::tokens::PoolType;
 use alloy::primitives::Bytes;
 
 #[derive(Debug, Error)]
@@ -46,6 +46,43 @@ pub enum EthCallCollectionError {
     EventParamExtraction(String),
 }
 
+/// A collection of spawned write-task handles that aborts all remaining
+/// tasks when dropped. Prevents silent detached writes on error paths.
+pub(crate) struct AbortOnDropHandles {
+    handles: VecDeque<JoinHandle<Result<(), EthCallCollectionError>>>,
+}
+
+impl AbortOnDropHandles {
+    pub fn new() -> Self {
+        Self {
+            handles: VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, handle: JoinHandle<Result<(), EthCallCollectionError>>) {
+        self.handles.push_back(handle);
+    }
+
+    /// Await all handles front-to-back. On error, remaining handles stay in
+    /// `self` and are aborted by `Drop`.
+    pub async fn drain_all(&mut self) -> Result<(), EthCallCollectionError> {
+        while let Some(handle) = self.handles.pop_front() {
+            handle
+                .await
+                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AbortOnDropHandles {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 pub use crate::storage::BlockRange;
 
 /// Shared context for eth_call processing functions.
@@ -53,6 +90,7 @@ pub use crate::storage::BlockRange;
 /// Bundles the RPC client, output paths, and chain info that are threaded
 /// through every `process_*` function in the execution and event_triggers
 /// modules.
+#[allow(dead_code)]
 pub struct EthCallContext<'a> {
     pub client: &'a UnifiedRpcClient,
     pub output_dir: &'a Path,
@@ -199,7 +237,6 @@ pub struct EthCallCatchupState {
     pub call_configs: Vec<CallConfig>,
     pub factory_call_configs: HashMap<String, Vec<EthCallConfig>>,
     pub event_call_configs: HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
-    pub token_call_configs: Vec<TokenCallConfig>,
     pub once_configs: HashMap<String, Vec<OnceCallConfig>>,
     pub factory_once_configs: HashMap<String, Vec<OnceCallConfig>>,
     // Feature flags
@@ -208,7 +245,6 @@ pub struct EthCallCatchupState {
     pub has_factory_calls: bool,
     pub has_factory_once_calls: bool,
     pub has_event_triggered_calls: bool,
-    pub has_token_calls: bool,
     // Derived constants
     pub max_params: usize,
     pub factory_max_params: usize,
@@ -225,24 +261,4 @@ pub struct EthCallCatchupState {
     /// Buffered triggers skipped because factory addresses weren't known yet.
     /// Each entry: (skipped_triggers, range_start, range_end_inclusive)
     pub factory_skipped_triggers: Vec<(Vec<SkippedFactoryTrigger>, u64, u64)>,
-}
-
-/// Configuration for a token pool call
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TokenCallConfig {
-    /// Token name (used for output directory naming as {token_name}_pool)
-    pub token_name: String,
-    /// Pool type (v2, v3, v4)
-    pub pool_type: PoolType,
-    /// Target address for the call (pool address for v2/v3, StateView for v4)
-    pub target_address: Address,
-    /// Function name (e.g., "slot0")
-    pub function_name: String,
-    /// Encoded calldata including selector and any params
-    pub encoded_calldata: Bytes,
-    /// Call frequency
-    pub frequency: Frequency,
-    /// Output type for decoding
-    pub output_type: EvmType,
 }

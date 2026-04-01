@@ -445,6 +445,7 @@ impl TransformationEngine {
     /// Acquires a semaphore permit, clones all shared state, and spawns an
     /// async task that invokes the handler and executes the resulting database
     /// operations.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_catchup_handler_task<H>(
         &self,
         join_set: &mut JoinSet<HandlerTaskResult>,
@@ -521,7 +522,8 @@ impl TransformationEngine {
                 Ok(Err(e)) => {
                     tracing::error!(
                         "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
-                        handler_key, e
+                        handler_key,
+                        e
                     );
                     failed_handlers.push((handler_key.to_string(), e.to_string()));
                     errored = true;
@@ -529,7 +531,8 @@ impl TransformationEngine {
                 }
                 Err(e) => {
                     tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                    failed_handlers.push((handler_key.to_string(), format!("task panicked: {}", e)));
+                    failed_handlers
+                        .push((handler_key.to_string(), format!("task panicked: {}", e)));
                     errored = true;
                     break;
                 }
@@ -556,10 +559,7 @@ impl TransformationEngine {
         })
     }
 
-    async fn run_handler_catchup(
-        &self,
-        kind: HandlerKind,
-    ) -> Result<(), TransformationError> {
+    async fn run_handler_catchup(&self, kind: HandlerKind) -> Result<(), TransformationError> {
         let base_dir = match kind {
             HandlerKind::Event => &self.decoded_logs_dir,
             HandlerKind::Call => &self.decoded_calls_dir,
@@ -702,7 +702,11 @@ impl TransformationEngine {
                     let (events, primary_data_empty) = match ch.kind {
                         HandlerKind::Event => {
                             let evts = self
-                                .read_decoded_events_for_triggers(*range_start, *range_end, triggers)
+                                .read_decoded_events_for_triggers(
+                                    *range_start,
+                                    *range_end,
+                                    triggers,
+                                )
                                 .await?;
                             let evts = filter_events_by_start_block(&self.contracts, evts);
                             let empty = evts.is_empty();

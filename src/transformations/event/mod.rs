@@ -4,10 +4,11 @@
 
 pub mod decay_multicurve;
 pub mod derc20_transfer;
+pub mod dhook;
 pub mod multicurve;
 pub mod scheduled_multicurve;
+pub mod v3;
 pub mod v4;
-pub mod dhook;
 
 use super::registry::TransformationRegistry;
 
@@ -19,4 +20,5 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
     scheduled_multicurve::create::register_handlers(registry);
     decay_multicurve::create::register_handlers(registry);
     dhook::create::register_handlers(registry);
+    v3::create::register_handlers(registry);
 }

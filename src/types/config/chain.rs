@@ -7,7 +7,6 @@ use crate::types::config::contract::{
     load_contracts_from_path, load_factory_collections_from_path, Contracts, FactoryCollections,
 };
 use crate::types::config::generic::InlineOrPath;
-use crate::types::config::tokens::{load_tokens_from_path, Tokens};
 
 /// RPC method to use for fetching block receipts.
 ///
@@ -55,7 +54,6 @@ pub struct ChainConfigRaw {
     pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
     pub contracts: InlineOrPath<Contracts>,
-    pub tokens: InlineOrPath<Tokens>,
     pub block_receipts_method: Option<BlockReceiptsMethod>,
     #[serde(default)]
     pub factory_collections: Option<InlineOrPath<FactoryCollections>>,
@@ -73,7 +71,6 @@ pub struct ChainConfig {
     pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
     pub contracts: Contracts,
-    pub tokens: Tokens,
     pub block_receipts_method: Option<BlockReceiptsMethod>,
     pub factory_collections: FactoryCollections,
     /// RPC client configuration (rate limiting, concurrency).
@@ -90,22 +87,13 @@ pub fn resolve_chain_config(
             .map_err(|e| anyhow::anyhow!("Failed to load contracts from path {}: {}", p, e))?,
     };
 
-    let tokens = match raw_config.tokens {
-        InlineOrPath::Inline(tokens) => tokens,
-        InlineOrPath::Path(p) => load_tokens_from_path(base_dir, &p)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokens from path {}: {}", p, e))?,
-    };
-
     let factory_collections = match raw_config.factory_collections {
         Some(InlineOrPath::Inline(collections)) => collections,
-        Some(InlineOrPath::Path(p)) => load_factory_collections_from_path(base_dir, &p)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to load factory collections from path {}: {}",
-                    p,
-                    e
-                )
-            })?,
+        Some(InlineOrPath::Path(p)) => {
+            load_factory_collections_from_path(base_dir, &p).map_err(|e| {
+                anyhow::anyhow!("Failed to load factory collections from path {}: {}", p, e)
+            })?
+        }
         None => FactoryCollections::new(),
     };
 
@@ -116,7 +104,6 @@ pub fn resolve_chain_config(
         ws_url_env_var: raw_config.ws_url_env_var,
         start_block: raw_config.start_block,
         contracts,
-        tokens,
         block_receipts_method: raw_config.block_receipts_method,
         factory_collections,
         rpc: raw_config.rpc,
@@ -171,25 +158,6 @@ mod tests {
             ws_url_env_var: None,
             start_block: None,
             contracts: InlineOrPath::Path("nonexistent/contracts.json".to_string()),
-            tokens: InlineOrPath::Inline(Tokens::new()),
-            block_receipts_method: None,
-            factory_collections: None,
-            rpc: RpcConfig::default(),
-        };
-        let result = resolve_chain_config(raw, Path::new("/tmp"));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_resolve_chain_config_nonexistent_tokens_returns_err() {
-        let raw = ChainConfigRaw {
-            name: "test".to_string(),
-            chain_id: 1,
-            rpc_url_env_var: "RPC_URL".to_string(),
-            ws_url_env_var: None,
-            start_block: None,
-            contracts: InlineOrPath::Inline(Contracts::new()),
-            tokens: InlineOrPath::Path("nonexistent/tokens.json".to_string()),
             block_receipts_method: None,
             factory_collections: None,
             rpc: RpcConfig::default(),
@@ -207,7 +175,6 @@ mod tests {
             ws_url_env_var: None,
             start_block: None,
             contracts: InlineOrPath::Inline(Contracts::new()),
-            tokens: InlineOrPath::Inline(Tokens::new()),
             block_receipts_method: Some(BlockReceiptsMethod::EthGetBlockReceipts),
             factory_collections: None,
             rpc: RpcConfig::default(),

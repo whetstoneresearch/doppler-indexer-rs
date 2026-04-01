@@ -392,8 +392,7 @@ impl RetryProcessor {
                     }
 
                     // Check call dependencies
-                    let missing_deps =
-                        missing_retry_call_dependencies(&rh.call_deps, &calls);
+                    let missing_deps = missing_retry_call_dependencies(&rh.call_deps, &calls);
                     if !missing_deps.is_empty() {
                         tracing::warn!(
                             "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",

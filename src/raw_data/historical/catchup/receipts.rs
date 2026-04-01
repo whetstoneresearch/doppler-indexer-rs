@@ -114,11 +114,8 @@ pub async fn collect_receipts(
     // Also check for missing logs files - if receipts exist but logs don't, we
     // need to re-process to regenerate the logs data
     // =========================================================================
-    let block_ranges = get_existing_block_ranges_async(
-        chain.name.clone(),
-        s3_manifest.as_ref().cloned(),
-    )
-    .await;
+    let block_ranges =
+        get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
     let mut catchup_count = 0;
 
     // Check existing logs files

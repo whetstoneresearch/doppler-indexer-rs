@@ -1235,10 +1235,7 @@ pub(crate) async fn process_logs_live(
             tracing::info!("Block {} logs decoded", block_number);
         }
         Err(e) => {
-            tracing::warn!(
-                "Failed to update block status after log decoding: {}",
-                e
-            );
+            tracing::warn!("Failed to update block status after log decoding: {}", e);
         }
     }
 

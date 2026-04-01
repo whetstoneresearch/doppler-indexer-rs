@@ -14,9 +14,8 @@ use super::multicall::{
 use super::parquet_io::{
     extract_addresses_from_once_parquet, extract_existing_results_from_parquet,
     find_null_entries_async, merge_once_columns, read_existing_once_parquet_async,
-    read_once_column_index_async, read_parquet_column_names_async,
-    write_once_column_index_async, write_once_results_to_parquet_async,
-    write_record_batch_to_parquet_async,
+    read_once_column_index_async, read_parquet_column_names_async, write_once_column_index_async,
+    write_once_results_to_parquet_async, write_record_batch_to_parquet_async,
 };
 use super::types::{
     AddressResults, BlockInfo, BlockRange, CollectionResults, ContractProcessingInfo,
@@ -324,7 +323,8 @@ pub(crate) async fn process_once_calls_regular(
                     output_path.display()
                 );
 
-                write_once_results_to_parquet_async(results, output_path, all_fn_names.clone()).await?;
+                write_once_results_to_parquet_async(results, output_path, all_fn_names.clone())
+                    .await?;
             }
         }
 
@@ -502,7 +502,8 @@ pub(crate) async fn process_factory_once_calls(
         // Write empty file when no factory addresses discovered (no data for this range)
         if address_discovery.is_empty() && !has_existing_file {
             tokio::fs::create_dir_all(&sub_dir).await?;
-            write_once_results_to_parquet_async(vec![], output_path.clone(), all_fn_names.clone()).await?;
+            write_once_results_to_parquet_async(vec![], output_path.clone(), all_fn_names.clone())
+                .await?;
             let mut index = read_once_column_index_async(sub_dir.clone()).await;
             index.insert(file_name.clone(), all_fn_names.clone());
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
@@ -797,7 +798,12 @@ pub(crate) async fn process_factory_once_calls(
                     output_path.display()
                 );
 
-                write_once_results_to_parquet_async(results, output_path.clone(), all_fn_names.clone()).await?;
+                write_once_results_to_parquet_async(
+                    results,
+                    output_path.clone(),
+                    all_fn_names.clone(),
+                )
+                .await?;
             }
         }
 
@@ -1037,13 +1043,8 @@ pub(crate) async fn process_once_calls_multicall(
     );
 
     // Execute multicall
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.rpc_batch_size,
-    )
-    .await?;
+    let results =
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
     // Group results by contract_name -> address -> function_name -> value
     let mut results_by_contract: HashMap<String, HashMap<Address, HashMap<String, Vec<u8>>>> =
@@ -1095,7 +1096,8 @@ pub(crate) async fn process_once_calls_multicall(
                     .map(|(addr, fns)| (addr.0 .0, fns))
                     .collect();
 
-                let existing_batches = read_existing_once_parquet_async(output_path.clone()).await?;
+                let existing_batches =
+                    read_existing_once_parquet_async(output_path.clone()).await?;
                 if !existing_batches.is_empty() {
                     // Combine missing + patch function names for merge
                     let all_new_fn_names: Vec<String> = missing_fn_names
@@ -1134,7 +1136,12 @@ pub(crate) async fn process_once_calls_multicall(
                         output_path.display()
                     );
 
-                    write_once_results_to_parquet_async(results, output_path.clone(), all_fn_names.clone()).await?;
+                    write_once_results_to_parquet_async(
+                        results,
+                        output_path.clone(),
+                        all_fn_names.clone(),
+                    )
+                    .await?;
                 }
             }
 
@@ -1287,7 +1294,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
         // Write empty file when no factory addresses discovered (no data for this range)
         if address_discovery.is_empty() && !has_existing_file {
             tokio::fs::create_dir_all(&sub_dir).await?;
-            write_once_results_to_parquet_async(vec![], output_path.clone(), all_fn_names.clone()).await?;
+            write_once_results_to_parquet_async(vec![], output_path.clone(), all_fn_names.clone())
+                .await?;
             let mut index = read_once_column_index_async(sub_dir.clone()).await;
             index.insert(file_name.clone(), all_fn_names.clone());
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
@@ -1427,13 +1435,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
         );
 
         // Execute multicalls
-        let results = execute_multicalls_generic(
-            ctx.client,
-            multicall3_address,
-            block_multicalls,
-            ctx.rpc_batch_size,
-        )
-        .await?;
+        let results =
+            execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
 
         for (meta, return_data, _success) in results {
             let entry = results_by_collection
@@ -1473,7 +1476,8 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
                         .collect();
 
-                let existing_batches = read_existing_once_parquet_async(output_path.clone()).await?;
+                let existing_batches =
+                    read_existing_once_parquet_async(output_path.clone()).await?;
                 if !existing_batches.is_empty() {
                     // Check which addresses already have data for the missing functions
                     let existing_results =
@@ -1583,7 +1587,6 @@ pub(crate) async fn process_factory_once_calls_multicall(
                             ctx.client,
                             multicall3_address,
                             backfill_multicalls,
-                            ctx.rpc_batch_size,
                         )
                         .await?;
 
@@ -1633,7 +1636,12 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         output_path.display()
                     );
 
-                    write_once_results_to_parquet_async(results, output_path.clone(), all_fn_names.clone()).await?;
+                    write_once_results_to_parquet_async(
+                        results,
+                        output_path.clone(),
+                        all_fn_names.clone(),
+                    )
+                    .await?;
                 }
             }
 

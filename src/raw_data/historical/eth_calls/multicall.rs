@@ -1,25 +1,16 @@
 //! Multicall3 infrastructure: types, calldata encoding/decoding, and generic executor.
 
+use super::config::compute_function_selector;
+use super::types::{BlockInfo, EthCallCollectionError};
+use crate::rpc::UnifiedRpcClient;
+use crate::types::config::eth_call::{encode_call_with_params, Frequency};
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{Address, Bytes};
 use alloy::rpc::types::{BlockId, TransactionRequest};
-use futures::{stream, StreamExt, TryStreamExt};
-
-use super::config::compute_function_selector;
-use super::types::{BlockInfo, EthCallCollectionError, TokenCallConfig};
-use crate::rpc::UnifiedRpcClient;
-use crate::types::config::eth_call::{encode_call_with_params, Frequency};
 
 // =============================================================================
 // Multicall Types
 // =============================================================================
-
-/// Tracks which group and config index a multicall slot maps back to (token calls).
-pub(crate) struct MulticallSlot<'a> {
-    pub(crate) group_key: (String, String), // (token_name, function_name)
-    pub(crate) config: &'a TokenCallConfig,
-    pub(crate) block: BlockInfo,
-}
 
 /// Generic slot for tracking call metadata through multicall execution.
 #[derive(Clone)]
@@ -102,22 +93,6 @@ pub(crate) struct RegularGroupInfo<'a> {
     pub(crate) configs: Vec<&'a super::types::CallConfig>,
     pub(crate) filtered_blocks: Vec<BlockInfo>,
     pub(crate) frequency: Frequency,
-}
-
-/// Group info for token multicall processing.
-pub(crate) struct TokenGroupInfo<'a> {
-    pub(crate) output_name: String,
-    pub(crate) function_name: String,
-    pub(crate) configs: Vec<&'a TokenCallConfig>,
-    pub(crate) filtered_blocks: Vec<BlockInfo>,
-    pub(crate) frequency: Frequency,
-}
-
-/// Pending multicall for token range processing.
-pub(crate) struct PendingTokenMulticall<'a> {
-    pub(crate) block_number: u64,
-    pub(crate) block_id: BlockId,
-    pub(crate) slots: Vec<MulticallSlot<'a>>,
 }
 
 // =============================================================================
@@ -207,118 +182,7 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
     client: &UnifiedRpcClient,
     multicall3_address: Address,
     block_multicalls: Vec<BlockMulticall<M>>,
-    rpc_batch_size: usize,
 ) -> Result<Vec<(M, Vec<u8>, bool)>, EthCallCollectionError> {
-    // Track failed calls with chunk-relative indices
-    struct ChunkFailedCall {
-        relative_index: usize, // Index within the chunk's results
-        target_address: Address,
-        calldata: Bytes,
-        block_number: u64,
-        block_id: BlockId,
-    }
-
-    struct ChunkResult<M> {
-        results: Vec<(M, Vec<u8>, bool)>,
-        failed_calls: Vec<ChunkFailedCall>,
-    }
-
-    // Number of chunks to process concurrently
-    let chunk_concurrency = 4;
-
-    // Pre-collect chunks into owned vectors to avoid lifetime issues
-    let owned_chunks: Vec<Vec<BlockMulticall<M>>> = block_multicalls
-        .chunks(rpc_batch_size)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    // Process chunks concurrently using buffered (maintains order for correct index calculation)
-    let chunk_results: Vec<ChunkResult<M>> = stream::iter(owned_chunks)
-        .map(|chunk| async move {
-            let calls: Vec<(TransactionRequest, BlockId)> = chunk
-                .iter()
-                .map(|bm| {
-                    let sub_calls: Vec<(Address, &Bytes)> = bm
-                        .slots
-                        .iter()
-                        .map(|s| (s.target_address, &s.encoded_calldata))
-                        .collect();
-                    let multicall_data = build_multicall_calldata(&sub_calls);
-                    let tx = TransactionRequest::default()
-                        .to(multicall3_address)
-                        .input(multicall_data.into());
-                    (tx, bm.block_id)
-                })
-                .collect();
-
-            let results = client.call_batch(calls).await?;
-
-            let mut chunk_results: Vec<(M, Vec<u8>, bool)> = Vec::new();
-            let mut chunk_failed_calls: Vec<ChunkFailedCall> = Vec::new();
-
-            for (i, result) in results.into_iter().enumerate() {
-                let bm = &chunk[i];
-                let slot_count = bm.slots.len();
-
-                match result {
-                    Ok(bytes) => {
-                        match decode_multicall_results(&bytes, slot_count) {
-                            Ok(decoded) => {
-                                for (j, (success, return_data)) in decoded.into_iter().enumerate() {
-                                    let slot = &bm.slots[j];
-                                    if !success {
-                                        tracing::warn!(
-                                            "Multicall sub-call failed at block {} targeting {}",
-                                            bm.block_number,
-                                            slot.target_address
-                                        );
-                                        chunk_failed_calls.push(ChunkFailedCall {
-                                            relative_index: chunk_results.len(),
-                                            target_address: slot.target_address,
-                                            calldata: slot.encoded_calldata.clone(),
-                                            block_number: bm.block_number,
-                                            block_id: bm.block_id,
-                                        });
-                                    }
-                                    chunk_results.push((
-                                        slot.metadata.clone(),
-                                        if success { return_data } else { Vec::new() },
-                                        success,
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to decode multicall results for block {}: {}",
-                                    bm.block_number,
-                                    e
-                                );
-                                // Treat all sub-calls as failed
-                                for slot in &bm.slots {
-                                    chunk_results.push((slot.metadata.clone(), Vec::new(), false));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Multicall RPC failed for block {}: {}", bm.block_number, e);
-                        // Treat all sub-calls as failed
-                        for slot in &bm.slots {
-                            chunk_results.push((slot.metadata.clone(), Vec::new(), false));
-                        }
-                    }
-                }
-            }
-            Ok::<_, EthCallCollectionError>(ChunkResult {
-                results: chunk_results,
-                failed_calls: chunk_failed_calls,
-            })
-        })
-        .buffered(chunk_concurrency)
-        .try_collect()
-        .await?;
-
-    // Flatten results and compute global indices for failed calls
     struct FailedCall {
         result_index: usize,
         target_address: Address,
@@ -327,24 +191,80 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
         block_id: BlockId,
     }
 
+    // Build a single batch of calls from all block multicalls
+    let calls: Vec<(TransactionRequest, BlockId)> = block_multicalls
+        .iter()
+        .map(|bm| {
+            let sub_calls: Vec<(Address, &Bytes)> = bm
+                .slots
+                .iter()
+                .map(|s| (s.target_address, &s.encoded_calldata))
+                .collect();
+            let multicall_data = build_multicall_calldata(&sub_calls);
+            let tx = TransactionRequest::default()
+                .to(multicall3_address)
+                .input(multicall_data.into());
+            (tx, bm.block_id)
+        })
+        .collect();
+
+    let results = client.call_batch(calls).await?;
+
     let mut all_results: Vec<(M, Vec<u8>, bool)> = Vec::new();
     let mut failed_retries: Vec<FailedCall> = Vec::new();
 
-    for chunk_result in chunk_results {
-        let base_index = all_results.len();
+    for (i, result) in results.into_iter().enumerate() {
+        let bm = &block_multicalls[i];
+        let slot_count = bm.slots.len();
 
-        // Convert chunk-relative indices to global indices
-        for failed in chunk_result.failed_calls {
-            failed_retries.push(FailedCall {
-                result_index: base_index + failed.relative_index,
-                target_address: failed.target_address,
-                calldata: failed.calldata,
-                block_number: failed.block_number,
-                block_id: failed.block_id,
-            });
+        match result {
+            Ok(bytes) => {
+                match decode_multicall_results(&bytes, slot_count) {
+                    Ok(decoded) => {
+                        for (j, (success, return_data)) in decoded.into_iter().enumerate() {
+                            let slot = &bm.slots[j];
+                            if !success {
+                                tracing::warn!(
+                                    "Multicall sub-call failed at block {} targeting {}",
+                                    bm.block_number,
+                                    slot.target_address
+                                );
+                                failed_retries.push(FailedCall {
+                                    result_index: all_results.len(),
+                                    target_address: slot.target_address,
+                                    calldata: slot.encoded_calldata.clone(),
+                                    block_number: bm.block_number,
+                                    block_id: bm.block_id,
+                                });
+                            }
+                            all_results.push((
+                                slot.metadata.clone(),
+                                if success { return_data } else { Vec::new() },
+                                success,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to decode multicall results for block {}: {}",
+                            bm.block_number,
+                            e
+                        );
+                        // Treat all sub-calls as failed
+                        for slot in &bm.slots {
+                            all_results.push((slot.metadata.clone(), Vec::new(), false));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Multicall RPC failed for block {}: {}", bm.block_number, e);
+                // Treat all sub-calls as failed
+                for slot in &bm.slots {
+                    all_results.push((slot.metadata.clone(), Vec::new(), false));
+                }
+            }
         }
-
-        all_results.extend(chunk_result.results);
     }
 
     // Retry failed multicall sub-calls individually
@@ -476,10 +396,7 @@ mod tests {
                 DynSolValue::Bool(true),
                 DynSolValue::Bytes(vec![0x01]),
             ]),
-            DynSolValue::Tuple(vec![
-                DynSolValue::Bool(false),
-                DynSolValue::Bytes(vec![]),
-            ]),
+            DynSolValue::Tuple(vec![DynSolValue::Bool(false), DynSolValue::Bytes(vec![])]),
         ]);
         let encoded = value.abi_encode();
 
