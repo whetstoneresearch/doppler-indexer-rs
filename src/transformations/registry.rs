@@ -330,12 +330,16 @@ fn trace_cycle(
     graph: &HashMap<String, Vec<String>>,
     in_degree: &HashMap<String, usize>,
 ) -> String {
-    // Start from any node still with non-zero in-degree (part of a cycle)
-    let start = in_degree
-        .iter()
-        .find(|(_, &deg)| deg > 0)
-        .map(|(name, _)| name.clone())
-        .unwrap_or_default();
+    // Start from the alphabetically first node with non-zero in-degree (deterministic)
+    let start = {
+        let mut candidates: Vec<_> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg > 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        candidates.sort();
+        candidates.into_iter().next().unwrap_or_default()
+    };
 
     let mut path = vec![start.clone()];
     let mut current = start.clone();
