@@ -1176,11 +1176,30 @@ impl TransformationEngine {
                         let dep_names = self.registry.dependency_handler_names();
                         if !dep_names.is_empty() {
                             let mut state = self.live_state.lock().await;
+
+                            // Compute handler names that are pending (triggered
+                            // but waiting on their own deps). These must NOT be
+                            // marked as no-op — they still need to execute.
+                            let pending_names: HashSet<&str> = state
+                                .pending_events
+                                .iter()
+                                .filter(|(_, entries)| {
+                                    entries.iter().any(|e| {
+                                        (e.range_start, e.range_end) == range_key
+                                    })
+                                })
+                                .filter_map(|(handler_key, _)| {
+                                    self.registry.handler_name_for_key(handler_key)
+                                })
+                                .collect();
+
                             let completed = state.completed_handlers
                                 .entry(range_key)
                                 .or_default();
                             for name in dep_names {
-                                if !completed.contains(name) {
+                                if !completed.contains(name)
+                                    && !pending_names.contains(name.as_str())
+                                {
                                     tracing::debug!(
                                         "Marking handler {} as completed-no-op for block {} (not triggered)",
                                         name, range_key.0

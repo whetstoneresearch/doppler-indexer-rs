@@ -67,7 +67,6 @@ impl LiveProcessingState {
 
             // Remove from finalized_ranges to allow re-finalization if block is re-processed
             self.finalized_ranges.remove(&range_key);
-            self.completed_handlers.remove(&range_key);
 
             // Remove from received_calls
             for ranges in self.received_calls.values_mut() {
@@ -222,6 +221,10 @@ impl LiveProcessingState {
         for ranges in self.received_calls.values_mut() {
             ranges.remove(&range_key);
         }
+        for pending in self.pending_events.values_mut() {
+            pending.retain(|entry| (entry.range_start, entry.range_end) != range_key);
+        }
+        self.pending_events.retain(|_, entries| !entries.is_empty());
         self.pending_event_timestamps
             .retain(|(rs, re, _), _| (*rs, *re) != range_key);
     }

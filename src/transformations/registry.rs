@@ -63,6 +63,8 @@ pub struct TransformationRegistry {
     handler_topological_order: Vec<String>,
     /// Set of all handler names that appear as a dependency of another handler
     dependency_handler_names: HashSet<String>,
+    /// Maps handler_key() to handler name() for reverse lookup
+    handler_key_to_name: HashMap<String, String>,
 }
 
 impl TransformationRegistry {
@@ -75,6 +77,7 @@ impl TransformationRegistry {
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
+            handler_key_to_name: HashMap::new(),
         }
     }
 
@@ -105,6 +108,9 @@ impl TransformationRegistry {
             self.handler_dependency_graph
                 .insert(handler.name().to_string(), deps);
         }
+
+        self.handler_key_to_name
+            .insert(handler.handler_key(), handler.name().to_string());
 
         self.all_handlers.push(handler);
     }
@@ -312,6 +318,11 @@ impl TransformationRegistry {
     /// Get the set of all handler names that are declared as a dependency by another handler.
     pub fn dependency_handler_names(&self) -> &HashSet<String> {
         &self.dependency_handler_names
+    }
+
+    /// Look up a handler's name() from its handler_key().
+    pub fn handler_name_for_key(&self, handler_key: &str) -> Option<&str> {
+        self.handler_key_to_name.get(handler_key).map(|s| s.as_str())
     }
 
     /// Get all unique call handlers with their triggers grouped.
