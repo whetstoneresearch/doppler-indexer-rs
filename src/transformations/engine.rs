@@ -1193,12 +1193,19 @@ impl TransformationEngine {
                                 })
                                 .collect();
 
+                            let failed_names: HashSet<String> = state
+                                .failed_handlers
+                                .get(&range_key)
+                                .cloned()
+                                .unwrap_or_default();
+
                             let completed = state.completed_handlers
                                 .entry(range_key)
                                 .or_default();
                             for name in dep_names {
                                 if !completed.contains(name)
                                     && !pending_names.contains(name.as_str())
+                                    && !failed_names.contains(name)
                                 {
                                     tracing::debug!(
                                         "Marking handler {} as completed-no-op for block {} (not triggered)",
@@ -1423,7 +1430,7 @@ impl TransformationEngine {
         )
         .await;
 
-        // Record handler completions for dependency tracking
+        // Record handler completions and failures for dependency tracking
         {
             let mut state = self.live_state.lock().await;
             for outcome in &outcomes {
@@ -1432,6 +1439,15 @@ impl TransformationEngine {
                     .entry(range_key)
                     .or_default()
                     .insert(outcome.handler_name.clone());
+            }
+            for key in submitted_keys.difference(&succeeded_keys) {
+                if let Some(name) = self.registry.handler_name_for_key(key) {
+                    state
+                        .failed_handlers
+                        .entry(range_key)
+                        .or_default()
+                        .insert(name.to_string());
+                }
             }
         }
 
@@ -1747,7 +1763,7 @@ impl TransformationEngine {
             )
             .await;
 
-            // Record handler completions for cascading
+            // Record handler completions and failures for cascading
             {
                 let mut state = self.live_state.lock().await;
                 for outcome in &outcomes {
@@ -1756,6 +1772,15 @@ impl TransformationEngine {
                         .entry(range_key)
                         .or_default()
                         .insert(outcome.handler_name.clone());
+                }
+                for key in submitted_keys.difference(&succeeded_keys) {
+                    if let Some(name) = self.registry.handler_name_for_key(key) {
+                        state
+                            .failed_handlers
+                            .entry(range_key)
+                            .or_default()
+                            .insert(name.to_string());
+                    }
                 }
             }
             // Loop to check if more handlers are now unblocked

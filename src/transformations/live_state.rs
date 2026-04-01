@@ -47,6 +47,9 @@ pub(crate) struct LiveProcessingState {
     /// Handlers that have completed for a given range.
     /// Key: (range_start, range_end), Value: set of handler names (from name(), not handler_key())
     pub completed_handlers: HashMap<(u64, u64), HashSet<String>>,
+    /// Handlers that were dispatched and failed for a given range.
+    /// Key: (range_start, range_end), Value: set of handler names (from name(), not handler_key())
+    pub failed_handlers: HashMap<(u64, u64), HashSet<String>>,
 }
 
 impl LiveProcessingState {
@@ -64,6 +67,7 @@ impl LiveProcessingState {
             }
             self.completion.remove(&range_key);
             self.completed_handlers.remove(&range_key);
+            self.failed_handlers.remove(&range_key);
 
             // Remove from finalized_ranges to allow re-finalization if block is re-processed
             self.finalized_ranges.remove(&range_key);
@@ -107,6 +111,7 @@ impl LiveProcessingState {
         self.completion.remove(&range_key);
         self.finalized_ranges.remove(&range_key);
         self.completed_handlers.remove(&range_key);
+        self.failed_handlers.remove(&range_key);
         self.pending_event_timestamps
             .retain(|(rs, re, _), _| (*rs, *re) != range_key);
         for ranges in self.received_calls.values_mut() {
@@ -218,6 +223,7 @@ impl LiveProcessingState {
         self.calls_buffer.remove(&range_key);
         self.completion.remove(&range_key);
         self.completed_handlers.remove(&range_key);
+        self.failed_handlers.remove(&range_key);
         for ranges in self.received_calls.values_mut() {
             ranges.remove(&range_key);
         }

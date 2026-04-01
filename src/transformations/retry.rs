@@ -432,6 +432,24 @@ impl RetryProcessor {
                         .collect();
 
                     if handler_events.is_empty() {
+                        // No matching events — treat as no-op success so
+                        // dependent handlers aren't blocked on this one.
+                        attempted_keys.insert(handler_key.clone());
+                        succeeded_keys.insert(handler_key.clone());
+                        succeeded_names.insert(rh.handler.name().to_string());
+                        if let Some(ref tracker) = self.progress_tracker {
+                            if let Err(e) = tracker
+                                .lock()
+                                .await
+                                .mark_complete(block_number, &handler_key)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark no-op retry progress for block {} handler {}: {}",
+                                    block_number, handler_key, e
+                                );
+                            }
+                        }
                         continue;
                     }
 
@@ -470,6 +488,24 @@ impl RetryProcessor {
                         .collect();
 
                     if handler_calls.is_empty() {
+                        // No matching calls — treat as no-op success so
+                        // dependent handlers aren't blocked on this one.
+                        attempted_keys.insert(handler_key.clone());
+                        succeeded_keys.insert(handler_key.clone());
+                        succeeded_names.insert(rh.handler.name().to_string());
+                        if let Some(ref tracker) = self.progress_tracker {
+                            if let Err(e) = tracker
+                                .lock()
+                                .await
+                                .mark_complete(block_number, &handler_key)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark no-op retry progress for block {} handler {}: {}",
+                                    block_number, handler_key, e
+                                );
+                            }
+                        }
                         continue;
                     }
 
@@ -982,5 +1018,39 @@ mod tests {
         assert!(s.failed_handlers.is_empty());
         assert!(s.completed_handlers.contains("handler_a"));
         assert!(s.completed_handlers.contains("handler_b"));
+    }
+
+    /// Regression: a no-op handler (no matching events) that was previously in
+    /// `failed_handlers` must be moved to `completed_handlers` when retried as
+    /// a no-op success, so dependents can proceed and the handler isn't retried
+    /// indefinitely.
+    #[test]
+    fn retry_noop_handler_clears_prior_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        // Simulate a prior failure for handler_a
+        status.failed_handlers.insert("handler_a".to_string());
+        storage.write_status(100, &status).unwrap();
+
+        // Retry treats handler_a as no-op success (no matching events)
+        let attempted = HashSet::from(["handler_a".to_string()]);
+        let succeeded = HashSet::from(["handler_a".to_string()]);
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.completed_handlers.contains("handler_a"),
+            "no-op succeeded handler must be in completed_handlers"
+        );
+        assert!(
+            !s.failed_handlers.contains("handler_a"),
+            "no-op succeeded handler must be cleared from failed_handlers"
+        );
     }
 }
