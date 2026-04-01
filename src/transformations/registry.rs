@@ -2,7 +2,7 @@
 //!
 //! The registry maintains a mapping from event/call triggers to their handlers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::traits::{
@@ -57,6 +57,10 @@ pub struct TransformationRegistry {
     call_handlers: HashMap<(String, String), Vec<Arc<dyn EthCallHandler>>>,
     /// All handlers for initialization (de-duplicated)
     all_handlers: Vec<Arc<dyn TransformationHandler>>,
+    /// Maps handler name() to its declared handler dependency names
+    handler_dependency_graph: HashMap<String, Vec<String>>,
+    /// Topological ordering of handler names (computed after all handlers registered)
+    handler_topological_order: Vec<String>,
 }
 
 impl TransformationRegistry {
@@ -66,6 +70,8 @@ impl TransformationRegistry {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
             all_handlers: Vec::new(),
+            handler_dependency_graph: HashMap::new(),
+            handler_topological_order: Vec::new(),
         }
     }
 
@@ -85,6 +91,16 @@ impl TransformationRegistry {
                 .entry(key)
                 .or_default()
                 .push(handler.clone());
+        }
+
+        let deps: Vec<String> = handler
+            .handler_dependencies()
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        if !deps.is_empty() {
+            self.handler_dependency_graph
+                .insert(handler.name().to_string(), deps);
         }
 
         self.all_handlers.push(handler);
@@ -161,6 +177,129 @@ impl TransformationRegistry {
         .collect()
     }
 
+    /// Get the topological ordering of handler names.
+    /// Available after `validate_and_sort_handler_dependencies()` has been called.
+    pub fn handler_topological_order(&self) -> &[String] {
+        &self.handler_topological_order
+    }
+
+    /// Get the dependency graph (handler name -> dependency names).
+    pub fn handler_dependency_graph(&self) -> &HashMap<String, Vec<String>> {
+        &self.handler_dependency_graph
+    }
+
+    /// Validate handler dependencies and compute topological ordering.
+    ///
+    /// Panics if:
+    /// - A handler declares a dependency on a name that isn't registered
+    /// - The dependency graph contains a cycle
+    pub fn validate_and_sort_handler_dependencies(&mut self) {
+        // Collect all registered handler names (use name(), not handler_key())
+        let registered_names: HashSet<String> = self
+            .all_handlers
+            .iter()
+            .map(|h| h.name().to_string())
+            .collect();
+
+        // Validate all dependency references exist
+        let mut missing: Vec<(String, Vec<String>)> = Vec::new();
+        for (handler_name, deps) in &self.handler_dependency_graph {
+            let unresolved: Vec<String> = deps
+                .iter()
+                .filter(|dep| !registered_names.contains(*dep))
+                .cloned()
+                .collect();
+            if !unresolved.is_empty() {
+                missing.push((handler_name.clone(), unresolved));
+            }
+        }
+
+        if !missing.is_empty() {
+            let mut msg = String::from(
+                "missing handler dependency: one or more handlers declare handler_dependencies \
+                 that do not match any registered handler name:\n",
+            );
+            for (handler_name, unresolved) in &missing {
+                msg.push_str(&format!("\n  Handler '{}':\n", handler_name));
+                for dep in unresolved {
+                    msg.push_str(&format!("    - \"{}\"\n", dep));
+                }
+            }
+            msg.push_str("\nRegistered handler names:\n");
+            let mut sorted_names: Vec<_> = registered_names.iter().collect();
+            sorted_names.sort();
+            for name in &sorted_names {
+                msg.push_str(&format!("    - \"{}\"\n", name));
+            }
+            panic!("{}", msg);
+        }
+
+        // Kahn's algorithm for topological sort
+        // Build adjacency: dependency -> set of dependents
+        let mut in_degree: HashMap<String, usize> = HashMap::new();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Initialize all handlers with 0 in-degree
+        for name in &registered_names {
+            in_degree.insert(name.clone(), 0);
+        }
+
+        // Build edges from the dependency graph
+        for (handler_name, deps) in &self.handler_dependency_graph {
+            *in_degree.get_mut(handler_name).unwrap() += deps.len();
+            for dep in deps {
+                dependents
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(handler_name.clone());
+            }
+        }
+
+        // Seed queue with zero-in-degree handlers, sorted alphabetically for determinism
+        let mut queue: VecDeque<String> = {
+            let mut zeros: Vec<String> = in_degree
+                .iter()
+                .filter(|(_, &deg)| deg == 0)
+                .map(|(name, _)| name.clone())
+                .collect();
+            zeros.sort();
+            zeros.into_iter().collect()
+        };
+
+        let mut order: Vec<String> = Vec::with_capacity(registered_names.len());
+
+        while let Some(name) = queue.pop_front() {
+            order.push(name.clone());
+            if let Some(deps) = dependents.get(&name) {
+                // Collect newly freed handlers, sort for determinism
+                let mut newly_free: Vec<String> = Vec::new();
+                for dependent in deps {
+                    let deg = in_degree.get_mut(dependent).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        newly_free.push(dependent.clone());
+                    }
+                }
+                newly_free.sort();
+                for freed in newly_free {
+                    queue.push_back(freed);
+                }
+            }
+        }
+
+        if order.len() != registered_names.len() {
+            // Cycle detected — find and report it
+            let cycle = trace_cycle(&self.handler_dependency_graph, &in_degree);
+            panic!(
+                "handler dependency cycle detected: {}\n\
+                 Handler dependencies must form a directed acyclic graph (DAG).",
+                cycle
+            );
+        }
+
+        self.handler_topological_order = order;
+    }
+
     /// Get all unique call handlers with their triggers grouped.
     /// Each handler appears exactly once, deduplicated by `handler_key()`.
     pub fn unique_call_handlers(&self) -> Vec<CallHandlerInfo> {
@@ -183,6 +322,51 @@ impl Default for TransformationRegistry {
 /// e.g., "Swap(bytes32,address,int128)" -> "Swap"
 pub fn extract_event_name(signature: &str) -> String {
     signature.split('(').next().unwrap_or(signature).to_string()
+}
+
+/// Trace a cycle in the dependency graph for error reporting.
+/// Returns a string like "A -> B -> C -> A".
+fn trace_cycle(
+    graph: &HashMap<String, Vec<String>>,
+    in_degree: &HashMap<String, usize>,
+) -> String {
+    // Start from the alphabetically first node with non-zero in-degree (deterministic)
+    let start = {
+        let mut candidates: Vec<_> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg > 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        candidates.sort();
+        candidates.into_iter().next().unwrap_or_default()
+    };
+
+    let mut path = vec![start.clone()];
+    let mut current = start.clone();
+
+    // Follow dependency edges to trace the cycle
+    for _ in 0..in_degree.len() {
+        if let Some(deps) = graph.get(&current) {
+            // Follow the first dependency that's part of the cycle (non-zero in-degree)
+            if let Some(next) = deps
+                .iter()
+                .find(|d| in_degree.get(*d).copied().unwrap_or(0) > 0)
+            {
+                if *next == start {
+                    path.push(next.clone());
+                    break;
+                }
+                path.push(next.clone());
+                current = next.clone();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    path.join(" -> ")
 }
 
 /// Validate that all handler call_dependencies are satisfied by the eth_call configs.
@@ -293,6 +477,8 @@ pub fn build_registry() -> TransformationRegistry {
     // Register eth_call handlers
     super::eth_call::register_handlers(&mut registry);
 
+    registry.validate_and_sort_handler_dependencies();
+
     tracing::info!(
         "Built transformation registry with {} handlers ({} event triggers, {} call triggers)",
         registry.handler_count(),
@@ -317,6 +503,7 @@ mod tests {
         name: &'static str,
         triggers: Vec<EventTrigger>,
         call_deps: Vec<(String, String)>,
+        handler_deps: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -341,6 +528,10 @@ mod tests {
         fn call_dependencies(&self) -> Vec<(String, String)> {
             self.call_deps.clone()
         }
+
+        fn handler_dependencies(&self) -> Vec<&'static str> {
+            self.handler_deps.clone()
+        }
     }
 
     fn empty_contracts() -> Contracts {
@@ -349,6 +540,15 @@ mod tests {
 
     fn empty_factory_collections() -> FactoryCollections {
         FactoryCollections::new()
+    }
+
+    fn mock_handler(name: &'static str, handler_deps: Vec<&'static str>) -> MockEventHandler {
+        MockEventHandler {
+            name,
+            triggers: vec![EventTrigger::new("Test", format!("{}()", name))],
+            call_deps: vec![],
+            handler_deps,
+        }
     }
 
     #[test]
@@ -371,6 +571,7 @@ mod tests {
                 "Transfer(address,address,uint256)",
             )],
             call_deps: vec![],
+            handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -392,6 +593,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "getState".to_string())],
+            handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -426,6 +628,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
+            handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -448,6 +651,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
+            handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -486,6 +690,7 @@ mod tests {
             name: "test_handler",
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "once".to_string())],
+            handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -510,5 +715,108 @@ mod tests {
 
         // Should not panic — once dependency is satisfied
         validate_call_dependencies(&registry, &contracts, &factory_collections);
+    }
+
+    #[test]
+    fn handler_deps_empty_registry_passes() {
+        let mut registry = TransformationRegistry::new();
+        // Should not panic — no handlers, no deps
+        registry.validate_and_sort_handler_dependencies();
+        assert!(registry.handler_topological_order().is_empty());
+    }
+
+    #[test]
+    fn handler_deps_no_deps_passes() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec![]));
+        registry.validate_and_sort_handler_dependencies();
+        assert_eq!(registry.handler_topological_order().len(), 2);
+    }
+
+    #[test]
+    fn handler_deps_linear_chain() {
+        let mut registry = TransformationRegistry::new();
+        // C depends on B, B depends on A
+        registry.register_event_handler(mock_handler("C", vec!["B"]));
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+        let order = registry.handler_topological_order();
+        let pos_a = order.iter().position(|n| n == "A").unwrap();
+        let pos_b = order.iter().position(|n| n == "B").unwrap();
+        let pos_c = order.iter().position(|n| n == "C").unwrap();
+        assert!(pos_a < pos_b, "A must come before B");
+        assert!(pos_b < pos_c, "B must come before C");
+    }
+
+    #[test]
+    fn handler_deps_diamond() {
+        let mut registry = TransformationRegistry::new();
+        // Diamond: A -> B, A -> C, B -> D, C -> D
+        registry.register_event_handler(mock_handler("D", vec!["B", "C"]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.register_event_handler(mock_handler("C", vec!["A"]));
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.validate_and_sort_handler_dependencies();
+        let order = registry.handler_topological_order();
+        let pos_a = order.iter().position(|n| n == "A").unwrap();
+        let pos_b = order.iter().position(|n| n == "B").unwrap();
+        let pos_c = order.iter().position(|n| n == "C").unwrap();
+        let pos_d = order.iter().position(|n| n == "D").unwrap();
+        assert!(pos_a < pos_b, "A must come before B");
+        assert!(pos_a < pos_c, "A must come before C");
+        assert!(pos_b < pos_d, "B must come before D");
+        assert!(pos_c < pos_d, "C must come before D");
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn handler_deps_two_node_cycle_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["B"]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn handler_deps_three_node_cycle_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["C"]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.register_event_handler(mock_handler("C", vec!["B"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle")]
+    fn handler_deps_self_cycle_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    #[should_panic(expected = "missing handler dependency")]
+    fn handler_deps_missing_dep_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec!["NonExistent"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    fn handler_deps_deterministic_ordering() {
+        // Run twice to verify determinism
+        for _ in 0..2 {
+            let mut registry = TransformationRegistry::new();
+            // All independent — should sort alphabetically
+            registry.register_event_handler(mock_handler("C", vec![]));
+            registry.register_event_handler(mock_handler("A", vec![]));
+            registry.register_event_handler(mock_handler("B", vec![]));
+            registry.validate_and_sort_handler_dependencies();
+            let order = registry.handler_topological_order();
+            assert_eq!(order, &["A", "B", "C"]);
+        }
     }
 }

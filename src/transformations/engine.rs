@@ -581,7 +581,7 @@ impl TransformationEngine {
         }
 
         // Collect handler descriptors uniformly across both kinds.
-        let handlers: Vec<CatchupHandler> = match kind {
+        let mut handlers: Vec<CatchupHandler> = match kind {
             HandlerKind::Event => self
                 .registry
                 .unique_event_handlers()
@@ -620,6 +620,19 @@ impl TransformationEngine {
                 })
                 .collect(),
         };
+
+        // Sort event handlers by topological order so dependencies are processed first
+        if kind == HandlerKind::Event {
+            let topo_order = self.registry.handler_topological_order();
+            let position: HashMap<&str, usize> = topo_order
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.as_str(), i))
+                .collect();
+            handlers.sort_by_key(|ch| {
+                position.get(ch.handler.name()).copied().unwrap_or(usize::MAX)
+            });
+        }
 
         let mut failed_handlers: Vec<(String, String)> = vec![];
 

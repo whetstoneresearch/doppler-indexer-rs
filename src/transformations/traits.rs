@@ -137,10 +137,9 @@ pub trait EventHandler: TransformationHandler {
         vec![]
     }
 
-    /// Declare other handlers that must complete before this handler runs.
-    /// Returns handler keys (e.g., "pool_create_v1") that must have finished
-    /// processing the same block range before this handler can execute.
-    fn handler_dependencies(&self) -> Vec<String> {
+    /// Handler names (via `TransformationHandler::name()`) that must complete
+    /// before this handler can execute for a given block range.
+    fn handler_dependencies(&self) -> Vec<&'static str> {
         vec![]
     }
 }
