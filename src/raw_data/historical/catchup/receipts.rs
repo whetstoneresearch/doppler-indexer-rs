@@ -20,6 +20,44 @@ use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
+/// Drain a pending background write, upload to S3, and send RangeComplete.
+///
+/// Both `pending_write_handle` and `pending_write_info` are `.take()`'d so the
+/// caller cannot accidentally re-process the same write.
+async fn drain_pending_write(
+    pending_write_handle: &mut Option<tokio::task::JoinHandle<Result<(), ReceiptCollectionError>>>,
+    pending_write_info: &mut Option<(PathBuf, u64, u64)>,
+    storage_manager: &Option<Arc<StorageManager>>,
+    chain_name: &str,
+    channels: &ReceiptOutputChannels,
+) -> Result<(), ReceiptCollectionError> {
+    if let Some(handle) = pending_write_handle.take() {
+        handle
+            .await
+            .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+
+        if let Some((ref path, wr_start, wr_end)) = pending_write_info.take() {
+            if let Some(ref sm) = storage_manager {
+                upload_parquet_to_s3(sm, path, chain_name, "raw/receipts", wr_start, wr_end - 1)
+                    .await
+                    .map_err(|e| {
+                        ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
+                    })?;
+            }
+
+            send_range_complete(
+                &channels.factory_log_tx,
+                &channels.log_tx,
+                &channels.event_trigger_tx,
+                wr_start,
+                wr_end,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// State passed from catchup phase to current phase for receipt collection.
 pub struct ReceiptsCatchupState {
     /// Set of existing receipt files (local filesystem)
@@ -120,37 +158,14 @@ pub async fn collect_receipts(
             // RangeComplete for this skipped range.  Otherwise the event-trigger
             // collector sees RangeComplete(B) before the write for A finishes,
             // flushing A's buffered triggers under B's range.
-            if let Some(handle) = pending_write_handle.take() {
-                handle
-                    .await
-                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
-
-                if let Some((ref path, wr_start, wr_end)) = pending_write_info.take() {
-                    if let Some(ref sm) = storage_manager {
-                        upload_parquet_to_s3(
-                            sm,
-                            path,
-                            &chain.name,
-                            "raw/receipts",
-                            wr_start,
-                            wr_end - 1,
-                        )
-                        .await
-                        .map_err(|e| {
-                            ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
-                        })?;
-                    }
-
-                    send_range_complete(
-                        &channels.factory_log_tx,
-                        &channels.log_tx,
-                        &channels.event_trigger_tx,
-                        wr_start,
-                        wr_end,
-                    )
-                    .await?;
-                }
-            }
+            drain_pending_write(
+                &mut pending_write_handle,
+                &mut pending_write_info,
+                &storage_manager,
+                &chain.name,
+                &channels,
+            )
+            .await?;
 
             // Still need to signal range complete for downstream collectors
             // when catching up, so they know this range is done
@@ -168,39 +183,14 @@ pub async fn collect_receipts(
         }
 
         // Drain the previous range's write before starting a new one.
-        if let Some(handle) = pending_write_handle.take() {
-            handle
-                .await
-                .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
-
-            if let Some((ref path, wr_start, wr_end)) = pending_write_info {
-                // Upload the now-written file to S3 if configured.
-                if let Some(ref sm) = storage_manager {
-                    upload_parquet_to_s3(
-                        sm,
-                        path,
-                        &chain.name,
-                        "raw/receipts",
-                        wr_start,
-                        wr_end - 1,
-                    )
-                    .await
-                    .map_err(|e| {
-                        ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
-                    })?;
-                }
-
-                // Signal range complete now that the parquet file exists.
-                send_range_complete(
-                    &channels.factory_log_tx,
-                    &channels.log_tx,
-                    &channels.event_trigger_tx,
-                    wr_start,
-                    wr_end,
-                )
-                .await?;
-            }
-        }
+        drain_pending_write(
+            &mut pending_write_handle,
+            &mut pending_write_info,
+            &storage_manager,
+            &chain.name,
+            &channels,
+        )
+        .await?;
 
         // Ensure block file is available locally (download from S3 if needed)
         if !block_range.file_path.exists() {
@@ -301,37 +291,14 @@ pub async fn collect_receipts(
     }
 
     // Drain the final pending write.
-    if let Some(handle) = pending_write_handle.take() {
-        handle
-            .await
-            .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
-
-        if let Some((ref path, wr_start, wr_end)) = pending_write_info {
-            if let Some(ref sm) = storage_manager {
-                upload_parquet_to_s3(
-                    sm,
-                    path,
-                    &chain.name,
-                    "raw/receipts",
-                    wr_start,
-                    wr_end - 1,
-                )
-                .await
-                .map_err(|e| {
-                    ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
-                })?;
-            }
-
-            send_range_complete(
-                &channels.factory_log_tx,
-                &channels.log_tx,
-                &channels.event_trigger_tx,
-                wr_start,
-                wr_end,
-            )
-            .await?;
-        }
-    }
+    drain_pending_write(
+        &mut pending_write_handle,
+        &mut pending_write_info,
+        &storage_manager,
+        &chain.name,
+        &channels,
+    )
+    .await?;
 
     if catchup_count > 0 {
         tracing::info!(

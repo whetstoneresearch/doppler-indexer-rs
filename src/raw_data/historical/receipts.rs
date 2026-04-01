@@ -353,8 +353,6 @@ pub(crate) struct ReceiptBatchState {
     pub(crate) minimal_records: Vec<MinimalReceiptRecord>,
     /// Accumulated full receipt records (sorted before write)
     pub(crate) full_records: Vec<FullReceiptRecord>,
-    /// Accumulated logs (sorted before write)
-    pub(crate) logs: Vec<LogData>,
     /// Accumulated event triggers (sent atomically with RangeComplete)
     pub(crate) event_triggers: Vec<EventTriggerData>,
 }

@@ -261,7 +261,6 @@ pub async fn collect_receipts(
                                 blocks_completed: HashSet::new(),
                                 minimal_records: Vec::new(),
                                 full_records: Vec::new(),
-                                logs: Vec::new(),
                                 event_triggers: Vec::new(),
                             }
                         });
