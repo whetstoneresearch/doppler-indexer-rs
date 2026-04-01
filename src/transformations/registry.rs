@@ -65,6 +65,8 @@ pub struct TransformationRegistry {
     dependency_handler_names: HashSet<String>,
     /// Maps handler_key() to handler name() for reverse lookup
     handler_key_to_name: HashMap<String, String>,
+    /// Set of handler names registered as event handlers (for dep validation)
+    event_handler_names: HashSet<String>,
 }
 
 impl TransformationRegistry {
@@ -78,6 +80,7 @@ impl TransformationRegistry {
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
             handler_key_to_name: HashMap::new(),
+            event_handler_names: HashSet::new(),
         }
     }
 
@@ -111,6 +114,8 @@ impl TransformationRegistry {
 
         self.handler_key_to_name
             .insert(handler.handler_key(), handler.name().to_string());
+        self.event_handler_names
+            .insert(handler.name().to_string());
 
         self.all_handlers.push(handler);
     }
@@ -238,6 +243,39 @@ impl TransformationRegistry {
             let mut sorted_names: Vec<_> = registered_names.iter().collect();
             sorted_names.sort();
             for name in &sorted_names {
+                msg.push_str(&format!("    - \"{}\"\n", name));
+            }
+            panic!("{}", msg);
+        }
+
+        // Validate all dependencies reference event handlers (not call handlers)
+        let mut non_event_deps: Vec<(String, Vec<String>)> = Vec::new();
+        for (handler_name, deps) in &self.handler_dependency_graph {
+            let bad: Vec<String> = deps
+                .iter()
+                .filter(|dep| !self.event_handler_names.contains(*dep))
+                .cloned()
+                .collect();
+            if !bad.is_empty() {
+                non_event_deps.push((handler_name.clone(), bad));
+            }
+        }
+
+        if !non_event_deps.is_empty() {
+            let mut msg = String::from(
+                "invalid handler dependency: handler_dependencies can only reference event \
+                 handler names, not call handler names:\n",
+            );
+            for (handler_name, bad) in &non_event_deps {
+                msg.push_str(&format!("\n  Handler '{}':\n", handler_name));
+                for dep in bad {
+                    msg.push_str(&format!("    - \"{}\" (not an event handler)\n", dep));
+                }
+            }
+            msg.push_str("\nRegistered event handler names:\n");
+            let mut sorted: Vec<_> = self.event_handler_names.iter().collect();
+            sorted.sort();
+            for name in &sorted {
                 msg.push_str(&format!("    - \"{}\"\n", name));
             }
             panic!("{}", msg);
@@ -843,5 +881,56 @@ mod tests {
             let order = registry.handler_topological_order();
             assert_eq!(order, &["A", "B", "C"]);
         }
+    }
+
+    // ─── Call handler dep validation tests ──────────────────────────────
+
+    use crate::transformations::traits::{EthCallHandler, EthCallTrigger};
+
+    struct MockCallHandler {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl TransformationHandler for MockCallHandler {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &TransformationContext,
+        ) -> Result<Vec<DbOperation>, TransformationError> {
+            Ok(vec![])
+        }
+    }
+
+    impl EthCallHandler for MockCallHandler {
+        fn triggers(&self) -> Vec<EthCallTrigger> {
+            vec![EthCallTrigger::new("Test", self.name)]
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not an event handler")]
+    fn handler_deps_referencing_call_handler_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_call_handler(MockCallHandler { name: "B" });
+        registry.register_event_handler(mock_handler("C", vec!["B"]));
+        registry.validate_and_sort_handler_dependencies();
+    }
+
+    #[test]
+    fn handler_deps_with_call_handlers_and_valid_event_deps_passes() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_call_handler(MockCallHandler { name: "B" });
+        registry.register_event_handler(mock_handler("C", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+        let order = registry.handler_topological_order();
+        let pos_a = order.iter().position(|n| n == "A").unwrap();
+        let pos_c = order.iter().position(|n| n == "C").unwrap();
+        assert!(pos_a < pos_c, "A must come before C");
     }
 }

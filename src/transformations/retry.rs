@@ -43,6 +43,8 @@ struct RetryHandler {
     triggers: HashSet<(String, String)>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
     call_deps: HashSet<(String, String)>,
+    /// Handler dependencies: handler name() values that must complete first.
+    handler_deps: Vec<String>,
     kind: HandlerKind,
 }
 
@@ -363,6 +365,18 @@ impl RetryProcessor {
         let mut blocked_handlers = HashSet::new();
         let mut attempted_keys = HashSet::new();
         let mut succeeded_keys = HashSet::new();
+        let mut succeeded_names: HashSet<String> = HashSet::new();
+
+        // Precompute handler names that are being retried (in missing_handlers)
+        // so we can check handler deps efficiently.
+        let missing_names: HashSet<String> = missing_handlers
+            .iter()
+            .filter_map(|mk| {
+                self.registry
+                    .handler_name_for_key(mk)
+                    .map(|n| n.to_string())
+            })
+            .collect();
 
         // Build a uniform list of retry handler descriptors, sorted by
         // topological order so dependencies execute before dependents.
@@ -381,6 +395,28 @@ impl RetryProcessor {
             let handler_key = rh.handler.handler_key();
             if !missing_handlers.contains(&handler_key) {
                 continue;
+            }
+
+            // Check handler dependencies: a dep blocks only if it is itself
+            // being retried (in missing_names) and hasn't succeeded yet.
+            // Deps not in missing_names already completed in a prior run.
+            if !rh.handler_deps.is_empty() {
+                let unmet: Vec<&str> = rh
+                    .handler_deps
+                    .iter()
+                    .filter(|dep| missing_names.contains(*dep) && !succeeded_names.contains(*dep))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !unmet.is_empty() {
+                    tracing::warn!(
+                        "Skipping live retry for handler {} on block {}: handler deps not met {:?}",
+                        handler_key,
+                        block_number,
+                        unmet
+                    );
+                    blocked_handlers.insert(handler_key);
+                    continue;
+                }
             }
 
             // Filter primary data by trigger match
@@ -482,6 +518,7 @@ impl RetryProcessor {
                     }
 
                     succeeded_keys.insert(handler_key.clone());
+                    succeeded_names.insert(handler_name.to_string());
 
                     if let Err(e) = self
                         .db_pool
@@ -572,10 +609,17 @@ impl RetryProcessor {
                 .collect();
             let call_deps: HashSet<(String, String)> =
                 info.handler.call_dependencies().into_iter().collect();
+            let handler_deps: Vec<String> = info
+                .handler
+                .handler_dependencies()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             handlers.push(RetryHandler {
                 handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                 triggers,
                 call_deps,
+                handler_deps,
                 kind: HandlerKind::Event,
             });
         }
@@ -590,6 +634,7 @@ impl RetryProcessor {
                 handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                 triggers,
                 call_deps: HashSet::new(),
+                handler_deps: Vec::new(),
                 kind: HandlerKind::Call,
             });
         }
