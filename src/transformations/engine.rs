@@ -1235,12 +1235,15 @@ impl TransformationEngine {
             let mut state = self.live_state.lock().await;
             for handler in &handlers {
                 let call_deps = handler.call_dependencies();
+                let handler_deps: Vec<String> = handler
+                    .handler_dependencies()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
                 let handler_key = handler.handler_key();
 
-                if call_deps.is_empty() {
-                    ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
-                } else {
-                    let deps_ready = call_deps.iter().all(|dep| {
+                let call_deps_ready = call_deps.is_empty()
+                    || call_deps.iter().all(|dep| {
                         state
                             .received_calls
                             .get(dep)
@@ -1248,7 +1251,20 @@ impl TransformationEngine {
                             .unwrap_or(false)
                     });
 
-                    if deps_ready {
+                let handler_deps_ready = handler_deps.is_empty()
+                    || handler_deps.iter().all(|dep| {
+                        state
+                            .completed_handlers
+                            .get(&range_key)
+                            .map(|completed| completed.contains(dep))
+                            .unwrap_or(false)
+                    });
+
+                if call_deps_ready && handler_deps_ready {
+                    // Ready to execute
+                    if call_deps.is_empty() {
+                        ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
+                    } else {
                         let calls = state.get_buffered_calls(range_key);
                         let calls: Vec<_> = calls
                             .into_iter()
@@ -1267,32 +1283,44 @@ impl TransformationEngine {
                             calls.len()
                         );
                         ready_handlers.push((handler.clone(), Arc::new(calls)));
-                    } else {
-                        tracing::warn!(
-                            "Handler {} buffering block {}: waiting for eth_call deps {:?}",
-                            handler_key,
-                            msg.range_start,
-                            call_deps
-                        );
-                        let pending = PendingEventData {
-                            range_start: msg.range_start,
-                            range_end: msg.range_end,
-                            source_name: msg.source_name.clone(),
-                            event_name: msg.event_name.clone(),
-                            events: filtered_events.clone(),
-                            required_calls: call_deps.clone(),
-                        };
-                        let timestamp_key = (msg.range_start, msg.range_end, handler_key.clone());
-                        state
-                            .pending_event_timestamps
-                            .entry(timestamp_key)
-                            .or_insert_with(Instant::now);
-                        state
-                            .pending_events
-                            .entry(handler_key)
-                            .or_default()
-                            .push(pending);
                     }
+                } else {
+                    // Buffer — needs either call deps or handler deps (or both)
+                    let waiting_for = if !call_deps_ready && !handler_deps_ready {
+                        format!(
+                            "eth_call deps {:?} and handler deps {:?}",
+                            call_deps, handler_deps
+                        )
+                    } else if !call_deps_ready {
+                        format!("eth_call deps {:?}", call_deps)
+                    } else {
+                        format!("handler deps {:?}", handler_deps)
+                    };
+                    tracing::warn!(
+                        "Handler {} buffering block {}: waiting for {}",
+                        handler_key,
+                        msg.range_start,
+                        waiting_for
+                    );
+                    let pending = PendingEventData {
+                        range_start: msg.range_start,
+                        range_end: msg.range_end,
+                        source_name: msg.source_name.clone(),
+                        event_name: msg.event_name.clone(),
+                        events: filtered_events.clone(),
+                        required_calls: call_deps.clone(),
+                        required_handlers: handler_deps,
+                    };
+                    let timestamp_key = (msg.range_start, msg.range_end, handler_key.clone());
+                    state
+                        .pending_event_timestamps
+                        .entry(timestamp_key)
+                        .or_insert_with(Instant::now);
+                    state
+                        .pending_events
+                        .entry(handler_key)
+                        .or_default()
+                        .push(pending);
                 }
             }
         } // lock released
@@ -1342,6 +1370,21 @@ impl TransformationEngine {
             &outcomes,
         )
         .await;
+
+        // Record handler completions for dependency tracking
+        {
+            let mut state = self.live_state.lock().await;
+            for outcome in &outcomes {
+                state
+                    .completed_handlers
+                    .entry(range_key)
+                    .or_default()
+                    .insert(outcome.handler_name.clone());
+            }
+        }
+
+        // Try to unblock handlers waiting on these completions
+        self.try_process_pending_events(range_key).await?;
 
         Ok(())
     }
@@ -1512,133 +1555,159 @@ impl TransformationEngine {
         Ok(())
     }
 
-    /// Try to process pending events for a range now that new calls arrived.
+    /// Try to process pending events for a range now that new calls or handler
+    /// completions arrived. Uses a cascading loop: after executing newly-ready
+    /// handlers, their completions may unblock further handlers in the chain.
     async fn try_process_pending_events(
         &self,
         range_key: (u64, u64),
     ) -> Result<(), TransformationError> {
-        let ready_events: Vec<(
-            String,
-            PendingEventData,
-            Arc<dyn super::traits::TransformationHandler>,
-        )> = {
-            let mut state = self.live_state.lock().await;
-            let mut ready = Vec::new();
+        loop {
+            let ready_events: Vec<(
+                String,
+                PendingEventData,
+                Arc<dyn super::traits::TransformationHandler>,
+            )> = {
+                let mut state = self.live_state.lock().await;
+                let mut ready = Vec::new();
 
-            let handler_keys: Vec<_> = state.pending_events.keys().cloned().collect();
+                let handler_keys: Vec<_> = state.pending_events.keys().cloned().collect();
 
-            for handler_key in handler_keys {
-                let ready_indices: Vec<usize> = {
-                    let pending = state.pending_events.get(&handler_key).unwrap();
+                for handler_key in handler_keys {
+                    let ready_indices: Vec<usize> = {
+                        let pending = state.pending_events.get(&handler_key).unwrap();
 
-                    pending
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, event_data)| {
-                            (event_data.range_start, event_data.range_end) == range_key
-                        })
-                        .filter(|(_, event_data)| {
-                            event_data.required_calls.iter().all(|dep| {
-                                state
-                                    .received_calls
-                                    .get(dep)
-                                    .map(|ranges| ranges.contains(&range_key))
-                                    .unwrap_or(false)
+                        pending
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, event_data)| {
+                                (event_data.range_start, event_data.range_end) == range_key
                             })
-                        })
-                        .map(|(i, _)| i)
-                        .collect()
-                };
+                            .filter(|(_, event_data)| {
+                                let calls_ready = event_data.required_calls.iter().all(|dep| {
+                                    state
+                                        .received_calls
+                                        .get(dep)
+                                        .map(|ranges| ranges.contains(&range_key))
+                                        .unwrap_or(false)
+                                });
+                                let handlers_ready =
+                                    event_data.required_handlers.iter().all(|dep| {
+                                        state
+                                            .completed_handlers
+                                            .get(&range_key)
+                                            .map(|completed| completed.contains(dep))
+                                            .unwrap_or(false)
+                                    });
+                                calls_ready && handlers_ready
+                            })
+                            .map(|(i, _)| i)
+                            .collect()
+                    };
 
-                if !ready_indices.is_empty() {
-                    tracing::info!(
-                        "Handler {} unblocked for block {}: call deps now available",
-                        handler_key,
-                        range_key.0
-                    );
-                    let pending = state.pending_events.get_mut(&handler_key).unwrap();
-                    for i in ready_indices.into_iter().rev() {
-                        let event_data = pending.remove(i);
-                        let handlers = self
-                            .registry
-                            .handlers_for_event(&event_data.source_name, &event_data.event_name);
-                        if let Some(handler) = handlers
-                            .into_iter()
-                            .find(|h| h.handler_key() == handler_key)
-                        {
-                            let handler: Arc<dyn super::traits::TransformationHandler> = handler;
-                            ready.push((handler_key.clone(), event_data, handler));
+                    if !ready_indices.is_empty() {
+                        tracing::info!(
+                            "Handler {} unblocked for block {}: deps now available",
+                            handler_key,
+                            range_key.0
+                        );
+                        let pending = state.pending_events.get_mut(&handler_key).unwrap();
+                        for i in ready_indices.into_iter().rev() {
+                            let event_data = pending.remove(i);
+                            let handlers = self.registry.handlers_for_event(
+                                &event_data.source_name,
+                                &event_data.event_name,
+                            );
+                            if let Some(handler) = handlers
+                                .into_iter()
+                                .find(|h| h.handler_key() == handler_key)
+                            {
+                                let handler: Arc<dyn super::traits::TransformationHandler> =
+                                    handler;
+                                ready.push((handler_key.clone(), event_data, handler));
+                            }
                         }
+                    }
+
+                    if state
+                        .pending_events
+                        .get(&handler_key)
+                        .map(|p| p.is_empty())
+                        .unwrap_or(true)
+                    {
+                        state.pending_events.remove(&handler_key);
                     }
                 }
 
-                if state
-                    .pending_events
-                    .get(&handler_key)
-                    .map(|p| p.is_empty())
-                    .unwrap_or(true)
-                {
-                    state.pending_events.remove(&handler_key);
-                }
+                ready
+            };
+
+            if ready_events.is_empty() {
+                return Ok(());
             }
 
-            ready
-        };
+            let calls = {
+                let state = self.live_state.lock().await;
+                let calls = state.get_buffered_calls(range_key);
+                Arc::new(filter_calls_by_start_block(&self.contracts, calls))
+            };
 
-        if ready_events.is_empty() {
-            return Ok(());
-        }
+            // Build HandlerTasks and use executor
+            let mut tasks = Vec::new();
+            for (_handler_key, event_data, handler) in ready_events {
+                let tx_addresses =
+                    self.read_receipt_addresses(event_data.range_start, event_data.range_end);
+                tasks.push(HandlerTask {
+                    handler,
+                    events: Arc::new(event_data.events),
+                    calls: calls.clone(),
+                    tx_addresses,
+                });
+            }
 
-        let calls = {
-            let state = self.live_state.lock().await;
-            let calls = state.get_buffered_calls(range_key);
-            Arc::new(filter_calls_by_start_block(&self.contracts, calls))
-        };
+            let submitted_keys: HashSet<String> =
+                tasks.iter().map(|t| t.handler.handler_key()).collect();
 
-        // Build HandlerTasks and use executor
-        let mut tasks = Vec::new();
-        for (_handler_key, event_data, handler) in ready_events {
-            let tx_addresses =
-                self.read_receipt_addresses(event_data.range_start, event_data.range_end);
-            tasks.push(HandlerTask {
-                handler,
-                events: Arc::new(event_data.events),
-                calls: calls.clone(),
-                tx_addresses,
-            });
-        }
+            let outcomes = self
+                .executor
+                .execute_handlers(tasks, range_key.0, range_key.1, &DbExecMode::Direct)
+                .await;
 
-        let submitted_keys: HashSet<String> =
-            tasks.iter().map(|t| t.handler.handler_key()).collect();
+            let succeeded_keys: HashSet<String> =
+                outcomes.iter().map(|o| o.handler_key.clone()).collect();
 
-        let outcomes = self
-            .executor
-            .execute_handlers(tasks, range_key.0, range_key.1, &DbExecMode::Direct)
+            for outcome in &outcomes {
+                self.finalizer
+                    .record_completed_range_for_handler(
+                        &outcome.handler_key,
+                        outcome.range_start,
+                        outcome.range_end,
+                    )
+                    .await?;
+            }
+
+            self.record_handler_outcomes(
+                range_key.0,
+                range_key.1,
+                &submitted_keys,
+                &succeeded_keys,
+                &outcomes,
+            )
             .await;
 
-        let succeeded_keys: HashSet<String> =
-            outcomes.iter().map(|o| o.handler_key.clone()).collect();
-
-        for outcome in &outcomes {
-            self.finalizer
-                .record_completed_range_for_handler(
-                    &outcome.handler_key,
-                    outcome.range_start,
-                    outcome.range_end,
-                )
-                .await?;
+            // Record handler completions for cascading
+            {
+                let mut state = self.live_state.lock().await;
+                for outcome in &outcomes {
+                    state
+                        .completed_handlers
+                        .entry(range_key)
+                        .or_default()
+                        .insert(outcome.handler_name.clone());
+                }
+            }
+            // Loop to check if more handlers are now unblocked
         }
-
-        self.record_handler_outcomes(
-            range_key.0,
-            range_key.1,
-            &submitted_keys,
-            &succeeded_keys,
-            &outcomes,
-        )
-        .await;
-
-        Ok(())
     }
 
     /// Build handler tasks for all event and call triggers in a block range.

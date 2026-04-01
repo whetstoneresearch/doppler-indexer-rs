@@ -136,6 +136,13 @@ pub trait EventHandler: TransformationHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![]
     }
+
+    /// Declare other handlers that must complete before this handler runs.
+    /// Returns handler keys (e.g., "pool_create_v1") that must have finished
+    /// processing the same block range before this handler can execute.
+    fn handler_dependencies(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// Marker trait for handlers that respond to eth_call results.

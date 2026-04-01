@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use super::context::{DecodedCall, DecodedEvent};
 use super::engine::RangeCompleteKind;
 
-/// Buffered event data waiting for call dependencies.
+/// Buffered event data waiting for call dependencies and/or handler dependencies.
 #[derive(Debug)]
 pub(crate) struct PendingEventData {
     pub range_start: u64,
@@ -19,12 +19,14 @@ pub(crate) struct PendingEventData {
     pub events: Vec<DecodedEvent>,
     /// Call dependencies needed: (source, function_name)
     pub required_calls: Vec<(String, String)>,
+    /// Handler dependencies needed: handler keys that must complete first
+    pub required_handlers: Vec<String>,
 }
 
 /// Default timeout for stuck pending events (5 minutes).
 pub(crate) const PENDING_EVENT_TIMEOUT_SECS: u64 = 300;
 
-/// Live processing state for buffering events with call dependencies.
+/// Live processing state for buffering events with call and handler dependencies.
 #[derive(Default)]
 pub(crate) struct LiveProcessingState {
     /// Track which (source, function) calls have arrived for which ranges.
@@ -42,6 +44,9 @@ pub(crate) struct LiveProcessingState {
     pub pending_event_timestamps: HashMap<(u64, u64, String), Instant>,
     /// Ranges that have been finalized (to prevent double finalization).
     pub finalized_ranges: HashSet<(u64, u64)>,
+    /// Track which handlers have completed for each range (for handler dependency chains).
+    /// Key: (range_start, range_end), Value: set of completed handler keys
+    pub completed_handlers: HashMap<(u64, u64), HashSet<String>>,
 }
 
 impl LiveProcessingState {
@@ -58,6 +63,7 @@ impl LiveProcessingState {
                 tracing::debug!("Removed calls buffer for orphaned range {:?}", range_key);
             }
             self.completion.remove(&range_key);
+            self.completed_handlers.remove(&range_key);
 
             // Remove from finalized_ranges to allow re-finalization if block is re-processed
             self.finalized_ranges.remove(&range_key);
@@ -100,6 +106,7 @@ impl LiveProcessingState {
         self.calls_buffer.remove(&range_key);
         self.completion.remove(&range_key);
         self.finalized_ranges.remove(&range_key);
+        self.completed_handlers.remove(&range_key);
         self.pending_event_timestamps
             .retain(|(rs, re, _), _| (*rs, *re) != range_key);
         for ranges in self.received_calls.values_mut() {
@@ -208,6 +215,7 @@ impl LiveProcessingState {
     pub fn cleanup_after_finalize(&mut self, range_key: (u64, u64)) {
         self.calls_buffer.remove(&range_key);
         self.completion.remove(&range_key);
+        self.completed_handlers.remove(&range_key);
         for ranges in self.received_calls.values_mut() {
             ranges.remove(&range_key);
         }
