@@ -227,12 +227,25 @@ pub async fn collect_receipts(
 
     let block_receipts_method = chain.block_receipts_method.clone();
 
+    // When block_receipts_method is available, each task makes a single
+    // eth_getBlockReceipts call — safe to run block_receipt_concurrency of
+    // them in parallel.  Without it, each task falls back to
+    // get_transaction_receipts_batch() which internally fans out up to
+    // rpc_concurrency concurrent eth_getTransactionReceipt calls.  Running
+    // multiple of those concurrently multiplies the request count, so cap
+    // at 1 to match the old sequential behaviour.
+    let effective_receipt_concurrency = if block_receipts_method.is_some() {
+        block_receipt_concurrency
+    } else {
+        1
+    };
+
     loop {
         tokio::select! {
             // -----------------------------------------------------------------
             // Branch 1: A new block arrives from upstream
             // -----------------------------------------------------------------
-            block_result = block_rx.recv(), if !block_rx_closed && receipt_join_set.len() < block_receipt_concurrency => {
+            block_result = block_rx.recv(), if !block_rx_closed && receipt_join_set.len() < effective_receipt_concurrency => {
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
                         let range_start = (block_number / range_size) * range_size;

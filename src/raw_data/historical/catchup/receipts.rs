@@ -116,6 +116,42 @@ pub async fn collect_receipts(
         // Skip if receipts and logs both exist (or logs aren't needed)
         // Factory catchup is handled separately by factories.rs reading from logs files
         if receipts_exist && (logs_exist || log_tx.is_none()) {
+            // Drain any pending write from the previous range before sending
+            // RangeComplete for this skipped range.  Otherwise the event-trigger
+            // collector sees RangeComplete(B) before the write for A finishes,
+            // flushing A's buffered triggers under B's range.
+            if let Some(handle) = pending_write_handle.take() {
+                handle
+                    .await
+                    .map_err(|e| ReceiptCollectionError::JoinError(e.to_string()))??;
+
+                if let Some((ref path, wr_start, wr_end)) = pending_write_info.take() {
+                    if let Some(ref sm) = storage_manager {
+                        upload_parquet_to_s3(
+                            sm,
+                            path,
+                            &chain.name,
+                            "raw/receipts",
+                            wr_start,
+                            wr_end - 1,
+                        )
+                        .await
+                        .map_err(|e| {
+                            ReceiptCollectionError::Io(std::io::Error::other(e.to_string()))
+                        })?;
+                    }
+
+                    send_range_complete(
+                        &channels.factory_log_tx,
+                        &channels.log_tx,
+                        &channels.event_trigger_tx,
+                        wr_start,
+                        wr_end,
+                    )
+                    .await?;
+                }
+            }
+
             // Still need to signal range complete for downstream collectors
             // when catching up, so they know this range is done
             if has_factories || channels.event_trigger_tx.is_some() {
