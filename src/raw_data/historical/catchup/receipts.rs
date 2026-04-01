@@ -281,7 +281,7 @@ pub async fn collect_receipts(
         catchup_count += 1;
 
         // Spawn background write; RangeComplete deferred until drain confirms the write.
-        let output_path = result.output_path.clone();
+        let output_path = result.pending_write.output_path().to_path_buf();
         pending_write_info = Some((output_path, range.start, range.end));
         pending_write_handle =
             Some(tokio::spawn(execute_receipt_write(result.pending_write)));

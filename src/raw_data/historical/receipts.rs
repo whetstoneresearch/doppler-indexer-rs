@@ -309,11 +309,17 @@ pub(crate) enum PendingReceiptWrite {
     },
 }
 
-#[allow(dead_code)]
+impl PendingReceiptWrite {
+    pub(crate) fn output_path(&self) -> &Path {
+        match self {
+            PendingReceiptWrite::Minimal { output_path, .. } => output_path,
+            PendingReceiptWrite::Full { output_path, .. } => output_path,
+        }
+    }
+}
+
 pub(crate) struct ProcessRangeResult {
     pub(crate) pending_write: PendingReceiptWrite,
-    pub(crate) total_receipts: usize,
-    pub(crate) output_path: PathBuf,
 }
 
 pub(crate) async fn execute_receipt_write(
@@ -793,11 +799,7 @@ pub(crate) async fn process_range(
         channel_pct,
     );
 
-    Ok(ProcessRangeResult {
-        pending_write,
-        total_receipts,
-        output_path,
-    })
+    Ok(ProcessRangeResult { pending_write })
 }
 
 fn process_receipts_minimal(

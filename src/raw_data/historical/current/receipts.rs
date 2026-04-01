@@ -127,7 +127,7 @@ async fn try_finalize_range(
     // Spawn parquet write; LogMessage::RangeComplete deferred to Branch 3.
     let wr_start = range.start;
     let wr_end = range.end;
-    let wr_path = output_path;
+    let wr_path = output_path.to_path_buf();
     write_join_set.spawn(async move {
         let result = execute_receipt_write(pending_write).await;
         WriteCompleteResult {
@@ -534,13 +534,14 @@ pub async fn collect_receipts(
                     .await?;
 
                     // Recollect is a one-off - write immediately.
+                    let recollect_output_path = pr.pending_write.output_path().to_path_buf();
                     execute_receipt_write(pr.pending_write).await?;
 
                     // Upload to S3 if configured
                     if let Some(ref sm) = storage_manager {
                         upload_parquet_to_s3(
                             sm,
-                            &pr.output_path,
+                            &recollect_output_path,
                             &chain.name,
                             "raw/receipts",
                             range.start,
