@@ -1346,6 +1346,7 @@ impl TransformationEngine {
         // Categorize handlers: ready to run vs needs buffering
         let range_key = (msg.range_start, msg.range_end);
         let mut ready_handlers: Vec<ReadyHandler> = Vec::new();
+        let mut dep_failed_names: Vec<String> = Vec::new();
         {
             let mut state = self.live_state.lock().await;
             for handler in &handlers {
@@ -1375,7 +1376,36 @@ impl TransformationEngine {
                             .unwrap_or(false)
                     });
 
-                if call_deps_ready && handler_deps_ready {
+                // If any handler dependency has already failed for this
+                // range, this handler can never run — skip it immediately.
+                let dep_already_failed = if handler_deps.is_empty() {
+                    false
+                } else {
+                    let failed = state
+                        .failed_handlers
+                        .get(&range_key)
+                        .map(|f| handler_deps.iter().any(|dep| f.contains(dep)))
+                        .unwrap_or(false);
+                    if failed {
+                        let handler_name = handler.name().to_string();
+                        tracing::warn!(
+                            "Handler {} skipped for block {}: upstream handler dep already failed",
+                            handler_key,
+                            msg.range_start,
+                        );
+                        state
+                            .failed_handlers
+                            .entry(range_key)
+                            .or_default()
+                            .insert(handler_name.clone());
+                        dep_failed_names.push(handler_name);
+                    }
+                    failed
+                };
+
+                if dep_already_failed {
+                    // Don't buffer — handler is already doomed for this range
+                } else if call_deps_ready && handler_deps_ready {
                     // Ready to execute
                     if call_deps.is_empty() {
                         ready_handlers.push((handler.clone(), Arc::new(Vec::new())));
@@ -1440,6 +1470,39 @@ impl TransformationEngine {
             }
         } // lock released
 
+        // Handlers skipped because an upstream dep already failed: persist
+        // and cascade so their own dependents are also failed immediately.
+        if !dep_failed_names.is_empty() {
+            if range_key.1 - range_key.0 == 1 {
+                let failed_keys: HashSet<String> = dep_failed_names
+                    .iter()
+                    .filter_map(|name| {
+                        self.registry
+                            .handler_key_for_name(name)
+                            .map(|k| k.to_string())
+                    })
+                    .collect();
+                let storage = LiveStorage::new(&self.chain_name);
+                if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
+                    status.failed_handlers.extend(failed_keys.iter().cloned());
+                    for k in &failed_keys {
+                        status.completed_handlers.remove(k);
+                    }
+                    status.transformed = false;
+                }) {
+                    if !matches!(e, StorageError::NotFound(_)) {
+                        tracing::warn!(
+                            "Failed to persist dep-failed handlers for block {}: {}",
+                            range_key.0,
+                            e
+                        );
+                    }
+                }
+            }
+            self.cascade_handler_failures(&dep_failed_names, range_key)
+                .await;
+        }
+
         if ready_handlers.is_empty() {
             return Ok(());
         }
@@ -1492,7 +1555,7 @@ impl TransformationEngine {
         // handler would prematurely unblock dependents after its first batch.
         // Dep handlers are completed at RangeCompleteKind::Logs time when all
         // event batches for the block have been dispatched.
-        {
+        let newly_failed_names: Vec<String> = {
             let dep_names = self.registry.dependency_handler_names();
             let mut state = self.live_state.lock().await;
             let failed_names: HashSet<String> = state
@@ -1511,6 +1574,7 @@ impl TransformationEngine {
                         .insert(outcome.handler_name.clone());
                 }
             }
+            let mut newly_failed = Vec::new();
             for key in submitted_keys.difference(&succeeded_keys) {
                 if let Some(name) = self.registry.handler_name_for_key(key) {
                     state
@@ -1518,9 +1582,14 @@ impl TransformationEngine {
                         .entry(range_key)
                         .or_default()
                         .insert(name.to_string());
+                    newly_failed.push(name.to_string());
                 }
             }
-        }
+            newly_failed
+        };
+
+        self.cascade_handler_failures(&newly_failed_names, range_key)
+            .await;
 
         // Try to unblock handlers waiting on call deps (handler dep
         // unblocking for dep handlers is deferred until Logs fires).
@@ -1874,7 +1943,7 @@ impl TransformationEngine {
             // pre-Logs they are deferred to avoid premature dependent unblocking.
             // Only fully-succeeded handlers are marked as completed.
             // Handlers already in failed_handlers are never re-completed.
-            {
+            let newly_failed_names: Vec<String> = {
                 let dep_names = self.registry.dependency_handler_names();
                 let mut state = self.live_state.lock().await;
                 let logs_complete = state
@@ -1899,6 +1968,7 @@ impl TransformationEngine {
                             .insert(outcome.handler_name.clone());
                     }
                 }
+                let mut newly_failed_names: Vec<String> = Vec::new();
                 for key in submitted_keys.difference(&succeeded_keys) {
                     if let Some(name) = self.registry.handler_name_for_key(key) {
                         state
@@ -1906,10 +1976,110 @@ impl TransformationEngine {
                             .entry(range_key)
                             .or_default()
                             .insert(name.to_string());
+                        newly_failed_names.push(name.to_string());
                     }
                 }
-            }
+                newly_failed_names
+            };
+
+            self.cascade_handler_failures(&newly_failed_names, range_key)
+                .await;
+
             // Loop to check if more handlers are now unblocked
+        }
+    }
+
+    /// Cascade failures from newly-failed handlers to all their transitive
+    /// dependents.  Marks dependents as failed in `state`, removes their
+    /// pending events, and persists the cascaded failures to the status file
+    /// for single-block (live) ranges.
+    ///
+    /// `newly_failed_names` should contain the handler `name()` strings that
+    /// just failed — **not** handler keys.
+    ///
+    /// Must be called while the caller does **not** hold the `live_state` lock.
+    async fn cascade_handler_failures(
+        &self,
+        newly_failed_names: &[String],
+        range_key: (u64, u64),
+    ) {
+        if newly_failed_names.is_empty() {
+            return;
+        }
+
+        let mut cascaded: HashSet<String> = HashSet::new();
+        for failed_name in newly_failed_names {
+            for dep_name in self.registry.transitive_dependents_of(failed_name) {
+                cascaded.insert(dep_name);
+            }
+        }
+        if cascaded.is_empty() {
+            return;
+        }
+
+        let cascaded_keys: Vec<String> = cascaded
+            .iter()
+            .filter_map(|name| {
+                self.registry
+                    .handler_key_for_name(name)
+                    .map(|k| k.to_string())
+            })
+            .collect();
+
+        {
+            let mut state = self.live_state.lock().await;
+            for name in &cascaded {
+                state
+                    .failed_handlers
+                    .entry(range_key)
+                    .or_default()
+                    .insert(name.clone());
+                if let Some(completed) = state.completed_handlers.get_mut(&range_key) {
+                    completed.remove(name);
+                }
+            }
+
+            for key in &cascaded_keys {
+                if let Some(pending) = state.pending_events.get_mut(key) {
+                    pending.retain(|p| (p.range_start, p.range_end) != range_key);
+                    if pending.is_empty() {
+                        state.pending_events.remove(key);
+                    }
+                }
+                state
+                    .pending_event_timestamps
+                    .remove(&(range_key.0, range_key.1, key.clone()));
+            }
+        }
+
+        tracing::warn!(
+            "Cascaded failure to {} dependent handler(s) for block {}: {:?}",
+            cascaded.len(),
+            range_key.0,
+            cascaded
+        );
+
+        // Persist cascaded failures to status file for single-block (live) ranges.
+        if range_key.1 - range_key.0 == 1 {
+            let cascaded_key_set: HashSet<String> = cascaded_keys.into_iter().collect();
+            let storage = LiveStorage::new(&self.chain_name);
+            if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
+                status
+                    .failed_handlers
+                    .extend(cascaded_key_set.iter().cloned());
+                for k in &cascaded_key_set {
+                    status.completed_handlers.remove(k);
+                }
+                status.transformed = false;
+            }) {
+                if !matches!(e, StorageError::NotFound(_)) {
+                    tracing::warn!(
+                        "Failed to persist cascaded failures for block {}: {}",
+                        range_key.0,
+                        e
+                    );
+                }
+            }
         }
     }
 

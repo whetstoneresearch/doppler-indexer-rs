@@ -95,6 +95,17 @@ A handler is ready to execute when ALL of the following are true:
 
 Both dep types are stored on the same `PendingEventData` and checked in the same filter in `try_process_pending_events`. The check runs on two triggers: call arrival (existing) and handler completion (new).
 
+#### Failure Cascading
+
+When a handler fails, all of its transitive dependents are immediately failed as well (they can never satisfy their `required_handlers`). The cascade:
+
+1. Computes transitive dependents via `registry.transitive_dependents_of(failed_name)`.
+2. Marks each dependent as failed in `state.failed_handlers` for the range.
+3. Removes their pending events from `state.pending_events` so they don't sit waiting for a 5-minute timeout.
+4. Persists the cascaded failures to the status file so the block is retryable.
+
+This replaces the previous behavior where dependents of a failed handler would eventually time out after 5 minutes. Failure cascading is immediate.
+
 #### Finalization
 
 The existing finalization flow is unchanged. `check_finalization_readiness` already gates on "no pending events." Since handler-dep pending events use the same `pending_events` map, they are automatically included in the finalization gate and the 5-minute timeout.
@@ -121,6 +132,7 @@ The database transaction model is unchanged: each handler commits independently.
 3. All handler names referenced in `handler_dependencies()` must correspond to a registered handler — missing references are rejected at startup.
 4. Independent dependency chains execute concurrently. A handler blocks only on its own declared dependencies.
 5. Catchup mode processes handlers in topological order. Live mode dispatches handlers as soon as their dependencies complete.
+6. When a handler fails, all transitive dependents are immediately failed for that range — they are not left pending.
 
 ## Files to Modify
 

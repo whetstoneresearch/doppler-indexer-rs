@@ -65,6 +65,8 @@ pub struct TransformationRegistry {
     dependency_handler_names: HashSet<String>,
     /// Maps handler_key() to handler name() for reverse lookup
     handler_key_to_name: HashMap<String, String>,
+    /// Maps handler name() to handler_key() for reverse lookup
+    handler_name_to_key: HashMap<String, String>,
     /// Set of handler names registered as event handlers (for dep validation)
     event_handler_names: HashSet<String>,
 }
@@ -80,6 +82,7 @@ impl TransformationRegistry {
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
             handler_key_to_name: HashMap::new(),
+            handler_name_to_key: HashMap::new(),
             event_handler_names: HashSet::new(),
         }
     }
@@ -114,6 +117,8 @@ impl TransformationRegistry {
 
         self.handler_key_to_name
             .insert(handler.handler_key(), handler.name().to_string());
+        self.handler_name_to_key
+            .insert(handler.name().to_string(), handler.handler_key());
         self.event_handler_names
             .insert(handler.name().to_string());
 
@@ -361,6 +366,43 @@ impl TransformationRegistry {
     /// Look up a handler's name() from its handler_key().
     pub fn handler_name_for_key(&self, handler_key: &str) -> Option<&str> {
         self.handler_key_to_name.get(handler_key).map(|s| s.as_str())
+    }
+
+    /// Look up a handler's handler_key() from its name().
+    pub fn handler_key_for_name(&self, name: &str) -> Option<&str> {
+        self.handler_name_to_key.get(name).map(|s| s.as_str())
+    }
+
+    /// Return the transitive set of handler names that depend on `name`.
+    ///
+    /// Given handler A with dependent B and B with dependent C,
+    /// `transitive_dependents_of("A")` returns {"B", "C"}.
+    pub fn transitive_dependents_of(&self, name: &str) -> HashSet<String> {
+        // Build reverse adjacency: dep -> set of handlers that list it as a dependency
+        let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (handler, deps) in &self.handler_dependency_graph {
+            for dep in deps {
+                reverse.entry(dep.as_str()).or_default().push(handler.as_str());
+            }
+        }
+
+        let mut result = HashSet::new();
+        let mut queue = VecDeque::new();
+        if let Some(direct) = reverse.get(name) {
+            for d in direct {
+                queue.push_back(*d);
+            }
+        }
+        while let Some(current) = queue.pop_front() {
+            if result.insert(current.to_string()) {
+                if let Some(further) = reverse.get(current) {
+                    for d in further {
+                        queue.push_back(*d);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Get all unique call handlers with their triggers grouped.
@@ -932,5 +974,54 @@ mod tests {
         let pos_a = order.iter().position(|n| n == "A").unwrap();
         let pos_c = order.iter().position(|n| n == "C").unwrap();
         assert!(pos_a < pos_c, "A must come before C");
+    }
+
+    #[test]
+    fn transitive_dependents_no_deps() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec![]));
+        registry.validate_and_sort_handler_dependencies();
+        assert!(registry.transitive_dependents_of("A").is_empty());
+    }
+
+    #[test]
+    fn transitive_dependents_linear_chain() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.register_event_handler(mock_handler("C", vec!["B"]));
+        registry.validate_and_sort_handler_dependencies();
+        let deps_of_a = registry.transitive_dependents_of("A");
+        assert_eq!(deps_of_a.len(), 2);
+        assert!(deps_of_a.contains("B"));
+        assert!(deps_of_a.contains("C"));
+        let deps_of_b = registry.transitive_dependents_of("B");
+        assert_eq!(deps_of_b.len(), 1);
+        assert!(deps_of_b.contains("C"));
+        assert!(registry.transitive_dependents_of("C").is_empty());
+    }
+
+    #[test]
+    fn transitive_dependents_diamond() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.register_event_handler(mock_handler("C", vec!["A"]));
+        registry.register_event_handler(mock_handler("D", vec!["B", "C"]));
+        registry.validate_and_sort_handler_dependencies();
+        let deps_of_a = registry.transitive_dependents_of("A");
+        assert_eq!(deps_of_a.len(), 3);
+        assert!(deps_of_a.contains("B"));
+        assert!(deps_of_a.contains("C"));
+        assert!(deps_of_a.contains("D"));
+    }
+
+    #[test]
+    fn handler_key_for_name_lookup() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        assert!(registry.handler_key_for_name("A").is_some());
+        assert!(registry.handler_key_for_name("nonexistent").is_none());
     }
 }
