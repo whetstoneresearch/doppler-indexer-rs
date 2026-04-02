@@ -569,7 +569,7 @@ impl RetryProcessor {
                 Ok(ops) => {
                     if !ops.is_empty() {
                         let ops = inject_source_version(ops, handler_name, handler_version);
-                        execute_with_snapshot_capture(
+                        if let Err(e) = execute_with_snapshot_capture(
                             ops,
                             &self.db_pool,
                             Some(&live_storage),
@@ -577,7 +577,16 @@ impl RetryProcessor {
                             handler_name,
                             handler_version,
                         )
-                        .await?;
+                        .await
+                        {
+                            tracing::error!(
+                                "Handler {} DB write failed during live retry for block {}: {}",
+                                handler_key,
+                                block_number,
+                                e
+                            );
+                            continue;
+                        }
                     }
 
                     succeeded_keys.insert(handler_key.clone());

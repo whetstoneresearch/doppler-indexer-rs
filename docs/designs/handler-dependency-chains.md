@@ -43,16 +43,17 @@ Live mode processes single-block ranges. Events arrive as `DecodedEventsMessage`
 #### New State
 
 ```rust
-// In LiveProcessingState:
+// In PendingEventData (extended, not a new struct):
+pub required_handlers: Vec<String>,  // handler name() strings
 
-/// Handlers that have completed for a given range.
-/// Key: (range_start, range_end), Value: set of handler names (from name(), not handler_key())
+// In LiveProcessingState:
 pub completed_handlers: HashMap<(u64, u64), HashSet<String>>,
 
-/// Events buffered because handler dependencies are not yet met.
-/// Key: handler_key, Value: pending event data (similar to existing call-dep pending)
-pub pending_handler_dep_events: HashMap<String, Vec<PendingEventData>>,
+// In HandlerOutcome (extended):
+pub handler_name: String,  // handler name() for completion tracking
 ```
+
+Handler deps are tracked in the **same** `pending_events` map as call deps (via the extended `PendingEventData`), not a separate map. This avoids the "which map does a handler with both dep types go in?" problem.
 
 #### Dispatch Flow
 
@@ -63,13 +64,14 @@ When `process_events_message` receives events for a block:
    - **Call deps**: all `(source, function)` pairs present in `received_calls` for this range.
    - **Handler deps**: all dependency handler `name()`s present in `completed_handlers` for this range.
 3. If both are satisfied, the handler is ready — add to the execution batch.
-4. If either is unsatisfied, buffer in the appropriate pending structure.
+4. If either is unsatisfied, buffer in `pending_events` with both `required_calls` and `required_handlers` populated.
 
 When a handler completes execution:
 
 1. Insert its `name()` into `completed_handlers` for the range.
-2. Scan `pending_handler_dep_events` for handlers whose dependencies are now fully met.
-3. Dispatch any newly-unblocked handlers (they may still need call-dep checks).
+2. Call `try_process_pending_events` which scans the unified `pending_events` map for handlers whose call deps AND handler deps are now all met.
+3. Dispatch any newly-unblocked handlers.
+4. Cascade: loop steps 1-3 until no more handlers are unblocked (handles A→B→C chains).
 
 This means independent chains and dependency-free handlers run concurrently, while dependent handlers wait only for their specific dependencies — not an entire "level."
 
@@ -91,11 +93,11 @@ A handler is ready to execute when ALL of the following are true:
 - All `call_dependencies()` are available for the range
 - All `handler_dependencies()` are completed (or no-op'd) for the range
 
-The pending state can be unified or kept as two separate maps checked together. Two separate maps is cleaner since the unblocking triggers are different (call arrival vs. handler completion), but the dispatch check gates on both.
+Both dep types are stored on the same `PendingEventData` and checked in the same filter in `try_process_pending_events`. The check runs on two triggers: call arrival (existing) and handler completion (new).
 
 #### Finalization
 
-The existing finalization flow is unchanged. `check_finalization_readiness` already gates on "no pending events." Handler-dep pending events are an additional set of pending events that must drain before finalization. The 5-minute timeout applies to handler-dep pending events as well, as a safety net.
+The existing finalization flow is unchanged. `check_finalization_readiness` already gates on "no pending events." Since handler-dep pending events use the same `pending_events` map, they are automatically included in the finalization gate and the 5-minute timeout.
 
 ### Catchup / Historical Mode
 
@@ -126,8 +128,9 @@ The database transaction model is unchanged: each handler commits independently.
 |------|--------|
 | `src/transformations/traits.rs` | Add `handler_dependencies()` to `EventHandler` trait |
 | `src/transformations/registry.rs` | Dependency graph construction, topological sort, cycle detection, missing-dep validation |
-| `src/transformations/live_state.rs` | Add `completed_handlers` and `pending_handler_dep_events` to `LiveProcessingState`, handler-dep readiness check |
-| `src/transformations/engine.rs` | Extend `process_events_message` to check handler deps, add handler-completion dispatch, integrate no-op completion into `process_range_complete` flow |
+| `src/transformations/live_state.rs` | Add `completed_handlers` to `LiveProcessingState`, extend `PendingEventData` with `required_handlers`, extend cleanup methods |
+| `src/transformations/executor.rs` | Add `handler_name` to `HandlerOutcome` |
+| `src/transformations/engine.rs` | Unified dep check in `process_events_message`, handler-completion recording, cascading dispatch in `try_process_pending_events`, integrate no-op completion into `process_range_complete` flow |
 | `src/transformations/finalizer.rs` | Extend `process_range_complete` to trigger no-op marking before finalization check |
 | `src/transformations/event/v3/create.rs` | No change (this is the dependency target) |
 | Swap/metrics handlers | Add `handler_dependencies()` returning `vec!["V3CreateHandler"]` |
@@ -150,20 +153,44 @@ The database transaction model is unchanged: each handler commits independently.
 - Only applies to `HandlerKind::Event` — call handlers have no dependency ordering.
 - Committed directly to `feat/handler-dependency-chains`.
 
-### Phase 3: Live Mode Dispatch
+### Phase 3: Live Mode Dispatch (COMPLETE)
 
-- Add `completed_handlers` and `pending_handler_dep_events` to `LiveProcessingState`.
-- Extend `process_events_message` to check handler dependencies alongside call dependencies when categorizing handlers as ready vs. pending.
-- On handler completion, insert into `completed_handlers` and scan pending handlers for newly-unblocked ones.
-- Dispatch unblocked handlers through the existing executor path.
-- Cleanup `completed_handlers` and `pending_handler_dep_events` in `cleanup_after_finalize`.
+- Extended `PendingEventData` with `required_handlers` field (unified pending map, not a second map).
+- Added `completed_handlers` to `LiveProcessingState` for tracking handler completions per range.
+- Added `handler_name` to `HandlerOutcome` for completion tracking without reverse-lookup.
+- Extended `process_events_message` with unified call+handler dep check.
+- Record handler completions after execution, then cascade via `try_process_pending_events`.
+- `try_process_pending_events` now checks both `required_calls` and `required_handlers`, wrapped in a loop for cascading (A→B→C chains).
+- Extended all cleanup methods (`cleanup_after_finalize`, `cleanup_for_orphaned_blocks`, `cleanup_for_retry`) to clear `completed_handlers`.
+- Timeout logging now shows both `waiting_for_calls` and `waiting_for_handlers`.
+- PRs: #82 (state), #83 (dispatch)
 
-### Phase 4: No-op Completion and Finalization
+### Phase 4: No-op Completion for Untriggered Handlers
 
-- On `RangeCompleteKind::Logs`, compute untriggered dependency handlers and mark them completed-no-op.
-- Unblock any pending handlers that were waiting on the no-op'd handlers.
-- Extend `check_finalization_readiness` to also gate on handler-dep pending events being drained.
-- Apply the existing 5-minute timeout to handler-dep pending events.
+- On `RangeCompleteKind::Logs`, compute untriggered dependency handlers and mark them completed-no-op in `completed_handlers`.
+- Unblock any pending handlers that were waiting on the no-op'd handlers via `try_process_pending_events`.
+- Without this phase, a handler depending on an untriggered handler will timeout after 5 minutes (the existing timeout safety net).
+
+**Key details for implementation:**
+
+**File:** `src/transformations/engine.rs` or `src/transformations/finalizer.rs`
+
+**Trigger:** `process_range_complete()` in `finalizer.rs` (line 92) is called when `RangeCompleteKind::Logs` arrives. After marking `logs_complete`, but before calling `maybe_finalize_range`, insert the no-op logic.
+
+**Logic:**
+1. Get the set of all handler names that are declared as dependencies (from `registry.handler_dependency_graph()` — values are the dep names).
+2. Lock `live_state`, get `completed_handlers[range_key]` (what has already completed).
+3. For each dependency handler name not in the completed set, insert it as completed-no-op.
+4. Call `try_process_pending_events(range_key)` to unblock any waiting handlers.
+5. Then proceed to `maybe_finalize_range`.
+
+**Registry helper needed:** A method like `all_dependency_handler_names() -> HashSet<String>` that returns the union of all values in `handler_dependency_graph`. This can be precomputed during `validate_and_sort_handler_dependencies()` and stored as a field. Or computed on the fly from `handler_dependency_graph()`.
+
+**Interaction with `process_range_complete`:** Currently `process_range_complete` just marks completion and calls `maybe_finalize_range`. The no-op + unblock step goes between. Since `process_range_complete` is on `RangeFinalizer` (not the engine), it doesn't have access to `try_process_pending_events`. Options:
+- Move the no-op logic to the engine's `run()` loop where `complete_rx` messages are handled (the engine has access to both finalizer and live_state)
+- Pass a callback or the engine ref to the finalizer
+
+The cleanest approach is to handle it in the engine's `run()` loop: when receiving a `RangeCompleteKind::Logs` message, do the no-op marking and pending dispatch BEFORE calling `finalizer.process_range_complete`.
 
 ### Phase 5: Wire Up Handlers
 
