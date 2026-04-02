@@ -162,6 +162,21 @@ impl SlidingWindowRateLimiter {
         let history = self.history.lock().await;
         Self::current_usage(&history, Instant::now(), self.window)
     }
+
+    /// Like `acquire`, but returns the time spent waiting for capacity.
+    pub async fn acquire_metered(&self, units: u32) -> Duration {
+        let start = Instant::now();
+        self.acquire(units).await;
+        start.elapsed()
+    }
+
+    /// Get current usage as a ratio of max capacity (0.0 to 1.0).
+    #[allow(dead_code)]
+    pub async fn usage_ratio(&self) -> f64 {
+        let history = self.history.lock().await;
+        let usage = Self::current_usage(&history, Instant::now(), self.window);
+        usage as f64 / self.max_in_window as f64
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +262,8 @@ struct ConcurrentExecutor {
     /// Tasks beyond this limit are spawned only as earlier tasks complete,
     /// preventing unbounded task creation for large request sets.
     max_in_flight: usize,
+    /// Chain identifier for metric labels.
+    chain_label: String,
 }
 
 impl ConcurrentExecutor {
@@ -264,13 +281,22 @@ impl ConcurrentExecutor {
         let semaphore = self.semaphore.clone();
         let rate_limiter = self.rate_limiter.clone();
         let cost = self.cost_per_request;
+        let chain = self.chain_label.clone();
 
         join_set.spawn(async move {
+            let sem_start = Instant::now();
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("semaphore should never be closed during operation");
-            rate_limiter.acquire(cost).await;
+            let sem_wait = sem_start.elapsed();
+            metrics::histogram!("rpc_semaphore_wait_seconds", "chain" => chain.clone())
+                .record(sem_wait.as_secs_f64());
+
+            let rl_wait = rate_limiter.acquire_metered(cost).await;
+            metrics::histogram!("rpc_rate_limiter_wait_seconds", "chain" => chain)
+                .record(rl_wait.as_secs_f64());
+
             let result = fut.await;
             drop(permit);
             (idx, result)
@@ -290,13 +316,22 @@ impl ConcurrentExecutor {
         let semaphore = self.semaphore.clone();
         let rate_limiter = self.rate_limiter.clone();
         let cost = self.cost_per_request;
+        let chain = self.chain_label.clone();
 
         join_set.spawn(async move {
+            let sem_start = Instant::now();
             let permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("semaphore should never be closed during operation");
-            rate_limiter.acquire(cost).await;
+            let sem_wait = sem_start.elapsed();
+            metrics::histogram!("rpc_semaphore_wait_seconds", "chain" => chain.clone())
+                .record(sem_wait.as_secs_f64());
+
+            let rl_wait = rate_limiter.acquire_metered(cost).await;
+            metrics::histogram!("rpc_rate_limiter_wait_seconds", "chain" => chain)
+                .record(rl_wait.as_secs_f64());
+
             let result = fut.await;
             drop(permit);
             let _ = result_tx.send(result).await;
@@ -391,6 +426,25 @@ impl AlchemyClient {
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
             max_in_flight: (self.config.rpc_concurrency * 2).max(1),
+            chain_label: self.chain_label(),
+        }
+    }
+
+    /// Create a concurrent executor with a caller-specified concurrency cap.
+    /// The effective concurrency is the minimum of the requested value and
+    /// the client's configured `rpc_concurrency`.
+    fn create_concurrent_executor_with_concurrency(
+        &self,
+        cost_per_request: u32,
+        concurrency: usize,
+    ) -> ConcurrentExecutor {
+        let effective = concurrency.min(self.config.rpc_concurrency);
+        ConcurrentExecutor {
+            semaphore: Arc::new(Semaphore::new(effective)),
+            rate_limiter: self.rate_limiter.clone(),
+            cost_per_request,
+            max_in_flight: (effective * 2).max(1),
+            chain_label: self.chain_label(),
         }
     }
 
@@ -740,34 +794,81 @@ impl AlchemyClient {
     /// # Arguments
     /// * `method_name` - The RPC method name (e.g., "eth_getBlockReceipts")
     /// * `block_numbers` - Block numbers to fetch receipts for
-    /// * `_concurrency` - **Deprecated and ignored.** Concurrency is controlled by
-    ///   `rpc_concurrency` in `AlchemyConfig`. This parameter is kept for API compatibility.
+    /// * `concurrency` - Maximum concurrency for this batch. The effective concurrency
+    ///   is the minimum of this value and the client's configured `rpc_concurrency`.
     pub async fn get_block_receipts_concurrent(
         &self,
         method_name: &str,
         block_numbers: Vec<BlockNumberOrTag>,
-        #[allow(unused_variables)] _concurrency: usize,
+        concurrency: usize,
     ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
+        let chain = self.chain_label();
         let inner = self.inner.clone();
         let method_name = method_name.to_string();
 
-        self.execute_batch_collecting_results(
-            RpcMethod::GetBlockReceiptsConcurrent,
-            block_numbers,
-            ComputeUnitCost::GET_BLOCK_RECEIPTS.cost(),
-            move |block_number| {
+        with_metrics(RpcMethod::GetBlockReceiptsConcurrent, &chain, || async {
+            if block_numbers.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let executor = self.create_concurrent_executor_with_concurrency(
+                ComputeUnitCost::GET_BLOCK_RECEIPTS.cost(),
+                concurrency,
+            );
+            let make_request = Arc::new(move |block_number: BlockNumberOrTag| {
                 let inner = inner.clone();
                 let method_name = method_name.clone();
                 async move {
-                    // inner.get_block_receipts already has retry logic
                     inner.get_block_receipts(&method_name, block_number).await
                 }
-            },
-            |_block_numbers| async move {
-                // Batching is always enabled for this method
-                Ok(vec![])
-            },
-        )
+            });
+
+            let num_requests = block_numbers.len();
+            let mut join_set = tokio::task::JoinSet::new();
+            let mut requests_iter = block_numbers.into_iter().enumerate().peekable();
+
+            // Seed initial batch
+            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                let (idx, request) = requests_iter.next().unwrap();
+                let make_request = make_request.clone();
+                executor.spawn_indexed(
+                    &mut join_set,
+                    idx,
+                    async move { make_request(request).await },
+                );
+            }
+
+            let mut indexed_results: Vec<(usize, Result<Vec<Option<TransactionReceipt>>, RpcError>)> =
+                Vec::with_capacity(num_requests);
+
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok((idx, value)) => indexed_results.push((idx, value)),
+                    Err(e) => {
+                        return Err(RpcError::ProviderError(format!(
+                            "Task panicked in get_block_receipts_concurrent: {:?}", e
+                        )));
+                    }
+                }
+
+                while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                    let (idx, request) = requests_iter.next().unwrap();
+                    let make_request = make_request.clone();
+                    executor.spawn_indexed(
+                        &mut join_set,
+                        idx,
+                        async move { make_request(request).await },
+                    );
+                }
+            }
+
+            indexed_results.sort_by_key(|(idx, _)| *idx);
+            let mut collected = Vec::with_capacity(indexed_results.len());
+            for (_, result) in indexed_results {
+                collected.push(result?);
+            }
+            Ok(collected)
+        })
         .await
     }
 

@@ -592,42 +592,53 @@ pub(crate) struct BatchFetchResult {
     pub(crate) process_time: std::time::Duration,
 }
 
-/// Fetch receipts for a batch of blocks and return the results.
-/// This enables early RPC fetching before the full range is complete.
-/// For Alchemy the executor's rate limiter and semaphore handle pacing;
-/// for standard providers `block_receipt_concurrency` caps the chunk size.
-pub(crate) async fn fetch_receipts_for_blocks(
+/// Fetch receipts using block-receipt RPC method with caller-owned bounded concurrency.
+/// Each block is fetched as a single `get_block_receipts` RPC call.
+/// Blocks are processed in chunks of `concurrency`, with all futures in each chunk
+/// executing concurrently via `join_all`.
+pub(crate) async fn fetch_block_receipts_bounded(
     blocks: &[&BlockInfo],
     client: &UnifiedRpcClient,
     receipt_fields: &Option<Vec<ReceiptField>>,
-    block_receipts_method: Option<&str>,
-    block_receipt_concurrency: usize,
+    method: &str,
+    concurrency: usize,
 ) -> Result<BatchFetchResult, ReceiptCollectionError> {
+    use alloy::rpc::types::BlockNumberOrTag;
+
     let mut minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
     let mut full_records: Vec<FullReceiptRecord> = Vec::new();
     let mut all_logs: Vec<LogData> = Vec::new();
     let mut total_rpc_time = std::time::Duration::ZERO;
     let mut total_process_time = std::time::Duration::ZERO;
 
-    if let Some(method) = block_receipts_method {
-        // Using block receipts method (e.g., alchemy_getTransactionReceipts)
-        let blocks_with_txs: Vec<&&BlockInfo> =
-            blocks.iter().filter(|b| !b.tx_hashes.is_empty()).collect();
+    let blocks_with_txs: Vec<&&BlockInfo> =
+        blocks.iter().filter(|b| !b.tx_hashes.is_empty()).collect();
 
-        let block_numbers: Vec<alloy::rpc::types::BlockNumberOrTag> = blocks_with_txs
-            .iter()
-            .map(|b| alloy::rpc::types::BlockNumberOrTag::Number(b.block_number))
-            .collect();
+    if blocks_with_txs.is_empty() {
+        return Ok(BatchFetchResult {
+            minimal_records,
+            full_records,
+            logs: all_logs,
+            rpc_time: total_rpc_time,
+            process_time: total_process_time,
+        });
+    }
 
-        let concurrency = block_receipt_concurrency;
+    // Process blocks in chunks of `concurrency`, firing concurrent RPC calls per chunk
+    for chunk in blocks_with_txs.chunks(concurrency) {
         let rpc_start = Instant::now();
-        let all_receipts = client
-            .get_block_receipts_concurrent(method, block_numbers, concurrency)
-            .await?;
+        let futures: Vec<_> = chunk
+            .iter()
+            .map(|block| {
+                client.get_block_receipts(method, BlockNumberOrTag::Number(block.block_number))
+            })
+            .collect();
+        let results = futures::future::join_all(futures).await;
         total_rpc_time += rpc_start.elapsed();
 
         let process_start = Instant::now();
-        for (block, receipts) in blocks_with_txs.iter().zip(all_receipts.into_iter()) {
+        for (block, result) in chunk.iter().zip(results.into_iter()) {
+            let receipts = result?;
             let tx_block_info: Vec<(B256, u64, u64)> = receipts
                 .iter()
                 .map(|r| {
@@ -650,35 +661,6 @@ pub(crate) async fn fetch_receipts_for_blocks(
             }
         }
         total_process_time += process_start.elapsed();
-    } else {
-        // Using individual transaction receipt fetches
-        let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
-        for block in blocks {
-            for tx_hash in &block.tx_hashes {
-                tx_block_info.push((*tx_hash, block.block_number, block.timestamp));
-            }
-        }
-
-        let tx_hashes: Vec<B256> = tx_block_info.iter().map(|(h, _, _)| *h).collect();
-
-        let rpc_start = Instant::now();
-        let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
-        total_rpc_time += rpc_start.elapsed();
-
-        let process_start = Instant::now();
-        match receipt_fields {
-            Some(_) => {
-                let records =
-                    process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
-                minimal_records.extend(records);
-            }
-            None => {
-                let records =
-                    process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
-                full_records.extend(records);
-            }
-        }
-        total_process_time += process_start.elapsed();
     }
 
     Ok(BatchFetchResult {
@@ -688,6 +670,82 @@ pub(crate) async fn fetch_receipts_for_blocks(
         rpc_time: total_rpc_time,
         process_time: total_process_time,
     })
+}
+
+/// Fetch receipts using per-transaction RPCs, batching all tx hashes
+/// across the provided blocks into a single batch call for maximum utilization.
+pub(crate) async fn fetch_tx_receipts_batched(
+    blocks: &[&BlockInfo],
+    client: &UnifiedRpcClient,
+    receipt_fields: &Option<Vec<ReceiptField>>,
+) -> Result<BatchFetchResult, ReceiptCollectionError> {
+    let mut minimal_records: Vec<MinimalReceiptRecord> = Vec::new();
+    let mut full_records: Vec<FullReceiptRecord> = Vec::new();
+    let mut all_logs: Vec<LogData> = Vec::new();
+
+    let mut tx_block_info: Vec<(B256, u64, u64)> = Vec::new();
+    for block in blocks {
+        for tx_hash in &block.tx_hashes {
+            tx_block_info.push((*tx_hash, block.block_number, block.timestamp));
+        }
+    }
+
+    if tx_block_info.is_empty() {
+        return Ok(BatchFetchResult {
+            minimal_records,
+            full_records,
+            logs: all_logs,
+            rpc_time: std::time::Duration::ZERO,
+            process_time: std::time::Duration::ZERO,
+        });
+    }
+
+    let tx_hashes: Vec<B256> = tx_block_info.iter().map(|(h, _, _)| *h).collect();
+
+    let rpc_start = Instant::now();
+    let receipts = client.get_transaction_receipts_batch(tx_hashes).await?;
+    let total_rpc_time = rpc_start.elapsed();
+
+    let process_start = Instant::now();
+    match receipt_fields {
+        Some(_) => {
+            let records =
+                process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
+            minimal_records.extend(records);
+        }
+        None => {
+            let records =
+                process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+            full_records.extend(records);
+        }
+    }
+    let total_process_time = process_start.elapsed();
+
+    Ok(BatchFetchResult {
+        minimal_records,
+        full_records,
+        logs: all_logs,
+        rpc_time: total_rpc_time,
+        process_time: total_process_time,
+    })
+}
+
+/// Fetch receipts for a batch of blocks and return the results.
+/// Thin dispatcher that delegates to mode-specific implementations:
+/// - `fetch_block_receipts_bounded` when a block-receipts RPC method is available
+/// - `fetch_tx_receipts_batched` for per-transaction fallback
+pub(crate) async fn fetch_receipts_for_blocks(
+    blocks: &[&BlockInfo],
+    client: &UnifiedRpcClient,
+    receipt_fields: &Option<Vec<ReceiptField>>,
+    block_receipts_method: Option<&str>,
+    block_receipt_concurrency: usize,
+) -> Result<BatchFetchResult, ReceiptCollectionError> {
+    if let Some(method) = block_receipts_method {
+        fetch_block_receipts_bounded(blocks, client, receipt_fields, method, block_receipt_concurrency).await
+    } else {
+        fetch_tx_receipts_batched(blocks, client, receipt_fields).await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
