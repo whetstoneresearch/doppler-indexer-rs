@@ -30,7 +30,7 @@ pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
         Field::new("value", DataType::Binary, false),
     ];
 
@@ -96,7 +96,7 @@ pub(crate) fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     for fn_name in function_names {
@@ -282,7 +282,7 @@ pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]
 
     let mut null_entries: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
     for batch in &batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -346,7 +346,7 @@ pub(crate) fn extract_addresses_from_once_parquet(
     let mut addresses = HashMap::new();
 
     for batch in batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -389,7 +389,7 @@ pub(crate) fn extract_existing_results_from_parquet(
     let mut results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = HashMap::new();
 
     for batch in batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -454,12 +454,12 @@ pub(crate) fn merge_once_columns(
 
     let num_rows = existing.num_rows();
     let address_col = existing
-        .column_by_name("address")
-        .expect("existing once parquet must have address column");
+        .column_by_name("contract_address")
+        .expect("existing once parquet must have contract_address column");
     let address_arr = address_col
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .expect("address column must be FixedSizeBinary(20)");
+        .expect("contract_address column must be FixedSizeBinary(20)");
 
     tracing::debug!(
         "Existing data has {} rows, {} columns",

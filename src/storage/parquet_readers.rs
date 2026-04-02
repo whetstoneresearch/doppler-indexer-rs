@@ -317,7 +317,7 @@ pub fn read_factory_addresses_with_blocks(
 
 /// Read regular eth_call results from a parquet file.
 ///
-/// Reads `block_number`, `block_timestamp`, `address`, and `value` columns.
+/// Reads `block_number`, `block_timestamp`, `contract_address`, and `value` columns.
 pub fn read_regular_calls_from_parquet(
     path: &Path,
 ) -> Result<Vec<EthCallResult>, ParquetReadError> {
@@ -333,7 +333,7 @@ pub fn read_regular_calls_from_parquet(
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema.index_of("address").ok();
+        let address_idx = schema.index_of("contract_address").ok();
         let value_idx = schema.index_of("value").ok();
 
         for row in 0..batch.num_rows() {

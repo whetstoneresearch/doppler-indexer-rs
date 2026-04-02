@@ -51,7 +51,7 @@ pub(super) fn write_decoded_calls_to_parquet(
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     // Add value fields based on output type
@@ -149,7 +149,7 @@ pub(super) fn write_decoded_event_calls_to_parquet(
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
         Field::new("log_index", DataType::UInt32, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     // Add value fields based on output type
@@ -819,14 +819,14 @@ pub(super) fn merge_decoded_once_calls(
 
     // Extract address column from existing batch
     let address_col_idx = existing_schema
-        .index_of("address")
-        .map_err(|e| EthCallDecodingError::Decode(format!("Missing address column: {}", e)))?;
+        .index_of("contract_address")
+        .map_err(|e| EthCallDecodingError::Decode(format!("Missing contract_address column: {}", e)))?;
     let address_arr = existing_batch
         .column(address_col_idx)
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
         .ok_or_else(|| {
-            EthCallDecodingError::Decode("address column is not FixedSizeBinaryArray".to_string())
+            EthCallDecodingError::Decode("contract_address column is not FixedSizeBinaryArray".to_string())
         })?;
 
     // Build new schema with existing fields + new fields
@@ -1000,7 +1000,7 @@ pub(super) fn write_decoded_once_calls_to_parquet(
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     // Add a field for each function result
