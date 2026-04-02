@@ -53,7 +53,12 @@ pub(crate) fn resolve_retry_missing_handlers(
     tracker_missing: Option<HashSet<String>>,
     all_handlers: HashSet<String>,
 ) -> HashSet<String> {
-    tracker_missing.unwrap_or_else(|| request_missing.unwrap_or(all_handlers))
+    match (tracker_missing, request_missing) {
+        (Some(tracker), Some(request)) => tracker.union(&request).cloned().collect(),
+        (Some(tracker), None) => tracker,
+        (None, Some(request)) => request,
+        (None, None) => all_handlers,
+    }
 }
 
 pub(crate) fn missing_retry_call_dependencies(
@@ -144,8 +149,20 @@ impl RetryProcessor {
             .iter()
             .map(|handler| handler.handler_key())
             .collect();
-        let missing_handlers =
+        let mut missing_handlers =
             resolve_retry_missing_handlers(request.missing_handlers, tracker_missing, all_handlers);
+
+        // Union in persisted failed_handlers so stale tracker state can't hide
+        // known failures. This must happen BEFORE the empty check.
+        let storage = LiveStorage::new(&self.chain_name);
+        if let Ok(status) = storage.read_status(block_number) {
+            if !status.failed_handlers.is_empty() {
+                missing_handlers = missing_handlers
+                    .union(&status.failed_handlers)
+                    .cloned()
+                    .collect();
+            }
+        }
 
         if missing_handlers.is_empty() {
             return record_and_finalize
@@ -717,6 +734,9 @@ pub(crate) fn update_retry_status(
             status.failed_handlers.insert(key.clone());
             status.completed_handlers.remove(key);
         }
+        if !failed_keys.is_empty() {
+            status.transformed = false;
+        }
         // Don't set transformed=true here — finalize_range() handles that
         // after recording _handler_progress for all handlers.
     })
@@ -861,7 +881,7 @@ mod tests {
     use crate::transformations::context::DecodedValue;
 
     #[test]
-    fn retry_missing_handlers_prefers_current_tracker_state() {
+    fn retry_missing_handlers_unions_tracker_and_request() {
         let requested = Some(HashSet::from([
             "handler_a_v1".to_string(),
             "handler_b_v1".to_string(),
@@ -874,6 +894,22 @@ mod tests {
         ]);
 
         let resolved = resolve_retry_missing_handlers(requested, tracker, all_handlers);
+        // Union: tracker {b} ∪ request {a, b} = {a, b}
+        assert_eq!(
+            resolved,
+            HashSet::from(["handler_a_v1".to_string(), "handler_b_v1".to_string()])
+        );
+    }
+
+    #[test]
+    fn retry_missing_handlers_tracker_only() {
+        let tracker = Some(HashSet::from(["handler_b_v1".to_string()]));
+        let all_handlers = HashSet::from([
+            "handler_a_v1".to_string(),
+            "handler_b_v1".to_string(),
+        ]);
+
+        let resolved = resolve_retry_missing_handlers(None, tracker, all_handlers);
         assert_eq!(resolved, HashSet::from(["handler_b_v1".to_string()]));
     }
 
@@ -1062,5 +1098,32 @@ mod tests {
             !s.failed_handlers.contains("handler_a"),
             "no-op succeeded handler must be cleared from failed_handlers"
         );
+    }
+
+    /// Regression: when update_retry_status records failed handlers, it must
+    /// also clear `transformed` so the block remains retryable on restart.
+    #[test]
+    fn retry_status_clears_transformed_on_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        status.transformed = true;
+        storage.write_status(100, &status).unwrap();
+
+        let attempted = HashSet::from(["handler_a".to_string()]);
+        let succeeded = HashSet::new();
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            !s.transformed,
+            "transformed must be cleared when failures are recorded"
+        );
+        assert!(s.failed_handlers.contains("handler_a"));
     }
 }

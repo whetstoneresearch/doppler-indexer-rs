@@ -125,6 +125,44 @@ impl RangeFinalizer {
                 range_key,
                 timed_out_handlers
             );
+
+            // Persist timed-out handlers as failures so they remain retryable
+            let is_single_block = range_key.1 - range_key.0 == 1;
+            if is_single_block {
+                let storage = LiveStorage::new(&self.chain_name);
+                if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
+                    for key in &timed_out_handlers {
+                        status.failed_handlers.insert(key.clone());
+                        status.completed_handlers.remove(key);
+                    }
+                    status.transformed = false;
+                }) {
+                    if !matches!(e, StorageError::NotFound(_)) {
+                        tracing::warn!(
+                            "Failed to persist timed-out handlers for block {}: {}",
+                            range_key.0,
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Update in-memory state: mark failed, remove from completed
+            {
+                let mut state = live_state.lock().await;
+                for key in &timed_out_handlers {
+                    if let Some(name) = self.registry.handler_name_for_key(key) {
+                        state
+                            .failed_handlers
+                            .entry(range_key)
+                            .or_default()
+                            .insert(name.to_string());
+                        if let Some(completed) = state.completed_handlers.get_mut(&range_key) {
+                            completed.remove(name);
+                        }
+                    }
+                }
+            }
         }
 
         if !should_finalize {

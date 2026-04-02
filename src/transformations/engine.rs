@@ -133,6 +133,8 @@ struct CatchupHandler {
     triggers: Vec<(String, String)>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
     call_deps: Vec<(String, String)>,
+    /// Handler dependencies: handler name() values that must complete first.
+    handler_deps: Vec<String>,
     kind: HandlerKind,
 }
 
@@ -593,10 +595,17 @@ impl TransformationEngine {
                         .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
                         .collect();
                     let call_deps = info.handler.call_dependencies();
+                    let handler_deps: Vec<String> = info
+                        .handler
+                        .handler_dependencies()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers,
                         call_deps,
+                        handler_deps,
                         kind: HandlerKind::Event,
                     }
                 })
@@ -615,6 +624,7 @@ impl TransformationEngine {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers,
                         call_deps: Vec::new(),
+                        handler_deps: Vec::new(),
                         kind: HandlerKind::Call,
                     }
                 })
@@ -634,6 +644,34 @@ impl TransformationEngine {
             });
         }
 
+        // Preload completed ranges for dependency target handlers so downstream
+        // handlers can be gated on upstream completion per range.
+        let mut dep_completed: HashMap<String, HashSet<u64>> = HashMap::new();
+        if kind == HandlerKind::Event {
+            let dep_names = self.registry.dependency_handler_names();
+            for name in dep_names {
+                if let Some(ch) = handlers.iter().find(|ch| ch.handler.name() == name) {
+                    let dep_key = ch.handler.handler_key();
+                    let completed = self
+                        .finalizer
+                        .get_completed_ranges_for_handler(&dep_key)
+                        .await?;
+                    dep_completed.insert(name.clone(), completed);
+                } else {
+                    debug_assert!(
+                        false,
+                        "dep target {} not found in catchup handlers",
+                        name
+                    );
+                    tracing::error!(
+                        "Dependency target handler {} not found in catchup handlers",
+                        name
+                    );
+                    dep_completed.insert(name.clone(), HashSet::new());
+                }
+            }
+        }
+
         let mut failed_handlers: Vec<(String, String)> = vec![];
 
         for ch in &handlers {
@@ -650,6 +688,14 @@ impl TransformationEngine {
             let to_process: Vec<_> = available
                 .iter()
                 .filter(|(start, _)| !completed.contains(start))
+                .filter(|(start, _)| {
+                    ch.handler_deps.iter().all(|dep_name| {
+                        dep_completed
+                            .get(dep_name)
+                            .map(|c| c.contains(start))
+                            .unwrap_or(false)
+                    })
+                })
                 .cloned()
                 .collect();
 
@@ -853,6 +899,16 @@ impl TransformationEngine {
                     handler_errored = true;
                     break;
                 }
+            }
+
+            // Refresh dep completed ranges so downstream handlers see current state
+            let handler_name = handler.name().to_string();
+            if dep_completed.contains_key(&handler_name) {
+                let refreshed = self
+                    .finalizer
+                    .get_completed_ranges_for_handler(&handler_key)
+                    .await?;
+                dep_completed.insert(handler_name, refreshed);
             }
 
             if handler_errored {
@@ -1439,8 +1495,15 @@ impl TransformationEngine {
         {
             let dep_names = self.registry.dependency_handler_names();
             let mut state = self.live_state.lock().await;
+            let failed_names: HashSet<String> = state
+                .failed_handlers
+                .get(&range_key)
+                .cloned()
+                .unwrap_or_default();
             for outcome in &outcomes {
-                if !dep_names.contains(&outcome.handler_name) {
+                if !dep_names.contains(&outcome.handler_name)
+                    && !failed_names.contains(&outcome.handler_name)
+                {
                     state
                         .completed_handlers
                         .entry(range_key)
@@ -1499,6 +1562,7 @@ impl TransformationEngine {
                 for h in &failed_keys {
                     status.completed_handlers.remove(h);
                 }
+                status.transformed = false;
             }) {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
@@ -1520,12 +1584,29 @@ impl TransformationEngine {
         range_end: u64,
         submitted_keys: &HashSet<String>,
         succeeded_keys: &HashSet<String>,
-        outcomes: &[super::executor::HandlerOutcome],
+        _outcomes: &[super::executor::HandlerOutcome],
     ) {
         if range_end - range_start == 1 {
-            for outcome in outcomes {
-                self.record_live_progress(outcome.range_start, &outcome.handler_key)
-                    .await;
+            // Only record live progress for fully succeeded handlers.
+            // Skip handlers that already failed for this block to prevent
+            // re-completing them outside explicit retry.
+            let failed_for_block: HashSet<String> = {
+                let state = self.live_state.lock().await;
+                state
+                    .failed_handlers
+                    .get(&(range_start, range_end))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            for key in succeeded_keys {
+                let is_already_failed = self
+                    .registry
+                    .handler_name_for_key(key)
+                    .map(|n| failed_for_block.contains(n))
+                    .unwrap_or(false);
+                if !is_already_failed {
+                    self.record_live_progress(range_start, key).await;
+                }
             }
             self.persist_failed_handlers(range_start, submitted_keys, succeeded_keys)
                 .await;
@@ -1742,24 +1823,40 @@ impl TransformationEngine {
                 });
             }
 
-            let submitted_keys: HashSet<String> =
-                tasks.iter().map(|t| t.handler.handler_key()).collect();
+            // Count submissions per handler to detect partial failures.
+            // A handler is "fully succeeded" only if ALL its batches succeeded.
+            let mut submitted_counts: HashMap<String, usize> = HashMap::new();
+            for t in &tasks {
+                *submitted_counts
+                    .entry(t.handler.handler_key())
+                    .or_default() += 1;
+            }
 
             let outcomes = self
                 .executor
                 .execute_handlers(tasks, range_key.0, range_key.1, &DbExecMode::Direct)
                 .await;
 
-            let succeeded_keys: HashSet<String> =
-                outcomes.iter().map(|o| o.handler_key.clone()).collect();
+            let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
+            for o in &outcomes {
+                *succeeded_counts
+                    .entry(o.handler_key.clone())
+                    .or_default() += 1;
+            }
+            let submitted_keys: HashSet<String> =
+                submitted_counts.keys().cloned().collect();
+            let succeeded_keys: HashSet<String> = submitted_counts
+                .iter()
+                .filter(|(k, &count)| {
+                    succeeded_counts.get(*k).copied().unwrap_or(0) == count
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
 
-            for outcome in &outcomes {
+            // Only write _handler_progress for fully succeeded handlers
+            for key in &succeeded_keys {
                 self.finalizer
-                    .record_completed_range_for_handler(
-                        &outcome.handler_key,
-                        outcome.range_start,
-                        outcome.range_end,
-                    )
+                    .record_completed_range_for_handler(key, range_key.0, range_key.1)
                     .await?;
             }
 
@@ -1775,6 +1872,8 @@ impl TransformationEngine {
             // Record handler completions and failures for cascading.
             // Dep handlers are only completed post-Logs (all batches dispatched);
             // pre-Logs they are deferred to avoid premature dependent unblocking.
+            // Only fully-succeeded handlers are marked as completed.
+            // Handlers already in failed_handlers are never re-completed.
             {
                 let dep_names = self.registry.dependency_handler_names();
                 let mut state = self.live_state.lock().await;
@@ -1783,8 +1882,16 @@ impl TransformationEngine {
                     .get(&range_key)
                     .map(|c| c.logs_complete)
                     .unwrap_or(false);
+                let failed_names: HashSet<String> = state
+                    .failed_handlers
+                    .get(&range_key)
+                    .cloned()
+                    .unwrap_or_default();
                 for outcome in &outcomes {
-                    if logs_complete || !dep_names.contains(&outcome.handler_name) {
+                    if succeeded_keys.contains(&outcome.handler_key)
+                        && (logs_complete || !dep_names.contains(&outcome.handler_name))
+                        && !failed_names.contains(&outcome.handler_name)
+                    {
                         state
                             .completed_handlers
                             .entry(range_key)
@@ -1890,24 +1997,39 @@ impl TransformationEngine {
             tx_addresses,
         );
 
-        let submitted_keys: HashSet<String> =
-            tasks.iter().map(|t| t.handler.handler_key()).collect();
+        // Count submissions per handler to detect partial failures.
+        let mut submitted_counts: HashMap<String, usize> = HashMap::new();
+        for t in &tasks {
+            *submitted_counts
+                .entry(t.handler.handler_key())
+                .or_default() += 1;
+        }
 
         let outcomes = self
             .executor
             .execute_handlers(tasks, range_start, range_end, &db_exec_mode)
             .await;
 
-        let succeeded_keys: HashSet<String> =
-            outcomes.iter().map(|o| o.handler_key.clone()).collect();
+        let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
+        for o in &outcomes {
+            *succeeded_counts
+                .entry(o.handler_key.clone())
+                .or_default() += 1;
+        }
+        let submitted_keys: HashSet<String> =
+            submitted_counts.keys().cloned().collect();
+        let succeeded_keys: HashSet<String> = submitted_counts
+            .iter()
+            .filter(|(k, &count)| {
+                succeeded_counts.get(*k).copied().unwrap_or(0) == count
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
 
-        for outcome in &outcomes {
+        // Only write _handler_progress for fully succeeded handlers
+        for key in &succeeded_keys {
             self.finalizer
-                .record_completed_range_for_handler(
-                    &outcome.handler_key,
-                    outcome.range_start,
-                    outcome.range_end,
-                )
+                .record_completed_range_for_handler(key, range_start, range_end)
                 .await?;
         }
 
