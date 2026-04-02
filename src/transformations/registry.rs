@@ -69,6 +69,10 @@ pub struct TransformationRegistry {
     handler_name_to_key: HashMap<String, String>,
     /// Set of handler names registered as event handlers (for dep validation)
     event_handler_names: HashSet<String>,
+    /// Handler keys whose handler declares more than one trigger.
+    /// Multi-trigger handlers must not have their success persisted until
+    /// all batches for the block have been dispatched.
+    multi_trigger_handler_keys: HashSet<String>,
 }
 
 impl TransformationRegistry {
@@ -84,6 +88,7 @@ impl TransformationRegistry {
             handler_key_to_name: HashMap::new(),
             handler_name_to_key: HashMap::new(),
             event_handler_names: HashSet::new(),
+            multi_trigger_handler_keys: HashSet::new(),
         }
     }
 
@@ -92,7 +97,24 @@ impl TransformationRegistry {
     /// The handler will be invoked for all events matching its triggers.
     pub fn register_event_handler<H: EventHandler + 'static>(&mut self, handler: H) {
         let handler = Arc::new(handler);
+        let name = handler.name().to_string();
+
+        if let Some(existing_key) = self.handler_name_to_key.get(&name) {
+            panic!(
+                "duplicate handler name '{}': already registered with key '{}', \
+                 cannot register again with key '{}'",
+                name,
+                existing_key,
+                handler.handler_key()
+            );
+        }
+
         let triggers = handler.triggers();
+
+        if triggers.len() > 1 {
+            self.multi_trigger_handler_keys
+                .insert(handler.handler_key());
+        }
 
         for trigger in triggers {
             let key = (
@@ -131,7 +153,24 @@ impl TransformationRegistry {
     #[allow(dead_code)]
     pub fn register_call_handler<H: EthCallHandler + 'static>(&mut self, handler: H) {
         let handler = Arc::new(handler);
+        let name = handler.name().to_string();
+
+        if let Some(existing_key) = self.handler_name_to_key.get(&name) {
+            panic!(
+                "duplicate handler name '{}': already registered with key '{}', \
+                 cannot register again with key '{}'",
+                name,
+                existing_key,
+                handler.handler_key()
+            );
+        }
+
         let triggers = handler.triggers();
+
+        if triggers.len() > 1 {
+            self.multi_trigger_handler_keys
+                .insert(handler.handler_key());
+        }
 
         for trigger in triggers {
             let key = (trigger.source.clone(), trigger.function_name.clone());
@@ -140,6 +179,11 @@ impl TransformationRegistry {
                 .or_default()
                 .push(handler.clone());
         }
+
+        self.handler_key_to_name
+            .insert(handler.handler_key(), name.clone());
+        self.handler_name_to_key
+            .insert(name, handler.handler_key());
 
         self.all_handlers.push(handler);
     }
@@ -371,6 +415,32 @@ impl TransformationRegistry {
     /// Look up a handler's handler_key() from its name().
     pub fn handler_key_for_name(&self, name: &str) -> Option<&str> {
         self.handler_name_to_key.get(name).map(|s| s.as_str())
+    }
+
+    /// Whether a handler was registered with more than one trigger.
+    pub fn is_multi_trigger(&self, handler_key: &str) -> bool {
+        self.multi_trigger_handler_keys.contains(handler_key)
+    }
+
+    /// Get handler keys for all dependency handler names.
+    ///
+    /// Panics if any dependency name cannot be resolved to a handler key,
+    /// which would indicate a registry inconsistency.
+    pub fn dependency_handler_keys(&self) -> HashSet<String> {
+        self.dependency_handler_names
+            .iter()
+            .map(|name| {
+                self.handler_name_to_key
+                    .get(name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "dependency handler name '{}' has no registered handler_key",
+                            name
+                        )
+                    })
+                    .clone()
+            })
+            .collect()
     }
 
     /// Return the transitive set of handler names that depend on `name`.
@@ -1023,5 +1093,95 @@ mod tests {
         registry.register_event_handler(mock_handler("A", vec![]));
         assert!(registry.handler_key_for_name("A").is_some());
         assert!(registry.handler_key_for_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn single_trigger_handler_is_not_multi_trigger() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        assert!(!registry.is_multi_trigger(&"A_v1".to_string()));
+    }
+
+    #[test]
+    fn multi_trigger_event_handler_detected() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(MockEventHandler {
+            name: "multi",
+            triggers: vec![
+                EventTrigger::new("Source1", "Event1()"),
+                EventTrigger::new("Source2", "Event2()"),
+            ],
+            call_deps: vec![],
+            handler_deps: vec![],
+        });
+        assert!(registry.is_multi_trigger("multi_v1"));
+    }
+
+    #[test]
+    fn multi_trigger_call_handler_detected() {
+        use crate::transformations::traits::{EthCallHandler, EthCallTrigger};
+
+        struct MockCallHandler;
+
+        #[async_trait]
+        impl TransformationHandler for MockCallHandler {
+            fn name(&self) -> &'static str {
+                "multi_call"
+            }
+            async fn handle(
+                &self,
+                _ctx: &TransformationContext,
+            ) -> Result<Vec<DbOperation>, TransformationError> {
+                Ok(vec![])
+            }
+        }
+
+        impl EthCallHandler for MockCallHandler {
+            fn triggers(&self) -> Vec<EthCallTrigger> {
+                vec![
+                    EthCallTrigger::new("Pool1", "slot0"),
+                    EthCallTrigger::new("Pool2", "slot0"),
+                ]
+            }
+        }
+
+        let mut registry = TransformationRegistry::new();
+        registry.register_call_handler(MockCallHandler);
+        assert!(registry.is_multi_trigger("multi_call_v1"));
+    }
+
+    #[test]
+    fn dependency_handler_keys_resolves_all_names() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("B", vec!["A"]));
+        registry.validate_and_sort_handler_dependencies();
+        let dep_keys = registry.dependency_handler_keys();
+        assert_eq!(dep_keys.len(), 1);
+        assert!(dep_keys.contains("A_v1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate handler name 'A'")]
+    fn duplicate_event_handler_name_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(mock_handler("A", vec![]));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate handler name 'B'")]
+    fn duplicate_call_handler_name_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_call_handler(MockCallHandler { name: "B" });
+        registry.register_call_handler(MockCallHandler { name: "B" });
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate handler name 'X'")]
+    fn duplicate_name_across_event_and_call_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("X", vec![]));
+        registry.register_call_handler(MockCallHandler { name: "X" });
     }
 }
