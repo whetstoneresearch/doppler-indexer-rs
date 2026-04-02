@@ -270,34 +270,35 @@ data/ethereum/historical/raw/receipts/
 5. Uploads receipt parquet files to S3 if `storage_manager` is configured
 6. Sends `RangeComplete` signals for each range (even if already complete) to synchronize downstream collectors
 
-### Current Phase (Early Batch Fetching)
+### Current Phase (Mode-Specific Scheduling)
 
-The current phase uses early batch-based RPC fetching to improve throughput:
+The current phase uses mode-specific scheduling to maximize rate-limit saturation:
 
 1. Receives block info (block number, timestamp, tx hashes) from block collector
 2. Skips ranges that already exist (checked against catchup state's file lists and S3 manifest)
 3. Tracks blocks in batch states per range (`ReceiptBatchState`)
-4. **Early fetch**: When unfetched blocks reach `rpc_batch_size`, immediately fetches receipts via RPC without waiting for full range
-5. Sends logs immediately to downstream collectors as batches complete
-6. When all blocks in a range are received:
-   - Fetches any remaining unfetched blocks
+4. **Block-receipt mode** (`block_receipts_method` set): Spawns one JoinSet task per block, bounded at `block_receipt_concurrency`. Each task calls `get_block_receipts` for a single block. The client's internal rate limiter and semaphore handle RPC pacing.
+5. **Fallback mode** (per-tx receipts): Accumulates blocks in a pending buffer. Flushes when the accumulated tx count reaches `rpc_batch_size`, when a range boundary is crossed, or after a 150ms timeout. Each flush dispatches all accumulated tx hashes as a single `get_transaction_receipts_batch` call, maximizing batch utilization across sparse blocks.
+6. Sends logs immediately to downstream collectors as fetches complete
+7. When all blocks in a range are received and completed:
    - Sorts records by block number
    - Writes receipt data to Parquet file
    - Uploads to S3 if `storage_manager` is configured
-7. Handles recollection requests via `tokio::select!` alongside normal block processing
-8. On shutdown, processes any incomplete ranges with partial data
+8. Handles recollection requests via `tokio::select!` alongside normal block processing
+9. On shutdown, flushes any pending fallback blocks and processes incomplete ranges
 
 ## Fetching Strategies
 
 The receipt collector supports two fetching strategies, configured per-chain via `block_receipts_method`:
 
-### Per-Transaction Fetching (Default)
+### Per-Transaction Fetching (Default / Fallback)
 
 When `block_receipts_method` is not set, receipts are fetched individually using `eth_getTransactionReceipt`:
 
-- Transactions are batched into chunks (configurable via `rpc_batch_size`, default 100)
-- Each batch is fetched concurrently using `futures::join_all`
-- Rate limiting is applied per batch
+- In catchup mode: all tx hashes across a range's blocks are collected and sent as a single `get_transaction_receipts_batch` call
+- In current mode: blocks accumulate in a pending buffer; tx hashes are flushed as a batch when count reaches `rpc_batch_size`, at range boundaries, or after a 150ms timeout
+- Cross-block micro-batching maximizes batch utilization even on chains with sparse blocks
+- Rate limiting is applied per-request by the RPC client
 
 This is the most compatible approach and works with all RPC providers.
 
@@ -488,7 +489,7 @@ src/raw_data/historical/
     └── receipts.rs      # Current phase: process new blocks from channel
 ```
 
-- **`receipts.rs`**: Contains shared types (`LogMessage`, `EventTriggerMessage`, `ReceiptCollectionError`, etc.), helper functions (`process_range`, `fetch_receipts_for_blocks`, `send_logs_to_channels`), and schema/parquet utilities
+- **`receipts.rs`**: Contains shared types (`LogMessage`, `EventTriggerMessage`, `ReceiptCollectionError`, etc.), helper functions (`fetch_block_receipts_bounded`, `fetch_tx_receipts_batched`, `process_range`, `send_logs_to_channels`), and schema/parquet utilities
 - **`catchup/receipts.rs`**: Standalone catchup function that scans existing block files and re-processes missing ranges
 - **`current/receipts.rs`**: Main collection function with early batch fetching and recollection support
 
@@ -533,20 +534,19 @@ The following `raw_data_collection` options affect receipt collection:
 | `rpc_batch_size` | 100 | Transactions per RPC batch. Also controls early batch fetch threshold in current phase. |
 | `block_receipt_concurrency` | 10 | Concurrent block receipt requests (block-level fetching only) |
 
-### Early Batch Fetching (Current Phase)
+### Block-Receipt Mode (Current Phase)
 
-In the current phase, the collector uses `rpc_batch_size` as the threshold for early batch fetching:
+When `block_receipts_method` is set, each arriving block is dispatched as a separate `get_block_receipts` RPC call into a bounded JoinSet. The concurrency cap is `block_receipt_concurrency` (default 10). The client's internal rate limiter and semaphore handle per-request pacing. This maximizes in-flight blocks up to the hard cap.
 
-- As blocks arrive, they are accumulated in a `ReceiptBatchState`
-- When the number of unfetched blocks reaches `rpc_batch_size`, receipts are fetched immediately
-- Logs are sent to downstream collectors as each batch completes
-- This allows RPC work to overlap with block collection, improving throughput
+### Fallback Micro-Batching (Current Phase)
 
-Example: With `rpc_batch_size: 100` and `parquet_block_range: 1000`:
-- First 100 blocks arrive: immediate RPC fetch, logs sent downstream
-- Next 100 blocks arrive: immediate RPC fetch, logs sent downstream
-- ... (8 more batches)
-- Final batch may be smaller, fetched when range is complete
+When `block_receipts_method` is not set, the collector accumulates arriving blocks in a pending buffer and flushes them as batched `get_transaction_receipts_batch` calls. Flush triggers:
+
+- **Batch full**: accumulated tx count reaches `rpc_batch_size` (default 100)
+- **Range boundary**: a block from a new range arrives while blocks from the old range are pending
+- **Timeout**: 150ms after the first block entered the buffer (prevents stalling on sparse chains)
+
+This cross-block micro-batching keeps tx batches full regardless of per-block tx density.
 
 ## Backpressure Monitoring
 

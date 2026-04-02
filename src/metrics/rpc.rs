@@ -93,6 +93,26 @@ pub fn describe_rpc_metrics() {
         "rpc_requests_in_flight",
         "Number of RPC requests currently in progress"
     );
+    describe_histogram!(
+        "rpc_rate_limiter_wait_seconds",
+        "Time spent waiting for rate limiter capacity"
+    );
+    describe_histogram!(
+        "rpc_semaphore_wait_seconds",
+        "Time spent waiting to acquire concurrency semaphore"
+    );
+    describe_gauge!(
+        "rpc_rate_limiter_usage_ratio",
+        "Current rate limiter usage as fraction of max capacity"
+    );
+    describe_gauge!(
+        "receipt_pipeline_in_flight_fetches",
+        "Number of receipt fetch tasks currently in flight"
+    );
+    describe_gauge!(
+        "receipt_pipeline_pending_tx_hashes",
+        "Number of transaction hashes pending in fallback batch buffer"
+    );
 }
 
 /// Extract a sanitized chain identifier from an RPC URL.
