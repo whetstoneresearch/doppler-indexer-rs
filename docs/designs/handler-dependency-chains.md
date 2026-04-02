@@ -133,6 +133,8 @@ The database transaction model is unchanged: each handler commits independently.
 4. Independent dependency chains execute concurrently. A handler blocks only on its own declared dependencies.
 5. Catchup mode processes handlers in topological order. Live mode dispatches handlers as soon as their dependencies complete.
 6. When a handler fails, all transitive dependents are immediately failed for that range — they are not left pending.
+7. A handler is not marked completed (in-memory or persisted) while it still has pending entries for the range. This prevents a handler with multiple batches (e.g., from multiple triggers or split call-dep arrivals) from prematurely unblocking its dependents or being skipped on crash recovery.
+8. Multi-trigger handler success is not persisted to `_handler_progress` or `_live_progress` until the corresponding completion signal (`RangeCompleteKind::Logs` for event handlers) confirms all batches have been dispatched. Single-trigger handlers persist immediately for crash-recovery efficiency. `finalize_range()` handles deferred persistence for multi-trigger handlers.
 
 ## Files to Modify
 

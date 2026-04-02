@@ -1226,13 +1226,24 @@ impl TransformationEngine {
                 Some(msg) = complete_rx.recv() => {
                     let range_key = (msg.range_start, msg.range_end);
 
-                    // When all log events have been sent, mark untriggered dependency
-                    // handlers as completed-no-op so dependent handlers can proceed.
+                    // When all log events have been sent, mark logs complete and
+                    // mark untriggered dependency handlers as completed-no-op so
+                    // dependent handlers can proceed.
                     if msg.kind == RangeCompleteKind::Logs {
                         let dep_names = self.registry.dependency_handler_names();
-                        if !dep_names.is_empty() {
-                            let mut state = self.live_state.lock().await;
 
+                        // Mark logs complete before processing pending events so
+                        // that handlers unblocked below are properly recorded in
+                        // completed_handlers (the recording logic gates dep-handler
+                        // completion on logs_complete being true).
+                        let mut state = self.live_state.lock().await;
+                        state
+                            .completion
+                            .entry(range_key)
+                            .or_default()
+                            .mark(RangeCompleteKind::Logs);
+
+                        if !dep_names.is_empty() {
                             // Compute handler names that are pending (triggered
                             // but waiting on their own deps). These must NOT be
                             // marked as no-op — they still need to execute.
@@ -1271,6 +1282,8 @@ impl TransformationEngine {
                                 }
                             }
                         }
+                        drop(state);
+
                         self.try_process_pending_events(range_key).await?;
                     }
 
@@ -1530,13 +1543,19 @@ impl TransformationEngine {
         let succeeded_keys: HashSet<String> =
             outcomes.iter().map(|o| o.handler_key.clone()).collect();
 
-        for outcome in &outcomes {
+        // Only persist success for single-trigger handlers.  Multi-trigger
+        // handlers are deferred to finalize_range() because this method runs
+        // once per (source, event_name) batch and a multi-trigger handler
+        // would be marked complete before all its batches are dispatched.
+        let persistable_success_keys: HashSet<String> = succeeded_keys
+            .iter()
+            .filter(|k| !self.registry.is_multi_trigger(k))
+            .cloned()
+            .collect();
+
+        for key in &persistable_success_keys {
             self.finalizer
-                .record_completed_range_for_handler(
-                    &outcome.handler_key,
-                    outcome.range_start,
-                    outcome.range_end,
-                )
+                .record_completed_range_for_handler(key, msg.range_start, msg.range_end)
                 .await?;
         }
 
@@ -1545,6 +1564,7 @@ impl TransformationEngine {
             msg.range_end,
             &submitted_keys,
             &succeeded_keys,
+            &persistable_success_keys,
             &outcomes,
         )
         .await;
@@ -1647,16 +1667,23 @@ impl TransformationEngine {
     /// Record progress and persist failures for handler outcomes from a single
     /// block range execution.  For single-block (live) ranges this records
     /// per-handler live progress and writes failures to the status file.
+    ///
+    /// `persistable_success_keys` controls which handlers get their success
+    /// written to `_live_progress` and the status file.  This is a subset of
+    /// `succeeded_keys` that excludes multi-trigger handlers whose remaining
+    /// batches have not yet been dispatched.  Failure persistence always uses
+    /// the real `submitted_keys` / `succeeded_keys` to avoid false positives.
     async fn record_handler_outcomes(
         &self,
         range_start: u64,
         range_end: u64,
         submitted_keys: &HashSet<String>,
         succeeded_keys: &HashSet<String>,
+        persistable_success_keys: &HashSet<String>,
         _outcomes: &[super::executor::HandlerOutcome],
     ) {
         if range_end - range_start == 1 {
-            // Only record live progress for fully succeeded handlers.
+            // Only record live progress for handlers in persistable_success_keys.
             // Skip handlers that already failed for this block to prevent
             // re-completing them outside explicit retry.
             let failed_for_block: HashSet<String> = {
@@ -1667,7 +1694,7 @@ impl TransformationEngine {
                     .cloned()
                     .unwrap_or_default()
             };
-            for key in succeeded_keys {
+            for key in persistable_success_keys {
                 let is_already_failed = self
                     .registry
                     .handler_name_for_key(key)
@@ -1922,8 +1949,42 @@ impl TransformationEngine {
                 .map(|(k, _)| k.clone())
                 .collect();
 
-            // Only write _handler_progress for fully succeeded handlers
-            for key in &succeeded_keys {
+            // Compute which succeeded keys are safe to persist now.
+            // A handler's success is persistable only when:
+            //  - it is not multi-trigger, OR logs_complete is true (all
+            //    event batches dispatched), AND
+            //  - it has no remaining pending entries for this range.
+            let (persistable_success_keys, logs_complete) = {
+                let state = self.live_state.lock().await;
+                let logs_complete = state
+                    .completion
+                    .get(&range_key)
+                    .map(|c| c.logs_complete)
+                    .unwrap_or(false);
+                let keys: HashSet<String> = succeeded_keys
+                    .iter()
+                    .filter(|key| {
+                        let is_multi = self.registry.is_multi_trigger(key);
+                        if is_multi && !logs_complete {
+                            return false;
+                        }
+                        let has_remaining_pending = state
+                            .pending_events
+                            .get(*key)
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .any(|e| (e.range_start, e.range_end) == range_key)
+                            })
+                            .unwrap_or(false);
+                        !has_remaining_pending
+                    })
+                    .cloned()
+                    .collect();
+                (keys, logs_complete)
+            };
+
+            for key in &persistable_success_keys {
                 self.finalizer
                     .record_completed_range_for_handler(key, range_key.0, range_key.1)
                     .await?;
@@ -1934,31 +1995,38 @@ impl TransformationEngine {
                 range_key.1,
                 &submitted_keys,
                 &succeeded_keys,
+                &persistable_success_keys,
                 &outcomes,
             )
             .await;
 
             // Record handler completions and failures for cascading.
-            // Dep handlers are only completed post-Logs (all batches dispatched);
-            // pre-Logs they are deferred to avoid premature dependent unblocking.
-            // Only fully-succeeded handlers are marked as completed.
-            // Handlers already in failed_handlers are never re-completed.
+            // A handler is only marked completed in-memory when:
+            //  - it succeeded (all batches in this execution round)
+            //  - for dep handlers: logs_complete is true (all event batches dispatched)
+            //  - it has no remaining pending entries for this range
+            //  - it is not already failed
             let newly_failed_names: Vec<String> = {
                 let dep_names = self.registry.dependency_handler_names();
                 let mut state = self.live_state.lock().await;
-                let logs_complete = state
-                    .completion
-                    .get(&range_key)
-                    .map(|c| c.logs_complete)
-                    .unwrap_or(false);
                 let failed_names: HashSet<String> = state
                     .failed_handlers
                     .get(&range_key)
                     .cloned()
                     .unwrap_or_default();
                 for outcome in &outcomes {
+                    let has_remaining_pending = state
+                        .pending_events
+                        .get(&outcome.handler_key)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .any(|e| (e.range_start, e.range_end) == range_key)
+                        })
+                        .unwrap_or(false);
                     if succeeded_keys.contains(&outcome.handler_key)
                         && (logs_complete || !dep_names.contains(&outcome.handler_name))
+                        && !has_remaining_pending
                         && !failed_names.contains(&outcome.handler_name)
                     {
                         state
@@ -2196,8 +2264,17 @@ impl TransformationEngine {
             .map(|(k, _)| k.clone())
             .collect();
 
-        // Only write _handler_progress for fully succeeded handlers
-        for key in &succeeded_keys {
+        // Only persist success for single-trigger handlers.  Multi-trigger
+        // call handlers (e.g. PriceHandler) are deferred to finalize_range()
+        // because process_calls_message dispatches one call-trigger batch at
+        // a time.
+        let persistable_success_keys: HashSet<String> = succeeded_keys
+            .iter()
+            .filter(|k| !self.registry.is_multi_trigger(k))
+            .cloned()
+            .collect();
+
+        for key in &persistable_success_keys {
             self.finalizer
                 .record_completed_range_for_handler(key, range_start, range_end)
                 .await?;
@@ -2208,6 +2285,7 @@ impl TransformationEngine {
             range_end,
             &submitted_keys,
             &succeeded_keys,
+            &persistable_success_keys,
             &outcomes,
         )
         .await;

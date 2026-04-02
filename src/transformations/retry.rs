@@ -433,21 +433,16 @@ impl RetryProcessor {
                         // No matching events — treat as no-op success so
                         // dependent handlers aren't blocked on this one.
                         attempted_keys.insert(handler_key.clone());
-                        succeeded_keys.insert(handler_key.clone());
-                        succeeded_names.insert(rh.handler.name().to_string());
-                        if let Some(ref tracker) = self.progress_tracker {
-                            if let Err(e) = tracker
-                                .lock()
-                                .await
-                                .mark_complete(block_number, &handler_key)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark no-op retry progress for block {} handler {}: {}",
-                                    block_number, handler_key, e
-                                );
-                            }
-                        }
+                        self.record_handler_retry_success(
+                            &handler_key,
+                            rh.handler.name(),
+                            range_start,
+                            range_end,
+                            block_number,
+                            &mut succeeded_keys,
+                            &mut succeeded_names,
+                        )
+                        .await;
                         continue;
                     }
 
@@ -467,21 +462,16 @@ impl RetryProcessor {
                         // No matching calls — treat as no-op success so
                         // dependent handlers aren't blocked on this one.
                         attempted_keys.insert(handler_key.clone());
-                        succeeded_keys.insert(handler_key.clone());
-                        succeeded_names.insert(rh.handler.name().to_string());
-                        if let Some(ref tracker) = self.progress_tracker {
-                            if let Err(e) = tracker
-                                .lock()
-                                .await
-                                .mark_complete(block_number, &handler_key)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark no-op retry progress for block {} handler {}: {}",
-                                    block_number, handler_key, e
-                                );
-                            }
-                        }
+                        self.record_handler_retry_success(
+                            &handler_key,
+                            rh.handler.name(),
+                            range_start,
+                            range_end,
+                            block_number,
+                            &mut succeeded_keys,
+                            &mut succeeded_names,
+                        )
+                        .await;
                         continue;
                     }
 
@@ -589,53 +579,16 @@ impl RetryProcessor {
                         }
                     }
 
-                    succeeded_keys.insert(handler_key.clone());
-                    succeeded_names.insert(handler_name.to_string());
-
-                    if let Err(e) = self
-                        .db_pool
-                        .execute_transaction(vec![crate::db::DbOperation::Upsert {
-                            table: "_handler_progress".to_string(),
-                            columns: vec![
-                                "chain_id".to_string(),
-                                "handler_key".to_string(),
-                                "range_start".to_string(),
-                                "range_end".to_string(),
-                            ],
-                            values: vec![
-                                crate::db::DbValue::Int64(self.chain_id as i64),
-                                crate::db::DbValue::Text(handler_key.clone()),
-                                crate::db::DbValue::Int64(range_start as i64),
-                                crate::db::DbValue::Int64(range_end as i64),
-                            ],
-                            conflict_columns: vec![
-                                "chain_id".to_string(),
-                                "handler_key".to_string(),
-                                "range_start".to_string(),
-                            ],
-                            update_columns: vec!["range_end".to_string()],
-                        }])
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to record completed range for handler {} on block {}: {}",
-                            handler_key,
-                            block_number,
-                            e
-                        );
-                    }
-
-                    if let Some(ref tracker) = self.progress_tracker {
-                        let mut tracker = tracker.lock().await;
-                        if let Err(e) = tracker.mark_complete(block_number, &handler_key).await {
-                            tracing::warn!(
-                                "Failed to mark retry progress for block {} handler {}: {}",
-                                block_number,
-                                handler_key,
-                                e
-                            );
-                        }
-                    }
+                    self.record_handler_retry_success(
+                        &handler_key,
+                        handler_name,
+                        range_start,
+                        range_end,
+                        block_number,
+                        &mut succeeded_keys,
+                        &mut succeeded_names,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -667,6 +620,71 @@ impl RetryProcessor {
         }
 
         Ok(blocked_handlers)
+    }
+
+    /// Record shared bookkeeping for a successfully retried handler (no-op or real).
+    ///
+    /// Operations in order (matching the normal success path):
+    /// 1. Insert into succeeded_keys / succeeded_names
+    /// 2. Upsert `_handler_progress` so catchup won't re-run this range
+    /// 3. Mark complete in progress_tracker (`_live_progress`)
+    async fn record_handler_retry_success(
+        &self,
+        handler_key: &str,
+        handler_name: &str,
+        range_start: u64,
+        range_end: u64,
+        block_number: u64,
+        succeeded_keys: &mut HashSet<String>,
+        succeeded_names: &mut HashSet<String>,
+    ) {
+        succeeded_keys.insert(handler_key.to_string());
+        succeeded_names.insert(handler_name.to_string());
+
+        if let Err(e) = self
+            .db_pool
+            .execute_transaction(vec![crate::db::DbOperation::Upsert {
+                table: "_handler_progress".to_string(),
+                columns: vec![
+                    "chain_id".to_string(),
+                    "handler_key".to_string(),
+                    "range_start".to_string(),
+                    "range_end".to_string(),
+                ],
+                values: vec![
+                    crate::db::DbValue::Int64(self.chain_id as i64),
+                    crate::db::DbValue::Text(handler_key.to_string()),
+                    crate::db::DbValue::Int64(range_start as i64),
+                    crate::db::DbValue::Int64(range_end as i64),
+                ],
+                conflict_columns: vec![
+                    "chain_id".to_string(),
+                    "handler_key".to_string(),
+                    "range_start".to_string(),
+                ],
+                update_columns: vec!["range_end".to_string()],
+            }])
+            .await
+        {
+            tracing::warn!(
+                "Failed to record completed range for handler {} on block {}: {}",
+                handler_key,
+                block_number,
+                e
+            );
+        }
+
+        if let Some(ref tracker) = self.progress_tracker {
+            let mut tracker = tracker.lock().await;
+            if let Err(e) = tracker.mark_complete(block_number, handler_key).await {
+                tracing::warn!(
+                    "Failed to mark retry progress for block {} handler {}: {}",
+                    block_number,
+                    handler_key,
+                    e
+                );
+            }
+        }
     }
 
     /// Build a uniform list of retry handler descriptors from both event and call handlers.
@@ -1134,5 +1152,57 @@ mod tests {
             "transformed must be cleared when failures are recorded"
         );
         assert!(s.failed_handlers.contains("handler_a"));
+    }
+
+    /// Regression: a no-op retry (no matching events/calls) that clears a prior
+    /// failure must flow through to finalization successfully — the handler ends
+    /// up in `completed_handlers`, failures are empty, and `transformed` is set.
+    ///
+    /// This exercises the status-file chain that the `record_handler_retry_success`
+    /// helper feeds into. Direct `_handler_progress` DB verification requires a
+    /// test harness that doesn't exist yet (tracked as follow-up).
+    #[test]
+    fn noop_retry_success_flows_through_to_finalization() {
+        use super::super::finalizer::update_finalization_status;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        // handler_a previously failed (will be retried as no-op)
+        status.failed_handlers.insert("handler_a".to_string());
+        storage.write_status(100, &status).unwrap();
+
+        let registered_keys = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
+
+        // Phase 1: No-op retry succeeds for handler_a, handler_b was never
+        // attempted (already completed in a prior run)
+        let attempted = HashSet::from(["handler_a".to_string()]);
+        let succeeded = HashSet::from(["handler_a".to_string()]);
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.completed_handlers.contains("handler_a"),
+            "no-op retry must move handler into completed_handlers"
+        );
+        assert!(
+            s.failed_handlers.is_empty(),
+            "no failures should remain after successful retry"
+        );
+
+        // Phase 2: Finalization runs — no failures remain, so transformed is set
+        update_finalization_status(&storage, 100, &registered_keys).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.transformed,
+            "finalization must set transformed once all failures are cleared by retry"
+        );
+        assert!(s.completed_handlers.contains("handler_a"));
     }
 }
