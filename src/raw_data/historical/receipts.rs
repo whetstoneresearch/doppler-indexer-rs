@@ -1070,14 +1070,14 @@ fn extract_logs(
     tx_hash: B256,
     all_logs: &mut Vec<LogData>,
 ) {
-    for (log_index, log) in logs.iter().enumerate() {
+    for log in logs.iter() {
         let topics: Vec<[u8; 32]> = log.topics().iter().map(|t| t.0).collect();
 
         all_logs.push(LogData {
             block_number,
             block_timestamp,
             transaction_hash: tx_hash,
-            log_index: log_index as u32,
+            log_index: log.log_index.unwrap_or(0) as u32,
             address: log.address().0 .0,
             topics,
             data: log.data().data.to_vec(),
