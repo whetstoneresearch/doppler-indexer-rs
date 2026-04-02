@@ -1136,6 +1136,8 @@ impl TransformationEngine {
             self.mode
         );
 
+        let mut timeout_sweep_interval = tokio::time::interval(Duration::from_secs(30));
+
         loop {
             tokio::select! {
                 biased;
@@ -1184,6 +1186,37 @@ impl TransformationEngine {
                     self.retry_processor
                         .process_transform_retry(msg, &self.live_state, self)
                         .await?;
+                }
+
+                _ = timeout_sweep_interval.tick() => {
+                    let timed_out = {
+                        let mut state = self.live_state.lock().await;
+                        state.sweep_timed_out_events()
+                    };
+
+                    if !timed_out.is_empty() {
+                        for ((rs, re), handler_key) in &timed_out {
+                            tracing::error!(
+                                "Periodic sweep: timed out pending event for handler={} range={}-{}. \
+                                 Force-cleaning to unblock progress.",
+                                handler_key, rs, re
+                            );
+                        }
+
+                        // Attempt finalization for ranges that had timed-out events
+                        let affected_ranges: HashSet<(u64, u64)> = timed_out.iter().map(|(rk, _)| *rk).collect();
+                        for range_key in affected_ranges {
+                            if let Err(e) = self.finalizer
+                                .maybe_finalize_range(range_key, &self.live_state)
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to finalize range {:?} after timeout sweep: {}",
+                                    range_key, e
+                                );
+                            }
+                        }
+                    }
                 }
 
                 else => {
