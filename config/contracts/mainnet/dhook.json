@@ -2,7 +2,7 @@
     "DopplerHookInitializer": {
         "address": [
             "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
-            "0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544"
+            "0xbdf938149ac6a781f94faa0ed45e6a0e984c6544"
         ],
         "events": [
             { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
@@ -57,8 +57,8 @@
     },
     "RehypeDopplerHookInitializer": {
         "address": [
-            "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d",
-            "0x6ab5ae3191c914de8437431091776fc90f314be4"
+            "0x6ab5ae3191c914de8437431091776fc90f314be4",
+            "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d"
         ]
     }
 }

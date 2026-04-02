@@ -1,0 +1,54 @@
+{
+    "UniswapV3Initializer": {
+        "address": "0x4c3062b9ccfdbcb10353f57c1b59a29d4c5cfa47",
+        "factories": [
+            {
+                "collection_name": "DopplerV3Pool",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address,address,address",
+                    "factory_parameters": "topics[1]"
+                },
+                "calls": [
+                    { "function": "fee()", "output_type": "uint24", "frequency": "once" }
+                ],
+                "events": [
+                    { "signature": "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)" }
+                ]
+            }
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
+        ]
+    },
+    "LockableUniswapV3Initializer": {
+        "address": "0x1fb8a108ff5c16213ebe3456314858d6b069a23b",
+        "factories": [
+            {
+                "collection_name": "DopplerLockableV3Pool",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address,address,address",
+                    "factory_parameters": "topics[1]"
+                },
+                "calls": [
+                    { "function": "fee()", "output_type": "uint24", "frequency": "once" }
+                ],
+                "events": [
+                    { "signature": "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
+                    { "signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)" }
+                ]
+            }
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
+            { "signature": "Lock(address indexed pool, (address beneficiary, uint96 shares)[] beneficiaries)" }
+        ]
+    },
+    "UniswapV3Migrator": {
+        "address": "0x0A3d3678b31cfF5F926c2A0384E742E4747605A0"
+    }
+}

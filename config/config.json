@@ -4,9 +4,63 @@
             "name": "base",
             "chain_id": 8453,
             "rpc_url_env_var": "BASE_RPC_URL",
-            "ws_url_env_var": "BASE_WS_URL",            
+            "ws_url_env_var": "BASE_WS_URL",
             "start_block": 26602741,
             "contracts": "contracts/base",
+            "block_receipts_method": "eth_getBlockReceipts"
+        },
+        {
+            "name": "mainnet",
+            "chain_id": 1,
+            "rpc_url_env_var": "MAINNET_RPC_URL",
+            "ws_url_env_var": "MAINNET_WS_URL",
+            "start_block": 21781000,
+            "contracts": "contracts/mainnet",
+            "block_receipts_method": "eth_getBlockReceipts"
+        },
+        {
+            "name": "unichain",
+            "chain_id": 130,
+            "rpc_url_env_var": "UNICHAIN_RPC_URL",
+            "ws_url_env_var": "UNICHAIN_WS_URL",
+            "start_block": 8536880,
+            "contracts": "contracts/unichain",
+            "block_receipts_method": "eth_getBlockReceipts"
+        },
+        {
+            "name": "ink",
+            "chain_id": 57073,
+            "rpc_url_env_var": "INK_RPC_URL",
+            "ws_url_env_var": "INK_WS_URL",
+            "start_block": 9508011,
+            "contracts": "contracts/ink",
+            "block_receipts_method": "eth_getBlockReceipts"
+        },
+        {
+            "name": "monad",
+            "chain_id": 143,
+            "rpc_url_env_var": "MONAD_RPC_URL",
+            "ws_url_env_var": "MONAD_WS_URL",
+            "start_block": 34746370,
+            "contracts": "contracts/monad",
+            "block_receipts_method": "eth_getBlockReceipts"
+        },
+        {
+            "name": "sepolia",
+            "chain_id": 11155111,
+            "rpc_url_env_var": "SEPOLIA_RPC_URL",
+            "ws_url_env_var": "SEPOLIA_WS_URL",
+            "start_block": 10134362,
+            "contracts": "contracts/sepolia",
+            "block_receipts_method": "eth_getBlockReceipts"
+        },
+        {
+            "name": "baseSepolia",
+            "chain_id": 84532,
+            "rpc_url_env_var": "BASE_SEPOLIA_RPC_URL",
+            "ws_url_env_var": "BASE_SEPOLIA_WS_URL",
+            "start_block": 28109000,
+            "contracts": "contracts/baseSepolia",
             "block_receipts_method": "eth_getBlockReceipts"
         }
     ],

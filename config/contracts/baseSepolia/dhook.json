@@ -1,6 +1,7 @@
 {
     "DopplerHookInitializer": {
         "address": [
+            "0x98cd6478debe443069db863abb9626d94de9a544",
             "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
             "0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544"
         ],
@@ -38,19 +39,25 @@
     },
     "RehypeDopplerHook": {
         "address": [
+            "0x0ed4c733f2642bd947b464a05acc848a9580eae7",
             "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
+            "0x636A756CeE08775CC18780F52dd90B634F18ad37",
             "0x3ec4798a9b11e8243a8db99687f7a23597b96623"
         ]
     },
     "DopplerHookMigrator": {
         "address": [
             "0x1e40b0875dda35f41e15cfb475403859b8c860c4",
-            "0x65b6737c7a897029afe54dbb61bc4a84b232e0c4"
+            "0x65b6737c7a897029afe54dbb61bc4a84b232e0c4",
+            "0xf848fea3329185529b50228bcb36f3b5a60960c4",
+            "0x8bbbe586f9a902c15a759fc134a99a2d28bc20c4"
         ]
     },
     "RehypeDopplerHookMigrator": {
         "address": [
+            "0x2497969a9d38045e7bd3d632af9685d9fd774ca1",
             "0xc3c9f4cfd1dc0a7837cc4b202b3455b4156a8005",
+            "0x6477ae25bca3db3911af7cbb48a0ace38692720b",
             "0x82d5e22911fbbcb8d3e45812d74ee6203c5824e0",
             "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
         ]
