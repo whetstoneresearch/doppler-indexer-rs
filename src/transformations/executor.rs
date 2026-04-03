@@ -22,6 +22,7 @@ use crate::types::config::contract::Contracts;
 /// Outcome of a successful handler execution.
 pub(crate) struct HandlerOutcome {
     pub handler_key: String,
+    pub handler_name: String,
     pub range_start: u64,
     pub range_end: u64,
 }
@@ -142,6 +143,7 @@ impl HandlerExecutor {
                         }
                         Ok(Some(HandlerOutcome {
                             handler_key,
+                            handler_name: handler_name.to_string(),
                             range_start,
                             range_end,
                         }))

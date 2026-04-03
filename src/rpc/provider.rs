@@ -17,6 +17,8 @@ use governor::{Jitter, Quota, RateLimiter};
 use thiserror::Error;
 use url::Url;
 
+use super::alchemy::SlidingWindowRateLimiter;
+
 /// Trait for RPC providers that can execute Ethereum JSON-RPC calls.
 /// This abstracts over different client implementations (standard, Alchemy, etc.)
 /// and allows unified usage while each implementation handles rate limiting differently.
@@ -390,6 +392,7 @@ pub struct RpcClient {
     config: RpcClientConfig,
     rate_limiter: Option<Arc<StandardRateLimiter>>,
     jitter: Option<Jitter>,
+    sliding_limiter: Option<Arc<SlidingWindowRateLimiter>>,
 }
 
 #[allow(dead_code)]
@@ -414,6 +417,21 @@ impl RpcClient {
             config,
             rate_limiter,
             jitter,
+            sliding_limiter: None,
+        })
+    }
+
+    pub fn new_with_shared_limiter(
+        config: RpcClientConfig,
+        limiter: Arc<SlidingWindowRateLimiter>,
+    ) -> Result<Self, RpcError> {
+        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        Ok(Self {
+            provider,
+            config,
+            rate_limiter: None,
+            jitter: None,
+            sliding_limiter: Some(limiter),
         })
     }
 
@@ -439,7 +457,9 @@ impl RpcClient {
     }
 
     async fn wait_for_rate_limit(&self) {
-        if let (Some(limiter), Some(jitter)) = (&self.rate_limiter, &self.jitter) {
+        if let Some(ref limiter) = self.sliding_limiter {
+            limiter.acquire(1).await;
+        } else if let (Some(limiter), Some(jitter)) = (&self.rate_limiter, &self.jitter) {
             limiter.until_ready_with_jitter(*jitter).await;
         }
     }
