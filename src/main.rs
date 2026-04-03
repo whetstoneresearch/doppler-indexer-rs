@@ -407,7 +407,7 @@ async fn process_chain_live_only(
     }
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain).await?;
+    let runtime = ChainRuntime::build(config, chain, None, None).await?;
 
     // Build channels with config-derived capacity
     let channels = CommonChannels::build_for_live_only(
@@ -1010,7 +1010,7 @@ async fn process_chain(
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain).await?;
+    let runtime = ChainRuntime::build(config, chain, None, None).await?;
 
     let features = &runtime.features;
     let has_factories = features.has_factories;

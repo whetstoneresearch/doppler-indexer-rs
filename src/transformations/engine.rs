@@ -279,6 +279,23 @@ impl TransformationEngine {
         }
 
         let pool = self.db_pool.inner();
+
+        // Acquire advisory lock to prevent concurrent handler migration races.
+        // Multiple chains may initialize concurrently with the same handlers.
+        // The lock is session-level: if this method returns early due to error,
+        // the lock_client is dropped, the connection returns to the pool, and
+        // the lock is automatically released.
+        let lock_client = pool.get().await?;
+        lock_client
+            .execute("SELECT pg_advisory_lock(424242)", &[])
+            .await
+            .map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::MigrationError(format!(
+                    "Failed to acquire migration lock: {}",
+                    e
+                )))
+            })?;
+
         let applied: HashSet<String> = {
             let client = pool.get().await?;
             let rows = client.query("SELECT name FROM _migrations", &[]).await?;
@@ -338,6 +355,17 @@ impl TransformationEngine {
 
             tracing::info!("Applied handler migration: {}", migration_name);
         }
+
+        // Explicitly release the advisory lock on the happy path
+        lock_client
+            .execute("SELECT pg_advisory_unlock(424242)", &[])
+            .await
+            .map_err(|e| {
+                TransformationError::DatabaseError(crate::db::DbError::MigrationError(format!(
+                    "Failed to release migration lock: {}",
+                    e
+                )))
+            })?;
 
         Ok(())
     }
