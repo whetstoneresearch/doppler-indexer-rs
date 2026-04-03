@@ -666,6 +666,7 @@ impl RetryProcessor {
                     "range_start".to_string(),
                 ],
                 update_columns: vec!["range_end".to_string()],
+                update_condition: None,
             }])
             .await
         {

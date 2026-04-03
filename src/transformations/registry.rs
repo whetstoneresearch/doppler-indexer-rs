@@ -716,6 +716,7 @@ pub fn build_registry(chain_id: u64) -> TransformationRegistry {
 /// factory collections are registered. This prevents handlers designed for one
 /// chain from being initialized, migrated, or validated on another.
 pub fn build_registry_for_chain(
+    chain_id: u64,
     contracts: &Contracts,
     factory_collections: &FactoryCollections,
 ) -> TransformationRegistry {
@@ -725,7 +726,7 @@ pub fn build_registry_for_chain(
     let mut registry = TransformationRegistry::with_source_filter(available);
 
     // Register event handlers (filtered by available sources)
-    super::event::register_handlers(&mut registry);
+    super::event::register_handlers(&mut registry, chain_id);
 
     // Register eth_call handlers (filtered by available sources)
     super::eth_call::register_handlers(&mut registry);

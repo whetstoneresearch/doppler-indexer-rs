@@ -197,6 +197,10 @@ impl EventHandler for V3SwapMetricsHandler {
             "Swap(address,address,int256,int256,uint160,uint128,int24)",
         )]
     }
+
+    fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["V3CreateHandler"]
+    }
 }
 
 // --- V3LiquidityMetricsHandler ---
@@ -244,6 +248,10 @@ impl EventHandler for V3LiquidityMetricsHandler {
                 "Burn(address,int24,int24,uint128,uint256,uint256)",
             ),
         ]
+    }
+
+    fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["V3CreateHandler"]
     }
 }
 
@@ -317,6 +325,10 @@ impl EventHandler for LockableV3SwapMetricsHandler {
             "Swap(address,address,int256,int256,uint160,uint128,int24)",
         )]
     }
+
+    fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["LockableV3CreateHandler"]
+    }
 }
 
 // --- LockableV3LiquidityMetricsHandler ---
@@ -364,6 +376,10 @@ impl EventHandler for LockableV3LiquidityMetricsHandler {
                 "Burn(address,int24,int24,uint128,uint256,uint256)",
             ),
         ]
+    }
+
+    fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["LockableV3CreateHandler"]
     }
 }
 

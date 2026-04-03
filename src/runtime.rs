@@ -359,7 +359,7 @@ impl ChainRuntime {
         };
 
         // Build transformation registry filtered to this chain's contracts
-        let registry = build_registry_for_chain(&chain.contracts, &chain.factory_collections);
+        let registry = build_registry_for_chain(chain.chain_id, &chain.contracts, &chain.factory_collections);
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
         // Validate that all handler call dependencies are satisfied by config

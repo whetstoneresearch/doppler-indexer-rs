@@ -186,6 +186,18 @@ pub trait EventHandler: TransformationHandler {
     /// Returns (source_name, function_name) pairs that must be available
     /// in decoded parquet files before this handler can process a range.
     fn call_dependencies(&self) -> Vec<(String, String)> { vec![] }
+
+    /// Handler names (via `TransformationHandler::name()`) that must complete
+    /// before this handler can execute for a given block range.
+    ///
+    /// Used to enforce ordering when one handler populates shared in-memory
+    /// state (e.g., a metadata cache) that another handler reads. References
+    /// `name()` rather than `handler_key()` so version bumps on the dependency
+    /// don't require updating dependents.
+    ///
+    /// All declared names must resolve to registered handlers — missing names
+    /// cause a panic at startup. Cycles are also detected at startup.
+    fn handler_dependencies(&self) -> Vec<&'static str> { vec![] }
 }
 ```
 
@@ -371,16 +383,18 @@ impl EventHandler for V4CreateHandler {
 
 ### Registering Handlers
 
-Handlers are registered at compile-time via the `build_registry()` function in `src/transformations/registry.rs`. Each handler category has its own registration function:
+Handlers are registered at compile-time via the `build_registry()` or `build_registry_for_chain()` functions in `src/transformations/registry.rs`. Each handler category has its own registration function.
 
-**Event handlers** in `src/transformations/event/mod.rs`:
+**Event handlers** in `src/transformations/event/mod.rs` take `chain_id` (used by handlers that need chain-specific state like the `PoolMetadataCache`):
 
 ```rust
-pub fn register_handlers(registry: &mut TransformationRegistry) {
+pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     derc20_transfer::register_handlers(registry);
     v4::create::register_handlers(registry);
-    multicurve::create::register_handlers(registry);
-    // Add more handler registrations here
+    // Handlers that share a PoolMetadataCache pass it down:
+    let v3_cache = Arc::new(PoolMetadataCache::new());
+    v3::create::register_handlers(registry, v3_cache.clone());
+    v3::metrics::register_handlers(registry, chain_id, v3_cache);
 }
 ```
 
@@ -389,7 +403,6 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
 ```rust
 pub fn register_handlers(registry: &mut TransformationRegistry) {
     // oracle::register_handlers(registry);
-    // pool_state::register_handlers(registry);
 }
 ```
 
@@ -401,6 +414,8 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
     registry.register_event_handler(V4CreateHandler);
 }
 ```
+
+`build_registry(chain_id)` builds a global registry (used for running migrations at startup). `build_registry_for_chain(chain_id, contracts, factory_collections)` builds a registry filtered to handlers whose trigger sources are present in the chain's config.
 
 ## TransformationContext
 
@@ -658,6 +673,7 @@ DbOperation::Upsert {
     values: vec![DbValue::Bytes32(id), DbValue::Numeric(amount)],
     conflict_columns: vec!["id".into()],
     update_columns: vec!["amount".into()],
+    update_condition: None,  // Optional WHERE on the DO UPDATE (e.g. "EXCLUDED.block_number > swaps.block_number")
 }
 // Engine injects source/source_version into columns, values, and conflict_columns
 // Generates: INSERT INTO swaps (id, amount, source, source_version) VALUES ($1, $2, $3, $4)

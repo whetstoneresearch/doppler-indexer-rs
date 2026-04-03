@@ -188,6 +188,8 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 - Fixed `liquidity_deltas` from INSERT to Upsert with empty update_columns (ON CONFLICT DO NOTHING) to prevent duplicate key errors on re-runs
 - Updated DDL: `liquidity_deltas` changed from PRIMARY KEY to UNIQUE constraint including source/source_version
 - Registered in `v3/mod.rs` and `event/mod.rs`
+- `handler_dependencies()` added to all 4 handlers so create handlers run before metrics handlers within the same block, ensuring the shared `PoolMetadataCache` is populated before swap/liquidity processing
+- `PoolMetadataCache` crash recovery: rebuilt from `pools` table on startup via `load_into()` in `initialize()` — no separate persistence needed since create handlers already write to `pools`
 
 ### Established patterns (reference for all future handlers)
 

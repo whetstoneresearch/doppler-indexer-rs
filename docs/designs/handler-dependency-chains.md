@@ -179,34 +179,19 @@ The database transaction model is unchanged: each handler commits independently.
 - Timeout logging now shows both `waiting_for_calls` and `waiting_for_handlers`.
 - PRs: #82 (state), #83 (dispatch)
 
-### Phase 4: No-op Completion for Untriggered Handlers
+### Phase 4: No-op Completion for Untriggered Handlers (COMPLETE)
 
 - On `RangeCompleteKind::Logs`, compute untriggered dependency handlers and mark them completed-no-op in `completed_handlers`.
 - Unblock any pending handlers that were waiting on the no-op'd handlers via `try_process_pending_events`.
-- Without this phase, a handler depending on an untriggered handler will timeout after 5 minutes (the existing timeout safety net).
+- Implemented in `src/transformations/engine.rs` in the `run()` loop where `RangeCompleteKind::Logs` messages are handled — no-op marking happens before `finalizer.process_range_complete`.
+- Registry helper `dependency_handler_names()` returns precomputed `HashSet<String>` of all handler names that appear as dependencies in any `handler_dependencies()` declaration.
 
-**Key details for implementation:**
+### Phase 5: Wire Up Handlers (COMPLETE)
 
-**File:** `src/transformations/engine.rs` or `src/transformations/finalizer.rs`
-
-**Trigger:** `process_range_complete()` in `finalizer.rs` (line 92) is called when `RangeCompleteKind::Logs` arrives. After marking `logs_complete`, but before calling `maybe_finalize_range`, insert the no-op logic.
-
-**Logic:**
-1. Get the set of all handler names that are declared as dependencies (from `registry.handler_dependency_graph()` — values are the dep names).
-2. Lock `live_state`, get `completed_handlers[range_key]` (what has already completed).
-3. For each dependency handler name not in the completed set, insert it as completed-no-op.
-4. Call `try_process_pending_events(range_key)` to unblock any waiting handlers.
-5. Then proceed to `maybe_finalize_range`.
-
-**Registry helper needed:** A method like `all_dependency_handler_names() -> HashSet<String>` that returns the union of all values in `handler_dependency_graph`. This can be precomputed during `validate_and_sort_handler_dependencies()` and stored as a field. Or computed on the fly from `handler_dependency_graph()`.
-
-**Interaction with `process_range_complete`:** Currently `process_range_complete` just marks completion and calls `maybe_finalize_range`. The no-op + unblock step goes between. Since `process_range_complete` is on `RangeFinalizer` (not the engine), it doesn't have access to `try_process_pending_events`. Options:
-- Move the no-op logic to the engine's `run()` loop where `complete_rx` messages are handled (the engine has access to both finalizer and live_state)
-- Pass a callback or the engine ref to the finalizer
-
-The cleanest approach is to handle it in the engine's `run()` loop: when receiving a `RangeCompleteKind::Logs` message, do the no-op marking and pending dispatch BEFORE calling `finalizer.process_range_complete`.
-
-### Phase 5: Wire Up Handlers
-
-- Add `handler_dependencies()` to swap/metrics handlers that depend on create handlers.
-- Integration test: block with pool creation and swap in same block, verify create handler runs before swap handler.
+- Added `handler_dependencies()` to all V3 metrics handlers, declaring dependencies on their respective create handlers:
+  - `V3SwapMetricsHandler` → `["V3CreateHandler"]`
+  - `V3LiquidityMetricsHandler` → `["V3CreateHandler"]`
+  - `LockableV3SwapMetricsHandler` → `["LockableV3CreateHandler"]`
+  - `LockableV3LiquidityMetricsHandler` → `["LockableV3CreateHandler"]`
+- This ensures the create handler populates the shared `PoolMetadataCache` (via `insert_if_absent`) before swap/liquidity metrics handlers execute for the same block.
+- Crash recovery: `PoolMetadataCache` is rebuilt from the `pools` DB table in `initialize()` via `load_into()`. No separate persistence needed — the create handler already writes to `pools` as part of its normal DB operations.
