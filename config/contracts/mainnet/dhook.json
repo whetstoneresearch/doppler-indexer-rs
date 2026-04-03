@@ -1,0 +1,64 @@
+{
+    "DopplerHookInitializer": {
+        "address": [
+            "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
+            "0xbdf938149ac6a781f94faa0ed45e6a0e984c6544"
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
+        ],
+        "calls": [
+            {
+                "function": "getState(address)",
+                "output_type": "(address numeraire, uint256 totalTokensOnBondingCurve, address dopplerHook, bytes graduationDopplerHookCalldata, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
+                "frequency": {
+                    "on_events": {
+                        "source": "DopplerHookInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            },
+            {
+                "function": "getBeneficiaries(address)",
+                "output_type": "(address, uint96)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "DopplerHookInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            }
+        ]
+    },
+    "RehypeDopplerHook": {
+        "address": [
+            "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
+            "0x3ec4798a9b11e8243a8db99687f7a23597b96623"
+        ]
+    },
+    "DopplerHookMigrator": {
+        "address": [
+            "0x1e40b0875dda35f41e15cfb475403859b8c860c4",
+            "0x65b6737c7a897029afe54dbb61bc4a84b232e0c4"
+        ]
+    },
+    "RehypeDopplerHookMigrator": {
+        "address": [
+            "0xc3c9f4cfd1dc0a7837cc4b202b3455b4156a8005",
+            "0x82d5e22911fbbcb8d3e45812d74ee6203c5824e0",
+            "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
+        ]
+    },
+    "RehypeDopplerHookInitializer": {
+        "address": [
+            "0x6ab5ae3191c914de8437431091776fc90f314be4",
+            "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d"
+        ]
+    }
+}

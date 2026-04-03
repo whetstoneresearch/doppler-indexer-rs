@@ -73,4 +73,4 @@ pub use engine::{
     RangeCompleteMessage, ReorgMessage, TransformationEngine, TransformationEngineConfig,
 };
 pub use error::TransformationError;
-pub use registry::build_registry;
+pub use registry::{build_registry, build_registry_for_chain};

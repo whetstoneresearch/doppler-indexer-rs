@@ -430,7 +430,7 @@ fn batch_to_calls(
     // Extract standard columns
     let block_numbers = get_u64_column(&batch, "block_number")?;
     let block_timestamps = get_u64_column(&batch, "block_timestamp")?;
-    let addresses = get_address_column(&batch, "address")?;
+    let addresses = get_address_column(&batch, "contract_address")?;
 
     // Extract log_index if present (event-triggered calls have this column)
     let log_indices = batch
@@ -439,7 +439,7 @@ fn batch_to_calls(
         .transpose()?;
 
     // Get result columns (exclude standard + log_index)
-    let standard_cols = ["block_number", "block_timestamp", "address", "log_index"];
+    let standard_cols = ["block_number", "block_timestamp", "contract_address", "log_index"];
     let schema = batch.schema();
     let result_columns: Vec<_> = schema
         .fields()

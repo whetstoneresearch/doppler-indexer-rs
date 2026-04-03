@@ -14,7 +14,8 @@ use crate::live::{LiveProgressTracker, TransformRetryRequest};
 use crate::rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::{
-    build_registry, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage, ReorgMessage,
+    build_registry_for_chain, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage,
+    ReorgMessage,
 };
 use crate::types::config::chain::{ChainConfig, RpcConfig};
 use crate::types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
@@ -307,7 +308,16 @@ pub struct ChainRuntime {
 
 impl ChainRuntime {
     /// Build the runtime infrastructure for a chain.
-    pub async fn build(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::Result<Self> {
+    ///
+    /// When running multiple chains concurrently, pass a pre-created `shared_db_pool`
+    /// (with migrations already run) and `shared_rate_limiter` to avoid redundant
+    /// setup and enable account-level rate limiting across chains.
+    pub async fn build(
+        config: &IndexerConfig,
+        chain: &ChainConfig,
+        shared_db_pool: Option<Arc<DbPool>>,
+        shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    ) -> anyhow::Result<Self> {
         let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
             format!(
                 "env var {} not set for chain {}",
@@ -327,11 +337,29 @@ impl ChainRuntime {
             .or(config.raw_data_collection.rpc_batch_size)
             .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
 
-        // Build RPC client with rate limiter from per-chain config
-        let (rate_limiter, http_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+        // Resolve RPC parameters before building client
+        let concurrency = chain.rpc.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
+        let cu_per_second = chain
+            .rpc
+            .compute_units_per_second
+            .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
-        // Build transformation registry
-        let registry = build_registry(chain.chain_id);
+        // Build RPC client, reusing shared rate limiter if provided
+        let (rate_limiter, http_client) = if let Some(limiter) = shared_rate_limiter {
+            let client = UnifiedRpcClient::from_url_with_options(
+                &rpc_url,
+                cu_per_second,
+                concurrency,
+                rpc_batch_size,
+                Some(limiter.clone()),
+            )?;
+            (limiter, Arc::new(client))
+        } else {
+            build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
+        };
+
+        // Build transformation registry filtered to this chain's contracts
+        let registry = build_registry_for_chain(&chain.contracts, &chain.factory_collections);
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
         // Validate that all handler call dependencies are satisfied by config
@@ -344,8 +372,13 @@ impl ChainRuntime {
         }
 
         // Setup database if transformations enabled
-        let db_pool = if let Some(ref tc) = config.transformations {
-            if transformations_enabled {
+        let db_pool = if transformations_enabled {
+            if let Some(pool) = shared_db_pool {
+                // Use pre-created shared pool (migrations already run in main)
+                Some(pool)
+            } else {
+                // Fallback: create per-chain pool (for backwards compat or single-chain mode)
+                let tc = config.transformations.as_ref().unwrap();
                 let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
                     format!(
                         "env var {} not set for transformations",
@@ -359,11 +392,12 @@ impl ChainRuntime {
                 pool.run_migrations()
                     .await
                     .context("failed to run database migrations")?;
+                pool.run_handler_migrations(&registry)
+                    .await
+                    .context("failed to run handler migrations")?;
 
                 tracing::info!("Database pool initialized and migrations complete");
                 Some(Arc::new(pool))
-            } else {
-                None
             }
         } else {
             None

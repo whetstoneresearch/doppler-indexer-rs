@@ -117,6 +117,13 @@ impl DbPool {
         super::migrations::run(&self.pool).await
     }
 
+    pub async fn run_handler_migrations(
+        &self,
+        registry: &crate::transformations::registry::TransformationRegistry,
+    ) -> Result<(), DbError> {
+        super::migrations::run_handler_migrations(&self.pool, registry).await
+    }
+
     pub async fn query(
         &self,
         query: &str,

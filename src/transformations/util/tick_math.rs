@@ -116,8 +116,7 @@ mod tests {
     fn test_tick_1() {
         // Known value from Uniswap: tick 1 = 79232123823359799118286999568
         let result = tick_to_sqrt_price_x96(1);
-        let expected =
-            U256::from_str_radix("79232123823359799118286999568", 10).unwrap();
+        let expected = U256::from_str_radix("79232123823359799118286999568", 10).unwrap();
         assert_eq!(result, expected);
     }
 
@@ -125,8 +124,7 @@ mod tests {
     fn test_tick_negative_1() {
         // Known Uniswap value: tick -1 = 79224201403219477170569942574
         let result = tick_to_sqrt_price_x96(-1);
-        let expected =
-            U256::from_str_radix("79224201403219477170569942574", 10).unwrap();
+        let expected = U256::from_str_radix("79224201403219477170569942574", 10).unwrap();
         assert_eq!(result, expected);
     }
 

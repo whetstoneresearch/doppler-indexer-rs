@@ -73,7 +73,10 @@
         ]
     },
     "UniswapV4MigratorHook": {
-        "address": "0xd6fecff347c6203a41874e8d77de669b54e7a500",
+        "address": [
+            "0x45178a8d6d368d612b7552b217802b7f97262000",
+            "0xd6fecff347c6203a41874e8d77de669b54e7a500"
+        ],
         "events": [
             { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
         ]

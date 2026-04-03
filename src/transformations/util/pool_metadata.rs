@@ -82,6 +82,9 @@ impl PoolMetadataCache {
             base_token.copy_from_slice(&base_token_bytes);
             quote_token.copy_from_slice(&quote_token_bytes);
 
+            let base_decimals = 18; // all launched tokens are 18 decimals
+            let quote_decimals = quote_token_decimals(&quote_token, contracts).unwrap_or(18);
+
             map.insert(
                 pool_id.clone(),
                 PoolMetadata {
@@ -90,8 +93,8 @@ impl PoolMetadataCache {
                     quote_token,
                     is_token_0,
                     pool_type,
-                    base_decimals: 18,
-                    quote_decimals: 18,
+                    base_decimals,
+                    quote_decimals,
                 },
             );
         }
