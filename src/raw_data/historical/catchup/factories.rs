@@ -15,8 +15,9 @@ use crate::raw_data::historical::factories::{
     FactoryAddressData, FactoryCatchupState, FactoryCollectionError, RecollectRequest,
 };
 use crate::storage::contract_index::{
-    build_expected_factory_contracts, get_missing_contracts, range_key, read_contract_index,
-    update_contract_index, write_contract_index, ContractIndex,
+    build_address_contract_map, build_expected_factory_contracts, detect_contracts_in_log_parquet,
+    get_missing_contracts, range_key, read_contract_index, update_contract_index,
+    write_contract_index, ContractIndex,
 };
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
@@ -147,6 +148,133 @@ pub async fn collect_factories(
                 .unwrap_or_default()
         };
         contract_indexes.insert(collection.clone(), idx);
+    }
+
+    // =========================================================================
+    // Migration: build contract_index.json from existing data if missing
+    // =========================================================================
+    let needs_migration = factory_collection_names
+        .iter()
+        .any(|c| contract_indexes.get(c).map_or(true, |idx| idx.is_empty()));
+
+    if needs_migration {
+        tracing::info!(
+            "Contract index migration: scanning log files to build index for existing factory ranges"
+        );
+        let address_maps = build_address_contract_map(&chain.contracts);
+        let log_ranges_for_migration = {
+            let chain_name = chain.name.clone();
+            let s3_manifest_clone = s3_manifest.clone();
+            tokio::task::spawn_blocking(move || {
+                get_existing_log_ranges(&chain_name, s3_manifest_clone.as_ref())
+            })
+            .await
+            .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+        };
+
+        let mut migrated_count = 0usize;
+        for log_range in &log_ranges_for_migration {
+            let rk = range_key(log_range.start, log_range.end - 1);
+
+            // Only migrate ranges that have factory parquet but no index entry
+            let any_needs_migration = factory_collection_names.iter().any(|collection| {
+                let rel_path = format!(
+                    "{}/{}-{}.parquet",
+                    collection,
+                    log_range.start,
+                    log_range.end - 1
+                );
+                let file_exists = existing_files.contains(&rel_path)
+                    || s3_manifest
+                        .as_ref()
+                        .is_some_and(|m| m.has_factories(collection, log_range.start, log_range.end - 1));
+                if !file_exists {
+                    return false;
+                }
+                let index = contract_indexes.get(collection).cloned().unwrap_or_default();
+                !index.contains_key(&rk)
+            });
+
+            if !any_needs_migration {
+                continue;
+            }
+
+            // Scan the log parquet to detect which contracts were present
+            if !log_range.file_path.exists() {
+                continue;
+            }
+
+            match detect_contracts_in_log_parquet(&log_range.file_path, &address_maps) {
+                Ok(detected) => {
+                    for (collection, contracts_found) in &detected {
+                        let index = contract_indexes.entry(collection.clone()).or_default();
+                        if !index.contains_key(&rk) {
+                            update_contract_index(index, &rk, contracts_found);
+                        }
+                    }
+                    // Also record collections where no source addresses were found
+                    // (the range was processed but had no matching events)
+                    for collection in &factory_collection_names {
+                        if !detected.contains_key(collection) {
+                            let rel_path = format!(
+                                "{}/{}-{}.parquet",
+                                collection,
+                                log_range.start,
+                                log_range.end - 1
+                            );
+                            let file_exists = existing_files.contains(&rel_path)
+                                || s3_manifest.as_ref().is_some_and(|m| {
+                                    m.has_factories(collection, log_range.start, log_range.end - 1)
+                                });
+                            if file_exists {
+                                let index = contract_indexes.entry(collection.clone()).or_default();
+                                if !index.contains_key(&rk) {
+                                    // No source addresses matched, but the file exists.
+                                    // Record an empty entry so we don't re-scan.
+                                    // Use detected (empty for this collection) which is correct:
+                                    // no contracts contributed, so empty map.
+                                    update_contract_index(
+                                        index,
+                                        &rk,
+                                        detected.get(collection).unwrap_or(&HashMap::new()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    migrated_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Migration: failed to scan log parquet {}: {}",
+                        log_range.file_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Write migrated indexes
+        if migrated_count > 0 {
+            for collection in &factory_collection_names {
+                if let Some(index) = contract_indexes.get(collection) {
+                    if !index.is_empty() {
+                        let dir = output_dir.join(collection);
+                        if let Err(e) = write_contract_index(&dir, index) {
+                            tracing::warn!(
+                                "Migration: failed to write contract index for {}: {}",
+                                collection,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                "Contract index migration complete: built index from {} log ranges",
+                migrated_count
+            );
+        }
     }
 
     // =========================================================================

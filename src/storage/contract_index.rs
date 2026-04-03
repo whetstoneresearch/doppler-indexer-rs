@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
+use arrow::array::Array;
 use serde::{Deserialize, Serialize};
 
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
@@ -223,12 +224,127 @@ pub async fn write_contract_index_async(
 }
 
 // ---------------------------------------------------------------------------
-// Serde helpers for inline usage
+// Migration: build contract_index from existing log parquet files
 // ---------------------------------------------------------------------------
 
-/// Wrapper used when the index must be serialized for S3 upload.
-#[derive(Serialize, Deserialize)]
-struct ContractIndexWrapper(ContractIndex);
+/// Address-to-contract lookup built from factory matchers.
+///
+/// Maps `[u8; 20]` factory source addresses → `(contract_name, hex_address)`.
+pub type AddressContractMap = HashMap<[u8; 20], (String, String)>;
+
+/// Build a lookup from factory source addresses to `(contract_name, hex_addr)`.
+///
+/// This is used during migration to determine which contracts were active
+/// when an existing range was processed, by checking which source addresses
+/// appear in the log parquet.
+pub fn build_address_contract_map(contracts: &Contracts) -> HashMap<String, AddressContractMap> {
+    let mut result: HashMap<String, AddressContractMap> = HashMap::new();
+
+    for (contract_name, config) in contracts {
+        let addrs: Vec<([u8; 20], String)> = match &config.address {
+            AddressOrAddresses::Single(a) => {
+                vec![(a.0 .0, format!("0x{}", hex::encode(a.0 .0)))]
+            }
+            AddressOrAddresses::Multiple(addrs) => addrs
+                .iter()
+                .map(|a| (a.0 .0, format!("0x{}", hex::encode(a.0 .0))))
+                .collect(),
+        };
+
+        if let Some(factories) = &config.factories {
+            for factory in factories {
+                let map = result.entry(factory.collection.clone()).or_default();
+                for (raw, hex_str) in &addrs {
+                    map.insert(*raw, (contract_name.clone(), hex_str.clone()));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Scan a log parquet file and return which factory source contracts have
+/// matching addresses in the `address` column.
+///
+/// Returns an `ExpectedContracts` map containing only the contracts whose
+/// source addresses actually appear in the log file. This tells us what was
+/// configured when the range was originally processed.
+pub fn detect_contracts_in_log_parquet(
+    log_path: &Path,
+    address_maps: &HashMap<String, AddressContractMap>,
+) -> io::Result<HashMap<String, ExpectedContracts>> {
+    use std::collections::HashSet;
+    use std::fs::File;
+
+    let file = File::open(log_path).map_err(|e| {
+        io::Error::other(format!("Failed to open log parquet {}: {}", log_path.display(), e))
+    })?;
+
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| io::Error::other(format!("Parquet reader error: {}", e)))?;
+
+    let schema = builder.schema().clone();
+    let addr_col_idx = match schema.index_of("address") {
+        Ok(idx) => idx,
+        Err(_) => return Ok(HashMap::new()), // no address column
+    };
+
+    let mask =
+        parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), vec![addr_col_idx]);
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .map_err(|e| io::Error::other(format!("Parquet build error: {}", e)))?;
+
+    // Collect unique 20-byte addresses from the column
+    let mut unique_addresses: HashSet<[u8; 20]> = HashSet::new();
+
+    for batch_result in reader {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let col = match batch
+            .column_by_name("address")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::FixedSizeBinaryArray>())
+        {
+            Some(c) => c,
+            None => continue,
+        };
+        for i in 0..col.len() {
+            let bytes = col.value(i);
+            if bytes.len() == 20 {
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(bytes);
+                unique_addresses.insert(addr);
+            }
+        }
+    }
+
+    // Match against each collection's address map
+    let mut result: HashMap<String, ExpectedContracts> = HashMap::new();
+    for (collection, addr_map) in address_maps {
+        let mut contracts_found: ExpectedContracts = ExpectedContracts::new();
+        for addr in &unique_addresses {
+            if let Some((contract_name, hex_addr)) = addr_map.get(addr) {
+                contracts_found
+                    .entry(contract_name.clone())
+                    .or_default()
+                    .push(hex_addr.clone());
+            }
+        }
+        // Sort addresses for deterministic comparison
+        for addrs in contracts_found.values_mut() {
+            addrs.sort();
+            addrs.dedup();
+        }
+        if !contracts_found.is_empty() {
+            result.insert(collection.clone(), contracts_found);
+        }
+    }
+
+    Ok(result)
+}
 
 // ---------------------------------------------------------------------------
 // Tests
