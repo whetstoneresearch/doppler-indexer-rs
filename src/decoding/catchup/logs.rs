@@ -12,9 +12,10 @@ use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::decoding::types::{FileProcessingEntry, LogDecoderOutputs, LogMatcherConfig};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::storage::contract_index::{
-    build_expected_factory_contracts, get_missing_contracts, migrate_downstream_index, range_key,
-    read_contract_index, ContractIndex, ExpectedContracts,
+    build_expected_factory_contracts_for_range, get_missing_contracts, migrate_downstream_index,
+    range_key, read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
+use crate::types::config::contract::Contracts;
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::factory_data::load_factory_addresses_by_range;
@@ -89,9 +90,6 @@ pub async fn catchup_decode_logs(
         factory_addresses.len()
     );
 
-    // Build expected contracts per collection for contract index checks
-    let expected_by_collection = build_expected_factory_contracts(&chain.contracts);
-
     // Pre-load contract indexes for each factory collection
     let factory_collection_names: HashSet<String> =
         factory_matchers.keys().cloned().collect();
@@ -162,8 +160,7 @@ pub async fn catchup_decode_logs(
                 regular_matchers,
                 factory_matchers,
                 &existing_decoded,
-                output_base,
-                &expected_by_collection,
+                &chain.contracts,
                 &contract_indexes,
             );
             if missing_regular.is_empty() && missing_factory.is_empty() {
@@ -197,12 +194,34 @@ pub async fn catchup_decode_logs(
         concurrency
     );
 
+    // Build (range_start, range_end) -> missing_factory lookup before spawning
+    // (files_to_process is consumed by the spawn loop below)
+    let factory_by_range: HashMap<(u64, u64), HashMap<String, Vec<EventMatcher>>> =
+        files_to_process
+            .iter()
+            .map(|(rs, re, _, _, mf)| ((*rs, *re), mf.clone()))
+            .collect();
+
+    // Pre-load contract indexes for all (collection, event) pairs that will be written.
+    // Re-use the already-loaded contract_indexes to avoid duplicate disk reads.
+    let mut live_indexes: HashMap<(String, String), ContractIndex> = HashMap::new();
+    for (_, _, _, _, missing_factory) in &files_to_process {
+        for (collection, matchers) in missing_factory {
+            for matcher in matchers {
+                let key = (collection.clone(), matcher.event_name.clone());
+                live_indexes.entry(key).or_insert_with(|| {
+                    let index_key = format!("{}/{}", collection, matcher.event_name);
+                    contract_indexes.get(&index_key).cloned().unwrap_or_default()
+                });
+            }
+        }
+    }
+
     let output_base = Arc::new(output_base.to_path_buf());
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let transform_tx = transform_tx.cloned();
-    let expected_by_collection = Arc::new(expected_by_collection);
 
-    let mut join_set = JoinSet::new();
+    let mut join_set: JoinSet<Result<Option<(u64, u64)>, LogDecodingError>> = JoinSet::new();
 
     let recollect_tx = recollect_tx.cloned();
 
@@ -212,7 +231,6 @@ pub async fn catchup_decode_logs(
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
         let recollect_tx = recollect_tx.clone();
-        let expected_by_collection = expected_by_collection.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -264,7 +282,7 @@ pub async fn catchup_decode_logs(
                         }
                     }
 
-                    return Ok(());
+                    return Ok(None);
                 }
             };
 
@@ -290,19 +308,61 @@ pub async fn catchup_decode_logs(
                 &factory_addrs,
                 &output_base,
                 &outputs,
-                Some(&expected_by_collection),
+                None, // contract index writes are done serially after drain (Fix 3)
             )
             .await
+            .map(|_| Some((range_start, range_end)))
         });
     }
 
-    // Collect results and propagate errors
+    // Drain JoinSet with deferred error — collect processed ranges for serial index write
+    let mut processed_ranges: Vec<(u64, u64)> = Vec::new();
+    let mut first_error: Option<LogDecodingError> = None;
+
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(LogDecodingError::JoinError(e.to_string())),
+            Ok(Ok(Some((start, end)))) => {
+                processed_ranges.push((start, end));
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                first_error.get_or_insert(e);
+            }
+            Err(e) => {
+                first_error.get_or_insert(LogDecodingError::JoinError(e.to_string()));
+            }
         }
+    }
+
+    // Serial contract index update — no concurrent R-M-W races (Fix 3)
+    for (start, end) in &processed_ranges {
+        let rk = range_key(*start, end - 1);
+        if let Some(missing_factory) = factory_by_range.get(&(*start, *end)) {
+            for (collection, matchers) in missing_factory {
+                for matcher in matchers {
+                    let key = (collection.clone(), matcher.event_name.clone());
+                    if let Some(index) = live_indexes.get_mut(&key) {
+                        let expected_for_range =
+                            build_expected_factory_contracts_for_range(&chain.contracts, *end);
+                        if let Some(expected) = expected_for_range.get(collection) {
+                            update_contract_index(index, &rk, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Write each index once — no per-range repeated R-M-W
+    for ((collection, event_name), index) in &live_indexes {
+        let dir = output_base.join(collection).join(event_name);
+        if let Err(e) = write_contract_index(&dir, index) {
+            first_error.get_or_insert(LogDecodingError::Io(e));
+        }
+    }
+
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     Ok(())
@@ -320,12 +380,12 @@ fn get_missing_matchers(
     regular_matchers: &[EventMatcher],
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     existing: &HashSet<String>,
-    _output_base: &Path,
-    expected_by_collection: &HashMap<String, ExpectedContracts>,
+    contracts: &Contracts,
     contract_indexes: &HashMap<String, ContractIndex>,
 ) -> (Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>) {
     let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
     let rk = range_key(range_start, range_end - 1);
+    let expected_for_range = build_expected_factory_contracts_for_range(contracts, range_end);
 
     let missing_regular: Vec<EventMatcher> = regular_matchers
         .iter()
@@ -362,7 +422,7 @@ fn get_missing_matchers(
                     }
 
                     // File exists — check contract index for missing contracts
-                    if let Some(expected) = expected_by_collection.get(collection) {
+                    if let Some(expected) = expected_for_range.get(collection) {
                         let index_key = format!("{}/{}", collection, matcher.event_name);
                         let index = contract_indexes
                             .get(&index_key)

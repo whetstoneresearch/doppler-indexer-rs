@@ -67,6 +67,38 @@ pub fn build_expected_factory_contracts(contracts: &Contracts) -> HashMap<String
     result
 }
 
+/// Like [`build_expected_factory_contracts`] but omits sources whose
+/// `start_block >= range_end_exclusive`.
+///
+/// Uses an exclusive end to match the `range.end` convention used throughout.
+pub fn build_expected_factory_contracts_for_range(
+    contracts: &Contracts,
+    range_end_exclusive: u64,
+) -> HashMap<String, ExpectedContracts> {
+    let mut result: HashMap<String, ExpectedContracts> = HashMap::new();
+
+    for (contract_name, config) in contracts {
+        if let Some(sb) = config.start_block {
+            if sb.to::<u64>() >= range_end_exclusive {
+                continue;
+            }
+        }
+
+        let mut addresses = addresses_to_hex(&config.address);
+        addresses.sort();
+
+        if let Some(factories) = &config.factories {
+            for factory in factories {
+                result
+                    .entry(factory.collection.clone())
+                    .or_default()
+                    .insert(contract_name.clone(), addresses.clone());
+            }
+        }
+    }
+    result
+}
+
 /// Convert `AddressOrAddresses` to a list of lowercase `0x`-prefixed hex strings.
 fn addresses_to_hex(addr: &AddressOrAddresses) -> Vec<String> {
     match addr {

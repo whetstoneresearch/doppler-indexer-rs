@@ -11,8 +11,8 @@ use crate::raw_data::historical::factories::{
 };
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::storage::contract_index::{
-    build_expected_factory_contracts, range_key, read_contract_index, update_contract_index,
-    write_contract_index,
+    build_expected_factory_contracts_for_range, range_key, read_contract_index,
+    update_contract_index, write_contract_index,
 };
 use crate::storage::{upload_sidecar_to_s3, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
@@ -111,8 +111,6 @@ pub async fn collect_factories(
     // =========================================================================
     let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
 
-    // Build expected contracts for contract index tracking
-    let expected_by_collection = build_expected_factory_contracts(&chain.contracts);
     let factory_collection_names: HashSet<String> =
         matchers.iter().map(|m| m.collection_name.clone()).collect();
 
@@ -225,8 +223,10 @@ pub async fn collect_factories(
 
                 // Update contract index for each collection
                 let rk = range_key(range_start, range_end - 1);
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(&chain.contracts, range_end);
                 for collection in &factory_collection_names {
-                    if let Some(expected) = expected_by_collection.get(collection) {
+                    if let Some(expected) = expected_for_range.get(collection) {
                         let dir = output_dir.join(collection);
                         let mut index = read_contract_index(&dir);
                         update_contract_index(&mut index, &rk, expected);

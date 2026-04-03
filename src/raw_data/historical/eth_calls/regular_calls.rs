@@ -24,10 +24,11 @@ use super::types::{
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::storage::contract_index::{
-    get_missing_contracts, range_key, read_contract_index, update_contract_index,
-    write_contract_index, ExpectedContracts,
+    build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
+    read_contract_index, update_contract_index, write_contract_index,
 };
 use crate::storage::upload_sidecar_to_s3;
+use crate::types::config::contract::Contracts;
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig};
 
 #[allow(clippy::too_many_arguments)]
@@ -40,7 +41,7 @@ pub(crate) async fn process_factory_range(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     mut pending_writes: Option<&mut AbortOnDropHandles>,
-    expected_by_collection: &HashMap<String, ExpectedContracts>,
+    contracts: &Contracts,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for addrs in factory_data.addresses_by_block.values() {
@@ -76,7 +77,9 @@ pub(crate) async fn process_factory_range(
 
             if ctx.existing_files.contains(&rel_path) {
                 // File exists locally, but check contract index for missing contracts
-                if let Some(expected) = expected_by_collection.get(collection_name) {
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(contracts, range.end);
+                if let Some(expected) = expected_for_range.get(collection_name) {
                     let index_dir = ctx.output_dir.join(collection_name).join(&function_name);
                     let index = read_contract_index(&index_dir);
                     let rk = range_key(range.start, range.end - 1);
@@ -290,7 +293,9 @@ pub(crate) async fn process_factory_range(
             }
 
             // Update contract index after successful write
-            if let Some(expected) = expected_by_collection.get(collection_name) {
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range.end);
+            if let Some(expected) = expected_for_range.get(collection_name) {
                 let rk = range_key(range.start, range.end - 1);
                 let mut index = read_contract_index(&sub_dir);
                 update_contract_index(&mut index, &rk, expected);
@@ -331,7 +336,7 @@ pub(crate) async fn process_factory_range_multicall(
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
     mut pending_writes: Option<&mut AbortOnDropHandles>,
-    expected_by_collection: &HashMap<String, ExpectedContracts>,
+    contracts: &Contracts,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -371,7 +376,9 @@ pub(crate) async fn process_factory_range_multicall(
 
             if ctx.existing_files.contains(&rel_path) {
                 // File exists locally, but check contract index for missing contracts
-                if let Some(expected) = expected_by_collection.get(collection_name) {
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(contracts, range.end);
+                if let Some(expected) = expected_for_range.get(collection_name) {
                     let index_dir = ctx.output_dir.join(collection_name).join(&function_name);
                     let index = read_contract_index(&index_dir);
                     let rk = range_key(range.start, range.end - 1);
@@ -608,7 +615,9 @@ pub(crate) async fn process_factory_range_multicall(
             }
 
             // Update contract index after successful write
-            if let Some(expected) = expected_by_collection.get(&group.collection_name) {
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range.end);
+            if let Some(expected) = expected_for_range.get(&group.collection_name) {
                 let rk = range_key(range.start, range.end - 1);
                 let mut index = read_contract_index(&sub_dir);
                 update_contract_index(&mut index, &rk, expected);

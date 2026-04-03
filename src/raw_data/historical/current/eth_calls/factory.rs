@@ -94,7 +94,7 @@ pub(super) async fn handle_factory_message(
                                 multicall_addr,
                                 buf_range_start,
                                 buf_range_end,
-                                &state.expected_by_collection,
+                                &state.contracts,
                             )
                             .await?
                         } else {
@@ -105,7 +105,7 @@ pub(super) async fn handle_factory_message(
                                 &ctx,
                                 buf_range_start,
                                 buf_range_end,
-                                &state.expected_by_collection,
+                                &state.contracts,
                             )
                             .await?
                         };
@@ -175,7 +175,7 @@ pub(super) async fn handle_factory_message(
                                 &mut state.frequency_state,
                                 multicall_addr,
                                 None,
-                                &state.expected_by_collection,
+                                &state.contracts,
                             )
                             .await?;
                         } else {
@@ -188,7 +188,7 @@ pub(super) async fn handle_factory_message(
                                 state.factory_max_params,
                                 &mut state.frequency_state,
                                 None,
-                                &state.expected_by_collection,
+                                &state.contracts,
                             )
                             .await?;
                         }

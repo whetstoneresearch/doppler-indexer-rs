@@ -15,9 +15,9 @@ use crate::raw_data::historical::factories::{
     FactoryAddressData, FactoryCatchupState, FactoryCollectionError, RecollectRequest,
 };
 use crate::storage::contract_index::{
-    build_address_contract_map, build_expected_factory_contracts, detect_contracts_in_log_parquet,
-    get_missing_contracts, range_key, read_contract_index, update_contract_index,
-    write_contract_index, ContractIndex,
+    build_address_contract_map, build_expected_factory_contracts_for_range,
+    detect_contracts_in_log_parquet, get_missing_contracts, range_key, read_contract_index,
+    update_contract_index, write_contract_index, ContractIndex,
 };
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
@@ -133,9 +133,6 @@ pub async fn collect_factories(
     // Get the factory collection names from matchers
     let factory_collection_names: HashSet<String> =
         matchers.iter().map(|m| m.collection_name.clone()).collect();
-
-    // Build expected contracts per collection from current config
-    let expected_by_collection = build_expected_factory_contracts(&chain.contracts);
 
     // Pre-load contract indexes for each collection to avoid repeated disk reads
     let mut contract_indexes: HashMap<String, ContractIndex> = HashMap::new();
@@ -328,7 +325,11 @@ pub async fn collect_factories(
                 }
 
                 // File exists — check contract index for missing contracts
-                if let Some(expected) = expected_by_collection.get(collection) {
+                let expected_for_range = build_expected_factory_contracts_for_range(
+                    &chain.contracts,
+                    log_range.end,
+                );
+                if let Some(expected) = expected_for_range.get(collection) {
                     let index = contract_indexes.get(collection).cloned().unwrap_or_default();
                     get_missing_contracts(&index, &rk, expected).is_empty()
                 } else {
@@ -541,12 +542,18 @@ pub async fn collect_factories(
     // avoid concurrent writes from the JoinSet tasks).
     if !processed_ranges.is_empty() {
         for collection in &factory_collection_names {
-            if let Some(expected) = expected_by_collection.get(collection) {
-                let index = contract_indexes.entry(collection.clone()).or_default();
-                for &(start, end) in &processed_ranges {
-                    let rk = range_key(start, end - 1);
+            let index = contract_indexes.entry(collection.clone()).or_default();
+            let mut wrote_any = false;
+            for &(start, end) in &processed_ranges {
+                let rk = range_key(start, end - 1);
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(&chain.contracts, end);
+                if let Some(expected) = expected_for_range.get(collection) {
                     update_contract_index(index, &rk, expected);
+                    wrote_any = true;
                 }
+            }
+            if wrote_any {
                 let dir = output_dir.join(collection);
                 write_contract_index(&dir, index)
                     .map_err(|e| FactoryCollectionError::Io(e))?;

@@ -162,6 +162,13 @@ pub(crate) fn event_output_exists(
         let func_key = format!("{}/on_events", function_name);
         if manifest.has_raw_eth_calls_granular(contract_name, &func_key, range_start, range_end - 1)
         {
+            if let Some(expected) = expected_contracts {
+                let index = read_contract_index(&sub_dir);
+                let rk = range_key(range_start, range_end - 1);
+                if !get_missing_contracts(&index, &rk, expected).is_empty() {
+                    return false;
+                }
+            }
             return true;
         }
     }

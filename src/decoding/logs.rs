@@ -174,6 +174,7 @@ pub async fn decode_logs(
         &output_base,
         &chain.name,
         &log_outputs,
+        Some(&chain.contracts),
     )
     .await?;
 

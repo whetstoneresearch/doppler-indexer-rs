@@ -107,7 +107,7 @@ pub(super) async fn process_complete_range(
                     &mut state.frequency_state,
                     multicall_addr,
                     None,
-                    &state.expected_by_collection,
+                    &state.contracts,
                 )
                 .await?;
             } else {
@@ -120,7 +120,7 @@ pub(super) async fn process_complete_range(
                     state.factory_max_params,
                     &mut state.frequency_state,
                     None,
-                    &state.expected_by_collection,
+                    &state.contracts,
                 )
                 .await?;
             }
@@ -265,7 +265,7 @@ pub(super) async fn process_incomplete_range(
                         &mut state.frequency_state,
                         multicall_addr,
                         None,
-                        &state.expected_by_collection,
+                        &state.contracts,
                     )
                     .await?;
                 } else {
@@ -278,7 +278,7 @@ pub(super) async fn process_incomplete_range(
                         state.factory_max_params,
                         &mut state.frequency_state,
                         None,
-                        &state.expected_by_collection,
+                        &state.contracts,
                     )
                     .await?;
                 }
