@@ -23,7 +23,10 @@ use crate::raw_data::historical::eth_calls::{
     EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
-use crate::storage::contract_index::build_expected_factory_contracts;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts, migrate_downstream_index, read_contract_index,
+};
+use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::factory_data::{
@@ -157,6 +160,76 @@ pub async fn collect_eth_calls(
     );
 
     let existing_files = scan_existing_parquet_files_async(base_output_dir.clone()).await;
+
+    // =========================================================================
+    // Migration: seed downstream contract indexes from the factory layer
+    // =========================================================================
+    if has_factory_calls || has_factory_once_calls || has_event_triggered_calls {
+        let factories_dir = factories_dir_path(&chain.name);
+        let factory_collection_names: HashSet<String> =
+            factory_call_configs.keys().cloned().collect();
+
+        for collection in &factory_collection_names {
+            let factory_index = {
+                let dir = factories_dir.join(collection);
+                let d = dir.clone();
+                tokio::task::spawn_blocking(move || read_contract_index(&d))
+                    .await
+                    .unwrap_or_default()
+            };
+            if factory_index.is_empty() {
+                continue;
+            }
+
+            // Migrate regular call indexes: {collection}/{function}/contract_index.json
+            if let Some(configs) = factory_call_configs.get(collection) {
+                for config in configs {
+                    let function_name = config
+                        .function
+                        .split('(')
+                        .next()
+                        .unwrap_or(&config.function);
+                    let sub_dir = base_output_dir.join(collection).join(function_name);
+                    let ef = &existing_files;
+                    migrate_downstream_index(&sub_dir, &factory_index, |rk| {
+                        let file = format!("{}/{}/{}.parquet", collection, function_name, rk);
+                        ef.contains(&file)
+                    });
+                }
+            }
+
+            // Migrate once call indexes: {collection}/once/contract_index.json
+            let once_dir = base_output_dir.join(collection).join("once");
+            if once_dir.exists() {
+                let ef = &existing_files;
+                let coll = collection.clone();
+                migrate_downstream_index(&once_dir, &factory_index, |rk| {
+                    let file = format!("{}/once/{}.parquet", coll, rk);
+                    ef.contains(&file)
+                });
+            }
+
+            // Migrate on_events indexes: {collection}/{function}/on_events/contract_index.json
+            for configs in event_call_configs.values() {
+                for config in configs {
+                    if config.contract_name != *collection {
+                        continue;
+                    }
+                    let sub_dir = base_output_dir
+                        .join(collection)
+                        .join(&config.function_name)
+                        .join("on_events");
+                    if sub_dir.exists() {
+                        migrate_downstream_index(&sub_dir, &factory_index, |_rk| {
+                            // on_events uses overlap check, not exact match.
+                            // If the directory exists with parquet files, assume it needs migration.
+                            true
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
     let range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
