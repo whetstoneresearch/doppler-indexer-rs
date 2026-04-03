@@ -203,6 +203,7 @@ pub(super) async fn handle_factory_message(
                                     &state.factory_once_configs,
                                     &empty_index,
                                     multicall_addr,
+                                    None,
                                 )
                                 .await?;
                             } else {
@@ -212,6 +213,7 @@ pub(super) async fn handle_factory_message(
                                     factory_data,
                                     &state.factory_once_configs,
                                     &empty_index,
+                                    None,
                                 )
                                 .await?;
                             }

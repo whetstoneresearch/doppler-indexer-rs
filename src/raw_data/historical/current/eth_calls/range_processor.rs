@@ -136,6 +136,7 @@ pub(super) async fn process_complete_range(
                     &state.factory_once_configs,
                     &empty_index,
                     multicall_addr,
+                    None,
                 )
                 .await?;
             } else {
@@ -145,6 +146,7 @@ pub(super) async fn process_complete_range(
                     factory_data,
                     &state.factory_once_configs,
                     &empty_index,
+                    None,
                 )
                 .await?;
             }
@@ -293,6 +295,7 @@ pub(super) async fn process_incomplete_range(
                             &state.factory_once_configs,
                             &empty_index,
                             multicall_addr,
+                            None,
                         )
                         .await?;
                     } else {
@@ -302,6 +305,7 @@ pub(super) async fn process_incomplete_range(
                             factory_data,
                             &state.factory_once_configs,
                             &empty_index,
+                            None,
                         )
                         .await?;
                     }

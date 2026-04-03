@@ -787,6 +787,19 @@ For `frequency: "once"` calls, the catchup logic is column-aware:
 
 This means you can add new `frequency: "once"` calls to an existing configuration without re-running all historical calls — only the new calls are executed and merged into existing files.
 
+### Contract-Index Completeness for Factory Once Calls
+
+Factory once calls use a two-level skip gate to decide whether a range needs processing:
+
+1. **Column-level check** — Does the parquet file contain all configured function columns with no unindexed nulls? (Existing behavior via `column_index.json`)
+2. **Address-level check** — Does `contract_index.json` confirm that the range was processed against the current set of expected factory source addresses? (New check)
+
+When a new factory source address is added to the config, the column check still passes (the existing parquet has all function columns for the addresses it knows about), but the contract-index check fails because the new address was never processed. This triggers re-processing for only the absent addresses.
+
+The `contract_index.json` sidecar is written alongside `column_index.json` after each successful parquet write, including for empty ranges (no factory addresses discovered). Without the empty-range write, zero-address ranges would retry indefinitely.
+
+**Optimization:** If the contract-index check fails but no new RPC calls are needed (the parquet data is already complete), only the missing `contract_index.json` is written — the parquet file is not rewritten. This avoids a no-op read/write cycle on the first run after upgrade.
+
 ### Factory Calls
 
 Factory eth_calls are processed in two ways:

@@ -12,11 +12,10 @@ use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::decoding::types::{FileProcessingEntry, LogDecoderOutputs, LogMatcherConfig};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::storage::contract_index::{
-    build_expected_factory_contracts_for_range, get_missing_contracts, migrate_downstream_index,
-    range_key, read_contract_index, update_contract_index, write_contract_index, ContractIndex,
+    build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
+    read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
 use crate::types::config::contract::Contracts;
-use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::factory_data::load_factory_addresses_by_range;
 use crate::storage::parquet_readers::read_raw_logs_from_parquet;
@@ -107,46 +106,6 @@ pub async fn catchup_decode_logs(
             };
             let key = format!("{}/{}", collection, matchers.event_name);
             contract_indexes.insert(key, idx);
-        }
-    }
-
-    // =========================================================================
-    // Migration: seed decoded logs contract indexes from the factory layer
-    // =========================================================================
-    {
-        let factories_dir = factories_dir_path(&chain.name);
-        for collection in &factory_collection_names {
-            let factory_index = {
-                let dir = factories_dir.join(collection);
-                let d = dir.clone();
-                tokio::task::spawn_blocking(move || read_contract_index(&d))
-                    .await
-                    .unwrap_or_default()
-            };
-            if factory_index.is_empty() {
-                continue;
-            }
-
-            for matchers_list in factory_matchers.get(collection).iter().flat_map(|v| v.iter()) {
-                let key = format!("{}/{}", collection, matchers_list.event_name);
-                let downstream_dir =
-                    output_base.join(collection).join(&matchers_list.event_name);
-                let existing = &existing_decoded;
-                let coll = collection.clone();
-                let evt = matchers_list.event_name.clone();
-                let migrated = migrate_downstream_index(&downstream_dir, &factory_index, |rk| {
-                    let file = format!("{}/{}/{}.parquet", coll, evt, rk);
-                    existing.contains(&file)
-                });
-                if migrated {
-                    // Reload the index so the skip check uses the migrated data
-                    let d = downstream_dir.clone();
-                    let idx = tokio::task::spawn_blocking(move || read_contract_index(&d))
-                        .await
-                        .unwrap_or_default();
-                    contract_indexes.insert(key, idx);
-                }
-            }
         }
     }
 

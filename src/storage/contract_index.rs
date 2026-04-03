@@ -12,7 +12,6 @@ use std::io;
 use std::path::Path;
 
 use arrow::array::Array;
-use serde::{Deserialize, Serialize};
 
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
@@ -262,45 +261,6 @@ pub async fn write_contract_index_async(
 /// Migrate a downstream contract index (eth_calls, decoded logs) by seeding it
 /// from the factory layer's contract_index.json.
 ///
-/// For each range in the factory index, if the downstream index has no entry,
-/// copy the factory index entry. This avoids full reprocessing for downstream
-/// layers when the factory layer already has a correct index.
-///
-/// `downstream_dir` is the directory where the downstream contract_index.json lives.
-/// `factory_index` is the already-loaded factory contract_index for the same collection.
-/// `existing_file_check` is a closure that returns true if the downstream parquet exists
-/// for a given range key (e.g. "0-999").
-///
-/// Returns true if any entries were added and the index was written.
-pub fn migrate_downstream_index(
-    downstream_dir: &Path,
-    factory_index: &ContractIndex,
-    existing_file_check: impl Fn(&str) -> bool,
-) -> bool {
-    let mut downstream = read_contract_index(downstream_dir);
-    let mut added = false;
-
-    for (rk, contracts) in factory_index {
-        if !downstream.contains_key(rk) && existing_file_check(rk) {
-            downstream.insert(rk.clone(), contracts.clone());
-            added = true;
-        }
-    }
-
-    if added {
-        if let Err(e) = write_contract_index(downstream_dir, &downstream) {
-            tracing::warn!(
-                "Migration: failed to write downstream contract index at {}: {}",
-                downstream_dir.display(),
-                e
-            );
-            return false;
-        }
-    }
-
-    added
-}
-
 /// Address-to-contract lookup built from factory matchers.
 ///
 /// Maps `[u8; 20]` factory source addresses → `(contract_name, hex_address)`.
