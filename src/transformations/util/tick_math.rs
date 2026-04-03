@@ -44,94 +44,92 @@ pub fn tick_to_sqrt_price_x96(tick: i32) -> U256 {
 
     // Bit 1: sqrt(1.0001^2)
     if abs_tick & 0x2 != 0 {
-        ratio = (ratio * U256::from_str_radix("fff97272373d413259a46990580e213a", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("fff97272373d413259a46990580e213a", 16).unwrap()) >> 128;
     }
     // Bit 2: sqrt(1.0001^4)
     if abs_tick & 0x4 != 0 {
-        ratio = (ratio * U256::from_str_radix("fff2e50f5f656932ef12357cf3c7fdcc", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("fff2e50f5f656932ef12357cf3c7fdcc", 16).unwrap()) >> 128;
     }
     // Bit 3: sqrt(1.0001^8)
     if abs_tick & 0x8 != 0 {
-        ratio = (ratio * U256::from_str_radix("ffe5caca7e10e4e61c3624eaa0941cd0", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("ffe5caca7e10e4e61c3624eaa0941cd0", 16).unwrap()) >> 128;
     }
     // Bit 4: sqrt(1.0001^16)
     if abs_tick & 0x10 != 0 {
-        ratio = (ratio * U256::from_str_radix("ffcb9843d60f6159c9db58835c926644", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("ffcb9843d60f6159c9db58835c926644", 16).unwrap()) >> 128;
     }
     // Bit 5: sqrt(1.0001^32)
     if abs_tick & 0x20 != 0 {
-        ratio = (ratio * U256::from_str_radix("ff973b41fa98c081472e6896dfb254c0", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("ff973b41fa98c081472e6896dfb254c0", 16).unwrap()) >> 128;
     }
     // Bit 6: sqrt(1.0001^64)
     if abs_tick & 0x40 != 0 {
-        ratio = (ratio * U256::from_str_radix("ff2ea16466c96a3843ec78b326b52861", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("ff2ea16466c96a3843ec78b326b52861", 16).unwrap()) >> 128;
     }
     // Bit 7: sqrt(1.0001^128)
     if abs_tick & 0x80 != 0 {
-        ratio = (ratio * U256::from_str_radix("fe5dee046a99a2a811c461f1969c3053", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("fe5dee046a99a2a811c461f1969c3053", 16).unwrap()) >> 128;
     }
     // Bit 8: sqrt(1.0001^256)
     if abs_tick & 0x100 != 0 {
-        ratio = (ratio * U256::from_str_radix("fcbe86c7900a88aedcffc83b479aa3a4", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("fcbe86c7900a88aedcffc83b479aa3a4", 16).unwrap()) >> 128;
     }
     // Bit 9: sqrt(1.0001^512)
     if abs_tick & 0x200 != 0 {
-        ratio = (ratio * U256::from_str_radix("f987a7253ac413176f2b074cf7815e54", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("f987a7253ac413176f2b074cf7815e54", 16).unwrap()) >> 128;
     }
     // Bit 10: sqrt(1.0001^1024)
     if abs_tick & 0x400 != 0 {
-        ratio = (ratio * U256::from_str_radix("f3392b0822b70005940c7a398e4b70f3", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("f3392b0822b70005940c7a398e4b70f3", 16).unwrap()) >> 128;
     }
     // Bit 11: sqrt(1.0001^2048)
     if abs_tick & 0x800 != 0 {
-        ratio = (ratio * U256::from_str_radix("e7159475a2c29b7443b29c7fa6e889d9", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("e7159475a2c29b7443b29c7fa6e889d9", 16).unwrap()) >> 128;
     }
     // Bit 12: sqrt(1.0001^4096)
     if abs_tick & 0x1000 != 0 {
-        ratio = (ratio * U256::from_str_radix("d097f3bdfd2022b8845ad8f792aa5825", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("d097f3bdfd2022b8845ad8f792aa5825", 16).unwrap()) >> 128;
     }
     // Bit 13: sqrt(1.0001^8192)
     if abs_tick & 0x2000 != 0 {
-        ratio = (ratio * U256::from_str_radix("a9f746462d870fdf8a65dc1f90e061e5", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("a9f746462d870fdf8a65dc1f90e061e5", 16).unwrap()) >> 128;
     }
     // Bit 14: sqrt(1.0001^16384)
     if abs_tick & 0x4000 != 0 {
-        ratio = (ratio * U256::from_str_radix("70d869a156d2a1b890bb3df62baf32f7", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("70d869a156d2a1b890bb3df62baf32f7", 16).unwrap()) >> 128;
     }
     // Bit 15: sqrt(1.0001^32768)
     if abs_tick & 0x8000 != 0 {
-        ratio = (ratio * U256::from_str_radix("31be135f97d08fd981231505542fcfa6", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("31be135f97d08fd981231505542fcfa6", 16).unwrap()) >> 128;
     }
     // Bit 16: sqrt(1.0001^65536)
     if abs_tick & 0x10000 != 0 {
-        ratio = (ratio * U256::from_str_radix("9aa508b5b7a84e1c677de54f3e99bc9", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("9aa508b5b7a84e1c677de54f3e99bc9", 16).unwrap()) >> 128;
     }
     // Bit 17: sqrt(1.0001^131072)
     if abs_tick & 0x20000 != 0 {
-        ratio = (ratio
-            * U256::from_str_radix("5d6af8dedb81196699c329225ee604", 16).unwrap())
-            >> 128;
+        ratio =
+            (ratio * U256::from_str_radix("5d6af8dedb81196699c329225ee604", 16).unwrap()) >> 128;
     }
     // Bit 18: sqrt(1.0001^262144)
     if abs_tick & 0x40000 != 0 {
-        ratio =
-            (ratio * U256::from_str_radix("2216e584f5fa1ea926041bedfe98", 16).unwrap()) >> 128;
+        ratio = (ratio * U256::from_str_radix("2216e584f5fa1ea926041bedfe98", 16).unwrap()) >> 128;
     }
     // Bit 19: sqrt(1.0001^524288)
     if abs_tick & 0x80000 != 0 {
@@ -181,8 +179,7 @@ mod tests {
     fn test_tick_1() {
         // Known value from Uniswap: tick 1 = 79232123823359799118286999568
         let result = tick_to_sqrt_price_x96(1);
-        let expected =
-            U256::from_str_radix("79232123823359799118286999568", 10).unwrap();
+        let expected = U256::from_str_radix("79232123823359799118286999568", 10).unwrap();
         assert_eq!(result, expected);
     }
 
@@ -190,8 +187,7 @@ mod tests {
     fn test_tick_negative_1() {
         // Known Uniswap value: tick -1 = 79224201403219477170569942574
         let result = tick_to_sqrt_price_x96(-1);
-        let expected =
-            U256::from_str_radix("79224201403219477170569942574", 10).unwrap();
+        let expected = U256::from_str_radix("79224201403219477170569942574", 10).unwrap();
         assert_eq!(result, expected);
     }
 

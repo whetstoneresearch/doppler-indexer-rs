@@ -120,11 +120,7 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
             DbValue::Numeric(data.volume1.clone()),
             DbValue::Int32(data.swap_count),
         ],
-        conflict_columns: vec![
-            "chain_id".into(),
-            "pool_id".into(),
-            "block_number".into(),
-        ],
+        conflict_columns: vec!["chain_id".into(), "pool_id".into(), "block_number".into()],
         update_columns: vec![
             "block_timestamp".into(),
             "price_open".into(),
