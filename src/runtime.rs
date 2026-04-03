@@ -307,7 +307,12 @@ pub struct ChainRuntime {
 
 impl ChainRuntime {
     /// Build the runtime infrastructure for a chain.
-    pub async fn build(config: &IndexerConfig, chain: &ChainConfig) -> anyhow::Result<Self> {
+    pub async fn build(
+        config: &IndexerConfig,
+        chain: &ChainConfig,
+        shared_db_pool: Option<Arc<DbPool>>,
+        shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    ) -> anyhow::Result<Self> {
         let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
             format!(
                 "env var {} not set for chain {}",
@@ -328,7 +333,27 @@ impl ChainRuntime {
             .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
 
         // Build RPC client with rate limiter from per-chain config
-        let (rate_limiter, http_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+        let concurrency = chain
+            .rpc
+            .concurrency
+            .unwrap_or(rpc_defaults::CONCURRENCY);
+        let cu_per_second = chain
+            .rpc
+            .compute_units_per_second
+            .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
+
+        let (rate_limiter, http_client) = if let Some(limiter) = shared_rate_limiter {
+            let client = UnifiedRpcClient::from_url_with_options(
+                &rpc_url,
+                cu_per_second,
+                concurrency,
+                rpc_batch_size,
+                Some(limiter.clone()),
+            )?;
+            (limiter, Arc::new(client))
+        } else {
+            build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
+        };
 
         // Build transformation registry
         let registry = build_registry();
@@ -344,8 +369,11 @@ impl ChainRuntime {
         }
 
         // Setup database if transformations enabled
-        let db_pool = if let Some(ref tc) = config.transformations {
-            if transformations_enabled {
+        let db_pool = if transformations_enabled {
+            if let Some(pool) = shared_db_pool {
+                Some(pool)
+            } else {
+                let tc = config.transformations.as_ref().unwrap();
                 let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
                     format!(
                         "env var {} not set for transformations",
@@ -362,8 +390,6 @@ impl ChainRuntime {
 
                 tracing::info!("Database pool initialized and migrations complete");
                 Some(Arc::new(pool))
-            } else {
-                None
             }
         } else {
             None

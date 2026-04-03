@@ -20,7 +20,7 @@ pub struct IndexerConfigRaw {
     pub storage: Option<StorageConfig>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexerConfig {
     pub chains: Vec<ChainConfig>,
     pub raw_data_collection: RawDataCollectionConfig,
