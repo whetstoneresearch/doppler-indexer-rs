@@ -14,7 +14,8 @@ use crate::live::{LiveProgressTracker, TransformRetryRequest};
 use crate::rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::{
-    build_registry, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage, ReorgMessage,
+    build_registry_for_chain, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage,
+    ReorgMessage,
 };
 use crate::types::config::chain::{ChainConfig, RpcConfig};
 use crate::types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
@@ -357,8 +358,8 @@ impl ChainRuntime {
             build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
         };
 
-        // Build transformation registry
-        let registry = build_registry();
+        // Build transformation registry filtered to this chain's contracts
+        let registry = build_registry_for_chain(&chain.contracts, &chain.factory_collections);
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
         // Validate that all handler call dependencies are satisfied by config

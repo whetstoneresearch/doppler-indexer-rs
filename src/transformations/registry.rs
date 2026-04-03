@@ -57,6 +57,11 @@ pub struct TransformationRegistry {
     call_handlers: HashMap<(String, String), Vec<Arc<dyn EthCallHandler>>>,
     /// All handlers for initialization (de-duplicated)
     all_handlers: Vec<Arc<dyn TransformationHandler>>,
+<<<<<<< feat/chain-aware-handlers
+    /// When set, only handlers whose trigger sources are all present in this
+    /// set will be registered. Used to filter handlers per-chain.
+    available_sources: Option<HashSet<String>>,
+=======
     /// Maps handler name() to its declared handler dependency names
     handler_dependency_graph: HashMap<String, Vec<String>>,
     /// Topological ordering of handler names (computed after all handlers registered)
@@ -73,6 +78,7 @@ pub struct TransformationRegistry {
     /// Multi-trigger handlers must not have their success persisted until
     /// all batches for the block have been dispatched.
     multi_trigger_handler_keys: HashSet<String>,
+>>>>>>> main
 }
 
 impl TransformationRegistry {
@@ -82,6 +88,22 @@ impl TransformationRegistry {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
             all_handlers: Vec::new(),
+<<<<<<< feat/chain-aware-handlers
+            available_sources: None,
+        }
+    }
+
+    /// Create a registry that filters handlers by available sources.
+    ///
+    /// Only handlers whose trigger sources are ALL present in the set will
+    /// be registered. Handlers with missing sources are silently skipped.
+    pub fn with_source_filter(sources: HashSet<String>) -> Self {
+        Self {
+            event_handlers: HashMap::new(),
+            call_handlers: HashMap::new(),
+            all_handlers: Vec::new(),
+            available_sources: Some(sources),
+=======
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
@@ -89,12 +111,14 @@ impl TransformationRegistry {
             handler_name_to_key: HashMap::new(),
             event_handler_names: HashSet::new(),
             multi_trigger_handler_keys: HashSet::new(),
+>>>>>>> main
         }
     }
 
     /// Register an event handler.
     ///
-    /// The handler will be invoked for all events matching its triggers.
+    /// If a source filter is set, the handler is skipped when any of its
+    /// trigger sources are missing from the filter set.
     pub fn register_event_handler<H: EventHandler + 'static>(&mut self, handler: H) {
         let handler = Arc::new(handler);
         let name = handler.name().to_string();
@@ -111,9 +135,20 @@ impl TransformationRegistry {
 
         let triggers = handler.triggers();
 
+<<<<<<< feat/chain-aware-handlers
+        if let Some(ref sources) = self.available_sources {
+            if !triggers.iter().all(|t| sources.contains(&t.source)) {
+                tracing::debug!(
+                    "Skipping event handler {} — trigger sources not available for this chain",
+                    handler.name(),
+                );
+                return;
+            }
+=======
         if triggers.len() > 1 {
             self.multi_trigger_handler_keys
                 .insert(handler.handler_key());
+>>>>>>> main
         }
 
         for trigger in triggers {
@@ -148,7 +183,8 @@ impl TransformationRegistry {
 
     /// Register an eth_call handler.
     ///
-    /// The handler will be invoked for all call results matching its triggers.
+    /// If a source filter is set, the handler is skipped when any of its
+    /// trigger sources are missing from the filter set.
     #[allow(dead_code)]
     pub fn register_call_handler<H: EthCallHandler + 'static>(&mut self, handler: H) {
         let handler = Arc::new(handler);
@@ -166,9 +202,20 @@ impl TransformationRegistry {
 
         let triggers = handler.triggers();
 
+<<<<<<< feat/chain-aware-handlers
+        if let Some(ref sources) = self.available_sources {
+            if !triggers.iter().all(|t| sources.contains(&t.source)) {
+                tracing::debug!(
+                    "Skipping call handler {} — trigger sources not available for this chain",
+                    handler.name(),
+                );
+                return;
+            }
+=======
         if triggers.len() > 1 {
             self.multi_trigger_handler_keys
                 .insert(handler.handler_key());
+>>>>>>> main
         }
 
         for trigger in triggers {
@@ -639,7 +686,7 @@ pub fn validate_call_dependencies(
     }
 }
 
-/// Build the transformation registry with all handlers.
+/// Build the transformation registry with all handlers (unfiltered).
 ///
 /// This is where handlers are registered at compile-time.
 /// Add new handler registrations here as they are implemented.
@@ -656,6 +703,36 @@ pub fn build_registry() -> TransformationRegistry {
 
     tracing::info!(
         "Built transformation registry with {} handlers ({} event triggers, {} call triggers)",
+        registry.handler_count(),
+        registry.all_event_triggers().len(),
+        registry.all_call_triggers().len()
+    );
+
+    registry
+}
+
+/// Build a transformation registry filtered to handlers relevant for a specific chain.
+///
+/// Only handlers whose trigger sources all exist in the chain's contracts or
+/// factory collections are registered. This prevents handlers designed for one
+/// chain from being initialized, migrated, or validated on another.
+pub fn build_registry_for_chain(
+    contracts: &Contracts,
+    factory_collections: &FactoryCollections,
+) -> TransformationRegistry {
+    let mut available: HashSet<String> = contracts.keys().cloned().collect();
+    available.extend(factory_collections.keys().cloned());
+
+    let mut registry = TransformationRegistry::with_source_filter(available);
+
+    // Register event handlers (filtered by available sources)
+    super::event::register_handlers(&mut registry);
+
+    // Register eth_call handlers (filtered by available sources)
+    super::eth_call::register_handlers(&mut registry);
+
+    tracing::info!(
+        "Built chain-filtered transformation registry with {} handlers ({} event triggers, {} call triggers)",
         registry.handler_count(),
         registry.all_event_triggers().len(),
         registry.all_call_triggers().len()

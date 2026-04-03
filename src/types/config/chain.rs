@@ -32,6 +32,14 @@ impl BlockReceiptsMethod {
     }
 }
 
+/// Configuration for a shared RPC rate limit group.
+///
+/// Multiple chains can reference the same group to share a single rate limit budget.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RpcRateLimitGroup {
+    pub units_per_second: u32,
+}
+
 /// RPC client configuration for a chain.
 ///
 /// All fields are optional and fall back to defaults in `defaults::rpc`.
@@ -43,6 +51,10 @@ pub struct RpcConfig {
     pub compute_units_per_second: Option<u32>,
     /// Max batch size for RPC requests (default: 100)
     pub batch_size: Option<u32>,
+    /// Name of a shared rate limit group (defined in top-level rpc_rate_limits).
+    /// Mutually exclusive with compute_units_per_second.
+    #[serde(default)]
+    pub rate_limit_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

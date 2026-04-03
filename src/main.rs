@@ -98,7 +98,44 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("Cannot use --catch-up-only and --decode-only together");
     }
 
-    let config = IndexerConfig::load(Path::new("config/config.json"))?;
+    let chains_filter: Option<Vec<String>> = args
+        .iter()
+        .position(|a| a == "--chains")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .or_else(|| {
+            args.iter()
+                .find(|a| a.starts_with("--chains="))
+                .map(|a| {
+                    a.trim_start_matches("--chains=")
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect()
+                })
+        });
+
+    let mut config = IndexerConfig::load(Path::new("config/config.json"))?;
+
+    if let Some(ref filter) = chains_filter {
+        for name in filter {
+            if !config.chains.iter().any(|c| c.name == *name) {
+                let available: Vec<&str> = config.chains.iter().map(|c| c.name.as_str()).collect();
+                anyhow::bail!(
+                    "Unknown chain '{}' in --chains filter. Available chains: {}",
+                    name,
+                    available.join(", ")
+                );
+            }
+        }
+        let before = config.chains.len();
+        config.chains.retain(|c| filter.contains(&c.name));
+        tracing::info!(
+            "Filtered to {} of {} configured chains: {:?}",
+            config.chains.len(),
+            before,
+            filter
+        );
+    }
     if !decode_only {
         load_required_env_vars(&config)?;
     }
@@ -254,17 +291,95 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
-    for chain in &config.chains {
-        if live_only {
-            process_chain_live_only(&config, chain).await?;
-        } else if decode_only {
-            decode_only_chain(&config, chain).await?;
+    let shared_db_pool: Option<Arc<DbPool>> = if !decode_only {
+        if let Some(ref tc) = config.transformations {
+            let registry = transformations::build_registry();
+            if !registry.is_empty() {
+                let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
+                    format!(
+                        "env var {} not set for transformations",
+                        tc.database_url_env_var
+                    )
+                })?;
+                let pool = DbPool::new(&database_url)
+                    .await
+                    .context("failed to create shared database pool")?;
+                pool.run_migrations()
+                    .await
+                    .context("failed to run database migrations")?;
+                tracing::info!("Shared database pool initialized and migrations complete");
+                Some(Arc::new(pool))
+            } else {
+                None
+            }
         } else {
-            process_chain(&config, chain, storage_manager.clone(), catch_up_only).await?;
+            None
+        }
+    } else {
+        None
+    };
+
+    let mut chain_tasks: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
+
+    for chain in &config.chains {
+        let chain_name = chain.name.clone();
+        let config = config.clone();
+        let storage_manager = storage_manager.clone();
+        let shared_db_pool = shared_db_pool.clone();
+        let chain = chain.clone();
+
+        chain_tasks.spawn(async move {
+            let result = if live_only {
+                process_chain_live_only(&config, &chain, shared_db_pool).await
+            } else if decode_only {
+                decode_only_chain(&config, &chain).await
+            } else {
+                process_chain(
+                    &config,
+                    &chain,
+                    storage_manager,
+                    catch_up_only,
+                    shared_db_pool,
+                )
+                .await
+            };
+            (chain_name, result)
+        });
+    }
+
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    while let Some(result) = chain_tasks.join_next().await {
+        match result {
+            Ok((chain_name, Ok(()))) => {
+                tracing::info!("Chain {} completed successfully", chain_name);
+            }
+            Ok((chain_name, Err(e))) => {
+                tracing::error!("Chain {} failed: {:?}", chain_name, e);
+                failures.push((chain_name, format!("{:?}", e)));
+            }
+            Err(join_error) => {
+                tracing::error!("Chain task panicked: {:?}", join_error);
+                failures.push(("unknown".to_string(), format!("{:?}", join_error)));
+            }
         }
     }
 
-    tracing::info!("All chains processed successfully");
+    if !failures.is_empty() {
+        for (name, err) in &failures {
+            tracing::error!("  Chain '{}': {}", name, err);
+        }
+        anyhow::bail!(
+            "{} chain(s) failed: {}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     Ok(())
 }
 
@@ -388,6 +503,7 @@ async fn decode_only_chain(config: &IndexerConfig, chain: &ChainConfig) -> anyho
 async fn process_chain_live_only(
     config: &IndexerConfig,
     chain: &ChainConfig,
+    shared_db_pool: Option<Arc<DbPool>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain {} in live-only mode", chain.name);
 
@@ -407,7 +523,7 @@ async fn process_chain_live_only(
     }
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, None, None).await?;
+    let runtime = ChainRuntime::build(config, chain, shared_db_pool, None).await?;
 
     // Build channels with config-derived capacity
     let channels = CommonChannels::build_for_live_only(
@@ -1006,11 +1122,12 @@ async fn process_chain(
     chain: &ChainConfig,
     storage_manager: Arc<StorageManager>,
     catch_up_only: bool,
+    shared_db_pool: Option<Arc<DbPool>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, None, None).await?;
+    let runtime = ChainRuntime::build(config, chain, shared_db_pool, None).await?;
 
     let features = &runtime.features;
     let has_factories = features.has_factories;
