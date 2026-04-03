@@ -141,8 +141,7 @@ impl TransformationRegistry {
             .insert(handler.handler_key(), handler.name().to_string());
         self.handler_name_to_key
             .insert(handler.name().to_string(), handler.handler_key());
-        self.event_handler_names
-            .insert(handler.name().to_string());
+        self.event_handler_names.insert(handler.name().to_string());
 
         self.all_handlers.push(handler);
     }
@@ -182,8 +181,7 @@ impl TransformationRegistry {
 
         self.handler_key_to_name
             .insert(handler.handler_key(), name.clone());
-        self.handler_name_to_key
-            .insert(name, handler.handler_key());
+        self.handler_name_to_key.insert(name, handler.handler_key());
 
         self.all_handlers.push(handler);
     }
@@ -409,7 +407,9 @@ impl TransformationRegistry {
 
     /// Look up a handler's name() from its handler_key().
     pub fn handler_name_for_key(&self, handler_key: &str) -> Option<&str> {
-        self.handler_key_to_name.get(handler_key).map(|s| s.as_str())
+        self.handler_key_to_name
+            .get(handler_key)
+            .map(|s| s.as_str())
     }
 
     /// Look up a handler's handler_key() from its name().
@@ -452,7 +452,10 @@ impl TransformationRegistry {
         let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
         for (handler, deps) in &self.handler_dependency_graph {
             for dep in deps {
-                reverse.entry(dep.as_str()).or_default().push(handler.as_str());
+                reverse
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(handler.as_str());
             }
         }
 
@@ -501,10 +504,7 @@ pub fn extract_event_name(signature: &str) -> String {
 
 /// Trace a cycle in the dependency graph for error reporting.
 /// Returns a string like "A -> B -> C -> A".
-fn trace_cycle(
-    graph: &HashMap<String, Vec<String>>,
-    in_degree: &HashMap<String, usize>,
-) -> String {
+fn trace_cycle(graph: &HashMap<String, Vec<String>>, in_degree: &HashMap<String, usize>) -> String {
     // Start from the alphabetically first node with non-zero in-degree (deterministic)
     let start = {
         let mut candidates: Vec<_> = in_degree

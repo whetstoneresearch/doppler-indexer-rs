@@ -640,7 +640,10 @@ impl TransformationEngine {
                 .map(|(i, name)| (name.as_str(), i))
                 .collect();
             handlers.sort_by_key(|ch| {
-                position.get(ch.handler.name()).copied().unwrap_or(usize::MAX)
+                position
+                    .get(ch.handler.name())
+                    .copied()
+                    .unwrap_or(usize::MAX)
             });
         }
 
@@ -658,11 +661,7 @@ impl TransformationEngine {
                         .await?;
                     dep_completed.insert(name.clone(), completed);
                 } else {
-                    debug_assert!(
-                        false,
-                        "dep target {} not found in catchup handlers",
-                        name
-                    );
+                    debug_assert!(false, "dep target {} not found in catchup handlers", name);
                     tracing::error!(
                         "Dependency target handler {} not found in catchup handlers",
                         name
@@ -700,6 +699,29 @@ impl TransformationEngine {
                 .collect();
 
             if to_process.is_empty() {
+                if !ch.handler_deps.is_empty() {
+                    let blocked_count = available
+                        .iter()
+                        .filter(|(start, _)| !completed.contains(start))
+                        .filter(|(start, _)| {
+                            ch.handler_deps.iter().any(|dep_name| {
+                                !dep_completed
+                                    .get(dep_name)
+                                    .map(|c| c.contains(start))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .count();
+                    if blocked_count > 0 {
+                        tracing::warn!(
+                            "Handler {} catchup: {} range(s) blocked by incomplete dependencies ({:?})",
+                            handler_key,
+                            blocked_count,
+                            ch.handler_deps,
+                        );
+                        continue;
+                    }
+                }
                 tracing::info!("Handler {} catchup: already up to date", handler_key);
                 continue;
             }
@@ -1370,6 +1392,7 @@ impl TransformationEngine {
                     .map(|s| s.to_string())
                     .collect();
                 let handler_key = handler.handler_key();
+                let handler_name = handler.name().to_string();
 
                 let call_deps_ready = call_deps.is_empty()
                     || call_deps.iter().all(|dep| {
@@ -1389,6 +1412,20 @@ impl TransformationEngine {
                             .unwrap_or(false)
                     });
 
+                let self_already_failed = state
+                    .failed_handlers
+                    .get(&range_key)
+                    .map(|failed| failed.contains(&handler_name))
+                    .unwrap_or(false);
+                if self_already_failed {
+                    tracing::debug!(
+                        "Handler {} skipped for block {}: already failed for this range",
+                        handler_key,
+                        msg.range_start,
+                    );
+                    continue;
+                }
+
                 // If any handler dependency has already failed for this
                 // range, this handler can never run — skip it immediately.
                 let dep_already_failed = if handler_deps.is_empty() {
@@ -1400,7 +1437,6 @@ impl TransformationEngine {
                         .map(|f| handler_deps.iter().any(|dep| f.contains(dep)))
                         .unwrap_or(false);
                     if failed {
-                        let handler_name = handler.name().to_string();
                         tracing::warn!(
                             "Handler {} skipped for block {}: upstream handler dep already failed",
                             handler_key,
@@ -1828,6 +1864,36 @@ impl TransformationEngine {
                 let handler_keys: Vec<_> = state.pending_events.keys().cloned().collect();
 
                 for handler_key in handler_keys {
+                    let handler_failed = self
+                        .registry
+                        .handler_name_for_key(&handler_key)
+                        .map(|name| {
+                            state
+                                .failed_handlers
+                                .get(&range_key)
+                                .map(|failed| failed.contains(name))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if handler_failed {
+                        let remove_entry =
+                            if let Some(pending) = state.pending_events.get_mut(&handler_key) {
+                                pending.retain(|p| (p.range_start, p.range_end) != range_key);
+                                pending.is_empty()
+                            } else {
+                                false
+                            };
+                        if remove_entry {
+                            state.pending_events.remove(&handler_key);
+                        }
+                        state.pending_event_timestamps.remove(&(
+                            range_key.0,
+                            range_key.1,
+                            handler_key.clone(),
+                        ));
+                        continue;
+                    }
+
                     let ready_indices: Vec<usize> = {
                         let pending = state.pending_events.get(&handler_key).unwrap();
 
@@ -1923,9 +1989,7 @@ impl TransformationEngine {
             // A handler is "fully succeeded" only if ALL its batches succeeded.
             let mut submitted_counts: HashMap<String, usize> = HashMap::new();
             for t in &tasks {
-                *submitted_counts
-                    .entry(t.handler.handler_key())
-                    .or_default() += 1;
+                *submitted_counts.entry(t.handler.handler_key()).or_default() += 1;
             }
 
             let outcomes = self
@@ -1935,17 +1999,12 @@ impl TransformationEngine {
 
             let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
             for o in &outcomes {
-                *succeeded_counts
-                    .entry(o.handler_key.clone())
-                    .or_default() += 1;
+                *succeeded_counts.entry(o.handler_key.clone()).or_default() += 1;
             }
-            let submitted_keys: HashSet<String> =
-                submitted_counts.keys().cloned().collect();
+            let submitted_keys: HashSet<String> = submitted_counts.keys().cloned().collect();
             let succeeded_keys: HashSet<String> = submitted_counts
                 .iter()
-                .filter(|(k, &count)| {
-                    succeeded_counts.get(*k).copied().unwrap_or(0) == count
-                })
+                .filter(|(k, &count)| succeeded_counts.get(*k).copied().unwrap_or(0) == count)
                 .map(|(k, _)| k.clone())
                 .collect();
 
@@ -2066,11 +2125,7 @@ impl TransformationEngine {
     /// just failed — **not** handler keys.
     ///
     /// Must be called while the caller does **not** hold the `live_state` lock.
-    async fn cascade_handler_failures(
-        &self,
-        newly_failed_names: &[String],
-        range_key: (u64, u64),
-    ) {
+    async fn cascade_handler_failures(&self, newly_failed_names: &[String], range_key: (u64, u64)) {
         if newly_failed_names.is_empty() {
             return;
         }
@@ -2081,10 +2136,11 @@ impl TransformationEngine {
                 cascaded.insert(dep_name);
             }
         }
-        if cascaded.is_empty() {
-            return;
-        }
 
+        let newly_failed_keys: Vec<String> = newly_failed_names
+            .iter()
+            .filter_map(|name| self.registry.handler_key_for_name(name).map(str::to_string))
+            .collect();
         let cascaded_keys: Vec<String> = cascaded
             .iter()
             .filter_map(|name| {
@@ -2096,6 +2152,21 @@ impl TransformationEngine {
 
         {
             let mut state = self.live_state.lock().await;
+            for key in &newly_failed_keys {
+                let remove_entry = if let Some(pending) = state.pending_events.get_mut(key) {
+                    pending.retain(|p| (p.range_start, p.range_end) != range_key);
+                    pending.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    state.pending_events.remove(key);
+                }
+                state
+                    .pending_event_timestamps
+                    .remove(&(range_key.0, range_key.1, key.clone()));
+            }
+
             for name in &cascaded {
                 state
                     .failed_handlers
@@ -2118,6 +2189,10 @@ impl TransformationEngine {
                     .pending_event_timestamps
                     .remove(&(range_key.0, range_key.1, key.clone()));
             }
+        }
+
+        if cascaded.is_empty() {
+            return;
         }
 
         tracing::warn!(
@@ -2238,9 +2313,7 @@ impl TransformationEngine {
         // Count submissions per handler to detect partial failures.
         let mut submitted_counts: HashMap<String, usize> = HashMap::new();
         for t in &tasks {
-            *submitted_counts
-                .entry(t.handler.handler_key())
-                .or_default() += 1;
+            *submitted_counts.entry(t.handler.handler_key()).or_default() += 1;
         }
 
         let outcomes = self
@@ -2250,17 +2323,12 @@ impl TransformationEngine {
 
         let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
         for o in &outcomes {
-            *succeeded_counts
-                .entry(o.handler_key.clone())
-                .or_default() += 1;
+            *succeeded_counts.entry(o.handler_key.clone()).or_default() += 1;
         }
-        let submitted_keys: HashSet<String> =
-            submitted_counts.keys().cloned().collect();
+        let submitted_keys: HashSet<String> = submitted_counts.keys().cloned().collect();
         let succeeded_keys: HashSet<String> = submitted_counts
             .iter()
-            .filter(|(k, &count)| {
-                succeeded_counts.get(*k).copied().unwrap_or(0) == count
-            })
+            .filter(|(k, &count)| succeeded_counts.get(*k).copied().unwrap_or(0) == count)
             .map(|(k, _)| k.clone())
             .collect();
 

@@ -405,7 +405,10 @@ impl RetryProcessor {
             .map(|(i, name)| (name.as_str(), i))
             .collect();
         retry_handlers.sort_by_key(|rh| {
-            position.get(rh.handler.name()).copied().unwrap_or(usize::MAX)
+            position
+                .get(rh.handler.name())
+                .copied()
+                .unwrap_or(usize::MAX)
         });
 
         for rh in &retry_handlers {
@@ -931,10 +934,7 @@ mod tests {
     #[test]
     fn retry_missing_handlers_tracker_only() {
         let tracker = Some(HashSet::from(["handler_b_v1".to_string()]));
-        let all_handlers = HashSet::from([
-            "handler_a_v1".to_string(),
-            "handler_b_v1".to_string(),
-        ]);
+        let all_handlers = HashSet::from(["handler_a_v1".to_string(), "handler_b_v1".to_string()]);
 
         let resolved = resolve_retry_missing_handlers(None, tracker, all_handlers);
         assert_eq!(resolved, HashSet::from(["handler_b_v1".to_string()]));

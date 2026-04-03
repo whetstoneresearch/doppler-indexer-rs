@@ -332,10 +332,7 @@ mod tests {
             .unwrap_or(false);
         let remaining = has_remaining_pending(state, handler_key, range_key);
 
-        succeeded
-            && (logs_complete || !is_dep_handler)
-            && !remaining
-            && !is_failed
+        succeeded && (logs_complete || !is_dep_handler) && !remaining && !is_failed
     }
 
     /// Simulates the persistable_success_keys computation in
@@ -386,16 +383,8 @@ mod tests {
         state.pending_events.insert(
             "B_v1".to_string(),
             vec![
-                make_pending(
-                    range_key,
-                    vec![("Pool".into(), "callC".into())],
-                    vec![],
-                ),
-                make_pending(
-                    range_key,
-                    vec![("Pool".into(), "callD".into())],
-                    vec![],
-                ),
+                make_pending(range_key, vec![("Pool".into(), "callC".into())], vec![]),
+                make_pending(range_key, vec![("Pool".into(), "callD".into())], vec![]),
             ],
         );
 
