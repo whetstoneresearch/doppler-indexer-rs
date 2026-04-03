@@ -2,6 +2,10 @@
 //!
 //! Loads pool metadata from the `pools` table on handler initialization and
 //! provides fast lookups by pool_id during event processing.
+//!
+//! Queries join against `active_versions` to select only the currently active
+//! source_version for each handler source, so a create-handler version bump
+//! does not cause the cache to load stale rows from the previous version.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +61,11 @@ impl PoolMetadataCache {
 
         let rows = client
             .query(
-                "SELECT address, base_token, quote_token, is_token_0, type \
-                 FROM pools WHERE chain_id = $1",
+                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type \
+                 FROM pools p \
+                 JOIN active_versions av \
+                   ON p.source = av.source AND p.source_version = av.active_version \
+                 WHERE p.chain_id = $1",
                 &[&(chain_id as i64)],
             )
             .await
@@ -180,8 +187,11 @@ impl PoolMetadataCache {
 
         let rows = client
             .query(
-                "SELECT address, base_token, quote_token, is_token_0, type \
-                 FROM pools WHERE chain_id = $1",
+                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type \
+                 FROM pools p \
+                 JOIN active_versions av \
+                   ON p.source = av.source AND p.source_version = av.active_version \
+                 WHERE p.chain_id = $1",
                 &[&(chain_id as i64)],
             )
             .await
