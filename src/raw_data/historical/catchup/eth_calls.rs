@@ -23,6 +23,7 @@ use crate::raw_data::historical::eth_calls::{
     EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
+use crate::storage::contract_index::build_expected_factory_contracts;
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::factory_data::{
@@ -122,6 +123,7 @@ pub async fn collect_eth_calls(
             range_regular_done: HashSet::new(),
             range_factory_done: HashSet::new(),
             factory_skipped_triggers: Vec::new(),
+            expected_by_collection: build_expected_factory_contracts(&chain.contracts),
         });
     }
 
@@ -607,6 +609,7 @@ pub async fn collect_eth_calls(
         let total_log_ranges = log_ranges.len();
         let mut event_catchup_count = 0;
         let s3_manifest_arc = s3_manifest.as_ref().map(|m| Arc::new(m.clone()));
+        let event_expected_by_collection = build_expected_factory_contracts(&chain.contracts);
 
         tracing::info!(
             "Event-triggered calls catchup: checking {} log ranges for chain {}",
@@ -625,6 +628,12 @@ pub async fn collect_eth_calls(
                             continue;
                         }
                     }
+                    // For factory configs, pass expected contracts for contract index checking
+                    let expected_for_config = if config.is_factory {
+                        event_expected_by_collection.get(&config.contract_name).cloned()
+                    } else {
+                        None
+                    };
                     if !event_output_exists_async(
                         base_output_dir.clone(),
                         config.contract_name.clone(),
@@ -632,6 +641,7 @@ pub async fn collect_eth_calls(
                         log_range.start,
                         log_range.end,
                         s3_manifest_arc.clone(),
+                        expected_for_config,
                     )
                     .await?
                     {
@@ -712,6 +722,7 @@ pub async fn collect_eth_calls(
                     multicall_addr,
                     range_start,
                     range_end,
+                    &event_expected_by_collection,
                 )
                 .await?
             } else {
@@ -732,6 +743,7 @@ pub async fn collect_eth_calls(
                     &event_ctx,
                     range_start,
                     range_end,
+                    &event_expected_by_collection,
                 )
                 .await?
             };
@@ -803,5 +815,6 @@ pub async fn collect_eth_calls(
         range_regular_done,
         range_factory_done,
         factory_skipped_triggers: Vec::new(),
+        expected_by_collection: build_expected_factory_contracts(&chain.contracts),
     })
 }

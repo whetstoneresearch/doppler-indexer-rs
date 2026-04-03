@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::types::EthCallCollectionError;
+use crate::storage::contract_index::{get_missing_contracts, range_key, read_contract_index, ExpectedContracts};
 use crate::storage::paths::{parse_range_from_filename, raw_logs_dir};
 use crate::storage::S3Manifest;
 
@@ -89,6 +90,10 @@ pub(crate) fn get_existing_log_ranges(
 }
 
 /// Check if on_events output already exists for a range (locally or in S3)
+///
+/// When `expected_contracts` is provided, also checks the contract index for
+/// completeness. Returns `false` if the file exists but the contract index
+/// shows missing contracts (forcing re-processing).
 pub(crate) fn event_output_exists(
     output_dir: &Path,
     contract_name: &str,
@@ -96,6 +101,7 @@ pub(crate) fn event_output_exists(
     range_start: u64,
     range_end: u64,
     s3_manifest: Option<&S3Manifest>,
+    expected_contracts: Option<&ExpectedContracts>,
 ) -> bool {
     // Check local first
     let sub_dir = output_dir
@@ -123,6 +129,23 @@ pub(crate) fn event_output_exists(
                             // Ranges overlap if: start1 < end2 AND start2 < end1 (using exclusive ends)
                             let file_end_exclusive = file_end_inclusive + 1;
                             if range_start < file_end_exclusive && file_start < range_end {
+                                // File exists, but check contract index if expected contracts provided
+                                if let Some(expected) = expected_contracts {
+                                    let index = read_contract_index(&sub_dir);
+                                    let rk = range_key(file_start, file_end_inclusive);
+                                    let missing = get_missing_contracts(&index, &rk, expected);
+                                    if !missing.is_empty() {
+                                        tracing::info!(
+                                            "on_events {}.{} range {}-{}: file exists but contract index has missing contracts: {:?}",
+                                            contract_name,
+                                            function_name,
+                                            file_start,
+                                            file_end_inclusive,
+                                            missing.keys().collect::<Vec<_>>()
+                                        );
+                                        return false;
+                                    }
+                                }
                                 return true;
                             }
                         }
@@ -180,6 +203,7 @@ pub(crate) async fn event_output_exists_async(
     range_start: u64,
     range_end: u64,
     s3_manifest: Option<Arc<S3Manifest>>,
+    expected_contracts: Option<ExpectedContracts>,
 ) -> Result<bool, EthCallCollectionError> {
     tokio::task::spawn_blocking(move || {
         event_output_exists(
@@ -189,6 +213,7 @@ pub(crate) async fn event_output_exists_async(
             range_start,
             range_end,
             s3_manifest.as_deref(),
+            expected_contracts.as_ref(),
         )
     })
     .await

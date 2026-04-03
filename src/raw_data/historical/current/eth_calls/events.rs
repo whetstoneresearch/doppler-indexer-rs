@@ -63,6 +63,7 @@ pub(super) async fn handle_event_trigger_message(
                         multicall_addr,
                         range_start,
                         inclusive_end,
+                        &state.expected_by_collection,
                     )
                     .await?
                 } else {
@@ -73,6 +74,7 @@ pub(super) async fn handle_event_trigger_message(
                         &ctx,
                         range_start,
                         inclusive_end,
+                        &state.expected_by_collection,
                     )
                     .await?
                 };

@@ -13,6 +13,7 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::event_triggers::SkippedFactoryTrigger;
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
+use crate::storage::contract_index::ExpectedContracts;
 use crate::storage::{S3Manifest, StorageManager};
 use crate::types::config::eth_call::{
     EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue,
@@ -261,4 +262,6 @@ pub struct EthCallCatchupState {
     /// Buffered triggers skipped because factory addresses weren't known yet.
     /// Each entry: (skipped_triggers, range_start, range_end_inclusive)
     pub factory_skipped_triggers: Vec<(Vec<SkippedFactoryTrigger>, u64, u64)>,
+    /// Expected factory contracts per collection for contract index tracking.
+    pub expected_by_collection: HashMap<String, ExpectedContracts>,
 }

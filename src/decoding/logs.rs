@@ -21,6 +21,9 @@ use super::types::{BuiltMatchers, DecoderMessage, LogDecoderOutputs, LogMatcherC
 use crate::live::{LiveDecodedLog, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::contract_index::{
+    range_key, read_contract_index, update_contract_index, write_contract_index, ExpectedContracts,
+};
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
     RangeCompleteMessage,
@@ -266,6 +269,7 @@ pub(crate) async fn process_logs(
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     output_base: &Path,
     outputs: &LogDecoderOutputs<'_>,
+    expected_by_collection: Option<&HashMap<String, ExpectedContracts>>,
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
@@ -464,6 +468,29 @@ pub(crate) async fn process_logs(
             if !output_path.exists() {
                 std::fs::create_dir_all(&output_dir)?;
                 write_decoded_logs_to_parquet(&[], &matcher.event, &output_path)?;
+            }
+        }
+    }
+
+    // Update contract index for factory collections so that catchup can skip
+    // ranges already processed with the current set of contracts/addresses.
+    if let Some(expected_map) = expected_by_collection {
+        let rk = range_key(range_start, range_end - 1);
+
+        // Collect unique (collection, event_name) pairs from factory matchers
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+        for (collection, matchers) in factory_matchers {
+            for matcher in matchers {
+                seen_pairs.insert((collection.clone(), matcher.event_name.clone()));
+            }
+        }
+
+        for (collection, event_name) in seen_pairs {
+            if let Some(expected) = expected_map.get(&collection) {
+                let dir = output_base.join(&collection).join(&event_name);
+                let mut index = read_contract_index(&dir);
+                update_contract_index(&mut index, &rk, expected);
+                write_contract_index(&dir, &index)?;
             }
         }
     }

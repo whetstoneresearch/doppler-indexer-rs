@@ -10,7 +10,11 @@ use crate::raw_data::historical::factories::{
     process_range, FactoryAddressData, FactoryCollectionError, FactoryMatcher, FactoryMessage,
 };
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
-use crate::storage::{S3Manifest, StorageManager};
+use crate::storage::contract_index::{
+    build_expected_factory_contracts, range_key, read_contract_index, update_contract_index,
+    write_contract_index,
+};
+use crate::storage::{upload_sidecar_to_s3, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
@@ -106,6 +110,11 @@ pub async fn collect_factories(
     // Streaming phase: Process new logs from channel
     // =========================================================================
     let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
+
+    // Build expected contracts for contract index tracking
+    let expected_by_collection = build_expected_factory_contracts(&chain.contracts);
+    let factory_collection_names: HashSet<String> =
+        matchers.iter().map(|m| m.collection_name.clone()).collect();
 
     tracing::info!(
         "Starting factory collection for chain {} with {} matchers",
@@ -212,6 +221,33 @@ pub async fn collect_factories(
                             addresses,
                         })
                         .await;
+                }
+
+                // Update contract index for each collection
+                let rk = range_key(range_start, range_end - 1);
+                for collection in &factory_collection_names {
+                    if let Some(expected) = expected_by_collection.get(collection) {
+                        let dir = output_dir.join(collection);
+                        let mut index = read_contract_index(&dir);
+                        update_contract_index(&mut index, &rk, expected);
+                        if let Err(e) = write_contract_index(&dir, &index) {
+                            tracing::error!(
+                                "Failed to write contract index for {}: {}",
+                                collection, e
+                            );
+                        }
+
+                        // Upload to S3
+                        if let Some(ref sm) = storage_manager {
+                            let index_path = dir.join("contract_index.json");
+                            if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                                tracing::warn!(
+                                    "Failed to upload contract index for {} to S3: {}",
+                                    collection, e
+                                );
+                            }
+                        }
+                    }
                 }
             }
             LogMessage::AllRangesComplete => {

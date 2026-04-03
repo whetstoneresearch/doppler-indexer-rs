@@ -11,6 +11,10 @@ use tokio::task::JoinSet;
 use crate::decoding::logs::{process_logs, EventMatcher, LogDecodingError};
 use crate::decoding::types::{FileProcessingEntry, LogDecoderOutputs, LogMatcherConfig};
 use crate::raw_data::historical::factories::RecollectRequest;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts, get_missing_contracts, range_key, read_contract_index,
+    ContractIndex, ExpectedContracts,
+};
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::factory_data::load_factory_addresses_by_range;
 use crate::storage::parquet_readers::read_raw_logs_from_parquet;
@@ -84,6 +88,29 @@ pub async fn catchup_decode_logs(
         factory_addresses.len()
     );
 
+    // Build expected contracts per collection for contract index checks
+    let expected_by_collection = build_expected_factory_contracts(&chain.contracts);
+
+    // Pre-load contract indexes for each factory collection
+    let factory_collection_names: HashSet<String> =
+        factory_matchers.keys().cloned().collect();
+    let mut contract_indexes: HashMap<String, ContractIndex> = HashMap::new();
+    for collection in &factory_collection_names {
+        // Each factory collection's decoded logs use the same output_base/{collection}/{event}/ layout
+        // We load one index per (collection, event) pair
+        for matchers in factory_matchers.get(collection).iter().flat_map(|v| v.iter()) {
+            let dir = output_base.join(collection).join(&matchers.event_name);
+            let idx = {
+                let dir_clone = dir.clone();
+                tokio::task::spawn_blocking(move || read_contract_index(&dir_clone))
+                    .await
+                    .unwrap_or_default()
+            };
+            let key = format!("{}/{}", collection, matchers.event_name);
+            contract_indexes.insert(key, idx);
+        }
+    }
+
     // Filter files that need processing and compute per-range missing matchers
     let files_to_process: Vec<FileProcessingEntry> = raw_files
         .into_iter()
@@ -94,6 +121,9 @@ pub async fn catchup_decode_logs(
                 regular_matchers,
                 factory_matchers,
                 &existing_decoded,
+                output_base,
+                &expected_by_collection,
+                &contract_indexes,
             );
             if missing_regular.is_empty() && missing_factory.is_empty() {
                 tracing::debug!(
@@ -129,6 +159,7 @@ pub async fn catchup_decode_logs(
     let output_base = Arc::new(output_base.to_path_buf());
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let transform_tx = transform_tx.cloned();
+    let expected_by_collection = Arc::new(expected_by_collection);
 
     let mut join_set = JoinSet::new();
 
@@ -140,6 +171,7 @@ pub async fn catchup_decode_logs(
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
         let recollect_tx = recollect_tx.clone();
+        let expected_by_collection = expected_by_collection.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -217,6 +249,7 @@ pub async fn catchup_decode_logs(
                 &factory_addrs,
                 &output_base,
                 &outputs,
+                Some(&expected_by_collection),
             )
             .await
         });
@@ -236,14 +269,22 @@ pub async fn catchup_decode_logs(
 
 /// Get matchers whose decoded output files don't exist yet for a given range.
 /// Returns only the matchers that still need decoding.
+///
+/// For factory matchers, even when the parquet file exists, the contract index
+/// is checked for missing contracts/addresses. If the index shows gaps, the
+/// matcher is included so the range gets reprocessed.
 fn get_missing_matchers(
     range_start: u64,
     range_end: u64,
     regular_matchers: &[EventMatcher],
     factory_matchers: &HashMap<String, Vec<EventMatcher>>,
     existing: &HashSet<String>,
+    _output_base: &Path,
+    expected_by_collection: &HashMap<String, ExpectedContracts>,
+    contract_indexes: &HashMap<String, ContractIndex>,
 ) -> (Vec<EventMatcher>, HashMap<String, Vec<EventMatcher>>) {
     let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+    let rk = range_key(range_start, range_end - 1);
 
     let missing_regular: Vec<EventMatcher> = regular_matchers
         .iter()
@@ -275,7 +316,31 @@ fn get_missing_matchers(
                     }
                     // Check if output file is missing
                     let rel_path = format!("{}/{}/{}", matcher.name, matcher.event_name, file_name);
-                    !existing.contains(&rel_path)
+                    if !existing.contains(&rel_path) {
+                        return true; // File missing — needs processing
+                    }
+
+                    // File exists — check contract index for missing contracts
+                    if let Some(expected) = expected_by_collection.get(collection) {
+                        let index_key = format!("{}/{}", collection, matcher.event_name);
+                        let index = contract_indexes
+                            .get(&index_key)
+                            .cloned()
+                            .unwrap_or_default();
+                        let missing = get_missing_contracts(&index, &rk, expected);
+                        if !missing.is_empty() {
+                            tracing::debug!(
+                                "Range {} file exists for {}/{} but contract index has {} missing contracts",
+                                rk,
+                                collection,
+                                matcher.event_name,
+                                missing.len()
+                            );
+                            return true; // Index shows gaps — reprocess
+                        }
+                    }
+
+                    false // File exists and index is complete
                 })
                 .cloned()
                 .collect();

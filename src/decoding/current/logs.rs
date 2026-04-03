@@ -145,6 +145,7 @@ pub async fn decode_logs_live(
                         &accumulated_factory_addresses,
                         output_base,
                         outputs,
+                        None,
                     )
                     .await?;
                 }
