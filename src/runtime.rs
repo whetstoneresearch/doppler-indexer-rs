@@ -392,6 +392,9 @@ impl ChainRuntime {
                 pool.run_migrations()
                     .await
                     .context("failed to run database migrations")?;
+                pool.run_handler_migrations(&registry)
+                    .await
+                    .context("failed to run handler migrations")?;
 
                 tracing::info!("Database pool initialized and migrations complete");
                 Some(Arc::new(pool))

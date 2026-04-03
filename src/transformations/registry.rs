@@ -57,11 +57,9 @@ pub struct TransformationRegistry {
     call_handlers: HashMap<(String, String), Vec<Arc<dyn EthCallHandler>>>,
     /// All handlers for initialization (de-duplicated)
     all_handlers: Vec<Arc<dyn TransformationHandler>>,
-<<<<<<< feat/chain-aware-handlers
     /// When set, only handlers whose trigger sources are all present in this
     /// set will be registered. Used to filter handlers per-chain.
     available_sources: Option<HashSet<String>>,
-=======
     /// Maps handler name() to its declared handler dependency names
     handler_dependency_graph: HashMap<String, Vec<String>>,
     /// Topological ordering of handler names (computed after all handlers registered)
@@ -78,7 +76,6 @@ pub struct TransformationRegistry {
     /// Multi-trigger handlers must not have their success persisted until
     /// all batches for the block have been dispatched.
     multi_trigger_handler_keys: HashSet<String>,
->>>>>>> main
 }
 
 impl TransformationRegistry {
@@ -88,8 +85,14 @@ impl TransformationRegistry {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
             all_handlers: Vec::new(),
-<<<<<<< feat/chain-aware-handlers
             available_sources: None,
+            handler_dependency_graph: HashMap::new(),
+            handler_topological_order: Vec::new(),
+            dependency_handler_names: HashSet::new(),
+            handler_key_to_name: HashMap::new(),
+            handler_name_to_key: HashMap::new(),
+            event_handler_names: HashSet::new(),
+            multi_trigger_handler_keys: HashSet::new(),
         }
     }
 
@@ -103,7 +106,6 @@ impl TransformationRegistry {
             call_handlers: HashMap::new(),
             all_handlers: Vec::new(),
             available_sources: Some(sources),
-=======
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
@@ -111,7 +113,6 @@ impl TransformationRegistry {
             handler_name_to_key: HashMap::new(),
             event_handler_names: HashSet::new(),
             multi_trigger_handler_keys: HashSet::new(),
->>>>>>> main
         }
     }
 
@@ -135,7 +136,6 @@ impl TransformationRegistry {
 
         let triggers = handler.triggers();
 
-<<<<<<< feat/chain-aware-handlers
         if let Some(ref sources) = self.available_sources {
             if !triggers.iter().all(|t| sources.contains(&t.source)) {
                 tracing::debug!(
@@ -144,11 +144,11 @@ impl TransformationRegistry {
                 );
                 return;
             }
-=======
+        }
+
         if triggers.len() > 1 {
             self.multi_trigger_handler_keys
                 .insert(handler.handler_key());
->>>>>>> main
         }
 
         for trigger in triggers {
@@ -202,7 +202,6 @@ impl TransformationRegistry {
 
         let triggers = handler.triggers();
 
-<<<<<<< feat/chain-aware-handlers
         if let Some(ref sources) = self.available_sources {
             if !triggers.iter().all(|t| sources.contains(&t.source)) {
                 tracing::debug!(
@@ -211,11 +210,11 @@ impl TransformationRegistry {
                 );
                 return;
             }
-=======
+        }
+
         if triggers.len() > 1 {
             self.multi_trigger_handler_keys
                 .insert(handler.handler_key());
->>>>>>> main
         }
 
         for trigger in triggers {
@@ -730,6 +729,8 @@ pub fn build_registry_for_chain(
 
     // Register eth_call handlers (filtered by available sources)
     super::eth_call::register_handlers(&mut registry);
+
+    registry.validate_and_sort_handler_dependencies();
 
     tracing::info!(
         "Built chain-filtered transformation registry with {} handlers ({} event triggers, {} call triggers)",
