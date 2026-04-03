@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::config::chain::{resolve_chain_config, ChainConfig, ChainConfigRaw};
+use crate::types::config::chain::{resolve_chain_config, ChainConfig, ChainConfigRaw, RpcRateLimitGroup};
 use crate::types::config::metrics::MetricsConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::config::storage::StorageConfig;
@@ -18,15 +19,18 @@ pub struct IndexerConfigRaw {
     pub metrics: Option<MetricsConfig>,
     #[serde(default)]
     pub storage: Option<StorageConfig>,
+    #[serde(default)]
+    pub rpc_rate_limits: Option<HashMap<String, RpcRateLimitGroup>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IndexerConfig {
     pub chains: Vec<ChainConfig>,
     pub raw_data_collection: RawDataCollectionConfig,
     pub transformations: Option<TransformationConfig>,
     pub metrics: Option<MetricsConfig>,
     pub storage: Option<StorageConfig>,
+    pub rpc_rate_limits: Option<HashMap<String, RpcRateLimitGroup>>,
 }
 
 impl IndexerConfig {
@@ -47,12 +51,36 @@ impl IndexerConfig {
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|e| anyhow::anyhow!("Failed to resolve chain config: {}", e))?;
 
+        let rpc_rate_limits = raw_config.rpc_rate_limits;
+
+        // Validate rate limit group references
+        for chain in &chains {
+            if let Some(ref group_name) = chain.rpc.rate_limit_group {
+                let valid = rpc_rate_limits
+                    .as_ref()
+                    .is_some_and(|groups| groups.contains_key(group_name));
+                if !valid {
+                    anyhow::bail!(
+                        "Chain '{}' references rate_limit_group '{}' which is not defined in rpc_rate_limits",
+                        chain.name, group_name
+                    );
+                }
+            }
+            if chain.rpc.rate_limit_group.is_some() && chain.rpc.compute_units_per_second.is_some() {
+                anyhow::bail!(
+                    "Chain '{}' has both rate_limit_group and compute_units_per_second; the group defines the rate budget",
+                    chain.name
+                );
+            }
+        }
+
         Ok(IndexerConfig {
             chains,
             raw_data_collection: raw_config.raw_data_collection,
             transformations: raw_config.transformations,
             metrics: raw_config.metrics,
             storage: raw_config.storage,
+            rpc_rate_limits,
         })
     }
 }
