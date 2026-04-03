@@ -5,6 +5,8 @@
 
 use alloy_primitives::U256;
 
+use crate::transformations::error::TransformationError;
+
 /// Minimum tick that can be used on any pool.
 pub const MIN_TICK: i32 = -887272;
 /// Maximum tick that can be used on any pool.
@@ -46,16 +48,14 @@ const TICK_RATIOS: [U256; 20] = [
 /// Ports Uniswap v3's `TickMath.getSqrtRatioAtTick(int24 tick)`.
 /// The result is a Q64.96 fixed-point number representing sqrt(1.0001^tick) * 2^96.
 ///
-/// # Panics
-/// Panics if tick is outside [MIN_TICK, MAX_TICK].
-pub fn tick_to_sqrt_price_x96(tick: i32) -> U256 {
-    assert!(
-        (MIN_TICK..=MAX_TICK).contains(&tick),
-        "tick {} out of range [{}, {}]",
-        tick,
-        MIN_TICK,
-        MAX_TICK
-    );
+/// Returns `Err` if tick is outside [MIN_TICK, MAX_TICK].
+pub fn tick_to_sqrt_price_x96(tick: i32) -> Result<U256, TransformationError> {
+    if !(MIN_TICK..=MAX_TICK).contains(&tick) {
+        return Err(TransformationError::TypeConversion(format!(
+            "tick {} out of range [{}, {}]",
+            tick, MIN_TICK, MAX_TICK
+        )));
+    }
 
     let abs_tick = tick.unsigned_abs();
 
@@ -85,7 +85,7 @@ pub fn tick_to_sqrt_price_x96(tick: i32) -> U256 {
     } else {
         U256::ZERO
     };
-    (ratio >> 32) + shift
+    Ok((ratio >> 32) + shift)
 }
 
 #[cfg(test)]
@@ -95,27 +95,27 @@ mod tests {
     #[test]
     fn test_tick_0() {
         // tick 0 = price 1.0, sqrtPriceX96 = 2^96
-        let result = tick_to_sqrt_price_x96(0);
+        let result = tick_to_sqrt_price_x96(0).unwrap();
         let expected = U256::from(1u64) << 96;
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_min_tick() {
-        let result = tick_to_sqrt_price_x96(MIN_TICK);
+        let result = tick_to_sqrt_price_x96(MIN_TICK).unwrap();
         assert_eq!(result, MIN_SQRT_RATIO);
     }
 
     #[test]
     fn test_max_tick() {
-        let result = tick_to_sqrt_price_x96(MAX_TICK);
+        let result = tick_to_sqrt_price_x96(MAX_TICK).unwrap();
         assert_eq!(result, MAX_SQRT_RATIO);
     }
 
     #[test]
     fn test_tick_1() {
         // Known value from Uniswap: tick 1 = 79232123823359799118286999568
-        let result = tick_to_sqrt_price_x96(1);
+        let result = tick_to_sqrt_price_x96(1).unwrap();
         let expected = U256::from_str_radix("79232123823359799118286999568", 10).unwrap();
         assert_eq!(result, expected);
     }
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn test_tick_negative_1() {
         // Known Uniswap value: tick -1 = 79224201403219477170569942574
-        let result = tick_to_sqrt_price_x96(-1);
+        let result = tick_to_sqrt_price_x96(-1).unwrap();
         let expected = U256::from_str_radix("79224201403219477170569942574", 10).unwrap();
         assert_eq!(result, expected);
     }
@@ -132,8 +132,8 @@ mod tests {
     fn test_positive_negative_symmetry() {
         // sqrt(1.0001^tick) * sqrt(1.0001^(-tick)) ≈ 1
         // So sqrtPrice(tick) * sqrtPrice(-tick) ≈ 2^192
-        let pos = tick_to_sqrt_price_x96(100);
-        let neg = tick_to_sqrt_price_x96(-100);
+        let pos = tick_to_sqrt_price_x96(100).unwrap();
+        let neg = tick_to_sqrt_price_x96(-100).unwrap();
         let product = pos * neg;
         let one_q192 = U256::from(1u64) << 192;
         // Allow small rounding error
@@ -147,14 +147,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tick")]
     fn test_tick_too_low() {
-        tick_to_sqrt_price_x96(MIN_TICK - 1);
+        assert!(tick_to_sqrt_price_x96(MIN_TICK - 1).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "tick")]
     fn test_tick_too_high() {
-        tick_to_sqrt_price_x96(MAX_TICK + 1);
+        assert!(tick_to_sqrt_price_x96(MAX_TICK + 1).is_err());
     }
 }

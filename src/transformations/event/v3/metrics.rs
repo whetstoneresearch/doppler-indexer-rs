@@ -58,25 +58,41 @@ fn extract_v3_liquidity(
 
     for event in ctx.events_of_type(source, "Mint") {
         let amount = event.extract_uint256("amount")?;
+        let delta = I256::try_from(amount).map_err(|_| {
+            TransformationError::TypeConversion(format!(
+                "Mint amount {} overflows I256 (pool {}, block {})",
+                amount,
+                hex::encode(&event.contract_address),
+                event.block_number,
+            ))
+        })?;
         deltas.push(LiquidityInput {
             pool_id: event.contract_address.to_vec(),
             block_number: event.block_number,
             log_index: event.log_index,
             tick_lower: event.extract_i32_flexible("tickLower")?,
             tick_upper: event.extract_i32_flexible("tickUpper")?,
-            liquidity_delta: I256::try_from(amount).unwrap_or(I256::MAX),
+            liquidity_delta: delta,
         });
     }
 
     for event in ctx.events_of_type(source, "Burn") {
         let amount = event.extract_uint256("amount")?;
+        let delta = I256::try_from(amount).map_err(|_| {
+            TransformationError::TypeConversion(format!(
+                "Burn amount {} overflows I256 (pool {}, block {})",
+                amount,
+                hex::encode(&event.contract_address),
+                event.block_number,
+            ))
+        })?;
         deltas.push(LiquidityInput {
             pool_id: event.contract_address.to_vec(),
             block_number: event.block_number,
             log_index: event.log_index,
             tick_lower: event.extract_i32_flexible("tickLower")?,
             tick_upper: event.extract_i32_flexible("tickUpper")?,
-            liquidity_delta: -I256::try_from(amount).unwrap_or(I256::MAX),
+            liquidity_delta: -delta,
         });
     }
 
@@ -251,7 +267,7 @@ impl EventHandler for V3LiquidityMetricsHandler {
     }
 
     fn handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["V3CreateHandler"]
+        vec![]
     }
 }
 

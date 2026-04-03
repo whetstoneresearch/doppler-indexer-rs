@@ -50,8 +50,8 @@ pub struct LiquidityDeltaData {
 /// (execute_with_snapshot_capture) can record the previous row state before
 /// overwriting. This enables correct rollback on reorg.
 ///
-/// The engine processes block ranges sequentially per handler, so the
-/// unconditional update is safe — newer blocks always arrive after older ones.
+/// Updates only if incoming block is strictly newer, guarding against
+/// out-of-order re-processing.
 pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
     DbOperation::Upsert {
         table: "pool_state".to_string(),
@@ -85,7 +85,7 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
             "active_liquidity".into(),
         ],
         update_condition: Some(
-            "EXCLUDED.\"block_number\" >= \"pool_state\".\"block_number\"".into(),
+            "EXCLUDED.\"block_number\" > \"pool_state\".\"block_number\"".into(),
         ),
     }
 }

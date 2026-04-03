@@ -113,16 +113,14 @@ impl TransformationHandler for PriceHandler {
             for call in ctx.calls_of_type(config.source, config.function_name) {
                 let sqrt_price_x96 = call.extract_uint256("sqrtPriceX96")?;
 
-                if sqrt_price_x96.is_zero() {
-                    continue;
-                }
-
-                let price = sqrt_price_x96_to_price(
+                let Some(price) = sqrt_price_x96_to_price(
                     &sqrt_price_x96,
                     config.token_decimals,
                     config.quote_decimals,
                     config.is_token0,
-                );
+                ) else {
+                    continue;
+                };
 
                 ops.push(DbOperation::Upsert {
                     table: "prices".into(),
@@ -140,7 +138,7 @@ impl TransformationHandler for PriceHandler {
                         DbValue::Int64(ctx.chain_id as i64),
                         DbValue::Address(token_address),
                         DbValue::Address(quote_token_address),
-                        DbValue::Numeric(format!("{:.18}", price)),
+                        DbValue::Numeric(price.to_string()),
                     ],
                     conflict_columns: vec!["timestamp".into(), "chain_id".into(), "token".into()],
                     update_columns: vec![

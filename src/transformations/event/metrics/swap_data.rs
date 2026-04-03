@@ -46,6 +46,8 @@ pub struct LiquidityInput {
 ///
 /// Groups swaps by (pool_id, block_number), builds a BlockAccumulator for each group,
 /// then emits one snapshot row per group and one pool_state upsert per pool (latest block).
+/// Groups where no valid price could be computed (e.g. all swaps had zero sqrtPriceX96)
+/// are silently skipped — no ghost snapshot rows are emitted.
 pub fn process_swaps(
     swaps: &[SwapInput],
     metadata_cache: &PoolMetadataCache,
@@ -94,15 +96,14 @@ pub fn process_swaps(
         sorted_swaps.sort_by_key(|s| s.log_index);
 
         for swap in sorted_swaps {
-            let price = sqrt_price_x96_to_price(
+            let Some(price) = sqrt_price_x96_to_price(
                 &swap.sqrt_price_x96,
                 meta.base_decimals,
                 meta.quote_decimals,
                 meta.is_token_0,
-            );
-            if !price.is_finite() {
+            ) else {
                 continue;
-            }
+            };
             acc.record_swap(
                 price,
                 swap.amount0,
@@ -113,25 +114,30 @@ pub fn process_swaps(
             );
         }
 
+        // Skip pools where no valid price was computed (all swaps had invalid sqrtPriceX96).
+        if acc.swap_count == 0 {
+            continue;
+        }
+
         accumulators.push((pool_id.clone(), *block_number, acc));
     }
 
     for (pool_id, block_number, acc) in &accumulators {
-        // Emit snapshot
-        let price_open = acc.price_open.unwrap_or(0.0);
-        let price_close = acc.price_close.unwrap_or(0.0);
-        let price_high = acc.price_high.unwrap_or(0.0);
-        let price_low = acc.price_low.unwrap_or(0.0);
+        // price_open/close/high/low are guaranteed Some because swap_count > 0.
+        let price_open = acc.price_open.as_ref().unwrap().to_string();
+        let price_close = acc.price_close.as_ref().unwrap().to_string();
+        let price_high = acc.price_high.as_ref().unwrap().to_string();
+        let price_low = acc.price_low.as_ref().unwrap().to_string();
 
         ops.push(insert_pool_snapshot(&SnapshotData {
             chain_id,
             pool_id: pool_id.clone(),
             block_number: *block_number,
             block_timestamp: acc.block_timestamp,
-            price_open: format!("{:.18}", price_open),
-            price_close: format!("{:.18}", price_close),
-            price_high: format!("{:.18}", price_high),
-            price_low: format!("{:.18}", price_low),
+            price_open,
+            price_close,
+            price_high,
+            price_low,
             active_liquidity: acc.last_liquidity.to_string(),
             volume0: acc.volume0.to_string(),
             volume1: acc.volume1.to_string(),
@@ -149,7 +155,7 @@ pub fn process_swaps(
 
     // Emit pool_state upserts for the latest block per pool
     for (pool_id, (block_number, acc)) in &latest_per_pool {
-        let price_close = acc.price_close.unwrap_or(0.0);
+        let price_close = acc.price_close.as_ref().unwrap().to_string();
 
         ops.push(upsert_pool_state(&PoolStateData {
             chain_id,
@@ -158,7 +164,7 @@ pub fn process_swaps(
             block_timestamp: acc.block_timestamp,
             tick: acc.last_tick,
             sqrt_price_x96: acc.last_sqrt_price_x96.to_string(),
-            price: format!("{:.18}", price_close),
+            price: price_close,
             active_liquidity: acc.last_liquidity.to_string(),
         }));
     }
@@ -182,4 +188,110 @@ pub fn process_liquidity_deltas(deltas: &[LiquidityInput], chain_id: u64) -> Vec
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
+
+    fn make_cache_with_pool(pool_id: Vec<u8>) -> PoolMetadataCache {
+        let cache = PoolMetadataCache::new();
+        cache.insert_if_absent(
+            pool_id.clone(),
+            PoolMetadata {
+                pool_id,
+                base_token: [0u8; 20],
+                quote_token: [1u8; 20],
+                is_token_0: true,
+                pool_type: "v3".to_string(),
+                base_decimals: 18,
+                quote_decimals: 18,
+            },
+        );
+        cache
+    }
+
+    fn q96() -> U256 {
+        // 2^96
+        U256::from_str_radix("79228162514264337593543950336", 10).unwrap()
+    }
+
+    #[test]
+    fn test_ghost_snapshot_zero_sqrt_price() {
+        let pool_id = vec![0u8; 20];
+        let cache = make_cache_with_pool(pool_id.clone());
+
+        let swaps = vec![SwapInput {
+            pool_id: pool_id.clone(),
+            block_number: 100,
+            block_timestamp: 1000,
+            log_index: 0,
+            amount0: I256::try_from(100i64).unwrap(),
+            amount1: I256::try_from(-100i64).unwrap(),
+            sqrt_price_x96: U256::ZERO, // invalid — zero sqrtPrice
+            tick: 0,
+            liquidity: U256::from(1000u64),
+        }];
+
+        let ops = process_swaps(&swaps, &cache, 8453);
+        assert!(ops.is_empty(), "zero sqrtPrice should produce no ops");
+    }
+
+    #[test]
+    fn test_all_invalid_prices_produce_no_snapshot() {
+        let pool_id = vec![0u8; 20];
+        let cache = make_cache_with_pool(pool_id.clone());
+
+        // Two swaps, both with zero sqrtPrice
+        let swaps = vec![
+            SwapInput {
+                pool_id: pool_id.clone(),
+                block_number: 100,
+                block_timestamp: 1000,
+                log_index: 0,
+                amount0: I256::try_from(50i64).unwrap(),
+                amount1: I256::try_from(-50i64).unwrap(),
+                sqrt_price_x96: U256::ZERO,
+                tick: 0,
+                liquidity: U256::from(1000u64),
+            },
+            SwapInput {
+                pool_id: pool_id.clone(),
+                block_number: 100,
+                block_timestamp: 1000,
+                log_index: 1,
+                amount0: I256::try_from(50i64).unwrap(),
+                amount1: I256::try_from(-50i64).unwrap(),
+                sqrt_price_x96: U256::ZERO,
+                tick: 0,
+                liquidity: U256::from(1000u64),
+            },
+        ];
+
+        let ops = process_swaps(&swaps, &cache, 8453);
+        assert!(ops.is_empty(), "all-invalid swaps should produce no ops");
+    }
+
+    #[test]
+    fn test_valid_swap_produces_snapshot_and_state() {
+        let pool_id = vec![0u8; 20];
+        let cache = make_cache_with_pool(pool_id.clone());
+
+        let swaps = vec![SwapInput {
+            pool_id: pool_id.clone(),
+            block_number: 100,
+            block_timestamp: 1000,
+            log_index: 0,
+            amount0: I256::try_from(100i64).unwrap(),
+            amount1: I256::try_from(-100i64).unwrap(),
+            sqrt_price_x96: q96(), // tick 0, price = 1
+            tick: 0,
+            liquidity: U256::from(1000u64),
+        }];
+
+        let ops = process_swaps(&swaps, &cache, 8453);
+        // Expect one pool_snapshots upsert + one pool_state upsert
+        assert_eq!(ops.len(), 2, "valid swap should emit snapshot + state");
+    }
 }
