@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,8 +13,6 @@ use alloy::rpc::types::Log;
 use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
@@ -1280,16 +1277,7 @@ fn write_parquet(
     output_path: &Path,
 ) -> Result<(), ReceiptCollectionError> {
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 

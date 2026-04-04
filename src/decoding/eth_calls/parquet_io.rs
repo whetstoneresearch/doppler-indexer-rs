@@ -13,8 +13,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 use super::types::{
     CallDecodeConfig, DecodedCallRecord, DecodedEventCallRecord, DecodedOnceRecord,
@@ -125,16 +123,7 @@ pub(super) fn write_decoded_calls_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -221,16 +210,7 @@ pub(super) fn write_decoded_event_calls_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -978,16 +958,7 @@ pub(super) fn merge_decoded_once_calls(
 
     // Write merged parquet
     let batch = RecordBatch::try_new(new_schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, new_schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -1074,16 +1045,7 @@ pub(super) fn write_decoded_once_calls_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 

@@ -1,7 +1,6 @@
 //! Event-triggered eth_call configuration, processing, and parquet output.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,8 +13,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 use super::config::compute_function_selector;
 use super::types::{
@@ -1357,16 +1354,7 @@ pub(crate) fn write_event_call_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 

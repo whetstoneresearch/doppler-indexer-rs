@@ -10,8 +10,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 use super::types::{CallResult, EthCallCollectionError, OnceCallResult};
 use crate::storage::paths::scan_nested_parquet_files_2;
@@ -79,16 +77,7 @@ pub(crate) fn write_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -609,16 +598,7 @@ pub(crate) fn write_once_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -630,13 +610,7 @@ pub(crate) fn write_record_batch_to_parquet(
     batch: &RecordBatch,
     output_path: &Path,
 ) -> Result<(), EthCallCollectionError> {
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
-    writer.write(batch)?;
-    writer.close()?;
+    crate::storage::atomic_write_parquet(batch, output_path)?;
     Ok(())
 }
 
