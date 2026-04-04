@@ -32,6 +32,7 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
         table: "tokens".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
         update_columns: vec![],
+        update_condition: None,
         columns: vec![
             "chain_id".to_string(),
             "tx_hash".to_string(),

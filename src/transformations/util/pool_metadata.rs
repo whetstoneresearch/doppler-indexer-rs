@@ -2,11 +2,17 @@
 //!
 //! Loads pool metadata from the `pools` table on handler initialization and
 //! provides fast lookups by pool_id during event processing.
+//!
+//! Queries join against `active_versions` to select only the currently active
+//! source_version for each handler source, so a create-handler version bump
+//! does not cause the cache to load stale rows from the previous version.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use alloy_primitives::Address;
+use deadpool_postgres::Pool;
 
 use crate::db::DbPool;
 use crate::transformations::error::TransformationError;
@@ -27,6 +33,7 @@ pub struct PoolMetadata {
 /// Thread-safe cache of pool metadata keyed by pool_id bytes.
 pub struct PoolMetadataCache {
     inner: RwLock<HashMap<Vec<u8>, PoolMetadata>>,
+    loaded: AtomicBool,
 }
 
 impl PoolMetadataCache {
@@ -34,14 +41,17 @@ impl PoolMetadataCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            loaded: AtomicBool::new(false),
         }
     }
 
     /// Load all pool metadata from the `pools` table for a given chain.
+    ///
+    /// Quote token decimals default to 18. Call `resolve_quote_decimals()`
+    /// with the contracts config to set correct values.
     pub async fn load_from_db(
         db_pool: &DbPool,
         chain_id: u64,
-        contracts: &Contracts,
     ) -> Result<Self, TransformationError> {
         let client = db_pool
             .inner()
@@ -51,8 +61,11 @@ impl PoolMetadataCache {
 
         let rows = client
             .query(
-                "SELECT address, base_token, quote_token, is_token_0, type \
-                 FROM pools WHERE chain_id = $1",
+                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type \
+                 FROM pools p \
+                 JOIN active_versions av \
+                   ON p.source = av.source AND p.source_version = av.active_version \
+                 WHERE p.chain_id = $1",
                 &[&(chain_id as i64)],
             )
             .await
@@ -76,8 +89,8 @@ impl PoolMetadataCache {
             base_token.copy_from_slice(&base_token_bytes);
             quote_token.copy_from_slice(&quote_token_bytes);
 
-            let base_decimals = 18; // all launched tokens are 18 decimals
-            let quote_decimals = quote_token_decimals(&quote_token, contracts).unwrap_or(18);
+            let base_decimals = 18u8; // all launched tokens are 18 decimals
+            let quote_decimals = 18u8; // resolved later via resolve_quote_decimals()
 
             map.insert(
                 pool_id.clone(),
@@ -101,7 +114,49 @@ impl PoolMetadataCache {
 
         Ok(Self {
             inner: RwLock::new(map),
+            loaded: AtomicBool::new(true),
         })
+    }
+
+    /// Load metadata from DB into an existing (shared) cache instance.
+    /// Uses atomic compare-exchange to ensure exactly one concurrent caller loads.
+    pub async fn load_into(
+        &self,
+        db_pool: &DbPool,
+        chain_id: u64,
+    ) -> Result<(), TransformationError> {
+        if self
+            .loaded
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let result = Self::load_from_db(db_pool, chain_id).await;
+        match result {
+            Ok(loaded_cache) => {
+                let entries = loaded_cache.inner.into_inner().unwrap();
+                let mut inner = self.inner.write().unwrap();
+                inner.extend(entries);
+                Ok(())
+            }
+            Err(e) => {
+                // Reset flag so a subsequent call can retry
+                self.loaded.store(false, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// Update quote token decimals for all cached entries using contracts config.
+    /// Called on first handle() when the TransformationContext is available.
+    pub fn resolve_quote_decimals(&self, contracts: &Contracts) {
+        let mut inner = self.inner.write().unwrap();
+        for meta in inner.values_mut() {
+            if let Some(decimals) = quote_token_decimals(&meta.quote_token, contracts) {
+                meta.quote_decimals = decimals;
+            }
+        }
     }
 
     /// Look up metadata by pool_id.
@@ -109,19 +164,97 @@ impl PoolMetadataCache {
         self.inner.read().unwrap().get(pool_id).cloned()
     }
 
-    /// Insert or update metadata for a pool.
-    pub fn insert(&self, pool_id: Vec<u8>, meta: PoolMetadata) {
-        self.inner.write().unwrap().insert(pool_id, meta);
+    /// Insert metadata for a pool if not already cached.
+    /// Used by Create handlers to populate the cache in-memory before their
+    /// DB transaction commits, so Swap handlers in the same range/block can
+    /// find newly created pools without a DB round-trip.
+    pub fn insert_if_absent(&self, pool_id: Vec<u8>, meta: PoolMetadata) {
+        let mut inner = self.inner.write().unwrap();
+        inner.entry(pool_id).or_insert(meta);
     }
 
-    /// Number of cached entries.
-    pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
-    }
+    /// Re-query the `pools` table and insert any pools not already cached.
+    ///
+    /// Also resolves `quote_decimals` for all newly inserted entries while
+    /// still holding the write lock, eliminating the two-lock race that
+    /// existed when `resolve_quote_decimals` was called separately.
+    ///
+    /// Returns the number of newly discovered pools.
+    pub async fn refresh(
+        &self,
+        pool: &Pool,
+        chain_id: u64,
+        contracts: &crate::types::config::contract::Contracts,
+    ) -> Result<usize, TransformationError> {
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
-    /// Whether the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        let rows = client
+            .query(
+                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type \
+                 FROM pools p \
+                 JOIN active_versions av \
+                   ON p.source = av.source AND p.source_version = av.active_version \
+                 WHERE p.chain_id = $1",
+                &[&(chain_id as i64)],
+            )
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
+
+        let mut inner = self.inner.write().unwrap();
+        let mut new_count = 0;
+
+        for row in &rows {
+            let pool_id: Vec<u8> = row.get("address");
+            if inner.contains_key(&pool_id) {
+                continue;
+            }
+
+            let base_token_bytes: Vec<u8> = row.get("base_token");
+            let quote_token_bytes: Vec<u8> = row.get("quote_token");
+            let is_token_0: bool = row.get("is_token_0");
+            let pool_type: String = row.get("type");
+
+            if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
+                continue;
+            }
+
+            let mut base_token = [0u8; 20];
+            let mut quote_token = [0u8; 20];
+            base_token.copy_from_slice(&base_token_bytes);
+            quote_token.copy_from_slice(&quote_token_bytes);
+
+            inner.insert(
+                pool_id.clone(),
+                PoolMetadata {
+                    pool_id,
+                    base_token,
+                    quote_token,
+                    is_token_0,
+                    pool_type,
+                    base_decimals: 18,
+                    quote_decimals: 18,
+                },
+            );
+            new_count += 1;
+        }
+
+        // Resolve quote_decimals for entries that still carry the placeholder value (18).
+        // This runs under the same write lock as the insert loop, so there is no window
+        // in which another thread can read a partially-initialised entry.
+        // All known non-WETH quote tokens (USDC, USDT, EURC) have decimals != 18, so
+        // resolving every entry with quote_decimals == 18 is safe and idempotent.
+        for meta in inner.values_mut() {
+            if meta.quote_decimals == 18 {
+                if let Some(decimals) = quote_token_decimals(&meta.quote_token, contracts) {
+                    meta.quote_decimals = decimals;
+                }
+            }
+        }
+
+        Ok(new_count)
     }
 }
 

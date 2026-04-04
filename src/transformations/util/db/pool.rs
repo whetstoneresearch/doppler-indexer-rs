@@ -61,6 +61,7 @@ pub fn insert_pool(data: &PoolData, ctx: &TransformationContext) -> DbOperation 
         table: "pools".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
         update_columns: vec![],
+        update_condition: None,
         columns: vec![
             "chain_id".to_string(),
             "block_number".to_string(),

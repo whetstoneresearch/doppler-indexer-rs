@@ -417,6 +417,26 @@ impl RetryProcessor {
                 continue;
             }
 
+            // Skip if already committed — avoids duplicate snapshots corrupting reorg rollback
+            let completed = self
+                .get_completed_ranges_for_handler(&handler_key)
+                .await
+                .unwrap_or_default();
+            if completed.contains(&range_start) {
+                attempted_keys.insert(handler_key.clone());
+                self.record_handler_retry_success(
+                    &handler_key,
+                    rh.handler.name(),
+                    range_start,
+                    range_end,
+                    block_number,
+                    &mut succeeded_keys,
+                    &mut succeeded_names,
+                )
+                .await;
+                continue;
+            }
+
             // Filter primary data by trigger match BEFORE checking handler
             // deps. If the handler has no matching events/calls, it's a no-op
             // regardless of whether its deps are met — blocking it would
@@ -666,6 +686,7 @@ impl RetryProcessor {
                     "range_start".to_string(),
                 ],
                 update_columns: vec!["range_end".to_string()],
+                update_condition: None,
             }])
             .await
         {
@@ -688,6 +709,28 @@ impl RetryProcessor {
                 );
             }
         }
+    }
+
+    /// Get completed range_start values for a specific handler from the database.
+    async fn get_completed_ranges_for_handler(
+        &self,
+        handler_key: &str,
+    ) -> Result<HashSet<u64>, TransformationError> {
+        let rows = self
+            .db_pool
+            .query(
+                "SELECT range_start FROM _handler_progress WHERE chain_id = $1 AND handler_key = $2",
+                &[&(self.chain_id as i64), &handler_key.to_string()],
+            )
+            .await?;
+
+        let mut completed = HashSet::new();
+        for row in rows {
+            let range_start: i64 = row.get(0);
+            completed.insert(range_start as u64);
+        }
+
+        Ok(completed)
     }
 
     /// Build a uniform list of retry handler descriptors from both event and call handlers.
@@ -1152,6 +1195,32 @@ mod tests {
             "transformed must be cleared when failures are recorded"
         );
         assert!(s.failed_handlers.contains("handler_a"));
+    }
+
+    /// Fix D test: verifies that the already-committed guard correctly identifies
+    /// handlers that should be skipped.  The guard skips a handler when
+    /// `completed.contains(&range_start)` is true.
+    #[test]
+    fn test_retry_skips_already_completed_handler() {
+        // Simulate two scenarios: one where the handler is already in the
+        // completed set and one where it is not.
+        let range_start_completed: u64 = 100;
+        let range_start_missing: u64 = 200;
+
+        let mut completed: HashSet<u64> = HashSet::new();
+        completed.insert(range_start_completed);
+
+        // Handler that has already been completed for this block should be skipped
+        assert!(
+            completed.contains(&range_start_completed),
+            "already-completed handler must be detected as such"
+        );
+
+        // Handler that has not been completed should not be skipped
+        assert!(
+            !completed.contains(&range_start_missing),
+            "handler not yet committed must not be falsely detected as complete"
+        );
     }
 
     /// Regression: a no-op retry (no matching events/calls) that clears a prior

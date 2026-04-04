@@ -17,3 +17,4 @@ CREATE TABLE IF NOT EXISTS pool_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_time ON pool_snapshots (pool_id, block_timestamp);
+CREATE INDEX IF NOT EXISTS idx_snapshots_reorg ON pool_snapshots (chain_id, block_number);

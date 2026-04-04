@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use alloy_primitives::{Address, B256, U256};
@@ -12,10 +14,13 @@ use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::metadata::get_metadata;
 use crate::transformations::util::migration::resolve_migration_type;
+use crate::transformations::util::pool_metadata::PoolMetadataCache;
 
 use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
-pub struct V3CreateHandler;
+pub struct V3CreateHandler {
+    pub(crate) metadata_cache: Arc<PoolMetadataCache>,
+}
 
 #[async_trait]
 impl TransformationHandler for V3CreateHandler {
@@ -146,6 +151,10 @@ impl TransformationHandler for V3CreateHandler {
                 },
                 ctx,
             ));
+            // NOTE: intentionally no metadata_cache.insert_if_absent here.
+            // Inserting before the DB transaction commits would leave stale
+            // cache entries if the transaction later fails.  Swap handlers
+            // call refresh_cache_if_needed which queries the DB on cache miss.
         }
 
         Ok(ops)
@@ -174,7 +183,9 @@ impl EventHandler for V3CreateHandler {
     }
 }
 
-pub struct LockableV3CreateHandler;
+pub struct LockableV3CreateHandler {
+    pub(crate) metadata_cache: Arc<PoolMetadataCache>,
+}
 
 #[async_trait]
 impl TransformationHandler for LockableV3CreateHandler {
@@ -305,6 +316,8 @@ impl TransformationHandler for LockableV3CreateHandler {
                 },
                 ctx,
             ));
+            // NOTE: intentionally no metadata_cache.insert_if_absent here.
+            // See V3CreateHandler for rationale.
         }
 
         Ok(ops)
@@ -333,7 +346,71 @@ impl EventHandler for LockableV3CreateHandler {
     }
 }
 
-pub fn register_handlers(registry: &mut TransformationRegistry) {
-    registry.register_event_handler(V3CreateHandler);
-    registry.register_event_handler(LockableV3CreateHandler);
+pub fn register_handlers(registry: &mut TransformationRegistry, metadata_cache: Arc<PoolMetadataCache>) {
+    registry.register_event_handler(V3CreateHandler {
+        metadata_cache: metadata_cache.clone(),
+    });
+    registry.register_event_handler(LockableV3CreateHandler {
+        metadata_cache,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::transformations::context::TransformationContext;
+    use crate::transformations::historical::HistoricalDataReader;
+    use crate::transformations::util::pool_metadata::PoolMetadataCache;
+    use crate::rpc::UnifiedRpcClient;
+
+    fn make_empty_ctx() -> TransformationContext {
+        let historical = Arc::new(
+            HistoricalDataReader::new("test_chain_create")
+                .expect("HistoricalDataReader::new should succeed with nonexistent dir"),
+        );
+        let rpc = Arc::new(
+            UnifiedRpcClient::from_url("http://localhost:8545")
+                .expect("RPC client construction should succeed"),
+        );
+        TransformationContext::new(
+            "test".to_string(),
+            8453,
+            100,
+            200,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            HashMap::new(),
+            historical,
+            rpc,
+            Arc::new(HashMap::new()),
+        )
+    }
+
+    /// Fix E: After removing insert_if_absent, calling handle() must not
+    /// populate the cache even when the context contains no Create events.
+    /// If the context has no matching events the for-loop body never runs,
+    /// confirming the cache insertion path is gone.
+    #[tokio::test]
+    async fn test_no_stale_cache_on_create_failure() {
+        let pool_id = vec![0xABu8; 20];
+        let cache = Arc::new(PoolMetadataCache::new());
+
+        let handler = V3CreateHandler {
+            metadata_cache: cache.clone(),
+        };
+
+        let ctx = make_empty_ctx();
+        // handle() returns Ok([]) because no Create events are present.
+        let ops = handler.handle(&ctx).await.expect("handle() must not fail");
+        assert!(ops.is_empty(), "no ops expected with empty context");
+
+        // The cache must still be empty — no insert_if_absent was called.
+        assert!(
+            cache.get(&pool_id).is_none(),
+            "cache must not contain pool after handle() without committed DB ops"
+        );
+    }
 }

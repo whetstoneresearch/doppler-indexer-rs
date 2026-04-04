@@ -293,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_db_pool: Option<Arc<DbPool>> = if !decode_only {
         if let Some(ref tc) = config.transformations {
-            let registry = transformations::build_registry();
+            let registry = transformations::build_registry(0);
             if !registry.is_empty() {
                 let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
                     format!(

@@ -1487,10 +1487,31 @@ impl TransformationEngine {
         let submitted_keys: HashSet<String> =
             tasks.iter().map(|t| t.handler.handler_key()).collect();
 
-        let outcomes = self
+        let (snapshot_tasks, direct_tasks): (Vec<_>, Vec<_>) = tasks
+            .into_iter()
+            .partition(|t| !self.registry.is_multi_trigger(&t.handler.handler_key()));
+
+        let mut outcomes = self
             .executor
-            .execute_handlers(tasks, msg.range_start, msg.range_end, &DbExecMode::Direct)
+            .execute_handlers(
+                snapshot_tasks,
+                msg.range_start,
+                msg.range_end,
+                &DbExecMode::WithSnapshotCapture {
+                    chain_name: self.chain_name.clone(),
+                },
+            )
             .await;
+        outcomes.extend(
+            self.executor
+                .execute_handlers(
+                    direct_tasks,
+                    msg.range_start,
+                    msg.range_end,
+                    &DbExecMode::Direct,
+                )
+                .await,
+        );
 
         let succeeded_keys: HashSet<String> =
             outcomes.iter().map(|o| o.handler_key.clone()).collect();
@@ -1908,10 +1929,31 @@ impl TransformationEngine {
                 *submitted_counts.entry(t.handler.handler_key()).or_default() += 1;
             }
 
-            let outcomes = self
+            let (snapshot_tasks, direct_tasks): (Vec<_>, Vec<_>) = tasks
+                .into_iter()
+                .partition(|t| !self.registry.is_multi_trigger(&t.handler.handler_key()));
+
+            let mut outcomes = self
                 .executor
-                .execute_handlers(tasks, range_key.0, range_key.1, &DbExecMode::Direct)
+                .execute_handlers(
+                    snapshot_tasks,
+                    range_key.0,
+                    range_key.1,
+                    &DbExecMode::WithSnapshotCapture {
+                        chain_name: self.chain_name.clone(),
+                    },
+                )
                 .await;
+            outcomes.extend(
+                self.executor
+                    .execute_handlers(
+                        direct_tasks,
+                        range_key.0,
+                        range_key.1,
+                        &DbExecMode::Direct,
+                    )
+                    .await,
+            );
 
             let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
             for o in &outcomes {
@@ -2143,6 +2185,9 @@ impl TransformationEngine {
     }
 
     /// Build handler tasks for all event and call triggers in a block range.
+    ///
+    /// Deduplicates by handler_key so that multi-trigger handlers produce
+    /// exactly one task even when multiple triggers match the same block.
     fn build_handler_tasks(
         &self,
         event_triggers: &[(String, String)],
@@ -2152,9 +2197,13 @@ impl TransformationEngine {
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
     ) -> Vec<HandlerTask> {
         let mut tasks = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
 
         for (source, event_name) in event_triggers {
             for handler in self.registry.handlers_for_event(source, event_name) {
+                if !seen_keys.insert(handler.handler_key()) {
+                    continue;
+                }
                 let handler: Arc<dyn super::traits::TransformationHandler> = handler;
                 tasks.push(HandlerTask {
                     handler,
@@ -2167,6 +2216,9 @@ impl TransformationEngine {
 
         for (source, function_name) in call_triggers {
             for handler in self.registry.handlers_for_call(source, function_name) {
+                if !seen_keys.insert(handler.handler_key()) {
+                    continue;
+                }
                 let handler: Arc<dyn super::traits::TransformationHandler> = handler;
                 tasks.push(HandlerTask {
                     handler,

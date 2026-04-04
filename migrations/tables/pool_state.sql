@@ -17,3 +17,4 @@ CREATE TABLE IF NOT EXISTS pool_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pool_state_price ON pool_state (price DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_pool_state_reorg ON pool_state (chain_id, block_number);

@@ -4,7 +4,7 @@
 //! detecting finalization readiness, executing finalization, and cleaning up
 //! after reorgs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -79,6 +79,7 @@ impl RangeFinalizer {
                     "range_start".to_string(),
                 ],
                 update_columns: vec!["range_end".to_string()],
+                update_condition: None,
             }])
             .await?;
 
@@ -355,14 +356,18 @@ impl RangeFinalizer {
 
         let storage = LiveStorage::new(&self.chain_name);
         let mut restore_ops = Vec::new();
-        let mut tables_with_snapshots: HashSet<String> = HashSet::new();
+        // Maps table_name -> set of block numbers for which we have snapshots.
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
 
         // Phase 2a: Read snapshots and generate restore operations
         for &block_number in orphaned {
             match storage.read_snapshots(block_number) {
                 Ok(snapshots) => {
                     for snapshot in snapshots {
-                        tables_with_snapshots.insert(snapshot.table.clone());
+                        tables_covered
+                            .entry(snapshot.table.clone())
+                            .or_default()
+                            .insert(block_number);
 
                         match snapshot.previous_row {
                             Some(previous) => {
@@ -388,6 +393,7 @@ impl RangeFinalizer {
                                     values,
                                     conflict_columns: conflict_cols,
                                     update_columns: update_cols,
+                                    update_condition: None,
                                 });
                             }
                             None => {
@@ -429,30 +435,30 @@ impl RangeFinalizer {
             self.db_pool.execute_transaction(restore_ops).await?;
         }
 
-        // Phase 2b: Delete remaining rows without snapshots
-        let block_list = orphaned
-            .iter()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut fallback_ops = Vec::new();
-        for table in &tables_to_clean {
-            if tables_with_snapshots.contains(*table) {
-                continue;
-            }
-
-            fallback_ops.push(DbOperation::Delete {
-                table: table.to_string(),
-                where_clause: WhereClause::Raw {
-                    condition: format!(
-                        "chain_id = {} AND block_number IN ({})",
-                        self.chain_id, block_list
-                    ),
-                    params: vec![],
-                },
-            });
-        }
+        // Phase 2b: Delete remaining rows without snapshots.
+        // Only delete the specific blocks not covered by a snapshot for each table.
+        let fallback_entries =
+            compute_fallback_deletes(&tables_to_clean, &tables_covered, orphaned);
+        let fallback_ops: Vec<DbOperation> = fallback_entries
+            .into_iter()
+            .map(|(table, uncovered)| {
+                let block_list = uncovered
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                DbOperation::Delete {
+                    table,
+                    where_clause: WhereClause::Raw {
+                        condition: format!(
+                            "chain_id = {} AND block_number IN ({})",
+                            self.chain_id, block_list
+                        ),
+                        params: vec![],
+                    },
+                }
+            })
+            .collect();
 
         if !fallback_ops.is_empty() {
             tracing::info!(
@@ -507,6 +513,99 @@ impl RangeFinalizer {
         self.db_pool.execute_transaction(ops).await?;
 
         Ok(())
+    }
+}
+
+/// Compute per-table fallback delete block lists.
+///
+/// For each table in `tables_to_clean`, returns `(table_name, uncovered_blocks)`
+/// where `uncovered_blocks` is the subset of `orphaned` that have no snapshot
+/// coverage for that table.  Tables where all orphaned blocks are covered are
+/// omitted entirely.
+pub(crate) fn compute_fallback_deletes<'a>(
+    tables_to_clean: &HashSet<&'a str>,
+    tables_covered: &HashMap<String, HashSet<u64>>,
+    orphaned: &[u64],
+) -> Vec<(String, Vec<u64>)> {
+    let mut result = Vec::new();
+    for &table in tables_to_clean {
+        let covered = tables_covered.get(table);
+        let uncovered: Vec<u64> = orphaned
+            .iter()
+            .copied()
+            .filter(|b| !covered.map(|s| s.contains(b)).unwrap_or(false))
+            .collect();
+        if !uncovered.is_empty() {
+            result.push((table.to_string(), uncovered));
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix C test: when block 100 has a snapshot but block 101 does not,
+    /// the fallback DELETE should target only block 101.
+    #[test]
+    fn test_per_block_fallback_delete_coverage() {
+        let mut tables_to_clean: HashSet<&str> = HashSet::new();
+        tables_to_clean.insert("v3_pool_metrics_v1");
+
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+        // Block 100 has a snapshot for "v3_pool_metrics_v1"
+        tables_covered
+            .entry("v3_pool_metrics_v1".to_string())
+            .or_default()
+            .insert(100);
+        // Block 101 has NO snapshot
+
+        let orphaned = vec![100u64, 101u64];
+
+        let fallbacks = compute_fallback_deletes(&tables_to_clean, &tables_covered, &orphaned);
+
+        assert_eq!(fallbacks.len(), 1);
+        let (table, blocks) = &fallbacks[0];
+        assert_eq!(table, "v3_pool_metrics_v1");
+        // Only block 101 should be in the fallback delete list
+        assert_eq!(*blocks, vec![101u64]);
+    }
+
+    /// When all orphaned blocks have snapshots, no fallback deletes are needed.
+    #[test]
+    fn test_no_fallback_delete_when_all_blocks_covered() {
+        let mut tables_to_clean: HashSet<&str> = HashSet::new();
+        tables_to_clean.insert("v3_pool_metrics_v1");
+
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+        let mut covered_set = HashSet::new();
+        covered_set.insert(100u64);
+        covered_set.insert(101u64);
+        tables_covered.insert("v3_pool_metrics_v1".to_string(), covered_set);
+
+        let orphaned = vec![100u64, 101u64];
+
+        let fallbacks = compute_fallback_deletes(&tables_to_clean, &tables_covered, &orphaned);
+
+        assert!(fallbacks.is_empty());
+    }
+
+    /// When a table has no coverage at all, all orphaned blocks need deletes.
+    #[test]
+    fn test_all_blocks_need_fallback_when_no_coverage() {
+        let mut tables_to_clean: HashSet<&str> = HashSet::new();
+        tables_to_clean.insert("v3_pool_metrics_v1");
+
+        let tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+
+        let orphaned = vec![100u64, 101u64, 102u64];
+
+        let fallbacks = compute_fallback_deletes(&tables_to_clean, &tables_covered, &orphaned);
+
+        assert_eq!(fallbacks.len(), 1);
+        let (_, blocks) = &fallbacks[0];
+        assert_eq!(*blocks, vec![100u64, 101u64, 102u64]);
     }
 }
 
