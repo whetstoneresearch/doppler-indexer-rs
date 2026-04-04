@@ -850,11 +850,16 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    use alloy::primitives::{Address, U256};
     use crate::raw_data::historical::eth_calls::parquet_io::{
         extract_addresses_from_once_parquet, read_existing_once_parquet,
         read_parquet_column_names,
     };
     use crate::rpc::UnifiedRpcClient;
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+        FactoryEventConfigOrArray, FactoryParameterLocation,
+    };
 
     #[tokio::test]
     async fn test_factory_once_catchup_zero_address_range_still_processes() {
@@ -875,7 +880,27 @@ mod tests {
         );
 
         let column_indexes = HashMap::new();
-        let contracts = HashMap::new(); // empty contracts = no expected_contracts entries
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "TestFactory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::new([0xaa; 20])),
+                start_block: Some(U256::from(0)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "Created(address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![0]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
 
         let existing_files = HashSet::new();
         let ctx = EthCallContext {
@@ -929,6 +954,14 @@ mod tests {
                 .join("test_collection/once/column_index.json")
                 .exists(),
             "column_index.json must be written"
+        );
+
+        // Verify contract index was written (requires non-empty contracts config)
+        assert!(
+            tmp.path()
+                .join("test_collection/once/contract_index.json")
+                .exists(),
+            "contract_index.json must be written when expected_contracts is non-empty"
         );
     }
 }
