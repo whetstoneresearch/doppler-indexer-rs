@@ -76,14 +76,15 @@ impl DbPool {
 
     /// Execute a transaction with pre-queries that run inside the same transaction context.
     /// Snapshot queries see committed state before any modifications in this transaction.
-    /// Returns the pre-query results after the transaction commits.
+    /// Returns a tuple of (snapshot_results, affected_rows) after the transaction commits.
+    /// `affected_rows[i]` is the number of rows touched by `operations[i]`.
     pub async fn execute_transaction_with_snapshot_reads(
         &self,
         snapshot_specs: &[(String, Vec<(String, DbValue)>)],
         operations: Vec<DbOperation>,
-    ) -> Result<Vec<Option<Vec<(String, DbValue)>>>, DbError> {
+    ) -> Result<(Vec<Option<Vec<(String, DbValue)>>>, Vec<u64>), DbError> {
         if operations.is_empty() && snapshot_specs.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut client = self.pool.get().await?;
@@ -96,21 +97,25 @@ impl DbPool {
             snapshot_results.push(result);
         }
 
-        // Execute all operations
+        // Execute all operations and collect affected row counts
+        let mut affected_rows = Vec::with_capacity(operations.len());
         for op in operations {
             let (sql, params) = build_operation_sql(op);
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
-            if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
-                let db_err: DbError = e.into();
-                tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
-                return Err(db_err);
+            match transaction.execute(&sql, &params_refs[..]).await {
+                Ok(n) => affected_rows.push(n),
+                Err(e) => {
+                    let db_err: DbError = e.into();
+                    tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                    return Err(db_err);
+                }
             }
         }
 
         transaction.commit().await?;
-        Ok(snapshot_results)
+        Ok((snapshot_results, affected_rows))
     }
 
     pub async fn run_migrations(&self) -> Result<(), DbError> {

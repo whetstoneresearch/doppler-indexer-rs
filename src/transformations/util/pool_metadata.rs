@@ -174,11 +174,17 @@ impl PoolMetadataCache {
     }
 
     /// Re-query the `pools` table and insert any pools not already cached.
+    ///
+    /// Also resolves `quote_decimals` for all newly inserted entries while
+    /// still holding the write lock, eliminating the two-lock race that
+    /// existed when `resolve_quote_decimals` was called separately.
+    ///
     /// Returns the number of newly discovered pools.
     pub async fn refresh(
         &self,
         pool: &Pool,
         chain_id: u64,
+        contracts: &crate::types::config::contract::Contracts,
     ) -> Result<usize, TransformationError> {
         let client = pool
             .get()
@@ -233,6 +239,19 @@ impl PoolMetadataCache {
                 },
             );
             new_count += 1;
+        }
+
+        // Resolve quote_decimals for entries that still carry the placeholder value (18).
+        // This runs under the same write lock as the insert loop, so there is no window
+        // in which another thread can read a partially-initialised entry.
+        // All known non-WETH quote tokens (USDC, USDT, EURC) have decimals != 18, so
+        // resolving every entry with quote_decimals == 18 is safe and idempotent.
+        for meta in inner.values_mut() {
+            if meta.quote_decimals == 18 {
+                if let Some(decimals) = quote_token_decimals(&meta.quote_token, contracts) {
+                    meta.quote_decimals = decimals;
+                }
+            }
         }
 
         Ok(new_count)

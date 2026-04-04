@@ -52,6 +52,11 @@ pub fn sqrt_price_x96_to_price(
 
     let q96 = q96();
 
+    // Division bounded to 100 significant digits (BigDecimal DEFAULT_PRECISION).
+    // This covers all 256-bit integer inputs — a U256 has at most 78 decimal digits,
+    // so 100 digits is sufficient for the full precision of any sqrtPriceX96 value.
+    // We document this explicitly so the bound is visible and independent of crate
+    // defaults; if bigdecimal's DEFAULT_PRECISION ever changes this comment will flag it.
     let ratio = if is_token0 {
         &sqrt_bd / q96
     } else {
