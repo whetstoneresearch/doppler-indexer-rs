@@ -10,8 +10,7 @@
 //! capture issues with multi-trigger handlers.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, OnceLock};
 
 use alloy_primitives::I256;
 use async_trait::async_trait;
@@ -100,13 +99,17 @@ fn extract_v3_liquidity(
 }
 
 /// Refresh the metadata cache from DB if any pool IDs in the batch are missing.
+///
+/// Returns `Err` if the DB refresh fails, or if any of the originally-missing
+/// pool IDs are still absent after the refresh (indicating the pool was not yet
+/// committed to the DB by a prior handler, which is a programming error).
 async fn refresh_cache_if_needed(
     pool_ids: impl Iterator<Item = &Vec<u8>>,
     cache: &PoolMetadataCache,
     db_pool: &OnceLock<Pool>,
     chain_id: u64,
     contracts: &crate::types::config::contract::Contracts,
-) {
+) -> Result<(), TransformationError> {
     let missing: Vec<_> = {
         let unique: HashSet<&Vec<u8>> = pool_ids.collect();
         unique
@@ -115,16 +118,15 @@ async fn refresh_cache_if_needed(
             .collect()
     };
     if missing.is_empty() {
-        return;
+        return Ok(());
     }
 
     let Some(pool) = db_pool.get() else {
-        return;
+        return Ok(());
     };
 
-    match cache.refresh(pool, chain_id).await {
+    match cache.refresh(pool, chain_id, contracts).await {
         Ok(new_count) if new_count > 0 => {
-            cache.resolve_quote_decimals(contracts);
             tracing::info!(
                 "Metadata cache refreshed: {} new pool(s) discovered ({} were missing)",
                 new_count,
@@ -138,16 +140,34 @@ async fn refresh_cache_if_needed(
             );
         }
         Err(e) => {
-            tracing::warn!("Failed to refresh metadata cache: {}", e);
+            return Err(e);
         }
     }
+
+    // Verify all originally-missing pools were found after the refresh.
+    let still_missing: Vec<_> = missing
+        .iter()
+        .filter(|id| cache.get(id).is_none())
+        .collect();
+    if !still_missing.is_empty() {
+        tracing::warn!(
+            "{} pool(s) still missing after cache refresh — cannot compute metrics",
+            still_missing.len()
+        );
+        return Err(TransformationError::MissingData(format!(
+            "{} pool(s) still missing after metadata cache refresh",
+            still_missing.len()
+        )));
+    }
+
+    Ok(())
 }
 
 // --- V3SwapMetricsHandler ---
 
 pub struct V3SwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
-    decimals_resolved: AtomicBool,
+    decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
 }
@@ -177,10 +197,9 @@ impl TransformationHandler for V3SwapMetricsHandler {
         &self,
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
-        if !self.decimals_resolved.swap(true, Ordering::Relaxed) {
-            self.metadata_cache
-                .resolve_quote_decimals(&ctx.contracts);
-        }
+        self.decimals_init.call_once(|| {
+            self.metadata_cache.resolve_quote_decimals(&ctx.contracts);
+        });
 
         let swaps = extract_v3_swaps(ctx, "DopplerV3Pool")?;
 
@@ -191,7 +210,7 @@ impl TransformationHandler for V3SwapMetricsHandler {
             self.chain_id,
             &ctx.contracts,
         )
-        .await;
+        .await?;
 
         Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
     }
@@ -267,7 +286,7 @@ impl EventHandler for V3LiquidityMetricsHandler {
     }
 
     fn handler_dependencies(&self) -> Vec<&'static str> {
-        vec![]
+        vec!["V3CreateHandler"]
     }
 }
 
@@ -275,7 +294,7 @@ impl EventHandler for V3LiquidityMetricsHandler {
 
 pub struct LockableV3SwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
-    decimals_resolved: AtomicBool,
+    decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
 }
@@ -305,10 +324,9 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
         &self,
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
-        if !self.decimals_resolved.swap(true, Ordering::Relaxed) {
-            self.metadata_cache
-                .resolve_quote_decimals(&ctx.contracts);
-        }
+        self.decimals_init.call_once(|| {
+            self.metadata_cache.resolve_quote_decimals(&ctx.contracts);
+        });
 
         let swaps = extract_v3_swaps(ctx, "DopplerLockableV3Pool")?;
 
@@ -319,7 +337,7 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
             self.chain_id,
             &ctx.contracts,
         )
-        .await;
+        .await?;
 
         Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
     }
@@ -409,13 +427,13 @@ pub fn register_handlers(
     // Swap metrics: pool_state + pool_snapshots (single-trigger, captures snapshots)
     registry.register_event_handler(V3SwapMetricsHandler {
         metadata_cache: cache.clone(),
-        decimals_resolved: AtomicBool::new(false),
+        decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
     });
     registry.register_event_handler(LockableV3SwapMetricsHandler {
         metadata_cache: cache,
-        decimals_resolved: AtomicBool::new(false),
+        decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
     });
@@ -423,4 +441,130 @@ pub fn register_handlers(
     // Liquidity metrics: liquidity_deltas (insert-only, no snapshot concerns)
     registry.register_event_handler(V3LiquidityMetricsHandler { chain_id });
     registry.register_event_handler(LockableV3LiquidityMetricsHandler { chain_id });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Once, OnceLock};
+
+    use crate::transformations::context::TransformationContext;
+    use crate::transformations::historical::HistoricalDataReader;
+    use crate::transformations::traits::EventHandler;
+    use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
+    use crate::rpc::UnifiedRpcClient;
+
+    fn make_empty_ctx() -> TransformationContext {
+        let historical = Arc::new(
+            HistoricalDataReader::new("test_chain_metrics")
+                .expect("HistoricalDataReader::new should succeed"),
+        );
+        let rpc = Arc::new(
+            UnifiedRpcClient::from_url("http://localhost:8545")
+                .expect("RPC client construction should succeed"),
+        );
+        TransformationContext::new(
+            "test".to_string(),
+            8453,
+            100,
+            200,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            HashMap::new(),
+            historical,
+            rpc,
+            Arc::new(HashMap::new()),
+        )
+    }
+
+    /// Fix F: V3LiquidityMetricsHandler must declare V3CreateHandler as a dependency.
+    #[test]
+    fn test_v3_liquidity_handler_deps() {
+        let handler = V3LiquidityMetricsHandler { chain_id: 8453 };
+        let deps = handler.handler_dependencies();
+        assert_eq!(deps, vec!["V3CreateHandler"]);
+    }
+
+    /// Fix G: handle() returns Ok([]) when the context has no swap events, even
+    /// when the cache is empty and no DB pool is set (refresh short-circuits).
+    #[tokio::test]
+    async fn test_missing_metadata_causes_handler_failure() {
+        let cache = Arc::new(PoolMetadataCache::new());
+        let handler = V3SwapMetricsHandler {
+            metadata_cache: cache.clone(),
+            decimals_init: Once::new(),
+            chain_id: 8453,
+            db_pool: OnceLock::new(),
+        };
+
+        // No swap events in context -> no missing pool IDs -> refresh short-circuits.
+        let ctx = make_empty_ctx();
+        let result = handler.handle(&ctx).await;
+        assert!(
+            result.is_ok(),
+            "handle() with no swaps and no DB should return Ok([])"
+        );
+        assert!(result.unwrap().is_empty());
+    }
+
+    /// Fix H: Once::call_once ensures resolve_quote_decimals runs at most once
+    /// even when called concurrently, preventing the AtomicBool race.
+    #[tokio::test]
+    async fn test_concurrent_decimal_init() {
+        let pool_id = vec![0xCCu8; 20];
+        let cache = Arc::new(PoolMetadataCache::new());
+
+        // Insert a pool with placeholder decimals (zero address won't match any
+        // known contract so decimals stay 18 — tests idempotency not the value).
+        cache.insert_if_absent(
+            pool_id.clone(),
+            PoolMetadata {
+                pool_id: pool_id.clone(),
+                base_token: [0u8; 20],
+                quote_token: [0u8; 20],
+                is_token_0: true,
+                pool_type: "v3".to_string(),
+                base_decimals: 18,
+                quote_decimals: 18,
+            },
+        );
+
+        // Two tasks each with their own handler but sharing the cache.
+        // Once::call_once on a per-handler Once means each handler resolves once.
+        let cache1 = cache.clone();
+        let cache2 = cache.clone();
+
+        let t1 = tokio::spawn(async move {
+            let handler = V3SwapMetricsHandler {
+                metadata_cache: cache1,
+                decimals_init: Once::new(),
+                chain_id: 8453,
+                db_pool: OnceLock::new(),
+            };
+            let ctx = make_empty_ctx();
+            handler.handle(&ctx).await
+        });
+
+        let t2 = tokio::spawn(async move {
+            let handler = V3SwapMetricsHandler {
+                metadata_cache: cache2,
+                decimals_init: Once::new(),
+                chain_id: 8453,
+                db_pool: OnceLock::new(),
+            };
+            let ctx = make_empty_ctx();
+            handler.handle(&ctx).await
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        assert!(r1.unwrap().is_ok(), "task 1 should succeed");
+        assert!(r2.unwrap().is_ok(), "task 2 should succeed");
+
+        // Pool entry should be accessible after concurrent handle() calls.
+        assert!(
+            cache.get(&pool_id).is_some(),
+            "pool entry should still be in cache after concurrent handle() calls"
+        );
+    }
 }
