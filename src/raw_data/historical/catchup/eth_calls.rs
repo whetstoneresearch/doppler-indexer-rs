@@ -515,10 +515,6 @@ pub async fn collect_eth_calls(
                     }
                 }
 
-                if addresses_by_block.is_empty() {
-                    continue;
-                }
-
                 let factory_data = FactoryAddressData {
                     range_start: range.start,
                     range_end: range.end,

@@ -11,6 +11,7 @@ use crate::raw_data::historical::eth_calls::{
     EthCallCollectionError, EthCallContext,
 };
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::build_expected_factory_contracts_for_range;
 use crate::storage::StorageManager;
 use crate::types::config::chain::ChainConfig;
 
@@ -128,6 +129,8 @@ pub(super) async fn process_complete_range(
 
         if state.has_factory_once_calls {
             let empty_index = HashMap::new();
+            let expected_once =
+                build_expected_factory_contracts_for_range(&state.contracts, range.end);
             if let Some(multicall_addr) = state.multicall3_address {
                 process_factory_once_calls_multicall(
                     &range,
@@ -136,7 +139,7 @@ pub(super) async fn process_complete_range(
                     &state.factory_once_configs,
                     &empty_index,
                     multicall_addr,
-                    None,
+                    Some(&expected_once),
                 )
                 .await?;
             } else {
@@ -146,7 +149,7 @@ pub(super) async fn process_complete_range(
                     factory_data,
                     &state.factory_once_configs,
                     &empty_index,
-                    None,
+                    Some(&expected_once),
                 )
                 .await?;
             }
@@ -155,7 +158,8 @@ pub(super) async fn process_complete_range(
     }
 
     if state.range_regular_done.contains(&range_start)
-        && (!state.has_factory_calls || state.range_factory_done.contains(&range_start))
+        && ((!state.has_factory_calls && !state.has_factory_once_calls)
+            || state.range_factory_done.contains(&range_start))
     {
         state.range_data.remove(&range_start);
         state.range_factory_data.remove(&range_start);
@@ -253,40 +257,44 @@ pub(super) async fn process_incomplete_range(
         }
     }
 
-    if state.has_factory_calls {
+    if state.has_factory_calls || state.has_factory_once_calls {
         if let Some(factory_data) = state.range_factory_data.get(&range_start) {
             if !state.range_factory_done.contains(&range_start) {
-                if let Some(multicall_addr) = state.multicall3_address {
-                    process_factory_range_multicall(
-                        &range,
-                        &blocks,
-                        &ctx,
-                        factory_data,
-                        &state.factory_call_configs,
-                        state.factory_max_params,
-                        &mut state.frequency_state,
-                        multicall_addr,
-                        None,
-                        &state.contracts,
-                    )
-                    .await?;
-                } else {
-                    process_factory_range(
-                        &range,
-                        &blocks,
-                        &ctx,
-                        factory_data,
-                        &state.factory_call_configs,
-                        state.factory_max_params,
-                        &mut state.frequency_state,
-                        None,
-                        &state.contracts,
-                    )
-                    .await?;
+                if state.has_factory_calls {
+                    if let Some(multicall_addr) = state.multicall3_address {
+                        process_factory_range_multicall(
+                            &range,
+                            &blocks,
+                            &ctx,
+                            factory_data,
+                            &state.factory_call_configs,
+                            state.factory_max_params,
+                            &mut state.frequency_state,
+                            multicall_addr,
+                            None,
+                            &state.contracts,
+                        )
+                        .await?;
+                    } else {
+                        process_factory_range(
+                            &range,
+                            &blocks,
+                            &ctx,
+                            factory_data,
+                            &state.factory_call_configs,
+                            state.factory_max_params,
+                            &mut state.frequency_state,
+                            None,
+                            &state.contracts,
+                        )
+                        .await?;
+                    }
                 }
 
                 if state.has_factory_once_calls {
                     let empty_index = HashMap::new();
+                    let expected_once =
+                        build_expected_factory_contracts_for_range(&state.contracts, range.end);
                     if let Some(multicall_addr) = state.multicall3_address {
                         process_factory_once_calls_multicall(
                             &range,
@@ -295,7 +303,7 @@ pub(super) async fn process_incomplete_range(
                             &state.factory_once_configs,
                             &empty_index,
                             multicall_addr,
-                            None,
+                            Some(&expected_once),
                         )
                         .await?;
                     } else {
@@ -305,7 +313,7 @@ pub(super) async fn process_incomplete_range(
                             factory_data,
                             &state.factory_once_configs,
                             &empty_index,
-                            None,
+                            Some(&expected_once),
                         )
                         .await?;
                     }
