@@ -329,10 +329,12 @@ pub(crate) async fn execute_with_snapshot_capture(
         conflict_columns: Vec<String>,
         values: Vec<DbValue>,
         columns: Vec<String>,
+        /// Index into `ops` for this snapshot, used to check affected_rows.
+        op_index: usize,
     }
     let mut snapshot_metas: Vec<SnapshotMeta> = Vec::new();
 
-    for op in &ops {
+    for (op_index, op) in ops.iter().enumerate() {
         if let DbOperation::Upsert {
             table,
             columns,
@@ -361,6 +363,7 @@ pub(crate) async fn execute_with_snapshot_capture(
                 conflict_columns: conflict_columns.clone(),
                 values: values.clone(),
                 columns: columns.clone(),
+                op_index,
             });
         }
     }
@@ -374,7 +377,7 @@ pub(crate) async fn execute_with_snapshot_capture(
     }
 
     // Execute transaction with snapshot reads inside the same transaction
-    let snapshot_results = db_pool
+    let (snapshot_results, affected_rows) = db_pool
         .execute_transaction_with_snapshot_reads(&snapshot_specs, ops)
         .await
         .map_err(TransformationError::DatabaseError)?;
@@ -382,6 +385,11 @@ pub(crate) async fn execute_with_snapshot_capture(
     // Build snapshots from results
     let mut snapshots = Vec::new();
     for (i, meta) in snapshot_metas.iter().enumerate() {
+        // Skip snapshot if the operation did not actually modify any row
+        if affected_rows.get(meta.op_index).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+
         let previous_row = snapshot_results.get(i).cloned().flatten();
 
         let key_columns: Vec<(String, DbValue)> = meta
@@ -430,4 +438,124 @@ pub(crate) async fn execute_with_snapshot_capture(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::{DbOperation, DbValue};
+
+    /// Helper to build a upsert op with update_columns (triggers snapshot).
+    fn make_upsert_op(table: &str) -> DbOperation {
+        DbOperation::Upsert {
+            table: table.to_string(),
+            columns: vec![
+                "chain_id".to_string(),
+                "pool_address".to_string(),
+                "value".to_string(),
+            ],
+            values: vec![
+                DbValue::Int64(1),
+                DbValue::Text("0xABC".to_string()),
+                DbValue::Int64(42),
+            ],
+            conflict_columns: vec!["chain_id".to_string(), "pool_address".to_string()],
+            update_columns: vec!["value".to_string()],
+            update_condition: None,
+        }
+    }
+
+    /// Helper to build an upsert op with no update_columns (no snapshot needed).
+    fn make_insert_only_op(table: &str) -> DbOperation {
+        DbOperation::Upsert {
+            table: table.to_string(),
+            columns: vec!["chain_id".to_string(), "pool_address".to_string()],
+            values: vec![DbValue::Int64(1), DbValue::Text("0xDEF".to_string())],
+            conflict_columns: vec!["chain_id".to_string(), "pool_address".to_string()],
+            update_columns: vec![],
+            update_condition: Some("FALSE".to_string()),
+        }
+    }
+
+    /// Simulate the snapshot-filtering logic from `execute_with_snapshot_capture`
+    /// in isolation: given `ops` and `affected_rows`, return the snapshot metas
+    /// that would survive the filter.
+    ///
+    /// This mirrors the filtering block added in Fix A without requiring a real DB.
+    fn collect_surviving_snapshot_tables(
+        ops: &[DbOperation],
+        affected_rows: &[u64],
+    ) -> Vec<String> {
+        struct SnapshotMeta {
+            table: String,
+            op_index: usize,
+        }
+
+        let mut metas: Vec<SnapshotMeta> = Vec::new();
+        for (op_index, op) in ops.iter().enumerate() {
+            if let DbOperation::Upsert {
+                table,
+                update_columns,
+                ..
+            } = op
+            {
+                if update_columns.is_empty() {
+                    continue;
+                }
+                metas.push(SnapshotMeta {
+                    table: table.clone(),
+                    op_index,
+                });
+            }
+        }
+
+        metas
+            .iter()
+            .filter(|m| affected_rows.get(m.op_index).copied().unwrap_or(0) > 0)
+            .map(|m| m.table.clone())
+            .collect()
+    }
+
+    /// Fix A test: a upsert that actually modifies a row produces a snapshot;
+    /// a conditional upsert that is a no-op (0 affected rows) produces no snapshot.
+    #[test]
+    fn test_no_snapshot_for_conditional_upsert_noop() {
+        // op[0]: real upsert — affected_rows[0] = 1  → snapshot expected
+        // op[1]: noop conditional upsert — affected_rows[1] = 0  → no snapshot
+        let ops = vec![
+            make_upsert_op("real_table"),
+            make_upsert_op("noop_table"),
+        ];
+        let affected_rows = vec![1u64, 0u64];
+
+        let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        assert_eq!(survivors, vec!["real_table".to_string()]);
+    }
+
+    /// When all ops modify rows, all produce snapshots.
+    #[test]
+    fn test_snapshot_for_all_affected_upserts() {
+        let ops = vec![
+            make_upsert_op("table_a"),
+            make_upsert_op("table_b"),
+        ];
+        let affected_rows = vec![1u64, 2u64];
+
+        let mut survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec!["table_a".to_string(), "table_b".to_string()]
+        );
+    }
+
+    /// Insert-only ops (empty update_columns) never produce snapshots regardless
+    /// of affected_rows — they were not candidates to begin with.
+    #[test]
+    fn test_no_snapshot_for_insert_only_ops() {
+        let ops = vec![make_insert_only_op("insert_table")];
+        let affected_rows = vec![1u64]; // row was inserted, but still no snapshot wanted
+
+        let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        assert!(survivors.is_empty());
+    }
 }

@@ -1487,10 +1487,31 @@ impl TransformationEngine {
         let submitted_keys: HashSet<String> =
             tasks.iter().map(|t| t.handler.handler_key()).collect();
 
-        let outcomes = self
+        let (snapshot_tasks, direct_tasks): (Vec<_>, Vec<_>) = tasks
+            .into_iter()
+            .partition(|t| !self.registry.is_multi_trigger(&t.handler.handler_key()));
+
+        let mut outcomes = self
             .executor
-            .execute_handlers(tasks, msg.range_start, msg.range_end, &DbExecMode::Direct)
+            .execute_handlers(
+                snapshot_tasks,
+                msg.range_start,
+                msg.range_end,
+                &DbExecMode::WithSnapshotCapture {
+                    chain_name: self.chain_name.clone(),
+                },
+            )
             .await;
+        outcomes.extend(
+            self.executor
+                .execute_handlers(
+                    direct_tasks,
+                    msg.range_start,
+                    msg.range_end,
+                    &DbExecMode::Direct,
+                )
+                .await,
+        );
 
         let succeeded_keys: HashSet<String> =
             outcomes.iter().map(|o| o.handler_key.clone()).collect();
@@ -1908,10 +1929,31 @@ impl TransformationEngine {
                 *submitted_counts.entry(t.handler.handler_key()).or_default() += 1;
             }
 
-            let outcomes = self
+            let (snapshot_tasks, direct_tasks): (Vec<_>, Vec<_>) = tasks
+                .into_iter()
+                .partition(|t| !self.registry.is_multi_trigger(&t.handler.handler_key()));
+
+            let mut outcomes = self
                 .executor
-                .execute_handlers(tasks, range_key.0, range_key.1, &DbExecMode::Direct)
+                .execute_handlers(
+                    snapshot_tasks,
+                    range_key.0,
+                    range_key.1,
+                    &DbExecMode::WithSnapshotCapture {
+                        chain_name: self.chain_name.clone(),
+                    },
+                )
                 .await;
+            outcomes.extend(
+                self.executor
+                    .execute_handlers(
+                        direct_tasks,
+                        range_key.0,
+                        range_key.1,
+                        &DbExecMode::Direct,
+                    )
+                    .await,
+            );
 
             let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
             for o in &outcomes {
