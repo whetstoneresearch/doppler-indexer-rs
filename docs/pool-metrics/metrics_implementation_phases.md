@@ -171,51 +171,67 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 - All modules wired in `util/mod.rs`, `util/db/mod.rs`, `event/mod.rs`
 
 ### Key design decisions (for reference by later phases)
-- `pool_state` uses `RawSql` for conditional upsert (`WHERE block_number < EXCLUDED.block_number`). Handler must include source/source_version manually since RawSql skips auto-injection.
-- `pool_snapshots` uses standard `Upsert` with all columns as update_columns (idempotent). source/source_version are auto-injected by the executor.
-- `liquidity_deltas` uses standard `Insert`. source/source_version are auto-injected.
-- Quote token decimals hardcoded: WETH=18, USDC=6, USDT=6, EURC=6. Implemented in `pool_metadata::quote_token_decimals()`.
+- `pool_state` uses `DbOperation::Upsert` with `update_condition: Some("EXCLUDED.block_number > pool_state.block_number")`. The conditional update ensures stale retried blocks are no-ops (`affected_rows = 0`), which also prevents bogus rollback snapshots from being recorded.
+- `pool_snapshots` uses `DbOperation::Upsert` with all non-key columns as `update_columns` and no `update_condition` (unconditional, idempotent). source/source_version are auto-injected by the executor.
+- `liquidity_deltas` uses `DbOperation::Upsert` with `update_columns: vec![]` (ON CONFLICT DO NOTHING). source/source_version are auto-injected.
+- Quote token decimals: WETH=18, USDC=6, USDT=6, EURC=6. Resolved lazily on first `handle()` via `resolve_quote_decimals()` using `std::sync::Once` for thread safety.
 
 ---
 
 ## Phase 2: V3 Handlers ✅
 
-**Status**: Complete — `feat/pool-metrics-phase2` branch
+**Status**: Complete — PR #96
 
 **Delivered**:
-- `src/transformations/event/v3/metrics.rs` — Split into V3SwapMetricsHandler + V3LiquidityMetricsHandler (and Lockable variants) to prevent duplicate live executions from multi-trigger registration
-- `PoolMetadataCache`: `load_from_db()` no longer requires contracts, added `load_into()` for shared caches, `resolve_quote_decimals()` for lazy decimal resolution, `refresh()` for DB re-query on cache miss
-- Fixed `liquidity_deltas` from INSERT to Upsert with empty update_columns (ON CONFLICT DO NOTHING) to prevent duplicate key errors on re-runs
-- Updated DDL: `liquidity_deltas` changed from PRIMARY KEY to UNIQUE constraint including source/source_version
-- Registered in `v3/mod.rs` and `event/mod.rs`
-- `handler_dependencies()` added to all 4 handlers so create handlers run before metrics handlers within the same block, ensuring the shared `PoolMetadataCache` is populated before swap/liquidity processing
-- `PoolMetadataCache` crash recovery: rebuilt from `pools` table on startup via `load_into()` in `initialize()` — no separate persistence needed since create handlers already write to `pools`
+- `src/transformations/event/v3/metrics.rs` — `V3SwapMetricsHandler`, `V3LiquidityMetricsHandler`, `LockableV3SwapMetricsHandler`, `LockableV3LiquidityMetricsHandler`. Split swap/liquidity into separate handlers to avoid multi-trigger snapshot capture issues (see issue #95)
+- `PoolMetadataCache` additions: `load_into()` for shared cache instances, `resolve_quote_decimals()`, `refresh(contracts)` for DB re-query on cache miss with immediate decimal resolution under the same write lock
+- `liquidity_deltas` changed from INSERT to Upsert with `update_columns: vec![]` (ON CONFLICT DO NOTHING) — prevents duplicate key errors on re-runs
+- DDL: all three tables now use UNIQUE constraints including `source`/`source_version` instead of PRIMARY KEY; added `idx_*_reorg` indexes on `(chain_id, block_number)` for cleanup queries
+- `handler_dependencies()`: V3SwapMetricsHandler and V3LiquidityMetricsHandler depend on V3CreateHandler; Lockable variants depend on LockableV3CreateHandler
+- `PoolMetadataCache` crash recovery via `load_into()` in `initialize()` — no separate persistence needed
+
+**Correctness fixes applied during review (PRs #93, #94)**:
+- Removed pre-commit `insert_if_absent` from create handlers — cache was populated before DB commit, poisoning it on write failures
+- `refresh_cache_if_needed` now returns `Result` and propagates errors — missing pool metadata causes handler retry instead of silent data loss
+- `std::sync::Once` replaces `AtomicBool + Ordering::Relaxed` for decimal resolution — prevents concurrent catchup tasks from reading `quote_decimals = 18` before resolution completes
+- `refresh()` resolves quote decimals under the same write lock that inserts new entries — closes a two-lock race window
+- Live event paths (`process_events_message`, `try_process_pending_events`) now use `WithSnapshotCapture` for single-trigger handlers — swap handlers previously wrote `pool_state` with no rollback snapshots
+- Snapshot recording gated on `affected_rows > 0` — no-op conditional upserts no longer produce bogus rollback snapshots
+- Per-block fallback DELETE in `cleanup_reorg_tables` — was skipping entire tables when any orphaned block had a snapshot; now only skips the specific covered blocks per table
+- Retry loop checks completed ranges before executing — prevents duplicate snapshots from double-writing a handler that already committed
 
 ### Established patterns (reference for all future handlers)
 
-**Handler struct pattern**:
+**Handler struct pattern** (single-trigger swap handler):
 ```rust
-pub struct MyMetricsHandler {
-    metadata_cache: Arc<PoolMetadataCache>,   // shared across related handlers
-    decimals_resolved: AtomicBool,            // guards one-time resolve in handle()
+pub struct MySwapMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,  // shared with sibling handlers
+    decimals_init: std::sync::Once,          // guards one-time resolve in handle()
+    chain_id: u64,
+    db_pool: OnceLock<Pool>,                 // set in initialize(), used by refresh_cache_if_needed
 }
 ```
 
 **Lifecycle**:
-1. `register_handlers()`: create shared `Arc<PoolMetadataCache>`, construct handlers
-2. `initialize(&self, db_pool)`: call `self.metadata_cache.load_into(db_pool, 8453)` — loads pools from DB, skips if already loaded by sibling handler
-3. First `handle()`: call `self.metadata_cache.resolve_quote_decimals(&ctx.contracts)` guarded by `AtomicBool` — resolves WETH=18, USDC=6, USDT=6, EURC=6
-4. Every `handle()`: extract events → normalize to `SwapInput`/`LiquidityInput` → delegate to `process_swaps()`/`process_liquidity_deltas()`
+1. `register_handlers()`: create shared `Arc<PoolMetadataCache>`, construct handlers, pass `Arc::clone` to each
+2. `initialize(&self, db_pool)`: call `self.metadata_cache.load_into(db_pool, chain_id)` — loads pools from DB, is a no-op if sibling handler already loaded. Store `db_pool.inner().clone()` in `self.db_pool`.
+3. First `handle()`: call `self.decimals_init.call_once(|| self.metadata_cache.resolve_quote_decimals(&ctx.contracts))` — `call_once` blocks all concurrent callers until done, resolves WETH=18, USDC=6, USDT=6, EURC=6
+4. Every `handle()`: call `refresh_cache_if_needed(...).await?` — re-queries DB if any swap pool is absent from cache. Returns `Err` on DB failure or if pools still missing after refresh; this causes the handler to fail and be retried.
+5. Delegate to `process_swaps()` / `process_liquidity_deltas()`
 
-**Extraction helpers**: defined as module-level `fn` (not methods) to share between two handler structs:
+**Extraction helpers**: defined as module-level `fn` to share between handler structs:
 ```rust
 fn extract_v3_swaps(ctx: &TransformationContext, source: &str) -> Result<Vec<SwapInput>, TransformationError>
 fn extract_v3_liquidity(ctx: &TransformationContext, source: &str) -> Result<Vec<LiquidityInput>, TransformationError>
 ```
 
+**Reorg tables declaration**:
+- Swap handlers: `reorg_tables() = ["pool_state", "pool_snapshots"]` — snapshot capture required; single-trigger only
+- Liquidity handlers: `reorg_tables() = ["liquidity_deltas"]` — append-only; fallback DELETE is correct; safe for multi-trigger
+
 **Registration pattern** in `event/mod.rs`:
 ```rust
-v3::metrics::register_handlers(registry);
+v3::metrics::register_handlers(registry, chain_id, Arc::clone(&metadata_cache));
 ```
 
 ---
@@ -286,11 +302,13 @@ Same call config but `"source": "UniswapV4ScheduledMulticurveInitializerHook"`.
 
 Each handler follows the same struct + lifecycle pattern from Phase 2 (see `src/transformations/event/v3/metrics.rs`). The key differences are in event extraction.
 
-**Handler struct** (identical to V3):
+**Handler struct** (follow Phase 2 pattern):
 ```rust
 pub struct MulticurveMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
-    decimals_resolved: AtomicBool,
+    decimals_init: std::sync::Once,
+    chain_id: u64,
+    db_pool: OnceLock<Pool>,
 }
 ```
 
