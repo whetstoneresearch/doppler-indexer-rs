@@ -20,7 +20,7 @@ use crate::raw_data::historical::eth_calls::{
     process_once_calls_multicall, process_once_calls_regular, process_range,
     process_range_multicall, read_logs_from_parquet_async, scan_existing_parquet_files_async,
     AbortOnDropHandles, BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError,
-    EthCallContext, FrequencyState,
+    EthCallContext, FrequencyState, OnceCallConfig,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::storage::contract_index::build_expected_factory_contracts_for_range;
@@ -32,8 +32,37 @@ use crate::storage::factory_data::{
 use crate::storage::paths::raw_eth_calls_dir;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
-use crate::types::config::contract::AddressOrAddresses;
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::RawDataCollectionConfig;
+
+/// Extracted helper: processes factory-once catchup for a single block range.
+///
+/// Builds a `FactoryAddressData` from the provided `addresses_by_block`, computes
+/// expected factory contracts for the range, and delegates to `process_factory_once_calls`.
+pub(crate) async fn process_factory_once_catchup_range(
+    range: &BlockRange,
+    addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>>,
+    ctx: &EthCallContext<'_>,
+    factory_once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    factory_once_column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
+    contracts: &Contracts,
+) -> Result<(), EthCallCollectionError> {
+    let factory_data = FactoryAddressData {
+        range_start: range.start,
+        range_end: range.end,
+        addresses_by_block,
+    };
+    let expected_once = build_expected_factory_contracts_for_range(contracts, range.end);
+    process_factory_once_calls(
+        range,
+        ctx,
+        &factory_data,
+        factory_once_configs,
+        factory_once_column_indexes,
+        Some(&expected_once),
+    )
+    .await
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_eth_calls(
@@ -515,12 +544,6 @@ pub async fn collect_eth_calls(
                     }
                 }
 
-                let factory_data = FactoryAddressData {
-                    range_start: range.start,
-                    range_end: range.end,
-                    addresses_by_block,
-                };
-
                 let factory_once_ctx = EthCallContext {
                     client,
                     output_dir: &base_output_dir,
@@ -531,15 +554,14 @@ pub async fn collect_eth_calls(
                     storage_manager: storage_manager.as_ref(),
                     s3_manifest: &s3_manifest,
                 };
-                let expected_once =
-                    build_expected_factory_contracts_for_range(&chain.contracts, range.end);
-                process_factory_once_calls(
+
+                process_factory_once_catchup_range(
                     &range,
+                    addresses_by_block,
                     &factory_once_ctx,
-                    &factory_data,
                     &factory_once_configs,
                     &factory_once_column_indexes,
-                    Some(&expected_once),
+                    &chain.contracts,
                 )
                 .await?;
 
@@ -819,4 +841,94 @@ pub async fn collect_eth_calls(
         factory_skipped_triggers: Vec::new(),
         contracts: chain.contracts.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    use crate::raw_data::historical::eth_calls::parquet_io::{
+        extract_addresses_from_once_parquet, read_existing_once_parquet,
+        read_parquet_column_names,
+    };
+    use crate::rpc::UnifiedRpcClient;
+
+    #[tokio::test]
+    async fn test_factory_once_catchup_zero_address_range_still_processes() {
+        let tmp = TempDir::new().unwrap();
+        let client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes = HashMap::new();
+        let contracts = HashMap::new(); // empty contracts = no expected_contracts entries
+
+        let existing_files = HashSet::new();
+        let ctx = EthCallContext {
+            client: &client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            decoder_tx: &None,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &None,
+        };
+
+        let range = BlockRange { start: 0, end: 100 };
+        let addresses_by_block = HashMap::new(); // empty = zero-address range
+
+        let result = process_factory_once_catchup_range(
+            &range,
+            addresses_by_block,
+            &ctx,
+            &once_configs,
+            &column_indexes,
+            &contracts,
+        )
+        .await;
+
+        assert!(result.is_ok(), "processing empty range should succeed");
+
+        // Verify empty parquet was written
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "empty parquet must be written for zero-address range"
+        );
+
+        // Verify column names include our test function
+        let cols = read_parquet_column_names(&parquet_path);
+        assert!(
+            cols.contains("testFn"),
+            "parquet schema must include testFn column"
+        );
+
+        // Verify zero rows
+        let batches = read_existing_once_parquet(&parquet_path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(addrs.is_empty(), "empty range parquet must have 0 rows");
+
+        // Verify column index was written
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must be written"
+        );
+    }
 }

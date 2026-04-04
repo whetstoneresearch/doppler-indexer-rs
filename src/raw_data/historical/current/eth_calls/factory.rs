@@ -285,3 +285,132 @@ pub(super) async fn handle_factory_message(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    use crate::raw_data::historical::eth_calls::{
+        BlockInfo, EthCallCatchupState, FrequencyState, OnceCallConfig,
+    };
+    use crate::raw_data::historical::factories::FactoryAddressData;
+    use crate::rpc::UnifiedRpcClient;
+
+    fn dummy_client() -> Arc<UnifiedRpcClient> {
+        Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
+    }
+
+    fn factory_once_only_state(base_dir: &Path) -> EthCallCatchupState {
+        let mut factory_once_configs = HashMap::new();
+        factory_once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        EthCallCatchupState {
+            base_output_dir: base_dir.to_path_buf(),
+            range_size: 100,
+            rpc_batch_size: 10,
+            multicall3_address: None,
+            call_configs: vec![],
+            factory_call_configs: HashMap::new(),
+            event_call_configs: HashMap::new(),
+            once_configs: HashMap::new(),
+            factory_once_configs,
+            has_regular_calls: false,
+            has_once_calls: false,
+            has_factory_calls: false,
+            has_factory_once_calls: true,
+            has_event_triggered_calls: false,
+            max_params: 0,
+            factory_max_params: 0,
+            existing_files: HashSet::new(),
+            s3_manifest: None,
+            factory_addresses: HashMap::new(),
+            frequency_state: FrequencyState {
+                last_call_times: HashMap::new(),
+            },
+            range_data: HashMap::new(),
+            range_factory_data: HashMap::new(),
+            range_regular_done: HashSet::new(),
+            range_factory_done: HashSet::new(),
+            factory_skipped_triggers: vec![],
+            contracts: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_factory_rangecomplete_runs_factory_once_without_factory_calls() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let mut state = factory_once_only_state(tmp.path());
+
+        // Pre-populate: regular processing done, block data available
+        state.range_regular_done.insert(0);
+        state
+            .range_data
+            .insert(0, vec![BlockInfo { block_number: 0, timestamp: 100 }]);
+        state.range_factory_data.insert(
+            0,
+            FactoryAddressData {
+                range_start: 0,
+                range_end: 100,
+                addresses_by_block: HashMap::new(),
+            },
+        );
+
+        let mut factory_rx = None;
+
+        handle_factory_message(
+            Some(FactoryMessage::RangeComplete {
+                range_start: 0,
+                range_end: 100,
+            }),
+            &mut state,
+            &client,
+            &mut factory_rx,
+            &None,
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Factory processing marked done
+        assert!(
+            state.range_factory_done.contains(&0),
+            "range_factory_done must be set"
+        );
+        // Both regular and factory done -> range data cleaned up
+        assert!(
+            !state.range_data.contains_key(&0),
+            "range_data should be cleaned up"
+        );
+
+        // Verify empty parquet was written (BlockRange { start: 0, end: 100 } -> 0-99.parquet)
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "empty parquet must be written via late-arrival factory-once path"
+        );
+
+        // Verify sidecars
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must be written"
+        );
+    }
+}

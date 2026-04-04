@@ -324,3 +324,148 @@ pub(super) async fn process_incomplete_range(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    use crate::raw_data::historical::eth_calls::{BlockInfo, OnceCallConfig, FrequencyState};
+    use crate::raw_data::historical::factories::FactoryAddressData;
+    use crate::rpc::UnifiedRpcClient;
+    use crate::types::config::chain::ChainConfig;
+
+    fn test_chain() -> ChainConfig {
+        ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            contracts: HashMap::new(),
+            block_receipts_method: None,
+            factory_collections: HashMap::new(),
+            rpc: Default::default(),
+        }
+    }
+
+    fn dummy_client() -> Arc<UnifiedRpcClient> {
+        Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
+    }
+
+    fn factory_once_only_state(base_dir: &Path) -> EthCallCatchupState {
+        let mut factory_once_configs = HashMap::new();
+        factory_once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        EthCallCatchupState {
+            base_output_dir: base_dir.to_path_buf(),
+            range_size: 100,
+            rpc_batch_size: 10,
+            multicall3_address: None,
+            call_configs: vec![],
+            factory_call_configs: HashMap::new(),
+            event_call_configs: HashMap::new(),
+            once_configs: HashMap::new(),
+            factory_once_configs,
+            has_regular_calls: false,
+            has_once_calls: false,
+            has_factory_calls: false,
+            has_factory_once_calls: true,
+            has_event_triggered_calls: false,
+            max_params: 0,
+            factory_max_params: 0,
+            existing_files: HashSet::new(),
+            s3_manifest: None,
+            factory_addresses: HashMap::new(),
+            frequency_state: FrequencyState {
+                last_call_times: HashMap::new(),
+            },
+            range_data: HashMap::new(),
+            range_factory_data: HashMap::new(),
+            range_regular_done: HashSet::new(),
+            range_factory_done: HashSet::new(),
+            factory_skipped_triggers: vec![],
+            contracts: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_range_factory_once_only_retains_state_until_factory_arrives() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let chain = test_chain();
+        let mut state = factory_once_only_state(tmp.path());
+
+        // Pre-populate range_data with one block
+        state
+            .range_data
+            .insert(0, vec![BlockInfo { block_number: 0, timestamp: 100 }]);
+        // Do NOT insert range_factory_data — factory hasn't arrived yet
+
+        process_complete_range(0, &mut state, &client, &chain, &None, None)
+            .await
+            .unwrap();
+
+        // Regular processing done
+        assert!(state.range_regular_done.contains(&0));
+        // Range data retained — factory-once still pending
+        assert!(
+            state.range_data.contains_key(&0),
+            "range_data must not be cleaned up while factory-once is pending"
+        );
+        // Factory not done yet
+        assert!(!state.range_factory_done.contains(&0));
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_range_flush_runs_factory_once_without_factory_calls() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let chain = test_chain();
+        let mut state = factory_once_only_state(tmp.path());
+
+        // Pre-populate factory data (empty addresses)
+        state.range_factory_data.insert(
+            0,
+            FactoryAddressData {
+                range_start: 0,
+                range_end: 50,
+                addresses_by_block: HashMap::new(),
+            },
+        );
+
+        let blocks = vec![BlockInfo { block_number: 0, timestamp: 100 }];
+
+        process_incomplete_range(0, blocks, &mut state, &client, &chain, &None, None)
+            .await
+            .unwrap();
+
+        // Verify empty parquet was written (range end = max_block + 1 = 1, so file is 0-0.parquet)
+        let parquet_path = tmp.path().join("test_collection/once/0-0.parquet");
+        assert!(
+            parquet_path.exists(),
+            "empty parquet must be written for factory-once-only flush"
+        );
+
+        // Verify sidecars
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must be written"
+        );
+    }
+}

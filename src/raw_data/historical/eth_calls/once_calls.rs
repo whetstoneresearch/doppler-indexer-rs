@@ -1986,18 +1986,22 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use tempfile::TempDir;
 
     use crate::raw_data::historical::eth_calls::{
         extract_addresses_from_once_parquet, read_existing_once_parquet,
-        read_parquet_column_names, write_once_results_to_parquet,
+        read_parquet_column_names, write_once_results_to_parquet, EthCallContext, OnceCallConfig,
     };
+    use crate::raw_data::historical::factories::FactoryAddressData;
+    use crate::rpc::UnifiedRpcClient;
     use crate::storage::contract_index::{
         build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
         read_contract_index, update_contract_index, write_contract_index, ExpectedContracts,
     };
+    use crate::storage::BlockRange;
 
     /// When no contract_index.json exists, `read_contract_index` returns an empty
     /// index and `get_missing_contracts` reports everything as missing. The skip
@@ -2244,6 +2248,137 @@ mod tests {
         assert!(
             result.is_empty(),
             "contract with start_block >= range_end must be excluded"
+        );
+    }
+
+    /// Calling `process_factory_once_calls` with empty factory data (no addresses
+    /// discovered) must still write the empty-range outputs: a parquet file with
+    /// the function schema, a column_index.json, and a contract_index.json.
+    #[tokio::test]
+    async fn test_factory_once_empty_range_writes_outputs() {
+        use alloy_primitives::{Address, U256};
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let dummy_client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+        let existing_files: HashSet<String> = HashSet::new();
+        let decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>> = None;
+        let s3_manifest: Option<crate::storage::S3Manifest> = None;
+
+        let ctx = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        let factory_data = FactoryAddressData {
+            range_start: 0,
+            range_end: 100,
+            addresses_by_block: HashMap::new(),
+        };
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
+        // Build expected contracts using the same ContractConfig pattern as
+        // test_build_expected_factory_contracts_for_range.
+        let addr_a = Address::new([0xaa; 20]);
+        let addr_b = Address::new([0xbb; 20]);
+
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "UniswapV3Factory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Multiple(vec![addr_a, addr_b]),
+                start_block: Some(U256::from(100)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "PoolCreated".to_string(),
+                        topics_signature:
+                            "PoolCreated(address,address,uint24,int24,address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![4]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        // range_end must be > start_block for the contract to be included.
+        let expected = build_expected_factory_contracts_for_range(&contracts, 101);
+        let range = BlockRange { start: 0, end: 100 };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        // 1. Parquet file exists (range 0..100 → file "0-99.parquet")
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "parquet file must exist after empty-range write"
+        );
+
+        // 2. Column names include our function
+        let col_names = read_parquet_column_names(&parquet_path);
+        assert!(
+            col_names.contains("testFn"),
+            "parquet schema must contain 'testFn'"
+        );
+
+        // 3. No rows (empty factory data → 0 addresses)
+        let batches = read_existing_once_parquet(&parquet_path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(
+            addrs.is_empty(),
+            "empty factory data must produce 0-row parquet"
+        );
+
+        // 4. Column index sidecar exists
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must exist after empty-range write"
+        );
+
+        // 5. Contract index sidecar exists
+        assert!(
+            tmp.path()
+                .join("test_collection/once/contract_index.json")
+                .exists(),
+            "contract_index.json must exist after empty-range write"
         );
     }
 }
