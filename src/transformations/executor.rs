@@ -84,9 +84,6 @@ impl HandlerExecutor {
             let events = task.events;
             let calls = task.calls;
             let tx_addresses = task.tx_addresses;
-            let handler_name = handler.name();
-            let handler_version = handler.version();
-            let handler_key = handler.handler_key();
             let snapshot_chain = match db_exec_mode {
                 DbExecMode::Direct => None,
                 DbExecMode::WithSnapshotCapture { chain_name } => Some(chain_name.clone()),
@@ -94,70 +91,32 @@ impl HandlerExecutor {
 
             join_set.spawn(async move {
                 let _permit = permit;
-                let ctx = TransformationContext::new(
+                let db_exec_mode = match snapshot_chain {
+                    Some(cn) => DbExecMode::WithSnapshotCapture { chain_name: cn },
+                    None => DbExecMode::Direct,
+                };
+                // run_handler_task logs handler/transaction failures internally;
+                // we convert its Err variant to Ok(None) to keep the existing
+                // join-set contract (caller never sees a propagated error).
+                match run_handler_task(
+                    handler,
+                    events,
+                    calls,
+                    tx_addresses,
                     chain_name,
                     chain_id,
                     range_start,
                     range_end,
-                    events,
-                    calls,
-                    tx_addresses,
                     historical,
                     rpc,
                     contracts,
-                );
-
-                match handler.handle(&ctx).await {
-                    Ok(ops) => {
-                        if !ops.is_empty() {
-                            let ops = inject_source_version(ops, handler_name, handler_version);
-
-                            let result = if let Some(ref cn) = snapshot_chain {
-                                let storage = LiveStorage::new(cn);
-                                execute_with_snapshot_capture(
-                                    ops,
-                                    &db_pool,
-                                    Some(&storage),
-                                    range_start,
-                                    handler_name,
-                                    handler_version,
-                                )
-                                .await
-                            } else {
-                                db_pool
-                                    .execute_transaction(ops)
-                                    .await
-                                    .map_err(TransformationError::DatabaseError)
-                            };
-
-                            if let Err(e) = result {
-                                tracing::error!(
-                                    "Handler {} transaction failed for range {}-{}: {:?}",
-                                    handler_key,
-                                    range_start,
-                                    range_end,
-                                    e
-                                );
-                                return Ok(None);
-                            }
-                        }
-                        Ok(Some(HandlerOutcome {
-                            handler_key,
-                            handler_name: handler_name.to_string(),
-                            range_start,
-                            range_end,
-                        }))
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Handler {} failed for range {}-{}: {}",
-                            handler_key,
-                            range_start,
-                            range_end,
-                            e
-                        );
-                        Ok(None)
-                    }
+                    db_pool,
+                    &db_exec_mode,
+                )
+                .await
+                {
+                    Ok(outcome) => Ok(Some(outcome)),
+                    Err(_) => Ok(None),
                 }
             });
         }
@@ -178,6 +137,106 @@ impl HandlerExecutor {
 
         outcomes
     }
+}
+
+/// Run a single handler on a single range: build context, invoke the handler,
+/// inject `source`/`source_version`, and execute the resulting DB ops.
+///
+/// Returns the handler outcome on success. On handler or DB failure, logs the
+/// error (matching the prior inline behavior) and returns `Err`. Callers that
+/// want to tolerate failures should pattern-match on the result; the
+/// [`HandlerExecutor`] converts `Err` to `Ok(None)` to preserve its existing
+/// fire-and-forget contract.
+///
+/// Shared between [`HandlerExecutor`] and (in subsequent phases) the DAG-aware
+/// scheduler in [`super::scheduler`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_handler_task(
+    handler: Arc<dyn TransformationHandler>,
+    events: Arc<Vec<DecodedEvent>>,
+    calls: Arc<Vec<DecodedCall>>,
+    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    chain_name: String,
+    chain_id: u64,
+    range_start: u64,
+    range_end: u64,
+    historical: Arc<HistoricalDataReader>,
+    rpc: Arc<UnifiedRpcClient>,
+    contracts: Arc<Contracts>,
+    db_pool: Arc<DbPool>,
+    db_exec_mode: &DbExecMode,
+) -> Result<HandlerOutcome, TransformationError> {
+    let handler_name = handler.name();
+    let handler_version = handler.version();
+    let handler_key = handler.handler_key();
+
+    let ctx = TransformationContext::new(
+        chain_name,
+        chain_id,
+        range_start,
+        range_end,
+        events,
+        calls,
+        tx_addresses,
+        historical,
+        rpc,
+        contracts,
+    );
+
+    let ops = match handler.handle(&ctx).await {
+        Ok(ops) => ops,
+        Err(e) => {
+            tracing::error!(
+                "Handler {} failed for range {}-{}: {}",
+                handler_key,
+                range_start,
+                range_end,
+                e
+            );
+            return Err(e);
+        }
+    };
+
+    if !ops.is_empty() {
+        let ops = inject_source_version(ops, handler_name, handler_version);
+
+        let result = match db_exec_mode {
+            DbExecMode::WithSnapshotCapture { chain_name: cn } => {
+                let storage = LiveStorage::new(cn);
+                execute_with_snapshot_capture(
+                    ops,
+                    &db_pool,
+                    Some(&storage),
+                    range_start,
+                    handler_name,
+                    handler_version,
+                )
+                .await
+            }
+            DbExecMode::Direct => db_pool
+                .execute_transaction(ops)
+                .await
+                .map_err(TransformationError::DatabaseError),
+        };
+
+        if let Err(e) = result {
+            tracing::error!(
+                "Handler {} transaction failed for range {}-{}: {:?}",
+                handler_key,
+                range_start,
+                range_end,
+                e
+            );
+            return Err(e);
+        }
+    }
+
+    Ok(HandlerOutcome {
+        handler_key,
+        handler_name: handler_name.to_string(),
+        range_start,
+        range_end,
+    })
 }
 
 // ─── Source/Version Injection (free functions) ───────────────────────

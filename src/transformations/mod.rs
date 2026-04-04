@@ -64,6 +64,7 @@ pub mod historical;
 mod live_state;
 pub mod registry;
 mod retry;
+pub(crate) mod scheduler;
 pub mod traits;
 pub mod util;
 
