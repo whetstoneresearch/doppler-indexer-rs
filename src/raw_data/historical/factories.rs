@@ -96,6 +96,8 @@ pub struct FactoryMatcher {
     pub param_location: FactoryParameterLocation,
     pub data_types: Vec<DynSolType>,
     pub collection_name: String,
+    /// Name of the contract in the config that owns this factory matcher.
+    pub contract_name: String,
 }
 
 /// State computed during factory catchup, passed to current/streaming phase
@@ -146,6 +148,7 @@ pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
                             param_location: param_location.clone(),
                             data_types: data_types.clone(),
                             collection_name: factory.collection.clone(),
+                            contract_name: contract_name.clone(),
                         });
                     }
                 }
@@ -281,6 +284,7 @@ pub(crate) async fn process_range(
         s3_manifest,
         storage_manager,
         chain_name,
+        false, // don't force rewrite for streaming
     )
     .await?;
 
@@ -480,6 +484,7 @@ pub(crate) async fn process_range_batches(
         s3_manifest,
         storage_manager,
         chain_name,
+        true, // force rewrite during catchup (contract index handles skip)
     )
     .await?;
 
@@ -492,6 +497,9 @@ pub(crate) async fn process_range_batches(
 
 /// Write factory records to parquet files, grouped by collection.
 /// Writes empty parquet files for collections with no matching events.
+///
+/// When `force_rewrite` is true, existing files are overwritten (used when the
+/// contract index shows missing contracts for a range that already has parquet files).
 #[allow(clippy::too_many_arguments)]
 async fn write_factory_parquet_files(
     range_start: u64,
@@ -503,6 +511,7 @@ async fn write_factory_parquet_files(
     s3_manifest: Option<&S3Manifest>,
     storage_manager: Option<&Arc<StorageManager>>,
     chain_name: &str,
+    force_rewrite: bool,
 ) -> Result<(), FactoryCollectionError> {
     let mut by_collection: HashMap<String, Vec<FactoryRecord>> = HashMap::new();
     for record in records {
@@ -518,9 +527,10 @@ async fn write_factory_parquet_files(
         let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
         let rel_path = format!("{}/{}", collection_name, file_name);
 
-        if existing_files.contains(&rel_path)
-            || s3_manifest
-                .is_some_and(|m| m.has_factories(&collection_name, range_start, range_end - 1))
+        if !force_rewrite
+            && (existing_files.contains(&rel_path)
+                || s3_manifest
+                    .is_some_and(|m| m.has_factories(&collection_name, range_start, range_end - 1)))
         {
             tracing::debug!(
                 "Skipping factory parquet for {} blocks {}-{} (already exists)",
@@ -566,9 +576,10 @@ async fn write_factory_parquet_files(
             let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
             let rel_path = format!("{}/{}", collection_name, file_name);
 
-            if !existing_files.contains(&rel_path)
-                && !s3_manifest
-                    .is_some_and(|m| m.has_factories(collection_name, range_start, range_end - 1))
+            if force_rewrite
+                || (!existing_files.contains(&rel_path)
+                    && !s3_manifest
+                        .is_some_and(|m| m.has_factories(collection_name, range_start, range_end - 1)))
             {
                 let sub_dir = output_dir.join(collection_name);
                 tokio::fs::create_dir_all(&sub_dir).await?;

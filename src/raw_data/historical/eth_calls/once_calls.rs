@@ -24,6 +24,10 @@ use super::types::{
 };
 use crate::decoding::{DecoderMessage, OnceCallResult as DecoderOnceCallResult};
 use crate::raw_data::historical::factories::FactoryAddressData;
+use crate::storage::contract_index::{
+    get_missing_contracts, range_key, read_contract_index, update_contract_index,
+    write_contract_index, ExpectedContracts,
+};
 use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
@@ -384,6 +388,7 @@ pub(crate) async fn process_factory_once_calls(
     factory_data: &FactoryAddressData,
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
+    expected_contracts: Option<&HashMap<String, ExpectedContracts>>,
 ) -> Result<(), EthCallCollectionError> {
     for (collection_name, call_configs) in once_configs {
         if call_configs.is_empty() {
@@ -442,13 +447,30 @@ pub(crate) async fn process_factory_once_calls(
             };
 
             if missing.is_empty() && null_entries.is_empty() {
-                tracing::debug!(
-                    "Skipping factory once eth_calls for {} blocks {}-{} (all columns present and indexed)",
+                // Column check passes. Also verify contract-index completeness.
+                let index_complete = match expected_contracts.and_then(|m| m.get(collection_name)) {
+                    None => true,
+                    Some(expected) => {
+                        let index = read_contract_index(&sub_dir);
+                        let rk = range_key(range.start, range.end - 1);
+                        get_missing_contracts(&index, &rk, expected).is_empty()
+                    }
+                };
+                if index_complete {
+                    tracing::debug!(
+                        "Skipping factory once eth_calls for {} blocks {}-{} (all columns present and indexed)",
+                        collection_name,
+                        range.start,
+                        range.end - 1
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    "Factory once {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
                     collection_name,
                     range.start,
                     range.end - 1
                 );
-                continue;
             }
             if !missing.is_empty() {
                 tracing::info!(
@@ -507,6 +529,14 @@ pub(crate) async fn process_factory_once_calls(
             let mut index = read_once_column_index_async(sub_dir.clone()).await;
             index.insert(file_name.clone(), all_fn_names.clone());
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!("Failed to write once contract index (empty range) for {}: {}", collection_name, e);
+                }
+            }
             if let Some(tx) = ctx.decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::OnceFileBackfilled {
@@ -518,6 +548,22 @@ pub(crate) async fn process_factory_once_calls(
             }
             continue;
         }
+
+        // C. Read parquet early to identify absent addresses
+        let (mut existing_batches_opt, existing_addr_set) = if has_existing_file {
+            let batches = read_existing_once_parquet_async(output_path.clone()).await?;
+            let addrs: HashSet<[u8; 20]> = extract_addresses_from_once_parquet(&batches)
+                .into_keys()
+                .collect();
+            (Some(batches), addrs)
+        } else {
+            (None, HashSet::new())
+        };
+
+        let absent_addresses: Vec<(&Address, &(u64, u64))> = address_discovery
+            .iter()
+            .filter(|(addr, _)| !existing_addr_set.contains(&addr.0 .0))
+            .collect();
 
         let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> =
             Vec::new();
@@ -594,6 +640,86 @@ pub(crate) async fn process_factory_once_calls(
             }
         }
 
+        // D. Absent addresses: call existing functions for addresses not yet in the parquet
+        if !absent_addresses.is_empty() {
+            let already_covered_by_global: HashSet<&str> =
+                configs_to_call.iter().map(|c| c.function_name.as_str()).collect();
+
+            for (addr, (block_number, timestamp)) in &absent_addresses {
+                let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
+
+                for call_config in call_configs.iter() {
+                    if already_covered_by_global.contains(call_config.function_name.as_str()) {
+                        continue;
+                    }
+                    let target_address = call_config
+                        .target_addresses
+                        .as_ref()
+                        .and_then(|addrs| addrs.first().copied())
+                        .unwrap_or(**addr);
+
+                    let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                        preencoded.clone()
+                    } else {
+                        encode_once_call_params(
+                            call_config.function_selector,
+                            &call_config.params,
+                            **addr,
+                        )?
+                    };
+                    let tx = TransactionRequest::default()
+                        .to(target_address)
+                        .input(calldata.into());
+                    pending_calls.push((
+                        tx,
+                        block_id,
+                        **addr,
+                        *block_number,
+                        *timestamp,
+                        call_config.function_name.clone(),
+                    ));
+                }
+            }
+        }
+
+        // H. No-op optimization: if contract-index gate fell through but no calls needed,
+        // just write the missing contract_index.json and skip the parquet rewrite.
+        if pending_calls.is_empty() && has_existing_file {
+            // Rewrite empty parquet with full schema when columns are missing
+            if !missing_fn_names.is_empty() && existing_addr_set.is_empty() {
+                write_once_results_to_parquet_async(
+                    vec![],
+                    output_path.clone(),
+                    all_fn_names.clone(),
+                )
+                .await?;
+                let mut index = read_once_column_index_async(sub_dir.clone()).await;
+                index.insert(file_name.clone(), all_fn_names.clone());
+                write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
+                tracing::info!(
+                    "Factory once {} blocks {}-{}: rewrote empty parquet with {} columns",
+                    collection_name,
+                    range.start,
+                    range.end - 1,
+                    all_fn_names.len()
+                );
+            }
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!("Failed to write once contract index for {}: {}", collection_name, e);
+                } else {
+                    tracing::info!(
+                        "Factory once {} blocks {}-{}: wrote missing contract index (no parquet changes needed)",
+                        collection_name, range.start, range.end - 1
+                    );
+                }
+            }
+            continue;
+        }
+
         // Skip only if no pending calls AND no existing file to backfill
         if pending_calls.is_empty() && !has_existing_file {
             continue;
@@ -655,7 +781,11 @@ pub(crate) async fn process_factory_once_calls(
                 .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
                 .collect();
 
-            let existing_batches = read_existing_once_parquet_async(output_path.clone()).await?;
+            // E. Reuse pre-read batches from step C (or read now if not available)
+            let existing_batches = match existing_batches_opt.take() {
+                Some(batches) => batches,
+                None => read_existing_once_parquet_async(output_path.clone()).await?,
+            };
             if !existing_batches.is_empty() {
                 // Check which addresses already have data for the missing functions
                 let existing_results =
@@ -837,6 +967,16 @@ pub(crate) async fn process_factory_once_calls(
             actual_cols.len(),
             actual_cols
         );
+
+        // F. Write contract index after parquet write
+        if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+            let rk = range_key(range.start, range.end - 1);
+            let mut ci = read_contract_index(&sub_dir);
+            update_contract_index(&mut ci, &rk, expected);
+            if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                tracing::warn!("Failed to write once contract index for {}: {}", collection_name, e);
+            }
+        }
 
         // Notify decoder that this file was updated so it can decode new columns
         if let Some(tx) = ctx.decoder_tx {
@@ -1202,6 +1342,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
     once_configs: &HashMap<String, Vec<OnceCallConfig>>,
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
     multicall3_address: Address,
+    expected_contracts: Option<&HashMap<String, ExpectedContracts>>,
 ) -> Result<(), EthCallCollectionError> {
     // Collect all calls across all collections into one multicall
     let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
@@ -1262,7 +1403,25 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 };
 
                 if missing.is_empty() && null_entries.is_empty() {
-                    continue;
+                    // Column check passes. Also verify contract-index completeness.
+                    let index_complete =
+                        match expected_contracts.and_then(|m| m.get(collection_name)) {
+                            None => true,
+                            Some(expected) => {
+                                let index = read_contract_index(&sub_dir);
+                                let rk = range_key(range.start, range.end - 1);
+                                get_missing_contracts(&index, &rk, expected).is_empty()
+                            }
+                        };
+                    if index_complete {
+                        continue;
+                    }
+                    tracing::info!(
+                        "Factory once multicall {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
+                        collection_name,
+                        range.start,
+                        range.end - 1
+                    );
                 }
                 (missing, true, null_entries)
             } else {
@@ -1299,6 +1458,68 @@ pub(crate) async fn process_factory_once_calls_multicall(
             let mut index = read_once_column_index_async(sub_dir.clone()).await;
             index.insert(file_name.clone(), all_fn_names.clone());
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
+            // G. Write contract index in empty-file branch
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!("Failed to write once contract index (empty range) for {}: {}", collection_name, e);
+                }
+            }
+            continue;
+        }
+
+        // C. Read parquet early to identify absent addresses
+        let existing_addr_set: HashSet<[u8; 20]> = if has_existing_file {
+            let batches = read_existing_once_parquet_async(output_path.clone()).await?;
+            extract_addresses_from_once_parquet(&batches)
+                .into_keys()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        let absent_addresses: Vec<(&Address, &(u64, u64))> = address_discovery
+            .iter()
+            .filter(|(addr, _)| !existing_addr_set.contains(&addr.0 .0))
+            .collect();
+
+        // Rewrite empty parquet with full schema when columns are missing and file is empty
+        if address_discovery.is_empty()
+            && has_existing_file
+            && !missing_fn_names.is_empty()
+            && existing_addr_set.is_empty()
+        {
+            tokio::fs::create_dir_all(&sub_dir).await?;
+            write_once_results_to_parquet_async(
+                vec![],
+                output_path.clone(),
+                all_fn_names.clone(),
+            )
+            .await?;
+            let mut index = read_once_column_index_async(sub_dir.clone()).await;
+            index.insert(file_name.clone(), all_fn_names.clone());
+            write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index for {}: {}",
+                        collection_name,
+                        e
+                    );
+                }
+            }
+            tracing::info!(
+                "Factory once multicall {} blocks {}-{}: rewrote empty parquet with {} columns",
+                collection_name,
+                range.start,
+                range.end - 1,
+                all_fn_names.len()
+            );
             continue;
         }
 
@@ -1373,6 +1594,49 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         block_timestamp: *timestamp,
                     },
                 });
+            }
+        }
+
+        // D. Absent addresses: add slots for existing functions for addresses not yet in the parquet
+        if !absent_addresses.is_empty() {
+            let already_covered_by_global: HashSet<&str> =
+                configs_to_call.iter().map(|c| c.function_name.as_str()).collect();
+
+            for (addr, (block_num, timestamp)) in &absent_addresses {
+                for call_config in call_configs.iter() {
+                    if already_covered_by_global.contains(call_config.function_name.as_str()) {
+                        continue;
+                    }
+                    let target_address = call_config
+                        .target_addresses
+                        .as_ref()
+                        .and_then(|addrs| addrs.first().copied())
+                        .unwrap_or(**addr);
+
+                    let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                        preencoded.clone()
+                    } else {
+                        encode_once_call_params(
+                            call_config.function_selector,
+                            &call_config.params,
+                            **addr,
+                        )?
+                    };
+
+                    all_slots.push(MulticallSlotGeneric {
+                        block_number: *block_num,
+                        block_timestamp: *timestamp,
+                        target_address,
+                        encoded_calldata: calldata,
+                        metadata: FactoryOnceSlotMeta {
+                            collection_name: collection_name.clone(),
+                            function_name: call_config.function_name.clone(),
+                            address: **addr,
+                            block_number: *block_num,
+                            block_timestamp: *timestamp,
+                        },
+                    });
+                }
             }
         }
 
@@ -1464,6 +1728,27 @@ pub(crate) async fn process_factory_once_calls_multicall(
 
         // Get results for this collection (may be None if no new addresses discovered)
         let results_by_address = results_by_collection.remove(&collection_name);
+
+        // H. No-op optimization: if contract-index gate fell through but no slots were
+        // queued for this collection and the parquet already exists, just write the
+        // missing contract_index.json and skip the parquet rewrite.
+        let has_results = results_by_address.as_ref().map_or(false, |r| !r.is_empty());
+        if !has_results && has_existing_file && missing_fn_names.is_empty() && patch_fn_names.is_empty() {
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(&collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(sub_dir, &ci) {
+                    tracing::warn!("Failed to write once contract index for {}: {}", collection_name, e);
+                } else {
+                    tracing::info!(
+                        "Factory once multicall {} blocks {}-{}: wrote missing contract index (no parquet changes needed)",
+                        collection_name, range.start, range.end - 1
+                    );
+                }
+            }
+            continue;
+        }
 
         // Process if we have results OR if existing file needs backfill
         if results_by_address.is_some() || has_existing_file {
@@ -1674,6 +1959,16 @@ pub(crate) async fn process_factory_once_calls_multicall(
             index.insert(file_name.clone(), actual_cols.clone());
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
 
+            // F. Write contract index after parquet write
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(&collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(sub_dir, &ci) {
+                    tracing::warn!("Failed to write once contract index for {}: {}", collection_name, e);
+                }
+            }
+
             if let Some(tx) = ctx.decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::OnceFileBackfilled {
@@ -1687,4 +1982,403 @@ pub(crate) async fn process_factory_once_calls_multicall(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use crate::raw_data::historical::eth_calls::{
+        extract_addresses_from_once_parquet, read_existing_once_parquet,
+        read_parquet_column_names, write_once_results_to_parquet, EthCallContext, OnceCallConfig,
+    };
+    use crate::raw_data::historical::factories::FactoryAddressData;
+    use crate::rpc::UnifiedRpcClient;
+    use crate::storage::contract_index::{
+        build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
+        read_contract_index, update_contract_index, write_contract_index, ExpectedContracts,
+    };
+    use crate::storage::BlockRange;
+
+    /// When no contract_index.json exists, `read_contract_index` returns an empty
+    /// index and `get_missing_contracts` reports everything as missing. The skip
+    /// gate must NOT be taken.
+    #[test]
+    fn test_factory_once_skip_requires_contract_index_completeness() {
+        let dir = TempDir::new().unwrap();
+
+        // No contract_index.json written to dir.
+
+        let mut expected = ExpectedContracts::new();
+        expected.insert(
+            "ContractX".to_string(),
+            vec!["0xaaa".to_string(), "0xbbb".to_string()],
+        );
+        expected.insert("ContractY".to_string(), vec!["0xccc".to_string()]);
+
+        let index = read_contract_index(dir.path());
+        assert!(index.is_empty(), "index should be empty when file is absent");
+
+        let rk = range_key(0, 999);
+        let missing = get_missing_contracts(&index, &rk, &expected);
+
+        assert!(
+            !missing.is_empty(),
+            "missing must be non-empty when contract index is absent — skip should NOT be taken"
+        );
+        // Every expected entry should be reported missing.
+        assert!(missing.contains_key("ContractX"));
+        assert!(missing.contains_key("ContractY"));
+    }
+
+    /// When the contract_index.json contains all expected contracts and addresses
+    /// for the range, `get_missing_contracts` returns an empty map. The skip gate
+    /// IS taken.
+    #[test]
+    fn test_factory_once_skip_allowed_when_contract_index_complete() {
+        let dir = TempDir::new().unwrap();
+
+        let mut expected = ExpectedContracts::new();
+        expected.insert(
+            "ContractX".to_string(),
+            vec!["0xaaa".to_string(), "0xbbb".to_string()],
+        );
+        expected.insert("ContractY".to_string(), vec!["0xccc".to_string()]);
+
+        // Write a fully-populated contract index.
+        let mut index = read_contract_index(dir.path());
+        let rk = range_key(0, 999);
+        update_contract_index(&mut index, &rk, &expected);
+        write_contract_index(dir.path(), &index).unwrap();
+
+        // Re-read from disk to confirm roundtrip fidelity.
+        let index = read_contract_index(dir.path());
+        let missing = get_missing_contracts(&index, &rk, &expected);
+
+        assert!(
+            missing.is_empty(),
+            "missing must be empty when contract index is complete — skip IS taken"
+        );
+    }
+
+    /// When the contract_index.json only has partial data (one contract missing
+    /// entirely, another missing an address), `get_missing_contracts` reports the
+    /// gaps. The skip gate must NOT be taken.
+    #[test]
+    fn test_factory_once_contract_index_partial_not_complete() {
+        let dir = TempDir::new().unwrap();
+
+        let mut expected = ExpectedContracts::new();
+        expected.insert(
+            "ContractX".to_string(),
+            vec!["0xaaa".to_string(), "0xbbb".to_string()],
+        );
+        expected.insert("ContractY".to_string(), vec!["0xccc".to_string()]);
+
+        // Write a partial index: only ContractX with one of its two addresses.
+        let rk = range_key(0, 999);
+        let mut partial = ExpectedContracts::new();
+        partial.insert("ContractX".to_string(), vec!["0xaaa".to_string()]);
+
+        let mut index = read_contract_index(dir.path());
+        update_contract_index(&mut index, &rk, &partial);
+        write_contract_index(dir.path(), &index).unwrap();
+
+        // Re-read from disk.
+        let index = read_contract_index(dir.path());
+        let missing = get_missing_contracts(&index, &rk, &expected);
+
+        assert!(
+            !missing.is_empty(),
+            "missing must be non-empty when contract index is partial — skip should NOT be taken"
+        );
+        // ContractY is entirely absent.
+        assert!(
+            missing.contains_key("ContractY"),
+            "ContractY should be reported as missing"
+        );
+        // ContractX is present but missing address 0xbbb.
+        let missing_x = missing.get("ContractX").expect("ContractX should have missing addresses");
+        assert!(
+            missing_x.contains(&"0xbbb".to_string()),
+            "0xbbb should be reported as missing for ContractX"
+        );
+        assert!(
+            !missing_x.contains(&"0xaaa".to_string()),
+            "0xaaa should NOT be reported as missing for ContractX"
+        );
+    }
+
+    /// P1 regression: when an existing once parquet has zero rows, all newly
+    /// discovered factory addresses must be treated as absent so they get
+    /// backfilled for existing functions.
+    #[test]
+    fn test_empty_parquet_absent_addresses_filter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.parquet");
+
+        // Write an empty parquet with schema [A, B] but 0 rows.
+        write_once_results_to_parquet(
+            &[],
+            &path,
+            &["getA".to_string(), "getB".to_string()],
+        )
+        .unwrap();
+
+        // Read back and extract addresses — should be empty.
+        let batches = read_existing_once_parquet(&path).unwrap();
+        let existing_addr_set: HashSet<[u8; 20]> = extract_addresses_from_once_parquet(&batches)
+            .into_keys()
+            .collect();
+        assert!(
+            existing_addr_set.is_empty(),
+            "empty parquet must yield empty address set"
+        );
+
+        // The fixed filter: `!existing_addr_set.contains(&addr)` must return true
+        // for any address, meaning all addresses are "absent" and eligible for backfill.
+        let test_addr: [u8; 20] = [0xaa; 20];
+        assert!(
+            !existing_addr_set.contains(&test_addr),
+            "any address must be treated as absent when parquet is empty"
+        );
+    }
+
+    /// P2 regression: when an empty once parquet exists with stale schema and a
+    /// new function column is added, rewriting the parquet with the full schema
+    /// must converge — the new column appears in the schema and no rows are lost.
+    #[test]
+    fn test_empty_parquet_schema_rewrite_converges() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.parquet");
+
+        // Step 1: write empty parquet with columns [A].
+        write_once_results_to_parquet(&[], &path, &["getA".to_string()]).unwrap();
+
+        let cols = read_parquet_column_names(&path);
+        assert!(cols.contains("getA"), "initial schema must contain getA");
+        assert!(!cols.contains("getB"), "initial schema must NOT contain getB");
+
+        // Step 2: rewrite with full schema [A, B] (the P2 fix).
+        write_once_results_to_parquet(
+            &[],
+            &path,
+            &["getA".to_string(), "getB".to_string()],
+        )
+        .unwrap();
+
+        let cols = read_parquet_column_names(&path);
+        assert!(cols.contains("getA"), "rewritten schema must contain getA");
+        assert!(cols.contains("getB"), "rewritten schema must contain getB");
+
+        // Step 3: verify no spurious rows were created.
+        let batches = read_existing_once_parquet(&path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(addrs.is_empty(), "rewritten empty parquet must have 0 rows");
+
+        // Step 4: a subsequent read_parquet_column_names returns full schema,
+        // so the missing-column check would now pass — no infinite loop.
+        let final_cols = read_parquet_column_names(&path);
+        let all_fn_names = vec!["getA".to_string(), "getB".to_string()];
+        let missing: Vec<&String> = all_fn_names
+            .iter()
+            .filter(|f| !final_cols.contains(*f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "no columns should be missing after rewrite — loop must converge"
+        );
+    }
+
+    /// P3 regression: `build_expected_factory_contracts_for_range` must return
+    /// correct collection→contract→addresses mapping from a Contracts config
+    /// that has factory entries, so that the live/current path can write
+    /// contract_index.json.
+    #[test]
+    fn test_build_expected_factory_contracts_for_range() {
+        use alloy_primitives::{Address, U256};
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+
+        let addr_a = Address::new([0xaa; 20]);
+        let addr_b = Address::new([0xbb; 20]);
+
+        let mut contracts = std::collections::HashMap::new();
+
+        // Contract with factory → collection "v3_pools", start_block 100.
+        contracts.insert(
+            "UniswapV3Factory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Multiple(vec![addr_a, addr_b]),
+                start_block: Some(U256::from(100)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "v3_pools".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "PoolCreated".to_string(),
+                        topics_signature: "PoolCreated(address,address,uint24,int24,address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![4]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        // range_end > start_block → included
+        let result = build_expected_factory_contracts_for_range(&contracts, 200);
+        assert!(result.contains_key("v3_pools"), "collection must be present");
+        let expected = &result["v3_pools"];
+        assert!(
+            expected.contains_key("UniswapV3Factory"),
+            "contract must be present"
+        );
+        let addrs = &expected["UniswapV3Factory"];
+        assert_eq!(addrs.len(), 2, "both addresses must be listed");
+
+        // range_end <= start_block → excluded
+        let result = build_expected_factory_contracts_for_range(&contracts, 100);
+        assert!(
+            result.is_empty(),
+            "contract with start_block >= range_end must be excluded"
+        );
+    }
+
+    /// Calling `process_factory_once_calls` with empty factory data (no addresses
+    /// discovered) must still write the empty-range outputs: a parquet file with
+    /// the function schema, a column_index.json, and a contract_index.json.
+    #[tokio::test]
+    async fn test_factory_once_empty_range_writes_outputs() {
+        use alloy_primitives::{Address, U256};
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let dummy_client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+        let existing_files: HashSet<String> = HashSet::new();
+        let decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>> = None;
+        let s3_manifest: Option<crate::storage::S3Manifest> = None;
+
+        let ctx = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        let factory_data = FactoryAddressData {
+            range_start: 0,
+            range_end: 100,
+            addresses_by_block: HashMap::new(),
+        };
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
+        // Build expected contracts using the same ContractConfig pattern as
+        // test_build_expected_factory_contracts_for_range.
+        let addr_a = Address::new([0xaa; 20]);
+        let addr_b = Address::new([0xbb; 20]);
+
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "UniswapV3Factory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Multiple(vec![addr_a, addr_b]),
+                start_block: Some(U256::from(100)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "PoolCreated".to_string(),
+                        topics_signature:
+                            "PoolCreated(address,address,uint24,int24,address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![4]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        // range_end must be > start_block for the contract to be included.
+        let expected = build_expected_factory_contracts_for_range(&contracts, 101);
+        let range = BlockRange { start: 0, end: 100 };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        // 1. Parquet file exists (range 0..100 → file "0-99.parquet")
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "parquet file must exist after empty-range write"
+        );
+
+        // 2. Column names include our function
+        let col_names = read_parquet_column_names(&parquet_path);
+        assert!(
+            col_names.contains("testFn"),
+            "parquet schema must contain 'testFn'"
+        );
+
+        // 3. No rows (empty factory data → 0 addresses)
+        let batches = read_existing_once_parquet(&parquet_path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(
+            addrs.is_empty(),
+            "empty factory data must produce 0-row parquet"
+        );
+
+        // 4. Column index sidecar exists
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must exist after empty-range write"
+        );
+
+        // 5. Contract index sidecar exists
+        assert!(
+            tmp.path()
+                .join("test_collection/once/contract_index.json")
+                .exists(),
+            "contract_index.json must exist after empty-range write"
+        );
+    }
 }

@@ -201,7 +201,7 @@ src/
 ├── raw_data/historical/ # Raw data collection (blocks, receipts, logs, eth_calls, factories)
 ├── decoding/            # ABI decoding (logs, eth_calls, catchup, current)
 ├── live/                # Live mode (collector, storage, compaction, reorg, progress)
-├── storage/             # S3 storage (local, s3, cached, manifest, upload, retry)
+├── storage/             # S3 storage (local, s3, cached, manifest, upload, retry, contract_index)
 ├── metrics/             # Prometheus metrics server and RPC metrics
 ├── transformations/     # Transformation engine, handlers, registry, utils
 └── types/               # Config types, shared types, decoded value types

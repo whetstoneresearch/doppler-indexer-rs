@@ -24,7 +24,11 @@ use super::types::{
 use super::{execute_multicalls_generic, BlockMulticall, EventCallMeta, MulticallSlotGeneric};
 use crate::decoding::{DecoderMessage, EventCallResult as DecoderEventCallResult};
 use crate::raw_data::historical::receipts::EventTriggerData;
-use crate::storage::upload_parquet_to_s3;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts_for_range, range_key, read_contract_index,
+    update_contract_index, write_contract_index,
+};
+use crate::storage::{upload_parquet_to_s3, upload_sidecar_to_s3};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{
     encode_call_with_params, EventFieldLocation, EvmType, ParamConfig,
@@ -484,6 +488,7 @@ pub(crate) async fn process_event_triggers(
     ctx: &EthCallContext<'_>,
     range_start: u64,
     range_end: u64,
+    contracts: &Contracts,
 ) -> Result<Vec<SkippedFactoryTrigger>, EthCallCollectionError> {
     let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
 
@@ -506,6 +511,20 @@ pub(crate) async fn process_event_triggers(
                 range_end,
             )
             .await?;
+            let sub_dir = ctx.output_dir.join(contract_name).join(function_name).join("on_events");
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range_end + 1);
+            if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
+                let rk = range_key(range_start, range_end);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write contract index (empty on_events): {}",
+                        e
+                    );
+                }
+            }
         }
         return Ok(skipped_factory_triggers);
     }
@@ -766,6 +785,33 @@ pub(crate) async fn process_event_triggers(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
+            // Update contract index for on_events
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range_end + 1);
+            if let Some(expected) = expected_for_range.get(&contract_name) {
+                let rk = range_key(range_start, range_end);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write contract index for {}.{}/on_events: {}",
+                        contract_name,
+                        function_name,
+                        e
+                    );
+                } else if let Some(sm) = ctx.storage_manager {
+                    let index_path = sub_dir.join("contract_index.json");
+                    if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                        tracing::warn!(
+                            "Failed to upload contract index sidecar for {}.{}/on_events: {}",
+                            contract_name,
+                            function_name,
+                            e
+                        );
+                    }
+                }
+            }
+
             // Send to decoder for decoding (range_end + 1 for exclusive convention)
             if let Some(tx) = ctx.decoder_tx {
                 if let Some(decoder_results) = decoder_results {
@@ -796,6 +842,21 @@ pub(crate) async fn process_event_triggers(
                 range_end,
             )
             .await?;
+            let sub_dir =
+                ctx.output_dir.join(&contract_name).join(&function_name).join("on_events");
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range_end + 1);
+            if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
+                let rk = range_key(range_start, range_end);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write contract index (empty on_events): {}",
+                        e
+                    );
+                }
+            }
         }
     }
 
@@ -839,6 +900,7 @@ pub(crate) async fn process_event_triggers_multicall(
     multicall3_address: Address,
     range_start: u64,
     range_end: u64,
+    contracts: &Contracts,
 ) -> Result<Vec<SkippedFactoryTrigger>, EthCallCollectionError> {
     let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
 
@@ -861,6 +923,20 @@ pub(crate) async fn process_event_triggers_multicall(
                 range_end,
             )
             .await?;
+            let sub_dir = ctx.output_dir.join(contract_name).join(function_name).join("on_events");
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range_end + 1);
+            if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
+                let rk = range_key(range_start, range_end);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write contract index (empty on_events): {}",
+                        e
+                    );
+                }
+            }
         }
         return Ok(skipped_factory_triggers);
     }
@@ -1151,6 +1227,33 @@ pub(crate) async fn process_event_triggers_multicall(
             .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
+        // Update contract index for on_events
+        let expected_for_range =
+            build_expected_factory_contracts_for_range(contracts, range_end + 1);
+        if let Some(expected) = expected_for_range.get(&contract_name) {
+            let rk = range_key(range_start, range_end);
+            let mut ci = read_contract_index(&sub_dir);
+            update_contract_index(&mut ci, &rk, expected);
+            if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                tracing::warn!(
+                    "Failed to write contract index for {}.{}/on_events: {}",
+                    contract_name,
+                    function_name,
+                    e
+                );
+            } else if let Some(sm) = ctx.storage_manager {
+                let index_path = sub_dir.join("contract_index.json");
+                if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                    tracing::warn!(
+                        "Failed to upload contract index sidecar for {}.{}/on_events: {}",
+                        contract_name,
+                        function_name,
+                        e
+                    );
+                }
+            }
+        }
+
         // Send to decoder (range_end + 1 for exclusive convention)
         if let Some(tx) = ctx.decoder_tx {
             if let Some(decoder_results) = decoder_results {
@@ -1180,6 +1283,21 @@ pub(crate) async fn process_event_triggers_multicall(
                 range_end,
             )
             .await?;
+            let sub_dir =
+                ctx.output_dir.join(&contract_name).join(&function_name).join("on_events");
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range_end + 1);
+            if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
+                let rk = range_key(range_start, range_end);
+                let mut ci = read_contract_index(&sub_dir);
+                update_contract_index(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write contract index (empty on_events): {}",
+                        e
+                    );
+                }
+            }
         }
     }
 

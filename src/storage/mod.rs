@@ -30,6 +30,7 @@
 //! ```
 
 mod cached;
+pub mod contract_index;
 mod data_loader;
 pub mod decoded_index;
 mod error;
@@ -52,7 +53,7 @@ pub use manifest::{ManifestManager, S3Manifest};
 pub use paths::BlockRange;
 pub use retry::RetryQueue;
 pub use s3::S3Backend;
-pub use upload::upload_parquet_to_s3;
+pub use upload::{upload_parquet_to_s3, upload_sidecar_to_s3};
 
 use std::path::PathBuf;
 use std::sync::Arc;

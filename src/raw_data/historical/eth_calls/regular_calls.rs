@@ -23,6 +23,12 @@ use super::types::{
     EthCallCollectionError, EthCallContext, FrequencyState,
 };
 use crate::raw_data::historical::factories::FactoryAddressData;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
+    read_contract_index, update_contract_index, write_contract_index,
+};
+use crate::storage::upload_sidecar_to_s3;
+use crate::types::config::contract::Contracts;
 use crate::types::config::eth_call::{encode_call_with_params, EthCallConfig};
 
 #[allow(clippy::too_many_arguments)]
@@ -35,6 +41,7 @@ pub(crate) async fn process_factory_range(
     max_params: usize,
     frequency_state: &mut FrequencyState,
     mut pending_writes: Option<&mut AbortOnDropHandles>,
+    contracts: &Contracts,
 ) -> Result<(), EthCallCollectionError> {
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
     for addrs in factory_data.addresses_by_block.values() {
@@ -69,14 +76,44 @@ pub(crate) async fn process_factory_range(
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
             if ctx.existing_files.contains(&rel_path) {
-                tracing::debug!(
-                    "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
-                    collection_name,
-                    function_name,
-                    range.start,
-                    range.end - 1
-                );
-                continue;
+                // File exists locally, but check contract index for missing contracts
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(contracts, range.end);
+                if let Some(expected) = expected_for_range.get(collection_name) {
+                    let index_dir = ctx.output_dir.join(collection_name).join(&function_name);
+                    let index = read_contract_index(&index_dir);
+                    let rk = range_key(range.start, range.end - 1);
+                    let missing = get_missing_contracts(&index, &rk, expected);
+                    if !missing.is_empty() {
+                        tracing::info!(
+                            "Factory eth_calls {}.{} blocks {}-{}: file exists but contract index has missing contracts: {:?}",
+                            collection_name,
+                            function_name,
+                            range.start,
+                            range.end - 1,
+                            missing.keys().collect::<Vec<_>>()
+                        );
+                        // Fall through to re-process
+                    } else {
+                        tracing::debug!(
+                            "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists, contract index complete)",
+                            collection_name,
+                            function_name,
+                            range.start,
+                            range.end - 1
+                        );
+                        continue;
+                    }
+                } else {
+                    tracing::debug!(
+                        "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
+                        collection_name,
+                        function_name,
+                        range.start,
+                        range.end - 1
+                    );
+                    continue;
+                }
             }
 
             let param_combinations = generate_param_combinations(&call_config.params)?;
@@ -227,7 +264,7 @@ pub(crate) async fn process_factory_range(
             let finalize_params = FinalizeRegularParams {
                 results: all_results,
                 max_params,
-                sub_dir,
+                sub_dir: sub_dir.clone(),
                 file_name,
                 log_label: "factory eth_call".to_string(),
                 s3_data_type: format!("raw/eth_calls/{}/{}", collection_name, function_name),
@@ -254,6 +291,33 @@ pub(crate) async fn process_factory_range(
             } else {
                 finalize_regular_results(finalize_params).await?;
             }
+
+            // Update contract index after successful write
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range.end);
+            if let Some(expected) = expected_for_range.get(collection_name) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut index = read_contract_index(&sub_dir);
+                update_contract_index(&mut index, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &index) {
+                    tracing::warn!(
+                        "Failed to write contract index for {}.{}: {}",
+                        collection_name,
+                        function_name,
+                        e
+                    );
+                } else if let Some(sm) = ctx.storage_manager {
+                    let index_path = sub_dir.join("contract_index.json");
+                    if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                        tracing::warn!(
+                            "Failed to upload contract index sidecar for {}.{}: {}",
+                            collection_name,
+                            function_name,
+                            e
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -272,6 +336,7 @@ pub(crate) async fn process_factory_range_multicall(
     frequency_state: &mut FrequencyState,
     multicall3_address: Address,
     mut pending_writes: Option<&mut AbortOnDropHandles>,
+    contracts: &Contracts,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
     let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
@@ -310,14 +375,44 @@ pub(crate) async fn process_factory_range_multicall(
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
 
             if ctx.existing_files.contains(&rel_path) {
-                tracing::debug!(
-                    "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
-                    collection_name,
-                    function_name,
-                    range.start,
-                    range.end - 1
-                );
-                continue;
+                // File exists locally, but check contract index for missing contracts
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(contracts, range.end);
+                if let Some(expected) = expected_for_range.get(collection_name) {
+                    let index_dir = ctx.output_dir.join(collection_name).join(&function_name);
+                    let index = read_contract_index(&index_dir);
+                    let rk = range_key(range.start, range.end - 1);
+                    let missing = get_missing_contracts(&index, &rk, expected);
+                    if !missing.is_empty() {
+                        tracing::info!(
+                            "Factory eth_calls {}.{} blocks {}-{}: file exists but contract index has missing contracts: {:?}",
+                            collection_name,
+                            function_name,
+                            range.start,
+                            range.end - 1,
+                            missing.keys().collect::<Vec<_>>()
+                        );
+                        // Fall through to re-process
+                    } else {
+                        tracing::debug!(
+                            "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists, contract index complete)",
+                            collection_name,
+                            function_name,
+                            range.start,
+                            range.end - 1
+                        );
+                        continue;
+                    }
+                } else {
+                    tracing::debug!(
+                        "Skipping factory eth_calls for {}.{} blocks {}-{} (already exists)",
+                        collection_name,
+                        function_name,
+                        range.start,
+                        range.end - 1
+                    );
+                    continue;
+                }
             }
 
             let param_combinations = generate_param_combinations(&call_config.params)?;
@@ -492,7 +587,7 @@ pub(crate) async fn process_factory_range_multicall(
             let finalize_params = FinalizeRegularParams {
                 results: std::mem::take(results),
                 max_params,
-                sub_dir,
+                sub_dir: sub_dir.clone(),
                 file_name,
                 log_label: "multicall factory eth_call".to_string(),
                 s3_data_type: format!(
@@ -517,6 +612,33 @@ pub(crate) async fn process_factory_range_multicall(
                 writes.push(handle);
             } else {
                 finalize_regular_results(finalize_params).await?;
+            }
+
+            // Update contract index after successful write
+            let expected_for_range =
+                build_expected_factory_contracts_for_range(contracts, range.end);
+            if let Some(expected) = expected_for_range.get(&group.collection_name) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut index = read_contract_index(&sub_dir);
+                update_contract_index(&mut index, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &index) {
+                    tracing::warn!(
+                        "Failed to write contract index for {}.{}: {}",
+                        group.collection_name,
+                        group.function_name,
+                        e
+                    );
+                } else if let Some(sm) = ctx.storage_manager {
+                    let index_path = sub_dir.join("contract_index.json");
+                    if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                        tracing::warn!(
+                            "Failed to upload contract index sidecar for {}.{}: {}",
+                            group.collection_name,
+                            group.function_name,
+                            e
+                        );
+                    }
+                }
             }
         }
     }
