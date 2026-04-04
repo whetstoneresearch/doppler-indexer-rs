@@ -17,9 +17,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -902,17 +899,8 @@ fn write_compaction_parquet(
     schema: Arc<Schema>,
     columns: Vec<ArrayRef>,
 ) -> Result<(), CompactionError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let batch = RecordBatch::try_new(schema, columns)?;
-    let file = std::fs::File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
+    crate::storage::atomic_write_parquet(&batch, path)?;
     Ok(())
 }
 

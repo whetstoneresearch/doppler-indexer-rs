@@ -12,8 +12,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::{ArrowWriter, ProjectionMask};
-use parquet::file::properties::WriterProperties;
+use parquet::arrow::ProjectionMask;
 use thiserror::Error;
 
 use crate::raw_data::historical::receipts::LogData;
@@ -700,16 +699,7 @@ fn write_factory_records_to_parquet(
     ];
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -937,15 +927,7 @@ fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollecti
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
