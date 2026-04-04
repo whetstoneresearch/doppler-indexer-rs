@@ -26,18 +26,22 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 
 ## Handler Matrix
 
-| Handler | Source | Swap Event | Liquidity Event | sqrtPriceX96 Source | Pool ID Source | Special |
-|---------|--------|-----------|-----------------|--------------------|----|---------|
-| V3SwapMetricsHandler | DopplerV3Pool | V3 Swap (has sqrtPriceX96) | — | From event | contract_address (20 bytes) | — |
-| V3LiquidityMetricsHandler | DopplerV3Pool | — | Mint/Burn | — | contract_address (20 bytes) | Insert-only |
-| LockableV3SwapMetricsHandler | DopplerLockableV3Pool | V3 Swap (has sqrtPriceX96) | — | From event | contract_address (20 bytes) | — |
-| LockableV3LiquidityMetricsHandler | DopplerLockableV3Pool | — | Mint/Burn | — | contract_address (20 bytes) | Insert-only |
-| V4BaseMetricsHandler | DopplerV4Hook | `Swap(int24, uint256, uint256)` | None (liquidity changes on swap) | Derived from tick via `tick_to_sqrt_price_x96()` | hook_address → pool_id via `v4_pool_configs` table | **Sequential**: in-memory proceeds tracker |
-| MulticurveMetricsHandler | UniswapV4MulticurveInitializerHook | V4 hook Swap (int128 amounts) | ModifyLiquidity (tuple PoolKey format) | getSlot0 on_event call | topics[3] (poolId) | — |
-| DecayMulticurveMetricsHandler | DecayMulticurveHook | V4 hook Swap (int128 amounts) | ModifyLiquidity (flat format, id in topics[1]) | getSlot0 on_event call | topics[3] (poolId) | — |
-| ScheduledMulticurveMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | V4 hook Swap (int128 amounts) | ModifyLiquidity (flat format, id in topics[1]) | getSlot0 on_event call | topics[3] (poolId) | — |
-| DhookMetricsHandler | DopplerHookInitializer | V4 hook Swap (int128 amounts) | ModifyLiquidity (tuple PoolKey format) | getSlot0 on_event call | topics[3] (poolId) | Initializer itself emits events |
-| MigrationPoolMetricsHandler | UniswapV4PoolManager + UniswapV4MigratorHook | PoolManager Swap (has sqrtPriceX96) | MigratorHook ModifyLiquidity | From event | topics[1] (id) | In-memory migration pool ID set for filtering |
+| Handler | Source | Event | sqrtPriceX96 Source | Pool ID Source | Phase | Special |
+|---------|--------|-------|--------------------|----|-------|---------|
+| V3SwapMetricsHandler | DopplerV3Pool | V3 Swap | From event | contract_address | 2 ✅ | — |
+| V3LiquidityMetricsHandler | DopplerV3Pool | Mint/Burn | — | contract_address | 2 ✅ | Insert-only |
+| LockableV3SwapMetricsHandler | DopplerLockableV3Pool | V3 Swap | From event | contract_address | 2 ✅ | — |
+| LockableV3LiquidityMetricsHandler | DopplerLockableV3Pool | Mint/Burn | — | contract_address | 2 ✅ | Insert-only |
+| MulticurveSwapMetricsHandler | UniswapV4MulticurveInitializerHook | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 3 ✅ | — |
+| MulticurveLiquidityMetricsHandler | UniswapV4MulticurveInitializerHook | ModifyLiquidity (tuple) | — | PoolKey::pool_id() | 3 ✅ | — |
+| DecayMulticurveSwapMetricsHandler | DecayMulticurveHook | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 3 ✅ | — |
+| DecayMulticurveLiquidityMetricsHandler | DecayMulticurveHook | ModifyLiquidity (flat) | — | extract_bytes32("id") | 3 ✅ | — |
+| ScheduledMulticurveSwapMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 3 ✅ | — |
+| ScheduledMulticurveLiquidityMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | ModifyLiquidity (flat) | — | extract_bytes32("id") | 3 ✅ | — |
+| DhookSwapMetricsHandler | DopplerHookInitializer | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 3 ✅ | Initializer emits events |
+| DhookLiquidityMetricsHandler | DopplerHookInitializer | ModifyLiquidity (tuple) | — | PoolKey::pool_id() | 3 ✅ | — |
+| V4BaseMetricsHandler | DopplerV4Hook | `Swap(int24, uint256, uint256)` | tick_to_sqrt_price_x96() | hook_address → v4_pool_configs | 4 | **Sequential** proceeds tracker |
+| MigrationPoolMetricsHandler | UniswapV4PoolManager + MigratorHook | PoolManager Swap + ModifyLiquidity | From event | topics[1] (id) | 5 | Migration pool ID filter |
 
 ---
 
@@ -82,23 +86,22 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 ```
 src/transformations/
 ├── util/
-│   ├── tick_math.rs             # NEW — tick_to_sqrt_price_x96(), port of TickMath.getSqrtRatioAtTick
-│   ├── pool_metadata.rs         # NEW — PoolMetadataCache (RwLock<HashMap>), quote_token_decimals()
-│   └── db/pool_metrics.rs       # NEW — upsert_pool_state(), insert_pool_snapshot(), insert_liquidity_delta()
+│   ├── tick_math.rs                    # tick_to_sqrt_price_x96() (Phase 1)
+│   ├── pool_metadata.rs               # PoolMetadataCache (Phase 1)
+│   └── db/pool_metrics.rs             # upsert_pool_state(), insert_pool_snapshot(), insert_liquidity_delta() (Phase 1)
 ├── event/
-│   ├── metrics/                 # NEW — shared metrics types
+│   ├── metrics/                        # Shared metrics types
 │   │   ├── mod.rs
-│   │   ├── accumulator.rs       # BlockAccumulator — per-pool per-block OHLC + volume aggregation
-│   │   └── swap_data.rs         # SwapInput, LiquidityInput, process_swaps(), process_liquidity_deltas()
-│   ├── v3/metrics.rs            # NEW
-│   ├── v4/metrics.rs            # NEW
-│   ├── multicurve/metrics.rs    # NEW
-│   ├── decay_multicurve/metrics.rs  # NEW
-│   ├── scheduled_multicurve/metrics.rs  # NEW
-│   ├── dhook/metrics.rs         # NEW
-│   └── migration_pool/          # NEW module
-│       ├── mod.rs
-│       └── metrics.rs
+│   │   ├── accumulator.rs             # BlockAccumulator (Phase 1)
+│   │   ├── swap_data.rs              # SwapInput, LiquidityInput, process_swaps(), process_liquidity_deltas(), refresh_cache_if_needed() (Phase 1, refactored Phase 3)
+│   │   └── v4_hook_extract.rs        # extract_v4_hook_swaps(), extract_tuple_modify_liquidity(), extract_flat_modify_liquidity() (Phase 3)
+│   ├── v3/metrics.rs                  # V3 swap + liquidity handlers (Phase 2)
+│   ├── multicurve/metrics.rs          # Multicurve swap + liquidity handlers (Phase 3)
+│   ├── decay_multicurve/metrics.rs    # Decay multicurve swap + liquidity handlers (Phase 3)
+│   ├── scheduled_multicurve/metrics.rs # Scheduled multicurve swap + liquidity handlers (Phase 3)
+│   ├── dhook/metrics.rs               # Dhook swap + liquidity handlers (Phase 3)
+│   ├── v4/metrics.rs                  # V4 base handler (Phase 4 — future)
+│   └── migration_pool/metrics.rs      # Migration pool handler (Phase 5 — future)
 ```
 
 ### Core types
@@ -110,6 +113,12 @@ src/transformations/
 - **process_swaps()**: Takes `Vec<SwapInput>` → groups by (pool_id, block_number) → builds accumulators → emits `Vec<DbOperation>` for pool_snapshots + pool_state.
 - **process_liquidity_deltas()**: Takes `Vec<LiquidityInput>` → emits `Vec<DbOperation>` for liquidity_deltas INSERT.
 
+### Shared extraction functions
+
+- **V3**: `extract_v3_swaps()`, `extract_v3_liquidity()` in `v3/metrics.rs` — extract from Swap/Mint/Burn events using `contract_address` as pool_id
+- **V4 hooks**: `extract_v4_hook_swaps()`, `extract_tuple_modify_liquidity()`, `extract_flat_modify_liquidity()` in `metrics/v4_hook_extract.rs` — extract from V4 hook events using `poolId` bytes32 field or computed from PoolKey
+- **refresh_cache_if_needed()**: in `metrics/swap_data.rs` — re-queries DB if swap pools are absent from cache; shared by all swap handlers
+
 ### Each handler's job
 
 Extract events from its source → normalize to SwapInput/LiquidityInput → call shared process functions. The per-handler code is thin: just event-specific field extraction.
@@ -118,38 +127,20 @@ Extract events from its source → normalize to SwapInput/LiquidityInput → cal
 
 ## Config Changes Required
 
-### Add getSlot0 on_event calls (4 files)
+### getSlot0 on_event calls ✅ (Phase 3)
 
-Target: `UniswapV4StateView`. Triggered by Swap events. Pool ID from topics[3].
+Added to all 4 hook contracts across all chain directories (15 JSON files). Each call targets `UniswapV4StateView`, triggered by the hook's Swap event, with pool ID from `topics[3]`.
 
-| Config File | Contract | Swap Event Source |
+| Config | Hook Contract | Chains |
 |---|---|---|
-| `config/contracts/base/multicurve.json` | UniswapV4MulticurveInitializerHook | topics[3] |
-| `config/contracts/base/decay_multicurve.json` | DecayMulticurveHook | topics[3] |
-| `config/contracts/base/scheduled_multicurve.json` | UniswapV4ScheduledMulticurveInitializerHook | topics[3] |
-| `config/contracts/base/dhook.json` | DopplerHookInitializer | topics[3] |
+| `multicurve.json` | UniswapV4MulticurveInitializerHook | base, baseSepolia |
+| `decay_multicurve.json` | DecayMulticurveHook | base, baseSepolia, sepolia |
+| `scheduled_multicurve.json` | UniswapV4ScheduledMulticurveInitializerHook | base, baseSepolia, mainnet, monad, sepolia |
+| `dhook.json` | DopplerHookInitializer | base, baseSepolia, mainnet, monad, sepolia |
 
-On_event call config pattern:
-```json
-{
-    "function": "getSlot0(bytes32)",
-    "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
-    "frequency": { "on_events": {
-        "source": "<contract_name>",
-        "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
-    }},
-    "target": "UniswapV4StateView",
-    "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
-}
-```
+### DopplerHookInitializer events ✅ (Phase 3)
 
-### Add DopplerHookInitializer events (dhook.json)
-
-Add to `DopplerHookInitializer.events[]`:
-```json
-{ "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },
-{ "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
-```
+Swap and ModifyLiquidity (tuple format) events added to `DopplerHookInitializer.events[]` across all dhook.json chain files.
 
 ### V4 base — no config change needed
 
@@ -171,324 +162,116 @@ sqrtPriceX96 derived from currentTick via `tick_to_sqrt_price_x96()` in handler 
 - All modules wired in `util/mod.rs`, `util/db/mod.rs`, `event/mod.rs`
 
 ### Key design decisions (for reference by later phases)
-- `pool_state` uses `RawSql` for conditional upsert (`WHERE block_number < EXCLUDED.block_number`). Handler must include source/source_version manually since RawSql skips auto-injection.
-- `pool_snapshots` uses standard `Upsert` with all columns as update_columns (idempotent). source/source_version are auto-injected by the executor.
-- `liquidity_deltas` uses standard `Insert`. source/source_version are auto-injected.
-- Quote token decimals hardcoded: WETH=18, USDC=6, USDT=6, EURC=6. Implemented in `pool_metadata::quote_token_decimals()`.
+- `pool_state` uses `DbOperation::Upsert` with `update_condition: Some("EXCLUDED.block_number > pool_state.block_number")`. The conditional update ensures stale retried blocks are no-ops (`affected_rows = 0`), which also prevents bogus rollback snapshots from being recorded.
+- `pool_snapshots` uses `DbOperation::Upsert` with all non-key columns as `update_columns` and no `update_condition` (unconditional, idempotent). source/source_version are auto-injected by the executor.
+- `liquidity_deltas` uses `DbOperation::Upsert` with `update_columns: vec![]` (ON CONFLICT DO NOTHING). source/source_version are auto-injected.
+- Quote token decimals: WETH=18, USDC=6, USDT=6, EURC=6. Resolved lazily on first `handle()` via `resolve_quote_decimals()` using `std::sync::Once` for thread safety.
 
 ---
 
 ## Phase 2: V3 Handlers ✅
 
-**Status**: Complete — `feat/pool-metrics-phase2` branch
+**Status**: Complete — PR #96
 
 **Delivered**:
-- `src/transformations/event/v3/metrics.rs` — Split into V3SwapMetricsHandler + V3LiquidityMetricsHandler (and Lockable variants) to prevent duplicate live executions from multi-trigger registration
-- `PoolMetadataCache`: `load_from_db()` no longer requires contracts, added `load_into()` for shared caches, `resolve_quote_decimals()` for lazy decimal resolution, `refresh()` for DB re-query on cache miss
-- Fixed `liquidity_deltas` from INSERT to Upsert with empty update_columns (ON CONFLICT DO NOTHING) to prevent duplicate key errors on re-runs
-- Updated DDL: `liquidity_deltas` changed from PRIMARY KEY to UNIQUE constraint including source/source_version
-- Registered in `v3/mod.rs` and `event/mod.rs`
-- `handler_dependencies()` added to all 4 handlers so create handlers run before metrics handlers within the same block, ensuring the shared `PoolMetadataCache` is populated before swap/liquidity processing
-- `PoolMetadataCache` crash recovery: rebuilt from `pools` table on startup via `load_into()` in `initialize()` — no separate persistence needed since create handlers already write to `pools`
+- `src/transformations/event/v3/metrics.rs` — `V3SwapMetricsHandler`, `V3LiquidityMetricsHandler`, `LockableV3SwapMetricsHandler`, `LockableV3LiquidityMetricsHandler`. Split swap/liquidity into separate handlers to avoid multi-trigger snapshot capture issues (see issue #95)
+- `PoolMetadataCache` additions: `load_into()` for shared cache instances, `resolve_quote_decimals()`, `refresh(contracts)` for DB re-query on cache miss with immediate decimal resolution under the same write lock
+- `liquidity_deltas` changed from INSERT to Upsert with `update_columns: vec![]` (ON CONFLICT DO NOTHING) — prevents duplicate key errors on re-runs
+- DDL: all three tables now use UNIQUE constraints including `source`/`source_version` instead of PRIMARY KEY; added `idx_*_reorg` indexes on `(chain_id, block_number)` for cleanup queries
+- `handler_dependencies()`: V3SwapMetricsHandler and V3LiquidityMetricsHandler depend on V3CreateHandler; Lockable variants depend on LockableV3CreateHandler
+- `PoolMetadataCache` crash recovery via `load_into()` in `initialize()` — no separate persistence needed
+
+**Correctness fixes applied during review (PRs #93, #94)**:
+- Removed pre-commit `insert_if_absent` from create handlers — cache was populated before DB commit, poisoning it on write failures
+- `refresh_cache_if_needed` now returns `Result` and propagates errors — missing pool metadata causes handler retry instead of silent data loss
+- `std::sync::Once` replaces `AtomicBool + Ordering::Relaxed` for decimal resolution — prevents concurrent catchup tasks from reading `quote_decimals = 18` before resolution completes
+- `refresh()` resolves quote decimals under the same write lock that inserts new entries — closes a two-lock race window
+- Live event paths (`process_events_message`, `try_process_pending_events`) now use `WithSnapshotCapture` for single-trigger handlers — swap handlers previously wrote `pool_state` with no rollback snapshots
+- Snapshot recording gated on `affected_rows > 0` — no-op conditional upserts no longer produce bogus rollback snapshots
+- Per-block fallback DELETE in `cleanup_reorg_tables` — was skipping entire tables when any orphaned block had a snapshot; now only skips the specific covered blocks per table
+- Retry loop checks completed ranges before executing — prevents duplicate snapshots from double-writing a handler that already committed
 
 ### Established patterns (reference for all future handlers)
 
-**Handler struct pattern**:
+**Handler struct pattern** (single-trigger swap handler):
 ```rust
-pub struct MyMetricsHandler {
-    metadata_cache: Arc<PoolMetadataCache>,   // shared across related handlers
-    decimals_resolved: AtomicBool,            // guards one-time resolve in handle()
+pub struct MySwapMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,  // shared with sibling handlers
+    decimals_init: std::sync::Once,          // guards one-time resolve in handle()
+    chain_id: u64,
+    db_pool: OnceLock<Pool>,                 // set in initialize(), used by refresh_cache_if_needed
 }
 ```
 
 **Lifecycle**:
-1. `register_handlers()`: create shared `Arc<PoolMetadataCache>`, construct handlers
-2. `initialize(&self, db_pool)`: call `self.metadata_cache.load_into(db_pool, 8453)` — loads pools from DB, skips if already loaded by sibling handler
-3. First `handle()`: call `self.metadata_cache.resolve_quote_decimals(&ctx.contracts)` guarded by `AtomicBool` — resolves WETH=18, USDC=6, USDT=6, EURC=6
-4. Every `handle()`: extract events → normalize to `SwapInput`/`LiquidityInput` → delegate to `process_swaps()`/`process_liquidity_deltas()`
+1. `register_handlers()`: create shared `Arc<PoolMetadataCache>`, construct handlers, pass `Arc::clone` to each
+2. `initialize(&self, db_pool)`: call `self.metadata_cache.load_into(db_pool, chain_id)` — loads pools from DB, is a no-op if sibling handler already loaded. Store `db_pool.inner().clone()` in `self.db_pool`.
+3. First `handle()`: call `self.decimals_init.call_once(|| self.metadata_cache.resolve_quote_decimals(&ctx.contracts))` — `call_once` blocks all concurrent callers until done, resolves WETH=18, USDC=6, USDT=6, EURC=6
+4. Every `handle()`: call `refresh_cache_if_needed(...).await?` — re-queries DB if any swap pool is absent from cache. Returns `Err` on DB failure or if pools still missing after refresh; this causes the handler to fail and be retried.
+5. Delegate to `process_swaps()` / `process_liquidity_deltas()`
 
-**Extraction helpers**: defined as module-level `fn` (not methods) to share between two handler structs:
+**Extraction helpers**: defined as module-level `fn` to share between handler structs:
 ```rust
 fn extract_v3_swaps(ctx: &TransformationContext, source: &str) -> Result<Vec<SwapInput>, TransformationError>
 fn extract_v3_liquidity(ctx: &TransformationContext, source: &str) -> Result<Vec<LiquidityInput>, TransformationError>
 ```
 
+**Reorg tables declaration**:
+- Swap handlers: `reorg_tables() = ["pool_state", "pool_snapshots"]` — snapshot capture required; single-trigger only
+- Liquidity handlers: `reorg_tables() = ["liquidity_deltas"]` — append-only; fallback DELETE is correct; safe for multi-trigger
+
 **Registration pattern** in `event/mod.rs`:
 ```rust
-v3::metrics::register_handlers(registry);
+v3::metrics::register_handlers(registry, chain_id, Arc::clone(&metadata_cache));
 ```
 
 ---
 
-## Phase 3: V4 Hook Handlers
+## Phase 3: V4 Hook Handlers ✅
+
+**Status**: Complete
 
 **Goal**: Add metrics for multicurve, decay, scheduled, and dhook pools.
 
-### Tasks
-1. Config changes: add getSlot0 on_event calls to 4 config files
-2. Config change: add Swap + ModifyLiquidity events to DopplerHookInitializer in dhook.json
-3. Implement `multicurve/metrics.rs` — MulticurveMetricsHandler
-4. Implement `decay_multicurve/metrics.rs` — DecayMulticurveMetricsHandler
-5. Implement `scheduled_multicurve/metrics.rs` — ScheduledMulticurveMetricsHandler
-6. Implement `dhook/metrics.rs` — DhookMetricsHandler
-7. Register all handlers in their respective `mod.rs` + `event/mod.rs`
-8. Test: `cargo build`, `cargo test`, verify on_event call configs work
+**Delivered**:
+- Config changes: getSlot0 on_event calls added to all 4 hook contract configs across all chain directories (15 JSON files total)
+- Config change: Swap + ModifyLiquidity events added to DopplerHookInitializer in all dhook.json files
+- `src/transformations/event/metrics/v4_hook_extract.rs` — shared extraction functions: `extract_v4_hook_swaps()`, `extract_tuple_modify_liquidity()`, `extract_flat_modify_liquidity()`
+- `src/transformations/event/multicurve/metrics.rs` — MulticurveSwapMetricsHandler, MulticurveLiquidityMetricsHandler
+- `src/transformations/event/decay_multicurve/metrics.rs` — DecayMulticurveSwapMetricsHandler, DecayMulticurveLiquidityMetricsHandler
+- `src/transformations/event/scheduled_multicurve/metrics.rs` — ScheduledMulticurveSwapMetricsHandler, ScheduledMulticurveLiquidityMetricsHandler
+- `src/transformations/event/dhook/metrics.rs` — DhookSwapMetricsHandler, DhookLiquidityMetricsHandler
+- `refresh_cache_if_needed()` moved from `v3/metrics.rs` to shared `metrics/swap_data.rs`
+- All 8 handlers registered in their respective `mod.rs` + `event/mod.rs`
 
-### Config changes needed
+**Key design decisions**:
+- Split into swap + liquidity handlers per pool type (same rationale as Phase 2: avoids multi-trigger snapshot capture issues)
+- Each pool type gets its own `Arc<PoolMetadataCache>` (not shared with create handlers since create handlers don't use the cache)
+- V4 hook swap handlers declare `call_dependencies` on `getSlot0` to ensure the on_event call results are available before handle() runs
+- Shared extraction functions in `metrics/v4_hook_extract.rs` avoid code duplication across 4 handler files
+- Two ModifyLiquidity extraction variants: tuple format (multicurve, dhook) computes pool_id from PoolKey, flat format (decay, scheduled) reads pool_id from event topics
 
-**Add getSlot0 on_event call** to each hook contract config. The call targets `UniswapV4StateView` and passes the pool ID from the Swap event's topics[3]. Add a `"calls"` array to contracts that currently only have `"events"`.
+### Established patterns (reference for all future V4 hook handlers)
 
-**`config/contracts/base/multicurve.json`** — add to `UniswapV4MulticurveInitializerHook`:
-```json
-"calls": [{
-    "function": "getSlot0(bytes32)",
-    "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
-    "frequency": { "on_events": {
-        "source": "UniswapV4MulticurveInitializerHook",
-        "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
-    }},
-    "target": "UniswapV4StateView",
-    "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
-}]
-```
+**V4 hook extraction** — all 4 handlers use shared functions from `metrics/v4_hook_extract.rs`:
+- `extract_v4_hook_swaps(ctx, event_source, call_source)` — matches getSlot0 calls by `trigger_log_index`; pool_id from `extract_bytes32("poolId")`; sqrtPriceX96/tick from getSlot0 result; reverted calls are skipped with a warning
+- `extract_tuple_modify_liquidity(ctx, source)` — for multicurve/dhook; builds `PoolKey` from `key.*` fields, computes `pool_id = pool_key.pool_id()` (keccak256)
+- `extract_flat_modify_liquidity(ctx, source)` — for decay/scheduled; pool_id from `extract_bytes32("id")`
 
-**`config/contracts/base/decay_multicurve.json`** — add to `DecayMulticurveHook`:
-Same call config but `"source": "DecayMulticurveHook"`.
+**call_dependencies**: Swap handlers declare `vec![(hook_contract_name, "getSlot0")]`. The `source_name` on decoded calls is set from `EventTriggeredCallConfig.contract_name` (the hook contract where the call is configured, NOT the target `UniswapV4StateView`).
 
-**`config/contracts/base/scheduled_multicurve.json`** — add to `UniswapV4ScheduledMulticurveInitializerHook`:
-Same call config but `"source": "UniswapV4ScheduledMulticurveInitializerHook"`.
+**handler_dependencies**: Both swap and liquidity handlers depend on their respective Create handler (e.g., `V4MulticurveCreateHandler`).
 
-**`config/contracts/base/dhook.json`** — add events AND call to `DopplerHookInitializer`:
-```json
-"events": [
-    { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
-    { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },
-    { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
-],
-"calls": [
-    // ... existing getState, getBeneficiaries calls ...
-    {
-        "function": "getSlot0(bytes32)",
-        "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
-        "frequency": { "on_events": {
-            "source": "DopplerHookInitializer",
-            "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
-        }},
-        "target": "UniswapV4StateView",
-        "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
-    }
-]
-```
-
-**Important**: The `"event"` field in `frequency.on_events` is keccak-hashed by `compute_event_signature_hash()` in `src/raw_data/historical/eth_calls/event_triggers.rs` and matched against log topic0. It must be the ABI-canonical form (types only, no names, no `indexed`). Test with one hook first (e.g., DecayMulticurveHook) to verify the format works before applying to all 4 configs.
-
-### How to implement V4 hook handlers using Phase 2 patterns
-
-Each handler follows the same struct + lifecycle pattern from Phase 2 (see `src/transformations/event/v3/metrics.rs`). The key differences are in event extraction.
-
-**Handler struct** (identical to V3):
+**Registration** in `event/mod.rs` — each pool type creates its own `Arc<PoolMetadataCache>`:
 ```rust
-pub struct MulticurveMetricsHandler {
-    metadata_cache: Arc<PoolMetadataCache>,
-    decimals_resolved: AtomicBool,
-}
+let multicurve_cache = Arc::new(PoolMetadataCache::new());
+multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 ```
 
-**Swap extraction** — V4 hooks emit a different Swap signature. The key differences from V3:
-- `amount0`/`amount1` are `int128` (decoded as I256 by the decoder — use `extract_int256`)
-- No sqrtPriceX96/tick/liquidity in the event itself — get from the getSlot0 on_event call
-- Pool ID from the `poolId` param (bytes32), not from `contract_address`
-
-```rust
-fn extract_v4_hook_swaps(
-    ctx: &TransformationContext,
-    source: &str,         // e.g., "DecayMulticurveHook"
-    call_source: &str,    // e.g., "DecayMulticurveHook" (where getSlot0 is configured)
-) -> Result<Vec<SwapInput>, TransformationError> {
-    let mut swaps = Vec::new();
-    for event in ctx.events_of_type(source, "Swap") {
-        let pool_id = event.extract_bytes32("poolId")?;
-
-        // Find the matching getSlot0 call for this swap event
-        let slot0 = ctx.calls_of_type(call_source, "getSlot0")
-            .find(|call| call.trigger_log_index == Some(event.log_index))
-            .ok_or_else(|| TransformationError::MissingData(format!(
-                "No getSlot0 call for swap at block {} log_index {}",
-                event.block_number, event.log_index
-            )))?;
-
-        if slot0.is_reverted {
-            tracing::warn!(
-                "getSlot0 reverted for pool {} at block {}, skipping",
-                hex::encode(pool_id), event.block_number
-            );
-            continue;
-        }
-
-        let sqrt_price_x96 = slot0.extract_uint256("sqrtPriceX96")?;
-        let tick = slot0.extract_i32_flexible("tick")?;
-
-        swaps.push(SwapInput {
-            pool_id: pool_id.to_vec(),
-            block_number: event.block_number,
-            block_timestamp: event.block_timestamp,
-            log_index: event.log_index,
-            amount0: event.extract_int256("amount0")?,
-            amount1: event.extract_int256("amount1")?,
-            sqrt_price_x96,
-            tick,
-            liquidity: U256::ZERO,  // not in event; populated by TVL pass later
-        });
-    }
-    Ok(swaps)
-}
-```
-
-**Note on `call_source`**: The getSlot0 on_event call is configured on the hook contract (e.g., `DecayMulticurveHook`). But the executor stores the call result under the *target* contract name (`UniswapV4StateView`) with the function name `getSlot0`. So the lookup should be:
-```rust
-ctx.calls_of_type("UniswapV4StateView", "getSlot0")
-```
-Wait — this is wrong. On-event calls are stored under the source contract name, not the target. Need to verify. Check `src/raw_data/historical/eth_calls/event_triggers.rs` to see what `source_name` is set to on the decoded call result. The `contract_name` on `EventTriggeredCallConfig` is the contract where the call config is defined (the hook), but the call is executed against the target address. The decoded result's `source_name` is set from the config's contract_name. So the lookup uses the hook's contract name as source, not `UniswapV4StateView`.
-
-**Actually**: look at how the existing on_event calls work. In `DecayMulticurveInitializer`, the getState call has no target override — it calls itself. The source_name on the decoded call matches the contract name. For getSlot0 with `"target": "UniswapV4StateView"`, the source_name is still the contract where the call is configured (e.g., `DecayMulticurveHook`). So the lookup is:
-```rust
-ctx.calls_of_type("DecayMulticurveHook", "getSlot0")
-```
-
-**Verify this** by checking what `source_name` is set to in the on_event call collection code. Look at `EventTriggeredCallConfig.contract_name` and how it flows to `DecodedCall.source_name`.
-
-**ModifyLiquidity extraction** — two different event formats:
-
-**Tuple format** (multicurve, dhook) — `ModifyLiquidity((PoolKey) key, (Params) params)`:
-```rust
-fn extract_tuple_modify_liquidity(
-    ctx: &TransformationContext,
-    source: &str,
-) -> Result<Vec<LiquidityInput>, TransformationError> {
-    let mut deltas = Vec::new();
-    for event in ctx.events_of_type(source, "ModifyLiquidity") {
-        // Compute pool_id from PoolKey fields
-        let pool_key = PoolKey {
-            currency0: event.extract_address("key.currency0")?.into(),
-            currency1: event.extract_address("key.currency1")?.into(),
-            fee: event.extract_u32("key.fee")?,
-            tick_spacing: event.extract_i32_flexible("key.tickSpacing")?,
-            hooks: event.extract_address("key.hooks")?.into(),
-        };
-        let pool_id = pool_key.pool_id();
-
-        deltas.push(LiquidityInput {
-            pool_id: pool_id.to_vec(),
-            block_number: event.block_number,
-            log_index: event.log_index,
-            tick_lower: event.extract_i32_flexible("params.tickLower")?,
-            tick_upper: event.extract_i32_flexible("params.tickUpper")?,
-            liquidity_delta: event.extract_int256("params.liquidityDelta")?,
-        });
-    }
-    Ok(deltas)
-}
-```
-
-**Flat format** (decay, scheduled) — `ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)`:
-```rust
-fn extract_flat_modify_liquidity(
-    ctx: &TransformationContext,
-    source: &str,
-) -> Result<Vec<LiquidityInput>, TransformationError> {
-    let mut deltas = Vec::new();
-    for event in ctx.events_of_type(source, "ModifyLiquidity") {
-        let pool_id = event.extract_bytes32("id")?;
-
-        deltas.push(LiquidityInput {
-            pool_id: pool_id.to_vec(),
-            block_number: event.block_number,
-            log_index: event.log_index,
-            tick_lower: event.extract_i32_flexible("tickLower")?,
-            tick_upper: event.extract_i32_flexible("tickUpper")?,
-            liquidity_delta: event.extract_int256("liquidityDelta")?,
-        });
-    }
-    Ok(deltas)
-}
-```
-
-### Per-handler summary
-
-| Handler | Source | Swap extraction | ModifyLiquidity extraction | getSlot0 call_source |
-|---------|--------|----------------|---------------------------|---------------------|
-| MulticurveMetricsHandler | UniswapV4MulticurveInitializerHook | `extract_v4_hook_swaps` | `extract_tuple_modify_liquidity` | UniswapV4MulticurveInitializerHook |
-| DecayMulticurveMetricsHandler | DecayMulticurveHook | `extract_v4_hook_swaps` | `extract_flat_modify_liquidity` | DecayMulticurveHook |
-| ScheduledMulticurveMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | `extract_v4_hook_swaps` | `extract_flat_modify_liquidity` | UniswapV4ScheduledMulticurveInitializerHook |
-| DhookMetricsHandler | DopplerHookInitializer | `extract_v4_hook_swaps` | `extract_tuple_modify_liquidity` | DopplerHookInitializer |
-
-### EventTrigger signatures
-
-Must match what's in the config JSON files. The registry uses `extract_event_name()` which takes the part before `(` as the event name for dispatch.
-
-**Multicurve + DHook (tuple ModifyLiquidity)**:
-```rust
-fn triggers(&self) -> Vec<EventTrigger> {
-    vec![
-        EventTrigger::new("UniswapV4MulticurveInitializerHook",
-            "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"),
-        EventTrigger::new("UniswapV4MulticurveInitializerHook",
-            "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))"),
-    ]
-}
-```
-
-**Decay + Scheduled (flat ModifyLiquidity)**:
-```rust
-fn triggers(&self) -> Vec<EventTrigger> {
-    vec![
-        EventTrigger::new("DecayMulticurveHook",
-            "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"),
-        EventTrigger::new("DecayMulticurveHook",
-            "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"),
-    ]
-}
-```
-
-### call_dependencies
-
-All 4 handlers declare the getSlot0 dependency so the validation at startup passes:
-```rust
-fn call_dependencies(&self) -> Vec<(String, String)> {
-    vec![("UniswapV4MulticurveInitializerHook".to_string(), "getSlot0".to_string())]
-}
-```
-
-**Note**: The `call_dependencies` source name must match the contract where the call is configured in the JSON, not the target. Verify this matches what `validate_call_dependencies()` checks against.
-
-### Shared extraction functions location
-
-The V4 hook extraction functions (`extract_v4_hook_swaps`, `extract_tuple_modify_liquidity`, `extract_flat_modify_liquidity`) are shared across 4 handlers. They should live in a shared location. Options:
-- `src/transformations/event/metrics/v4_hook.rs` — new file in the shared metrics module
-- Or inline in each handler's file (more duplication but simpler)
-
-Recommended: add `src/transformations/event/metrics/v4_hook.rs` with the shared extraction functions, and `pub mod v4_hook;` in `metrics/mod.rs`.
-
-### Registration
-
-In each handler module's `mod.rs` — add `pub mod metrics;`
-
-In `src/transformations/event/mod.rs` — add to `register_handlers()`:
-```rust
-multicurve::metrics::register_handlers(registry);
-decay_multicurve::metrics::register_handlers(registry);
-scheduled_multicurve::metrics::register_handlers(registry);
-dhook::metrics::register_handlers(registry);
-```
-
-Each handler's `register_handlers()` creates its own `Arc<PoolMetadataCache>` (not shared across pool types — each pool type may initialize at different times).
-
-### Key verification steps
-
-1. **on_event call format**: Start with one config (e.g., `decay_multicurve.json`), run the indexer for a small block range, and verify that getSlot0 calls appear in the decoded call parquet files. If the event signature hash doesn't match, no calls will be collected.
-2. **call source_name**: After getSlot0 calls are collected, verify the `source_name` on the `DecodedCall` matches what `ctx.calls_of_type(source, "getSlot0")` expects.
-3. **PoolKey field paths**: Verify that flattened field names like `"key.currency0"`, `"params.tickLower"` match what the decoder produces. Check existing tuple-format events in other handlers for the exact naming convention.
-4. **int128 amounts**: The Swap event has `int128 amount0, int128 amount1`. Verify the decoder produces these as values compatible with `extract_int256()` (the decoder likely widens them to I256).
+**Trigger signatures** (ABI-canonical, types only):
+- Swap: `Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)`
+- ModifyLiquidity (tuple): `ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))`
+- ModifyLiquidity (flat): `ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)`
 
 ---
 
@@ -579,5 +362,9 @@ Each handler's `register_handlers()` creates its own `Arc<PoolMetadataCache>` (n
 - **DopplerHookInitializer ModifyLiquidity**: tuple format `ModifyLiquidity((PoolKey) key, (ModifyLiquidityParams) params)`, same as multicurve
 - **Quote token decimals**: hardcoded lookup (WETH=18, USDC=6, USDT=6, EURC=6), extracted to shared util
 - **Indexed poolKey in Swap**: keccak hash of PoolKey = pool_id, so topics[2] = topics[3]
-- **getSlot0 on_event calls**: configured on hook contracts with `target: UniswapV4StateView`
+- **getSlot0 on_event calls**: configured on hook contracts with `target: UniswapV4StateView`; `source_name` on decoded calls = hook contract name (not target)
 - **TVL deferred**: liquidity_deltas written in parallel, TVL computed in a separate sequential pass (Phase 7)
+- **V4 hook swap/liquidity split**: same rationale as V3 — avoids multi-trigger snapshot capture issues
+- **V4 hook metadata caches**: each pool type gets its own `Arc<PoolMetadataCache>`, not shared with create handlers (create handlers don't use the cache)
+- **Shared V4 extraction functions**: `metrics/v4_hook_extract.rs` avoids duplication across 4 handler files
+- **`refresh_cache_if_needed` shared**: moved from `v3/metrics.rs` to `metrics/swap_data.rs` for reuse by all swap handlers
