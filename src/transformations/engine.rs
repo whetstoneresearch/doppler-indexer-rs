@@ -409,7 +409,17 @@ impl TransformationEngine {
                 Ok(ops) => {
                     if !ops.is_empty() {
                         let ops = inject_source_version(ops, handler_name, handler_version);
-                        db_pool.execute_transaction(ops).await?;
+                        match db_pool.execute_transaction(ops).await {
+                            Ok(()) => {
+                                handler.on_commit_success((range_start, range_end)).await?;
+                            }
+                            Err(e) => {
+                                handler.on_commit_failure((range_start, range_end)).await?;
+                                return Err(TransformationError::DatabaseError(e));
+                            }
+                        }
+                    } else {
+                        handler.on_commit_success((range_start, range_end)).await?;
                     }
                     Ok(Some((handler_key, range_start, range_end)))
                 }
@@ -691,7 +701,14 @@ impl TransformationEngine {
                 let mut processed = 0;
                 let mut skipped_ranges: Vec<(u64, u64)> = Vec::new();
 
-                let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
+                // Sequential handlers get a capacity-1 semaphore so ranges run
+                // one at a time in FIFO order (Tokio guarantees FIFO permit acquisition).
+                let semaphore_capacity = if handler.requires_sequential() {
+                    1
+                } else {
+                    self.handler_concurrency
+                };
+                let semaphore = Arc::new(Semaphore::new(semaphore_capacity));
                 let mut join_set: JoinSet<HandlerTaskResult> = JoinSet::new();
 
                 for (range_start, range_end) in &ranges_to_attempt {
