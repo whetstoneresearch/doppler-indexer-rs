@@ -86,6 +86,17 @@ pub trait TransformationHandler: Send + Sync + 'static {
     fn reorg_tables(&self) -> Vec<&'static str> {
         vec![]
     }
+
+    /// Whether this handler must process block ranges sequentially (one at a time, in order).
+    ///
+    /// When true, the catchup engine limits concurrency to 1 for this handler, relying on
+    /// Tokio's FIFO semaphore to guarantee ranges execute in ascending block order.
+    ///
+    /// Required for handlers that maintain cumulative in-memory state that depends on
+    /// block ordering (e.g., tracking running totals across block ranges).
+    fn requires_sequential(&self) -> bool {
+        false
+    }
 }
 
 /// Trigger for event-based handlers.

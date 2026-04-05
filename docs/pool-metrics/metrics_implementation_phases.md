@@ -40,7 +40,7 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 | ScheduledMulticurveLiquidityMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | ModifyLiquidity (flat) | — | extract_bytes32("id") | 3 ✅ | — |
 | DhookSwapMetricsHandler | DopplerHookInitializer | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 3 ✅ | Initializer emits events |
 | DhookLiquidityMetricsHandler | DopplerHookInitializer | ModifyLiquidity (tuple) | — | PoolKey::pool_id() | 3 ✅ | — |
-| V4BaseMetricsHandler | DopplerV4Hook | `Swap(int24, uint256, uint256)` | tick_to_sqrt_price_x96() | hook_address → v4_pool_configs | 4 | **Sequential** proceeds tracker |
+| V4BaseMetricsHandler | DopplerV4Hook | `Swap(int24, uint256, uint256)` | tick_to_sqrt_price_x96() | hook_address → v4_pool_configs | 4 ✅ | **Sequential** proceeds tracker |
 | MigrationPoolMetricsHandler | UniswapV4PoolManager + MigratorHook | PoolManager Swap + ModifyLiquidity | From event | topics[1] (id) | 5 | Migration pool ID filter |
 
 ---
@@ -74,7 +74,7 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 | Swap → pool_snapshots | Parallel OK | Per-block, idempotent upsert on conflict |
 | Swap → pool_state | Parallel OK | Conditional upsert (only if newer block) |
 | Mint/Burn/ModifyLiquidity → liquidity_deltas | Parallel OK | Append-only INSERT with PK |
-| V4 base Swap (proceeds) | Sequential | In-memory cumulative state |
+| V4 base Swap (proceeds) | **Sequential** (`requires_sequential=true`) | Cumulative totals require ordered per-pool deltas; enforced via capacity-1 FIFO semaphore in catchup |
 | TVL computation | Deferred | Separate future pass over liquidity_deltas |
 
 ---
@@ -100,7 +100,7 @@ src/transformations/
 │   ├── decay_multicurve/metrics.rs    # Decay multicurve swap + liquidity handlers (Phase 3)
 │   ├── scheduled_multicurve/metrics.rs # Scheduled multicurve swap + liquidity handlers (Phase 3)
 │   ├── dhook/metrics.rs               # Dhook swap + liquidity handlers (Phase 3)
-│   ├── v4/metrics.rs                  # V4 base handler (Phase 4 — future)
+│   ├── v4/metrics.rs                  # V4 base (DopplerV4Hook) handler (Phase 4)
 │   └── migration_pool/metrics.rs      # Migration pool handler (Phase 5 — future)
 ```
 
@@ -275,24 +275,26 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ---
 
-## Phase 4: V4 Base Handler
+## Phase 4: V4 Base Handler ✅
+
+**Status**: Complete
 
 **Goal**: Handle the unique cumulative-counter Swap event on DopplerV4Hook.
 
-### Tasks
-1. Implement `src/transformations/event/v4/metrics.rs` — V4BaseMetricsHandler
-2. Register in `v4/mod.rs`
-3. Test sequential processing with cumulative proceeds tracking
+**Delivered**:
+- `migrations/tables/v4_base_proceeds_state.sql` — checkpoint table for cumulative proceeds per pool
+- `src/transformations/event/v4/metrics.rs` — V4BaseMetricsHandler (9 passing tests)
+- `src/transformations/traits.rs` — `requires_sequential()` method added to TransformationHandler
+- `src/transformations/engine.rs` — capacity-1 FIFO semaphore for sequential handlers in catchup
 
-### Handler specifics
-- Source: `DopplerV4Hook` (factory collection)
-- Swap event: `Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)`
-- **No poolId in event**: map hook contract_address → pool_id via `v4_pool_configs` table (loaded on init into `HashMap<[u8;20], [u8;32]>`)
-- **No sqrtPriceX96 in event**: derive from currentTick via `tick_to_sqrt_price_x96()`
-- **Cumulative counters**: in-memory `RwLock<HashMap<Vec<u8>, (U256, U256)>>` for (last_totalProceeds, last_totalTokensSold). Compute per-swap deltas. Rebuild from pool_snapshots or a dedicated column on init.
-- **Sequential processing required**: this handler cannot be parallelized across block ranges
-- No liquidity events (liquidity only changes via swaps or post-migration MigratorHook events)
-- amount0/amount1 derived from proceeds/tokens_sold deltas using is_token_0 orientation
+**Key design decisions**:
+- **Sequential enforcement**: `requires_sequential() = true` causes the catchup engine to create a capacity-1 semaphore for this handler. Tokio's FIFO `acquire_owned()` guarantee ensures ranges execute in ascending order, preventing delta corruption.
+- **In-memory cache + durable checkpoint**: cumulative `(totalProceeds, totalTokensSold)` per pool is kept in a `RwLock<HashMap>` loaded from `v4_base_proceeds_state` at init and refilled on miss (for just the missing pool IDs, using `pool_id = ANY($4)`). Pools with no checkpoint get cached as `(0, 0)` so misses aren't re-queried. `handle()` reads from the cache, returns upserts to `v4_base_proceeds_state` inside the same transaction as the snapshot writes, and updates the cache optimistically. On restart the cache rehydrates from the last-committed checkpoint.
+- **hook_address → pool_id lookup**: loaded from `v4_pool_configs` at init, refreshed on cache miss. `handler_dependencies = ["V4CreateHandler"]` ensures the config exists.
+- **sqrtPriceX96**: derived from `currentTick` via `tick_to_sqrt_price_x96()` (no extra RPC call).
+- **amount0/amount1**: `proceeds_delta` = quote inflow (positive for pool), `tokens_delta` = base outflow (negative for pool). Signs flipped via `is_token_0` from metadata cache.
+- **liquidity**: set to `U256::ZERO` — not available from the V4 base Swap event.
+- **No liquidity handler**: DopplerV4Hook has no ModifyLiquidity events (the pool only sells tokens; migration liquidity is handled by Phase 5's MigratorHook handler).
 
 ---
 
@@ -368,3 +370,7 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 - **V4 hook metadata caches**: each pool type gets its own `Arc<PoolMetadataCache>`, not shared with create handlers (create handlers don't use the cache)
 - **Shared V4 extraction functions**: `metrics/v4_hook_extract.rs` avoids duplication across 4 handler files
 - **`refresh_cache_if_needed` shared**: moved from `v3/metrics.rs` to `metrics/swap_data.rs` for reuse by all swap handlers
+- **Sequential handlers**: `TransformationHandler::requires_sequential()` method gates the catchup semaphore at capacity 1, with Tokio's FIFO permit ordering guaranteeing ascending-range execution. Per-handler, not global.
+- **V4 base proceeds state**: in-memory `RwLock<HashMap<[u8;32], (U256, U256)>>` cache + durable `v4_base_proceeds_state` checkpoint table. Loaded at init, refilled only for missing pool IDs via `pool_id = ANY($4)`. Optimistic update on commit; restart rehydrates from checkpoint. Minimizes DB reads while staying durable across process restarts.
+- **V4 base amount signs**: `proceeds_delta` is quote inflow, `tokens_delta` is base outflow. `is_token_0=true` → `amount0 = -tokens_delta`, `amount1 = proceeds_delta`; reversed for `is_token_0=false`.
+- **V4 base liquidity**: `U256::ZERO` — the V4 base Swap event doesn't carry liquidity, and Doppler auction "active liquidity" isn't meaningful in the same way as a v3 pool.
