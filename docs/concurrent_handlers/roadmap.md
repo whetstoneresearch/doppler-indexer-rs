@@ -118,6 +118,39 @@ Four independently-mergeable phases. Each ships value on its own and can be revi
 - **Largest behavior-change surface** of the four phases. Landed last intentionally. Gatekept on full live-mode integration test suite + manual replay on recent mainnet data before merge.
 - **Persistence ordering**: today, handler failures are persisted to status files synchronously from `process_events_message`. Must preserve the same "persist-before-returning-from-message" guarantee in the new flow.
 
+**Pick up Phase 2's call-dep deadlock workaround**
+
+Phase 2 shipped with a caller-side fix for a deadlock: when a handler's
+call-dep parquet files aren't yet on disk for a range `R`, its
+`(handler, R)` work item is deferred out of the scheduler, and any
+transitive dependents' `(handler, R)` items are cascade-deferred in
+the same pre-submit scan (topological handler iteration makes a
+single-level check compose into the full transitive cascade). That
+closed the correctness hole but left the catchup fundamentally
+batch-quantized: items whose prerequisites arrive mid-pass must wait
+for the current `DagScheduler::execute` batch to fully drain plus the
+1s inter-pass sleep before being considered again.
+
+Phase 4's `wait_for_calls` readiness condition (listed above) is the
+principled fix. Submit every `(handler, range)` item unconditionally,
+and have `wait_ready` gate on call-dep file availability as a second
+wait condition in addition to handler-dep completion. That retires
+the per-pass `next_pending` retry loop in `run_handler_catchup`
+entirely and lets items unblock the instant their prerequisites
+arrive, not at the next pass boundary. Doing this during Phase 4
+delivers the full catchup pipelining win as a side-effect of the
+live-mode unification.
+
+Concrete touchpoints when folding this in during Phase 4:
+- Remove the `deferred_starts` / `next_pending` cascade in
+  `run_handler_catchup` (introduced in Phase 2 as the deadlock fix).
+- Extend `WorkItem` with `call_deps` and thread them through
+  `wait_ready` as an additional readiness check.
+- Decide where the call-dep file-availability signal comes from in
+  catchup mode (filesystem polling, shared call-dep tracker, or
+  inotify) — this is the one place where catchup and live mode need
+  different signal sources for the same readiness condition.
+
 **Branch**: `feat/dag-live-mode`
 
 ---

@@ -102,8 +102,22 @@ where
 /// Read transaction addresses from a receipts parquet file.
 ///
 /// Returns a map from tx_hash → `TransactionAddresses`. Returns an empty map
-/// if the file is missing or cannot be read.
-pub(crate) fn read_receipt_addresses(
+/// if the file is missing or cannot be read. The parquet I/O is offloaded to
+/// a blocking thread via [`tokio::task::spawn_blocking`].
+pub(crate) async fn read_receipt_addresses(
+    raw_receipts_dir: &Path,
+    range_start: u64,
+    range_end: u64,
+) -> HashMap<[u8; 32], TransactionAddresses> {
+    let raw_receipts_dir = raw_receipts_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        read_receipt_addresses_sync(&raw_receipts_dir, range_start, range_end)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn read_receipt_addresses_sync(
     raw_receipts_dir: &Path,
     range_start: u64,
     range_end: u64,
@@ -320,7 +334,7 @@ impl CatchupLoader {
 
         let tx_addresses = match payload.kind {
             HandlerKind::Event => {
-                read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end)
+                read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await
             }
             HandlerKind::Call => HashMap::new(),
         };
@@ -402,5 +416,343 @@ impl CatchupLoader {
             |reader, path, src, func| reader.read_calls_from_file(path, src, func),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem};
+    use super::super::tracker::CompletionTracker;
+    use std::collections::{HashMap, HashSet};
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// (handler_name, range_start, kind) — kind is "start" or "end".
+    type EventLog = Arc<TokioMutex<Vec<(String, u64, &'static str)>>>;
+
+    struct Recorder {
+        events: EventLog,
+        fail_on: HashSet<(String, u64)>,
+        hold_ms: u64,
+    }
+
+    impl Recorder {
+        fn new(hold_ms: u64) -> Arc<Self> {
+            Arc::new(Self {
+                events: Arc::new(TokioMutex::new(Vec::new())),
+                fail_on: HashSet::new(),
+                hold_ms,
+            })
+        }
+
+        fn with_fails(hold_ms: u64, fail_on: &[(&str, u64)]) -> Arc<Self> {
+            Arc::new(Self {
+                events: Arc::new(TokioMutex::new(Vec::new())),
+                fail_on: fail_on.iter().map(|(n, r)| (n.to_string(), *r)).collect(),
+                hold_ms,
+            })
+        }
+
+        fn runner(
+            self: &Arc<Self>,
+        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+               + Send
+               + Sync
+               + Clone
+               + 'static
+        {
+            let rec = self.clone();
+            move |item: WorkItem| {
+                let rec = rec.clone();
+                Box::pin(async move {
+                    let key = (item.handler_name.clone(), item.range_start);
+                    rec.events
+                        .lock()
+                        .await
+                        .push((item.handler_name.clone(), item.range_start, "start"));
+
+                    if rec.hold_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(rec.hold_ms)).await;
+                    }
+
+                    rec.events
+                        .lock()
+                        .await
+                        .push((item.handler_name.clone(), item.range_start, "end"));
+
+                    if rec.fail_on.contains(&key) {
+                        Err(format!("test-forced failure at {}:{}", key.0, key.1))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+    }
+
+    fn item(name: &str, range_start: u64, deps: &[&str]) -> WorkItem {
+        WorkItem {
+            handler_name: name.to_string(),
+            range_start,
+            range_end: range_start + 1000,
+            dep_names: deps.iter().map(|s| s.to_string()).collect(),
+            payload: Box::new(()),
+        }
+    }
+
+    fn idx_start(events: &[(String, u64, &'static str)], name: &str, range: u64) -> usize {
+        events
+            .iter()
+            .position(|(n, r, k)| n == name && *r == range && *k == "start")
+            .unwrap_or_else(|| panic!("no start event for {}:{}", name, range))
+    }
+
+    fn idx_end(events: &[(String, u64, &'static str)], name: &str, range: u64) -> usize {
+        events
+            .iter()
+            .position(|(n, r, k)| n == name && *r == range && *k == "end")
+            .unwrap_or_else(|| panic!("no end event for {}:{}", name, range))
+    }
+
+    /// Simulates the engine's multi-pass build-items-with-deferral logic.
+    ///
+    /// Each "handler descriptor" is (name, handler_deps, has_call_deps).
+    /// `call_deps_ready` is the set of range_starts whose call-dep files
+    /// are available this pass.
+    fn build_items_with_deferral(
+        handlers: &[(&str, &[&str], bool)],
+        candidate_ranges: &[(u64, u64)],
+        call_deps_ready: &HashSet<u64>,
+        completed: &HashMap<String, HashSet<u64>>,
+    ) -> (Vec<WorkItem>, HashMap<String, Vec<(u64, u64)>>) {
+        let mut items = Vec::new();
+        let mut next_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+        let mut deferred_starts: HashMap<String, HashSet<u64>> = HashMap::new();
+
+        for &(name, handler_deps, has_call_deps) in handlers {
+            let handler_completed = completed.get(name).cloned().unwrap_or_default();
+
+            for &(range_start, range_end) in candidate_ranges {
+                if handler_completed.contains(&range_start) {
+                    continue;
+                }
+
+                // Check call-dep readiness.
+                if has_call_deps && !call_deps_ready.contains(&range_start) {
+                    next_pending
+                        .entry(name.to_string())
+                        .or_default()
+                        .push((range_start, range_end));
+                    deferred_starts
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(range_start);
+                    continue;
+                }
+
+                // Cascade: if any handler dep is deferred this pass, defer self.
+                if let Some(_blocking) = handler_deps.iter().find(|dep| {
+                    deferred_starts
+                        .get(**dep)
+                        .is_some_and(|starts| starts.contains(&range_start))
+                }) {
+                    next_pending
+                        .entry(name.to_string())
+                        .or_default()
+                        .push((range_start, range_end));
+                    deferred_starts
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(range_start);
+                    continue;
+                }
+
+                items.push(item(
+                    name,
+                    range_start,
+                    handler_deps,
+                ));
+            }
+        }
+
+        (items, next_pending)
+    }
+
+    /// Multi-pass catchup with call-dep deferral and cascade.
+    ///
+    /// Handlers: A (has call_deps), B (depends on A), C (independent).
+    /// Pass 1: call-deps not ready for ranges 100, 101 → A and B deferred,
+    ///         A:102 and B:102 submitted (B waits for A via tracker), C all submitted.
+    /// Pass 2: call-deps now ready → A:100,101 and B:100,101 submitted.
+    #[tokio::test]
+    async fn catchup_multi_pass_with_call_dep_deferral() {
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker.clone(), 8);
+        let rec = Recorder::new(5);
+
+        // Handlers in topological order: A first, then B (depends on A), then C.
+        let handlers: Vec<(&str, &[&str], bool)> = vec![
+            ("A", &[], true),        // has call_deps
+            ("B", &["A"], false),    // depends on A, no call_deps
+            ("C", &[], false),       // independent
+        ];
+        let ranges: Vec<(u64, u64)> = vec![(100, 1100), (101, 1101), (102, 1102)];
+        let completed: HashMap<String, HashSet<u64>> = HashMap::new();
+
+        // Pass 1: call-deps ready only for range 102.
+        let call_deps_ready: HashSet<u64> = [102].into_iter().collect();
+        let (items, next_pending) =
+            build_items_with_deferral(&handlers, &ranges, &call_deps_ready, &completed);
+
+        // Verify deferral: A:100, A:101 deferred; B:100, B:101 cascade-deferred.
+        assert!(next_pending.contains_key("A"));
+        assert!(next_pending.contains_key("B"));
+        assert!(!next_pending.contains_key("C"));
+        assert_eq!(next_pending["A"].len(), 2);
+        assert_eq!(next_pending["B"].len(), 2);
+
+        // Items submitted: A:102, B:102, C:100, C:101, C:102 = 5 items.
+        assert_eq!(items.len(), 5);
+        let item_keys: HashSet<(String, u64)> = items
+            .iter()
+            .map(|i| (i.handler_name.clone(), i.range_start))
+            .collect();
+        assert!(item_keys.contains(&("A".to_string(), 102)));
+        assert!(item_keys.contains(&("B".to_string(), 102)));
+        assert!(item_keys.contains(&("C".to_string(), 100)));
+        assert!(item_keys.contains(&("C".to_string(), 101)));
+        assert!(item_keys.contains(&("C".to_string(), 102)));
+
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 5);
+        for o in &outcomes {
+            assert_eq!(o.status, OutcomeStatus::Succeeded, "{:?}", o);
+        }
+
+        // Verify ordering: A:102 finishes before B:102 starts.
+        let events = rec.events.lock().await.clone();
+        assert!(idx_end(&events, "A", 102) < idx_start(&events, "B", 102));
+
+        // Update completed from pass 1 outcomes.
+        let mut completed = completed;
+        for o in &outcomes {
+            completed
+                .entry(o.handler_name.clone())
+                .or_default()
+                .insert(o.range_start);
+        }
+
+        // Pass 2: all call-deps ready now.
+        let call_deps_ready_all: HashSet<u64> = [100, 101, 102].into_iter().collect();
+        let pending_ranges: Vec<(u64, u64)> = next_pending
+            .values()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Build only for pending handlers.
+        let pending_handlers: Vec<(&str, &[&str], bool)> = handlers
+            .iter()
+            .filter(|(name, _, _)| next_pending.contains_key(*name))
+            .copied()
+            .collect();
+
+        let (items2, next_pending2) = build_items_with_deferral(
+            &pending_handlers,
+            &pending_ranges,
+            &call_deps_ready_all,
+            &completed,
+        );
+
+        assert!(next_pending2.is_empty(), "all should be submitted now");
+        assert_eq!(items2.len(), 4); // A:100, A:101, B:100, B:101
+
+        let rec2 = Recorder::new(5);
+        let outcomes2 = scheduler.execute(items2, rec2.runner()).await;
+        assert_eq!(outcomes2.len(), 4);
+        for o in &outcomes2 {
+            assert_eq!(o.status, OutcomeStatus::Succeeded, "{:?}", o);
+        }
+
+        // Verify ordering in pass 2: A finishes before B for each range.
+        let events2 = rec2.events.lock().await.clone();
+        assert!(idx_end(&events2, "A", 100) < idx_start(&events2, "B", 100));
+        assert!(idx_end(&events2, "A", 101) < idx_start(&events2, "B", 101));
+    }
+
+    /// Diamond DAG with cascade failure across ranges.
+    ///
+    /// A → B, A → C, B → D, C → D. A fails on range 101.
+    /// Ranges 100 and 102 should all succeed. Range 101: B, C, D cascade-fail.
+    #[tokio::test]
+    async fn catchup_cascade_failure_across_ranges() {
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker, 8);
+        let rec = Recorder::with_fails(5, &[("A", 101)]);
+
+        let handlers: Vec<(&str, &[&str], bool)> = vec![
+            ("A", &[], false),
+            ("B", &["A"], false),
+            ("C", &["A"], false),
+            ("D", &["B", "C"], false),
+        ];
+        let ranges: Vec<(u64, u64)> = vec![(100, 1100), (101, 1101), (102, 1102)];
+        let completed: HashMap<String, HashSet<u64>> = HashMap::new();
+        let all_ready: HashSet<u64> = [100, 101, 102].into_iter().collect();
+
+        let (items, next_pending) =
+            build_items_with_deferral(&handlers, &ranges, &all_ready, &completed);
+        assert!(next_pending.is_empty());
+        assert_eq!(items.len(), 12); // 4 handlers × 3 ranges
+
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 12);
+
+        let get = |name: &str, r: u64| {
+            outcomes
+                .iter()
+                .find(|o| o.handler_name == name && o.range_start == r)
+                .cloned()
+                .unwrap_or_else(|| panic!("no outcome for {}:{}", name, r))
+        };
+
+        // Range 100: all succeed.
+        assert_eq!(get("A", 100).status, OutcomeStatus::Succeeded);
+        assert_eq!(get("B", 100).status, OutcomeStatus::Succeeded);
+        assert_eq!(get("C", 100).status, OutcomeStatus::Succeeded);
+        assert_eq!(get("D", 100).status, OutcomeStatus::Succeeded);
+
+        // Range 101: A fails, B/C/D cascade.
+        assert!(matches!(
+            get("A", 101).status,
+            OutcomeStatus::HandlerFailed { .. }
+        ));
+        assert_eq!(
+            get("B", 101).status,
+            OutcomeStatus::DepCascadeFailed {
+                dep_name: "A".to_string()
+            }
+        );
+        assert_eq!(
+            get("C", 101).status,
+            OutcomeStatus::DepCascadeFailed {
+                dep_name: "A".to_string()
+            }
+        );
+        // D:101 cascades from B or C (whichever the tracker reports first).
+        assert!(matches!(
+            get("D", 101).status,
+            OutcomeStatus::DepCascadeFailed { .. }
+        ));
+
+        // Range 102: all succeed.
+        assert_eq!(get("A", 102).status, OutcomeStatus::Succeeded);
+        assert_eq!(get("B", 102).status, OutcomeStatus::Succeeded);
+        assert_eq!(get("C", 102).status, OutcomeStatus::Succeeded);
+        assert_eq!(get("D", 102).status, OutcomeStatus::Succeeded);
     }
 }

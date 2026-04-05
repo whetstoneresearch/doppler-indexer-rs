@@ -309,44 +309,49 @@ impl TransformationEngine {
 
     // ─── Range Scanning ──────────────────────────────────────────────
 
-    fn scan_available_ranges(
+    async fn scan_available_ranges(
         &self,
         base_dir: &Path,
     ) -> Result<Vec<(u64, u64)>, TransformationError> {
-        let mut ranges = HashSet::new();
+        let base_dir = base_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut ranges = HashSet::new();
 
-        if !base_dir.exists() {
-            return Ok(Vec::new());
-        }
+            if !base_dir.exists() {
+                return Ok(Vec::new());
+            }
 
-        fn scan_recursive(dir: &std::path::Path, ranges: &mut HashSet<(u64, u64)>) {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        scan_recursive(&path, ranges);
-                    } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                        if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
-                            let parts: Vec<&str> = file_name.split('-').collect();
-                            if parts.len() == 2 {
-                                if let (Ok(start), Ok(end)) =
-                                    (parts[0].parse::<u64>(), parts[1].parse::<u64>())
-                                {
-                                    ranges.insert((start, end + 1));
+            fn scan_recursive(dir: &std::path::Path, ranges: &mut HashSet<(u64, u64)>) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            scan_recursive(&path, ranges);
+                        } else if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                            if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
+                                let parts: Vec<&str> = file_name.split('-').collect();
+                                if parts.len() == 2 {
+                                    if let (Ok(start), Ok(end)) =
+                                        (parts[0].parse::<u64>(), parts[1].parse::<u64>())
+                                    {
+                                        ranges.insert((start, end + 1));
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        scan_recursive(base_dir, &mut ranges);
+            scan_recursive(&base_dir, &mut ranges);
 
-        let mut sorted: Vec<_> = ranges.into_iter().collect();
-        sorted.sort_by_key(|(start, _)| *start);
+            let mut sorted: Vec<_> = ranges.into_iter().collect();
+            sorted.sort_by_key(|(start, _)| *start);
 
-        Ok(sorted)
+            Ok(sorted)
+        })
+        .await
+        .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))?
     }
 
     // ─── Per-Handler Catchup ─────────────────────────────────────────
@@ -386,7 +391,7 @@ impl TransformationEngine {
             HandlerKind::Call => "Call",
         };
 
-        let available = self.scan_available_ranges(base_dir)?;
+        let available = self.scan_available_ranges(base_dir).await?;
 
         if available.is_empty() {
             tracing::info!(
@@ -527,12 +532,22 @@ impl TransformationEngine {
         // the call-dep parquet files weren't on disk yet.
         let mut ranges_pending: Option<HashMap<String, Vec<(u64, u64)>>> = None;
         let mut pass = 0u32;
+        // Bail only after several consecutive passes make zero progress, so that
+        // slowly-arriving call-dep files don't get abandoned.
+        const MAX_CONSECUTIVE_NO_PROGRESS: u32 = 3;
+        let mut consecutive_no_progress: u32 = 0;
 
         loop {
             pass += 1;
 
             let mut items: Vec<WorkItem> = Vec::new();
             let mut next_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+            // Parallel index into next_pending for O(1) cascade lookups.
+            // Updated in lock-step with next_pending whenever we defer a range.
+            let mut deferred_starts: HashMap<String, HashSet<u64>> = HashMap::new();
+            // Per-handler per-pass counters for observability.
+            // (submitted, call_dep_deferred, cascade_deferred).
+            let mut per_handler_counts: HashMap<String, (usize, usize, usize)> = HashMap::new();
 
             for ch in &handlers {
                 let name = ch.handler.name().to_string();
@@ -550,17 +565,16 @@ impl TransformationEngine {
                     };
 
                 // Scan call-dep file availability once per handler per pass.
-                let call_range_sets: Vec<HashSet<(u64, u64)>> = ch
-                    .call_deps
-                    .iter()
-                    .map(|(source, func)| {
-                        let dir = self.decoded_calls_dir.join(source).join(func);
-                        self.scan_available_ranges(&dir)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .collect()
-                    })
-                    .collect();
+                let mut call_range_sets: Vec<HashSet<(u64, u64)>> =
+                    Vec::with_capacity(ch.call_deps.len());
+                for (source, func) in &ch.call_deps {
+                    let dir = self.decoded_calls_dir.join(source).join(func);
+                    let ranges = self
+                        .scan_available_ranges(&dir)
+                        .await
+                        .unwrap_or_default();
+                    call_range_sets.push(ranges.into_iter().collect());
+                }
 
                 for (range_start, range_end) in candidate_ranges {
                     if completed.contains(&range_start) {
@@ -583,10 +597,47 @@ impl TransformationEngine {
                                 .entry(name.clone())
                                 .or_default()
                                 .push((range_start, range_end));
+                            deferred_starts
+                                .entry(name.clone())
+                                .or_default()
+                                .insert(range_start);
+                            per_handler_counts.entry(name.clone()).or_default().1 += 1;
                             continue;
                         }
                     }
 
+                    // Cascade: if any handler_dep is already deferred for this
+                    // range_start, defer this (handler, range) too. Submitting
+                    // it would hang the scheduler because its dep will never
+                    // be marked in the tracker for this pass. Topological
+                    // handler iteration (sorted above) guarantees deps are
+                    // processed before dependents in the same pass, so a
+                    // single-level check composes into full transitive cascade.
+                    if let Some(blocking) = ch.handler_deps.iter().find(|dep_name| {
+                        deferred_starts
+                            .get(dep_name.as_str())
+                            .is_some_and(|starts| starts.contains(&range_start))
+                    }) {
+                        tracing::debug!(
+                            "Handler {} deferring range {}-{}: upstream dep '{}' deferred",
+                            ch.handler.handler_key(),
+                            range_start,
+                            range_end,
+                            blocking
+                        );
+                        next_pending
+                            .entry(name.clone())
+                            .or_default()
+                            .push((range_start, range_end));
+                        deferred_starts
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(range_start);
+                        per_handler_counts.entry(name.clone()).or_default().2 += 1;
+                        continue;
+                    }
+
+                    per_handler_counts.entry(name.clone()).or_default().0 += 1;
                     items.push(WorkItem {
                         handler_name: name.clone(),
                         range_start,
@@ -602,6 +653,37 @@ impl TransformationEngine {
                             kind: ch.kind,
                         }),
                     });
+                }
+            }
+
+            // Per-handler summary of this pass's work (submitted / deferred).
+            // Iterate `handlers` for deterministic topological ordering.
+            for ch in &handlers {
+                let name = ch.handler.name();
+                let (submitted, call_dep_def, cascade_def) = per_handler_counts
+                    .get(name)
+                    .copied()
+                    .unwrap_or((0, 0, 0));
+                if submitted == 0 && call_dep_def == 0 && cascade_def == 0 {
+                    continue;
+                }
+                if call_dep_def == 0 && cascade_def == 0 {
+                    tracing::info!(
+                        "Handler {} catchup pass {}: submitting {} range(s)",
+                        ch.handler.handler_key(),
+                        pass,
+                        submitted
+                    );
+                } else {
+                    tracing::info!(
+                        "Handler {} catchup pass {}: submitting {} range(s), \
+                         deferring {} (call_deps not ready) + {} (upstream deferred)",
+                        ch.handler.handler_key(),
+                        pass,
+                        submitted,
+                        call_dep_def,
+                        cascade_def
+                    );
                 }
             }
 
@@ -625,8 +707,14 @@ impl TransformationEngine {
 
                 let mut succeeded = 0usize;
                 let mut cascade_failed = 0usize;
+                // Per-handler: (succeeded, failed, cascade_failed, panicked).
+                let mut per_handler_outcomes: HashMap<String, (usize, usize, usize, usize)> =
+                    HashMap::new();
 
                 for outcome in &outcomes {
+                    let counts = per_handler_outcomes
+                        .entry(outcome.handler_name.clone())
+                        .or_default();
                     match &outcome.status {
                         OutcomeStatus::Succeeded => {
                             self_completed
@@ -634,6 +722,7 @@ impl TransformationEngine {
                                 .or_default()
                                 .insert(outcome.range_start);
                             succeeded += 1;
+                            counts.0 += 1;
                         }
                         OutcomeStatus::HandlerFailed { reason } => {
                             tracing::error!(
@@ -649,6 +738,7 @@ impl TransformationEngine {
                                 .map(|ch| ch.handler.handler_key())
                                 .unwrap_or_else(|| outcome.handler_name.clone());
                             failed_items.push((key, outcome.range_start, reason.clone()));
+                            counts.1 += 1;
                         }
                         OutcomeStatus::DepCascadeFailed { dep_name } => {
                             tracing::warn!(
@@ -658,6 +748,7 @@ impl TransformationEngine {
                                 dep_name
                             );
                             cascade_failed += 1;
+                            counts.2 += 1;
                         }
                         OutcomeStatus::Panicked => {
                             tracing::error!(
@@ -672,7 +763,40 @@ impl TransformationEngine {
                                 .unwrap_or_else(|| outcome.handler_name.clone());
                             failed_items
                                 .push((key, outcome.range_start, "task panicked".to_string()));
+                            counts.3 += 1;
                         }
+                    }
+                }
+
+                // Per-handler outcome summary. Log anything with non-success
+                // activity at info, clean runs at debug to reduce log noise.
+                for ch in &handlers {
+                    let name = ch.handler.name();
+                    let Some(&(ok, failed, cascade, panicked)) =
+                        per_handler_outcomes.get(name)
+                    else {
+                        continue;
+                    };
+                    let total = ok + failed + cascade + panicked;
+                    if failed > 0 || cascade > 0 || panicked > 0 {
+                        tracing::info!(
+                            "Handler {} catchup pass {} result: {}/{} succeeded \
+                             ({} failed, {} cascade-failed, {} panicked)",
+                            ch.handler.handler_key(),
+                            pass,
+                            ok,
+                            total,
+                            failed,
+                            cascade,
+                            panicked
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Handler {} catchup pass {} result: {} range(s) ok",
+                            ch.handler.handler_key(),
+                            pass,
+                            ok
+                        );
                     }
                 }
 
@@ -689,18 +813,26 @@ impl TransformationEngine {
                 break;
             }
 
-            // Check for progress on call-dep-waiting ranges; bail if stuck.
+            // Check for progress on call-dep-waiting ranges; bail only after
+            // repeated passes with strictly zero progress.
             if let Some(ref prev) = ranges_pending {
                 let prev_count: usize = prev.values().map(|v| v.len()).sum();
                 let next_count: usize = next_pending.values().map(|v| v.len()).sum();
-                if next_count > 0 && next_count >= prev_count {
-                    tracing::warn!(
-                        "{} catchup: {} ranges still blocked by call dependencies, no progress after pass {}. Giving up.",
-                        kind_label,
-                        next_count,
-                        pass
-                    );
-                    break;
+                if next_count >= prev_count {
+                    consecutive_no_progress += 1;
+                    if consecutive_no_progress >= MAX_CONSECUTIVE_NO_PROGRESS {
+                        tracing::warn!(
+                            "{} catchup: {} ranges still blocked by call dependencies, \
+                             no progress for {} consecutive passes after pass {}. Giving up.",
+                            kind_label,
+                            next_count,
+                            consecutive_no_progress,
+                            pass
+                        );
+                        break;
+                    }
+                } else {
+                    consecutive_no_progress = 0;
                 }
             }
 
@@ -728,88 +860,12 @@ impl TransformationEngine {
 
     // ─── Receipt Address Reading ────────────────────────────────────
 
-    fn read_receipt_addresses(
+    async fn read_receipt_addresses(
         &self,
         range_start: u64,
         range_end: u64,
     ) -> HashMap<[u8; 32], TransactionAddresses> {
-        read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end)
-    }
-
-    // ─── Parquet Reading ─────────────────────────────────────────────
-
-    /// Read decoded parquet files for a set of triggers, spawning one blocking
-    /// read task per trigger.
-    ///
-    /// `resolve_paths` turns each `(source, name)` trigger into zero or more
-    /// file paths to read.  `read_file` performs the actual parquet read.
-    async fn read_decoded_parquet_for_triggers<T>(
-        &self,
-        triggers: &[(String, String)],
-        resolve_paths: impl Fn(&str, &str) -> Vec<PathBuf>,
-        read_file: impl Fn(Arc<HistoricalDataReader>, &Path, &str, &str) -> Result<Vec<T>, TransformationError>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Result<Vec<T>, TransformationError>
-    where
-        T: Send + 'static,
-    {
-        super::scheduler::loader::read_decoded_parquet(
-            self.historical_reader.clone(),
-            triggers,
-            resolve_paths,
-            read_file,
-        )
-        .await
-    }
-
-    async fn read_decoded_events_for_triggers(
-        &self,
-        range_start: u64,
-        range_end: u64,
-        event_triggers: &[(String, String)],
-    ) -> Result<Vec<DecodedEvent>, TransformationError> {
-        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-        let logs_dir = self.decoded_logs_dir.clone();
-
-        self.read_decoded_parquet_for_triggers(
-            event_triggers,
-            |source, event| vec![logs_dir.join(source).join(event).join(&file_name)],
-            |reader, path, src, evt| reader.read_events_from_file(path, src, evt),
-        )
-        .await
-    }
-
-    async fn read_decoded_calls_for_triggers(
-        &self,
-        range_start: u64,
-        range_end: u64,
-        call_triggers: &[(String, String)],
-    ) -> Result<Vec<DecodedCall>, TransformationError> {
-        let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-        let calls_dir = self.decoded_calls_dir.clone();
-
-        self.read_decoded_parquet_for_triggers(
-            call_triggers,
-            |source, function| {
-                let base_dir = calls_dir.join(source).join(function);
-                // Use first-match semantics: only the first existing path is returned,
-                // matching the original behavior where base > on_events > once priority
-                // prevents duplicate data when multiple paths exist.
-                [
-                    base_dir.join(&file_name),
-                    base_dir.join("on_events").join(&file_name),
-                    base_dir.join("once").join(&file_name),
-                ]
-                .into_iter()
-                .find(|p| p.exists())
-                .into_iter()
-                .collect()
-            },
-            |reader, path, src, func| reader.read_calls_from_file(path, src, func),
-        )
-        .await
+        read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await
     }
 
     // ─── Live Processing ─────────────────────────────────────────────
@@ -1172,7 +1228,7 @@ impl TransformationEngine {
         }
 
         // Build HandlerTasks and use executor
-        let tx_addresses = self.read_receipt_addresses(msg.range_start, msg.range_end);
+        let tx_addresses = self.read_receipt_addresses(msg.range_start, msg.range_end).await;
         let tasks: Vec<HandlerTask> = ready_handlers
             .into_iter()
             .map(|(handler, calls)| HandlerTask {
@@ -1612,7 +1668,7 @@ impl TransformationEngine {
             let mut tasks = Vec::new();
             for (_handler_key, event_data, handler) in ready_events {
                 let tx_addresses =
-                    self.read_receipt_addresses(event_data.range_start, event_data.range_end);
+                    self.read_receipt_addresses(event_data.range_start, event_data.range_end).await;
                 tasks.push(HandlerTask {
                     handler,
                     events: Arc::new(event_data.events),
@@ -1956,7 +2012,7 @@ impl TransformationEngine {
             .map(|c| (c.source_name.clone(), c.function_name.clone()))
             .collect();
 
-        let tx_addresses = self.read_receipt_addresses(range_start, range_end);
+        let tx_addresses = self.read_receipt_addresses(range_start, range_end).await;
         let events = Arc::new(events);
         let calls = Arc::new(calls);
 
