@@ -283,13 +283,13 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 **Delivered**:
 - `migrations/tables/v4_base_proceeds_state.sql` — checkpoint table for cumulative proceeds per pool
-- `src/transformations/event/v4/metrics.rs` — V4BaseMetricsHandler (8 passing tests)
+- `src/transformations/event/v4/metrics.rs` — V4BaseMetricsHandler (9 passing tests)
 - `src/transformations/traits.rs` — `requires_sequential()` method added to TransformationHandler
 - `src/transformations/engine.rs` — capacity-1 FIFO semaphore for sequential handlers in catchup
 
 **Key design decisions**:
 - **Sequential enforcement**: `requires_sequential() = true` causes the catchup engine to create a capacity-1 semaphore for this handler. Tokio's FIFO `acquire_owned()` guarantee ensures ranges execute in ascending order, preventing delta corruption.
-- **DB-read approach for cumulative state**: rather than purely in-memory counters (which would be wrong on retry after a failed transaction), each `handle()` reads the previous checkpoint from `v4_base_proceeds_state` and writes back the new totals as part of the same atomic transaction. This makes retries safe.
+- **In-memory cache + durable checkpoint**: cumulative `(totalProceeds, totalTokensSold)` per pool is kept in a `RwLock<HashMap>` loaded from `v4_base_proceeds_state` at init and refilled on miss (for just the missing pool IDs, using `pool_id = ANY($4)`). Pools with no checkpoint get cached as `(0, 0)` so misses aren't re-queried. `handle()` reads from the cache, returns upserts to `v4_base_proceeds_state` inside the same transaction as the snapshot writes, and updates the cache optimistically. On restart the cache rehydrates from the last-committed checkpoint.
 - **hook_address → pool_id lookup**: loaded from `v4_pool_configs` at init, refreshed on cache miss. `handler_dependencies = ["V4CreateHandler"]` ensures the config exists.
 - **sqrtPriceX96**: derived from `currentTick` via `tick_to_sqrt_price_x96()` (no extra RPC call).
 - **amount0/amount1**: `proceeds_delta` = quote inflow (positive for pool), `tokens_delta` = base outflow (negative for pool). Signs flipped via `is_token_0` from metadata cache.

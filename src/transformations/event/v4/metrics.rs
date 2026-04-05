@@ -6,17 +6,22 @@
 //! ## Design
 //!
 //! The V4 base swap event emits **cumulative** counters rather than per-swap deltas, so this
-//! handler must compute deltas by subtracting the previous cumulative values. The previous
-//! values are read from the `v4_base_proceeds_state` checkpoint table at the start of each
-//! batch and written back at the end. This DB-read approach (rather than purely in-memory
-//! state) ensures correctness across retries: if a transaction is rolled back, the next
-//! attempt re-reads the last committed checkpoint.
+//! handler must compute deltas by subtracting the previous cumulative values.
+//!
+//! Previous values live in an in-memory `RwLock<HashMap>`. The cache is:
+//!   - Populated from `v4_base_proceeds_state` at `initialize()`.
+//!   - Refilled on cache miss (only for the specific missing pool IDs).
+//!   - Updated optimistically inside `handle()` after computing deltas.
+//!
+//! Each `handle()` returns an upsert to `v4_base_proceeds_state` for every pool it touched,
+//! so the checkpoint table is always durable. On restart the cache is rebuilt from the
+//! checkpoint.
 //!
 //! ## Sequential processing
 //!
 //! `requires_sequential()` returns `true`. The catchup engine enforces one-at-a-time range
-//! execution via a capacity-1 FIFO semaphore, so the DB checkpoint is always up-to-date
-//! when the next range reads it.
+//! execution via a capacity-1 FIFO semaphore, so in-memory cache updates serialize naturally
+//! and the DB checkpoint is always up-to-date relative to what any pending range will read.
 //!
 //! ## Pool ID lookup
 //!
@@ -53,6 +58,9 @@ pub struct V4BaseMetricsHandler {
     db_pool: OnceLock<Pool>,
     /// hook_address → pool_id, loaded from v4_pool_configs at init, refreshed on miss.
     hook_pool_map: RwLock<HashMap<[u8; 20], [u8; 32]>>,
+    /// pool_id → (total_proceeds, total_tokens_sold) — loaded from v4_base_proceeds_state
+    /// at init, refreshed on cache miss, updated optimistically in handle().
+    proceeds_state: RwLock<HashMap<[u8; 32], (U256, U256)>>,
 }
 
 #[async_trait]
@@ -124,7 +132,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
         )
         .await?;
 
-        // Convert to fixed-size arrays for the DB checkpoint query.
+        // Convert to fixed-size arrays for cache lookups.
         let pool_ids: Vec<[u8; 32]> = pool_id_vecs
             .iter()
             .filter_map(|v| {
@@ -138,8 +146,17 @@ impl TransformationHandler for V4BaseMetricsHandler {
             })
             .collect();
 
-        // Read previous cumulative totals from the DB checkpoint.
-        let prev_state = self.load_prev_cumulative(&pool_ids).await?;
+        // Fetch any pools missing from the in-memory cache.
+        self.refresh_proceeds_state_for_pools(&pool_ids).await?;
+
+        // Snapshot the current in-memory cumulative state for the pools in this batch.
+        let prev_state: HashMap<[u8; 32], (U256, U256)> = {
+            let state = self.proceeds_state.read().unwrap();
+            pool_ids
+                .iter()
+                .filter_map(|id| state.get(id).map(|&v| (*id, v)))
+                .collect()
+        };
 
         // Extract swap inputs + determine new cumulative totals.
         let (swaps, new_cumulative) = self.extract_swaps(&events, &prev_state)?;
@@ -150,7 +167,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
 
         let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id);
 
-        // Checkpoint the new cumulative totals so the next range reads them.
+        // Durably checkpoint the new cumulative totals.
         for (pool_id, (total_proceeds, total_tokens_sold)) in &new_cumulative {
             ops.push(upsert_proceeds_state(
                 self.chain_id,
@@ -160,6 +177,17 @@ impl TransformationHandler for V4BaseMetricsHandler {
             ));
         }
 
+        // Update the in-memory cache optimistically. Because requires_sequential() is true,
+        // the next range won't run until this one finishes. If the DB transaction fails
+        // the engine halts further processing for this handler, so on restart the cache
+        // is rebuilt from the last-committed checkpoint.
+        {
+            let mut state = self.proceeds_state.write().unwrap();
+            for (pool_id, totals) in new_cumulative {
+                state.insert(pool_id, totals);
+            }
+        }
+
         Ok(ops)
     }
 
@@ -167,6 +195,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
         self.db_pool.set(db_pool.inner().clone()).ok();
         self.metadata_cache.load_into(db_pool, self.chain_id).await?;
         self.load_hook_pool_map(db_pool).await?;
+        self.load_all_proceeds_state(db_pool).await?;
         tracing::info!("V4BaseMetricsHandler initialized");
         Ok(())
     }
@@ -270,18 +299,13 @@ impl V4BaseMetricsHandler {
         Ok(())
     }
 
-    /// Read the last committed cumulative totals for the given pool IDs.
-    ///
-    /// Returns defaults of (0, 0) for pools with no prior checkpoint.
-    async fn load_prev_cumulative(
+    /// Load all committed checkpoints into the in-memory cache at startup.
+    async fn load_all_proceeds_state(
         &self,
-        pool_ids: &[[u8; 32]],
-    ) -> Result<HashMap<[u8; 32], (U256, U256)>, TransformationError> {
-        let Some(pool) = self.db_pool.get() else {
-            return Ok(HashMap::new());
-        };
-
-        let client = pool
+        db_pool: &DbPool,
+    ) -> Result<(), TransformationError> {
+        let client = db_pool
+            .inner()
             .get()
             .await
             .map_err(|e| TransformationError::DatabaseError(e.into()))?;
@@ -300,7 +324,7 @@ impl V4BaseMetricsHandler {
             .await
             .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
-        let mut result: HashMap<[u8; 32], (U256, U256)> = HashMap::new();
+        let mut state = self.proceeds_state.write().unwrap();
         for row in &rows {
             let pool_id_bytes: Vec<u8> = row.get("pool_id");
             if pool_id_bytes.len() != 32 {
@@ -309,21 +333,102 @@ impl V4BaseMetricsHandler {
             let mut pool_id = [0u8; 32];
             pool_id.copy_from_slice(&pool_id_bytes);
 
-            if !pool_ids.contains(&pool_id) {
-                continue;
-            }
-
             let proceeds_str: String = row.get("total_proceeds");
             let tokens_str: String = row.get("total_tokens_sold");
 
-            let proceeds =
-                U256::from_str_radix(proceeds_str.trim(), 10).unwrap_or(U256::ZERO);
+            let proceeds = U256::from_str_radix(proceeds_str.trim(), 10).unwrap_or(U256::ZERO);
             let tokens = U256::from_str_radix(tokens_str.trim(), 10).unwrap_or(U256::ZERO);
 
-            result.insert(pool_id, (proceeds, tokens));
+            state.insert(pool_id, (proceeds, tokens));
         }
 
-        Ok(result)
+        tracing::debug!(
+            "V4BaseMetricsHandler: loaded {} proceeds checkpoints",
+            state.len()
+        );
+        Ok(())
+    }
+
+    /// Fetch proceeds state from DB for any pool IDs missing from the in-memory cache.
+    ///
+    /// Pools without a checkpoint row are still marked present in the cache with (0, 0),
+    /// so subsequent calls for the same pool don't re-query the DB.
+    async fn refresh_proceeds_state_for_pools(
+        &self,
+        pool_ids: &[[u8; 32]],
+    ) -> Result<(), TransformationError> {
+        // Find pools not already in the cache.
+        let missing: Vec<[u8; 32]> = {
+            let state = self.proceeds_state.read().unwrap();
+            pool_ids
+                .iter()
+                .copied()
+                .filter(|id| !state.contains_key(id))
+                .collect()
+        };
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let Some(pool) = self.db_pool.get() else {
+            // No DB pool — seed missing entries with zero so we don't loop.
+            let mut state = self.proceeds_state.write().unwrap();
+            for id in &missing {
+                state.entry(*id).or_insert((U256::ZERO, U256::ZERO));
+            }
+            return Ok(());
+        };
+
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
+
+        // Use a BYTEA[] parameter so the query stays bounded.
+        let missing_bytes: Vec<&[u8]> = missing.iter().map(|id| id.as_slice()).collect();
+        let rows = client
+            .query(
+                "SELECT pool_id, total_proceeds::text, total_tokens_sold::text \
+                 FROM v4_base_proceeds_state \
+                 WHERE chain_id = $1 \
+                   AND source = $2 \
+                   AND source_version = $3 \
+                   AND pool_id = ANY($4)",
+                &[
+                    &(self.chain_id as i64),
+                    &self.name(),
+                    &(self.version() as i32),
+                    &missing_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
+
+        let mut state = self.proceeds_state.write().unwrap();
+        for row in &rows {
+            let pool_id_bytes: Vec<u8> = row.get("pool_id");
+            if pool_id_bytes.len() != 32 {
+                continue;
+            }
+            let mut pool_id = [0u8; 32];
+            pool_id.copy_from_slice(&pool_id_bytes);
+
+            let proceeds_str: String = row.get("total_proceeds");
+            let tokens_str: String = row.get("total_tokens_sold");
+            let proceeds = U256::from_str_radix(proceeds_str.trim(), 10).unwrap_or(U256::ZERO);
+            let tokens = U256::from_str_radix(tokens_str.trim(), 10).unwrap_or(U256::ZERO);
+
+            state.insert(pool_id, (proceeds, tokens));
+        }
+
+        // Any pool that still isn't in the cache has no checkpoint yet; seed with (0, 0)
+        // so we don't re-query for it on every subsequent handle().
+        for id in &missing {
+            state.entry(*id).or_insert((U256::ZERO, U256::ZERO));
+        }
+
+        Ok(())
     }
 
     /// Extract swap inputs from V4 base Swap events, computing per-swap deltas.
@@ -545,6 +650,7 @@ pub fn register_handlers(
         chain_id,
         db_pool: OnceLock::new(),
         hook_pool_map: RwLock::new(HashMap::new()),
+        proceeds_state: RwLock::new(HashMap::new()),
     });
 }
 
@@ -592,6 +698,7 @@ mod tests {
             chain_id,
             db_pool: OnceLock::new(),
             hook_pool_map: RwLock::new(HashMap::new()),
+            proceeds_state: RwLock::new(HashMap::new()),
         }
     }
 
@@ -775,6 +882,46 @@ mod tests {
 
         assert!(swaps.is_empty());
         assert!(new_cum.is_empty());
+    }
+
+    #[test]
+    fn test_proceeds_state_cache_used_instead_of_db_on_hit() {
+        // After a write to the in-memory proceeds_state, the next extract_swaps
+        // call should use those cached values rather than treating the pool as
+        // having no prior state.
+        let handler = make_handler(8453);
+        let hook_addr = make_hook_addr(0xEE);
+        let pool_id = make_pool_id(0x04);
+        setup_handler_with_pool(&handler, hook_addr, pool_id, true);
+
+        // Simulate an earlier handle() that populated the cache.
+        handler
+            .proceeds_state
+            .write()
+            .unwrap()
+            .insert(pool_id, (U256::from(700u64), U256::from(350u64)));
+
+        // A new event arrives with a higher cumulative total.
+        let event = make_decoded_event(hook_addr, 150, 0, 0, 1000, 500);
+        let events = vec![&event];
+
+        // Simulate handle()'s snapshot read from the in-memory state:
+        let prev_state: HashMap<[u8; 32], (U256, U256)> = {
+            let state = handler.proceeds_state.read().unwrap();
+            [pool_id]
+                .iter()
+                .filter_map(|id| state.get(id).map(|&v| (*id, v)))
+                .collect()
+        };
+
+        let (swaps, new_cum) = handler.extract_swaps(&events, &prev_state).unwrap();
+
+        assert_eq!(swaps.len(), 1);
+        // delta = (1000 - 700, 500 - 350) = (300, 150)
+        // is_token_0 = true: amount0 = -150, amount1 = +300
+        assert_eq!(swaps[0].amount0, I256::try_from(-150i64).unwrap());
+        assert_eq!(swaps[0].amount1, I256::try_from(300i64).unwrap());
+        assert_eq!(new_cum[&pool_id], (U256::from(1000u64), U256::from(500u64)));
     }
 
     #[test]
