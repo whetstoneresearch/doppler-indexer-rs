@@ -17,17 +17,19 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
-use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinSet;
+use tokio::sync::Mutex;
 
-use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
+use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use super::error::TransformationError;
-use super::executor::{inject_source_version, DbExecMode, HandlerExecutor, HandlerTask};
+use super::executor::{DbExecMode, HandlerExecutor, HandlerTask};
 use super::finalizer::RangeFinalizer;
 use super::historical::HistoricalDataReader;
 use super::live_state::{LiveProcessingState, PendingEventData};
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::retry::{filter_calls_by_start_block, filter_events_by_start_block, RetryProcessor};
+use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem};
+use super::scheduler::loader::{read_receipt_addresses, CatchupLoader, CatchupPayload};
+use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
 use crate::rpc::UnifiedRpcClient;
@@ -104,8 +106,6 @@ pub struct TransformationEngineConfig {
     pub expect_eth_call_completion: bool,
 }
 
-/// Result type for individual handler task execution during catchup.
-type HandlerTaskResult = Result<Option<(String, u64, u64)>, TransformationError>;
 
 /// A handler paired with the decoded calls it needs to process.
 type ReadyHandler = (
@@ -358,107 +358,6 @@ impl TransformationEngine {
         Ok(())
     }
 
-    /// Spawn a single catchup handler task into the provided JoinSet.
-    ///
-    /// Acquires a semaphore permit, clones all shared state, and spawns an
-    /// async task that invokes the handler and executes the resulting database
-    /// operations.
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_catchup_handler_task<H>(
-        &self,
-        join_set: &mut JoinSet<HandlerTaskResult>,
-        semaphore: &Arc<Semaphore>,
-        handler: &Arc<H>,
-        handler_key: &str,
-        range_start: u64,
-        range_end: u64,
-        events: Vec<DecodedEvent>,
-        calls: Vec<DecodedCall>,
-        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
-    ) where
-        H: super::traits::TransformationHandler + ?Sized,
-    {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let handler = handler.clone();
-        let db_pool = self.db_pool.clone();
-        let handler_key = handler_key.to_string();
-        let handler_name = handler.name();
-        let handler_version = handler.version();
-        let chain_name = self.chain_name.clone();
-        let chain_id = self.chain_id;
-        let historical = self.historical_reader.clone();
-        let rpc = self.executor.rpc_client.clone();
-        let contracts = self.contracts.clone();
-
-        join_set.spawn(async move {
-            let _permit = permit;
-            let ctx = TransformationContext::new(
-                chain_name,
-                chain_id,
-                range_start,
-                range_end,
-                Arc::new(events),
-                Arc::new(calls),
-                tx_addresses,
-                historical,
-                rpc,
-                contracts,
-            );
-
-            match handler.handle(&ctx).await {
-                Ok(ops) => {
-                    if !ops.is_empty() {
-                        let ops = inject_source_version(ops, handler_name, handler_version);
-                        db_pool.execute_transaction(ops).await?;
-                    }
-                    Ok(Some((handler_key, range_start, range_end)))
-                }
-                Err(e) => Err(e),
-            }
-        });
-    }
-
-    /// Drain completed tasks from a catchup JoinSet, recording completed
-    /// ranges and collecting failures.
-    ///
-    /// Returns `true` if at least one handler errored or panicked.
-    async fn drain_catchup_results(
-        &self,
-        join_set: &mut JoinSet<HandlerTaskResult>,
-        handler_key: &str,
-        failed_handlers: &mut Vec<(String, String)>,
-    ) -> Result<bool, TransformationError> {
-        let mut errored = false;
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(Some((hk, rs, re)))) => {
-                    self.finalizer
-                        .record_completed_range_for_handler(&hk, rs, re)
-                        .await?;
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        "Handler {} failed during catchup: {}. Stopping catchup for this handler.",
-                        handler_key,
-                        e
-                    );
-                    failed_handlers.push((handler_key.to_string(), e.to_string()));
-                    errored = true;
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!("Handler {} catchup task panicked: {}", handler_key, e);
-                    failed_handlers
-                        .push((handler_key.to_string(), format!("task panicked: {}", e)));
-                    errored = true;
-                    break;
-                }
-            }
-        }
-        Ok(errored)
-    }
-
     /// Format and return a catchup failure error from accumulated handler failures.
     fn catchup_failure_error(
         failed_handlers: &[(String, String)],
@@ -563,120 +462,96 @@ impl TransformationEngine {
             });
         }
 
-        // Preload completed ranges for dependency target handlers so downstream
-        // handlers can be gated on upstream completion per range.
-        let mut dep_completed: HashMap<String, HashSet<u64>> = HashMap::new();
-        if kind == HandlerKind::Event {
-            let dep_names = self.registry.dependency_handler_names();
-            for name in dep_names {
-                if let Some(ch) = handlers.iter().find(|ch| ch.handler.name() == name) {
-                    let dep_key = ch.handler.handler_key();
-                    let completed = self
-                        .finalizer
-                        .get_completed_ranges_for_handler(&dep_key)
-                        .await?;
-                    dep_completed.insert(name.clone(), completed);
-                } else {
-                    debug_assert!(false, "dep target {} not found in catchup handlers", name);
-                    tracing::error!(
-                        "Dependency target handler {} not found in catchup handlers",
-                        name
-                    );
-                    dep_completed.insert(name.clone(), HashSet::new());
-                }
-            }
-        }
-
-        let mut failed_handlers: Vec<(String, String)> = vec![];
-
+        // Seed CompletionTracker from _handler_progress so downstream handlers
+        // can gate on upstream completion per range via the DAG scheduler.
+        let tracker = Arc::new(CompletionTracker::new());
+        // self_completed: handler_name → set of range_starts already processed.
+        // Used to skip building WorkItems for ranges already done.
+        let mut self_completed: HashMap<String, HashSet<u64>> = HashMap::new();
         for ch in &handlers {
-            let handler = &ch.handler;
-            let handler_key = handler.handler_key();
-            let triggers = &ch.triggers;
-            let call_deps = &ch.call_deps;
-
             let completed = self
                 .finalizer
-                .get_completed_ranges_for_handler(&handler_key)
+                .get_completed_ranges_for_handler(&ch.handler.handler_key())
                 .await?;
+            tracker
+                .seed_completed(ch.handler.name(), completed.iter().copied())
+                .await;
+            self_completed.insert(ch.handler.name().to_string(), completed);
+        }
 
-            let to_process: Vec<_> = available
-                .iter()
-                .filter(|(start, _)| !completed.contains(start))
-                .filter(|(start, _)| {
-                    ch.handler_deps.iter().all(|dep_name| {
-                        dep_completed
-                            .get(dep_name)
-                            .map(|c| c.contains(start))
-                            .unwrap_or(false)
-                    })
-                })
-                .cloned()
-                .collect();
+        let total_todo: usize = handlers
+            .iter()
+            .map(|ch| {
+                let done = self_completed
+                    .get(ch.handler.name())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                available.len().saturating_sub(done)
+            })
+            .sum();
 
-            if to_process.is_empty() {
-                if !ch.handler_deps.is_empty() {
-                    let blocked_count = available
-                        .iter()
-                        .filter(|(start, _)| !completed.contains(start))
-                        .filter(|(start, _)| {
-                            ch.handler_deps.iter().any(|dep_name| {
-                                !dep_completed
-                                    .get(dep_name)
-                                    .map(|c| c.contains(start))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .count();
-                    if blocked_count > 0 {
-                        tracing::warn!(
-                            "Handler {} catchup: {} range(s) blocked by incomplete dependencies ({:?})",
-                            handler_key,
-                            blocked_count,
-                            ch.handler_deps,
-                        );
-                        continue;
-                    }
-                }
-                tracing::info!("Handler {} catchup: already up to date", handler_key);
-                continue;
-            }
+        if total_todo == 0 {
+            tracing::info!("{} handler catchup: all handlers up to date", kind_label);
+            return Ok(());
+        }
 
-            tracing::info!(
-                "Handler {} catchup: processing {} ranges (triggers: {:?}{})",
-                handler_key,
-                to_process.len(),
-                triggers,
-                if call_deps.is_empty() {
-                    String::new()
-                } else {
-                    format!(", call_deps: {:?}", call_deps)
-                }
-            );
+        tracing::info!(
+            "{} handler catchup: {} work items to process across {} handlers",
+            kind_label,
+            total_todo,
+            handlers.len()
+        );
 
-            let mut ranges_to_attempt = to_process;
-            let mut pass = 0u32;
-            let mut total_processed = 0usize;
-            let mut handler_errored = false;
+        let loader = Arc::new(CatchupLoader {
+            decoded_logs_dir: self.decoded_logs_dir.clone(),
+            decoded_calls_dir: self.decoded_calls_dir.clone(),
+            raw_receipts_dir: self.raw_receipts_dir.clone(),
+            historical_reader: self.historical_reader.clone(),
+            rpc_client: self.executor.rpc_client.clone(),
+            contracts: self.contracts.clone(),
+            chain_name: self.chain_name.clone(),
+            chain_id: self.chain_id,
+            db_pool: self.db_pool.clone(),
+            finalizer: self.finalizer.clone(),
+        });
 
-            loop {
-                pass += 1;
-                if ranges_to_attempt.is_empty() {
-                    break;
-                }
+        let scheduler = DagScheduler::new(tracker, self.handler_concurrency);
 
-                if pass > 1 {
-                    tracing::info!(
-                        "Handler {} catchup pass {}: retrying {} ranges waiting for call dependencies",
-                        handler_key,
-                        pass,
-                        ranges_to_attempt.len()
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+        // (handler_key, range_start, error_message) for each item-level failure.
+        let mut failed_items: Vec<(String, u64, String)> = vec![];
 
-                // Re-scan available call ranges from filesystem each pass (event handlers only)
-                let available_call_ranges: Vec<HashSet<(u64, u64)>> = call_deps
+        // Call-dep retry loop.
+        //
+        // `ranges_pending` is None on the first pass (try every available range).
+        // On subsequent passes it holds only the ranges that were skipped because
+        // the call-dep parquet files weren't on disk yet.
+        let mut ranges_pending: Option<HashMap<String, Vec<(u64, u64)>>> = None;
+        let mut pass = 0u32;
+
+        loop {
+            pass += 1;
+
+            let mut items: Vec<WorkItem> = Vec::new();
+            let mut next_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+
+            for ch in &handlers {
+                let name = ch.handler.name().to_string();
+                let completed = self_completed.get(&name).cloned().unwrap_or_default();
+
+                // On retry passes only re-try handlers that had pending ranges.
+                let candidate_ranges: Vec<(u64, u64)> =
+                    if let Some(ref pending) = ranges_pending {
+                        match pending.get(&name) {
+                            Some(r) => r.clone(),
+                            None => continue,
+                        }
+                    } else {
+                        available.clone()
+                    };
+
+                // Scan call-dep file availability once per handler per pass.
+                let call_range_sets: Vec<HashSet<(u64, u64)>> = ch
+                    .call_deps
                     .iter()
                     .map(|(source, func)| {
                         let dir = self.decoded_calls_dir.join(source).join(func);
@@ -687,173 +562,167 @@ impl TransformationEngine {
                     })
                     .collect();
 
-                let total = ranges_to_attempt.len();
-                let mut processed = 0;
-                let mut skipped_ranges: Vec<(u64, u64)> = Vec::new();
+                for (range_start, range_end) in candidate_ranges {
+                    if completed.contains(&range_start) {
+                        continue;
+                    }
 
-                let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-                let mut join_set: JoinSet<HandlerTaskResult> = JoinSet::new();
-
-                for (range_start, range_end) in &ranges_to_attempt {
-                    // Read primary data: events for event handlers, calls for call handlers
-                    let (events, primary_data_empty) = match ch.kind {
-                        HandlerKind::Event => {
-                            let evts = self
-                                .read_decoded_events_for_triggers(
-                                    *range_start,
-                                    *range_end,
-                                    triggers,
-                                )
-                                .await?;
-                            let evts = filter_events_by_start_block(&self.contracts, evts);
-                            let empty = evts.is_empty();
-                            (evts, empty)
-                        }
-                        HandlerKind::Call => (Vec::new(), false),
-                    };
-
-                    // For event handlers: check call dependency readiness and load calls
-                    if !primary_data_empty && !call_deps.is_empty() {
-                        let calls_ready = available_call_ranges
+                    // Skip range if call-dep files aren't on disk yet.
+                    if !ch.call_deps.is_empty() {
+                        let ready = call_range_sets
                             .iter()
-                            .all(|ranges| ranges.contains(&(*range_start, *range_end)));
-
-                        if !calls_ready {
+                            .all(|set| set.contains(&(range_start, range_end)));
+                        if !ready {
                             tracing::debug!(
                                 "Handler {} skipping range {}-{}: call dependencies not yet decoded",
-                                handler_key,
+                                ch.handler.handler_key(),
                                 range_start,
                                 range_end
                             );
-                            skipped_ranges.push((*range_start, *range_end));
+                            next_pending
+                                .entry(name.clone())
+                                .or_default()
+                                .push((range_start, range_end));
                             continue;
                         }
                     }
 
-                    let calls = match ch.kind {
-                        HandlerKind::Event => {
-                            if !events.is_empty() && !call_deps.is_empty() {
-                                let calls = self
-                                    .read_decoded_calls_for_triggers(
-                                        *range_start,
-                                        *range_end,
-                                        call_deps,
-                                    )
-                                    .await?;
-                                filter_calls_by_start_block(&self.contracts, calls)
-                            } else {
-                                Vec::new()
-                            }
+                    items.push(WorkItem {
+                        handler_name: name.clone(),
+                        range_start,
+                        range_end,
+                        dep_names: ch.handler_deps.clone(),
+                        payload: Box::new(CatchupPayload {
+                            handler: ch.handler.clone(),
+                            handler_key: ch.handler.handler_key(),
+                            handler_name: ch.handler.name(),
+                            handler_version: ch.handler.version(),
+                            triggers: ch.triggers.clone(),
+                            call_deps: ch.call_deps.clone(),
+                            kind: ch.kind,
+                        }),
+                    });
+                }
+            }
+
+            if !items.is_empty() {
+                tracing::info!(
+                    "{} catchup pass {}: executing {} work items",
+                    kind_label,
+                    pass,
+                    items.len()
+                );
+
+                let loader_ref = loader.clone();
+                let outcomes = scheduler
+                    .execute(items, move |item| {
+                        let loader = loader_ref.clone();
+                        Box::pin(async move {
+                            loader.run(item).await.map_err(|e| e.to_string())
+                        })
+                    })
+                    .await;
+
+                let mut succeeded = 0usize;
+                let mut cascade_failed = 0usize;
+
+                for outcome in &outcomes {
+                    match &outcome.status {
+                        OutcomeStatus::Succeeded => {
+                            self_completed
+                                .entry(outcome.handler_name.clone())
+                                .or_default()
+                                .insert(outcome.range_start);
+                            succeeded += 1;
                         }
-                        HandlerKind::Call => {
-                            let calls = self
-                                .read_decoded_calls_for_triggers(*range_start, *range_end, triggers)
-                                .await?;
-                            filter_calls_by_start_block(&self.contracts, calls)
+                        OutcomeStatus::HandlerFailed { reason } => {
+                            tracing::error!(
+                                "Handler {} failed on range {}-{}: {}",
+                                outcome.handler_name,
+                                outcome.range_start,
+                                outcome.range_end,
+                                reason
+                            );
+                            let key = handlers
+                                .iter()
+                                .find(|ch| ch.handler.name() == outcome.handler_name)
+                                .map(|ch| ch.handler.handler_key())
+                                .unwrap_or_else(|| outcome.handler_name.clone());
+                            failed_items.push((key, outcome.range_start, reason.clone()));
                         }
-                    };
-
-                    processed += 1;
-
-                    // Determine whether there is data to process
-                    let has_data = match ch.kind {
-                        HandlerKind::Event => !events.is_empty(),
-                        HandlerKind::Call => !calls.is_empty(),
-                    };
-
-                    if has_data {
-                        // Event handlers get tx_addresses; call handlers pass empty map
-                        let tx_addresses = match ch.kind {
-                            HandlerKind::Event => {
-                                self.read_receipt_addresses(*range_start, *range_end)
-                            }
-                            HandlerKind::Call => HashMap::new(),
-                        };
-                        self.spawn_catchup_handler_task(
-                            &mut join_set,
-                            &semaphore,
-                            handler,
-                            &handler_key,
-                            *range_start,
-                            *range_end,
-                            events,
-                            calls,
-                            tx_addresses,
-                        )
-                        .await;
-                    } else {
-                        self.finalizer
-                            .record_completed_range_for_handler(
-                                &handler_key,
-                                *range_start,
-                                *range_end,
-                            )
-                            .await?;
-                    }
-
-                    if processed % 50 == 0 {
-                        tracing::info!(
-                            "Handler {} catchup pass {} progress: {}/{} (skipped {} waiting for calls)",
-                            handler_key,
-                            pass,
-                            processed,
-                            total,
-                            skipped_ranges.len()
-                        );
+                        OutcomeStatus::DepCascadeFailed { dep_name } => {
+                            tracing::warn!(
+                                "Handler {} cascade-failed on range {} due to dep '{}'",
+                                outcome.handler_name,
+                                outcome.range_start,
+                                dep_name
+                            );
+                            cascade_failed += 1;
+                        }
+                        OutcomeStatus::Panicked => {
+                            tracing::error!(
+                                "Handler {} panicked on range {}",
+                                outcome.handler_name,
+                                outcome.range_start
+                            );
+                            let key = handlers
+                                .iter()
+                                .find(|ch| ch.handler.name() == outcome.handler_name)
+                                .map(|ch| ch.handler.handler_key())
+                                .unwrap_or_else(|| outcome.handler_name.clone());
+                            failed_items
+                                .push((key, outcome.range_start, "task panicked".to_string()));
+                        }
                     }
                 }
 
-                let handler_errored_this_pass = self
-                    .drain_catchup_results(&mut join_set, &handler_key, &mut failed_handlers)
-                    .await?;
+                tracing::info!(
+                    "{} catchup pass {} complete: {} succeeded, {} cascade-failed",
+                    kind_label,
+                    pass,
+                    succeeded,
+                    cascade_failed
+                );
+            }
 
-                total_processed += processed;
+            if next_pending.is_empty() {
+                break;
+            }
 
-                if !handler_errored_this_pass {
-                    if skipped_ranges.is_empty() {
-                        tracing::info!(
-                            "Handler {} catchup complete in {} pass(es): processed {} ranges",
-                            handler_key,
-                            pass,
-                            total_processed
-                        );
-                        break;
-                    }
-
-                    if skipped_ranges.len() == ranges_to_attempt.len() {
-                        tracing::warn!(
-                            "Handler {} catchup: no progress on {} ranges still waiting for call dependencies after {} pass(es). Giving up.",
-                            handler_key,
-                            skipped_ranges.len(),
-                            pass
-                        );
-                        break;
-                    }
-
-                    // Progress was made, retry the skipped ranges
-                    ranges_to_attempt = skipped_ranges;
-                } else {
-                    // Handler errored, skip retry-skipped-ranges and move to next handler
-                    handler_errored = true;
+            // Check for progress on call-dep-waiting ranges; bail if stuck.
+            if let Some(ref prev) = ranges_pending {
+                let prev_count: usize = prev.values().map(|v| v.len()).sum();
+                let next_count: usize = next_pending.values().map(|v| v.len()).sum();
+                if next_count > 0 && next_count >= prev_count {
+                    tracing::warn!(
+                        "{} catchup: {} ranges still blocked by call dependencies, no progress after pass {}. Giving up.",
+                        kind_label,
+                        next_count,
+                        pass
+                    );
                     break;
                 }
             }
 
-            // Refresh dep completed ranges so downstream handlers see current state
-            let handler_name = handler.name().to_string();
-            if dep_completed.contains_key(&handler_name) {
-                let refreshed = self
-                    .finalizer
-                    .get_completed_ranges_for_handler(&handler_key)
-                    .await?;
-                dep_completed.insert(handler_name, refreshed);
-            }
-
-            if handler_errored {
-                continue;
-            }
+            let pending_count: usize = next_pending.values().map(|v| v.len()).sum();
+            tracing::info!(
+                "{} catchup pass {}: {} ranges pending call dependencies, retrying in 1s...",
+                kind_label,
+                pass,
+                pending_count
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ranges_pending = Some(next_pending);
         }
 
+        if failed_items.is_empty() {
+            return Ok(());
+        }
+
+        let failed_handlers: Vec<(String, String)> = failed_items
+            .iter()
+            .map(|(key, range, reason)| (key.clone(), format!("range {}: {}", range, reason)))
+            .collect();
         Self::catchup_failure_error(&failed_handlers)
     }
 
@@ -864,130 +733,7 @@ impl TransformationEngine {
         range_start: u64,
         range_end: u64,
     ) -> HashMap<[u8; 32], TransactionAddresses> {
-        use arrow::array::{Array, FixedSizeBinaryArray};
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-        let file_name = format!("receipts_{}-{}.parquet", range_start, range_end - 1);
-        let file_path = self.raw_receipts_dir.join(&file_name);
-
-        if !file_path.exists() {
-            tracing::debug!(
-                "No receipt file found at {}, tx addresses unavailable for range {}-{}",
-                file_path.display(),
-                range_start,
-                range_end - 1
-            );
-            return HashMap::new();
-        }
-
-        let file = match std::fs::File::open(&file_path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("Failed to open receipt file {}: {}", file_path.display(), e);
-                return HashMap::new();
-            }
-        };
-
-        let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read receipt parquet {}: {}",
-                    file_path.display(),
-                    e
-                );
-                return HashMap::new();
-            }
-        };
-
-        let reader = match builder.build() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to build receipt reader {}: {}",
-                    file_path.display(),
-                    e
-                );
-                return HashMap::new();
-            }
-        };
-
-        let mut addresses = HashMap::new();
-
-        for batch_result in reader {
-            let batch = match batch_result {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read receipt batch from {}: {}",
-                        file_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let num_rows = batch.num_rows();
-            if num_rows == 0 {
-                continue;
-            }
-
-            let tx_hash_col = match batch.column_by_name("transaction_hash") {
-                Some(col) => match col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                    Some(arr) => arr.clone(),
-                    None => continue,
-                },
-                None => continue,
-            };
-
-            let from_col = match batch.column_by_name("from_address") {
-                Some(col) => match col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                    Some(arr) => arr.clone(),
-                    None => continue,
-                },
-                None => continue,
-            };
-
-            let to_col = batch
-                .column_by_name("to_address")
-                .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>().cloned());
-
-            for row in 0..num_rows {
-                let tx_hash: [u8; 32] = match tx_hash_col.value(row).try_into() {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-
-                let from_address: [u8; 20] = match from_col.value(row).try_into() {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-
-                let to_address = to_col.as_ref().and_then(|col| {
-                    if col.is_null(row) {
-                        None
-                    } else {
-                        col.value(row).try_into().ok()
-                    }
-                });
-
-                addresses.insert(
-                    tx_hash,
-                    TransactionAddresses {
-                        from_address,
-                        to_address,
-                    },
-                );
-            }
-        }
-
-        tracing::debug!(
-            "Read {} transaction addresses from {}",
-            addresses.len(),
-            file_path.display()
-        );
-
-        addresses
+        read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end)
     }
 
     // ─── Parquet Reading ─────────────────────────────────────────────
@@ -1009,60 +755,13 @@ impl TransformationEngine {
     where
         T: Send + 'static,
     {
-        let mut read_tasks = JoinSet::new();
-        let read_fn = Arc::new(read_file);
-
-        for (source_name, secondary_name) in triggers {
-            let paths = resolve_paths(source_name, secondary_name);
-
-            for file_path in paths {
-                if !file_path.exists() {
-                    continue;
-                }
-
-                let reader = self.historical_reader.clone();
-                let src = source_name.clone();
-                let name = secondary_name.clone();
-                let read_fn = read_fn.clone();
-
-                read_tasks.spawn_blocking(move || {
-                    tracing::debug!("Reading decoded data from {}", file_path.display());
-                    match read_fn(reader, &file_path, &src, &name) {
-                        Ok(items) => {
-                            tracing::debug!(
-                                "Read {} items from {}",
-                                items.len(),
-                                file_path.display()
-                            );
-                            Ok(items)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to read decoded data from {}: {}",
-                                file_path.display(),
-                                e
-                            );
-                            Ok(Vec::new())
-                        }
-                    }
-                });
-            }
-        }
-
-        let mut all_items = Vec::new();
-        while let Some(result) = read_tasks.join_next().await {
-            match result {
-                Ok(Ok(items)) => all_items.extend(items),
-                Ok(Err(e)) => return Err(e),
-                Err(e) => {
-                    return Err(TransformationError::IoError(std::io::Error::other(
-                        e.to_string(),
-                    )))
-                }
-            }
-        }
-
-        Ok(all_items)
+        super::scheduler::loader::read_decoded_parquet(
+            self.historical_reader.clone(),
+            triggers,
+            resolve_paths,
+            read_file,
+        )
+        .await
     }
 
     async fn read_decoded_events_for_triggers(
