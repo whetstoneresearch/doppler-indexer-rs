@@ -3,11 +3,14 @@
 //! All pool type handlers normalize their events into SwapInput/LiquidityInput,
 //! then call process_swaps()/process_liquidity_deltas() to produce DbOperations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 use alloy_primitives::{I256, U256};
+use deadpool_postgres::Pool;
 
 use crate::db::DbOperation;
+use crate::transformations::error::TransformationError;
 use crate::transformations::util::db::pool_metrics::{
     insert_liquidity_delta, insert_pool_snapshot, upsert_pool_state, LiquidityDeltaData,
     PoolStateData, SnapshotData,
@@ -144,13 +147,10 @@ pub fn process_swaps(
             swap_count: i32::try_from(acc.swap_count).unwrap_or(i32::MAX),
         }));
 
-        // Track latest block for pool_state
-        match latest_per_pool.get(pool_id) {
-            Some((prev_block, _)) if *prev_block >= *block_number => {}
-            _ => {
-                latest_per_pool.insert(pool_id.clone(), (*block_number, acc));
-            }
-        }
+        // Track latest block for pool_state.
+        // BTreeMap iterates in ascending order by (pool_id, block_number), so the
+        // last insert for each pool_id always has the highest block_number.
+        latest_per_pool.insert(pool_id.clone(), (*block_number, acc));
     }
 
     // Emit pool_state upserts for the latest block per pool
@@ -188,6 +188,71 @@ pub fn process_liquidity_deltas(deltas: &[LiquidityInput], chain_id: u64) -> Vec
             })
         })
         .collect()
+}
+
+/// Refresh the metadata cache from DB if any pool IDs in the batch are missing.
+///
+/// Returns `Err` if the DB refresh fails, or if any of the originally-missing
+/// pool IDs are still absent after the refresh (indicating the pool was not yet
+/// committed to the DB by a prior handler, which is a programming error).
+pub async fn refresh_cache_if_needed(
+    pool_ids: impl Iterator<Item = &Vec<u8>>,
+    cache: &PoolMetadataCache,
+    db_pool: &OnceLock<Pool>,
+    chain_id: u64,
+    contracts: &crate::types::config::contract::Contracts,
+) -> Result<(), TransformationError> {
+    let missing: Vec<_> = {
+        let unique: HashSet<&Vec<u8>> = pool_ids.collect();
+        unique
+            .into_iter()
+            .filter(|id| cache.get(id).is_none())
+            .collect()
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let Some(pool) = db_pool.get() else {
+        return Ok(());
+    };
+
+    match cache.refresh(pool, chain_id, contracts).await {
+        Ok(new_count) if new_count > 0 => {
+            tracing::info!(
+                "Metadata cache refreshed: {} new pool(s) discovered ({} were missing)",
+                new_count,
+                missing.len()
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                "{} pool(s) still missing from DB after refresh",
+                missing.len()
+            );
+        }
+        Err(e) => {
+            return Err(e);
+        }
+    }
+
+    // Verify all originally-missing pools were found after the refresh.
+    let still_missing: Vec<_> = missing
+        .iter()
+        .filter(|id| cache.get(id).is_none())
+        .collect();
+    if !still_missing.is_empty() {
+        tracing::warn!(
+            "{} pool(s) still missing after cache refresh — cannot compute metrics",
+            still_missing.len()
+        );
+        return Err(TransformationError::MissingData(format!(
+            "{} pool(s) still missing after metadata cache refresh",
+            still_missing.len()
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
