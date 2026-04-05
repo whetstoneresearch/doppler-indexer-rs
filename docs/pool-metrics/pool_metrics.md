@@ -337,6 +337,61 @@ The retry path always uses snapshot capture. Before retrying a handler for a blo
 
 ---
 
+## V4 Base Cumulative Counters
+
+`DopplerV4Hook` emits `Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)` where `totalProceeds` and `totalTokensSold` are **cumulative since pool creation**, not per-swap deltas. To feed the shared `process_swaps()` pipeline (which expects per-swap `amount0`/`amount1`), the `V4BaseMetricsHandler` computes deltas by subtracting the previous cumulative values for each pool.
+
+### State storage
+
+**Durable**: `v4_base_proceeds_state` — one row per `(chain_id, pool_id, source, source_version)` storing the most recent cumulative totals. Upserted inside the same transaction as the `pool_snapshots`/`pool_state` writes.
+
+```sql
+CREATE TABLE IF NOT EXISTS v4_base_proceeds_state (
+    chain_id           BIGINT NOT NULL,
+    pool_id            BYTEA NOT NULL,
+    total_proceeds     NUMERIC NOT NULL DEFAULT '0',
+    total_tokens_sold  NUMERIC NOT NULL DEFAULT '0',
+    source             VARCHAR(255) NOT NULL,
+    source_version     INT NOT NULL,
+    UNIQUE (chain_id, pool_id, source, source_version)
+);
+```
+
+**In-memory**: `RwLock<HashMap<[u8;32], (U256, U256)>>` on the handler. Loaded from `v4_base_proceeds_state` at `initialize()`, refilled on miss (one scoped `pool_id = ANY($4)` query for just the missing IDs), and updated optimistically in `handle()` after computing deltas.
+
+### Amount sign convention
+
+The protocol sells base tokens for quote tokens. For each delta:
+
+```
+proceeds_delta  = quote received by pool (inflow)
+tokens_delta    = base sold out of pool  (outflow)
+```
+
+| is_token_0 | amount0              | amount1              |
+|------------|----------------------|----------------------|
+| `true`     | `-(tokens_delta)`    | `+proceeds_delta`    |
+| `false`    | `+proceeds_delta`    | `-(tokens_delta)`    |
+
+### Sequential processing
+
+This handler sets `requires_sequential() = true`. The catchup engine creates a capacity-1 `Semaphore` for this handler only, and Tokio's FIFO permit ordering guarantees ranges run in ascending block order so the "prev cumulative" used for each delta is always the immediately preceding range's committed state.
+
+### Retry & recovery
+
+- If the transaction for range N fails, `requires_sequential` causes catchup to halt further ranges for this handler. On restart, `initialize()` rebuilds the cache from the last committed `v4_base_proceeds_state` row, so the next invocation reads the correct prior cumulative.
+- Live-retry correctness relies on the same invariant: if a range fails mid-session, the live retry path must either restart the process or invalidate the in-memory cache entries for affected pools before re-running.
+
+### pool_id lookup
+
+The V4 base Swap event has no `poolId` field. The handler maps `event.contract_address` (the hook address) to the 32-byte `pool_id` via `v4_pool_configs`. The map is loaded at init and refreshed on cache miss; `handler_dependencies = ["V4CreateHandler"]` guarantees the config row exists before metrics run for a range.
+
+### active_liquidity
+
+V4 base Swap events do not emit liquidity, and Doppler auction "active liquidity" isn't directly analogous to a v3 pool's. The handler writes `active_liquidity = 0` for V4 base snapshots.
+
+---
+
 ## Handler Flow
 
 ```python
