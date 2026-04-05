@@ -48,4 +48,8 @@ pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
 
     let dhook_cache = Arc::new(PoolMetadataCache::new());
     dhook::metrics::register_handlers(registry, chain_id, dhook_cache);
+
+    // V4 base (DopplerV4Hook) — sequential handler, own cache
+    let v4_base_cache = Arc::new(PoolMetadataCache::new());
+    v4::metrics::register_handlers(registry, chain_id, v4_base_cache);
 }
