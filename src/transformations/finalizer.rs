@@ -13,7 +13,7 @@ use super::error::TransformationError;
 use super::live_state::LiveProcessingState;
 use super::registry::TransformationRegistry;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
-use crate::live::{LiveProgressTracker, LiveStorage, StorageError};
+use crate::live::{LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, StorageError};
 
 /// Handles range finalization, reorg cleanup, and progress tracking.
 pub(crate) struct RangeFinalizer {
@@ -336,6 +336,12 @@ impl RangeFinalizer {
         // Phase 2: Delete committed rows from database tables
         self.cleanup_reorg_tables(orphaned).await?;
 
+        // Phase 2.5: Notify handlers so they can invalidate in-memory caches
+        // that mirror rolled-back DB state.
+        for handler in self.registry.all_handlers() {
+            handler.on_reorg(orphaned).await?;
+        }
+
         // Phase 3: Clean up _live_progress entries
         self.cleanup_live_progress(orphaned).await?;
 
@@ -355,61 +361,18 @@ impl RangeFinalizer {
         }
 
         let storage = LiveStorage::new(&self.chain_name);
-        let mut restore_ops = Vec::new();
         // Maps table_name -> set of block numbers for which we have snapshots.
         let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
 
-        // Phase 2a: Read snapshots and generate restore operations
+        // Phase 2a: Read snapshots and dedupe per (table, source, source_version,
+        // key_columns). Keep the OLDEST snapshot seen for each key so the
+        // restored row reflects the pre-rollback state, not the most recent
+        // orphaned write.
+        let mut per_block_snapshots: Vec<(u64, Vec<LiveUpsertSnapshot>)> = Vec::new();
         for &block_number in orphaned {
             match storage.read_snapshots(block_number) {
                 Ok(snapshots) => {
-                    for snapshot in snapshots {
-                        tables_covered
-                            .entry(snapshot.table.clone())
-                            .or_default()
-                            .insert(block_number);
-
-                        match snapshot.previous_row {
-                            Some(previous) => {
-                                let columns: Vec<String> =
-                                    previous.iter().map(|(k, _)| k.clone()).collect();
-                                let values: Vec<DbValue> =
-                                    previous.iter().map(|(_, v)| v.to_db_value()).collect();
-                                let conflict_cols: Vec<String> = snapshot
-                                    .key_columns
-                                    .iter()
-                                    .map(|(k, _)| k.clone())
-                                    .collect();
-
-                                let update_cols: Vec<String> = columns
-                                    .iter()
-                                    .filter(|c| !conflict_cols.contains(c))
-                                    .cloned()
-                                    .collect();
-
-                                restore_ops.push(DbOperation::Upsert {
-                                    table: snapshot.table,
-                                    columns,
-                                    values,
-                                    conflict_columns: conflict_cols,
-                                    update_columns: update_cols,
-                                    update_condition: None,
-                                });
-                            }
-                            None => {
-                                let key_conditions: Vec<(String, DbValue)> = snapshot
-                                    .key_columns
-                                    .into_iter()
-                                    .map(|(k, v)| (k, v.to_db_value()))
-                                    .collect();
-
-                                restore_ops.push(DbOperation::Delete {
-                                    table: snapshot.table,
-                                    where_clause: WhereClause::And(key_conditions),
-                                });
-                            }
-                        }
-                    }
+                    per_block_snapshots.push((block_number, snapshots));
                 }
                 Err(StorageError::NotFound(_)) => {
                     tracing::debug!(
@@ -423,6 +386,51 @@ impl RangeFinalizer {
                         block_number,
                         e
                     );
+                }
+            }
+        }
+
+        let deduped = dedupe_restore_snapshots(per_block_snapshots, &mut tables_covered);
+
+        let mut restore_ops = Vec::new();
+        for snapshot in deduped {
+            match snapshot.previous_row {
+                Some(previous) => {
+                    let columns: Vec<String> = previous.iter().map(|(k, _)| k.clone()).collect();
+                    let values: Vec<DbValue> =
+                        previous.iter().map(|(_, v)| v.to_db_value()).collect();
+                    let conflict_cols: Vec<String> = snapshot
+                        .key_columns
+                        .iter()
+                        .map(|(k, _)| k.clone())
+                        .collect();
+
+                    let update_cols: Vec<String> = columns
+                        .iter()
+                        .filter(|c| !conflict_cols.contains(c))
+                        .cloned()
+                        .collect();
+
+                    restore_ops.push(DbOperation::Upsert {
+                        table: snapshot.table,
+                        columns,
+                        values,
+                        conflict_columns: conflict_cols,
+                        update_columns: update_cols,
+                        update_condition: None,
+                    });
+                }
+                None => {
+                    let key_conditions: Vec<(String, DbValue)> = snapshot
+                        .key_columns
+                        .into_iter()
+                        .map(|(k, v)| (k, v.to_db_value()))
+                        .collect();
+
+                    restore_ops.push(DbOperation::Delete {
+                        table: snapshot.table,
+                        where_clause: WhereClause::And(key_conditions),
+                    });
                 }
             }
         }
@@ -516,6 +524,47 @@ impl RangeFinalizer {
     }
 }
 
+/// Dedupe rollback snapshots so only the OLDEST snapshot per
+/// `(table, source, source_version, key_columns)` is kept. Updates
+/// `tables_covered` with the set of blocks that had a snapshot per table.
+///
+/// `per_block_snapshots` must be ordered ascending by block number; the
+/// function relies on this so the first snapshot seen for a given key is
+/// the one whose `previous_row` holds the truly pre-rollback state.
+pub(crate) fn dedupe_restore_snapshots(
+    per_block_snapshots: Vec<(u64, Vec<LiveUpsertSnapshot>)>,
+    tables_covered: &mut HashMap<String, HashSet<u64>>,
+) -> Vec<LiveUpsertSnapshot> {
+    type DedupKey = (String, String, u32, Vec<(String, Vec<u8>)>);
+    fn dedup_key(s: &LiveUpsertSnapshot) -> DedupKey {
+        let serialized_keys: Vec<(String, Vec<u8>)> = s
+            .key_columns
+            .iter()
+            .map(|(name, v)| (name.clone(), bincode::serialize(v).unwrap_or_default()))
+            .collect();
+        (
+            s.table.clone(),
+            s.source.clone(),
+            s.source_version,
+            serialized_keys,
+        )
+    }
+
+    let mut first_snapshot_by_key: HashMap<DedupKey, LiveUpsertSnapshot> = HashMap::new();
+    for (block_number, snapshots) in per_block_snapshots {
+        for snapshot in snapshots {
+            tables_covered
+                .entry(snapshot.table.clone())
+                .or_default()
+                .insert(block_number);
+            first_snapshot_by_key
+                .entry(dedup_key(&snapshot))
+                .or_insert(snapshot);
+        }
+    }
+    first_snapshot_by_key.into_values().collect()
+}
+
 /// Compute per-table fallback delete block lists.
 ///
 /// For each table in `tables_to_clean`, returns `(table_name, uncovered_blocks)`
@@ -545,6 +594,133 @@ pub(crate) fn compute_fallback_deletes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::LiveDbValue;
+
+    fn make_snapshot(
+        table: &str,
+        pool_id_byte: u8,
+        previous_value: Option<i64>,
+    ) -> LiveUpsertSnapshot {
+        LiveUpsertSnapshot {
+            table: table.to_string(),
+            source: "TestHandler".to_string(),
+            source_version: 1,
+            key_columns: vec![(
+                "pool_id".to_string(),
+                LiveDbValue::Bytes32([pool_id_byte; 32]),
+            )],
+            previous_row: previous_value.map(|v| {
+                vec![
+                    (
+                        "pool_id".to_string(),
+                        LiveDbValue::Bytes32([pool_id_byte; 32]),
+                    ),
+                    ("value".to_string(), LiveDbValue::Int64(v)),
+                ]
+            }),
+        }
+    }
+
+    /// When two orphaned blocks each snapshot the same (table, key), the
+    /// dedupe must keep the OLDEST block's snapshot — that snapshot's
+    /// `previous_row` holds the true pre-rollback state.
+    #[test]
+    fn test_dedupe_restore_snapshots_keeps_oldest_per_key() {
+        // Simulate: blocks 100 and 101 both touched the same pool row.
+        // Block 100's snapshot says "before me, value was 50".
+        // Block 101's snapshot says "before me, value was 60" (post-block-100).
+        // Reorg of [100, 101] should restore value=50, so dedupe must
+        // keep the snapshot from block 100.
+        let per_block = vec![
+            (100u64, vec![make_snapshot("pool_state", 0xAA, Some(50))]),
+            (101u64, vec![make_snapshot("pool_state", 0xAA, Some(60))]),
+        ];
+
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+        let deduped = dedupe_restore_snapshots(per_block, &mut tables_covered);
+
+        assert_eq!(deduped.len(), 1, "expected one snapshot after dedup");
+        let kept = &deduped[0];
+        assert_eq!(kept.table, "pool_state");
+
+        // Verify the kept snapshot is the oldest one (value=50).
+        let row = kept
+            .previous_row
+            .as_ref()
+            .expect("snapshot should have previous_row");
+        let value_cell = row
+            .iter()
+            .find(|(k, _)| k == "value")
+            .expect("value column should exist");
+        match &value_cell.1 {
+            LiveDbValue::Int64(n) => assert_eq!(*n, 50, "expected oldest snapshot (value=50)"),
+            other => panic!("unexpected value type: {:?}", other),
+        }
+
+        // tables_covered should record both block numbers for pool_state.
+        let covered = tables_covered
+            .get("pool_state")
+            .expect("pool_state should be covered");
+        assert!(covered.contains(&100));
+        assert!(covered.contains(&101));
+    }
+
+    /// Snapshots for different pools in the same block remain separate.
+    #[test]
+    fn test_dedupe_restore_snapshots_different_keys_preserved() {
+        let per_block = vec![(
+            100u64,
+            vec![
+                make_snapshot("pool_state", 0xAA, Some(50)),
+                make_snapshot("pool_state", 0xBB, Some(60)),
+            ],
+        )];
+
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+        let deduped = dedupe_restore_snapshots(per_block, &mut tables_covered);
+
+        assert_eq!(deduped.len(), 2, "two distinct pool rows should both be kept");
+    }
+
+    /// Snapshots for different tables (same key) remain separate.
+    #[test]
+    fn test_dedupe_restore_snapshots_different_tables_preserved() {
+        let per_block = vec![(
+            100u64,
+            vec![
+                make_snapshot("pool_state", 0xAA, Some(50)),
+                make_snapshot("pool_snapshots", 0xAA, Some(50)),
+            ],
+        )];
+
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+        let deduped = dedupe_restore_snapshots(per_block, &mut tables_covered);
+
+        assert_eq!(deduped.len(), 2, "two distinct tables should both be kept");
+    }
+
+    /// Insert-case snapshot (previous_row = None) is still deduped.
+    #[test]
+    fn test_dedupe_restore_snapshots_delete_case_keeps_oldest() {
+        // Block 100: row was just inserted (previous_row = None → DELETE on reorg).
+        // Block 101: same row was updated (previous_row = Some).
+        // Dedupe should keep block 100's snapshot (the DELETE) since that's
+        // the correct rollback: the row didn't exist before block 100.
+        let per_block = vec![
+            (100u64, vec![make_snapshot("pool_state", 0xAA, None)]),
+            (101u64, vec![make_snapshot("pool_state", 0xAA, Some(60))]),
+        ];
+
+        let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
+        let deduped = dedupe_restore_snapshots(per_block, &mut tables_covered);
+
+        assert_eq!(deduped.len(), 1);
+        assert!(
+            deduped[0].previous_row.is_none(),
+            "expected the DELETE snapshot (previous_row = None) from block 100"
+        );
+    }
+
 
     /// Fix C test: when block 100 has a snapshot but block 101 does not,
     /// the fallback DELETE should target only block 101.

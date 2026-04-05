@@ -97,6 +97,34 @@ pub trait TransformationHandler: Send + Sync + 'static {
     fn requires_sequential(&self) -> bool {
         false
     }
+
+    /// Called after the finalizer has rolled back DB rows for orphaned blocks.
+    /// Handlers that cache stateful DB-derived values in memory should invalidate
+    /// or reload the affected entries here. Default is a no-op.
+    #[allow(unused_variables)]
+    async fn on_reorg(&self, orphaned: &[u64]) -> Result<(), TransformationError> {
+        Ok(())
+    }
+
+    /// Called after the ops returned by `handle()` committed successfully.
+    /// Lets handlers promote any in-flight optimistic state.
+    #[allow(unused_variables)]
+    async fn on_commit_success(
+        &self,
+        range: (u64, u64),
+    ) -> Result<(), TransformationError> {
+        Ok(())
+    }
+
+    /// Called after the ops returned by `handle()` failed to commit.
+    /// Lets handlers revert optimistic state and mark the range for retry.
+    #[allow(unused_variables)]
+    async fn on_commit_failure(
+        &self,
+        range: (u64, u64),
+    ) -> Result<(), TransformationError> {
+        Ok(())
+    }
 }
 
 /// Trigger for event-based handlers.

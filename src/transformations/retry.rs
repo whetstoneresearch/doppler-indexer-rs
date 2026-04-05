@@ -580,9 +580,9 @@ impl RetryProcessor {
 
             match rh.handler.handle(&ctx).await {
                 Ok(ops) => {
-                    if !ops.is_empty() {
+                    let commit_result = if !ops.is_empty() {
                         let ops = inject_source_version(ops, handler_name, handler_version);
-                        if let Err(e) = execute_with_snapshot_capture(
+                        execute_with_snapshot_capture(
                             ops,
                             &self.db_pool,
                             Some(&live_storage),
@@ -591,27 +591,58 @@ impl RetryProcessor {
                             handler_version,
                         )
                         .await
-                        {
+                    } else {
+                        Ok(())
+                    };
+
+                    match commit_result {
+                        Ok(()) => {
+                            if let Err(e) = rh
+                                .handler
+                                .on_commit_success((range_start, range_end))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Handler {} on_commit_success failed for block {}: {}",
+                                    handler_key,
+                                    block_number,
+                                    e
+                                );
+                                continue;
+                            }
+                            self.record_handler_retry_success(
+                                &handler_key,
+                                handler_name,
+                                range_start,
+                                range_end,
+                                block_number,
+                                &mut succeeded_keys,
+                                &mut succeeded_names,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
                             tracing::error!(
                                 "Handler {} DB write failed during live retry for block {}: {}",
                                 handler_key,
                                 block_number,
                                 e
                             );
+                            if let Err(hook_err) = rh
+                                .handler
+                                .on_commit_failure((range_start, range_end))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Handler {} on_commit_failure hook also failed for block {}: {}",
+                                    handler_key,
+                                    block_number,
+                                    hook_err
+                                );
+                            }
                             continue;
                         }
                     }
-
-                    self.record_handler_retry_success(
-                        &handler_key,
-                        handler_name,
-                        range_start,
-                        range_end,
-                        block_number,
-                        &mut succeeded_keys,
-                        &mut succeeded_names,
-                    )
-                    .await;
                 }
                 Err(e) => {
                     tracing::error!(

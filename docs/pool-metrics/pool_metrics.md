@@ -379,8 +379,15 @@ This handler sets `requires_sequential() = true`. The catchup engine creates a c
 
 ### Retry & recovery
 
-- If the transaction for range N fails, `requires_sequential` causes catchup to halt further ranges for this handler. On restart, `initialize()` rebuilds the cache from the last committed `v4_base_proceeds_state` row, so the next invocation reads the correct prior cumulative.
-- Live-retry correctness relies on the same invariant: if a range fails mid-session, the live retry path must either restart the process or invalidate the in-memory cache entries for affected pools before re-running.
+The handler uses three trait hooks (`on_commit_success`, `on_commit_failure`, `on_reorg`) to keep the in-memory `proceeds_state` cache consistent with the committed DB state across failures and reorgs:
+
+- **Optimistic cache snapshot**: before the optimistic cache update, `handle()` stashes the current (pre-update) cumulative per touched pool into `in_flight_pre`.
+- **`on_commit_success(range)`** (called by executor/engine/retry after a successful tx): drains `in_flight_pre` and removes `range` from `failed_ranges`.
+- **`on_commit_failure(range)`** (called after a failed tx): restores the cache from `in_flight_pre` (reverting the optimistic update) and records `range` in `failed_ranges`.
+- **Gate in `handle()`**: if `failed_ranges` contains any range smaller than the current one, the handler returns `TransformationError::TransientBlocked`, which the retry machinery surfaces as a retryable failure. This blocks subsequent ranges from advancing the cumulative past a stuck block. The retry of the failed range itself is always admitted (`current == min_failed`), so the handler converges as soon as the underlying error clears.
+- **`on_reorg(orphaned)`**: called by the finalizer after DB rollback. Clears `proceeds_state`, `in_flight_pre`, and `failed_ranges` entirely; the next `handle()` lazily reloads the cache from `v4_base_proceeds_state`.
+
+Catchup has its own guardrail: a commit failure halts catchup via the engine's `handler_errored` flag, so restart still rebuilds the cache correctly for historical ranges.
 
 ### pool_id lookup
 

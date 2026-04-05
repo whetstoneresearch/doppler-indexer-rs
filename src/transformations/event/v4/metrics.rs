@@ -29,7 +29,7 @@
 //! `contract_address` (the hook address) to the pool ID via `v4_pool_configs`. The map
 //! is loaded at `initialize()` and refreshed on cache miss.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Once, OnceLock, RwLock};
 
 use alloy_primitives::{I256, U256};
@@ -61,6 +61,15 @@ pub struct V4BaseMetricsHandler {
     /// pool_id → (total_proceeds, total_tokens_sold) — loaded from v4_base_proceeds_state
     /// at init, refreshed on cache miss, updated optimistically in handle().
     proceeds_state: RwLock<HashMap<[u8; 32], (U256, U256)>>,
+    /// Pre-update cumulatives for the currently-in-flight batch, used by
+    /// `on_commit_failure` to revert the optimistic cache update. Populated
+    /// by `handle()` just before the optimistic write; drained by either
+    /// commit hook. Always `None` between batches in normal operation.
+    in_flight_pre: RwLock<Option<HashMap<[u8; 32], (U256, U256)>>>,
+    /// Ranges whose commit failed. `handle()` refuses any range strictly
+    /// greater than the minimum entry so delta computation never advances
+    /// past a stuck block. Retries drain this set via `on_commit_success`.
+    failed_ranges: RwLock<BTreeSet<(u64, u64)>>,
 }
 
 #[async_trait]
@@ -93,6 +102,23 @@ impl TransformationHandler for V4BaseMetricsHandler {
         &self,
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
+        // Gate: if an earlier range's commit is still outstanding, refuse any
+        // range that is strictly greater. This keeps delta computation from
+        // advancing past a stuck block — the failed range must retry and drain
+        // `failed_ranges` before later ranges can proceed.
+        {
+            let failed = self.failed_ranges.read().unwrap();
+            if let Some(&min_failed) = failed.iter().next() {
+                let current = (ctx.blockrange_start, ctx.blockrange_end);
+                if current > min_failed {
+                    return Err(TransformationError::TransientBlocked(format!(
+                        "V4BaseMetricsHandler: waiting on failed range {:?} before processing {:?}",
+                        min_failed, current
+                    )));
+                }
+            }
+        }
+
         self.decimals_init.call_once(|| {
             self.metadata_cache.resolve_quote_decimals(&ctx.contracts);
         });
@@ -165,7 +191,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
             return Ok(Vec::new());
         }
 
-        let mut ops = process_swaps(&swaps, &self.metadata_cache, ctx.chain_id);
+        let mut ops = process_swaps(&swaps, &self.metadata_cache, self.chain_id);
 
         // Durably checkpoint the new cumulative totals.
         for (pool_id, (total_proceeds, total_tokens_sold)) in &new_cumulative {
@@ -177,10 +203,24 @@ impl TransformationHandler for V4BaseMetricsHandler {
             ));
         }
 
-        // Update the in-memory cache optimistically. Because requires_sequential() is true,
-        // the next range won't run until this one finishes. If the DB transaction fails
-        // the engine halts further processing for this handler, so on restart the cache
-        // is rebuilt from the last-committed checkpoint.
+        // Stash pre-update cumulatives so `on_commit_failure` can revert the
+        // optimistic cache write if the transaction fails.
+        let pre: HashMap<[u8; 32], (U256, U256)> = {
+            let state = self.proceeds_state.read().unwrap();
+            new_cumulative
+                .keys()
+                .map(|id| {
+                    let prev = state.get(id).copied().unwrap_or((U256::ZERO, U256::ZERO));
+                    (*id, prev)
+                })
+                .collect()
+        };
+        *self.in_flight_pre.write().unwrap() = Some(pre);
+
+        // Update the in-memory cache optimistically. `on_commit_success` drains
+        // `in_flight_pre` after the transaction commits; `on_commit_failure`
+        // restores these entries and records the range so subsequent ranges
+        // block until the retry succeeds.
         {
             let mut state = self.proceeds_state.write().unwrap();
             for (pool_id, totals) in new_cumulative {
@@ -197,6 +237,47 @@ impl TransformationHandler for V4BaseMetricsHandler {
         self.load_hook_pool_map(db_pool).await?;
         self.load_all_proceeds_state(db_pool).await?;
         tracing::info!("V4BaseMetricsHandler initialized");
+        Ok(())
+    }
+
+    async fn on_reorg(&self, _orphaned: &[u64]) -> Result<(), TransformationError> {
+        // The DB has just been rolled back to its pre-reorg state by the
+        // finalizer; clear all in-memory state so subsequent handle() calls
+        // lazily reload from the (now-restored) DB.
+        self.proceeds_state.write().unwrap().clear();
+        *self.in_flight_pre.write().unwrap() = None;
+        self.failed_ranges.write().unwrap().clear();
+        tracing::info!("V4BaseMetricsHandler: cleared in-memory state after reorg");
+        Ok(())
+    }
+
+    async fn on_commit_success(
+        &self,
+        range: (u64, u64),
+    ) -> Result<(), TransformationError> {
+        *self.in_flight_pre.write().unwrap() = None;
+        self.failed_ranges.write().unwrap().remove(&range);
+        Ok(())
+    }
+
+    async fn on_commit_failure(
+        &self,
+        range: (u64, u64),
+    ) -> Result<(), TransformationError> {
+        // Revert the optimistic cache update using the pre-values stashed in
+        // handle(). If no pre-values are stashed (e.g., handle() returned
+        // empty ops or failed before the stash), there is nothing to revert.
+        if let Some(pre) = self.in_flight_pre.write().unwrap().take() {
+            let mut state = self.proceeds_state.write().unwrap();
+            for (pool_id, prev) in pre {
+                state.insert(pool_id, prev);
+            }
+        }
+        self.failed_ranges.write().unwrap().insert(range);
+        tracing::warn!(
+            "V4BaseMetricsHandler: commit failed for range {:?}, blocking later ranges until retry succeeds",
+            range
+        );
         Ok(())
     }
 }
@@ -294,6 +375,20 @@ impl V4BaseMetricsHandler {
                 hook_addr.copy_from_slice(&hook_addr_bytes);
                 map.entry(hook_addr).or_insert(pool_id);
             }
+        }
+
+        let still_missing: Vec<_> = events
+            .iter()
+            .filter(|e| !map.contains_key(&e.contract_address))
+            .map(|e| hex::encode(e.contract_address))
+            .collect();
+        if !still_missing.is_empty() {
+            tracing::warn!(
+                "V4BaseMetricsHandler: {} hook address(es) still missing from v4_pool_configs \
+                 after refresh; swaps from those hooks will be skipped: {:?}",
+                still_missing.len(),
+                still_missing,
+            );
         }
 
         Ok(())
@@ -499,6 +594,13 @@ impl V4BaseMetricsHandler {
                         prev_proceeds,
                         total_proceeds,
                     );
+                    // NOTE: "treat as full value" (i.e. prev=0) also serves as crash-replay
+                    // idempotency. If the process crashed after committing the DB row but before
+                    // updating handler progress, the in-memory cache is reloaded from the
+                    // post-commit checkpoint on restart, so `prev_proceeds` exceeds this event's
+                    // cumulative. Using `total_proceeds` as the delta resets prev to the current
+                    // event's baseline, producing identical pool_snapshots to the original run.
+                    // Do NOT convert this warn to an error without preserving that invariant.
                     total_proceeds
                 };
 
@@ -651,6 +753,8 @@ pub fn register_handlers(
         db_pool: OnceLock::new(),
         hook_pool_map: RwLock::new(HashMap::new()),
         proceeds_state: RwLock::new(HashMap::new()),
+        in_flight_pre: RwLock::new(None),
+        failed_ranges: RwLock::new(BTreeSet::new()),
     });
 }
 
@@ -699,6 +803,8 @@ mod tests {
             db_pool: OnceLock::new(),
             hook_pool_map: RwLock::new(HashMap::new()),
             proceeds_state: RwLock::new(HashMap::new()),
+            in_flight_pre: RwLock::new(None),
+            failed_ranges: RwLock::new(BTreeSet::new()),
         }
     }
 
@@ -937,5 +1043,183 @@ mod tests {
             }
             _ => panic!("expected Upsert"),
         }
+    }
+
+    // ── commit hooks / gate / reorg ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_on_reorg_clears_all_in_memory_state() {
+        let handler = make_handler(8453);
+        let pool_id = make_pool_id(0x10);
+
+        // Pre-populate all three caches/structures.
+        handler
+            .proceeds_state
+            .write()
+            .unwrap()
+            .insert(pool_id, (U256::from(42u64), U256::from(21u64)));
+        *handler.in_flight_pre.write().unwrap() =
+            Some([(pool_id, (U256::ZERO, U256::ZERO))].into_iter().collect());
+        handler.failed_ranges.write().unwrap().insert((100, 101));
+
+        handler.on_reorg(&[100, 101]).await.unwrap();
+
+        assert!(handler.proceeds_state.read().unwrap().is_empty());
+        assert!(handler.in_flight_pre.read().unwrap().is_none());
+        assert!(handler.failed_ranges.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_on_commit_failure_reverts_cache_and_records_range() {
+        let handler = make_handler(8453);
+        let pool_id = make_pool_id(0x11);
+
+        // Simulate the in-flight state right before a commit failure:
+        //   cache is at (100, 50) (the optimistic post-update), but the
+        //   pre-update state was (70, 35).
+        handler
+            .proceeds_state
+            .write()
+            .unwrap()
+            .insert(pool_id, (U256::from(100u64), U256::from(50u64)));
+        *handler.in_flight_pre.write().unwrap() = Some(
+            [(pool_id, (U256::from(70u64), U256::from(35u64)))]
+                .into_iter()
+                .collect(),
+        );
+
+        handler.on_commit_failure((200, 201)).await.unwrap();
+
+        // Cache should have been reverted to the pre-update value.
+        let state = handler.proceeds_state.read().unwrap();
+        assert_eq!(
+            state.get(&pool_id).copied(),
+            Some((U256::from(70u64), U256::from(35u64)))
+        );
+        // in_flight_pre should be drained.
+        assert!(handler.in_flight_pre.read().unwrap().is_none());
+        // Range should be recorded as failed.
+        assert!(handler.failed_ranges.read().unwrap().contains(&(200, 201)));
+    }
+
+    #[tokio::test]
+    async fn test_on_commit_success_clears_pending_and_drains_range() {
+        let handler = make_handler(8453);
+        let pool_id = make_pool_id(0x12);
+
+        *handler.in_flight_pre.write().unwrap() =
+            Some([(pool_id, (U256::ZERO, U256::ZERO))].into_iter().collect());
+        handler.failed_ranges.write().unwrap().insert((300, 301));
+
+        handler.on_commit_success((300, 301)).await.unwrap();
+
+        assert!(handler.in_flight_pre.read().unwrap().is_none());
+        assert!(handler.failed_ranges.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_on_commit_success_for_unrelated_range_preserves_others() {
+        let handler = make_handler(8453);
+        handler.failed_ranges.write().unwrap().insert((100, 101));
+        handler.failed_ranges.write().unwrap().insert((102, 103));
+
+        handler.on_commit_success((102, 103)).await.unwrap();
+
+        let remaining = handler.failed_ranges.read().unwrap();
+        assert!(remaining.contains(&(100, 101)));
+        assert!(!remaining.contains(&(102, 103)));
+    }
+
+    #[tokio::test]
+    async fn test_on_commit_failure_with_no_in_flight_is_noop_on_cache() {
+        // If handle() returned empty ops (or failed before the stash) then
+        // in_flight_pre is None — on_commit_failure should still record the
+        // range but leave the cache alone.
+        let handler = make_handler(8453);
+        let pool_id = make_pool_id(0x13);
+        handler
+            .proceeds_state
+            .write()
+            .unwrap()
+            .insert(pool_id, (U256::from(999u64), U256::from(888u64)));
+
+        handler.on_commit_failure((400, 401)).await.unwrap();
+
+        let state = handler.proceeds_state.read().unwrap();
+        assert_eq!(
+            state.get(&pool_id).copied(),
+            Some((U256::from(999u64), U256::from(888u64)))
+        );
+        assert!(handler.failed_ranges.read().unwrap().contains(&(400, 401)));
+    }
+
+    // Gate tests — exercised by constructing an empty context and driving
+    // handle() with the failed_ranges set pre-populated. We don't need
+    // events since the gate is the very first check.
+
+    fn empty_ctx(range_start: u64, range_end: u64) -> TransformationContext {
+        use crate::rpc::UnifiedRpcClient;
+        use crate::transformations::historical::HistoricalDataReader;
+        use std::collections::HashMap as StdHashMap;
+
+        // These services aren't exercised because handle() returns before
+        // touching them when the gate trips or events are empty.
+        let historical = Arc::new(
+            HistoricalDataReader::new("test_chain_v4_metrics")
+                .expect("HistoricalDataReader::new should succeed"),
+        );
+        let rpc = Arc::new(
+            UnifiedRpcClient::from_url("http://localhost:8545")
+                .expect("RPC client construction should succeed"),
+        );
+        TransformationContext::new(
+            "test".to_string(),
+            8453,
+            range_start,
+            range_end,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            StdHashMap::new(),
+            historical,
+            rpc,
+            Arc::new(StdHashMap::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_gate_blocks_later_ranges_after_failure() {
+        let handler = make_handler(8453);
+        // Simulate a prior commit failure for range (100, 101).
+        handler.failed_ranges.write().unwrap().insert((100, 101));
+
+        // A later range should be refused.
+        let ctx = empty_ctx(200, 201);
+        let result = handler.handle(&ctx).await;
+        match result {
+            Err(TransformationError::TransientBlocked(_)) => {}
+            other => panic!("expected TransientBlocked, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gate_allows_the_failed_range_to_retry() {
+        let handler = make_handler(8453);
+        // The failed range is (100, 101); retrying it should be allowed.
+        handler.failed_ranges.write().unwrap().insert((100, 101));
+
+        let ctx = empty_ctx(100, 101);
+        // No events present in the context, so handle() returns Ok(vec![])
+        // after passing the gate. If the gate had refused we'd get
+        // TransientBlocked instead.
+        let result = handler.handle(&ctx).await;
+        assert!(matches!(result, Ok(ops) if ops.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_gate_allows_any_range_when_failed_ranges_empty() {
+        let handler = make_handler(8453);
+        let ctx = empty_ctx(9999, 10000);
+        let result = handler.handle(&ctx).await;
+        assert!(matches!(result, Ok(ops) if ops.is_empty()));
     }
 }

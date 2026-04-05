@@ -219,16 +219,26 @@ pub(crate) async fn run_handler_task(
                 .map_err(TransformationError::DatabaseError),
         };
 
-        if let Err(e) = result {
-            tracing::error!(
-                "Handler {} transaction failed for range {}-{}: {:?}",
-                handler_key,
-                range_start,
-                range_end,
-                e
-            );
-            return Err(e);
+        match result {
+            Ok(()) => {
+                handler.on_commit_success((range_start, range_end)).await?;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Handler {} transaction failed for range {}-{}: {:?}",
+                    handler_key,
+                    range_start,
+                    range_end,
+                    e
+                );
+                handler.on_commit_failure((range_start, range_end)).await?;
+                return Err(e);
+            }
         }
+    } else {
+        // Empty ops = nothing to commit, but still notify the handler so it
+        // can drain any per-range state it may track.
+        handler.on_commit_success((range_start, range_end)).await?;
     }
 
     Ok(HandlerOutcome {

@@ -409,7 +409,17 @@ impl TransformationEngine {
                 Ok(ops) => {
                     if !ops.is_empty() {
                         let ops = inject_source_version(ops, handler_name, handler_version);
-                        db_pool.execute_transaction(ops).await?;
+                        match db_pool.execute_transaction(ops).await {
+                            Ok(()) => {
+                                handler.on_commit_success((range_start, range_end)).await?;
+                            }
+                            Err(e) => {
+                                handler.on_commit_failure((range_start, range_end)).await?;
+                                return Err(TransformationError::DatabaseError(e));
+                            }
+                        }
+                    } else {
+                        handler.on_commit_success((range_start, range_end)).await?;
                     }
                     Ok(Some((handler_key, range_start, range_end)))
                 }
