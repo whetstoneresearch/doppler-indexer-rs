@@ -137,6 +137,8 @@ struct CatchupHandler {
     /// Handler dependencies: handler name() values that must complete first.
     handler_deps: Vec<String>,
     kind: HandlerKind,
+    /// When true, the scheduler processes ranges one at a time in ascending order.
+    sequential: bool,
 }
 
 /// The transformation engine processes decoded data and invokes handlers.
@@ -422,12 +424,14 @@ impl TransformationEngine {
                         .iter()
                         .map(|s| s.to_string())
                         .collect();
+                    let sequential = info.handler.requires_sequential();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers,
                         call_deps,
                         handler_deps,
                         kind: HandlerKind::Event,
+                        sequential,
                     }
                 })
                 .collect(),
@@ -441,12 +445,14 @@ impl TransformationEngine {
                         .iter()
                         .map(|t| (t.source.clone(), t.function_name.clone()))
                         .collect();
+                    let sequential = info.handler.requires_sequential();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers,
                         call_deps: Vec::new(),
                         handler_deps: Vec::new(),
                         kind: HandlerKind::Call,
+                        sequential,
                     }
                 })
                 .collect(),
@@ -549,6 +555,8 @@ impl TransformationEngine {
             // Per-handler per-pass counters for observability.
             // (submitted, call_dep_deferred, cascade_deferred).
             let mut per_handler_counts: HashMap<String, (usize, usize, usize)> = HashMap::new();
+            // First missing call dep paths per handler (for summary log).
+            let mut per_handler_missing_call_deps: HashMap<String, Vec<String>> = HashMap::new();
 
             for ch in &handlers {
                 let name = ch.handler.name().to_string();
@@ -584,16 +592,35 @@ impl TransformationEngine {
 
                     // Skip range if call-dep files aren't on disk yet.
                     if !ch.call_deps.is_empty() {
-                        let ready = call_range_sets
+                        let missing_deps: Vec<&str> = ch
+                            .call_deps
                             .iter()
-                            .all(|set| set.contains(&(range_start, range_end)));
-                        if !ready {
-                            tracing::debug!(
-                                "Handler {} skipping range {}-{}: call dependencies not yet decoded",
-                                ch.handler.handler_key(),
-                                range_start,
-                                range_end
-                            );
+                            .zip(call_range_sets.iter())
+                            .filter(|(_, set)| !set.contains(&(range_start, range_end)))
+                            .map(|((source, func), _)| {
+                                // Leak-free: just reference the source since it
+                                // lives as long as the handler.
+                                if func.is_empty() {
+                                    source.as_str()
+                                } else {
+                                    // Can't return a formatted &str, so store in
+                                    // per_handler_missing_deps below instead.
+                                    source.as_str()
+                                }
+                            })
+                            .collect();
+                        if !missing_deps.is_empty() {
+                            // Track which call deps are missing for the summary log.
+                            let missing_formatted: Vec<String> = ch
+                                .call_deps
+                                .iter()
+                                .zip(call_range_sets.iter())
+                                .filter(|(_, set)| !set.contains(&(range_start, range_end)))
+                                .map(|((source, func), _)| format!("{}/{}", source, func))
+                                .collect();
+                            per_handler_missing_call_deps
+                                .entry(name.clone())
+                                .or_insert_with(|| missing_formatted);
                             next_pending
                                 .entry(name.clone())
                                 .or_default()
@@ -661,6 +688,7 @@ impl TransformationEngine {
                         range_start,
                         range_end,
                         dep_names: ch.handler_deps.clone(),
+                        sequential: ch.sequential,
                         payload: Box::new(CatchupPayload {
                             handler: ch.handler.clone(),
                             handler_key: ch.handler.handler_key(),
@@ -693,14 +721,19 @@ impl TransformationEngine {
                         submitted
                     );
                 } else {
+                    let missing_info = per_handler_missing_call_deps
+                        .get(ch.handler.name())
+                        .map(|deps| format!(" [missing: {}]", deps.join(", ")))
+                        .unwrap_or_default();
                     tracing::info!(
                         "Handler {} catchup pass {}: submitting {} range(s), \
-                         deferring {} (call_deps not ready) + {} (upstream deferred)",
+                         deferring {} (call_deps not ready) + {} (upstream deferred){}",
                         ch.handler.handler_key(),
                         pass,
                         submitted,
                         call_dep_def,
-                        cascade_def
+                        cascade_def,
+                        missing_info
                     );
                 }
             }

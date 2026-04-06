@@ -542,6 +542,7 @@ mod tests {
             range_start,
             range_end: range_start + 1000,
             dep_names: deps.iter().map(|s| s.to_string()).collect(),
+            sequential: false,
             payload: Box::new(()),
         }
     }

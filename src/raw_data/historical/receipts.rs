@@ -13,6 +13,7 @@ use alloy::rpc::types::Log;
 use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use metrics::counter;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
@@ -935,6 +936,20 @@ pub(crate) async fn process_range(
         }
     };
     let total_write_time = write_start.elapsed();
+
+    // Record receipt collection metrics
+    counter!(
+        "collection_receipts_processed_total",
+        "chain" => chain_name.to_string()
+    )
+    .increment(total_receipts as u64);
+
+    crate::metrics::record_parquet_write(
+        chain_name,
+        "receipts",
+        total_write_time.as_secs_f64(),
+        &output_path,
+    );
 
     // Upload to S3 if configured
     if let Some(sm) = storage_manager {
