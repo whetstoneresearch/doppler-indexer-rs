@@ -1,5 +1,7 @@
+mod db;
 mod rpc;
 
+pub use db::{describe_db_metrics, sample_pool_stats};
 pub use rpc::{chain_label_from_url, describe_rpc_metrics, with_metrics, RpcMethod};
 
 use std::net::SocketAddr;
