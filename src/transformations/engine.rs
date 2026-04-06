@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use super::error::TransformationError;
-use super::executor::{DbExecMode, HandlerExecutor, HandlerTask};
+use super::executor::{DbExecMode, HandlerExecutor, HandlerTask, ProcessRangePayload, run_handler_task};
 use super::finalizer::RangeFinalizer;
 use super::historical::HistoricalDataReader;
 use super::live_state::{LiveProcessingState, PendingEventData};
@@ -1320,7 +1320,6 @@ impl TransformationEngine {
             &submitted_keys,
             &succeeded_keys,
             &persistable_success_keys,
-            &outcomes,
         )
         .await;
 
@@ -1435,7 +1434,6 @@ impl TransformationEngine {
         submitted_keys: &HashSet<String>,
         succeeded_keys: &HashSet<String>,
         persistable_success_keys: &HashSet<String>,
-        _outcomes: &[super::executor::HandlerOutcome],
     ) {
         if range_end - range_start == 1 {
             // Only record live progress for handlers in persistable_success_keys.
@@ -1795,7 +1793,6 @@ impl TransformationEngine {
                 &submitted_keys,
                 &succeeded_keys,
                 &persistable_success_keys,
-                &outcomes,
             )
             .await;
 
@@ -1966,55 +1963,97 @@ impl TransformationEngine {
         }
     }
 
-    /// Build handler tasks for all event and call triggers in a block range.
+    /// Build WorkItems and a `handler_name → handler_key` map for a single
+    /// `(range_start, range_end)` execution via the [`DagScheduler`].
     ///
-    /// Deduplicates by handler_key so that multi-trigger handlers produce
-    /// exactly one task even when multiple triggers match the same block.
-    fn build_handler_tasks(
+    /// Deduplicates by `handler_key` so multi-trigger handlers produce exactly
+    /// one `WorkItem` even when several triggers match the same block. Each
+    /// `WorkItem` carries `dep_names` derived from `handler_dependencies()` so
+    /// the scheduler gates execution on those deps completing first.
+    fn build_process_range_items(
         &self,
         event_triggers: &[(String, String)],
         call_triggers: &[(String, String)],
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
-    ) -> Vec<HandlerTask> {
-        let mut tasks = Vec::new();
+        range_start: u64,
+        range_end: u64,
+        snapshot_chain: Option<String>,
+    ) -> (Vec<WorkItem>, HashMap<String, String>) {
+        let mut items: Vec<WorkItem> = Vec::new();
         let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut name_to_key: HashMap<String, String> = HashMap::new();
 
         for (source, event_name) in event_triggers {
             for handler in self.registry.handlers_for_event(source, event_name) {
-                if !seen_keys.insert(handler.handler_key()) {
+                // Collect dep_names from EventHandler before upcasting — the
+                // method lives on EventHandler, not on TransformationHandler.
+                let dep_names: Vec<String> = handler
+                    .handler_dependencies()
+                    .iter()
+                    .map(|s: &&str| s.to_string())
+                    .collect();
+                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
+                let key = handler.handler_key();
+                if !seen_keys.insert(key.clone()) {
                     continue;
                 }
-                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
-                tasks.push(HandlerTask {
-                    handler,
-                    events: events.clone(),
-                    calls: calls.clone(),
-                    tx_addresses: tx_addresses.clone(),
+                let name = handler.name().to_string();
+                name_to_key.insert(name.clone(), key);
+                items.push(WorkItem {
+                    handler_name: name,
+                    range_start,
+                    range_end,
+                    dep_names,
+                    payload: Box::new(ProcessRangePayload {
+                        handler,
+                        events: events.clone(),
+                        calls: calls.clone(),
+                        tx_addresses: tx_addresses.clone(),
+                        snapshot_chain: snapshot_chain.clone(),
+                    }),
                 });
             }
         }
 
         for (source, function_name) in call_triggers {
             for handler in self.registry.handlers_for_call(source, function_name) {
-                if !seen_keys.insert(handler.handler_key()) {
+                // EthCallHandler has no handler_dependencies; call handlers
+                // never declare handler-level ordering constraints.
+                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
+                let key = handler.handler_key();
+                if !seen_keys.insert(key.clone()) {
                     continue;
                 }
-                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
-                tasks.push(HandlerTask {
-                    handler,
-                    events: events.clone(),
-                    calls: calls.clone(),
-                    tx_addresses: tx_addresses.clone(),
+                let name = handler.name().to_string();
+                name_to_key.insert(name.clone(), key);
+                items.push(WorkItem {
+                    handler_name: name,
+                    range_start,
+                    range_end,
+                    dep_names: vec![],
+                    payload: Box::new(ProcessRangePayload {
+                        handler,
+                        events: events.clone(),
+                        calls: calls.clone(),
+                        tx_addresses: tx_addresses.clone(),
+                        snapshot_chain: snapshot_chain.clone(),
+                    }),
                 });
             }
         }
 
-        tasks
+        (items, name_to_key)
     }
 
-    /// Process a block range with per-handler transactions.
+    /// Process a block range with dep-aware concurrent per-handler transactions.
+    ///
+    /// Routes all triggered handlers through the [`DagScheduler`], which gates
+    /// each handler on its `handler_dependencies()` completing first. Replaces
+    /// the old `HandlerExecutor::execute_handlers` call that ran handlers in
+    /// parallel with no dependency ordering, which was incorrect for handlers
+    /// with `handler_dependencies` in the retry/reorg path.
     async fn process_range(
         &self,
         range_start: u64,
@@ -2030,13 +2069,17 @@ impl TransformationEngine {
             calls.len()
         );
 
-        let event_triggers: HashSet<_> = events
+        let event_triggers: Vec<(String, String)> = events
             .iter()
             .map(|e| (e.source_name.clone(), e.event_name.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
-        let call_triggers: HashSet<_> = calls
+        let call_triggers: Vec<(String, String)> = calls
             .iter()
             .map(|c| (c.source_name.clone(), c.function_name.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
 
         let tx_addresses = self.read_receipt_addresses(range_start, range_end).await;
@@ -2044,42 +2087,105 @@ impl TransformationEngine {
         let calls = Arc::new(calls);
 
         let is_live_mode = range_end - range_start == 1;
-        let db_exec_mode = if is_live_mode {
-            DbExecMode::WithSnapshotCapture {
-                chain_name: self.chain_name.clone(),
-            }
+        let snapshot_chain = if is_live_mode {
+            Some(self.chain_name.clone())
         } else {
-            DbExecMode::Direct
+            None
         };
 
-        let tasks = self.build_handler_tasks(
-            &event_triggers.into_iter().collect::<Vec<_>>(),
-            &call_triggers.into_iter().collect::<Vec<_>>(),
+        let (items, name_to_key) = self.build_process_range_items(
+            &event_triggers,
+            &call_triggers,
             events,
             calls,
             tx_addresses,
+            range_start,
+            range_end,
+            snapshot_chain,
         );
 
-        // Count submissions per handler to detect partial failures.
-        let mut submitted_counts: HashMap<String, usize> = HashMap::new();
-        for t in &tasks {
-            *submitted_counts.entry(t.handler.handler_key()).or_default() += 1;
+        if items.is_empty() {
+            return Ok(());
         }
 
-        let outcomes = self
-            .executor
-            .execute_handlers(tasks, range_start, range_end, &db_exec_mode)
+        let submitted_keys: HashSet<String> = name_to_key.values().cloned().collect();
+
+        // Fresh tracker per call: single range. Dep handlers that have no
+        // triggers in this batch are seeded as completed so their dependents
+        // don't hang waiting on a mark_completed that will never arrive.
+        let tracker = Arc::new(CompletionTracker::new());
+        {
+            let item_names: HashSet<&str> = items
+                .iter()
+                .map(|i| i.handler_name.as_str())
+                .collect();
+            let missing_deps: HashSet<&str> = items
+                .iter()
+                .flat_map(|i| i.dep_names.iter().map(|d| d.as_str()))
+                .filter(|dep| !item_names.contains(dep))
+                .collect();
+            for dep in missing_deps {
+                tracker.seed_completed(dep, [range_start]).await;
+            }
+        }
+        let scheduler = DagScheduler::new(tracker, self.handler_concurrency);
+
+        let db_pool = self.db_pool.clone();
+        let historical = self.historical_reader.clone();
+        let rpc_client = self.executor.rpc_client.clone();
+        let contracts = self.contracts.clone();
+        let chain_name = self.chain_name.clone();
+        let chain_id = self.chain_id;
+
+        let outcomes = scheduler
+            .execute(items, move |item: WorkItem| {
+                let db_pool = db_pool.clone();
+                let historical = historical.clone();
+                let rpc_client = rpc_client.clone();
+                let contracts = contracts.clone();
+                let chain_name = chain_name.clone();
+                Box::pin(async move {
+                    let WorkItem {
+                        range_start,
+                        range_end,
+                        payload,
+                        ..
+                    } = item;
+                    let payload = *payload
+                        .downcast::<ProcessRangePayload>()
+                        .expect("process_range WorkItem payload type mismatch");
+                    let db_exec_mode = match payload.snapshot_chain {
+                        Some(ref cn) => DbExecMode::WithSnapshotCapture {
+                            chain_name: cn.clone(),
+                        },
+                        None => DbExecMode::Direct,
+                    };
+                    run_handler_task(
+                        payload.handler,
+                        payload.events,
+                        payload.calls,
+                        payload.tx_addresses,
+                        chain_name,
+                        chain_id,
+                        range_start,
+                        range_end,
+                        historical,
+                        rpc_client,
+                        contracts,
+                        db_pool,
+                        &db_exec_mode,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+                })
+            })
             .await;
 
-        let mut succeeded_counts: HashMap<String, usize> = HashMap::new();
-        for o in &outcomes {
-            *succeeded_counts.entry(o.handler_key.clone()).or_default() += 1;
-        }
-        let submitted_keys: HashSet<String> = submitted_counts.keys().cloned().collect();
-        let succeeded_keys: HashSet<String> = submitted_counts
+        let succeeded_keys: HashSet<String> = outcomes
             .iter()
-            .filter(|(k, &count)| succeeded_counts.get(*k).copied().unwrap_or(0) == count)
-            .map(|(k, _)| k.clone())
+            .filter(|o| matches!(o.status, OutcomeStatus::Succeeded))
+            .filter_map(|o| name_to_key.get(&o.handler_name).cloned())
             .collect();
 
         // Only persist success for single-trigger handlers.  Multi-trigger
@@ -2104,7 +2210,6 @@ impl TransformationEngine {
             &submitted_keys,
             &succeeded_keys,
             &persistable_success_keys,
-            &outcomes,
         )
         .await;
 

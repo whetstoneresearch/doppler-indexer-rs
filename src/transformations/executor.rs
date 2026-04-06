@@ -43,6 +43,22 @@ pub(crate) struct HandlerTask {
     pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
 }
 
+/// Opaque payload carried inside a process-range [`WorkItem`].
+///
+/// Holds the handler and its pre-decoded input data so the DAG runner
+/// closure can call [`run_handler_task`] without re-fetching anything.
+/// Used by [`engine::process_range`] for the dep-aware single-range path.
+///
+/// [`WorkItem`]: super::scheduler::dag::WorkItem
+pub(crate) struct ProcessRangePayload {
+    pub handler: Arc<dyn TransformationHandler>,
+    pub events: Arc<Vec<DecodedEvent>>,
+    pub calls: Arc<Vec<DecodedCall>>,
+    pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    /// `Some(chain_name)` → snapshot-capture mode (live); `None` → direct (historical).
+    pub snapshot_chain: Option<String>,
+}
+
 /// Executes transformation handlers concurrently with bounded parallelism.
 pub(crate) struct HandlerExecutor {
     pub db_pool: Arc<DbPool>,

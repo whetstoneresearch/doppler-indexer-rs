@@ -9,13 +9,15 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
+use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use super::engine::HandlerKind;
 use super::error::TransformationError;
-use super::executor::{execute_with_snapshot_capture, inject_source_version};
+use super::executor::{DbExecMode, run_handler_task};
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
+use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem};
+use super::scheduler::tracker::CompletionTracker;
 use crate::decoding::eth_calls::{
     build_decode_configs, build_result_map, build_result_map_for_merge, CallDecodeConfig,
     EventCallDecodeConfig,
@@ -46,6 +48,17 @@ struct RetryHandler {
     /// Handler dependencies: handler name() values that must complete first.
     handler_deps: Vec<String>,
     kind: HandlerKind,
+}
+
+/// Opaque payload for retry [`WorkItem`]s.
+///
+/// Carries the pre-filtered handler and data so the DAG runner can call
+/// [`run_handler_task`] without re-reading storage.
+struct RetryPayload {
+    handler: Arc<dyn super::traits::TransformationHandler>,
+    handler_events: Arc<Vec<DecodedEvent>>,
+    handler_calls: Arc<Vec<DecodedCall>>,
+    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
 }
 
 pub(crate) fn resolve_retry_missing_handlers(
@@ -379,61 +392,41 @@ impl RetryProcessor {
         let range_start = block_number;
         let range_end = block_number + 1;
         let tx_addresses = read_live_receipt_addresses(&self.chain_name, block_number)?;
-        let mut blocked_handlers = HashSet::new();
-        let mut attempted_keys = HashSet::new();
-        let mut succeeded_keys = HashSet::new();
-        let mut succeeded_names: HashSet<String> = HashSet::new();
+        let events = Arc::new(events);
+        let calls = Arc::new(calls);
 
-        // Precompute handler names that are being retried (in missing_handlers)
-        // so we can check handler deps efficiently.
-        let missing_names: HashSet<String> = missing_handlers
-            .iter()
-            .filter_map(|mk| {
-                self.registry
-                    .handler_name_for_key(mk)
-                    .map(|n| n.to_string())
-            })
-            .collect();
+        let tracker = Arc::new(CompletionTracker::new());
 
-        // Build a uniform list of retry handler descriptors, sorted by
-        // topological order so dependencies execute before dependents.
-        let mut retry_handlers = self.build_retry_handler_list();
-        let topo_order = self.registry.handler_topological_order();
-        let position: HashMap<&str, usize> = topo_order
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.as_str(), i))
-            .collect();
-        retry_handlers.sort_by_key(|rh| {
-            position
-                .get(rh.handler.name())
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
+        // (handler_key, handler_name) for handlers that resolve immediately
+        // (already committed in DB or no matching trigger data). These bypass
+        // the DAG and are unconditionally counted as successes.
+        let mut immediate_successes: Vec<(String, String)> = Vec::new();
+        // Handler keys pre-failed in the tracker because their call dependencies
+        // are absent from the available decoded data.
+        let mut call_dep_blocked_keys: HashSet<String> = HashSet::new();
+        // Work items submitted to the DAG, plus name→key for outcome lookup.
+        let mut work_items: Vec<WorkItem> = Vec::new();
+        let mut name_to_key: HashMap<String, String> = HashMap::new();
 
-        for rh in &retry_handlers {
+        for rh in &self.build_retry_handler_list() {
             let handler_key = rh.handler.handler_key();
+            let handler_name = rh.handler.name().to_string();
+
+            // Handlers not in missing_handlers already completed in a prior
+            // run; seed them so their dependents don't block waiting for them.
             if !missing_handlers.contains(&handler_key) {
+                tracker.seed_completed(&handler_name, [range_start]).await;
                 continue;
             }
 
-            // Skip if already committed — avoids duplicate snapshots corrupting reorg rollback
+            // Already committed in DB — skip re-execution, record success.
             let completed = self
                 .get_completed_ranges_for_handler(&handler_key)
                 .await
                 .unwrap_or_default();
             if completed.contains(&range_start) {
-                attempted_keys.insert(handler_key.clone());
-                self.record_handler_retry_success(
-                    &handler_key,
-                    rh.handler.name(),
-                    range_start,
-                    range_end,
-                    block_number,
-                    &mut succeeded_keys,
-                    &mut succeeded_names,
-                )
-                .await;
+                tracker.seed_completed(&handler_name, [range_start]).await;
+                immediate_successes.push((handler_key, handler_name));
                 continue;
             }
 
@@ -441,7 +434,7 @@ impl RetryProcessor {
             // deps. If the handler has no matching events/calls, it's a no-op
             // regardless of whether its deps are met — blocking it would
             // prevent finalization for no reason.
-            let trigger_data = match rh.kind {
+            let (handler_events, pre_handler_calls) = match rh.kind {
                 HandlerKind::Event => {
                     let handler_events: Vec<DecodedEvent> = events
                         .iter()
@@ -451,25 +444,12 @@ impl RetryProcessor {
                         })
                         .cloned()
                         .collect();
-
                     if handler_events.is_empty() {
-                        // No matching events — treat as no-op success so
-                        // dependent handlers aren't blocked on this one.
-                        attempted_keys.insert(handler_key.clone());
-                        self.record_handler_retry_success(
-                            &handler_key,
-                            rh.handler.name(),
-                            range_start,
-                            range_end,
-                            block_number,
-                            &mut succeeded_keys,
-                            &mut succeeded_names,
-                        )
-                        .await;
+                        tracker.seed_completed(&handler_name, [range_start]).await;
+                        immediate_successes.push((handler_key, handler_name));
                         continue;
                     }
-
-                    Some((handler_events, Vec::new()))
+                    (handler_events, Vec::new())
                 }
                 HandlerKind::Call => {
                     let handler_calls: Vec<DecodedCall> = calls
@@ -480,55 +460,18 @@ impl RetryProcessor {
                         })
                         .cloned()
                         .collect();
-
                     if handler_calls.is_empty() {
-                        // No matching calls — treat as no-op success so
-                        // dependent handlers aren't blocked on this one.
-                        attempted_keys.insert(handler_key.clone());
-                        self.record_handler_retry_success(
-                            &handler_key,
-                            rh.handler.name(),
-                            range_start,
-                            range_end,
-                            block_number,
-                            &mut succeeded_keys,
-                            &mut succeeded_names,
-                        )
-                        .await;
+                        tracker.seed_completed(&handler_name, [range_start]).await;
+                        immediate_successes.push((handler_key, handler_name));
                         continue;
                     }
-
-                    Some((Vec::new(), handler_calls))
+                    (Vec::new(), handler_calls)
                 }
             };
 
-            // Unwrap trigger data (both no-match branches continue above)
-            let (handler_events, mut handler_calls) = trigger_data.unwrap();
-
-            // Check handler dependencies: a dep blocks only if it is itself
-            // being retried (in missing_names) and hasn't succeeded yet.
-            // Deps not in missing_names already completed in a prior run.
-            if !rh.handler_deps.is_empty() {
-                let unmet: Vec<&str> = rh
-                    .handler_deps
-                    .iter()
-                    .filter(|dep| missing_names.contains(*dep) && !succeeded_names.contains(*dep))
-                    .map(|s| s.as_str())
-                    .collect();
-                if !unmet.is_empty() {
-                    tracing::warn!(
-                        "Skipping live retry for handler {} on block {}: handler deps not met {:?}",
-                        handler_key,
-                        block_number,
-                        unmet
-                    );
-                    blocked_handlers.insert(handler_key);
-                    continue;
-                }
-            }
-
-            // For event handlers: check call dependencies and filter calls
-            if rh.kind == HandlerKind::Event {
+            // For event handlers: check call dependencies. Missing deps →
+            // pre-fail in the tracker so dependents cascade-fail via the DAG.
+            let final_calls = if rh.kind == HandlerKind::Event {
                 let missing_deps = missing_retry_call_dependencies(&rh.call_deps, &calls);
                 if !missing_deps.is_empty() {
                     tracing::warn!(
@@ -537,125 +480,164 @@ impl RetryProcessor {
                         block_number,
                         missing_deps
                     );
-                    blocked_handlers.insert(handler_key);
+                    tracker.mark_failed(&handler_name, range_start).await;
+                    call_dep_blocked_keys.insert(handler_key);
                     continue;
                 }
-
-                handler_calls = calls
+                calls
                     .iter()
                     .filter(|call| {
                         rh.call_deps
                             .contains(&(call.source_name.clone(), call.function_name.clone()))
                     })
                     .cloned()
-                    .collect();
-            }
+                    .collect::<Vec<_>>()
+            } else {
+                pre_handler_calls
+            };
 
-            // handler_events and handler_calls are now ready for execution
-
-            attempted_keys.insert(handler_key.clone());
-
-            let handler_name = rh.handler.name();
-            let handler_version = rh.handler.version();
-
-            // Event handlers get tx_addresses; call handlers pass empty map
-            let task_tx_addresses = match rh.kind {
+            // tx_addresses for event handlers; empty for call handlers.
+            let item_tx_addresses = match rh.kind {
                 HandlerKind::Event => tx_addresses.clone(),
                 HandlerKind::Call => HashMap::new(),
             };
 
-            let live_storage = LiveStorage::new(&self.chain_name);
-            let ctx = TransformationContext::new(
-                self.chain_name.clone(),
-                self.chain_id,
+            // dep_names are handler names (not keys). The tracker already has
+            // the correct state for every possible dep via seeding/failing
+            // above, so wait_ready resolves immediately for non-missing deps
+            // and fails fast for call-blocked deps.
+            let dep_names = rh.handler_deps.clone();
+
+            name_to_key.insert(handler_name.clone(), handler_key);
+            work_items.push(WorkItem {
+                handler_name: handler_name.clone(),
                 range_start,
                 range_end,
-                Arc::new(handler_events),
-                Arc::new(handler_calls),
-                task_tx_addresses,
-                self.historical_reader.clone(),
-                self.rpc_client.clone(),
-                self.contracts.clone(),
-            );
+                dep_names,
+                payload: Box::new(RetryPayload {
+                    handler: rh.handler.clone(),
+                    handler_events: Arc::new(handler_events),
+                    handler_calls: Arc::new(final_calls),
+                    tx_addresses: item_tx_addresses,
+                }),
+            });
+        }
 
-            match rh.handler.handle(&ctx).await {
-                Ok(ops) => {
-                    let commit_result = if !ops.is_empty() {
-                        let ops = inject_source_version(ops, handler_name, handler_version);
-                        execute_with_snapshot_capture(
-                            ops,
-                            &self.db_pool,
-                            Some(&live_storage),
-                            range_start,
-                            handler_name,
-                            handler_version,
-                        )
-                        .await
-                    } else {
-                        Ok(())
+        // Run all work items concurrently through the DAG scheduler.
+        let db_pool = self.db_pool.clone();
+        let historical = self.historical_reader.clone();
+        let rpc_client = self.rpc_client.clone();
+        let contracts = self.contracts.clone();
+        let chain_name = self.chain_name.clone();
+        let chain_id = self.chain_id;
+
+        let scheduler = DagScheduler::new(tracker, self.handler_concurrency);
+        let outcomes = scheduler
+            .execute(work_items, move |item: WorkItem| {
+                let db_pool = db_pool.clone();
+                let historical = historical.clone();
+                let rpc_client = rpc_client.clone();
+                let contracts = contracts.clone();
+                let chain_name = chain_name.clone();
+                Box::pin(async move {
+                    let WorkItem {
+                        range_start,
+                        range_end,
+                        payload,
+                        ..
+                    } = item;
+                    let payload = *payload
+                        .downcast::<RetryPayload>()
+                        .expect("execute_live_retry_handlers WorkItem payload type mismatch");
+                    let db_exec_mode = DbExecMode::WithSnapshotCapture {
+                        chain_name: chain_name.clone(),
                     };
+                    run_handler_task(
+                        payload.handler,
+                        payload.handler_events,
+                        payload.handler_calls,
+                        payload.tx_addresses,
+                        chain_name,
+                        chain_id,
+                        range_start,
+                        range_end,
+                        historical,
+                        rpc_client,
+                        contracts,
+                        db_pool,
+                        &db_exec_mode,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+                })
+            })
+            .await;
 
-                    match commit_result {
-                        Ok(()) => {
-                            if let Err(e) = rh
-                                .handler
-                                .on_commit_success((range_start, range_end))
-                                .await
-                            {
-                                tracing::error!(
-                                    "Handler {} on_commit_success failed for block {}: {}",
-                                    handler_key,
-                                    block_number,
-                                    e
-                                );
-                                continue;
-                            }
-                            self.record_handler_retry_success(
-                                &handler_key,
-                                handler_name,
-                                range_start,
-                                range_end,
-                                block_number,
-                                &mut succeeded_keys,
-                                &mut succeeded_names,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Handler {} DB write failed during live retry for block {}: {}",
-                                handler_key,
-                                block_number,
-                                e
-                            );
-                            if let Err(hook_err) = rh
-                                .handler
-                                .on_commit_failure((range_start, range_end))
-                                .await
-                            {
-                                tracing::error!(
-                                    "Handler {} on_commit_failure hook also failed for block {}: {}",
-                                    handler_key,
-                                    block_number,
-                                    hook_err
-                                );
-                            }
-                            continue;
-                        }
+        // Aggregate outcomes.
+        let mut succeeded_keys: HashSet<String> = HashSet::new();
+        let mut succeeded_names: HashSet<String> = HashSet::new();
+        let mut attempted_keys: HashSet<String> = HashSet::new();
+        let mut cascade_blocked_keys: HashSet<String> = HashSet::new();
+
+        // Immediate successes (already committed or no trigger match).
+        for (key, name) in immediate_successes {
+            attempted_keys.insert(key.clone());
+            self.record_handler_retry_success(
+                &key,
+                &name,
+                range_start,
+                range_end,
+                block_number,
+                &mut succeeded_keys,
+                &mut succeeded_names,
+            )
+            .await;
+        }
+
+        // DAG outcomes.
+        for outcome in &outcomes {
+            match &outcome.status {
+                OutcomeStatus::Succeeded => {
+                    if let Some(key) = name_to_key.get(&outcome.handler_name) {
+                        attempted_keys.insert(key.clone());
+                        self.record_handler_retry_success(
+                            key,
+                            &outcome.handler_name,
+                            range_start,
+                            range_end,
+                            block_number,
+                            &mut succeeded_keys,
+                            &mut succeeded_names,
+                        )
+                        .await;
                     }
                 }
-                Err(e) => {
-                    tracing::error!(
-                        "Handler {} failed during live retry for block {}: {}",
-                        handler_key,
-                        block_number,
-                        e
-                    );
+                OutcomeStatus::HandlerFailed { .. } | OutcomeStatus::Panicked => {
+                    if let Some(key) = name_to_key.get(&outcome.handler_name) {
+                        attempted_keys.insert(key.clone());
+                    }
+                }
+                OutcomeStatus::DepCascadeFailed { dep_name } => {
+                    if let Some(key) = name_to_key.get(&outcome.handler_name) {
+                        tracing::warn!(
+                            "Live retry for handler {} on block {} cascade-failed: dep {} failed",
+                            key,
+                            block_number,
+                            dep_name,
+                        );
+                        cascade_blocked_keys.insert(key.clone());
+                    }
                 }
             }
         }
 
-        // Update status file: mark succeeded handlers, track failed ones
+        let blocked_handlers: HashSet<String> = call_dep_blocked_keys
+            .into_iter()
+            .chain(cascade_blocked_keys)
+            .collect();
+
+        // Update status file: mark succeeded handlers, track failed ones.
         let storage = LiveStorage::new(&self.chain_name);
         if let Err(e) = update_retry_status(
             &storage,
