@@ -6,6 +6,7 @@ pub mod decay_multicurve;
 pub mod derc20_transfer;
 pub mod dhook;
 pub mod metrics;
+pub mod migration_pool;
 pub mod multicurve;
 pub mod scheduled_multicurve;
 pub mod v3;
@@ -52,4 +53,9 @@ pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     // V4 base (DopplerV4Hook) — sequential handler, own cache
     let v4_base_cache = Arc::new(PoolMetadataCache::new());
     v4::metrics::register_handlers(registry, chain_id, v4_base_cache);
+
+    // Migration pool (graduated Doppler V4 pools on UniswapV4PoolManager)
+    migration_pool::create::register_handlers(registry);
+    let migration_pool_cache = Arc::new(PoolMetadataCache::new());
+    migration_pool::metrics::register_handlers(registry, chain_id, migration_pool_cache);
 }
