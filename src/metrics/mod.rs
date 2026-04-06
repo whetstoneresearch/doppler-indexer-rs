@@ -1,5 +1,7 @@
+mod live;
 mod rpc;
 
+pub use live::describe_live_metrics;
 pub use rpc::{chain_label_from_url, describe_rpc_metrics, with_metrics, RpcMethod};
 
 use std::net::SocketAddr;
