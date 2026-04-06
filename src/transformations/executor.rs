@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use metrics::counter;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -16,6 +17,7 @@ use super::historical::HistoricalDataReader;
 use super::traits::TransformationHandler;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
 use crate::live::{LiveDbValue, LiveStorage, LiveUpsertSnapshot};
+use crate::metrics::HandlerMetricsGuard;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::Contracts;
 
@@ -147,6 +149,12 @@ impl HandlerExecutor {
                 }
                 Err(e) => {
                     tracing::error!("Handler task panicked: {}", e);
+                    counter!(
+                        "transformation_handler_errors_total",
+                        "handler_key" => "unknown",
+                        "error_type" => "panic",
+                    )
+                    .increment(1);
                 }
             }
         }
@@ -186,6 +194,12 @@ pub(crate) async fn run_handler_task(
     let handler_version = handler.version();
     let handler_key = handler.handler_key();
 
+    let mode_label = match db_exec_mode {
+        DbExecMode::WithSnapshotCapture { .. } => "live",
+        DbExecMode::Direct => "catchup",
+    };
+    let guard = HandlerMetricsGuard::new(&handler_key, mode_label);
+
     let ctx = TransformationContext::new(
         chain_name,
         chain_id,
@@ -209,6 +223,7 @@ pub(crate) async fn run_handler_task(
                 range_end,
                 e
             );
+            guard.failure("handler_error");
             return Err(e);
         }
     };
@@ -247,6 +262,7 @@ pub(crate) async fn run_handler_task(
                     range_end,
                     e
                 );
+                guard.failure("db_error");
                 handler.on_commit_failure((range_start, range_end)).await?;
                 return Err(e);
             }
@@ -256,6 +272,8 @@ pub(crate) async fn run_handler_task(
         // can drain any per-range state it may track.
         handler.on_commit_success((range_start, range_end)).await?;
     }
+
+    guard.success();
 
     Ok(HandlerOutcome {
         handler_key,

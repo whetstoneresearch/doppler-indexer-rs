@@ -7,12 +7,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use metrics::counter;
 use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use super::engine::HandlerKind;
 use super::error::TransformationError;
 use super::executor::{DbExecMode, run_handler_task};
+use crate::metrics::HandlerMetricsGuard;
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
@@ -481,6 +483,12 @@ impl RetryProcessor {
                         missing_deps
                     );
                     tracker.mark_failed(&handler_name, range_start).await;
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
                     call_dep_blocked_keys.insert(handler_key);
                     continue;
                 }
@@ -514,6 +522,7 @@ impl RetryProcessor {
                 range_start,
                 range_end,
                 dep_names,
+                sequential: false,
                 payload: Box::new(RetryPayload {
                     handler: rh.handler.clone(),
                     handler_events: Arc::new(handler_events),
@@ -549,10 +558,12 @@ impl RetryProcessor {
                     let payload = *payload
                         .downcast::<RetryPayload>()
                         .expect("execute_live_retry_handlers WorkItem payload type mismatch");
+                    let handler_key = payload.handler.handler_key();
+                    let guard = HandlerMetricsGuard::new(&handler_key, "retry");
                     let db_exec_mode = DbExecMode::WithSnapshotCapture {
                         chain_name: chain_name.clone(),
                     };
-                    run_handler_task(
+                    let result = run_handler_task(
                         payload.handler,
                         payload.handler_events,
                         payload.handler_calls,
@@ -567,9 +578,29 @@ impl RetryProcessor {
                         db_pool,
                         &db_exec_mode,
                     )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                    .await;
+                    match result {
+                        Ok(_) => {
+                            guard.success();
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "success",
+                            )
+                            .increment(1);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            guard.failure("handler_error");
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "failure",
+                            )
+                            .increment(1);
+                            Err(e.to_string())
+                        }
+                    }
                 })
             })
             .await;
@@ -626,6 +657,12 @@ impl RetryProcessor {
                             block_number,
                             dep_name,
                         );
+                        counter!(
+                            "transformation_retry_attempts_total",
+                            "handler_key" => key.clone(),
+                            "outcome" => "blocked",
+                        )
+                        .increment(1);
                         cascade_blocked_keys.insert(key.clone());
                     }
                 }

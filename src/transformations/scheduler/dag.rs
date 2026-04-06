@@ -31,6 +31,10 @@ pub(crate) struct WorkItem {
     pub range_start: u64,
     pub range_end: u64,
     pub dep_names: Vec<String>,
+    /// When `true`, the scheduler enforces one-at-a-time FIFO execution for this
+    /// handler via a per-handler capacity-1 semaphore. Items must be submitted in
+    /// ascending `range_start` order for the FIFO guarantee to hold.
+    pub sequential: bool,
     pub payload: Box<dyn Any + Send + Sync>,
 }
 
@@ -95,6 +99,20 @@ impl DagScheduler {
             return Vec::new();
         }
 
+        // Build per-handler capacity-1 semaphores for sequential handlers.
+        // Tokio semaphores are FIFO, so items submitted in ascending range_start
+        // order will acquire permits in that order, guaranteeing block ordering.
+        let seq_sems: Arc<HashMap<String, Arc<Semaphore>>> = {
+            let mut m = HashMap::new();
+            for item in &items {
+                if item.sequential {
+                    m.entry(item.handler_name.clone())
+                        .or_insert_with(|| Arc::new(Semaphore::new(1)));
+                }
+            }
+            Arc::new(m)
+        };
+
         let mut join_set: JoinSet<WorkItemOutcome> = JoinSet::new();
         // Tracks identity per Tokio task ID so we can report a full outcome
         // even if the task panics (JoinError carries no user payload).
@@ -107,6 +125,7 @@ impl DagScheduler {
             let dep_names = item.dep_names.clone();
             let tracker = self.tracker.clone();
             let permits = self.global_permits.clone();
+            let seq_sems = seq_sems.clone();
             let runner = runner.clone();
 
             // Data captured by the spawned task:
@@ -126,16 +145,30 @@ impl DagScheduler {
                     };
                 }
 
-                // 2. Acquire permit AFTER waiting to avoid permit-deadlock.
+                // 2. Per-handler sequential gate (capacity-1 FIFO).
+                //    Acquired after dep-wait so parked sequential tasks don't
+                //    consume global permits. Dropped at end of scope, releasing
+                //    the next range in FIFO order.
+                let _seq_permit = match seq_sems.get(&name_for_task) {
+                    Some(sem) => Some(
+                        sem.clone()
+                            .acquire_owned()
+                            .await
+                            .expect("sequential semaphore never closed"),
+                    ),
+                    None => None,
+                };
+
+                // 3. Acquire global permit AFTER waiting to avoid permit-deadlock.
                 let _permit = permits
                     .acquire_owned()
                     .await
                     .expect("semaphore never closed");
 
-                // 3. Invoke runner.
+                // 4. Invoke runner.
                 let result = runner(item).await;
 
-                // 4. Propagate result to tracker + return outcome.
+                // 5. Propagate result to tracker + return outcome.
                 match result {
                     Ok(()) => {
                         tracker.mark_completed(&name_for_task, range_start).await;
@@ -302,7 +335,15 @@ mod tests {
             range_start,
             range_end: range_start + 1,
             dep_names: deps.iter().map(|s| s.to_string()).collect(),
+            sequential: false,
             payload: Box::new(()),
+        }
+    }
+
+    fn seq_item(name: &str, range_start: u64, deps: &[&str]) -> WorkItem {
+        WorkItem {
+            sequential: true,
+            ..item(name, range_start, deps)
         }
     }
 
@@ -630,5 +671,210 @@ mod tests {
         for o in &outcomes {
             assert_eq!(o.status, OutcomeStatus::Succeeded);
         }
+    }
+
+    // ─── Sequential handler tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn sequential_handler_executes_in_order() {
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker, 8);
+        let rec = Recorder::new(20);
+        let items = vec![
+            seq_item("S", 100, &[]),
+            seq_item("S", 101, &[]),
+            seq_item("S", 102, &[]),
+            seq_item("S", 103, &[]),
+            seq_item("S", 104, &[]),
+        ];
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 5);
+        for o in &outcomes {
+            assert_eq!(o.status, OutcomeStatus::Succeeded);
+        }
+
+        let events = rec.events.lock().await.clone();
+        // Each range must finish before the next starts.
+        for r in 100..104 {
+            let end_r = idx_end(&events, "S", r);
+            let start_next = idx_start(&events, "S", r + 1);
+            assert!(
+                end_r < start_next,
+                "expected S:{} end ({}) before S:{} start ({})\nevents: {:?}",
+                r,
+                end_r,
+                r + 1,
+                start_next,
+                events
+            );
+        }
+        assert_eq!(rec.max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sequential_does_not_starve_parallel() {
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker, 4);
+        // Sequential handler S holds for 30ms per range, parallel handler P
+        // holds for 10ms. With concurrency=4, P items should run in parallel
+        // while S consumes only 1 permit at a time.
+        let rec = Arc::new(Recorder {
+            events: Arc::new(TokioMutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
+            fail_on: HashSet::new(),
+            panic_on: HashSet::new(),
+            hold_ms: 10,
+        });
+        // We need separate hold_ms for S vs P, so use the default 10ms for all
+        // and rely on concurrency observation: if S were consuming all permits,
+        // P items would not overlap.
+        let mut items = Vec::new();
+        for r in 100..105 {
+            items.push(seq_item("S", r, &[]));
+        }
+        for r in 100..105 {
+            items.push(item("P", r, &[]));
+        }
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 10);
+        for o in &outcomes {
+            assert_eq!(o.status, OutcomeStatus::Succeeded);
+        }
+
+        // S uses only 1 permit, leaving 3 for P. P should be able to achieve
+        // at least 2 in-flight (practically all 3 or 4, but 2 is a safe lower bound).
+        // max_in_flight tracks the global peak, which includes S + P.
+        // Since S never has more than 1 in-flight, max_in_flight >= 2 proves P runs in parallel.
+        assert!(
+            rec.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "expected parallel handler P to achieve at least 2 in-flight; max was {}",
+            rec.max_in_flight.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_with_dep_on_parallel() {
+        // A (parallel, no deps) → S (sequential, depends on A).
+        // S must still execute its ranges in order even though A may complete
+        // out of order across ranges.
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker, 4);
+        let rec = Recorder::new(10);
+        let mut items = Vec::new();
+        for r in 100..103 {
+            items.push(item("A", r, &[]));
+            items.push(seq_item("S", r, &["A"]));
+        }
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 6);
+        for o in &outcomes {
+            assert_eq!(o.status, OutcomeStatus::Succeeded);
+        }
+
+        let events = rec.events.lock().await.clone();
+        // S's ranges must be strictly ordered.
+        for r in 100..102 {
+            let end_r = idx_end(&events, "S", r);
+            let start_next = idx_start(&events, "S", r + 1);
+            assert!(
+                end_r < start_next,
+                "expected S:{} end ({}) before S:{} start ({})\nevents: {:?}",
+                r,
+                end_r,
+                r + 1,
+                start_next,
+                events
+            );
+        }
+        // A must complete before S for each range (dep gating).
+        for r in 100..103 {
+            let a_end = idx_end(&events, "A", r);
+            let s_start = idx_start(&events, "S", r);
+            assert!(
+                a_end < s_start,
+                "expected A:{} end ({}) before S:{} start ({})\nevents: {:?}",
+                r,
+                a_end,
+                r,
+                s_start,
+                events
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn two_independent_sequential_handlers() {
+        // S1 and S2 are both sequential but independent. Each must be in order
+        // internally, but they should overlap with each other.
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker, 4);
+        let rec = Recorder::new(15);
+        let mut items = Vec::new();
+        for r in 100..103 {
+            items.push(seq_item("S1", r, &[]));
+            items.push(seq_item("S2", r, &[]));
+        }
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 6);
+        for o in &outcomes {
+            assert_eq!(o.status, OutcomeStatus::Succeeded);
+        }
+
+        let events = rec.events.lock().await.clone();
+        // Each sequential handler's ranges are strictly ordered.
+        for name in &["S1", "S2"] {
+            for r in 100..102 {
+                let end_r = idx_end(&events, name, r);
+                let start_next = idx_start(&events, name, r + 1);
+                assert!(
+                    end_r < start_next,
+                    "expected {}:{} end ({}) before {}:{} start ({})\nevents: {:?}",
+                    name,
+                    r,
+                    end_r,
+                    name,
+                    r + 1,
+                    start_next,
+                    events
+                );
+            }
+        }
+        // Global max_in_flight should be > 1 since S1 and S2 can overlap.
+        assert!(
+            rec.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "expected S1 and S2 to overlap; max_in_flight was {}",
+            rec.max_in_flight.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_failure_releases_semaphore() {
+        // S has 3 ranges; range 101 fails. Range 102 must still execute (the
+        // permit is released on failure because the task drops its OwnedSemaphorePermit).
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker, 4);
+        let rec = Recorder::with_fails(10, &[("S", 101)]);
+        let items = vec![
+            seq_item("S", 100, &[]),
+            seq_item("S", 101, &[]),
+            seq_item("S", 102, &[]),
+        ];
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 3);
+
+        let get = |r: u64| {
+            outcomes
+                .iter()
+                .find(|o| o.handler_name == "S" && o.range_start == r)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(get(100).status, OutcomeStatus::Succeeded);
+        assert!(matches!(
+            get(101).status,
+            OutcomeStatus::HandlerFailed { .. }
+        ));
+        assert_eq!(get(102).status, OutcomeStatus::Succeeded);
     }
 }

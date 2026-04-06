@@ -545,7 +545,8 @@ pub(crate) async fn process_factory_range_multicall(
 
     // Execute all multicalls
     let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.chain_name)
+            .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();
@@ -984,7 +985,8 @@ pub(crate) async fn process_range_multicall(
 
     // Execute all multicalls
     let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.chain_name)
+            .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<CallResult>> = HashMap::new();

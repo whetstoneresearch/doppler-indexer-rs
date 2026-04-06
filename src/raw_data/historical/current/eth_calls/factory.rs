@@ -96,6 +96,7 @@ pub(super) async fn handle_factory_message(
                                 buf_range_start,
                                 buf_range_end,
                                 &state.contracts,
+                                false,
                             )
                             .await?
                         } else {
@@ -107,6 +108,7 @@ pub(super) async fn handle_factory_message(
                                 buf_range_start,
                                 buf_range_end,
                                 &state.contracts,
+                                false,
                             )
                             .await?
                         };

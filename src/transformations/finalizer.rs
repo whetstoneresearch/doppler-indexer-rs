@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
+use metrics::histogram;
 use tokio::sync::Mutex;
 
 use super::error::TransformationError;
@@ -185,6 +187,7 @@ impl RangeFinalizer {
         range_end: u64,
         live_state: &Mutex<LiveProcessingState>,
     ) -> Result<(), TransformationError> {
+        let finalize_start = Instant::now();
         let range_key = (range_start, range_end);
 
         // Prevent double finalization
@@ -292,6 +295,9 @@ impl RangeFinalizer {
                 }
             }
         }
+
+        histogram!("transformation_range_finalization_duration_seconds")
+            .record(finalize_start.elapsed().as_secs_f64());
 
         Ok(())
     }

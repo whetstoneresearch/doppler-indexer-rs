@@ -22,6 +22,10 @@ pub struct RawDataCollectionConfig {
     /// Higher values improve throughput during catchup but use more memory.
     /// Default: 4
     pub factory_concurrency: Option<usize>,
+    /// Number of concurrent log ranges to process for event-triggered eth_call catchup.
+    /// Higher values improve throughput during catchup but use more RPC bandwidth.
+    /// Default: 4
+    pub event_call_concurrency: Option<usize>,
     /// Enable WebSocket live mode after catchup completes.
     /// Requires ws_url_env_var to be set in chain config.
     pub live_mode: Option<bool>,

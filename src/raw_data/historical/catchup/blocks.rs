@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy::primitives::B256;
 use alloy::rpc::types::BlockNumberOrTag;
 use arrow::datatypes::Schema;
+use metrics::{counter, histogram};
 use tokio::sync::mpsc::{self, Sender};
 
 use crate::raw_data::historical::blocks::{
@@ -26,11 +28,13 @@ enum PendingBlockWrite {
         schema: Arc<Schema>,
         fields: Vec<BlockField>,
         output_path: PathBuf,
+        chain_name: String,
     },
     Full {
         records: Vec<FullBlockRecord>,
         schema: Arc<Schema>,
         output_path: PathBuf,
+        chain_name: String,
     },
 }
 
@@ -154,6 +158,7 @@ pub async fn collect_blocks(
             &output_dir,
             &tx_sender,
             &eth_call_sender,
+            &chain.name,
         )
         .await?;
 
@@ -194,7 +199,9 @@ async fn collect_blocks_streaming(
     output_dir: &Path,
     tx_sender: &Option<Sender<(u64, u64, Vec<B256>)>>,
     eth_call_sender: &Option<Sender<(u64, u64)>>,
+    chain_name: &str,
 ) -> Result<(usize, PendingBlockWrite), BlockCollectionError> {
+    let range_start_time = Instant::now();
     let block_numbers: Vec<BlockNumberOrTag> = (range.start..range.end)
         .map(BlockNumberOrTag::Number)
         .collect();
@@ -296,12 +303,36 @@ async fn collect_blocks_streaming(
                 );
             }
 
+            // Record collection metrics
+            counter!(
+                "collection_blocks_processed_total",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .increment(count as u64);
+
+            for record in &all_records {
+                histogram!(
+                    "collection_block_transactions",
+                    "chain" => chain_name.to_string()
+                )
+                .record(record.transaction_count as f64);
+            }
+
+            histogram!(
+                "collection_block_processing_duration_seconds",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .record(range_start_time.elapsed().as_secs_f64());
+
             // Return data for deferred parquet write
             let pending = PendingBlockWrite::Minimal {
                 records: all_records,
                 schema: schema.clone(),
                 fields: fields.to_vec(),
                 output_path: output_dir.join(range.file_name("blocks")),
+                chain_name: chain_name.to_string(),
             };
 
             Ok((count, pending))
@@ -374,11 +405,35 @@ async fn collect_blocks_streaming(
             let all_records: Vec<FullBlockRecord> = records_map.into_values().collect();
             let count = all_records.len();
 
+            // Record collection metrics
+            counter!(
+                "collection_blocks_processed_total",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .increment(count as u64);
+
+            for record in &all_records {
+                histogram!(
+                    "collection_block_transactions",
+                    "chain" => chain_name.to_string()
+                )
+                .record(record.transaction_count as f64);
+            }
+
+            histogram!(
+                "collection_block_processing_duration_seconds",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .record(range_start_time.elapsed().as_secs_f64());
+
             // Return data for deferred parquet write
             let pending = PendingBlockWrite::Full {
                 records: all_records,
                 schema: schema.clone(),
                 output_path: output_dir.join(range.file_name("blocks")),
+                chain_name: chain_name.to_string(),
             };
 
             Ok((count, pending))
@@ -389,21 +444,37 @@ async fn collect_blocks_streaming(
 /// Execute a deferred parquet write using async wrappers (which internally
 /// use `spawn_blocking`).
 async fn execute_block_write(write: PendingBlockWrite) -> Result<(), BlockCollectionError> {
+    let write_start = Instant::now();
     match write {
         PendingBlockWrite::Minimal {
             records,
             schema,
             fields,
             output_path,
+            chain_name,
         } => {
-            write_minimal_blocks_to_parquet_async(records, schema, fields, output_path).await?;
+            write_minimal_blocks_to_parquet_async(records, schema, fields, output_path.clone())
+                .await?;
+            crate::metrics::record_parquet_write(
+                &chain_name,
+                "blocks",
+                write_start.elapsed().as_secs_f64(),
+                &output_path,
+            );
         }
         PendingBlockWrite::Full {
             records,
             schema,
             output_path,
+            chain_name,
         } => {
-            write_full_blocks_to_parquet_async(records, schema, output_path).await?;
+            write_full_blocks_to_parquet_async(records, schema, output_path.clone()).await?;
+            crate::metrics::record_parquet_write(
+                &chain_name,
+                "blocks",
+                write_start.elapsed().as_secs_f64(),
+                &output_path,
+            );
         }
     }
     Ok(())
