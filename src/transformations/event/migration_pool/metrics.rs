@@ -7,10 +7,10 @@
 //! ## Swap filtering
 //!
 //! `UniswapV4PoolManager` emits `Swap` for every V4 pool on the chain. The swap
-//! handler maintains an in-memory `HashSet` of known migration pool IDs loaded at
-//! init from `pools WHERE migrated_from IS NOT NULL`. `Migrate` events observed
-//! in the current context are also added inline so that a pool's first swap in
-//! the same range as its graduation is not missed.
+//! handler maintains an in-memory `HashSet` of known migration pool IDs seeded at
+//! init from `pools WHERE migrated_from IS NOT NULL` and refreshed from the DB on
+//! each `handle()` invocation to pick up pools that graduated since init (e.g.
+//! during catchup processing).
 //!
 //! ## Liquidity
 //!
@@ -37,7 +37,6 @@ use crate::transformations::util::pool_metadata::PoolMetadataCache;
 
 const POOL_MANAGER_SOURCE: &str = "UniswapV4PoolManager";
 const MIGRATOR_HOOK_SOURCE: &str = "UniswapV4MigratorHook";
-const MIGRATOR_SOURCE: &str = "UniswapV4Migrator";
 
 // ─── Swap handler ─────────────────────────────────────────────────────────────
 
@@ -47,9 +46,48 @@ pub struct MigrationPoolSwapMetricsHandler {
     chain_id: u64,
     db_pool: OnceLock<Pool>,
     /// bytes32 pool IDs of known migration pools.
-    /// Loaded at init from `pools WHERE migrated_from IS NOT NULL`;
-    /// augmented inline per-handle() from Migrate events in the current context.
+    /// Seeded at init from `pools WHERE migrated_from IS NOT NULL`;
+    /// refreshed from DB on each `handle()` to discover newly graduated pools.
     migration_pool_ids: RwLock<HashSet<Vec<u8>>>,
+}
+
+impl MigrationPoolSwapMetricsHandler {
+    /// Re-query the DB for migration pool IDs to pick up pools that graduated
+    /// since initialization (e.g. committed by MigrationPoolCreateHandler during
+    /// catchup).
+    async fn refresh_migration_pool_ids(&self) -> Result<(), TransformationError> {
+        let Some(pool) = self.db_pool.get() else {
+            return Ok(());
+        };
+        let client = pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT p.address \
+                 FROM pools p \
+                 JOIN active_versions av \
+                   ON p.source = av.source AND p.source_version = av.active_version \
+                 WHERE p.chain_id = $1 AND p.migrated_from IS NOT NULL",
+                &[&(self.chain_id as i64)],
+            )
+            .await?;
+
+        let mut ids = self.migration_pool_ids.write().unwrap();
+        let before = ids.len();
+        for row in &rows {
+            let address: Vec<u8> = row.get("address");
+            ids.insert(address);
+        }
+        let added = ids.len() - before;
+        if added > 0 {
+            tracing::info!(
+                added,
+                total = ids.len(),
+                chain_id = self.chain_id,
+                "Refreshed migration pool ID set"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -81,28 +119,9 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
             self.metadata_cache.resolve_quote_decimals(&ctx.contracts);
         });
 
-        // Add any newly graduated pools from Migrate events in this context so that
-        // a pool's first swap in the same range as its graduation is not missed.
-        {
-            let migrate_events: Vec<_> =
-                ctx.events_of_type(MIGRATOR_SOURCE, "Migrate").collect();
-            if !migrate_events.is_empty() {
-                let mut ids = self.migration_pool_ids.write().unwrap();
-                for event in migrate_events {
-                    match event.extract_bytes32("poolId") {
-                        Ok(pool_id) => {
-                            ids.insert(pool_id.to_vec());
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                block = event.block_number,
-                                "failed to extract poolId from Migrate event: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // Refresh the migration pool ID set from DB to pick up any pools
+        // graduated since init (e.g. by MigrationPoolCreateHandler during catchup).
+        self.refresh_migration_pool_ids().await?;
 
         // Extract PoolManager Swap events, filtering to known migration pool IDs.
         let mut swaps: Vec<SwapInput> = Vec::new();
