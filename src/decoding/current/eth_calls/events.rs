@@ -22,9 +22,12 @@ pub(super) async fn handle_event_calls_live(
     config: &EventCallDecodeConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     retry_transform_after_decode: bool,
+    chain_name: &str,
 ) -> Result<(), EthCallDecodingError> {
+    let decode_start = std::time::Instant::now();
     let mut decoded_event_calls: Vec<LiveDecodedEventCall> = Vec::with_capacity(results.len());
     let mut transform_calls: Vec<TransformDecodedCall> = Vec::with_capacity(results.len());
+    let mut decode_failures = 0u64;
 
     for result in results {
         if result.is_reverted {
@@ -66,6 +69,7 @@ pub(super) async fn handle_event_calls_live(
                 });
             }
             Err(e) => {
+                decode_failures += 1;
                 tracing::warn!(
                     "Failed to decode event_call {}/{} at block {}: address={}, log_index={}, raw_bytes=0x{}, error={}",
                     contract_name, function_name, result.block_number,
@@ -77,6 +81,16 @@ pub(super) async fn handle_event_calls_live(
             }
         }
     }
+
+    // Record eth_call decode metrics for live mode
+    let successes = decoded_event_calls.len() as u64;
+    crate::metrics::decoding::record_eth_call_decode_metrics(
+        chain_name,
+        "live",
+        successes,
+        decode_failures,
+        decode_start.elapsed(),
+    );
 
     if !decoded_event_calls.is_empty() {
         if let Err(e) = live_storage.write_decoded_event_calls(

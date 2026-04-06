@@ -134,6 +134,7 @@ pub async fn decode_logs_live(
                         &accumulated_factory_addresses,
                         &live_storage,
                         outputs,
+                        chain_name,
                     )
                     .await?;
                 } else {
@@ -150,6 +151,8 @@ pub async fn decode_logs_live(
                         output_base,
                         outputs,
                         expected_for_range.as_ref(),
+                        chain_name,
+                        "historical",
                     )
                     .await?;
                 }

@@ -1,5 +1,7 @@
+pub(crate) mod decoding;
 mod rpc;
 
+pub use decoding::describe_decoding_metrics;
 pub use rpc::{chain_label_from_url, describe_rpc_metrics, with_metrics, RpcMethod};
 
 use std::net::SocketAddr;

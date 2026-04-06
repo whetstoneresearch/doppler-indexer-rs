@@ -120,6 +120,14 @@ pub async fn decode_logs(
         return Ok(());
     }
 
+    // Record event matcher counts
+    let factory_matcher_count: usize = factory_matchers.values().map(|v| v.len()).sum();
+    crate::metrics::decoding::set_event_matcher_counts(
+        &chain.name,
+        regular_matchers.len(),
+        factory_matcher_count,
+    );
+
     tracing::info!(
         "Log decoder starting for chain {} with {} regular matchers and {} factory matchers",
         chain.name,
@@ -268,7 +276,10 @@ pub(crate) async fn process_logs(
     output_base: &Path,
     outputs: &LogDecoderOutputs<'_>,
     expected_by_collection: Option<&HashMap<String, ExpectedContracts>>,
+    chain_name: &str,
+    mode: &str,
 ) -> Result<(), LogDecodingError> {
+    let decode_start = std::time::Instant::now();
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
     let build_transform = outputs.transform_tx.is_some();
@@ -369,6 +380,16 @@ pub(crate) async fn process_logs(
     }
 
     let total_decoded: usize = decoded_by_event.values().map(|(v, _)| v.len()).sum();
+
+    // Record decode metrics
+    crate::metrics::decoding::record_log_decode_metrics(
+        chain_name,
+        mode,
+        logs.len() as u64,
+        total_decoded as u64,
+        decode_start.elapsed(),
+    );
+
     tracing::debug!(
         "Log decoding range {}-{}: {} logs in file, {} decoded events across {} event types",
         range_start,
@@ -414,6 +435,7 @@ pub(crate) async fn process_logs(
     }
 
     // Write decoded data to parquet files
+    let parquet_write_start = std::time::Instant::now();
     for ((contract_name, event_name), (records, parsed_event)) in decoded_by_event {
         let output_dir = output_base.join(&contract_name).join(&event_name);
         std::fs::create_dir_all(&output_dir)?;
@@ -469,6 +491,12 @@ pub(crate) async fn process_logs(
             }
         }
     }
+
+    crate::metrics::decoding::record_parquet_write_duration(
+        chain_name,
+        "logs",
+        parquet_write_start.elapsed(),
+    );
 
     // Update contract index for factory collections so that catchup can skip
     // ranges already processed with the current set of contracts/addresses.
@@ -1056,7 +1084,9 @@ pub(crate) async fn process_logs_live(
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     storage: &LiveStorage,
     outputs: &LogDecoderOutputs<'_>,
+    chain_name: &str,
 ) -> Result<(), LogDecodingError> {
+    let decode_start = std::time::Instant::now();
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
     // Group decoded logs by (contract_name, event_name)
@@ -1124,6 +1154,16 @@ pub(crate) async fn process_logs_live(
     }
 
     let total_decoded: usize = decoded_by_event.values().map(|(v, _)| v.len()).sum();
+
+    // Record decode metrics for live mode
+    crate::metrics::decoding::record_log_decode_metrics(
+        chain_name,
+        "live",
+        logs.len() as u64,
+        total_decoded as u64,
+        decode_start.elapsed(),
+    );
+
     tracing::debug!(
         "Live log decoding block {}: {} logs in file, {} decoded events across {} event types",
         block_number,

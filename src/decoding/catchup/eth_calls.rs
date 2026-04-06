@@ -57,6 +57,7 @@ pub async fn catchup_decode_eth_calls(
     event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    chain_name: &str,
 ) -> Result<(), EthCallDecodingError> {
     let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
 
@@ -402,11 +403,14 @@ pub async fn catchup_decode_eth_calls(
     let transform_tx = transform_tx.cloned();
     let mut join_set = JoinSet::new();
 
+    let chain_name_arc = Arc::new(chain_name.to_string());
+
     for item in work_items {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
         let completed = completed.clone();
+        let chain_name = chain_name_arc.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -426,6 +430,8 @@ pub async fn catchup_decode_eth_calls(
                         &config,
                         &output_base,
                         transform_tx.as_ref(),
+                        &chain_name,
+                        "catchup",
                     )
                     .await?;
                     // Regular calls don't need index updates
@@ -450,6 +456,8 @@ pub async fn catchup_decode_eth_calls(
                         &output_base,
                         transform_tx.as_ref(),
                         true, // return_index_info: batch update after all tasks complete
+                        &chain_name,
+                        "catchup",
                     )
                     .await
                 }
@@ -467,6 +475,8 @@ pub async fn catchup_decode_eth_calls(
                         &config,
                         &output_base,
                         transform_tx.as_ref(),
+                        &chain_name,
+                        "catchup",
                     )
                     .await?;
                     // Event calls don't need index updates

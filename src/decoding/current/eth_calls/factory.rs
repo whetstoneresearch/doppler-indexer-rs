@@ -28,11 +28,15 @@ pub(super) async fn handle_once_calls_live(
     configs: &[&CallDecodeConfig],
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     retry_transform_after_decode: bool,
+    chain_name: &str,
 ) -> Result<(), EthCallDecodingError> {
+    let decode_start = std::time::Instant::now();
     let mut decoded_once_calls: Vec<LiveDecodedOnceCall> = Vec::with_capacity(results.len());
     // Group transform calls by function name
     let mut transform_calls_by_fn: std::collections::HashMap<String, Vec<TransformDecodedCall>> =
         std::collections::HashMap::new();
+    let mut decode_successes = 0u64;
+    let mut decode_failures = 0u64;
 
     for result in results {
         let mut decoded_values: Vec<(String, DecodedValue)> = Vec::new();
@@ -41,6 +45,7 @@ pub(super) async fn handle_once_calls_live(
             if let Some(raw_value) = result.results.get(&config.function_name) {
                 match decode_value(raw_value, &config.output_type) {
                     Ok(decoded) => {
+                        decode_successes += 1;
                         let transform_call = TransformDecodedCall {
                             block_number: result.block_number,
                             block_timestamp: result.block_timestamp,
@@ -64,6 +69,7 @@ pub(super) async fn handle_once_calls_live(
                         decoded_values.push((config.function_name.clone(), decoded.clone()));
                     }
                     Err(e) => {
+                        decode_failures += 1;
                         tracing::warn!(
                             "Failed to decode once_call {}/{} at block {}: address={}, raw_bytes=0x{}, error={}",
                             contract_name, config.function_name, result.block_number,
@@ -85,6 +91,15 @@ pub(super) async fn handle_once_calls_live(
             });
         }
     }
+
+    // Record eth_call decode metrics for live mode
+    crate::metrics::decoding::record_eth_call_decode_metrics(
+        chain_name,
+        "live",
+        decode_successes,
+        decode_failures,
+        decode_start.elapsed(),
+    );
 
     if !decoded_once_calls.is_empty() {
         if let Err(e) =
@@ -130,6 +145,7 @@ pub(super) async fn handle_once_file_backfilled(
     contract_name: &str,
     once_configs: &[CallDecodeConfig],
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    chain_name: &str,
 ) -> Result<(), EthCallDecodingError> {
     let configs: Vec<&CallDecodeConfig> = once_configs
         .iter()
@@ -190,6 +206,8 @@ pub(super) async fn handle_once_file_backfilled(
             output_base,
             transform_tx,
             false,
+            chain_name,
+            "historical",
         )
         .await?;
     }
