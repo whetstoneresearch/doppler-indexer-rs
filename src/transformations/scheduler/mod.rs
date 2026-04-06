@@ -25,9 +25,6 @@
 //! [`DagScheduler`]: dag::DagScheduler
 //! [`WorkItem`]: dag::WorkItem
 
-// Phase 1 adds these primitives with no production callers yet; Phase 2 wires
-// them into catchup. Silence dead-code warnings until then.
-#![allow(dead_code)]
-
 pub(crate) mod dag;
+pub(crate) mod loader;
 pub(crate) mod tracker;

@@ -2,9 +2,13 @@
 //!
 //! [`CompletionTracker`] is the synchronization primitive used by [`DagScheduler`]
 //! to gate each `(handler, range_start)` work item on its dependencies. Each
-//! waiter registers a single `Notify::notified()` future, checks shared state,
-//! and awaits the future if any dep is still pending. Every `mark_completed` /
-//! `mark_failed` call wakes all waiters so they can re-check.
+//! waiter constructs a `Notify::notified()` future, checks shared state, and
+//! awaits the future if any dep is still pending. Every `mark_completed` /
+//! `mark_failed` call wakes all waiters so they can re-check. The ordering
+//! "construct notified() *before* probe" is load-bearing: tokio's Notified
+//! captures the notify_waiters call count at construction and honors any
+//! call that happens before first poll, so no wake can be lost between
+//! probe and `.await`.
 //!
 //! # Wake mechanism
 //!
@@ -66,19 +70,24 @@ impl CompletionTracker {
     }
 
     /// Pre-populate completed ranges for a handler. Intended for startup
-    /// seeding from `_handler_progress`; safe to call before any waiters exist.
+    /// seeding from `_handler_progress`. Calls `notify_waiters` so that any
+    /// waiters that happen to be active (e.g. Phase 4 live-mode overlap)
+    /// see the newly-seeded state.
     pub(crate) async fn seed_completed(
         &self,
         handler_name: &str,
         ranges: impl IntoIterator<Item = u64>,
     ) {
-        let mut completed = self.completed.lock().await;
-        let entry = completed
-            .entry(handler_name.to_string())
-            .or_insert_with(HashSet::new);
-        for range in ranges {
-            entry.insert(range);
+        {
+            let mut completed = self.completed.lock().await;
+            let entry = completed
+                .entry(handler_name.to_string())
+                .or_insert_with(HashSet::new);
+            for range in ranges {
+                entry.insert(range);
+            }
         }
+        self.notify.notify_waiters();
     }
 
     /// Snapshot check: are all `deps` completed for `range_start`?
@@ -114,16 +123,22 @@ impl CompletionTracker {
     /// Await until every `(dep, range_start)` pair is completed, or return
     /// [`DepFailed`] if any dep has that range marked failed.
     ///
-    /// The loop registers the `notified()` future *before* probing state so
-    /// wake-ups cannot be lost between the check and the await.
+    /// Construct `notified()` **before** probing state so that any
+    /// `notify_waiters()` call that lands between the probe read and the
+    /// first poll of `notified` still unblocks this waiter. Tokio's
+    /// `Notified` captures the `notify_waiters` call count at construction;
+    /// `poll_notified` compares it to the current count and, if it changed,
+    /// transitions directly to `Done`. That's what makes the bare
+    /// `notified()` / `probe()` / `.await` sequence race-free here.
     pub(crate) async fn wait_ready(
         &self,
         deps: &[String],
         range_start: u64,
     ) -> Result<(), DepFailed> {
         loop {
-            // Register interest BEFORE probing — otherwise a mark() between
-            // probe and await could leave this waiter parked forever.
+            // MUST be created before probing: the stored notify_waiters_calls
+            // counter is the mechanism that catches a mark that fires after
+            // our probe read but before we park on notified.
             let notified = self.notify.notified();
             match self.probe(deps, range_start).await {
                 DepState::Ready => return Ok(()),
@@ -148,6 +163,19 @@ impl CompletionTracker {
                 .insert(range_start);
         }
         self.notify.notify_waiters();
+    }
+
+    /// Check whether `(handler_name, range_start)` has been marked as failed.
+    ///
+    /// Used by the engine's item-building loop to skip WorkItems whose handler
+    /// deps failed in a previous scheduler pass, avoiding wasted submissions
+    /// that would immediately cascade-fail.
+    pub(crate) async fn is_failed(&self, handler_name: &str, range_start: u64) -> bool {
+        let failed = self.failed.lock().await;
+        failed
+            .get(handler_name)
+            .map(|ranges| ranges.contains(&range_start))
+            .unwrap_or(false)
     }
 
     /// Mark `(handler_name, range_start)` as failed and wake all waiters.
@@ -384,6 +412,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.dep_name, "B");
+    }
+
+    #[tokio::test]
+    async fn is_failed_reflects_mark_failed() {
+        let tracker = CompletionTracker::new();
+        assert!(!tracker.is_failed("A", 100).await);
+        tracker.mark_failed("A", 100).await;
+        assert!(tracker.is_failed("A", 100).await);
+        // Different range is not failed.
+        assert!(!tracker.is_failed("A", 200).await);
+        // Different handler is not failed.
+        assert!(!tracker.is_failed("B", 100).await);
+        // Completed handler is not failed.
+        tracker.mark_completed("C", 100).await;
+        assert!(!tracker.is_failed("C", 100).await);
     }
 
     #[tokio::test]
