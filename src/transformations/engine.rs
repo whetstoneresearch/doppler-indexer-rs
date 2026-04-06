@@ -520,7 +520,7 @@ impl TransformationEngine {
             finalizer: self.finalizer.clone(),
         });
 
-        let scheduler = DagScheduler::new(tracker, self.handler_concurrency);
+        let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
 
         // (handler_key, range_start, error_message) for each item-level failure.
         let mut failed_items: Vec<(String, u64, String)> = vec![];
@@ -637,6 +637,23 @@ impl TransformationEngine {
                         continue;
                     }
 
+                    // Skip if any handler dep already failed in a previous
+                    // pass — the tracker retains failure state across
+                    // scheduler.execute() calls, so submitting this item
+                    // would immediately cascade-fail.
+                    {
+                        let mut dep_failed = false;
+                        for dep in &ch.handler_deps {
+                            if tracker.is_failed(dep, range_start).await {
+                                dep_failed = true;
+                                break;
+                            }
+                        }
+                        if dep_failed {
+                            continue;
+                        }
+                    }
+
                     per_handler_counts.entry(name.clone()).or_default().0 += 1;
                     items.push(WorkItem {
                         handler_name: name.clone(),
@@ -747,6 +764,16 @@ impl TransformationEngine {
                                 outcome.range_start,
                                 dep_name
                             );
+                            let key = handlers
+                                .iter()
+                                .find(|ch| ch.handler.name() == outcome.handler_name)
+                                .map(|ch| ch.handler.handler_key())
+                                .unwrap_or_else(|| outcome.handler_name.clone());
+                            failed_items.push((
+                                key,
+                                outcome.range_start,
+                                format!("cascade-failed: dep '{}' failed", dep_name),
+                            ));
                             cascade_failed += 1;
                             counts.2 += 1;
                         }

@@ -165,6 +165,19 @@ impl CompletionTracker {
         self.notify.notify_waiters();
     }
 
+    /// Check whether `(handler_name, range_start)` has been marked as failed.
+    ///
+    /// Used by the engine's item-building loop to skip WorkItems whose handler
+    /// deps failed in a previous scheduler pass, avoiding wasted submissions
+    /// that would immediately cascade-fail.
+    pub(crate) async fn is_failed(&self, handler_name: &str, range_start: u64) -> bool {
+        let failed = self.failed.lock().await;
+        failed
+            .get(handler_name)
+            .map(|ranges| ranges.contains(&range_start))
+            .unwrap_or(false)
+    }
+
     /// Mark `(handler_name, range_start)` as failed and wake all waiters.
     pub(crate) async fn mark_failed(&self, handler_name: &str, range_start: u64) {
         {
@@ -399,6 +412,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.dep_name, "B");
+    }
+
+    #[tokio::test]
+    async fn is_failed_reflects_mark_failed() {
+        let tracker = CompletionTracker::new();
+        assert!(!tracker.is_failed("A", 100).await);
+        tracker.mark_failed("A", 100).await;
+        assert!(tracker.is_failed("A", 100).await);
+        // Different range is not failed.
+        assert!(!tracker.is_failed("A", 200).await);
+        // Different handler is not failed.
+        assert!(!tracker.is_failed("B", 100).await);
+        // Completed handler is not failed.
+        tracker.mark_completed("C", 100).await;
+        assert!(!tracker.is_failed("C", 100).await);
     }
 
     #[tokio::test]

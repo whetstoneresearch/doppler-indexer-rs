@@ -71,12 +71,25 @@ where
                         Ok(items)
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to read decoded data from {}: {}",
-                            file_path.display(),
-                            e
+                        let is_not_found = matches!(
+                            &e,
+                            TransformationError::IoError(io)
+                                if io.kind() == std::io::ErrorKind::NotFound
                         );
-                        Ok(Vec::new())
+                        if is_not_found {
+                            tracing::debug!(
+                                "File not found, skipping: {}",
+                                file_path.display()
+                            );
+                            Ok(Vec::new())
+                        } else {
+                            tracing::warn!(
+                                "Failed to read decoded data from {}: {}",
+                                file_path.display(),
+                                e
+                            );
+                            Err(e)
+                        }
                     }
                 }
             });
@@ -114,7 +127,13 @@ pub(crate) async fn read_receipt_addresses(
         read_receipt_addresses_sync(&raw_receipts_dir, range_start, range_end)
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_else(|e| {
+        tracing::error!(
+            "read_receipt_addresses panicked for range {}-{}: {}",
+            range_start, range_end, e
+        );
+        HashMap::new()
+    })
 }
 
 fn read_receipt_addresses_sync(
@@ -364,10 +383,16 @@ impl CatchupLoader {
                         .await?;
                 }
                 Err(e) => {
-                    payload
+                    if let Err(cb_err) = payload
                         .handler
                         .on_commit_failure((range_start, range_end))
-                        .await?;
+                        .await
+                    {
+                        tracing::warn!(
+                            "on_commit_failure callback failed for {} range {}-{}: {}",
+                            handler_key, range_start, range_end, cb_err
+                        );
+                    }
                     return Err(TransformationError::DatabaseError(e));
                 }
             }
