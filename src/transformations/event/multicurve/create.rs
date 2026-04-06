@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use alloy_primitives::{b256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::TransformationContext;
@@ -150,14 +150,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
             };
 
             let pool_id = pool_key.pool_id();
-
-            // The hook address in pool_key.hooks is the pool manager, not the actual hook.
-            // Find the real hook by looking for the contract that emitted a specific event in this tx.
-            const HOOK_EVENT_TOPIC0: B256 =
-                b256!("db675a606e5aa8f039e93c54673258dc875053bdaa5dbb96de1670bfdece53b3");
-            let hook: [u8; 20] = ctx
-                .find_log_emitter(event.transaction_hash, HOOK_EVENT_TOPIC0)
-                .await?;
+            let hook: [u8; 20] = pool_key.hooks.into();
 
             let far_tick = get_state_call
                 .result
