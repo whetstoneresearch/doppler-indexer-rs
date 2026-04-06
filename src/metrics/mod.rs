@@ -1,6 +1,8 @@
 mod rpc;
+mod transformations;
 
 pub use rpc::{chain_label_from_url, describe_rpc_metrics, with_metrics, RpcMethod};
+pub use transformations::{describe_transformation_metrics, HandlerMetricsGuard};
 
 use std::net::SocketAddr;
 

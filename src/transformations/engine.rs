@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use metrics::{counter, gauge};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -1074,6 +1075,16 @@ impl TransformationEngine {
         }
 
         let filtered_events = filter_events_by_start_block(&self.contracts, msg.events.clone());
+
+        if !filtered_events.is_empty() {
+            counter!(
+                "transformation_events_processed_total",
+                "source_name" => msg.source_name.clone(),
+                "event_name" => msg.event_name.clone(),
+            )
+            .increment(filtered_events.len() as u64);
+        }
+
         let events = Arc::new(filtered_events.clone());
 
         // Categorize handlers: ready to run vs needs buffering
@@ -1210,9 +1221,14 @@ impl TransformationEngine {
                         .or_insert_with(Instant::now);
                     state
                         .pending_events
-                        .entry(handler_key)
+                        .entry(handler_key.clone())
                         .or_default()
                         .push(pending);
+                    gauge!(
+                        "transformation_pending_events",
+                        "handler_key" => handler_key,
+                    )
+                    .increment(1.0);
                 }
             }
         } // lock released
@@ -1511,6 +1527,16 @@ impl TransformationEngine {
         }
 
         let filtered_calls = filter_calls_by_start_block(&self.contracts, msg.calls);
+
+        if !filtered_calls.is_empty() {
+            counter!(
+                "transformation_calls_processed_total",
+                "source_name" => msg.source_name.clone(),
+                "function_name" => msg.function_name.clone(),
+            )
+            .increment(filtered_calls.len() as u64);
+        }
+
         self.process_range(msg.range_start, msg.range_end, Vec::new(), filtered_calls)
             .await?;
 
@@ -1597,7 +1623,16 @@ impl TransformationEngine {
                     if handler_failed {
                         let remove_entry =
                             if let Some(pending) = state.pending_events.get_mut(&handler_key) {
+                                let before = pending.len();
                                 pending.retain(|p| (p.range_start, p.range_end) != range_key);
+                                let removed = before - pending.len();
+                                if removed > 0 {
+                                    gauge!(
+                                        "transformation_pending_events",
+                                        "handler_key" => handler_key.clone(),
+                                    )
+                                    .decrement(removed as f64);
+                                }
                                 pending.is_empty()
                             } else {
                                 false
@@ -1653,6 +1688,11 @@ impl TransformationEngine {
                         let pending = state.pending_events.get_mut(&handler_key).unwrap();
                         for i in ready_indices.into_iter().rev() {
                             let event_data = pending.remove(i);
+                            gauge!(
+                                "transformation_pending_events",
+                                "handler_key" => handler_key.clone(),
+                            )
+                            .decrement(1.0);
                             let handlers = self.registry.handlers_for_event(
                                 &event_data.source_name,
                                 &event_data.event_name,
