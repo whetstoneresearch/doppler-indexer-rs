@@ -53,17 +53,20 @@ impl TransformationHandler for V4CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let hook = event.extract_address("poolOrHook")?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
-
-            let asset_metadata;
-            let numeraire_metadata;
-            match metadata_result {
-                Ok(r) => {
-                    asset_metadata = r.0;
-                    numeraire_metadata = r.1;
-                }
-                Err(e) => return Err(e),
-            }
+            let (asset_metadata, numeraire_metadata) =
+                match get_metadata(&asset, &numeraire, event, ctx) {
+                    Ok(m) => m,
+                    Err(TransformationError::IncludesPrecompileError(msg)) => {
+                        tracing::warn!(
+                            asset = %Address::from(asset),
+                            numeraire = %Address::from(numeraire),
+                            block = event.block_number,
+                            "Skipping pool with precompile address: {}", msg
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
             let hook_call = ctx
                 .calls_for_address(hook)

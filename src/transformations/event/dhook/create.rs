@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 
 use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::{FieldExtractor, TransformationContext};
@@ -55,7 +55,19 @@ impl TransformationHandler for DopplerHookCreateHandler {
             let numeraire = event.extract_address("numeraire")?;
 
             let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+                match get_metadata(&asset, &numeraire, event, ctx) {
+                    Ok(m) => m,
+                    Err(TransformationError::IncludesPrecompileError(msg)) => {
+                        tracing::warn!(
+                            asset = %Address::from(asset),
+                            numeraire = %Address::from(numeraire),
+                            block = event.block_number,
+                            "Skipping pool with precompile address: {}", msg
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
             let get_state_call = ctx
                 .calls_of_type("DopplerHookInitializer", "getState")

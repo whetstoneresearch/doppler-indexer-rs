@@ -55,7 +55,19 @@ impl TransformationHandler for V3CreateHandler {
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
             let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+                match get_metadata(&asset, &numeraire, event, ctx) {
+                    Ok(m) => m,
+                    Err(TransformationError::IncludesPrecompileError(msg)) => {
+                        tracing::warn!(
+                            asset = %Address::from(asset),
+                            numeraire = %Address::from(numeraire),
+                            block = event.block_number,
+                            "Skipping pool with precompile address: {}", msg
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
             let pool_call = ctx
                 .calls_for_address(pool_or_hook)
@@ -220,7 +232,19 @@ impl TransformationHandler for LockableV3CreateHandler {
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
             let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+                match get_metadata(&asset, &numeraire, event, ctx) {
+                    Ok(m) => m,
+                    Err(TransformationError::IncludesPrecompileError(msg)) => {
+                        tracing::warn!(
+                            asset = %Address::from(asset),
+                            numeraire = %Address::from(numeraire),
+                            block = event.block_number,
+                            "Skipping pool with precompile address: {}", msg
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
             let pool_call = ctx
                 .calls_for_address(pool_or_hook)
