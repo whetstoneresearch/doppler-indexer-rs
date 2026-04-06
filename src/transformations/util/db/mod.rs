@@ -1,6 +1,7 @@
 pub mod dhook_pool_configs;
 pub mod pool;
 pub mod pool_metrics;
+pub mod skipped_addresses;
 pub mod token;
 pub mod transfers;
 pub mod users;

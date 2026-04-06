@@ -12,7 +12,7 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 
 use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 
@@ -36,6 +36,7 @@ impl TransformationHandler for V3CreateHandler {
         vec![
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -54,8 +55,11 @@ impl TransformationHandler for V3CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
-            let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+            else {
+                continue;
+            };
 
             let pool_call = ctx
                 .calls_for_address(pool_or_hook)
@@ -201,6 +205,7 @@ impl TransformationHandler for LockableV3CreateHandler {
         vec![
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -219,8 +224,11 @@ impl TransformationHandler for LockableV3CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
-            let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+            else {
+                continue;
+            };
 
             let pool_call = ctx
                 .calls_for_address(pool_or_hook)
