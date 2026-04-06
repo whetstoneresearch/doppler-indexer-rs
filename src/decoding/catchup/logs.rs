@@ -35,7 +35,11 @@ pub async fn catchup_decode_logs(
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
-    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    });
 
     // Scan existing decoded files
     let existing_decoded = Arc::new(scan_existing_decoded_files(output_base));
@@ -200,9 +204,15 @@ pub async fn catchup_decode_logs(
                 range_end - 1
             );
 
-            // Read raw logs from parquet
+            // Read raw logs from parquet — use spawn_blocking to avoid starving
+            // the tokio runtime with synchronous file I/O + decompression
             let file_path_for_read = file_path.clone();
-            let logs = match read_raw_logs_from_parquet(&file_path_for_read) {
+            let logs = match tokio::task::spawn_blocking(move || {
+                read_raw_logs_from_parquet(&file_path_for_read)
+            })
+            .await
+            .expect("parquet read task panicked")
+            {
                 Ok(logs) => logs,
                 Err(e) => {
                     tracing::warn!(

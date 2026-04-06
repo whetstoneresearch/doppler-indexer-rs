@@ -58,7 +58,11 @@ pub async fn catchup_decode_eth_calls(
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
-    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    });
 
     // Scan existing decoded files
     let existing_decoded = scan_existing_decoded_files(output_base);
@@ -418,7 +422,11 @@ pub async fn catchup_decode_eth_calls(
                     range_end,
                     config,
                 } => {
-                    let results = read_regular_calls_from_parquet(&file_path)?;
+                    let results = tokio::task::spawn_blocking(move || {
+                        read_regular_calls_from_parquet(&file_path)
+                    })
+                    .await
+                    .expect("parquet read task panicked")?;
                     process_regular_calls(
                         &results,
                         range_start,
@@ -428,7 +436,6 @@ pub async fn catchup_decode_eth_calls(
                         transform_tx.as_ref(),
                     )
                     .await?;
-                    // Regular calls don't need index updates
                     Ok(None)
                 }
                 CatchupWorkItem::Once {
@@ -438,9 +445,14 @@ pub async fn catchup_decode_eth_calls(
                     contract_name,
                     configs,
                 } => {
+                    let configs_for_read = configs.clone();
+                    let results = tokio::task::spawn_blocking(move || {
+                        let config_refs: Vec<&CallDecodeConfig> = configs_for_read.iter().collect();
+                        read_once_calls_from_parquet(&file_path, &config_refs)
+                    })
+                    .await
+                    .expect("parquet read task panicked")?;
                     let config_refs: Vec<&CallDecodeConfig> = configs.iter().collect();
-                    let results = read_once_calls_from_parquet(&file_path, &config_refs)?;
-                    // Return index info for batch update (avoids race condition)
                     process_once_calls(
                         &results,
                         range_start,
@@ -449,7 +461,7 @@ pub async fn catchup_decode_eth_calls(
                         &config_refs,
                         &output_base,
                         transform_tx.as_ref(),
-                        true, // return_index_info: batch update after all tasks complete
+                        true,
                     )
                     .await
                 }
@@ -459,7 +471,11 @@ pub async fn catchup_decode_eth_calls(
                     range_end,
                     config,
                 } => {
-                    let results = read_event_calls_from_parquet(&file_path)?;
+                    let results = tokio::task::spawn_blocking(move || {
+                        read_event_calls_from_parquet(&file_path)
+                    })
+                    .await
+                    .expect("parquet read task panicked")?;
                     process_event_calls(
                         &results,
                         range_start,
@@ -469,7 +485,6 @@ pub async fn catchup_decode_eth_calls(
                         transform_tx.as_ref(),
                     )
                     .await?;
-                    // Event calls don't need index updates
                     Ok(None)
                 }
             };
