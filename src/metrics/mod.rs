@@ -1,5 +1,7 @@
+mod collection;
 mod rpc;
 
+pub use collection::{describe_collection_metrics, record_parquet_write};
 pub use rpc::{chain_label_from_url, describe_rpc_metrics, with_metrics, RpcMethod};
 
 use std::net::SocketAddr;
