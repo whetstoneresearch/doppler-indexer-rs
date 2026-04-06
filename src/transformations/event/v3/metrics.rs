@@ -35,6 +35,7 @@ fn extract_v3_swaps(
     for event in ctx.events_of_type(source, "Swap") {
         swaps.push(SwapInput {
             pool_id: event.contract_address.to_vec(),
+            transaction_hash: event.transaction_hash,
             block_number: event.block_number,
             block_timestamp: event.block_timestamp,
             log_index: event.log_index,

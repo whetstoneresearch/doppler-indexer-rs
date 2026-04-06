@@ -35,11 +35,7 @@ pub async fn catchup_decode_logs(
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
-    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-    });
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(8);
 
     // Scan existing decoded files
     let existing_decoded = Arc::new(scan_existing_decoded_files(output_base));

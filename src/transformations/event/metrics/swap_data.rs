@@ -24,6 +24,7 @@ use super::accumulator::BlockAccumulator;
 #[derive(Debug, Clone)]
 pub struct SwapInput {
     pub pool_id: Vec<u8>,
+    pub transaction_hash: [u8; 32],
     pub block_number: u64,
     pub block_timestamp: u64,
     pub log_index: u32,
@@ -77,16 +78,22 @@ pub fn process_swaps(
     // We need to collect accumulators first, then reference them
     let mut accumulators: Vec<(Vec<u8>, u64, BlockAccumulator)> = Vec::new();
 
+    // Track skipped swaps for a single summary log at the end.
+    // Collect a few (pool, block, tx_hash) samples for debugging.
+    let mut skipped_swap_count = 0u64;
+    let mut skipped_pool_count = 0u64;
+    let mut skipped_samples: Vec<(String, u64, String)> = Vec::new();
+
     for ((pool_id, block_number), swap_group) in &grouped {
         let meta = match metadata_cache.get(pool_id) {
             Some(m) => m,
             None => {
-                tracing::warn!(
-                    "No metadata for pool {} at block {}, skipping {} swaps",
-                    hex::encode(pool_id),
-                    block_number,
-                    swap_group.len()
-                );
+                skipped_swap_count += swap_group.len() as u64;
+                skipped_pool_count += 1;
+                if skipped_samples.len() < 5 {
+                    let tx = swap_group.first().map(|s| hex::encode(s.transaction_hash)).unwrap_or_default();
+                    skipped_samples.push((hex::encode(pool_id), *block_number, tx));
+                }
                 continue;
             }
         };
@@ -123,6 +130,19 @@ pub fn process_swaps(
         }
 
         accumulators.push((pool_id.clone(), *block_number, acc));
+    }
+
+    if skipped_swap_count > 0 {
+        let samples_str: Vec<String> = skipped_samples
+            .iter()
+            .map(|(pool, block, tx)| format!("pool={} block={} tx={}", pool, block, tx))
+            .collect();
+        tracing::warn!(
+            "Skipped {} swap(s) across {} pool(s) due to missing metadata. Samples: [{}]",
+            skipped_swap_count,
+            skipped_pool_count,
+            samples_str.join("; "),
+        );
     }
 
     for (pool_id, block_number, acc) in &accumulators {
@@ -192,9 +212,9 @@ pub fn process_liquidity_deltas(deltas: &[LiquidityInput], chain_id: u64) -> Vec
 
 /// Refresh the metadata cache from DB if any pool IDs in the batch are missing.
 ///
-/// Returns `Err` if the DB refresh fails, or if any of the originally-missing
-/// pool IDs are still absent after the refresh (indicating the pool was not yet
-/// committed to the DB by a prior handler, which is a programming error).
+/// Returns `Err` only if the DB refresh itself fails. Pools that remain absent
+/// after the refresh are logged and silently skipped — `process_swaps` already
+/// handles missing metadata gracefully by skipping the affected pools.
 pub async fn refresh_cache_if_needed(
     pool_ids: impl Iterator<Item = &Vec<u8>>,
     cache: &PoolMetadataCache,
@@ -225,31 +245,28 @@ pub async fn refresh_cache_if_needed(
                 missing.len()
             );
         }
-        Ok(_) => {
-            tracing::debug!(
-                "{} pool(s) still missing from DB after refresh",
-                missing.len()
-            );
-        }
+        Ok(_) => {}
         Err(e) => {
             return Err(e);
         }
     }
 
-    // Verify all originally-missing pools were found after the refresh.
     let still_missing: Vec<_> = missing
         .iter()
         .filter(|id| cache.get(id).is_none())
         .collect();
+
     if !still_missing.is_empty() {
+        let sample: Vec<String> = still_missing
+            .iter()
+            .take(10)
+            .map(|id| hex::encode(id))
+            .collect();
         tracing::warn!(
-            "{} pool(s) still missing after cache refresh — cannot compute metrics",
-            still_missing.len()
+            "{} pool(s) not in pools table — metrics will be skipped (sample: {})",
+            still_missing.len(),
+            sample.join(", "),
         );
-        return Err(TransformationError::MissingData(format!(
-            "{} pool(s) still missing after metadata cache refresh",
-            still_missing.len()
-        )));
     }
 
     Ok(())
@@ -289,6 +306,7 @@ mod tests {
 
         let swaps = vec![SwapInput {
             pool_id: pool_id.clone(),
+            transaction_hash: [0u8; 32],
             block_number: 100,
             block_timestamp: 1000,
             log_index: 0,
@@ -312,6 +330,7 @@ mod tests {
         let swaps = vec![
             SwapInput {
                 pool_id: pool_id.clone(),
+                transaction_hash: [0u8; 32],
                 block_number: 100,
                 block_timestamp: 1000,
                 log_index: 0,
@@ -323,6 +342,7 @@ mod tests {
             },
             SwapInput {
                 pool_id: pool_id.clone(),
+                transaction_hash: [0u8; 32],
                 block_number: 100,
                 block_timestamp: 1000,
                 log_index: 1,
@@ -345,6 +365,7 @@ mod tests {
 
         let swaps = vec![SwapInput {
             pool_id: pool_id.clone(),
+            transaction_hash: [0u8; 32],
             block_number: 100,
             block_timestamp: 1000,
             log_index: 0,

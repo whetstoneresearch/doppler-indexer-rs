@@ -58,11 +58,7 @@ pub async fn catchup_decode_eth_calls(
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
-    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-    });
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(8);
 
     // Scan existing decoded files
     let existing_decoded = scan_existing_decoded_files(output_base);
