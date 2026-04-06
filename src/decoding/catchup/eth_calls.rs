@@ -58,7 +58,7 @@ pub async fn catchup_decode_eth_calls(
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
 ) -> Result<(), EthCallDecodingError> {
-    let concurrency = raw_data_config.decoding_concurrency.unwrap_or_else(8);
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(8);
 
     // Scan existing decoded files
     let existing_decoded = scan_existing_decoded_files(output_base);
@@ -206,7 +206,55 @@ pub async fn catchup_decode_eth_calls(
                                     .collect();
 
                                 if missing_configs.is_empty() {
-                                    continue; // All columns already decoded
+                                    // All columns decoded. Check if raw has more
+                                    // rows (new factory addresses added after
+                                    // initial decode).
+                                    let decoded_path = output_base
+                                        .join(&contract_name)
+                                        .join("once")
+                                        .join(file_name);
+                                    let needs_redecode = {
+                                        use parquet::file::reader::FileReader;
+                                        let raw_rows = std::fs::File::open(&file_path)
+                                            .ok()
+                                            .and_then(|f| parquet::file::reader::SerializedFileReader::new(f).ok())
+                                            .map(|r| (0..r.metadata().num_row_groups()).map(|i| r.metadata().row_group(i).num_rows() as u64).sum::<u64>())
+                                            .unwrap_or(0);
+                                        let dec_rows = std::fs::File::open(&decoded_path)
+                                            .ok()
+                                            .and_then(|f| parquet::file::reader::SerializedFileReader::new(f).ok())
+                                            .map(|r| (0..r.metadata().num_row_groups()).map(|i| r.metadata().row_group(i).num_rows() as u64).sum::<u64>())
+                                            .unwrap_or(0);
+                                        raw_rows > dec_rows
+                                    };
+                                    if !needs_redecode {
+                                        continue;
+                                    }
+                                    tracing::info!(
+                                        "Once file {}/once/{}: raw has more rows than decoded, re-decoding",
+                                        contract_name, file_name,
+                                    );
+                                    let all_configs: Vec<CallDecodeConfig> = configs
+                                        .iter()
+                                        .filter(|c| {
+                                            if let Some(start) = c.start_block {
+                                                if start >= range_end { return false; }
+                                            }
+                                            raw_cols.contains(&c.function_name)
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    if all_configs.is_empty() {
+                                        continue;
+                                    }
+                                    work_items.push(CatchupWorkItem::Once {
+                                        file_path,
+                                        range_start,
+                                        range_end,
+                                        contract_name: contract_name.to_string(),
+                                        configs: all_configs,
+                                    });
+                                    continue;
                                 }
 
                                 tracing::debug!(
@@ -458,6 +506,7 @@ pub async fn catchup_decode_eth_calls(
                         &output_base,
                         transform_tx.as_ref(),
                         true,
+                        true, // force_overwrite: catchup always overwrites to handle row additions
                     )
                     .await
                 }
