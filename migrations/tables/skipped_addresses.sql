@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS _skipped_addresses (
     asset_address BYTEA NOT NULL,
     numeraire_address BYTEA NOT NULL,
     reason TEXT NOT NULL,
+    source VARCHAR(255) NOT NULL,
+    source_version INT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
