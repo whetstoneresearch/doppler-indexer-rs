@@ -9,7 +9,6 @@
 //! single primary trigger, avoiding duplicate live executions and snapshot
 //! capture issues with multi-trigger handlers.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Once, OnceLock};
 
 use alloy_primitives::I256;
@@ -20,7 +19,7 @@ use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::{FieldExtractor, TransformationContext};
 use crate::transformations::error::TransformationError;
 use crate::transformations::event::metrics::swap_data::{
-    process_liquidity_deltas, process_swaps, LiquidityInput, SwapInput,
+    process_liquidity_deltas, process_swaps, refresh_cache_if_needed, LiquidityInput, SwapInput,
 };
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
@@ -96,71 +95,6 @@ fn extract_v3_liquidity(
     }
 
     Ok(deltas)
-}
-
-/// Refresh the metadata cache from DB if any pool IDs in the batch are missing.
-///
-/// Returns `Err` if the DB refresh fails, or if any of the originally-missing
-/// pool IDs are still absent after the refresh (indicating the pool was not yet
-/// committed to the DB by a prior handler, which is a programming error).
-async fn refresh_cache_if_needed(
-    pool_ids: impl Iterator<Item = &Vec<u8>>,
-    cache: &PoolMetadataCache,
-    db_pool: &OnceLock<Pool>,
-    chain_id: u64,
-    contracts: &crate::types::config::contract::Contracts,
-) -> Result<(), TransformationError> {
-    let missing: Vec<_> = {
-        let unique: HashSet<&Vec<u8>> = pool_ids.collect();
-        unique
-            .into_iter()
-            .filter(|id| cache.get(id).is_none())
-            .collect()
-    };
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    let Some(pool) = db_pool.get() else {
-        return Ok(());
-    };
-
-    match cache.refresh(pool, chain_id, contracts).await {
-        Ok(new_count) if new_count > 0 => {
-            tracing::info!(
-                "Metadata cache refreshed: {} new pool(s) discovered ({} were missing)",
-                new_count,
-                missing.len()
-            );
-        }
-        Ok(_) => {
-            tracing::debug!(
-                "{} pool(s) still missing from DB after refresh",
-                missing.len()
-            );
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
-
-    // Verify all originally-missing pools were found after the refresh.
-    let still_missing: Vec<_> = missing
-        .iter()
-        .filter(|id| cache.get(id).is_none())
-        .collect();
-    if !still_missing.is_empty() {
-        tracing::warn!(
-            "{} pool(s) still missing after cache refresh — cannot compute metrics",
-            still_missing.len()
-        );
-        return Err(TransformationError::MissingData(format!(
-            "{} pool(s) still missing after metadata cache refresh",
-            still_missing.len()
-        )));
-    }
-
-    Ok(())
 }
 
 // --- V3SwapMetricsHandler ---

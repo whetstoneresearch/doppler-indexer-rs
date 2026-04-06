@@ -775,18 +775,52 @@ pub(crate) async fn process_factory_once_calls(
         tokio::fs::create_dir_all(&sub_dir).await?;
 
         if has_existing_file {
+            // E. Reuse pre-read batches from step C (or read now if not available)
+            let existing_batches = match existing_batches_opt.take() {
+                Some(batches) => batches,
+                None => read_existing_once_parquet_async(output_path.clone()).await?,
+            };
+            let existing_is_empty = existing_batches.is_empty()
+                || existing_batches.iter().all(|b| b.num_rows() == 0);
+
+            // If existing file is empty but we have new results, treat as fresh write
+            if existing_is_empty && !results_by_address.is_empty() {
+                let results: Vec<OnceCallResult> = results_by_address
+                    .into_iter()
+                    .map(
+                        |(address, (block_number, timestamp, function_results))| {
+                            OnceCallResult {
+                                block_number,
+                                block_timestamp: timestamp,
+                                contract_address: address.0 .0,
+                                function_results,
+                            }
+                        },
+                    )
+                    .collect();
+
+                tracing::info!(
+                    "Writing {} factory once results (replacing empty file) to {} for {}",
+                    results.len(),
+                    output_path.display(),
+                    collection_name
+                );
+
+                write_once_results_to_parquet_async(
+                    results,
+                    output_path.clone(),
+                    all_fn_names.clone(),
+                )
+                .await?;
+            } else {
+
             // Merge new columns into existing parquet
             let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
                 .into_iter()
                 .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
                 .collect();
 
-            // E. Reuse pre-read batches from step C (or read now if not available)
-            let existing_batches = match existing_batches_opt.take() {
-                Some(batches) => batches,
-                None => read_existing_once_parquet_async(output_path.clone()).await?,
-            };
-            if !existing_batches.is_empty() {
+            if !existing_is_empty {
                 // Check which addresses already have data for the missing functions
                 let existing_results =
                     extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
@@ -908,6 +942,7 @@ pub(crate) async fn process_factory_once_calls(
                     collection_name
                 );
             }
+            } // close else { for existing_is_empty check
         } else {
             let results: Vec<OnceCallResult> = results_by_address
                 .into_iter()
@@ -1755,15 +1790,49 @@ pub(crate) async fn process_factory_once_calls_multicall(
             let results_by_address = results_by_address.unwrap_or_default();
 
             if has_existing_file {
+                let existing_batches =
+                    read_existing_once_parquet_async(output_path.clone()).await?;
+                let existing_is_empty = existing_batches.is_empty()
+                    || existing_batches.iter().all(|b| b.num_rows() == 0);
+
+                // If existing file is empty but we have new results, treat as fresh write
+                if existing_is_empty && !results_by_address.is_empty() {
+                    let results: Vec<OnceCallResult> = results_by_address
+                        .into_iter()
+                        .map(
+                            |(address, (block_number, timestamp, function_results))| {
+                                OnceCallResult {
+                                    block_number,
+                                    block_timestamp: timestamp,
+                                    contract_address: address.0 .0,
+                                    function_results,
+                                }
+                            },
+                        )
+                        .collect();
+
+                    tracing::info!(
+                        "Writing {} multicall factory once results (replacing empty file) to {} for {}",
+                        results.len(),
+                        output_path.display(),
+                        collection_name
+                    );
+
+                    write_once_results_to_parquet_async(
+                        results,
+                        output_path.clone(),
+                        all_fn_names.clone(),
+                    )
+                    .await?;
+                } else {
+
                 let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> =
                     results_by_address
                         .into_iter()
                         .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
                         .collect();
 
-                let existing_batches =
-                    read_existing_once_parquet_async(output_path.clone()).await?;
-                if !existing_batches.is_empty() {
+                if !existing_is_empty {
                     // Check which addresses already have data for the missing functions
                     let existing_results =
                         extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
@@ -1901,6 +1970,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         collection_name
                     );
                 }
+                } // close else { for existing_is_empty check
             } else {
                 let results: Vec<OnceCallResult> = results_by_address
                     .into_iter()

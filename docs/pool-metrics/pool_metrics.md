@@ -1,96 +1,84 @@
-# Uniswap V4 Pool Metrics: Tables, State & Math
+# Pool Metrics: Tables, State & Math
 
 ## SQL Tables
 
-### pool_state — hot query target for lists/dashboards
+All tables include `chain_id`, `source`, and `source_version` columns for multi-chain and multi-version isolation. These are injected automatically by the executor — handler code does not set them.
+
+### pool_state — one row per (chain, pool, source version); updated on every swap
 
 ```sql
-CREATE TABLE pool_state (
-    pool_id            BYTEA PRIMARY KEY,
-    token0             BYTEA NOT NULL,
-    token1             BYTEA NOT NULL,
-    decimals0          INT NOT NULL,
-    decimals1          INT NOT NULL,
-    tick_spacing       INT NOT NULL,
-
-    -- latest state
-    block_number       BIGINT NOT NULL,
-    block_timestamp    TIMESTAMPTZ NOT NULL,
-    tick               INT NOT NULL,
-    sqrt_price_x96     NUMERIC NOT NULL,
-
-    -- derived metrics
-    price              NUMERIC NOT NULL,          -- token1 per token0, decimal-adjusted
-    active_liquidity   NUMERIC NOT NULL,          -- L at current tick
-    amount0            NUMERIC NOT NULL,           -- total token0 in pool
-    amount1            NUMERIC NOT NULL,           -- total token1 in pool
-    tvl_usd            NUMERIC,                    -- amount0 * price0_usd + amount1 * price1_usd
-    total_supply       NUMERIC,                    -- token0 total supply (for market cap)
-    market_cap_usd     NUMERIC,
-    volume_24h_usd     NUMERIC,
-    price_change_1h    NUMERIC,
-    price_change_24h   NUMERIC,
-    swap_count_24h     INT,
-
-    updated_at         TIMESTAMPTZ DEFAULT now()
+CREATE TABLE IF NOT EXISTS pool_state (
+    chain_id         BIGINT NOT NULL,
+    pool_id          BYTEA NOT NULL,
+    block_number     BIGINT NOT NULL,
+    block_timestamp  BIGINT NOT NULL,       -- unix seconds
+    tick             INTEGER NOT NULL,
+    sqrt_price_x96   NUMERIC NOT NULL,
+    price            NUMERIC NOT NULL,      -- quote tokens per base token, decimal-adjusted
+    active_liquidity NUMERIC NOT NULL,      -- L at current tick
+    volume_24h_usd   NUMERIC,               -- rolling 24h (phase 3+)
+    price_change_1h  NUMERIC,               -- (phase 3+)
+    price_change_24h NUMERIC,               -- (phase 3+)
+    swap_count_24h   INTEGER,               -- (phase 3+)
+    source           VARCHAR(255) NOT NULL,
+    source_version   INT NOT NULL,
+    UNIQUE (chain_id, pool_id, source, source_version)
 );
 
-CREATE INDEX idx_pool_state_mcap ON pool_state (market_cap_usd DESC NULLS LAST);
-CREATE INDEX idx_pool_state_liq ON pool_state (active_liquidity DESC NULLS LAST);
-CREATE INDEX idx_pool_state_tvl ON pool_state (tvl_usd DESC NULLS LAST);
-CREATE INDEX idx_pool_state_price_chg_24h ON pool_state (price_change_24h DESC NULLS LAST);
-CREATE INDEX idx_pool_state_volume ON pool_state (volume_24h_usd DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_pool_state_price ON pool_state (price DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_pool_state_reorg ON pool_state (chain_id, block_number);
 ```
 
-### pool_snapshots — per-block time series (only blocks with activity)
+**Upsert semantics**: `ON CONFLICT DO UPDATE SET ... WHERE EXCLUDED.block_number > pool_state.block_number`. Writes from stale blocks (e.g., retried historical ranges) are silently dropped. This conditional update is the basis for correct reorg snapshot capture — see [Reorg Invariants](#reorg-invariants).
+
+### pool_snapshots — one row per (chain, pool, block) with swap activity
 
 ```sql
-CREATE TABLE pool_snapshots (
-    pool_id            BYTEA NOT NULL,
-    block_number       BIGINT NOT NULL,
-    block_timestamp    TIMESTAMPTZ NOT NULL,
-
-    -- OHLC (across all events in this block)
-    price_open         NUMERIC NOT NULL,
-    price_close        NUMERIC NOT NULL,
-    price_high         NUMERIC NOT NULL,
-    price_low          NUMERIC NOT NULL,
-
-    -- end-of-block state
-    active_liquidity   NUMERIC NOT NULL,
-    amount0            NUMERIC NOT NULL,
-    amount1            NUMERIC NOT NULL,
-    tvl_usd            NUMERIC,
-    market_cap_usd     NUMERIC,
-
-    -- block aggregates
-    volume0            NUMERIC NOT NULL DEFAULT 0,
-    volume1            NUMERIC NOT NULL DEFAULT 0,
-    volume_usd         NUMERIC DEFAULT 0,
-    swap_count         INT NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (pool_id, block_number)
+CREATE TABLE IF NOT EXISTS pool_snapshots (
+    chain_id         BIGINT NOT NULL,
+    pool_id          BYTEA NOT NULL,
+    block_number     BIGINT NOT NULL,
+    block_timestamp  BIGINT NOT NULL,       -- unix seconds
+    price_open       NUMERIC NOT NULL,      -- price at first swap in block
+    price_close      NUMERIC NOT NULL,      -- price at last swap in block
+    price_high       NUMERIC NOT NULL,
+    price_low        NUMERIC NOT NULL,
+    active_liquidity NUMERIC NOT NULL,      -- L at last swap in block
+    volume0          NUMERIC NOT NULL DEFAULT 0,   -- sum of |amount0| across all swaps
+    volume1          NUMERIC NOT NULL DEFAULT 0,   -- sum of |amount1| across all swaps
+    swap_count       INT NOT NULL DEFAULT 0,
+    source           VARCHAR(255) NOT NULL,
+    source_version   INT NOT NULL,
+    UNIQUE (chain_id, pool_id, block_number, source, source_version)
 );
 
-CREATE INDEX idx_snapshots_time ON pool_snapshots (pool_id, block_timestamp);
+CREATE INDEX IF NOT EXISTS idx_snapshots_time ON pool_snapshots (pool_id, block_timestamp);
+CREATE INDEX IF NOT EXISTS idx_snapshots_reorg ON pool_snapshots (chain_id, block_number);
 ```
 
-### liquidity_deltas — recovery log for rebuilding tick maps
+**Upsert semantics**: `ON CONFLICT DO UPDATE SET ...` (unconditional — updates all columns). Idempotent across retries for the same block.
+
+### liquidity_deltas — append-only recovery log for Mint/Burn events
 
 ```sql
-CREATE TABLE liquidity_deltas (
-    pool_id            BYTEA NOT NULL,
-    block_number       BIGINT NOT NULL,
-    log_index          INT NOT NULL,
-    tick_lower         INT NOT NULL,
-    tick_upper         INT NOT NULL,
-    liquidity_delta    NUMERIC NOT NULL,
-
-    PRIMARY KEY (pool_id, block_number, log_index)
+CREATE TABLE IF NOT EXISTS liquidity_deltas (
+    chain_id        BIGINT NOT NULL,
+    pool_id         BYTEA NOT NULL,
+    block_number    BIGINT NOT NULL,
+    log_index       INT NOT NULL,
+    tick_lower      INT NOT NULL,
+    tick_upper      INT NOT NULL,
+    liquidity_delta NUMERIC NOT NULL,       -- positive = mint, negative = burn
+    source          VARCHAR(255) NOT NULL,
+    source_version  INT NOT NULL,
+    UNIQUE (chain_id, pool_id, block_number, log_index, source, source_version)
 );
 
-CREATE INDEX idx_liq_deltas_pool ON liquidity_deltas (pool_id);
+CREATE INDEX IF NOT EXISTS idx_liq_deltas_pool ON liquidity_deltas (pool_id);
+CREATE INDEX IF NOT EXISTS idx_liq_deltas_reorg ON liquidity_deltas (chain_id, block_number);
 ```
+
+**Insert semantics**: `ON CONFLICT DO NOTHING`. Pure append log — one row per Mint/Burn event. Used to rebuild in-memory tick maps for future TVL computation (phase 3+).
 
 ---
 
@@ -317,6 +305,97 @@ def compute_24h_volume(pool_id: bytes, current_timestamp) -> Decimal:
     """
     ...
 ```
+
+---
+
+## Reorg Invariants
+
+The metrics handlers have specific requirements for correct reorg rollback. Violating these causes orphaned rows or incorrect state restoration.
+
+### pool_state (stateful — needs snapshot restore)
+
+`pool_state` holds one row per pool updated in place. On reorg, the pre-block value must be **restored**, not deleted. The executor captures a rollback snapshot (the row's value before the write) for every upsert where `affected_rows > 0`. The conditional `WHERE EXCLUDED.block_number > pool_state.block_number` ensures:
+
+- No-op writes (stale block) produce `affected_rows = 0` → **no snapshot recorded** → correct: nothing to roll back
+- Real writes produce `affected_rows = 1` → snapshot records the previous value → reorg restores it
+
+### pool_snapshots (block-keyed — needs delete on reorg)
+
+`pool_snapshots` has one row per (pool, block). On reorg, the row must be **deleted** (no previous state to restore — the row simply shouldn't exist). The snapshot capture records `previous_row = None` on first insert, which triggers a keyed DELETE during reorg cleanup.
+
+### liquidity_deltas (append-only — fallback DELETE is correct)
+
+`liquidity_deltas` uses `ON CONFLICT DO NOTHING` (`update_columns = []`). The snapshot capture loop skips ops with empty `update_columns`, so no rollback snapshot is ever written for this table. The reorg cleanup's fallback `DELETE ... WHERE chain_id = X AND block_number IN (...)` is the correct and complete reorg action.
+
+### Multi-trigger handler constraint (see issue #95)
+
+The liquidity metrics handlers (`V3LiquidityMetricsHandler`, `LockableV3LiquidityMetricsHandler`) are multi-trigger (Mint + Burn). Multi-trigger handlers run with `DbExecMode::Direct` (no snapshot capture). This is safe **only because** `liquidity_deltas` uses `update_columns = []` — snapshot capture would be a no-op anyway. If a future multi-trigger handler writes to a stateful table (non-empty `update_columns`), it would silently lose reorg protection and fall back to DELETE instead of restore.
+
+### Retry safety
+
+The retry path always uses snapshot capture. Before retrying a handler for a block, the retry loop checks whether the handler is already recorded as complete for that range. If so, it skips both `handle()` and the snapshot write — preventing duplicate snapshots that would conflict with the original write's snapshot and restore orphaned rows during reorg.
+
+---
+
+## V4 Base Cumulative Counters
+
+`DopplerV4Hook` emits `Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)` where `totalProceeds` and `totalTokensSold` are **cumulative since pool creation**, not per-swap deltas. To feed the shared `process_swaps()` pipeline (which expects per-swap `amount0`/`amount1`), the `V4BaseMetricsHandler` computes deltas by subtracting the previous cumulative values for each pool.
+
+### State storage
+
+**Durable**: `v4_base_proceeds_state` — one row per `(chain_id, pool_id, source, source_version)` storing the most recent cumulative totals. Upserted inside the same transaction as the `pool_snapshots`/`pool_state` writes.
+
+```sql
+CREATE TABLE IF NOT EXISTS v4_base_proceeds_state (
+    chain_id           BIGINT NOT NULL,
+    pool_id            BYTEA NOT NULL,
+    total_proceeds     NUMERIC NOT NULL DEFAULT '0',
+    total_tokens_sold  NUMERIC NOT NULL DEFAULT '0',
+    source             VARCHAR(255) NOT NULL,
+    source_version     INT NOT NULL,
+    UNIQUE (chain_id, pool_id, source, source_version)
+);
+```
+
+**In-memory**: `RwLock<HashMap<[u8;32], (U256, U256)>>` on the handler. Loaded from `v4_base_proceeds_state` at `initialize()`, refilled on miss (one scoped `pool_id = ANY($4)` query for just the missing IDs), and updated optimistically in `handle()` after computing deltas.
+
+### Amount sign convention
+
+The protocol sells base tokens for quote tokens. For each delta:
+
+```
+proceeds_delta  = quote received by pool (inflow)
+tokens_delta    = base sold out of pool  (outflow)
+```
+
+| is_token_0 | amount0              | amount1              |
+|------------|----------------------|----------------------|
+| `true`     | `-(tokens_delta)`    | `+proceeds_delta`    |
+| `false`    | `+proceeds_delta`    | `-(tokens_delta)`    |
+
+### Sequential processing
+
+This handler sets `requires_sequential() = true`. The catchup engine creates a capacity-1 `Semaphore` for this handler only, and Tokio's FIFO permit ordering guarantees ranges run in ascending block order so the "prev cumulative" used for each delta is always the immediately preceding range's committed state.
+
+### Retry & recovery
+
+The handler uses three trait hooks (`on_commit_success`, `on_commit_failure`, `on_reorg`) to keep the in-memory `proceeds_state` cache consistent with the committed DB state across failures and reorgs:
+
+- **Optimistic cache snapshot**: before the optimistic cache update, `handle()` stashes the current (pre-update) cumulative per touched pool into `in_flight_pre`.
+- **`on_commit_success(range)`** (called by executor/engine/retry after a successful tx): drains `in_flight_pre` and removes `range` from `failed_ranges`.
+- **`on_commit_failure(range)`** (called after a failed tx): restores the cache from `in_flight_pre` (reverting the optimistic update) and records `range` in `failed_ranges`.
+- **Gate in `handle()`**: if `failed_ranges` contains any range smaller than the current one, the handler returns `TransformationError::TransientBlocked`, which the retry machinery surfaces as a retryable failure. This blocks subsequent ranges from advancing the cumulative past a stuck block. The retry of the failed range itself is always admitted (`current == min_failed`), so the handler converges as soon as the underlying error clears.
+- **`on_reorg(orphaned)`**: called by the finalizer after DB rollback. Clears `proceeds_state`, `in_flight_pre`, and `failed_ranges` entirely; the next `handle()` lazily reloads the cache from `v4_base_proceeds_state`.
+
+Catchup has its own guardrail: a commit failure halts catchup via the engine's `handler_errored` flag, so restart still rebuilds the cache correctly for historical ranges.
+
+### pool_id lookup
+
+The V4 base Swap event has no `poolId` field. The handler maps `event.contract_address` (the hook address) to the 32-byte `pool_id` via `v4_pool_configs`. The map is loaded at init and refreshed on cache miss; `handler_dependencies = ["V4CreateHandler"]` guarantees the config row exists before metrics run for a range.
+
+### active_liquidity
+
+V4 base Swap events do not emit liquidity, and Doppler auction "active liquidity" isn't directly analogous to a v3 pool's. The handler writes `active_liquidity = 0` for V4 base snapshots.
 
 ---
 

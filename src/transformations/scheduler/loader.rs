@@ -356,7 +356,26 @@ impl CatchupLoader {
 
         if !ops.is_empty() {
             let ops = inject_source_version(ops, payload.handler_name, payload.handler_version);
-            self.db_pool.execute_transaction(ops).await?;
+            match self.db_pool.execute_transaction(ops).await {
+                Ok(()) => {
+                    payload
+                        .handler
+                        .on_commit_success((range_start, range_end))
+                        .await?;
+                }
+                Err(e) => {
+                    payload
+                        .handler
+                        .on_commit_failure((range_start, range_end))
+                        .await?;
+                    return Err(TransformationError::DatabaseError(e));
+                }
+            }
+        } else {
+            payload
+                .handler
+                .on_commit_success((range_start, range_end))
+                .await?;
         }
 
         self.finalizer

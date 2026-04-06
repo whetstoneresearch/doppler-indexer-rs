@@ -58,6 +58,9 @@ pub enum TransformationError {
 
     #[error("Live storage error: {0}")]
     LiveStorage(#[from] StorageError),
+
+    #[error("Handler transiently blocked: {0}")]
+    TransientBlocked(String),
 }
 
 #[allow(dead_code)]
