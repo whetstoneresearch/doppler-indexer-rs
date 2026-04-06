@@ -255,6 +255,7 @@ impl Default for AlchemyConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct AlchemyClient {
     inner: Arc<RpcClient>,
     rate_limiter: Arc<SlidingWindowRateLimiter>,

@@ -409,6 +409,7 @@ impl RpcClientConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct RpcClient {
     provider: RootProvider<Ethereum>,
     config: RpcClientConfig,
