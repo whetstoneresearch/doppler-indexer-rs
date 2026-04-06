@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 
 use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::{FieldExtractor, TransformationContext};
@@ -15,7 +15,7 @@ use crate::transformations::util::db::pool::{
     insert_pool, BeneficiariesData, Beneficiary, PoolData,
 };
 use crate::transformations::util::db::token::{insert_token, TokenData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
@@ -37,6 +37,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
             "migrations/tables/dhook_pool_configs.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -54,20 +55,11 @@ impl TransformationHandler for DopplerHookCreateHandler {
             let asset = event.extract_address("asset")?;
             let numeraire = event.extract_address("numeraire")?;
 
-            let (asset_metadata, numeraire_metadata) =
-                match get_metadata(&asset, &numeraire, event, ctx) {
-                    Ok(m) => m,
-                    Err(TransformationError::IncludesPrecompileError(msg)) => {
-                        tracing::warn!(
-                            asset = %Address::from(asset),
-                            numeraire = %Address::from(numeraire),
-                            block = event.block_number,
-                            "Skipping pool with precompile address: {}", msg
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+            else {
+                continue;
+            };
 
             let get_state_call = ctx
                 .calls_of_type("DopplerHookInitializer", "getState")

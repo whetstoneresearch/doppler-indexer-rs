@@ -13,7 +13,7 @@ use crate::transformations::util::db::pool::{
 };
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
@@ -35,6 +35,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
             "migrations/tables/v4_pool_configs.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -59,20 +60,11 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                 TransformationError::TypeConversion("numeraire is not an address".to_string())
             })?;
 
-            let (asset_metadata, numeraire_metadata) =
-                match get_metadata(&asset, &numeraire, event, ctx) {
-                    Ok(m) => m,
-                    Err(TransformationError::IncludesPrecompileError(msg)) => {
-                        tracing::warn!(
-                            asset = %Address::from(asset),
-                            numeraire = %Address::from(numeraire),
-                            block = event.block_number,
-                            "Skipping pool with precompile address: {}", msg
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+            else {
+                continue;
+            };
 
             let get_state_call = ctx
                 .calls_of_type("DecayMulticurveInitializer", "getState")
