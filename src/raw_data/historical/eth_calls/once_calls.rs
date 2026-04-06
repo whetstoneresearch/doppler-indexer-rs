@@ -1269,7 +1269,8 @@ pub(crate) async fn process_once_calls_multicall(
 
     // Execute multicall
     let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.chain_name)
+            .await?;
 
     // Group results by contract_name -> address -> function_name -> value
     let mut results_by_contract: HashMap<String, HashMap<Address, HashMap<String, Vec<u8>>>> =
@@ -1807,8 +1808,13 @@ pub(crate) async fn process_factory_once_calls_multicall(
         );
 
         // Execute multicalls
-        let results =
-            execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
+        let results = execute_multicalls_generic(
+            ctx.client,
+            multicall3_address,
+            block_multicalls,
+            ctx.chain_name,
+        )
+        .await?;
 
         for (meta, return_data, _success) in results {
             let entry = results_by_collection
@@ -2049,6 +2055,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
                             ctx.client,
                             multicall3_address,
                             backfill_multicalls,
+                            ctx.chain_name,
                         )
                         .await?;
 

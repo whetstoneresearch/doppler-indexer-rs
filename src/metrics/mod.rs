@@ -1,5 +1,7 @@
+mod collection;
 mod rpc;
 
+pub use collection::{describe_collection_metrics, record_parquet_write};
 pub use rpc::{
     chain_label_from_url, describe_rpc_metrics, record_batch_size, record_rate_limit_wait,
     record_retries_exhausted, record_retry_attempt, set_cu_usage, set_semaphore_utilization,
