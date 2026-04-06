@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, UInt32Array,
@@ -192,6 +193,7 @@ pub(crate) async fn process_range(
         range.end - 1
     );
 
+    let write_start = Instant::now();
     match log_fields {
         Some(fields) => {
             let records: Vec<MinimalLogRecord> = logs
@@ -234,6 +236,14 @@ pub(crate) async fn process_range(
     }
 
     let output_path = output_dir.join(range.file_name("logs"));
+
+    crate::metrics::record_parquet_write(
+        chain_name,
+        "logs",
+        write_start.elapsed().as_secs_f64(),
+        &output_path,
+    );
+
     tracing::info!("Wrote logs to {}", output_path.display());
 
     // Upload to S3 if configured

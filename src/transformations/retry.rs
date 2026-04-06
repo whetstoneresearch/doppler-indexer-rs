@@ -7,12 +7,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use metrics::counter;
 use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
 use super::engine::HandlerKind;
 use super::error::TransformationError;
 use super::executor::{execute_with_snapshot_capture, inject_source_version};
+use crate::metrics::HandlerMetricsGuard;
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
@@ -522,6 +524,12 @@ impl RetryProcessor {
                         block_number,
                         unmet
                     );
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
                     blocked_handlers.insert(handler_key);
                     continue;
                 }
@@ -537,6 +545,12 @@ impl RetryProcessor {
                         block_number,
                         missing_deps
                     );
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
                     blocked_handlers.insert(handler_key);
                     continue;
                 }
@@ -578,6 +592,8 @@ impl RetryProcessor {
                 self.contracts.clone(),
             );
 
+            let guard = HandlerMetricsGuard::new(&handler_key, "retry");
+
             match rh.handler.handle(&ctx).await {
                 Ok(ops) => {
                     let commit_result = if !ops.is_empty() {
@@ -608,8 +624,22 @@ impl RetryProcessor {
                                     block_number,
                                     e
                                 );
+                                guard.failure("handler_error");
+                                counter!(
+                                    "transformation_retry_attempts_total",
+                                    "handler_key" => handler_key.clone(),
+                                    "outcome" => "failure",
+                                )
+                                .increment(1);
                                 continue;
                             }
+                            guard.success();
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "success",
+                            )
+                            .increment(1);
                             self.record_handler_retry_success(
                                 &handler_key,
                                 handler_name,
@@ -628,6 +658,13 @@ impl RetryProcessor {
                                 block_number,
                                 e
                             );
+                            guard.failure("db_error");
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "failure",
+                            )
+                            .increment(1);
                             if let Err(hook_err) = rh
                                 .handler
                                 .on_commit_failure((range_start, range_end))
@@ -651,6 +688,13 @@ impl RetryProcessor {
                         block_number,
                         e
                     );
+                    guard.failure("handler_error");
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "failure",
+                    )
+                    .increment(1);
                 }
             }
         }

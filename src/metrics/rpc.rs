@@ -93,6 +93,106 @@ pub fn describe_rpc_metrics() {
         "rpc_requests_in_flight",
         "Number of RPC requests currently in progress"
     );
+    describe_gauge!(
+        "rpc_rate_limiter_cu_used",
+        "Current compute units consumed in sliding window"
+    );
+    describe_gauge!(
+        "rpc_rate_limiter_cu_capacity",
+        "Max compute units for the window"
+    );
+    describe_histogram!(
+        "rpc_rate_limit_wait_seconds",
+        "Time waiting for rate limiter capacity"
+    );
+    describe_counter!(
+        "rpc_retry_attempts_total",
+        "Each retry attempt"
+    );
+    describe_counter!(
+        "rpc_retries_exhausted_total",
+        "Retries fully exhausted"
+    );
+    describe_gauge!(
+        "rpc_semaphore_acquired",
+        "Currently held semaphore permits"
+    );
+    describe_gauge!(
+        "rpc_semaphore_capacity",
+        "Total semaphore permits configured"
+    );
+    describe_histogram!(
+        "rpc_batch_size",
+        "Items per batch execution"
+    );
+}
+
+/// Record time spent waiting for rate limiter capacity.
+pub fn record_rate_limit_wait(chain: &str, duration_secs: f64) {
+    histogram!(
+        "rpc_rate_limit_wait_seconds",
+        "chain" => chain.to_string()
+    )
+    .record(duration_secs);
+}
+
+/// Record a retry attempt with its outcome.
+pub fn record_retry_attempt(chain: &str, operation: &str, outcome: &str) {
+    counter!(
+        "rpc_retry_attempts_total",
+        "chain" => chain.to_string(),
+        "operation" => operation.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+/// Record that retries were fully exhausted for an operation.
+pub fn record_retries_exhausted(chain: &str, operation: &str) {
+    counter!(
+        "rpc_retries_exhausted_total",
+        "chain" => chain.to_string(),
+        "operation" => operation.to_string()
+    )
+    .increment(1);
+}
+
+/// Record the size of a batch execution.
+pub fn record_batch_size(chain: &str, method: &str, size: usize) {
+    histogram!(
+        "rpc_batch_size",
+        "chain" => chain.to_string(),
+        "method" => method.to_string()
+    )
+    .record(size as f64);
+}
+
+/// Set current compute unit usage and capacity gauges.
+pub fn set_cu_usage(chain: &str, current: f64, capacity: f64) {
+    gauge!(
+        "rpc_rate_limiter_cu_used",
+        "chain" => chain.to_string()
+    )
+    .set(current);
+    gauge!(
+        "rpc_rate_limiter_cu_capacity",
+        "chain" => chain.to_string()
+    )
+    .set(capacity);
+}
+
+/// Set semaphore utilization gauges.
+pub fn set_semaphore_utilization(chain: &str, acquired: f64, capacity: f64) {
+    gauge!(
+        "rpc_semaphore_acquired",
+        "chain" => chain.to_string()
+    )
+    .set(acquired);
+    gauge!(
+        "rpc_semaphore_capacity",
+        "chain" => chain.to_string()
+    )
+    .set(capacity);
 }
 
 /// Extract a sanitized chain identifier from an RPC URL.

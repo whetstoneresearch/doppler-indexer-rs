@@ -1,5 +1,7 @@
 use alloy_primitives::{Address, B256};
 
+use crate::db::DbOperation;
+use crate::transformations::util::db::skipped_addresses::{insert_skipped_address, SkippedAddressData};
 use crate::transformations::util::sanitize::is_precompile_address;
 
 use crate::transformations::{DecodedEvent, TransformationContext, TransformationError};
@@ -202,4 +204,37 @@ pub fn get_metadata(
     };
 
     Ok((asset_metadata, numeraire_metadata))
+}
+
+pub fn get_metadata_or_skip(
+    asset: &[u8; 20],
+    numeraire: &[u8; 20],
+    event: &DecodedEvent,
+    ctx: &TransformationContext,
+    ops: &mut Vec<DbOperation>,
+) -> Result<Option<(AssetTokenMetadata, TokenMetadata)>, TransformationError> {
+    match get_metadata(asset, numeraire, event, ctx) {
+        Ok(m) => Ok(Some(m)),
+        Err(TransformationError::MissingData(msg) | TransformationError::IncludesPrecompileError(msg)) => {
+            tracing::warn!(
+                asset = %Address::from(asset),
+                numeraire = %Address::from(numeraire),
+                block = event.block_number,
+                "Skipping create event (non-contract or missing metadata): {}",
+                msg
+            );
+            ops.push(insert_skipped_address(
+                &SkippedAddressData {
+                    block_number: event.block_number,
+                    tx_hash: &event.transaction_hash,
+                    asset_address: asset,
+                    numeraire_address: numeraire,
+                    reason: &msg,
+                },
+                ctx,
+            ));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }

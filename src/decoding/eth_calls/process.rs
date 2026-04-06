@@ -174,6 +174,7 @@ pub async fn process_once_calls(
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     return_index_info: bool,
+    #[allow(unused_variables)] force_overwrite: bool,
 ) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
     // Get start_block from first config (all configs for a contract share the same start_block)
     let start_block = configs.first().and_then(|c| c.start_block);
@@ -337,7 +338,7 @@ pub async fn process_once_calls(
     let output_path = output_dir.join(&file_name);
 
     // Check if we need to merge with existing decoded data
-    if output_path.exists() {
+    if output_path.exists() && !force_overwrite {
         tracing::info!(
             "Merging new decoded columns into existing file {}",
             output_path.display()

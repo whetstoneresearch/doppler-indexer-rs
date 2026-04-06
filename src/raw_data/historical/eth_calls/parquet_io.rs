@@ -657,6 +657,26 @@ pub(crate) async fn read_parquet_column_names_async(path: PathBuf) -> HashSet<St
         .unwrap_or_default()
 }
 
+pub(crate) async fn read_parquet_row_count_async(path: PathBuf) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        use parquet::file::reader::FileReader;
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        parquet::file::reader::SerializedFileReader::new(file)
+            .map(|r| {
+                let meta = r.metadata();
+                (0..meta.num_row_groups())
+                    .map(|i| meta.row_group(i).num_rows() as u64)
+                    .sum()
+            })
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
+}
+
 pub(crate) async fn read_existing_once_parquet_async(
     path: PathBuf,
 ) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
