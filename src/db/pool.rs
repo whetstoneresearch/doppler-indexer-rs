@@ -1,10 +1,16 @@
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
 
 use super::error::DbError;
 use super::types::{DbOperation, DbValue, WhereClause};
+
+/// Maximum number of retries for deadlock errors (40P01).
+const DEADLOCK_MAX_RETRIES: u32 = 3;
+/// Base delay between deadlock retries (doubled each attempt).
+const DEADLOCK_BASE_DELAY_MS: u64 = 50;
 
 pub struct DbPool {
     pool: Pool,
@@ -54,11 +60,32 @@ impl DbPool {
             return Ok(());
         }
 
+        for attempt in 0..=DEADLOCK_MAX_RETRIES {
+            match self.try_execute_transaction(&operations).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_deadlock(&e) && attempt < DEADLOCK_MAX_RETRIES => {
+                    let delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    tracing::warn!(
+                        "Deadlock detected (attempt {}/{}), retrying in {}ms",
+                        attempt + 1,
+                        DEADLOCK_MAX_RETRIES + 1,
+                        delay_ms,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!()
+    }
+
+    async fn try_execute_transaction(&self, operations: &[DbOperation]) -> Result<(), DbError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
         for op in operations {
-            let (sql, params) = build_operation_sql(op);
+            let (sql, params) = build_operation_sql(op.clone());
 
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -159,6 +186,16 @@ impl DbPool {
         let rows = client.query(&sql, &params_refs[..]).await?;
 
         extract_row_result(&rows)
+    }
+}
+
+/// Check whether a `DbError` is a PostgreSQL deadlock (SQLSTATE 40P01).
+fn is_deadlock(err: &DbError) -> bool {
+    match err {
+        DbError::PostgresError(e) => e
+            .as_db_error()
+            .is_some_and(|db| *db.code() == SqlState::T_R_DEADLOCK_DETECTED),
+        _ => false,
     }
 }
 
