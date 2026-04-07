@@ -1,0 +1,76 @@
+{
+    "Airlock": {
+        "address": "0xde3599a2ec440b296373a983c85c365da55d9dfa",
+        "factories": [
+            {
+                "collection_name": "DERC20",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address",
+                    "data_signature": "address,address,address",
+                    "factory_parameters": "data[0]"
+                },
+                "calls": [
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"},
+                    {"function": "tokenURI()", "output_type": "string", "frequency": "once"},
+                    {"function": "getAssetData(address)",
+                     "output_type": "(address numeraire, address timelock, address governance, address liquidityMigrator, address poolInitializer, address pool, address migrationPool, uint256 numTokensToSell, uint256 totalSupply, address integrator)",
+                    "frequency": "once",
+                    "target": "Airlock",
+                    "params": [{"type": "address", "source": "self"}]}
+                ],
+                "events": [
+                    { "signature": "Transfer(address indexed from, address indexed to, uint256 value)" }
+                ]
+            },
+            {
+                "collection_name": "Numeraires",
+                "factory_events": {
+                    "name": "Create",
+                    "topics_signature": "address",
+                    "data_signature": "address,address,address",
+                    "factory_parameters": "topics[1]"
+                },
+                "calls": [
+                    {"function": "name()", "output_type": "string", "frequency": "once"},
+                    {"function": "symbol()", "output_type": "string", "frequency": "once"},
+                    {"function": "decimals()", "output_type": "uint8", "frequency": "once"}
+                ]
+            },
+            {
+                "collection_name": "MigrationPool",
+                "factory_events": {
+                    "name": "Migrate",
+                    "topics_signature": "address,address",
+                    "factory_parameters": "topics[2]"
+                },
+                "events": [
+                    { "name": "v2Swap", "signature": "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)" },
+                    { "signature": "Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)" }
+                ]
+            }
+        ],
+        "events": [
+            { "signature": "Migrate(address indexed asset, address indexed pool)" }
+        ]
+    },
+    "UniversalRouter": {
+        "address": "0x66a9893cc07d91d95644aedd05d03f95e1dba8af"
+    },
+    "ChainlinkEthOracle": {
+        "address": "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419",
+        "calls": [
+            { "function": "latestAnswer()", "output_type": "int256", "frequency": "15m" }
+        ]
+    },
+    "ChainlinkUsdcOracle": {
+        "address": "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6"
+    },
+    "ChainlinkUsdtOracle": {
+        "address": "0x3E7d1eAB13ad0104d2750B8863b489D65364e32D"
+    },
+    "Multicall3": {
+        "address": "0xcA11bde05977b3631167028862bE2a173976CA11"
+    }
+}

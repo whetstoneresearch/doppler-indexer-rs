@@ -55,7 +55,7 @@ pub fn decode_value(
     let sol_type = evm_type_to_dyn_sol_type(output_type);
 
     let decoded = sol_type
-        .abi_decode(raw)
+        .abi_decode_params(raw)
         .map_err(|e| EthCallDecodingError::Decode(e.to_string()))?;
 
     convert_dyn_sol_value(&decoded, output_type)

@@ -20,19 +20,52 @@ use crate::raw_data::historical::eth_calls::{
     process_once_calls_multicall, process_once_calls_regular, process_range,
     process_range_multicall, read_logs_from_parquet_async, scan_existing_parquet_files_async,
     AbortOnDropHandles, BlockInfo, BlockRange, EthCallCatchupState, EthCallCollectionError,
-    EthCallContext, FrequencyState,
+    EthCallContext, FrequencyState, OnceCallConfig,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
+use crate::storage::contract_index::{
+    build_expected_factory_contracts_for_range, range_key, read_contract_index,
+    update_contract_index, write_contract_index,
+};
 use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::factory_data::{
     load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
 };
 use crate::storage::paths::raw_eth_calls_dir;
-use crate::storage::{DataLoader, S3Manifest, StorageManager};
+use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
-use crate::types::config::contract::AddressOrAddresses;
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::RawDataCollectionConfig;
+
+/// Extracted helper: processes factory-once catchup for a single block range.
+///
+/// Builds a `FactoryAddressData` from the provided `addresses_by_block`, computes
+/// expected factory contracts for the range, and delegates to `process_factory_once_calls`.
+pub(crate) async fn process_factory_once_catchup_range(
+    range: &BlockRange,
+    addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>>,
+    ctx: &EthCallContext<'_>,
+    factory_once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    factory_once_column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
+    contracts: &Contracts,
+) -> Result<(), EthCallCollectionError> {
+    let factory_data = FactoryAddressData {
+        range_start: range.start,
+        range_end: range.end,
+        addresses_by_block,
+    };
+    let expected_once = build_expected_factory_contracts_for_range(contracts, range.end);
+    process_factory_once_calls(
+        range,
+        ctx,
+        &factory_data,
+        factory_once_configs,
+        factory_once_column_indexes,
+        Some(&expected_once),
+    )
+    .await
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_eth_calls(
@@ -122,6 +155,7 @@ pub async fn collect_eth_calls(
             range_regular_done: HashSet::new(),
             range_factory_done: HashSet::new(),
             factory_skipped_triggers: Vec::new(),
+            contracts: chain.contracts.clone(),
         });
     }
 
@@ -513,16 +547,6 @@ pub async fn collect_eth_calls(
                     }
                 }
 
-                if addresses_by_block.is_empty() {
-                    continue;
-                }
-
-                let factory_data = FactoryAddressData {
-                    range_start: range.start,
-                    range_end: range.end,
-                    addresses_by_block,
-                };
-
                 let factory_once_ctx = EthCallContext {
                     client,
                     output_dir: &base_output_dir,
@@ -533,12 +557,14 @@ pub async fn collect_eth_calls(
                     storage_manager: storage_manager.as_ref(),
                     s3_manifest: &s3_manifest,
                 };
-                process_factory_once_calls(
+
+                process_factory_once_catchup_range(
                     &range,
+                    addresses_by_block,
                     &factory_once_ctx,
-                    &factory_data,
                     &factory_once_configs,
                     &factory_once_column_indexes,
+                    &chain.contracts,
                 )
                 .await?;
 
@@ -603,153 +629,288 @@ pub async fn collect_eth_calls(
 
         let log_ranges =
             get_existing_log_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
-        let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let total_log_ranges = log_ranges.len();
-        let mut event_catchup_count = 0;
-        let s3_manifest_arc = s3_manifest.as_ref().map(|m| Arc::new(m.clone()));
+        let event_call_concurrency = raw_data_config.event_call_concurrency.unwrap_or(4);
 
         tracing::info!(
-            "Event-triggered calls catchup: checking {} log ranges for chain {}",
+            "Event-triggered calls catchup: checking {} log ranges for chain {} (concurrency={})",
             log_ranges.len(),
-            chain.name
+            chain.name,
+            event_call_concurrency
         );
 
-        for (idx, log_range) in log_ranges.iter().enumerate() {
-            // Check if output already exists for all event-triggered call configs
-            let mut needs_processing = false;
-            for configs in event_call_configs.values() {
-                for config in configs {
-                    // Range is entirely before this config's start_block — no output needed
-                    if let Some(sb) = config.start_block {
-                        if log_range.end <= sb {
-                            continue;
+        // Wrap shared data in Arcs for concurrent task access
+        let event_matchers = build_event_trigger_matchers(&chain.contracts);
+        let event_call_configs_arc = Arc::new(event_call_configs.clone());
+        let factory_addresses_arc = Arc::new(factory_addresses.clone());
+        let existing_files_arc = Arc::new(existing_files.clone());
+        let contracts_arc = Arc::new(chain.contracts.clone());
+        let base_output_dir_arc = Arc::new(base_output_dir.clone());
+        let s3_manifest_arc = s3_manifest.as_ref().map(|m| Arc::new(m.clone()));
+        let storage_manager_arc = storage_manager.clone();
+        let chain_name_arc: Arc<str> = Arc::from(chain.name.as_str());
+
+        // Process ranges concurrently with Semaphore + JoinSet.
+        // Contract index writes are deferred to after all ranges complete.
+        let mut processed_event_ranges: Vec<(u64, u64)> = Vec::new();
+        {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency));
+            let mut join_set: tokio::task::JoinSet<
+                Result<Option<(u64, u64)>, EthCallCollectionError>,
+            > = tokio::task::JoinSet::new();
+
+            for (idx, log_range) in log_ranges.iter().enumerate() {
+                // Check if output already exists (before acquiring permit)
+                let event_expected_for_range =
+                    build_expected_factory_contracts_for_range(&chain.contracts, log_range.end);
+
+                let mut needs_processing = false;
+                for configs in event_call_configs.values() {
+                    for config in configs {
+                        if let Some(sb) = config.start_block {
+                            if log_range.end <= sb {
+                                continue;
+                            }
+                        }
+                        let expected_for_config = if config.is_factory {
+                            event_expected_for_range.get(&config.contract_name).cloned()
+                        } else {
+                            None
+                        };
+                        if !event_output_exists_async(
+                            base_output_dir.clone(),
+                            config.contract_name.clone(),
+                            config.function_name.clone(),
+                            log_range.start,
+                            log_range.end,
+                            s3_manifest_arc.clone(),
+                            expected_for_config,
+                        )
+                        .await?
+                        {
+                            needs_processing = true;
+                            break;
                         }
                     }
-                    if !event_output_exists_async(
-                        base_output_dir.clone(),
-                        config.contract_name.clone(),
-                        config.function_name.clone(),
-                        log_range.start,
-                        log_range.end,
-                        s3_manifest_arc.clone(),
-                    )
-                    .await?
-                    {
-                        needs_processing = true;
+                    if needs_processing {
                         break;
                     }
                 }
-                if needs_processing {
-                    break;
-                }
-            }
 
-            if !needs_processing {
-                tracing::debug!(
-                    "Skipping event-triggered calls for blocks {}-{} (already exists)",
-                    log_range.start,
-                    log_range.end - 1
-                );
-                continue;
-            }
-
-            // Read logs from parquet file
-            let logs = match read_logs_from_parquet_async(log_range.file_path.clone()).await {
-                Ok(logs) => logs,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to read logs from {}: {}",
-                        log_range.file_path.display(),
-                        e
+                if !needs_processing {
+                    tracing::debug!(
+                        "Skipping event-triggered calls for blocks {}-{} (already exists)",
+                        log_range.start,
+                        log_range.end - 1
                     );
                     continue;
                 }
-            };
 
-            if logs.is_empty() {
-                continue;
-            }
+                // --- Sequential phase: read parquet + extract triggers (one file at a time) ---
+                // This avoids holding N large log files in memory concurrently.
+                let range_start = log_range.start;
+                let inclusive_end = log_range.end - 1;
 
-            tracing::info!(
-                "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
-                log_range.start,
-                log_range.end - 1,
-                logs.len()
-            );
+                let logs = match read_logs_from_parquet_async(log_range.file_path.clone()).await {
+                    Ok(logs) => logs,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read logs from {}: {}",
+                            log_range.file_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-            // Extract event triggers from logs
-            let triggers = extract_event_triggers(&logs, &event_matchers);
+                if logs.is_empty() {
+                    continue;
+                }
 
-            if !triggers.is_empty() {
                 tracing::info!(
-                    "Extracted {} event triggers from {} logs for blocks {}-{}",
-                    triggers.len(),
-                    logs.len(),
-                    log_range.start,
-                    log_range.end - 1
+                    "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
+                    range_start,
+                    inclusive_end,
+                    logs.len()
                 );
+
+                let triggers = extract_event_triggers(&logs, &event_matchers);
+                // Drop logs immediately — only triggers (much smaller) are kept for RPC work
+                drop(logs);
+
+                if !triggers.is_empty() {
+                    tracing::info!(
+                        "Extracted {} event triggers for blocks {}-{}",
+                        triggers.len(),
+                        range_start,
+                        inclusive_end
+                    );
+                }
+
+                // --- Concurrent phase: acquire permit and spawn RPC work ---
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+                // Drain completed tasks to collect results eagerly
+                while let Some(result) = join_set.try_join_next() {
+                    match result {
+                        Ok(Ok(Some((start, end)))) => {
+                            processed_event_ranges.push((start, end));
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(EthCallCollectionError::JoinError(e.to_string()));
+                        }
+                    }
+                }
+
+                let event_call_configs = event_call_configs_arc.clone();
+                let factory_addresses = factory_addresses_arc.clone();
+                let existing_files = existing_files_arc.clone();
+                let contracts = contracts_arc.clone();
+                let base_output_dir = base_output_dir_arc.clone();
+                let s3_manifest = s3_manifest.clone();
+                let storage_manager: Option<Arc<StorageManager>> = storage_manager_arc.clone();
+                let chain_name = chain_name_arc.clone();
+                let client = client.clone();
+                let decoder_tx = decoder_tx.clone();
+
+                join_set.spawn(async move {
+                    // RPC phase — hold permit to limit concurrent RPC work
+                    let (skipped, mut pending_writes) = {
+                        let _permit = permit; // dropped at end of this block
+
+                        let event_ctx = EthCallContext {
+                            client: &client,
+                            output_dir: &base_output_dir,
+                            existing_files: &existing_files,
+                            rpc_batch_size,
+                            decoder_tx: &decoder_tx,
+                            chain_name: &chain_name,
+                            storage_manager: storage_manager.as_ref(),
+                            s3_manifest: &s3_manifest,
+                        };
+                        if let Some(multicall_addr) = multicall3_address {
+                            process_event_triggers_multicall(
+                                triggers,
+                                &event_call_configs,
+                                &factory_addresses,
+                                &event_ctx,
+                                multicall_addr,
+                                range_start,
+                                inclusive_end,
+                                &contracts,
+                                true,
+                            )
+                            .await?
+                        } else {
+                            process_event_triggers(
+                                triggers,
+                                &event_call_configs,
+                                &factory_addresses,
+                                &event_ctx,
+                                range_start,
+                                inclusive_end,
+                                &contracts,
+                                true,
+                            )
+                            .await?
+                        }
+                    }; // permit released — next range's RPC can start immediately
+
+                    if !skipped.is_empty() {
+                        tracing::warn!(
+                            "Unexpected skipped factory triggers during catchup ({} triggers) — factory addresses should be pre-loaded",
+                            skipped.len()
+                        );
+                    }
+
+                    // Write phase — no permit held, runs concurrently with other ranges' RPC
+                    while let Some(result) = pending_writes.join_next().await {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            Err(e) => {
+                                return Err(EthCallCollectionError::JoinError(e.to_string()))
+                            }
+                        }
+                    }
+
+                    tracing::debug!(
+                        "Event-triggered calls catchup: processed range {}/{} (blocks {}-{})",
+                        idx + 1,
+                        total_log_ranges,
+                        range_start,
+                        inclusive_end
+                    );
+
+                    Ok(Some((range_start, inclusive_end)))
+                });
             }
 
-            // Process the triggers (or write empty files if no triggers)
-            let range_start = log_range.start;
-            let range_end = log_range.end - 1;
-            let skipped = if let Some(multicall_addr) = multicall3_address {
-                let event_ctx = EthCallContext {
-                    client,
-                    output_dir: &base_output_dir,
-                    existing_files: &existing_files,
-                    rpc_batch_size,
-                    decoder_tx,
-                    chain_name: &chain.name,
-                    storage_manager: storage_manager.as_ref(),
-                    s3_manifest: &s3_manifest,
-                };
-                process_event_triggers_multicall(
-                    triggers,
-                    &event_call_configs,
-                    &factory_addresses,
-                    &event_ctx,
-                    multicall_addr,
-                    range_start,
-                    range_end,
-                )
-                .await?
-            } else {
-                let event_ctx = EthCallContext {
-                    client,
-                    output_dir: &base_output_dir,
-                    existing_files: &existing_files,
-                    rpc_batch_size,
-                    decoder_tx,
-                    chain_name: &chain.name,
-                    storage_manager: storage_manager.as_ref(),
-                    s3_manifest: &s3_manifest,
-                };
-                process_event_triggers(
-                    triggers,
-                    &event_call_configs,
-                    &factory_addresses,
-                    &event_ctx,
-                    range_start,
-                    range_end,
-                )
-                .await?
-            };
-            if !skipped.is_empty() {
-                tracing::warn!(
-                    "Unexpected skipped factory triggers during catchup ({} triggers) — factory addresses should be pre-loaded",
-                    skipped.len()
-                );
+            // Collect results from all spawned tasks
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(Ok(Some((start, end)))) => {
+                        processed_event_ranges.push((start, end));
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        return Err(EthCallCollectionError::JoinError(e.to_string()));
+                    }
+                }
             }
+        }
+        let event_catchup_count = processed_event_ranges.len();
 
-            event_catchup_count += 1;
-            tracing::debug!(
-                "Event-triggered calls catchup: processed range {}/{} (blocks {}-{})",
-                idx + 1,
-                total_log_ranges,
-                log_range.start,
-                log_range.end - 1
-            );
+        // Batch-write contract indexes for all processed ranges (deferred from concurrent phase)
+        if !processed_event_ranges.is_empty() {
+            let factory_pairs: HashSet<(String, String)> = event_call_configs
+                .values()
+                .flatten()
+                .filter(|c| c.is_factory)
+                .map(|c| (c.contract_name.clone(), c.function_name.clone()))
+                .collect();
+
+            for (contract_name, function_name) in &factory_pairs {
+                let sub_dir = base_output_dir
+                    .join(contract_name)
+                    .join(function_name)
+                    .join("on_events");
+                let mut ci = read_contract_index(&sub_dir);
+                let mut wrote_any = false;
+
+                for &(start, end) in &processed_event_ranges {
+                    let expected =
+                        build_expected_factory_contracts_for_range(&chain.contracts, end + 1);
+                    if let Some(exp) = expected.get(contract_name.as_str()) {
+                        update_contract_index(&mut ci, &range_key(start, end), exp);
+                        wrote_any = true;
+                    }
+                }
+
+                if wrote_any {
+                    if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                        tracing::warn!(
+                            "Failed to batch-write contract index for {}.{}/on_events: {}",
+                            contract_name,
+                            function_name,
+                            e
+                        );
+                    } else if let Some(sm) = storage_manager.as_ref() {
+                        let index_path = sub_dir.join("contract_index.json");
+                        if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                            tracing::warn!(
+                                "Failed to upload contract index sidecar for {}.{}/on_events: {}",
+                                contract_name,
+                                function_name,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         if event_catchup_count > 0 {
@@ -803,5 +964,129 @@ pub async fn collect_eth_calls(
         range_regular_done,
         range_factory_done,
         factory_skipped_triggers: Vec::new(),
+        contracts: chain.contracts.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    use alloy::primitives::{Address, U256};
+    use crate::raw_data::historical::eth_calls::parquet_io::{
+        extract_addresses_from_once_parquet, read_existing_once_parquet,
+        read_parquet_column_names,
+    };
+    use crate::rpc::UnifiedRpcClient;
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+        FactoryEventConfigOrArray, FactoryParameterLocation,
+    };
+
+    #[tokio::test]
+    async fn test_factory_once_catchup_zero_address_range_still_processes() {
+        let tmp = TempDir::new().unwrap();
+        let client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes = HashMap::new();
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "TestFactory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::new([0xaa; 20])),
+                start_block: Some(U256::from(0)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "Created(address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![0]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        let existing_files = HashSet::new();
+        let ctx = EthCallContext {
+            client: &client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            decoder_tx: &None,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &None,
+        };
+
+        let range = BlockRange { start: 0, end: 100 };
+        let addresses_by_block = HashMap::new(); // empty = zero-address range
+
+        let result = process_factory_once_catchup_range(
+            &range,
+            addresses_by_block,
+            &ctx,
+            &once_configs,
+            &column_indexes,
+            &contracts,
+        )
+        .await;
+
+        assert!(result.is_ok(), "processing empty range should succeed");
+
+        // Verify empty parquet was written
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "empty parquet must be written for zero-address range"
+        );
+
+        // Verify column names include our test function
+        let cols = read_parquet_column_names(&parquet_path);
+        assert!(
+            cols.contains("testFn"),
+            "parquet schema must include testFn column"
+        );
+
+        // Verify zero rows
+        let batches = read_existing_once_parquet(&parquet_path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(addrs.is_empty(), "empty range parquet must have 0 rows");
+
+        // Verify column index was written
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must be written"
+        );
+
+        // Verify contract index was written (requires non-empty contracts config)
+        assert!(
+            tmp.path()
+                .join("test_collection/once/contract_index.json")
+                .exists(),
+            "contract_index.json must be written when expected_contracts is non-empty"
+        );
+    }
 }

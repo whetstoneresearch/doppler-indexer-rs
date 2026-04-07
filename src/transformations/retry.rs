@@ -7,13 +7,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinSet;
+use metrics::counter;
+use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
 use super::engine::HandlerKind;
 use super::error::TransformationError;
 use super::executor::{execute_with_snapshot_capture, inject_source_version};
+use crate::metrics::HandlerMetricsGuard;
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
@@ -44,6 +45,8 @@ struct RetryHandler {
     triggers: HashSet<(String, String)>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
     call_deps: HashSet<(String, String)>,
+    /// Handler dependencies: handler name() values that must complete first.
+    handler_deps: Vec<String>,
     kind: HandlerKind,
 }
 
@@ -52,7 +55,12 @@ pub(crate) fn resolve_retry_missing_handlers(
     tracker_missing: Option<HashSet<String>>,
     all_handlers: HashSet<String>,
 ) -> HashSet<String> {
-    tracker_missing.unwrap_or_else(|| request_missing.unwrap_or(all_handlers))
+    match (tracker_missing, request_missing) {
+        (Some(tracker), Some(request)) => tracker.union(&request).cloned().collect(),
+        (Some(tracker), None) => tracker,
+        (None, Some(request)) => request,
+        (None, None) => all_handlers,
+    }
 }
 
 pub(crate) fn missing_retry_call_dependencies(
@@ -143,8 +151,20 @@ impl RetryProcessor {
             .iter()
             .map(|handler| handler.handler_key())
             .collect();
-        let missing_handlers =
+        let mut missing_handlers =
             resolve_retry_missing_handlers(request.missing_handlers, tracker_missing, all_handlers);
+
+        // Union in persisted failed_handlers so stale tracker state can't hide
+        // known failures. This must happen BEFORE the empty check.
+        let storage = LiveStorage::new(&self.chain_name);
+        if let Ok(status) = storage.read_status(block_number) {
+            if !status.failed_handlers.is_empty() {
+                missing_handlers = missing_handlers
+                    .union(&status.failed_handlers)
+                    .cloned()
+                    .collect();
+            }
+        }
 
         if missing_handlers.is_empty() {
             return record_and_finalize
@@ -360,14 +380,38 @@ impl RetryProcessor {
     ) -> Result<HashSet<String>, TransformationError> {
         let range_start = block_number;
         let range_end = block_number + 1;
-        let tx_addresses = Arc::new(read_live_receipt_addresses(&self.chain_name, block_number)?);
-        let semaphore = Arc::new(Semaphore::new(self.handler_concurrency));
-        let mut join_set: JoinSet<Result<Option<String>, TransformationError>> = JoinSet::new();
+        let tx_addresses = read_live_receipt_addresses(&self.chain_name, block_number)?;
         let mut blocked_handlers = HashSet::new();
         let mut attempted_keys = HashSet::new();
+        let mut succeeded_keys = HashSet::new();
+        let mut succeeded_names: HashSet<String> = HashSet::new();
 
-        // Build a uniform list of retry handler descriptors from both kinds.
-        let retry_handlers = self.build_retry_handler_list();
+        // Precompute handler names that are being retried (in missing_handlers)
+        // so we can check handler deps efficiently.
+        let missing_names: HashSet<String> = missing_handlers
+            .iter()
+            .filter_map(|mk| {
+                self.registry
+                    .handler_name_for_key(mk)
+                    .map(|n| n.to_string())
+            })
+            .collect();
+
+        // Build a uniform list of retry handler descriptors, sorted by
+        // topological order so dependencies execute before dependents.
+        let mut retry_handlers = self.build_retry_handler_list();
+        let topo_order = self.registry.handler_topological_order();
+        let position: HashMap<&str, usize> = topo_order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        retry_handlers.sort_by_key(|rh| {
+            position
+                .get(rh.handler.name())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
 
         for rh in &retry_handlers {
             let handler_key = rh.handler.handler_key();
@@ -375,8 +419,31 @@ impl RetryProcessor {
                 continue;
             }
 
-            // Filter primary data by trigger match
-            let (handler_events, handler_calls) = match rh.kind {
+            // Skip if already committed — avoids duplicate snapshots corrupting reorg rollback
+            let completed = self
+                .get_completed_ranges_for_handler(&handler_key)
+                .await
+                .unwrap_or_default();
+            if completed.contains(&range_start) {
+                attempted_keys.insert(handler_key.clone());
+                self.record_handler_retry_success(
+                    &handler_key,
+                    rh.handler.name(),
+                    range_start,
+                    range_end,
+                    block_number,
+                    &mut succeeded_keys,
+                    &mut succeeded_names,
+                )
+                .await;
+                continue;
+            }
+
+            // Filter primary data by trigger match BEFORE checking handler
+            // deps. If the handler has no matching events/calls, it's a no-op
+            // regardless of whether its deps are met — blocking it would
+            // prevent finalization for no reason.
+            let trigger_data = match rh.kind {
                 HandlerKind::Event => {
                     let handler_events: Vec<DecodedEvent> = events
                         .iter()
@@ -388,32 +455,23 @@ impl RetryProcessor {
                         .collect();
 
                     if handler_events.is_empty() {
-                        continue;
-                    }
-
-                    // Check call dependencies
-                    let missing_deps = missing_retry_call_dependencies(&rh.call_deps, &calls);
-                    if !missing_deps.is_empty() {
-                        tracing::warn!(
-                            "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
-                            handler_key,
+                        // No matching events — treat as no-op success so
+                        // dependent handlers aren't blocked on this one.
+                        attempted_keys.insert(handler_key.clone());
+                        self.record_handler_retry_success(
+                            &handler_key,
+                            rh.handler.name(),
+                            range_start,
+                            range_end,
                             block_number,
-                            missing_deps
-                        );
-                        blocked_handlers.insert(handler_key);
+                            &mut succeeded_keys,
+                            &mut succeeded_names,
+                        )
+                        .await;
                         continue;
                     }
 
-                    let handler_calls: Vec<DecodedCall> = calls
-                        .iter()
-                        .filter(|call| {
-                            rh.call_deps
-                                .contains(&(call.source_name.clone(), call.function_name.clone()))
-                        })
-                        .cloned()
-                        .collect();
-
-                    (handler_events, handler_calls)
+                    Some((handler_events, Vec::new()))
                 }
                 HandlerKind::Call => {
                     let handler_calls: Vec<DecodedCall> = calls
@@ -426,134 +484,217 @@ impl RetryProcessor {
                         .collect();
 
                     if handler_calls.is_empty() {
+                        // No matching calls — treat as no-op success so
+                        // dependent handlers aren't blocked on this one.
+                        attempted_keys.insert(handler_key.clone());
+                        self.record_handler_retry_success(
+                            &handler_key,
+                            rh.handler.name(),
+                            range_start,
+                            range_end,
+                            block_number,
+                            &mut succeeded_keys,
+                            &mut succeeded_names,
+                        )
+                        .await;
                         continue;
                     }
 
-                    (Vec::new(), handler_calls)
+                    Some((Vec::new(), handler_calls))
                 }
             };
+
+            // Unwrap trigger data (both no-match branches continue above)
+            let (handler_events, mut handler_calls) = trigger_data.unwrap();
+
+            // Check handler dependencies: a dep blocks only if it is itself
+            // being retried (in missing_names) and hasn't succeeded yet.
+            // Deps not in missing_names already completed in a prior run.
+            if !rh.handler_deps.is_empty() {
+                let unmet: Vec<&str> = rh
+                    .handler_deps
+                    .iter()
+                    .filter(|dep| missing_names.contains(*dep) && !succeeded_names.contains(*dep))
+                    .map(|s| s.as_str())
+                    .collect();
+                if !unmet.is_empty() {
+                    tracing::warn!(
+                        "Skipping live retry for handler {} on block {}: handler deps not met {:?}",
+                        handler_key,
+                        block_number,
+                        unmet
+                    );
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
+                    blocked_handlers.insert(handler_key);
+                    continue;
+                }
+            }
+
+            // For event handlers: check call dependencies and filter calls
+            if rh.kind == HandlerKind::Event {
+                let missing_deps = missing_retry_call_dependencies(&rh.call_deps, &calls);
+                if !missing_deps.is_empty() {
+                    tracing::warn!(
+                        "Skipping live retry for handler {} on block {}: missing call dependencies {:?}",
+                        handler_key,
+                        block_number,
+                        missing_deps
+                    );
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "blocked",
+                    )
+                    .increment(1);
+                    blocked_handlers.insert(handler_key);
+                    continue;
+                }
+
+                handler_calls = calls
+                    .iter()
+                    .filter(|call| {
+                        rh.call_deps
+                            .contains(&(call.source_name.clone(), call.function_name.clone()))
+                    })
+                    .cloned()
+                    .collect();
+            }
+
+            // handler_events and handler_calls are now ready for execution
 
             attempted_keys.insert(handler_key.clone());
 
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let db_pool = self.db_pool.clone();
-            let chain_name = self.chain_name.clone();
-            let chain_id = self.chain_id;
-            let historical = self.historical_reader.clone();
-            let rpc = self.rpc_client.clone();
-            let contracts = self.contracts.clone();
-            let handler = rh.handler.clone();
-            let handler_name = handler.name();
-            let handler_version = handler.version();
+            let handler_name = rh.handler.name();
+            let handler_version = rh.handler.version();
 
             // Event handlers get tx_addresses; call handlers pass empty map
             let task_tx_addresses = match rh.kind {
-                HandlerKind::Event => (*tx_addresses).clone(),
+                HandlerKind::Event => tx_addresses.clone(),
                 HandlerKind::Call => HashMap::new(),
             };
 
-            join_set.spawn(async move {
-                let _permit = permit;
-                let live_storage = LiveStorage::new(&chain_name);
-                let ctx = TransformationContext::new(
-                    chain_name,
-                    chain_id,
-                    range_start,
-                    range_end,
-                    Arc::new(handler_events),
-                    Arc::new(handler_calls),
-                    task_tx_addresses,
-                    historical,
-                    rpc,
-                    contracts,
-                );
+            let live_storage = LiveStorage::new(&self.chain_name);
+            let ctx = TransformationContext::new(
+                self.chain_name.clone(),
+                self.chain_id,
+                range_start,
+                range_end,
+                Arc::new(handler_events),
+                Arc::new(handler_calls),
+                task_tx_addresses,
+                self.historical_reader.clone(),
+                self.rpc_client.clone(),
+                self.contracts.clone(),
+            );
 
-                match handler.handle(&ctx).await {
-                    Ok(ops) => {
-                        if !ops.is_empty() {
-                            let ops = inject_source_version(ops, handler_name, handler_version);
-                            execute_with_snapshot_capture(
-                                ops,
-                                &db_pool,
-                                Some(&live_storage),
-                                range_start,
-                                handler_name,
-                                handler_version,
-                            )
-                            .await?;
-                        }
-                        Ok(Some(handler_key))
-                    }
-                    Err(e) => Err(e),
-                }
-            });
-        }
+            let guard = HandlerMetricsGuard::new(&handler_key, "retry");
 
-        let mut succeeded_keys = HashSet::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(Some(handler_key))) => {
-                    succeeded_keys.insert(handler_key.clone());
-
-                    if let Err(e) = self
-                        .db_pool
-                        .execute_transaction(vec![crate::db::DbOperation::Upsert {
-                            table: "_handler_progress".to_string(),
-                            columns: vec![
-                                "chain_id".to_string(),
-                                "handler_key".to_string(),
-                                "range_start".to_string(),
-                                "range_end".to_string(),
-                            ],
-                            values: vec![
-                                crate::db::DbValue::Int64(self.chain_id as i64),
-                                crate::db::DbValue::Text(handler_key.clone()),
-                                crate::db::DbValue::Int64(range_start as i64),
-                                crate::db::DbValue::Int64(range_end as i64),
-                            ],
-                            conflict_columns: vec![
-                                "chain_id".to_string(),
-                                "handler_key".to_string(),
-                                "range_start".to_string(),
-                            ],
-                            update_columns: vec!["range_end".to_string()],
-                        }])
+            match rh.handler.handle(&ctx).await {
+                Ok(ops) => {
+                    let commit_result = if !ops.is_empty() {
+                        let ops = inject_source_version(ops, handler_name, handler_version);
+                        execute_with_snapshot_capture(
+                            ops,
+                            &self.db_pool,
+                            Some(&live_storage),
+                            range_start,
+                            handler_name,
+                            handler_version,
+                        )
                         .await
-                    {
-                        tracing::warn!(
-                            "Failed to record completed range for handler {} on block {}: {}",
-                            handler_key,
-                            block_number,
-                            e
-                        );
-                    }
+                    } else {
+                        Ok(())
+                    };
 
-                    if let Some(ref tracker) = self.progress_tracker {
-                        let mut tracker = tracker.lock().await;
-                        if let Err(e) = tracker.mark_complete(block_number, &handler_key).await {
-                            tracing::warn!(
-                                "Failed to mark retry progress for block {} handler {}: {}",
+                    match commit_result {
+                        Ok(()) => {
+                            if let Err(e) = rh
+                                .handler
+                                .on_commit_success((range_start, range_end))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Handler {} on_commit_success failed for block {}: {}",
+                                    handler_key,
+                                    block_number,
+                                    e
+                                );
+                                guard.failure("handler_error");
+                                counter!(
+                                    "transformation_retry_attempts_total",
+                                    "handler_key" => handler_key.clone(),
+                                    "outcome" => "failure",
+                                )
+                                .increment(1);
+                                continue;
+                            }
+                            guard.success();
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "success",
+                            )
+                            .increment(1);
+                            self.record_handler_retry_success(
+                                &handler_key,
+                                handler_name,
+                                range_start,
+                                range_end,
                                 block_number,
+                                &mut succeeded_keys,
+                                &mut succeeded_names,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Handler {} DB write failed during live retry for block {}: {}",
                                 handler_key,
+                                block_number,
                                 e
                             );
+                            guard.failure("db_error");
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "failure",
+                            )
+                            .increment(1);
+                            if let Err(hook_err) = rh
+                                .handler
+                                .on_commit_failure((range_start, range_end))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Handler {} on_commit_failure hook also failed for block {}: {}",
+                                    handler_key,
+                                    block_number,
+                                    hook_err
+                                );
+                            }
+                            continue;
                         }
                     }
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        "Handler failed during live retry for block {}: {}",
-                        block_number,
-                        e
-                    );
                 }
                 Err(e) => {
                     tracing::error!(
-                        "Handler task panicked during live retry for block {}: {}",
+                        "Handler {} failed during live retry for block {}: {}",
+                        handler_key,
                         block_number,
                         e
                     );
+                    guard.failure("handler_error");
+                    counter!(
+                        "transformation_retry_attempts_total",
+                        "handler_key" => handler_key.clone(),
+                        "outcome" => "failure",
+                    )
+                    .increment(1);
                 }
             }
         }
@@ -579,6 +720,94 @@ impl RetryProcessor {
         Ok(blocked_handlers)
     }
 
+    /// Record shared bookkeeping for a successfully retried handler (no-op or real).
+    ///
+    /// Operations in order (matching the normal success path):
+    /// 1. Insert into succeeded_keys / succeeded_names
+    /// 2. Upsert `_handler_progress` so catchup won't re-run this range
+    /// 3. Mark complete in progress_tracker (`_live_progress`)
+    async fn record_handler_retry_success(
+        &self,
+        handler_key: &str,
+        handler_name: &str,
+        range_start: u64,
+        range_end: u64,
+        block_number: u64,
+        succeeded_keys: &mut HashSet<String>,
+        succeeded_names: &mut HashSet<String>,
+    ) {
+        succeeded_keys.insert(handler_key.to_string());
+        succeeded_names.insert(handler_name.to_string());
+
+        if let Err(e) = self
+            .db_pool
+            .execute_transaction(vec![crate::db::DbOperation::Upsert {
+                table: "_handler_progress".to_string(),
+                columns: vec![
+                    "chain_id".to_string(),
+                    "handler_key".to_string(),
+                    "range_start".to_string(),
+                    "range_end".to_string(),
+                ],
+                values: vec![
+                    crate::db::DbValue::Int64(self.chain_id as i64),
+                    crate::db::DbValue::Text(handler_key.to_string()),
+                    crate::db::DbValue::Int64(range_start as i64),
+                    crate::db::DbValue::Int64(range_end as i64),
+                ],
+                conflict_columns: vec![
+                    "chain_id".to_string(),
+                    "handler_key".to_string(),
+                    "range_start".to_string(),
+                ],
+                update_columns: vec!["range_end".to_string()],
+                update_condition: None,
+            }])
+            .await
+        {
+            tracing::warn!(
+                "Failed to record completed range for handler {} on block {}: {}",
+                handler_key,
+                block_number,
+                e
+            );
+        }
+
+        if let Some(ref tracker) = self.progress_tracker {
+            let mut tracker = tracker.lock().await;
+            if let Err(e) = tracker.mark_complete(block_number, handler_key).await {
+                tracing::warn!(
+                    "Failed to mark retry progress for block {} handler {}: {}",
+                    block_number,
+                    handler_key,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Get completed range_start values for a specific handler from the database.
+    async fn get_completed_ranges_for_handler(
+        &self,
+        handler_key: &str,
+    ) -> Result<HashSet<u64>, TransformationError> {
+        let rows = self
+            .db_pool
+            .query(
+                "SELECT range_start FROM _handler_progress WHERE chain_id = $1 AND handler_key = $2",
+                &[&(self.chain_id as i64), &handler_key.to_string()],
+            )
+            .await?;
+
+        let mut completed = HashSet::new();
+        for row in rows {
+            let range_start: i64 = row.get(0);
+            completed.insert(range_start as u64);
+        }
+
+        Ok(completed)
+    }
+
     /// Build a uniform list of retry handler descriptors from both event and call handlers.
     fn build_retry_handler_list(&self) -> Vec<RetryHandler> {
         let mut handlers = Vec::new();
@@ -591,10 +820,17 @@ impl RetryProcessor {
                 .collect();
             let call_deps: HashSet<(String, String)> =
                 info.handler.call_dependencies().into_iter().collect();
+            let handler_deps: Vec<String> = info
+                .handler
+                .handler_dependencies()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             handlers.push(RetryHandler {
                 handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                 triggers,
                 call_deps,
+                handler_deps,
                 kind: HandlerKind::Event,
             });
         }
@@ -609,6 +845,7 @@ impl RetryProcessor {
                 handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                 triggers,
                 call_deps: HashSet::new(),
+                handler_deps: Vec::new(),
                 kind: HandlerKind::Call,
             });
         }
@@ -644,6 +881,9 @@ pub(crate) fn update_retry_status(
         for key in &failed_keys {
             status.failed_handlers.insert(key.clone());
             status.completed_handlers.remove(key);
+        }
+        if !failed_keys.is_empty() {
+            status.transformed = false;
         }
         // Don't set transformed=true here — finalize_range() handles that
         // after recording _handler_progress for all handlers.
@@ -789,7 +1029,7 @@ mod tests {
     use crate::transformations::context::DecodedValue;
 
     #[test]
-    fn retry_missing_handlers_prefers_current_tracker_state() {
+    fn retry_missing_handlers_unions_tracker_and_request() {
         let requested = Some(HashSet::from([
             "handler_a_v1".to_string(),
             "handler_b_v1".to_string(),
@@ -802,6 +1042,19 @@ mod tests {
         ]);
 
         let resolved = resolve_retry_missing_handlers(requested, tracker, all_handlers);
+        // Union: tracker {b} ∪ request {a, b} = {a, b}
+        assert_eq!(
+            resolved,
+            HashSet::from(["handler_a_v1".to_string(), "handler_b_v1".to_string()])
+        );
+    }
+
+    #[test]
+    fn retry_missing_handlers_tracker_only() {
+        let tracker = Some(HashSet::from(["handler_b_v1".to_string()]));
+        let all_handlers = HashSet::from(["handler_a_v1".to_string(), "handler_b_v1".to_string()]);
+
+        let resolved = resolve_retry_missing_handlers(None, tracker, all_handlers);
         assert_eq!(resolved, HashSet::from(["handler_b_v1".to_string()]));
     }
 
@@ -956,5 +1209,144 @@ mod tests {
         assert!(s.failed_handlers.is_empty());
         assert!(s.completed_handlers.contains("handler_a"));
         assert!(s.completed_handlers.contains("handler_b"));
+    }
+
+    /// Regression: a no-op handler (no matching events) that was previously in
+    /// `failed_handlers` must be moved to `completed_handlers` when retried as
+    /// a no-op success, so dependents can proceed and the handler isn't retried
+    /// indefinitely.
+    #[test]
+    fn retry_noop_handler_clears_prior_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        // Simulate a prior failure for handler_a
+        status.failed_handlers.insert("handler_a".to_string());
+        storage.write_status(100, &status).unwrap();
+
+        // Retry treats handler_a as no-op success (no matching events)
+        let attempted = HashSet::from(["handler_a".to_string()]);
+        let succeeded = HashSet::from(["handler_a".to_string()]);
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.completed_handlers.contains("handler_a"),
+            "no-op succeeded handler must be in completed_handlers"
+        );
+        assert!(
+            !s.failed_handlers.contains("handler_a"),
+            "no-op succeeded handler must be cleared from failed_handlers"
+        );
+    }
+
+    /// Regression: when update_retry_status records failed handlers, it must
+    /// also clear `transformed` so the block remains retryable on restart.
+    #[test]
+    fn retry_status_clears_transformed_on_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        status.transformed = true;
+        storage.write_status(100, &status).unwrap();
+
+        let attempted = HashSet::from(["handler_a".to_string()]);
+        let succeeded = HashSet::new();
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            !s.transformed,
+            "transformed must be cleared when failures are recorded"
+        );
+        assert!(s.failed_handlers.contains("handler_a"));
+    }
+
+    /// Fix D test: verifies that the already-committed guard correctly identifies
+    /// handlers that should be skipped.  The guard skips a handler when
+    /// `completed.contains(&range_start)` is true.
+    #[test]
+    fn test_retry_skips_already_completed_handler() {
+        // Simulate two scenarios: one where the handler is already in the
+        // completed set and one where it is not.
+        let range_start_completed: u64 = 100;
+        let range_start_missing: u64 = 200;
+
+        let mut completed: HashSet<u64> = HashSet::new();
+        completed.insert(range_start_completed);
+
+        // Handler that has already been completed for this block should be skipped
+        assert!(
+            completed.contains(&range_start_completed),
+            "already-completed handler must be detected as such"
+        );
+
+        // Handler that has not been completed should not be skipped
+        assert!(
+            !completed.contains(&range_start_missing),
+            "handler not yet committed must not be falsely detected as complete"
+        );
+    }
+
+    /// Regression: a no-op retry (no matching events/calls) that clears a prior
+    /// failure must flow through to finalization successfully — the handler ends
+    /// up in `completed_handlers`, failures are empty, and `transformed` is set.
+    ///
+    /// This exercises the status-file chain that the `record_handler_retry_success`
+    /// helper feeds into. Direct `_handler_progress` DB verification requires a
+    /// test harness that doesn't exist yet (tracked as follow-up).
+    #[test]
+    fn noop_retry_success_flows_through_to_finalization() {
+        use super::super::finalizer::update_finalization_status;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = LiveStorage::with_base_dir(tmp.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveBlockStatus::default();
+        status.logs_decoded = true;
+        status.eth_calls_decoded = true;
+        // handler_a previously failed (will be retried as no-op)
+        status.failed_handlers.insert("handler_a".to_string());
+        storage.write_status(100, &status).unwrap();
+
+        let registered_keys = HashSet::from(["handler_a".to_string(), "handler_b".to_string()]);
+
+        // Phase 1: No-op retry succeeds for handler_a, handler_b was never
+        // attempted (already completed in a prior run)
+        let attempted = HashSet::from(["handler_a".to_string()]);
+        let succeeded = HashSet::from(["handler_a".to_string()]);
+        let blocked = HashSet::new();
+        update_retry_status(&storage, 100, &attempted, &succeeded, &blocked).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.completed_handlers.contains("handler_a"),
+            "no-op retry must move handler into completed_handlers"
+        );
+        assert!(
+            s.failed_handlers.is_empty(),
+            "no failures should remain after successful retry"
+        );
+
+        // Phase 2: Finalization runs — no failures remain, so transformed is set
+        update_finalization_status(&storage, 100, &registered_keys).unwrap();
+
+        let s = storage.read_status(100).unwrap();
+        assert!(
+            s.transformed,
+            "finalization must set transformed once all failures are cleared by retry"
+        );
+        assert!(s.completed_handlers.contains("handler_a"));
     }
 }

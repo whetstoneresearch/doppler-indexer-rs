@@ -32,8 +32,7 @@ pub fn read_once_calls_from_parquet(
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
         let address_idx = schema
-            .index_of("address")
-            .or_else(|_| schema.index_of("address"))
+            .index_of("contract_address")
             .ok();
 
         // Find function result columns
@@ -182,7 +181,7 @@ fn find_columns_with_fillable_nulls(decoded_path: &Path, raw_path: &Path) -> Has
     let decoded_batch = &decoded_batches[0];
     let decoded_schema = decoded_batch.schema();
 
-    let skip_columns: HashSet<&str> = ["block_number", "block_timestamp", "address"]
+    let skip_columns: HashSet<&str> = ["block_number", "block_timestamp", "contract_address"]
         .into_iter()
         .collect();
 
@@ -231,7 +230,7 @@ fn find_columns_with_fillable_nulls(decoded_path: &Path, raw_path: &Path) -> Has
     let raw_schema = raw_batch.schema();
 
     // Build address -> row index lookup from decoded parquet
-    let decoded_addr_idx = match decoded_schema.index_of("address") {
+    let decoded_addr_idx = match decoded_schema.index_of("contract_address") {
         Ok(idx) => idx,
         Err(_) => return fillable,
     };
@@ -245,7 +244,7 @@ fn find_columns_with_fillable_nulls(decoded_path: &Path, raw_path: &Path) -> Has
     };
 
     // Build address -> row index lookup from raw parquet
-    let raw_addr_idx = match raw_schema.index_of("address") {
+    let raw_addr_idx = match raw_schema.index_of("contract_address") {
         Ok(idx) => idx,
         Err(_) => return fillable,
     };
@@ -394,7 +393,7 @@ pub fn load_or_build_decoded_column_index(
 /// - `name` (simple type) -> returns `name`
 /// - `getAssetData.numeraire` (tuple field) -> returns `getAssetData`
 ///
-/// Excludes standard columns like block_number, block_timestamp, address.
+/// Excludes standard columns like block_number, block_timestamp, contract_address.
 pub fn read_decoded_parquet_function_names(path: &Path) -> HashSet<String> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -410,7 +409,7 @@ pub fn read_decoded_parquet_function_names(path: &Path) -> HashSet<String> {
     let mut fn_names = HashSet::new();
 
     // Standard columns to skip
-    let skip_columns: HashSet<&str> = ["block_number", "block_timestamp", "address", "address"]
+    let skip_columns: HashSet<&str> = ["block_number", "block_timestamp", "contract_address"]
         .into_iter()
         .collect();
 

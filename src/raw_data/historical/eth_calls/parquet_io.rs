@@ -10,8 +10,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 use super::types::{CallResult, EthCallCollectionError, OnceCallResult};
 use crate::storage::paths::scan_nested_parquet_files_2;
@@ -30,7 +28,7 @@ pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
         Field::new("value", DataType::Binary, false),
     ];
 
@@ -79,16 +77,7 @@ pub(crate) fn write_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -96,7 +85,7 @@ pub(crate) fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     for fn_name in function_names {
@@ -282,7 +271,7 @@ pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]
 
     let mut null_entries: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
     for batch in &batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -346,7 +335,7 @@ pub(crate) fn extract_addresses_from_once_parquet(
     let mut addresses = HashMap::new();
 
     for batch in batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -389,7 +378,7 @@ pub(crate) fn extract_existing_results_from_parquet(
     let mut results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = HashMap::new();
 
     for batch in batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -454,12 +443,12 @@ pub(crate) fn merge_once_columns(
 
     let num_rows = existing.num_rows();
     let address_col = existing
-        .column_by_name("address")
-        .expect("existing once parquet must have address column");
+        .column_by_name("contract_address")
+        .expect("existing once parquet must have contract_address column");
     let address_arr = address_col
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .expect("address column must be FixedSizeBinary(20)");
+        .expect("contract_address column must be FixedSizeBinary(20)");
 
     tracing::debug!(
         "Existing data has {} rows, {} columns",
@@ -609,16 +598,7 @@ pub(crate) fn write_once_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 
@@ -630,13 +610,7 @@ pub(crate) fn write_record_batch_to_parquet(
     batch: &RecordBatch,
     output_path: &Path,
 ) -> Result<(), EthCallCollectionError> {
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
-    writer.write(batch)?;
-    writer.close()?;
+    crate::storage::atomic_write_parquet(batch, output_path)?;
     Ok(())
 }
 
@@ -681,6 +655,26 @@ pub(crate) async fn read_parquet_column_names_async(path: PathBuf) -> HashSet<St
     tokio::task::spawn_blocking(move || read_parquet_column_names(&path))
         .await
         .unwrap_or_default()
+}
+
+pub(crate) async fn read_parquet_row_count_async(path: PathBuf) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        use parquet::file::reader::FileReader;
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        parquet::file::reader::SerializedFileReader::new(file)
+            .map(|r| {
+                let meta = r.metadata();
+                (0..meta.num_row_groups())
+                    .map(|i| meta.row_group(i).num_rows() as u64)
+                    .sum()
+            })
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 pub(crate) async fn read_existing_once_parquet_async(

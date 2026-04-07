@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, Int8Array,
-    ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array,
+    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int16Array, Int32Array, Int64Array,
+    Int8Array, ListArray, StringArray, StructArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -430,7 +431,7 @@ fn batch_to_calls(
     // Extract standard columns
     let block_numbers = get_u64_column(&batch, "block_number")?;
     let block_timestamps = get_u64_column(&batch, "block_timestamp")?;
-    let addresses = get_address_column(&batch, "address")?;
+    let addresses = get_address_column(&batch, "contract_address")?;
 
     // Extract log_index if present (event-triggered calls have this column)
     let log_indices = batch
@@ -439,7 +440,7 @@ fn batch_to_calls(
         .transpose()?;
 
     // Get result columns (exclude standard + log_index)
-    let standard_cols = ["block_number", "block_timestamp", "address", "log_index"];
+    let standard_cols = ["block_number", "block_timestamp", "contract_address", "log_index"];
     let schema = batch.schema();
     let result_columns: Vec<_> = schema
         .fields()
@@ -578,6 +579,12 @@ fn extract_value_from_batch(
     if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
         return Ok(Some(DecodedValue::Int32(arr.value(row))));
     }
+    if let Some(arr) = col.as_any().downcast_ref::<UInt16Array>() {
+        return Ok(Some(DecodedValue::Uint32(arr.value(row) as u32)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<Int16Array>() {
+        return Ok(Some(DecodedValue::Int32(arr.value(row) as i32)));
+    }
     if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
         return Ok(Some(DecodedValue::Int8(arr.value(row))));
     }
@@ -686,6 +693,12 @@ fn extract_value_from_array(
     }
     if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
         return Ok(DecodedValue::Int32(arr.value(row)));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<UInt16Array>() {
+        return Ok(DecodedValue::Uint32(arr.value(row) as u32));
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<Int16Array>() {
+        return Ok(DecodedValue::Int32(arr.value(row) as i32));
     }
     if let Some(arr) = col.as_any().downcast_ref::<Int8Array>() {
         return Ok(DecodedValue::Int8(arr.value(row)));

@@ -5,7 +5,9 @@
             "0xBDF938149ac6a781F94FAa0ed45E6A0e984c6544"
         ],
         "events": [
-            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
+            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },
+            { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
         ],
         "calls": [
             {
@@ -33,6 +35,18 @@
                 "params": [
                     { "type": "address", "from_event": "topics[2]"}
                 ]
+            },
+            {
+                "function": "getSlot0(bytes32)",
+                "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+                "frequency": {
+                    "on_events": {
+                        "source": "DopplerHookInitializer",
+                        "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
+                    }
+                },
+                "target": "UniswapV4StateView",
+                "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
             }
         ]
     },
@@ -53,6 +67,12 @@
             "0xc3c9f4cfd1dc0a7837cc4b202b3455b4156a8005",
             "0x82d5e22911fbbcb8d3e45812d74ee6203c5824e0",
             "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
+        ]
+    },
+    "RehypeDopplerHookInitializer": {
+        "address": [
+            "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d",
+            "0x6ab5ae3191c914de8437431091776fc90f314be4"
         ]
     }
 }

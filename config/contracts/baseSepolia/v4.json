@@ -1,0 +1,87 @@
+{
+    "UniswapV4PoolManager": {
+        "address": "0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408",
+        "events": [
+            { "signature": "Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)" },
+            { "signature": "Donate(bytes32 indexed id, address indexed sender, uint256 amount0, uint256 amount1)"},
+            { "signature": "Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)"}
+        ]
+    },
+    "UniswapV4StateView": {
+        "address": "0x571291b572ed32ce6751a2cb2486ebee8defb9b4"
+    },
+    "UniswapV4Initializer": {
+        "address": [
+            "0xca2079706a4c2a4a1aa637dfb47d7f27fe58653f",
+            "0x832e4763deecb9941a768f2bbd18583219f018cc",
+            "0x8e891d249f1ecbffa6143c03eb1b12843aef09d3",
+            "0x870386944938130457606451820a351420888434",
+            "0x53b4c21a6Cb61D64F636ABBfa6E8E90E6558e8ad"
+        ],
+        "factories": [
+            {
+                "collection_name": "DopplerV4Hook",
+                "factory_events": [
+                    {
+                        "name": "Create",
+                        "topics_signature": "address,address,address",
+                        "factory_parameters": "topics[1]"
+                    }
+                ],
+                "calls": [
+                    { "function": "poolKey()", "output_type": "(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)", "frequency": "once" },
+                    { "function": "numTokensToSell()", "output_type": "uint256", "frequency": "once" },
+                    { "function": "minimumProceeds()", "output_type": "uint256", "frequency": "once" },
+                    { "function": "maximumProceeds()", "output_type": "uint256", "frequency": "once" },
+                    { "function": "startingTime()", "output_type": "uint256", "frequency": "once" },
+                    { "function": "endingTime()", "output_type": "uint256", "frequency": "once" },
+                    { "function": "startingTick()", "output_type": "int24", "frequency": "once" },
+                    { "function": "endingTick()", "output_type": "int24", "frequency": "once" },
+                    { "function": "epochLength()", "output_type": "uint256", "frequency": "once" },
+                    { "function": "gamma()", "output_type": "int24", "frequency": "once" },
+                    { "function": "isToken0()", "output_type": "bool", "frequency": "once" },
+                    { "function": "numPDSlugs()", "output_type": "uint256", "frequency": "once" }
+                ],
+                "events": [
+                    { "signature": "Swap(int24 currentTick, uint256 totalProceeds, uint256 totalTokensSold)" }
+                ]
+            }
+        ],
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
+        ]
+    },
+    "UniswapV4Migrator": {
+        "address": [
+            "0xf326d8cdb65a4ad334cfbdd7d3a3cb27be8b770d",
+            "0xeee0eccb54398ce371caacbcef076d3ed597ddb3"
+        ],
+        "factories": [
+            {
+                "collection_name": "DopplerV4Pool",
+                "factory_events": [
+                    {
+                        "name": "Migrate",
+                        "topics_signature": "bytes32",
+                        "factory_parameters": "topics[1]"
+                    }
+                ]
+            }
+        ],
+        "events": [
+            { "signature": "Migrate(bytes32 indexed poolId, uint160 sqrtPriceX96, int24 lowerTick, int24 upperTick, uint256 liquidity, uint256 reserves0, uint256 reserves1)"}
+        ]
+    },
+    "UniswapV4MigratorHook": {
+        "address": [
+            "0x9d0c38a80647e53d5a8a319b39de2b66b8586500",
+            "0x127caaad598ffa97577940b0a5c3b6150019e500"
+        ],
+        "events": [
+            { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
+        ]
+    },
+    "DopplerLens": {
+        "address": "0x4a8d81db741248a36d9eb3bc6ef648bf798b47a7"
+    }
+}

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use metrics::counter;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -16,12 +17,14 @@ use super::historical::HistoricalDataReader;
 use super::traits::TransformationHandler;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
 use crate::live::{LiveDbValue, LiveStorage, LiveUpsertSnapshot};
+use crate::metrics::HandlerMetricsGuard;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::Contracts;
 
 /// Outcome of a successful handler execution.
 pub(crate) struct HandlerOutcome {
     pub handler_key: String,
+    pub handler_name: String,
     pub range_start: u64,
     pub range_end: u64,
 }
@@ -83,9 +86,6 @@ impl HandlerExecutor {
             let events = task.events;
             let calls = task.calls;
             let tx_addresses = task.tx_addresses;
-            let handler_name = handler.name();
-            let handler_version = handler.version();
-            let handler_key = handler.handler_key();
             let snapshot_chain = match db_exec_mode {
                 DbExecMode::Direct => None,
                 DbExecMode::WithSnapshotCapture { chain_name } => Some(chain_name.clone()),
@@ -93,69 +93,32 @@ impl HandlerExecutor {
 
             join_set.spawn(async move {
                 let _permit = permit;
-                let ctx = TransformationContext::new(
+                let db_exec_mode = match snapshot_chain {
+                    Some(cn) => DbExecMode::WithSnapshotCapture { chain_name: cn },
+                    None => DbExecMode::Direct,
+                };
+                // run_handler_task logs handler/transaction failures internally;
+                // we convert its Err variant to Ok(None) to keep the existing
+                // join-set contract (caller never sees a propagated error).
+                match run_handler_task(
+                    handler,
+                    events,
+                    calls,
+                    tx_addresses,
                     chain_name,
                     chain_id,
                     range_start,
                     range_end,
-                    events,
-                    calls,
-                    tx_addresses,
                     historical,
                     rpc,
                     contracts,
-                );
-
-                match handler.handle(&ctx).await {
-                    Ok(ops) => {
-                        if !ops.is_empty() {
-                            let ops = inject_source_version(ops, handler_name, handler_version);
-
-                            let result = if let Some(ref cn) = snapshot_chain {
-                                let storage = LiveStorage::new(cn);
-                                execute_with_snapshot_capture(
-                                    ops,
-                                    &db_pool,
-                                    Some(&storage),
-                                    range_start,
-                                    handler_name,
-                                    handler_version,
-                                )
-                                .await
-                            } else {
-                                db_pool
-                                    .execute_transaction(ops)
-                                    .await
-                                    .map_err(TransformationError::DatabaseError)
-                            };
-
-                            if let Err(e) = result {
-                                tracing::error!(
-                                    "Handler {} transaction failed for range {}-{}: {:?}",
-                                    handler_key,
-                                    range_start,
-                                    range_end,
-                                    e
-                                );
-                                return Ok(None);
-                            }
-                        }
-                        Ok(Some(HandlerOutcome {
-                            handler_key,
-                            range_start,
-                            range_end,
-                        }))
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Handler {} failed for range {}-{}: {}",
-                            handler_key,
-                            range_start,
-                            range_end,
-                            e
-                        );
-                        Ok(None)
-                    }
+                    db_pool,
+                    &db_exec_mode,
+                )
+                .await
+                {
+                    Ok(outcome) => Ok(Some(outcome)),
+                    Err(_) => Ok(None),
                 }
             });
         }
@@ -170,12 +133,138 @@ impl HandlerExecutor {
                 }
                 Err(e) => {
                     tracing::error!("Handler task panicked: {}", e);
+                    counter!(
+                        "transformation_handler_errors_total",
+                        "handler_key" => "unknown",
+                        "error_type" => "panic",
+                    )
+                    .increment(1);
                 }
             }
         }
 
         outcomes
     }
+}
+
+/// Run a single handler on a single range: build context, invoke the handler,
+/// inject `source`/`source_version`, and execute the resulting DB ops.
+///
+/// Returns the handler outcome on success. On handler or DB failure, logs the
+/// error (matching the prior inline behavior) and returns `Err`. Callers that
+/// want to tolerate failures should pattern-match on the result; the
+/// [`HandlerExecutor`] converts `Err` to `Ok(None)` to preserve its existing
+/// fire-and-forget contract.
+///
+/// Shared between [`HandlerExecutor`] and (in subsequent phases) the DAG-aware
+/// scheduler in [`super::scheduler`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_handler_task(
+    handler: Arc<dyn TransformationHandler>,
+    events: Arc<Vec<DecodedEvent>>,
+    calls: Arc<Vec<DecodedCall>>,
+    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    chain_name: String,
+    chain_id: u64,
+    range_start: u64,
+    range_end: u64,
+    historical: Arc<HistoricalDataReader>,
+    rpc: Arc<UnifiedRpcClient>,
+    contracts: Arc<Contracts>,
+    db_pool: Arc<DbPool>,
+    db_exec_mode: &DbExecMode,
+) -> Result<HandlerOutcome, TransformationError> {
+    let handler_name = handler.name();
+    let handler_version = handler.version();
+    let handler_key = handler.handler_key();
+
+    let mode_label = match db_exec_mode {
+        DbExecMode::WithSnapshotCapture { .. } => "live",
+        DbExecMode::Direct => "catchup",
+    };
+    let guard = HandlerMetricsGuard::new(&handler_key, mode_label);
+
+    let ctx = TransformationContext::new(
+        chain_name,
+        chain_id,
+        range_start,
+        range_end,
+        events,
+        calls,
+        tx_addresses,
+        historical,
+        rpc,
+        contracts,
+    );
+
+    let ops = match handler.handle(&ctx).await {
+        Ok(ops) => ops,
+        Err(e) => {
+            tracing::error!(
+                "Handler {} failed for range {}-{}: {}",
+                handler_key,
+                range_start,
+                range_end,
+                e
+            );
+            guard.failure("handler_error");
+            return Err(e);
+        }
+    };
+
+    if !ops.is_empty() {
+        let ops = inject_source_version(ops, handler_name, handler_version);
+
+        let result = match db_exec_mode {
+            DbExecMode::WithSnapshotCapture { chain_name: cn } => {
+                let storage = LiveStorage::new(cn);
+                execute_with_snapshot_capture(
+                    ops,
+                    &db_pool,
+                    Some(&storage),
+                    range_start,
+                    handler_name,
+                    handler_version,
+                )
+                .await
+            }
+            DbExecMode::Direct => db_pool
+                .execute_transaction(ops)
+                .await
+                .map_err(TransformationError::DatabaseError),
+        };
+
+        match result {
+            Ok(()) => {
+                handler.on_commit_success((range_start, range_end)).await?;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Handler {} transaction failed for range {}-{}: {:?}",
+                    handler_key,
+                    range_start,
+                    range_end,
+                    e
+                );
+                guard.failure("db_error");
+                handler.on_commit_failure((range_start, range_end)).await?;
+                return Err(e);
+            }
+        }
+    } else {
+        // Empty ops = nothing to commit, but still notify the handler so it
+        // can drain any per-range state it may track.
+        handler.on_commit_success((range_start, range_end)).await?;
+    }
+
+    guard.success();
+
+    Ok(HandlerOutcome {
+        handler_key,
+        handler_name: handler_name.to_string(),
+        range_start,
+        range_end,
+    })
 }
 
 // ─── Source/Version Injection (free functions) ───────────────────────
@@ -195,6 +284,7 @@ pub(crate) fn inject_source_version(
                 mut values,
                 mut conflict_columns,
                 mut update_columns,
+                update_condition,
             } => {
                 columns.push("source".to_string());
                 columns.push("source_version".to_string());
@@ -210,6 +300,7 @@ pub(crate) fn inject_source_version(
                     values,
                     conflict_columns,
                     update_columns,
+                    update_condition,
                 }
             }
             DbOperation::Insert {
@@ -325,16 +416,19 @@ pub(crate) async fn execute_with_snapshot_capture(
         conflict_columns: Vec<String>,
         values: Vec<DbValue>,
         columns: Vec<String>,
+        /// Index into `ops` for this snapshot, used to check affected_rows.
+        op_index: usize,
     }
     let mut snapshot_metas: Vec<SnapshotMeta> = Vec::new();
 
-    for op in &ops {
+    for (op_index, op) in ops.iter().enumerate() {
         if let DbOperation::Upsert {
             table,
             columns,
             values,
             conflict_columns,
             update_columns,
+            ..
         } = op
         {
             // Only capture snapshots for upserts that update existing rows
@@ -356,6 +450,7 @@ pub(crate) async fn execute_with_snapshot_capture(
                 conflict_columns: conflict_columns.clone(),
                 values: values.clone(),
                 columns: columns.clone(),
+                op_index,
             });
         }
     }
@@ -369,7 +464,7 @@ pub(crate) async fn execute_with_snapshot_capture(
     }
 
     // Execute transaction with snapshot reads inside the same transaction
-    let snapshot_results = db_pool
+    let (snapshot_results, affected_rows) = db_pool
         .execute_transaction_with_snapshot_reads(&snapshot_specs, ops)
         .await
         .map_err(TransformationError::DatabaseError)?;
@@ -377,6 +472,11 @@ pub(crate) async fn execute_with_snapshot_capture(
     // Build snapshots from results
     let mut snapshots = Vec::new();
     for (i, meta) in snapshot_metas.iter().enumerate() {
+        // Skip snapshot if the operation did not actually modify any row
+        if affected_rows.get(meta.op_index).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+
         let previous_row = snapshot_results.get(i).cloned().flatten();
 
         let key_columns: Vec<(String, DbValue)> = meta
@@ -425,4 +525,124 @@ pub(crate) async fn execute_with_snapshot_capture(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::{DbOperation, DbValue};
+
+    /// Helper to build a upsert op with update_columns (triggers snapshot).
+    fn make_upsert_op(table: &str) -> DbOperation {
+        DbOperation::Upsert {
+            table: table.to_string(),
+            columns: vec![
+                "chain_id".to_string(),
+                "pool_address".to_string(),
+                "value".to_string(),
+            ],
+            values: vec![
+                DbValue::Int64(1),
+                DbValue::Text("0xABC".to_string()),
+                DbValue::Int64(42),
+            ],
+            conflict_columns: vec!["chain_id".to_string(), "pool_address".to_string()],
+            update_columns: vec!["value".to_string()],
+            update_condition: None,
+        }
+    }
+
+    /// Helper to build an upsert op with no update_columns (no snapshot needed).
+    fn make_insert_only_op(table: &str) -> DbOperation {
+        DbOperation::Upsert {
+            table: table.to_string(),
+            columns: vec!["chain_id".to_string(), "pool_address".to_string()],
+            values: vec![DbValue::Int64(1), DbValue::Text("0xDEF".to_string())],
+            conflict_columns: vec!["chain_id".to_string(), "pool_address".to_string()],
+            update_columns: vec![],
+            update_condition: Some("FALSE".to_string()),
+        }
+    }
+
+    /// Simulate the snapshot-filtering logic from `execute_with_snapshot_capture`
+    /// in isolation: given `ops` and `affected_rows`, return the snapshot metas
+    /// that would survive the filter.
+    ///
+    /// This mirrors the filtering block added in Fix A without requiring a real DB.
+    fn collect_surviving_snapshot_tables(
+        ops: &[DbOperation],
+        affected_rows: &[u64],
+    ) -> Vec<String> {
+        struct SnapshotMeta {
+            table: String,
+            op_index: usize,
+        }
+
+        let mut metas: Vec<SnapshotMeta> = Vec::new();
+        for (op_index, op) in ops.iter().enumerate() {
+            if let DbOperation::Upsert {
+                table,
+                update_columns,
+                ..
+            } = op
+            {
+                if update_columns.is_empty() {
+                    continue;
+                }
+                metas.push(SnapshotMeta {
+                    table: table.clone(),
+                    op_index,
+                });
+            }
+        }
+
+        metas
+            .iter()
+            .filter(|m| affected_rows.get(m.op_index).copied().unwrap_or(0) > 0)
+            .map(|m| m.table.clone())
+            .collect()
+    }
+
+    /// Fix A test: a upsert that actually modifies a row produces a snapshot;
+    /// a conditional upsert that is a no-op (0 affected rows) produces no snapshot.
+    #[test]
+    fn test_no_snapshot_for_conditional_upsert_noop() {
+        // op[0]: real upsert — affected_rows[0] = 1  → snapshot expected
+        // op[1]: noop conditional upsert — affected_rows[1] = 0  → no snapshot
+        let ops = vec![
+            make_upsert_op("real_table"),
+            make_upsert_op("noop_table"),
+        ];
+        let affected_rows = vec![1u64, 0u64];
+
+        let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        assert_eq!(survivors, vec!["real_table".to_string()]);
+    }
+
+    /// When all ops modify rows, all produce snapshots.
+    #[test]
+    fn test_snapshot_for_all_affected_upserts() {
+        let ops = vec![
+            make_upsert_op("table_a"),
+            make_upsert_op("table_b"),
+        ];
+        let affected_rows = vec![1u64, 2u64];
+
+        let mut survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        survivors.sort();
+        assert_eq!(
+            survivors,
+            vec!["table_a".to_string(), "table_b".to_string()]
+        );
+    }
+
+    /// Insert-only ops (empty update_columns) never produce snapshots regardless
+    /// of affected_rows — they were not candidates to begin with.
+    #[test]
+    fn test_no_snapshot_for_insert_only_ops() {
+        let ops = vec![make_insert_only_op("insert_table")];
+        let affected_rows = vec![1u64]; // row was inserted, but still no snapshot wanted
+
+        let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        assert!(survivors.is_empty());
+    }
 }

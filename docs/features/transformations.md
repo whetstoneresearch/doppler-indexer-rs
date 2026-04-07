@@ -27,6 +27,106 @@ Decoded Events/Calls ──► TransformationEngine ──► Handlers ──►
 
 The transformation engine receives decoded data via channels from the decoders, invokes registered handlers, collects database operations, injects `source`/`source_version` columns automatically, and executes them transactionally.
 
+### DAG Scheduler
+
+The DAG-based execution scheduler lives in `src/transformations/scheduler/` (dag.rs, tracker.rs, loader.rs) and orchestrates handler execution respecting dependency ordering and concurrency limits.
+
+**DagScheduler** takes a `CompletionTracker` and a concurrency limit, then executes work items in dependency order:
+
+```
+DagScheduler::new(tracker: CompletionTracker, concurrency: usize)
+  └─ execute(items: Vec<WorkItem>, runner) -> Vec<WorkItemOutcome>
+```
+
+`execute(items, runner)` spawns one tokio task per `WorkItem`. Each task follows this flow:
+
+1. **Await dependencies** via `CompletionTracker` -- block until all `dep_names` report completed for this range
+2. **Acquire sequential semaphore** (if `sequential=true`) -- per-handler capacity-1 FIFO semaphore
+3. **Acquire global concurrency permit** -- bounded by the scheduler's concurrency limit
+4. **Run** the work item via the provided runner
+5. **Mark completed or failed** in the `CompletionTracker`
+
+Waits happen BEFORE permit acquisition to prevent permit-deadlock (holding a permit while waiting on a dependency that needs one).
+
+Returns outcomes for ALL items, including those that were cascade-failed due to a dependency failure.
+
+**WorkItem** struct:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `handler_name` | `String` | Handler identity |
+| `range_start` | `u64` | Block range start |
+| `range_end` | `u64` | Block range end |
+| `dep_names` | `Vec<String>` | Handler names that must complete first |
+| `sequential` | `bool` | Whether to acquire the per-handler sequential semaphore |
+| `payload` | generic | Data needed to execute the item |
+
+**OutcomeStatus** enum:
+
+| Variant | Description |
+|---------|-------------|
+| `Succeeded` | Handler completed successfully |
+| `HandlerFailed` | Handler returned an error |
+| `DepCascadeFailed` | A dependency failed, so this item was not attempted |
+| `Panicked` | The handler task panicked |
+
+**CompletionTracker** provides per-(handler_name, range_start) completion and failure tracking. Uses `tokio::sync::Notify` to wake blocked dependents. Supports `seed_completed()` to pre-mark ranges as done, enabling phase overlap (e.g., seeding from `_handler_progress` so catchup does not re-execute already-completed work).
+
+**CatchupLoader** executes one `WorkItem` end-to-end for catchup mode: load parquet data, build `TransformationContext`, invoke the handler, execute the resulting database transaction, and record progress in `_handler_progress`.
+
+### Handler Dependency Chains
+
+Handlers declare ordering constraints via `handler_dependencies()`, which returns `Vec<&'static str>` of handler names that must complete for a given block range before this handler can execute.
+
+**Cascade failures:** If handler A fails on range R, all handlers that depend (directly or transitively) on A immediately cascade-fail for range R without being attempted.
+
+**Startup validation** uses Kahn's algorithm to verify the dependency graph:
+
+- **Missing names**: If a declared dependency does not resolve to a registered handler, the process panics at startup
+- **Cycles**: If the dependency graph contains a cycle, the process panics with a diagnostic trace showing the cycle path
+- **Dep type validation**: All declared dependencies must be event handlers
+
+**Topological sort** of the validated graph determines execution order for both catchup and live processing.
+
+### Sequential Execution
+
+Handlers can opt into strictly ordered execution across block ranges by implementing `requires_sequential() -> bool` (default `false`).
+
+When a handler returns `true`:
+
+- Its `WorkItem`s are created with `sequential = true`
+- The DAG scheduler uses a per-handler capacity-1 FIFO semaphore
+- Items are submitted in ascending `range_start` order and acquire permits in FIFO order
+
+**Guarantee:** Within a handler that requires sequential execution, block ranges execute in strictly ascending order. This is useful for handlers that maintain cumulative state (e.g., running totals, position tracking) where processing range N depends on the result of range N-1.
+
+### Multi-Trigger Handler Completion
+
+Some handlers respond to multiple event triggers (e.g., a metrics handler that processes both Swap and Mint events).
+
+- The registry tracks multi-trigger handler keys via `is_multi_trigger(handler_key)`
+- In live mode, handler success is NOT persisted until all trigger batches for that block have been dispatched
+- This is coordinated by the engine's batching logic and the `RangeFinalizer` to prevent marking a handler as complete before all of its trigger sources have been processed
+
+### Catchup Execution with DAG
+
+Catchup uses the DAG scheduler in a multi-phase approach:
+
+**Phase 1 -- Initialization:**
+- Collect handlers by kind (event, eth_call), sort by topological order
+- Seed the `CompletionTracker` from `_handler_progress` so already-completed ranges are pre-marked
+
+**Phase 2 -- Multi-pass item building loop:**
+1. Build `WorkItem`s for each handler and block range
+2. Skip ranges already completed (seeded in Phase 1)
+3. Defer ranges where call-dependency files are unavailable (parquet not yet produced)
+4. Cascade defer: if a handler's dependency was deferred, the handler is also deferred
+5. Submit non-deferred items to the DAG scheduler
+6. Repeat from step 1 until no deferrals remain
+
+**Phase 3 -- Live processing:**
+- Transition to live mode with pending event buffering for handlers whose call dependencies have not yet arrived
+
 The engine delegates to sub-components:
 - **HandlerExecutor** (`executor.rs`): Concurrent handler spawn-loop, context construction, source/version injection, optional snapshot capture
 - **RangeFinalizer** (`finalizer.rs`): Range finalization, reorg cleanup, progress tracking
@@ -186,6 +286,18 @@ pub trait EventHandler: TransformationHandler {
     /// Returns (source_name, function_name) pairs that must be available
     /// in decoded parquet files before this handler can process a range.
     fn call_dependencies(&self) -> Vec<(String, String)> { vec![] }
+
+    /// Handler names (via `TransformationHandler::name()`) that must complete
+    /// before this handler can execute for a given block range.
+    ///
+    /// Used to enforce ordering when one handler populates shared in-memory
+    /// state (e.g., a metadata cache) that another handler reads. References
+    /// `name()` rather than `handler_key()` so version bumps on the dependency
+    /// don't require updating dependents.
+    ///
+    /// All declared names must resolve to registered handlers — missing names
+    /// cause a panic at startup. Cycles are also detected at startup.
+    fn handler_dependencies(&self) -> Vec<&'static str> { vec![] }
 }
 ```
 
@@ -371,16 +483,18 @@ impl EventHandler for V4CreateHandler {
 
 ### Registering Handlers
 
-Handlers are registered at compile-time via the `build_registry()` function in `src/transformations/registry.rs`. Each handler category has its own registration function:
+Handlers are registered at compile-time via the `build_registry()` or `build_registry_for_chain()` functions in `src/transformations/registry.rs`. Each handler category has its own registration function.
 
-**Event handlers** in `src/transformations/event/mod.rs`:
+**Event handlers** in `src/transformations/event/mod.rs` take `chain_id` (used by handlers that need chain-specific state like the `PoolMetadataCache`):
 
 ```rust
-pub fn register_handlers(registry: &mut TransformationRegistry) {
+pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     derc20_transfer::register_handlers(registry);
     v4::create::register_handlers(registry);
-    multicurve::create::register_handlers(registry);
-    // Add more handler registrations here
+    // Handlers that share a PoolMetadataCache pass it down:
+    let v3_cache = Arc::new(PoolMetadataCache::new());
+    v3::create::register_handlers(registry, v3_cache.clone());
+    v3::metrics::register_handlers(registry, chain_id, v3_cache);
 }
 ```
 
@@ -389,7 +503,6 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
 ```rust
 pub fn register_handlers(registry: &mut TransformationRegistry) {
     // oracle::register_handlers(registry);
-    // pool_state::register_handlers(registry);
 }
 ```
 
@@ -401,6 +514,8 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
     registry.register_event_handler(V4CreateHandler);
 }
 ```
+
+`build_registry(chain_id)` builds a global registry (used for running migrations at startup). `build_registry_for_chain(chain_id, contracts, factory_collections)` builds a registry filtered to handlers whose trigger sources are present in the chain's config.
 
 ## TransformationContext
 
@@ -658,6 +773,7 @@ DbOperation::Upsert {
     values: vec![DbValue::Bytes32(id), DbValue::Numeric(amount)],
     conflict_columns: vec!["id".into()],
     update_columns: vec!["amount".into()],
+    update_condition: None,  // Optional WHERE on the DO UPDATE (e.g. "EXCLUDED.block_number > swaps.block_number")
 }
 // Engine injects source/source_version into columns, values, and conflict_columns
 // Generates: INSERT INTO swaps (id, amount, source, source_version) VALUES ($1, $2, $3, $4)
@@ -713,10 +829,11 @@ DbOperation::RawSql {
 |---------|-----------|-----------------|
 | `Null` | - | NULL |
 | `Bool(bool)` | `bool` | BOOLEAN |
-| `Int2(u8)` | `u8` | SMALLINT (INT2) |
+| `Int2(i16)` | `i16` | SMALLINT (INT2) |
 | `Int32(i32)` | `i32` | INTEGER |
 | `Int64(i64)` | `i64` | BIGINT |
 | `Uint64(u64)` | `u64` | BIGINT |
+| `Float64(f64)` | `f64` | DOUBLE PRECISION |
 | `Text(String)` | `String` | TEXT |
 | `VarChar(String)` | `String` | VARCHAR |
 | `Bytes(Vec<u8>)` | `Vec<u8>` | BYTEA |
@@ -747,13 +864,19 @@ pub enum TransformationError {
     TypeConversion(String),
     ConfigError(String),
     ChannelError(String),
-    IncludesPrecompileError(String),
+    TransientBlocked(String),       // Call-dep blocking — range deferred, not failed
+    IncludesPrecompileError(String), // Handler's asset or numeraire is a precompile address
     LiveStorage(StorageError),      // Live storage read/write failures
 }
 
 // Create a handler error with context
 TransformationError::handler("MyHandler", "Failed to process swap event")
 ```
+
+Notable variants:
+
+- **`TransientBlocked(String)`**: Returned when a handler's call-dependency files are not yet available. During catchup, this causes the range to be deferred to a later pass rather than treated as a failure.
+- **`IncludesPrecompileError(String)`**: Returned when a handler detects that an asset or numeraire address is a precompile (addresses 0x01-0x09). These handlers are skipped rather than errored.
 
 When a handler returns an error:
 
@@ -762,7 +885,7 @@ When a handler returns an error:
 3. Other handlers continue processing independently
 4. In live mode, failed handler keys are persisted to the block's status file for retry
 
-During catchup, a handler error stops catchup for that specific handler but does not affect other handlers.
+During catchup, a handler error stops catchup for that specific handler and propagates via cascade to all dependent handlers (see [Handler Dependency Chains](#handler-dependency-chains)). Independent handlers are unaffected.
 
 ## Execution Modes
 
@@ -839,6 +962,11 @@ src/transformations/
 ├── registry.rs      # Handler registration and build_registry()
 ├── historical.rs    # HistoricalDataReader for parquet queries
 ├── error.rs         # TransformationError enum
+├── scheduler/       # DAG-based execution scheduling
+│   ├── mod.rs           # Public exports
+│   ├── dag.rs           # DagScheduler, WorkItem, WorkItemOutcome
+│   ├── tracker.rs       # CompletionTracker (dependency satisfaction)
+│   └── loader.rs        # CatchupLoader (end-to-end WorkItem execution)
 ├── event/           # Event handlers
 │   ├── mod.rs           # register_handlers() for all event handlers
 │   ├── derc20_transfer.rs  # ERC20 Transfer handler
@@ -854,8 +982,14 @@ src/transformations/
 │   │   └── create.rs
 │   ├── decay_multicurve/  # Decay multicurve handlers
 │   │   └── mod.rs
-│   └── dhook/           # DHook handlers
-│       └── (scaffolded)
+│   ├── dhook/           # DHook handlers
+│   │   └── (scaffolded)
+│   └── metrics/         # Shared metrics utilities
+│       ├── mod.rs
+│       ├── accumulator.rs    # BlockAccumulator
+│       ├── swap_data.rs      # Swap processing
+│       ├── v4_hook_extract.rs # V4 hook extraction
+│       └── metrics.rs        # Metric calculations
 ├── eth_call/        # Call handlers
 │   └── mod.rs           # register_handlers() for all call handlers
 └── util/            # Shared utilities
@@ -869,7 +1003,9 @@ src/transformations/
         ├── users.rs     # upsert_user helper
         ├── transfers.rs # insert_transfer helper
         ├── v4_pool_configs.rs  # insert_pool_config helper
-        └── dhook_pool_configs.rs  # insert_dhook_pool_config helper
+        ├── dhook_pool_configs.rs  # insert_dhook_pool_config helper
+        ├── skipped_addresses.rs  # Skipped address filtering
+        └── pool_metrics.rs       # Pool metrics queries
 
 migrations/
 ├── 000_handler_progress.sql  # _handler_progress table

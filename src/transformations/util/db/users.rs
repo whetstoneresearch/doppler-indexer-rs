@@ -22,5 +22,6 @@ pub fn upsert_user(
         ],
         conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
         update_columns: vec!["last_seen".to_string()],
+        update_condition: None,
     }
 }

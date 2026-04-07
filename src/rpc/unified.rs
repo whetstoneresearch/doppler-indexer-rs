@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::rpc::alchemy::{AlchemyClient, SlidingWindowRateLimiter};
 use crate::rpc::provider::{RpcClient, RpcClientConfig, RpcError, RpcProvider};
 
+#[derive(Clone)]
 pub enum UnifiedRpcClient {
     Standard(RpcClient),
     Alchemy(AlchemyClient),
@@ -79,7 +80,12 @@ impl UnifiedRpcClient {
             let config = RpcClientConfig::new(parsed_url)
                 .with_batch_size(max_batch_size)
                 .with_concurrency(rpc_concurrency);
-            Ok(Self::Standard(RpcClient::new(config)?))
+            let client = if let Some(limiter) = shared_limiter {
+                RpcClient::new_with_shared_limiter(config, limiter)?
+            } else {
+                RpcClient::new(config)?
+            };
+            Ok(Self::Standard(client))
         }
     }
 

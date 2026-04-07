@@ -11,6 +11,10 @@ use crate::raw_data::historical::eth_calls::{
 };
 use crate::raw_data::historical::receipts::EventTriggerMessage;
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts_for_range, range_key, read_contract_index,
+    update_contract_index, write_contract_index,
+};
 use crate::storage::StorageManager;
 
 /// Handle a single `EventTriggerMessage` received from the event trigger channel.
@@ -54,7 +58,9 @@ pub(super) async fn handle_event_trigger_message(
                     s3_manifest: &state.s3_manifest,
                 };
 
-                let skipped = if let Some(multicall_addr) = state.multicall3_address {
+                let (skipped, mut pending_writes) = if let Some(multicall_addr) =
+                    state.multicall3_address
+                {
                     process_event_triggers_multicall(
                         triggers,
                         &state.event_call_configs,
@@ -63,6 +69,8 @@ pub(super) async fn handle_event_trigger_message(
                         multicall_addr,
                         range_start,
                         inclusive_end,
+                        &state.contracts,
+                        false,
                     )
                     .await?
                 } else {
@@ -73,9 +81,15 @@ pub(super) async fn handle_event_trigger_message(
                         &ctx,
                         range_start,
                         inclusive_end,
+                        &state.contracts,
+                        false,
                     )
                     .await?
                 };
+                while let Some(result) = pending_writes.join_next().await {
+                    result
+                        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+                }
 
                 if !skipped.is_empty() {
                     tracing::info!(
@@ -130,6 +144,21 @@ pub(super) async fn handle_event_trigger_message(
                             "Wrote empty event-triggered eth_call file to {} (no matching events)",
                             output_path.display()
                         );
+                        let expected_for_range = build_expected_factory_contracts_for_range(
+                            &state.contracts,
+                            inclusive_end + 1,
+                        );
+                        if let Some(expected) = expected_for_range.get(&contract_name) {
+                            let rk = range_key(range_start, inclusive_end);
+                            let mut ci = read_contract_index(&sub_dir);
+                            update_contract_index(&mut ci, &rk, expected);
+                            if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                                tracing::warn!(
+                                    "Failed to write contract index (empty on_events current): {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                 }
             }

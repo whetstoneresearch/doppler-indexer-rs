@@ -1,10 +1,16 @@
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
 
 use super::error::DbError;
 use super::types::{DbOperation, DbValue, WhereClause};
+
+/// Maximum number of retries for deadlock errors (40P01).
+const DEADLOCK_MAX_RETRIES: u32 = 3;
+/// Base delay between deadlock retries (doubled each attempt).
+const DEADLOCK_BASE_DELAY_MS: u64 = 50;
 
 pub struct DbPool {
     pool: Pool,
@@ -54,11 +60,32 @@ impl DbPool {
             return Ok(());
         }
 
+        for attempt in 0..=DEADLOCK_MAX_RETRIES {
+            match self.try_execute_transaction(&operations).await {
+                Ok(()) => return Ok(()),
+                Err(e) if is_deadlock(&e) && attempt < DEADLOCK_MAX_RETRIES => {
+                    let delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    tracing::warn!(
+                        "Deadlock detected (attempt {}/{}), retrying in {}ms",
+                        attempt + 1,
+                        DEADLOCK_MAX_RETRIES + 1,
+                        delay_ms,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!()
+    }
+
+    async fn try_execute_transaction(&self, operations: &[DbOperation]) -> Result<(), DbError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
         for op in operations {
-            let (sql, params) = build_operation_sql(op);
+            let (sql, params) = build_operation_sql(op.clone());
 
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -76,14 +103,15 @@ impl DbPool {
 
     /// Execute a transaction with pre-queries that run inside the same transaction context.
     /// Snapshot queries see committed state before any modifications in this transaction.
-    /// Returns the pre-query results after the transaction commits.
+    /// Returns a tuple of (snapshot_results, affected_rows) after the transaction commits.
+    /// `affected_rows[i]` is the number of rows touched by `operations[i]`.
     pub async fn execute_transaction_with_snapshot_reads(
         &self,
         snapshot_specs: &[(String, Vec<(String, DbValue)>)],
         operations: Vec<DbOperation>,
-    ) -> Result<Vec<Option<Vec<(String, DbValue)>>>, DbError> {
+    ) -> Result<(Vec<Option<Vec<(String, DbValue)>>>, Vec<u64>), DbError> {
         if operations.is_empty() && snapshot_specs.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut client = self.pool.get().await?;
@@ -96,25 +124,36 @@ impl DbPool {
             snapshot_results.push(result);
         }
 
-        // Execute all operations
+        // Execute all operations and collect affected row counts
+        let mut affected_rows = Vec::with_capacity(operations.len());
         for op in operations {
             let (sql, params) = build_operation_sql(op);
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
-            if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
-                let db_err: DbError = e.into();
-                tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
-                return Err(db_err);
+            match transaction.execute(&sql, &params_refs[..]).await {
+                Ok(n) => affected_rows.push(n),
+                Err(e) => {
+                    let db_err: DbError = e.into();
+                    tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                    return Err(db_err);
+                }
             }
         }
 
         transaction.commit().await?;
-        Ok(snapshot_results)
+        Ok((snapshot_results, affected_rows))
     }
 
     pub async fn run_migrations(&self) -> Result<(), DbError> {
         super::migrations::run(&self.pool).await
+    }
+
+    pub async fn run_handler_migrations(
+        &self,
+        registry: &crate::transformations::registry::TransformationRegistry,
+    ) -> Result<(), DbError> {
+        super::migrations::run_handler_migrations(&self.pool, registry).await
     }
 
     pub async fn query(
@@ -150,6 +189,16 @@ impl DbPool {
     }
 }
 
+/// Check whether a `DbError` is a PostgreSQL deadlock (SQLSTATE 40P01).
+fn is_deadlock(err: &DbError) -> bool {
+    match err {
+        DbError::PostgresError(e) => e
+            .as_db_error()
+            .is_some_and(|db| *db.code() == SqlState::T_R_DEADLOCK_DETECTED),
+        _ => false,
+    }
+}
+
 /// Build SQL and parameters from a DbOperation.
 fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
     match op {
@@ -159,12 +208,14 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
             values,
             conflict_columns,
             update_columns,
+            update_condition,
         } => build_upsert_sql(
             &table,
             &columns,
             &values,
             &conflict_columns,
             &update_columns,
+            update_condition.as_deref(),
         ),
         DbOperation::Insert {
             table,
@@ -558,6 +609,7 @@ fn build_upsert_sql(
     values: &[DbValue],
     conflict_columns: &[String],
     update_columns: &[String],
+    update_condition: Option<&str>,
 ) -> (String, Vec<SqlParam>) {
     let mut builder = QueryBuilder::new();
     let cols = quote_cols(columns);
@@ -574,6 +626,11 @@ fn build_upsert_sql(
         format!(
             "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
             table, cols, placeholders_str, conflict_cols
+        )
+    } else if let Some(condition) = update_condition {
+        format!(
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            table, cols, placeholders_str, conflict_cols, updates_str, condition
         )
     } else {
         format!(

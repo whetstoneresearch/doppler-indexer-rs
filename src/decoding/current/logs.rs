@@ -10,7 +10,9 @@ use crate::decoding::logs::{
 };
 use crate::decoding::types::{DecoderMessage, LogDecoderOutputs, LogMatcherConfig};
 use crate::live::LiveStorage;
+use crate::storage::contract_index::build_expected_factory_contracts_for_range;
 use crate::storage::parquet_readers::read_factory_addresses_from_parquet;
+use crate::types::config::contract::Contracts;
 
 /// Load accumulated factory addresses from both compacted parquet and uncompacted bincode files.
 ///
@@ -96,6 +98,7 @@ pub async fn decode_logs_live(
     output_base: &Path,
     chain_name: &str,
     outputs: &LogDecoderOutputs<'_>,
+    contracts: Option<&Contracts>,
 ) -> Result<(), LogDecodingError> {
     // Load accumulated factory addresses from parquet and bincode files
     let mut accumulated_factory_addresses = load_accumulated_factory_addresses(chain_name)?;
@@ -135,8 +138,9 @@ pub async fn decode_logs_live(
                     .await?;
                 } else {
                     // Historical mode: write to parquet
-                    // For historical, we still use per-range factory addresses
-                    // (this path is only taken during catchup which has its own loading)
+                    // Build per-range expected contracts so the contract index gets an entry
+                    let expected_for_range = contracts
+                        .map(|c| build_expected_factory_contracts_for_range(c, range_end));
                     process_logs(
                         &logs,
                         range_start,
@@ -145,6 +149,7 @@ pub async fn decode_logs_live(
                         &accumulated_factory_addresses,
                         output_base,
                         outputs,
+                        expected_for_range.as_ref(),
                     )
                     .await?;
                 }

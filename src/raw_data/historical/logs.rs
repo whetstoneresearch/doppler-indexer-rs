@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, UInt32Array,
@@ -9,8 +9,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 
@@ -195,6 +193,7 @@ pub(crate) async fn process_range(
         range.end - 1
     );
 
+    let write_start = Instant::now();
     match log_fields {
         Some(fields) => {
             let records: Vec<MinimalLogRecord> = logs
@@ -237,6 +236,14 @@ pub(crate) async fn process_range(
     }
 
     let output_path = output_dir.join(range.file_name("logs"));
+
+    crate::metrics::record_parquet_write(
+        chain_name,
+        "logs",
+        write_start.elapsed().as_secs_f64(),
+        &output_path,
+    );
+
     tracing::info!("Wrote logs to {}", output_path.display());
 
     // Upload to S3 if configured
@@ -449,16 +456,7 @@ pub(crate) fn write_parquet(
     output_path: &Path,
 ) -> Result<(), LogCollectionError> {
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 

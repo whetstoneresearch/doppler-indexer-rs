@@ -748,20 +748,59 @@ Collection is fully resumable with multiple safeguards:
 
 Existing parquet files are scanned on startup and their ranges are skipped during collection. When S3 storage is configured, the S3 manifest is also checked, so ranges already uploaded to S3 are skipped even if the local files have been cleaned up.
 
+### Contract Index Tracking
+
+Each data layer writes a `contract_index.json` sidecar file alongside its parquet files. The index records which factory source contracts (and their addresses) were included when each block range was processed:
+
+```json
+{
+  "0-999": {
+    "Airlock": ["0x660eaaedebc968f8f3694354fa8ec0b4c5ba8d12"],
+    "OtherInitializer": ["0xabc...", "0xdef..."]
+  },
+  "1000-1999": {
+    "Airlock": ["0x660eaaedebc968f8f3694354fa8ec0b4c5ba8d12"]
+  }
+}
+```
+
+On catchup, ranges are reprocessed when the current config lists contracts or addresses absent from the index. This handles:
+- A new factory source contract is added to the config
+- A new address is added to an existing multi-address contract
+- Factory collection was interrupted after writing parquet but before updating the index
+
+**Contract index locations:**
+
+| Layer | Path |
+|-------|------|
+| Factory addresses | `factories/{collection}/contract_index.json` |
+| Eth_calls regular | `eth_calls/{collection}/{function}/contract_index.json` |
+| Eth_calls once | `eth_calls/{collection}/once/contract_index.json` |
+| Eth_calls on_events | `eth_calls/{collection}/{function}/on_events/contract_index.json` |
+| Decoded logs | `decoded/logs/{collection}/{event_name}/contract_index.json` |
+
+**Write ordering:** Parquet files are always written before the contract index is updated. If a crash occurs between the two, the next run detects the missing index entry and reprocesses (safe, idempotent).
+
+**Atomic writes:** The contract index uses a write-to-temp + sync + rename pattern to prevent partial writes on crash.
+
+**S3 integration:** Contract index files are uploaded to S3 alongside parquet files and downloaded during catchup.
+
 ### Catchup Phase
 
 On startup, before processing new logs from the channel, the factory collector performs a catchup phase:
 
 1. **Load existing factory data**: Reads all existing factory parquet files and sends addresses to downstream collectors (logs, decoders)
 2. **Scan for gaps**: Scans `data/{chain}/historical/raw/logs/` for existing log parquet files (and S3 manifest ranges not present locally)
-3. **Check completeness**: For each log file, checks if corresponding factory files exist for all configured collections (checking both local files and S3 manifest)
-4. **Process gaps concurrently**: If any factory files are missing, reads logs from the existing parquet file (downloading from S3 if needed) and processes them using semaphore-bounded concurrency (controlled by `factory_concurrency` config)
-5. **Upload to S3**: If storage manager is configured, newly written factory parquet files are uploaded to S3
-6. **Signal completion**: Sends `factory_catchup_done_tx` oneshot to unblock dependent catchup phases (e.g., eth_calls)
+3. **Check completeness**: For each log file, checks if corresponding factory files exist for all configured collections (checking both local files and S3 manifest). Also checks the contract index to ensure all currently-configured contracts are represented.
+4. **Process gaps concurrently**: If any factory files are missing or the contract index shows missing contracts, reads logs from the existing parquet file (downloading from S3 if needed) and processes them using semaphore-bounded concurrency (controlled by `factory_concurrency` config)
+5. **Update contract index**: After all concurrent tasks complete, the contract index is updated in memory and written atomically to avoid concurrent write conflicts from the JoinSet tasks
+6. **Upload to S3**: If storage manager is configured, newly written factory parquet files and contract index files are uploaded to S3
+7. **Signal completion**: Sends `factory_catchup_done_tx` oneshot to unblock dependent catchup phases (e.g., eth_calls)
 
 This is particularly useful when:
 - Factory collection was interrupted mid-run
 - New factory configurations are added to existing contracts
+- A new address is added to an existing contract
 - Factory files were manually deleted for re-processing
 
 ### Synchronization with eth_calls

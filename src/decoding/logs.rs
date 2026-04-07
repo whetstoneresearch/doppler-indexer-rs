@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,8 +10,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -21,6 +18,9 @@ use super::types::{BuiltMatchers, DecoderMessage, LogDecoderOutputs, LogMatcherC
 use crate::live::{LiveDecodedLog, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::contract_index::{
+    range_key, read_contract_index, update_contract_index, write_contract_index, ExpectedContracts,
+};
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
     RangeCompleteMessage,
@@ -171,6 +171,7 @@ pub async fn decode_logs(
         &output_base,
         &chain.name,
         &log_outputs,
+        Some(&chain.contracts),
     )
     .await?;
 
@@ -266,10 +267,31 @@ pub(crate) async fn process_logs(
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     output_base: &Path,
     outputs: &LogDecoderOutputs<'_>,
+    expected_by_collection: Option<&HashMap<String, ExpectedContracts>>,
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
     let build_transform = outputs.transform_tx.is_some();
+
+    // Build topic0 index for O(1) matcher lookup instead of O(matchers) linear scan per log.
+    // This is the key optimization for catchup with many configured events.
+    let mut regular_by_topic: HashMap<[u8; 32], Vec<&EventMatcher>> = HashMap::new();
+    for matcher in regular_matchers {
+        regular_by_topic
+            .entry(matcher.event.topic0)
+            .or_default()
+            .push(matcher);
+    }
+
+    let mut factory_by_topic: HashMap<[u8; 32], Vec<(&str, &EventMatcher)>> = HashMap::new();
+    for (collection_name, matchers) in factory_matchers {
+        for matcher in matchers {
+            factory_by_topic
+                .entry(matcher.event.topic0)
+                .or_default()
+                .push((collection_name.as_str(), matcher));
+        }
+    }
 
     // Group decoded logs by (contract_name, event_name) — for parquet storage
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
@@ -285,58 +307,52 @@ pub(crate) async fn process_logs(
         }
         let topic0 = log.topics[0];
 
-        // Try regular matchers
-        for matcher in regular_matchers {
-            // Skip if block is before contract's start_block
-            if let Some(sb) = matcher.start_block {
-                if log.block_number < sb {
+        // Regular matchers via topic0 index
+        if let Some(matchers) = regular_by_topic.get(&topic0) {
+            for matcher in matchers {
+                if let Some(sb) = matcher.start_block {
+                    if log.block_number < sb {
+                        continue;
+                    }
+                }
+                if !matcher.addresses.contains(&log.address) {
                     continue;
                 }
-            }
-            if !matcher.addresses.contains(&log.address) {
-                continue;
-            }
-            if topic0 != matcher.event.topic0 {
-                continue;
-            }
 
-            if let Some(decoded) = decode_log(log, &matcher.event)? {
-                if build_transform {
-                    let transform_event = convert_to_transform_event(
-                        &decoded,
-                        &matcher.event,
-                        &matcher.name,
-                        &matcher.event_name,
-                    );
+                if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    if build_transform {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            &matcher.name,
+                            &matcher.event_name,
+                        );
+                        let key = (matcher.name.clone(), matcher.event_name.clone());
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
+                    }
+
                     let key = (matcher.name.clone(), matcher.event_name.clone());
-                    transform_events_by_type
+                    decoded_by_event
                         .entry(key)
-                        .or_default()
-                        .push(transform_event);
+                        .or_insert_with(|| (Vec::new(), &matcher.event))
+                        .0
+                        .push(decoded);
                 }
-
-                let key = (matcher.name.clone(), matcher.event_name.clone());
-                decoded_by_event
-                    .entry(key)
-                    .or_insert_with(|| (Vec::new(), &matcher.event))
-                    .0
-                    .push(decoded);
             }
         }
 
-        // Try factory matchers
-        for (collection_name, matchers) in factory_matchers {
-            let addrs = match factory_addresses.get(collection_name) {
-                Some(addrs) => addrs,
-                None => continue,
-            };
+        // Factory matchers via topic0 index
+        if let Some(entries) = factory_by_topic.get(&topic0) {
+            for (collection_name, matcher) in entries {
+                let addrs = match factory_addresses.get(*collection_name) {
+                    Some(addrs) => addrs,
+                    None => continue,
+                };
 
-            if !addrs.contains(&log.address) {
-                continue;
-            }
-
-            for matcher in matchers {
-                if topic0 != matcher.event.topic0 {
+                if !addrs.contains(&log.address) {
                     continue;
                 }
 
@@ -348,14 +364,14 @@ pub(crate) async fn process_logs(
                             collection_name,
                             &matcher.event_name,
                         );
-                        let key = (collection_name.clone(), matcher.event_name.clone());
+                        let key = (collection_name.to_string(), matcher.event_name.clone());
                         transform_events_by_type
                             .entry(key)
                             .or_default()
                             .push(transform_event);
                     }
 
-                    let key = (collection_name.clone(), matcher.event_name.clone());
+                    let key = (collection_name.to_string(), matcher.event_name.clone());
                     decoded_by_event
                         .entry(key)
                         .or_insert_with(|| (Vec::new(), &matcher.event))
@@ -464,6 +480,29 @@ pub(crate) async fn process_logs(
             if !output_path.exists() {
                 std::fs::create_dir_all(&output_dir)?;
                 write_decoded_logs_to_parquet(&[], &matcher.event, &output_path)?;
+            }
+        }
+    }
+
+    // Update contract index for factory collections so that catchup can skip
+    // ranges already processed with the current set of contracts/addresses.
+    if let Some(expected_map) = expected_by_collection {
+        let rk = range_key(range_start, range_end - 1);
+
+        // Collect unique (collection, event_name) pairs from factory matchers
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+        for (collection, matchers) in factory_matchers {
+            for matcher in matchers {
+                seen_pairs.insert((collection.clone(), matcher.event_name.clone()));
+            }
+        }
+
+        for (collection, event_name) in seen_pairs {
+            if let Some(expected) = expected_map.get(&collection) {
+                let dir = output_base.join(&collection).join(&event_name);
+                let mut index = read_contract_index(&dir);
+                update_contract_index(&mut index, &rk, expected);
+                write_contract_index(&dir, &index)?;
             }
         }
     }
@@ -833,16 +872,7 @@ fn write_decoded_logs_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet(&batch, output_path)?;
     Ok(())
 }
 

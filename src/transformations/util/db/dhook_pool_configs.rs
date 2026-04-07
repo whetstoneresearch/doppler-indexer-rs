@@ -23,6 +23,7 @@ pub fn insert_dhook_pool_config(
         table: "dhook_pool_configs".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "hook_address".to_string()],
         update_columns: vec![],
+        update_condition: None,
         columns: vec![
             "chain_id".to_string(),
             "pool_id".to_string(),

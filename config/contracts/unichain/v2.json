@@ -1,0 +1,8 @@
+{
+    "UniswapV2Factory": {
+        "address": "0x1f98400000000000000000000000000000000002"
+    },
+    "UniswapV2Migrator": {
+        "address": "0xf6023127f6E937091D5B605680056A6D27524bad"
+    }
+}

@@ -1,0 +1,70 @@
+{
+    "UniswapV4ScheduledMulticurveInitializer": {
+        "address": "0xce3099b2f07029b086e5e92a1573c5f5a3071783",
+        "events": [
+            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
+        ],
+        "calls": [
+            {
+                "function": "getState(address)",
+                "output_type": "(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            },
+            {
+                "function": "getBeneficiaries(address)",
+                "output_type": "(address, uint96)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            },
+            {
+                "function": "getPositions(address)",
+                "output_type": "(int24 tickLower, int24 tickUpper, uint128 liquidity, bytes32 salt)[]",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializer",
+                        "event": "Create(address,address,address)"
+                    }
+                },
+                "params": [
+                    { "type": "address", "from_event": "topics[2]"}
+                ]
+            }
+        ]
+    },
+    "UniswapV4ScheduledMulticurveInitializerHook": {
+        "address": "0x580ca49389d83b019d07e17e99454f2f218e2dc0",
+        "events": [
+            { "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)" },
+            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" }
+        ],
+        "calls": [
+            {
+                "function": "getSlot0(bytes32)",
+                "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializerHook",
+                        "event": "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)"
+                    }
+                },
+                "target": "UniswapV4StateView",
+                "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+            }
+        ]
+    }
+}

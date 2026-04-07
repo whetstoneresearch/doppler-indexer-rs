@@ -70,6 +70,8 @@ pub enum DbOperation {
         conflict_columns: Vec<String>,
         /// Columns to update on conflict
         update_columns: Vec<String>,
+        /// Optional WHERE clause on the DO UPDATE (e.g. "EXCLUDED.block_number >= pool_state.block_number")
+        update_condition: Option<String>,
     },
     /// Simple INSERT
     Insert {

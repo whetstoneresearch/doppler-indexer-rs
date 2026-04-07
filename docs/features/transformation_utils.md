@@ -6,10 +6,70 @@ Shared helpers for metadata extraction, address validation, and database operati
 
 | Module | Purpose |
 |--------|---------|
-| `mod.rs` | Module declarations (`db`, `metadata`, `sanitize`) |
+| `mod.rs` | Module declarations |
 | `sanitize.rs` | Address validation helpers (precompile detection) |
 | `metadata.rs` | Token metadata extraction from decoded calls |
+| `pool_metadata.rs` | `PoolMetadataCache` — thread-safe pool metadata cache for metrics handlers |
+| `tick_math.rs` | `tick_to_sqrt_price_x96()` — Uniswap V4 tick-to-price conversion |
 | `db/` | Database operation builders for common entities |
+
+---
+
+## `pool_metadata.rs` — Pool Metadata Cache
+
+A thread-safe, lazily-loaded cache of pool metadata needed by metrics handlers (token addresses, decimals, orientation). Shared between a pool type's Create handler and its Metrics handlers via `Arc<PoolMetadataCache>`.
+
+### Structs
+
+```rust
+pub struct PoolMetadata {
+    pub pool_id: Vec<u8>,
+    pub base_token: [u8; 20],
+    pub quote_token: [u8; 20],
+    pub is_token_0: bool,         // true = base token is token0 in the pair
+    pub pool_type: String,        // "v3", "v4_hook", etc.
+    pub base_decimals: u8,        // always 18 for launched tokens
+    pub quote_decimals: u8,       // resolved from known quote tokens (WETH=18, USDC=6, etc.)
+}
+
+pub struct PoolMetadataCache {
+    inner: RwLock<HashMap<Vec<u8>, PoolMetadata>>,
+    loaded: AtomicBool,
+}
+```
+
+### Key Methods
+
+| Method | Description |
+|--------|-------------|
+| `new()` | Create an empty cache. |
+| `load_into(&self, db_pool, chain_id)` | Load from `pools` table into an existing (shared) cache. Uses atomic CAS so only the first caller among concurrent callers performs the query. Idempotent — subsequent calls are no-ops. |
+| `resolve_quote_decimals(&self, contracts)` | Set correct decimals for known quote tokens (WETH=18, USDC=6, USDT=6, EURC=6) by matching against contract config. Called on first `handle()` when `TransformationContext` is available. |
+| `get(&self, pool_id)` | Look up metadata by pool_id bytes. |
+| `insert_if_absent(&self, pool_id, meta)` | Insert if not already present. Used by Create handlers to pre-populate the cache in-memory before their DB transaction commits, so Metrics handlers in the same block can find the pool without a DB round-trip. |
+| `refresh(&self, pool, chain_id)` | Re-query the `pools` table and insert any pools not already in cache. Returns count of newly discovered pools. Used by Metrics handlers when a swap arrives for an unknown pool. |
+
+### Lifecycle
+
+1. **Registration**: Create handler and Metrics handlers for the same pool type share one `Arc<PoolMetadataCache>` constructed in their joint `register_handlers()`.
+2. **Initialization**: Metrics handler's `initialize()` calls `load_into()` to populate the cache from the `pools` table. The Create handler shares the same Arc, so its pools are visible immediately.
+3. **First handle()**: Metrics handler calls `resolve_quote_decimals()` (guarded by `AtomicBool`) to set correct decimal values using the `TransformationContext`'s contracts config.
+4. **During handle()**: If events reference an unknown pool, `refresh()` re-queries the DB. The Create handler also calls `insert_if_absent()` immediately on processing a Create event — before its own DB transaction commits — so same-block swaps can find the pool without a DB round-trip.
+5. **Crash recovery**: On restart, `load_into()` reads all committed pools from the `pools` table. The `pools` table is the source of truth; no separate persistence is needed.
+
+### Handler dependency
+
+Metrics handlers declare `handler_dependencies()` returning their corresponding Create handler's name. This ensures the Create handler runs first within a block, calling `insert_if_absent()` before any Metrics handler executes. Without this ordering, a same-block pool creation + swap could miss the cache.
+
+---
+
+## `tick_math.rs` — Tick to sqrtPriceX96
+
+```rust
+pub fn tick_to_sqrt_price_x96(tick: i32) -> U256
+```
+
+Port of Uniswap V4's `TickMath.getSqrtRatioAtTick`. Computes `sqrt(1.0001^tick) * 2^96` as an integer. Used by V4 base pool metrics handler to derive `sqrtPriceX96` from the `currentTick` field in V4 base swap events (which don't include `sqrtPriceX96` directly).
 
 ---
 

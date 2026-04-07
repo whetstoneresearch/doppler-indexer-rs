@@ -55,6 +55,35 @@ pub async fn upload_parquet_to_s3(
     Ok(())
 }
 
+/// Upload a sidecar file (e.g. `contract_index.json`) to S3.
+///
+/// Unlike [`upload_parquet_to_s3`], this does **not** write a marker because
+/// sidecar files are not range-based. The S3 key is derived from the local
+/// path by stripping the `data/` prefix.
+///
+/// No-op if S3 is not enabled.
+pub async fn upload_sidecar_to_s3(
+    storage_manager: &Arc<StorageManager>,
+    local_path: &Path,
+) -> Result<(), StorageError> {
+    if !storage_manager.is_s3_enabled() {
+        return Ok(());
+    }
+
+    let data = tokio::fs::read(local_path).await?;
+    let s3_key = compute_s3_key(local_path)?;
+
+    match storage_manager.s3_backend() {
+        Some(s3) => s3.write(&s3_key, &data).await?,
+        None => {
+            storage_manager.backend().write(&s3_key, &data).await?;
+        }
+    }
+
+    tracing::debug!("Uploaded sidecar {} to S3", s3_key);
+    Ok(())
+}
+
 /// Compute the S3 key from a local path by stripping the "data/" prefix.
 ///
 /// Returns an error if the path does not contain a "data/" segment,
