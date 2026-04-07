@@ -55,14 +55,14 @@ impl TransformationHandler for V4CreateHandler {
             let hook = event.extract_address("poolOrHook")?;
 
             let Some((asset_metadata, numeraire_metadata)) =
-                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
             else {
                 continue;
             };
 
             let hook_call = ctx
-                .calls_for_address(hook)
-                .find(|call| call.function_name == "once")
+                .current_or_historical_once_call_for_address("DopplerV4Hook", hook)
+                .await?
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(hook)
@@ -214,11 +214,7 @@ impl EventHandler for V4CreateHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![
-            ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
-            ("DopplerV4Hook".to_string(), "once".to_string()),
-        ]
+        vec![("DopplerV4Hook".to_string(), "once".to_string())]
     }
 }
 
