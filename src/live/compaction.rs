@@ -135,30 +135,13 @@ impl CompactionService {
 
     /// Run a single compaction cycle.
     pub async fn run_compaction_cycle(&self) -> Result<(), CompactionError> {
-        let cycle_start = Instant::now();
-        let chain_label = self.chain_name.clone();
-
         // Check for stuck blocks needing transformation retry
         self.check_for_stuck_blocks().await;
-
-        // Report pending blocks gauge
-        if let Ok(blocks) = self.storage.list_blocks() {
-            metrics::gauge!(
-                "live_compaction_blocks_pending",
-                "chain" => chain_label.clone()
-            )
-            .set(blocks.len() as f64);
-        }
 
         let ranges = self.find_compactable_ranges().await?;
 
         if ranges.is_empty() {
             tracing::debug!("No ranges ready for compaction");
-            metrics::histogram!(
-                "live_compaction_cycle_duration_seconds",
-                "chain" => chain_label
-            )
-            .record(cycle_start.elapsed().as_secs_f64());
             return Ok(());
         }
 
@@ -179,12 +162,6 @@ impl CompactionService {
                 );
             }
         }
-
-        metrics::histogram!(
-            "live_compaction_cycle_duration_seconds",
-            "chain" => chain_label
-        )
-        .record(cycle_start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -251,12 +228,6 @@ impl CompactionService {
         }
 
         stuck_blocks.retain(|block_number, _| seen_blocks.contains(block_number));
-
-        metrics::gauge!(
-            "live_compaction_stuck_blocks",
-            "chain" => self.chain_name.clone()
-        )
-        .set(stuck_blocks.len() as f64);
 
         // Only remove from stuck_blocks on successful send. If try_send fails
         // (channel full), the block keeps its original grace timer so it doesn't
