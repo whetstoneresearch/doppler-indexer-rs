@@ -86,32 +86,37 @@ pub(super) async fn handle_factory_message(
                             s3_manifest: &state.s3_manifest,
                         };
 
-                        let new_skipped = if let Some(multicall_addr) = state.multicall3_address {
-                            process_event_triggers_multicall(
-                                triggers,
-                                &state.event_call_configs,
-                                &state.factory_addresses,
-                                &ctx,
-                                multicall_addr,
-                                buf_range_start,
-                                buf_range_end,
-                                &state.contracts,
-                                false,
-                            )
-                            .await?
-                        } else {
-                            process_event_triggers(
-                                triggers,
-                                &state.event_call_configs,
-                                &state.factory_addresses,
-                                &ctx,
-                                buf_range_start,
-                                buf_range_end,
-                                &state.contracts,
-                                false,
-                            )
-                            .await?
-                        };
+                        let (new_skipped, mut pending_writes) =
+                            if let Some(multicall_addr) = state.multicall3_address {
+                                process_event_triggers_multicall(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    &ctx,
+                                    multicall_addr,
+                                    buf_range_start,
+                                    buf_range_end,
+                                    &state.contracts,
+                                    false,
+                                )
+                                .await?
+                            } else {
+                                process_event_triggers(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    &ctx,
+                                    buf_range_start,
+                                    buf_range_end,
+                                    &state.contracts,
+                                    false,
+                                )
+                                .await?
+                            };
+                        while let Some(result) = pending_writes.join_next().await {
+                            result
+                                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+                        }
 
                         if !new_skipped.is_empty() {
                             still_skipped.push((new_skipped, buf_range_start, buf_range_end));

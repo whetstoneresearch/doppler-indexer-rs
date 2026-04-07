@@ -14,7 +14,7 @@ Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-O
 |-----------|-------------|
 | **Raw Data Collection** | Fetches blocks, receipts, logs, factory addresses, and eth_call results from EVM chains |
 | **Decoding** | Parses raw log and eth_call data into typed columns using Solidity ABI signatures |
-| **Transformations** | Custom Rust handlers process decoded data and write to PostgreSQL with per-handler progress |
+| **Transformations** | Custom Rust handlers process decoded data and write to PostgreSQL with DAG-based dependency scheduling and per-handler progress |
 | **Live Mode** | Real-time block processing via WebSocket with reorg detection and bincode-to-parquet compaction |
 | **RPC Layer** | Unified RPC client with sliding-window rate limiting, streaming, and batch support |
 | **S3 Storage** | Optional S3-compatible storage with write-through caching and manifest management |
@@ -135,8 +135,8 @@ migrations/
 - **doc**: `docs/features/decoding.md`
 
 ### transformations
-- **description**: Custom Rust handlers process decoded events/calls and produce PostgreSQL operations. Per-handler progress tracking, version injection, and transactional execution.
-- **entry_points**: `src/transformations/traits.rs`, `src/transformations/registry.rs`, `src/transformations/engine.rs`, `src/transformations/executor.rs`
+- **description**: Custom Rust handlers process decoded events/calls and produce PostgreSQL operations. DAG-based catchup with dependency-aware pipelined execution. Per-handler progress tracking, version injection, sequential execution support, and transactional execution with deadlock retry.
+- **entry_points**: `src/transformations/traits.rs`, `src/transformations/registry.rs`, `src/transformations/engine.rs`, `src/transformations/executor.rs`, `src/transformations/scheduler/`
 - **depends_on**: [decoding, database]
 - **doc**: `docs/features/transformations.md`
 
@@ -183,16 +183,16 @@ migrations/
 - **doc**: `docs/features/parallelism.md`
 
 ### database
-- **description**: PostgreSQL connection pool (deadpool_postgres), migration runner, typed DbOperation/DbValue/WhereClause abstractions, and structured error types.
+- **description**: PostgreSQL connection pool (deadpool_postgres), migration runner, typed DbOperation/DbValue/WhereClause abstractions, deadlock retry, and structured error types.
 - **entry_points**: `src/db/`
 - **depends_on**: []
-- **doc**: *(no feature doc yet)*
+- **doc**: `docs/features/database.md`
 
 ### metrics
-- **description**: Prometheus metrics server exposing RPC counters, histograms, and pipeline observability metrics via HTTP endpoint.
+- **description**: Prometheus metrics server exposing RPC, live mode, collection, and transformation observability metrics via HTTP endpoint. RAII guards for safe in-flight tracking.
 - **entry_points**: `src/metrics/`
 - **depends_on**: [rpc]
-- **doc**: *(no feature doc yet)*
+- **doc**: `docs/features/metrics.md`
 
 ---
 
@@ -209,7 +209,7 @@ src/
 ├── live/                # Live mode (collector, storage, compaction, reorg, progress)
 ├── storage/             # S3 storage (local, s3, cached, manifest, upload, retry, contract_index)
 ├── metrics/             # Prometheus metrics server and RPC metrics
-├── transformations/     # Transformation engine, handlers, registry, utils
+├── transformations/     # Transformation engine, handlers, registry, scheduler, utils
 └── types/               # Config types, shared types, decoded value types
 ```
 

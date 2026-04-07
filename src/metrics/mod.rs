@@ -1,9 +1,7 @@
-mod live;
 mod collection;
 mod rpc;
 mod transformations;
 
-pub use live::describe_live_metrics;
 pub use transformations::{describe_transformation_metrics, HandlerMetricsGuard};
 pub use collection::{describe_collection_metrics, record_parquet_write};
 pub use rpc::{

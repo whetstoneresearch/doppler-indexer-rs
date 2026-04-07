@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 use alloy::primitives::{Address, B256};
@@ -79,8 +78,6 @@ pub struct LiveCollector {
     expectations: LivePipelineExpectations,
     /// Channel for direct transformation retries.
     transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
-    /// Timestamp of the last block arrival for inter-block interval metrics.
-    last_block_arrival: Option<Instant>,
 }
 
 impl LiveCollector {
@@ -170,7 +167,6 @@ impl LiveCollector {
             db_pool,
             expectations,
             transform_retry_tx,
-            last_block_arrival: None,
         }
     }
 
@@ -227,17 +223,6 @@ impl LiveCollector {
                         hex::encode(&hash.0[..4])
                     );
 
-                    // Record inter-block arrival interval
-                    let chain_label = self.chain.name.clone();
-                    if let Some(prev) = self.last_block_arrival {
-                        metrics::histogram!(
-                            "live_block_arrival_interval_seconds",
-                            "chain" => chain_label.clone()
-                        )
-                        .record(prev.elapsed().as_secs_f64());
-                    }
-                    self.last_block_arrival = Some(Instant::now());
-
                     // Check for gap on first block
                     if !first_block_seen {
                         first_block_seen = true;
@@ -262,16 +247,8 @@ impl LiveCollector {
                                     gap_start,
                                     gap_end,
                                 );
-
-                                metrics::counter!(
-                                    "live_gap_detections_total",
-                                    "chain" => chain_label.clone()
-                                )
-                                .increment(1);
-
                                 // Backfill the gap before processing this block
-                                let backfill_start = Instant::now();
-                                let backfill_result = self
+                                if let Err(e) = self
                                     .backfill_blocks(
                                         gap_start,
                                         gap_end,
@@ -280,22 +257,8 @@ impl LiveCollector {
                                         &eth_call_decoder_tx,
                                         &transform_reorg_tx,
                                     )
-                                    .await;
-
-                                metrics::histogram!(
-                                    "live_backfill_duration_seconds",
-                                    "chain" => chain_label.clone(),
-                                    "reason" => "gap"
-                                )
-                                .record(backfill_start.elapsed().as_secs_f64());
-
-                                metrics::counter!(
-                                    "live_backfill_blocks_total",
-                                    "chain" => chain_label.clone()
-                                )
-                                .increment(gap_size);
-
-                                if let Err(e) = backfill_result {
+                                    .await
+                                {
                                     tracing::error!(
                                         "Error backfilling gap blocks {}-{}: {}",
                                         gap_start,
@@ -334,34 +297,19 @@ impl LiveCollector {
                         "WebSocket disconnected, last processed block: {:?}",
                         last_block
                     );
-
-                    metrics::counter!(
-                        "live_ws_disconnects_total",
-                        "chain" => self.chain.name.clone()
-                    )
-                    .increment(1);
                 }
 
                 WsEvent::Reconnected {
                     missed_from,
                     missed_to,
                 } => {
-                    let chain_label = self.chain.name.clone();
-
                     tracing::info!(
                         "WebSocket reconnected, backfilling blocks {} to {}",
                         missed_from,
                         missed_to
                     );
 
-                    metrics::counter!(
-                        "live_ws_reconnects_total",
-                        "chain" => chain_label.clone()
-                    )
-                    .increment(1);
-
-                    let backfill_start = Instant::now();
-                    let backfill_result = self
+                    if let Err(e) = self
                         .backfill_blocks(
                             missed_from,
                             missed_to,
@@ -370,23 +318,8 @@ impl LiveCollector {
                             &eth_call_decoder_tx,
                             &transform_reorg_tx,
                         )
-                        .await;
-
-                    metrics::histogram!(
-                        "live_backfill_duration_seconds",
-                        "chain" => chain_label.clone(),
-                        "reason" => "reconnect"
-                    )
-                    .record(backfill_start.elapsed().as_secs_f64());
-
-                    let backfill_count = missed_to.saturating_sub(missed_from) + 1;
-                    metrics::counter!(
-                        "live_backfill_blocks_total",
-                        "chain" => chain_label.clone()
-                    )
-                    .increment(backfill_count);
-
-                    if let Err(e) = backfill_result {
+                        .await
+                    {
                         tracing::error!(
                             "Error backfilling blocks {}-{}: {}",
                             missed_from,
@@ -412,23 +345,9 @@ impl LiveCollector {
         transform_reorg_tx: &Option<mpsc::Sender<ReorgMessage>>,
     ) -> Result<(), CollectorError> {
         let block_number = block.number;
-        let process_start = Instant::now();
-        let chain_label = self.chain.name.clone();
 
         // Check for reorg
         if let Some(reorg_event) = self.reorg_detector.process_block(&block) {
-            metrics::counter!(
-                "live_reorgs_total",
-                "chain" => chain_label.clone(),
-                "deep" => if reorg_event.is_deep { "true" } else { "false" }
-            )
-            .increment(1);
-            metrics::histogram!(
-                "live_reorg_depth",
-                "chain" => chain_label.clone()
-            )
-            .record(reorg_event.depth as f64);
-
             self.handle_reorg(
                 &reorg_event,
                 live_tx,
@@ -641,18 +560,6 @@ impl LiveCollector {
                 .mark_transformed_if_no_handlers(block_number);
         }
 
-        metrics::histogram!(
-            "live_block_processing_duration_seconds",
-            "chain" => chain_label.clone()
-        )
-        .record(process_start.elapsed().as_secs_f64());
-
-        metrics::counter!(
-            "live_blocks_processed_total",
-            "chain" => chain_label
-        )
-        .increment(1);
-
         Ok(())
     }
 
@@ -804,9 +711,7 @@ impl LiveCollector {
             total_missing
         );
 
-        let chain_label = self.chain.name.clone();
         for (start, end) in gaps {
-            let backfill_start = Instant::now();
             self.backfill_blocks(
                 start,
                 end,
@@ -816,20 +721,6 @@ impl LiveCollector {
                 transform_reorg_tx,
             )
             .await?;
-
-            metrics::histogram!(
-                "live_backfill_duration_seconds",
-                "chain" => chain_label.clone(),
-                "reason" => "storage_gap"
-            )
-            .record(backfill_start.elapsed().as_secs_f64());
-
-            let block_count = end.saturating_sub(start) + 1;
-            metrics::counter!(
-                "live_backfill_blocks_total",
-                "chain" => chain_label.clone()
-            )
-            .increment(block_count);
         }
 
         Ok(())

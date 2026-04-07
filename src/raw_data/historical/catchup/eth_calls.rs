@@ -640,7 +640,7 @@ pub async fn collect_eth_calls(
         );
 
         // Wrap shared data in Arcs for concurrent task access
-        let event_matchers = Arc::new(build_event_trigger_matchers(&chain.contracts));
+        let event_matchers = build_event_trigger_matchers(&chain.contracts);
         let event_call_configs_arc = Arc::new(event_call_configs.clone());
         let factory_addresses_arc = Arc::new(factory_addresses.clone());
         let existing_files_arc = Arc::new(existing_files.clone());
@@ -706,11 +706,64 @@ pub async fn collect_eth_calls(
                     continue;
                 }
 
-                // Acquire semaphore permit before spawning
+                // --- Sequential phase: read parquet + extract triggers (one file at a time) ---
+                // This avoids holding N large log files in memory concurrently.
+                let range_start = log_range.start;
+                let inclusive_end = log_range.end - 1;
+
+                let logs = match read_logs_from_parquet_async(log_range.file_path.clone()).await {
+                    Ok(logs) => logs,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read logs from {}: {}",
+                            log_range.file_path.display(),
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                if logs.is_empty() {
+                    continue;
+                }
+
+                tracing::info!(
+                    "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
+                    range_start,
+                    inclusive_end,
+                    logs.len()
+                );
+
+                let triggers = extract_event_triggers(&logs, &event_matchers);
+                // Drop logs immediately — only triggers (much smaller) are kept for RPC work
+                drop(logs);
+
+                if !triggers.is_empty() {
+                    tracing::info!(
+                        "Extracted {} event triggers for blocks {}-{}",
+                        triggers.len(),
+                        range_start,
+                        inclusive_end
+                    );
+                }
+
+                // --- Concurrent phase: acquire permit and spawn RPC work ---
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-                // Clone Arc'd data for the spawned task
-                let event_matchers = event_matchers.clone();
+                // Drain completed tasks to collect results eagerly
+                while let Some(result) = join_set.try_join_next() {
+                    match result {
+                        Ok(Ok(Some((start, end)))) => {
+                            processed_event_ranges.push((start, end));
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(EthCallCollectionError::JoinError(e.to_string()));
+                        }
+                    }
+                }
+
                 let event_call_configs = event_call_configs_arc.clone();
                 let factory_addresses = factory_addresses_arc.clone();
                 let existing_files = existing_files_arc.clone();
@@ -721,94 +774,66 @@ pub async fn collect_eth_calls(
                 let chain_name = chain_name_arc.clone();
                 let client = client.clone();
                 let decoder_tx = decoder_tx.clone();
-                let file_path = log_range.file_path.clone();
-                let range_start = log_range.start;
-                let range_end_exclusive = log_range.end;
 
                 join_set.spawn(async move {
-                    let _permit = permit; // Released when task completes
+                    // RPC phase — hold permit to limit concurrent RPC work
+                    let (skipped, mut pending_writes) = {
+                        let _permit = permit; // dropped at end of this block
 
-                    // Read logs from parquet file
-                    let logs = match read_logs_from_parquet_async(file_path.clone()).await {
-                        Ok(logs) => logs,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to read logs from {}: {}",
-                                file_path.display(),
-                                e
-                            );
-                            return Ok(None);
+                        let event_ctx = EthCallContext {
+                            client: &client,
+                            output_dir: &base_output_dir,
+                            existing_files: &existing_files,
+                            rpc_batch_size,
+                            decoder_tx: &decoder_tx,
+                            chain_name: &chain_name,
+                            storage_manager: storage_manager.as_ref(),
+                            s3_manifest: &s3_manifest,
+                        };
+                        if let Some(multicall_addr) = multicall3_address {
+                            process_event_triggers_multicall(
+                                triggers,
+                                &event_call_configs,
+                                &factory_addresses,
+                                &event_ctx,
+                                multicall_addr,
+                                range_start,
+                                inclusive_end,
+                                &contracts,
+                                true,
+                            )
+                            .await?
+                        } else {
+                            process_event_triggers(
+                                triggers,
+                                &event_call_configs,
+                                &factory_addresses,
+                                &event_ctx,
+                                range_start,
+                                inclusive_end,
+                                &contracts,
+                                true,
+                            )
+                            .await?
                         }
-                    };
+                    }; // permit released — next range's RPC can start immediately
 
-                    if logs.is_empty() {
-                        return Ok(None);
-                    }
-
-                    let inclusive_end = range_end_exclusive - 1;
-
-                    tracing::info!(
-                        "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
-                        range_start,
-                        inclusive_end,
-                        logs.len()
-                    );
-
-                    // Extract event triggers from logs
-                    let triggers = extract_event_triggers(&logs, &event_matchers);
-
-                    if !triggers.is_empty() {
-                        tracing::info!(
-                            "Extracted {} event triggers from {} logs for blocks {}-{}",
-                            triggers.len(),
-                            logs.len(),
-                            range_start,
-                            inclusive_end
-                        );
-                    }
-
-                    // Process the triggers with skip_contract_index=true (deferred to after)
-                    let event_ctx = EthCallContext {
-                        client: &client,
-                        output_dir: &base_output_dir,
-                        existing_files: &existing_files,
-                        rpc_batch_size,
-                        decoder_tx: &decoder_tx,
-                        chain_name: &chain_name,
-                        storage_manager: storage_manager.as_ref(),
-                        s3_manifest: &s3_manifest,
-                    };
-                    let skipped = if let Some(multicall_addr) = multicall3_address {
-                        process_event_triggers_multicall(
-                            triggers,
-                            &event_call_configs,
-                            &factory_addresses,
-                            &event_ctx,
-                            multicall_addr,
-                            range_start,
-                            inclusive_end,
-                            &contracts,
-                            true,
-                        )
-                        .await?
-                    } else {
-                        process_event_triggers(
-                            triggers,
-                            &event_call_configs,
-                            &factory_addresses,
-                            &event_ctx,
-                            range_start,
-                            inclusive_end,
-                            &contracts,
-                            true,
-                        )
-                        .await?
-                    };
                     if !skipped.is_empty() {
                         tracing::warn!(
                             "Unexpected skipped factory triggers during catchup ({} triggers) — factory addresses should be pre-loaded",
                             skipped.len()
                         );
+                    }
+
+                    // Write phase — no permit held, runs concurrently with other ranges' RPC
+                    while let Some(result) = pending_writes.join_next().await {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => return Err(e),
+                            Err(e) => {
+                                return Err(EthCallCollectionError::JoinError(e.to_string()))
+                            }
+                        }
                     }
 
                     tracing::debug!(
