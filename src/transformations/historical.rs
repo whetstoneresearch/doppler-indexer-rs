@@ -104,8 +104,18 @@ impl HistoricalDataReader {
                 }
                 let name = name_entry.file_name().to_string_lossy().to_string();
 
-                // Find parquet files and extract ranges (already sorted by start)
-                let files = scan_parquet_ranges(&name_entry.path())?;
+                // Find parquet files and extract ranges (already sorted by start).
+                // Event-triggered decoded calls are stored under an `on_events/`
+                // subdirectory, so mirror the catchup loader's first-match
+                // semantics and fall back to indexing that location when the
+                // top-level function directory has no parquet files.
+                let mut files = scan_parquet_ranges(&name_entry.path())?;
+                if files.is_empty() {
+                    let on_events_dir = name_entry.path().join("on_events");
+                    if on_events_dir.is_dir() {
+                        files = scan_parquet_ranges(&on_events_dir)?;
+                    }
+                }
 
                 let key = (source_name.clone(), name);
                 index.insert(key, files);
@@ -827,10 +837,12 @@ fn extract_value_from_array(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::RwLock;
 
     use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use tempfile::TempDir;
 
     use super::{batch_to_events, HistoricalDataReader};
     use crate::types::decoded::DecodedValue;
@@ -848,6 +860,33 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].3, 0);
         assert_eq!(files[0].4, 9999);
+    }
+
+    #[test]
+    fn rebuild_index_falls_back_to_on_events_when_function_dir_is_empty() {
+        let temp = TempDir::new().unwrap();
+        let calls_dir = temp
+            .path()
+            .join("eth_calls")
+            .join("Hook")
+            .join("getSlot0")
+            .join("on_events");
+        std::fs::create_dir_all(&calls_dir).unwrap();
+        std::fs::write(calls_dir.join("100-199.parquet"), []).unwrap();
+
+        let reader = HistoricalDataReader {
+            chain_name: "test".to_string(),
+            decoded_base: temp.path().to_path_buf(),
+            file_index: RwLock::new(HashMap::new()),
+            call_cache: RwLock::new(HashMap::new()),
+        };
+
+        reader.rebuild_index().unwrap();
+
+        let index = reader.file_index.read().unwrap();
+        let files = reader.find_files_for_range(&index, Some("Hook"), Some("getSlot0"), 150, 151);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].2, calls_dir.join("100-199.parquet"));
     }
 
     #[test]

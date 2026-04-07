@@ -934,6 +934,97 @@ impl TransformationEngine {
         Self::catchup_failure_error(&failed_handlers)
     }
 
+    fn resolve_decoded_call_path(
+        &self,
+        range_key: (u64, u64),
+        source: &str,
+        function_name: &str,
+    ) -> Option<PathBuf> {
+        let file_name = format!("{}-{}.parquet", range_key.0, range_key.1 - 1);
+        let base_dir = self.decoded_calls_dir.join(source).join(function_name);
+
+        [
+            base_dir.join(&file_name),
+            base_dir.join("on_events").join(&file_name),
+            base_dir.join("once").join(&file_name),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+    }
+
+    async fn hydrate_call_dependency_from_disk(
+        &self,
+        range_key: (u64, u64),
+        dep: &(String, String),
+    ) -> Result<bool, TransformationError> {
+        {
+            let state = self.live_state.lock().await;
+            if state
+                .received_calls
+                .get(dep)
+                .map(|ranges| ranges.contains(&range_key))
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+
+        let Some(file_path) = self.resolve_decoded_call_path(range_key, &dep.0, &dep.1) else {
+            return Ok(false);
+        };
+
+        let historical_reader = self.historical_reader.clone();
+        let source_name = dep.0.clone();
+        let function_name = dep.1.clone();
+        let file_path_for_read = file_path.clone();
+        let calls = tokio::task::spawn_blocking(move || {
+            historical_reader.read_calls_from_file(
+                &file_path_for_read,
+                &source_name,
+                &function_name,
+            )
+        })
+        .await
+        .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))??;
+
+        let mut state = self.live_state.lock().await;
+        let ranges = state.received_calls.entry(dep.clone()).or_default();
+        if !ranges.insert(range_key) {
+            return Ok(true);
+        }
+        if !calls.is_empty() {
+            state
+                .calls_buffer
+                .entry(range_key)
+                .or_default()
+                .extend(calls);
+        }
+
+        tracing::debug!(
+            "Hydrated call dependency {}/{} for range {}-{} from {}",
+            dep.0,
+            dep.1,
+            range_key.0,
+            range_key.1,
+            file_path.display()
+        );
+
+        Ok(true)
+    }
+
+    async fn hydrate_missing_call_deps_from_disk(
+        &self,
+        range_key: (u64, u64),
+        deps: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<(), TransformationError> {
+        for dep in deps {
+            let _ = self
+                .hydrate_call_dependency_from_disk(range_key, &dep)
+                .await?;
+        }
+        Ok(())
+    }
+
     // ─── Receipt Address Reading ────────────────────────────────────
 
     async fn read_receipt_addresses(
@@ -1052,7 +1143,9 @@ impl TransformationEngine {
                             }
                         }
                         drop(state);
+                    }
 
+                    if matches!(msg.kind, RangeCompleteKind::Logs | RangeCompleteKind::EthCalls) {
                         self.try_process_pending_events(range_key).await?;
                     }
 
@@ -1134,9 +1227,28 @@ impl TransformationEngine {
         }
 
         let events = Arc::new(filtered_events.clone());
+        let range_key = (msg.range_start, msg.range_end);
+
+        let missing_call_deps: HashSet<(String, String)> = {
+            let state = self.live_state.lock().await;
+            handlers
+                .iter()
+                .flat_map(|handler| handler.call_dependencies())
+                .filter(|dep| {
+                    !state
+                        .received_calls
+                        .get(dep)
+                        .map(|ranges| ranges.contains(&range_key))
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+        if !missing_call_deps.is_empty() {
+            self.hydrate_missing_call_deps_from_disk(range_key, missing_call_deps)
+                .await?;
+        }
 
         // Categorize handlers: ready to run vs needs buffering
-        let range_key = (msg.range_start, msg.range_end);
         let mut ready_handlers: Vec<ReadyHandler> = Vec::new();
         let mut dep_failed_names: Vec<String> = Vec::new();
         {
@@ -1652,6 +1764,30 @@ impl TransformationEngine {
         range_key: (u64, u64),
     ) -> Result<(), TransformationError> {
         loop {
+            let missing_call_deps: HashSet<(String, String)> = {
+                let state = self.live_state.lock().await;
+                state
+                    .pending_events
+                    .values()
+                    .flat_map(|entries| entries.iter())
+                    .filter(|event_data| {
+                        (event_data.range_start, event_data.range_end) == range_key
+                    })
+                    .flat_map(|event_data| event_data.required_calls.iter().cloned())
+                    .filter(|dep| {
+                        !state
+                            .received_calls
+                            .get(dep)
+                            .map(|ranges| ranges.contains(&range_key))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            };
+            if !missing_call_deps.is_empty() {
+                self.hydrate_missing_call_deps_from_disk(range_key, missing_call_deps)
+                    .await?;
+            }
+
             let ready_events: Vec<(
                 String,
                 PendingEventData,
