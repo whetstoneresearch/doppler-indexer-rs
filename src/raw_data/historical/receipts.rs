@@ -78,7 +78,7 @@ pub struct LogData {
 
 #[derive(Debug, Clone)]
 pub enum LogMessage {
-    Logs(Vec<LogData>),
+    Logs(Arc<Vec<LogData>>),
     RangeComplete { range_start: u64, range_end: u64 },
     AllRangesComplete,
 }
@@ -506,6 +506,7 @@ pub(crate) async fn send_logs_to_channels(
     metrics: &mut ChannelMetricsState,
 ) -> Result<(), ReceiptCollectionError> {
     let log_count = batch_logs.len();
+    let logs = Arc::new(batch_logs);
 
     if let Some(sender) = &channels.factory_log_tx {
         let capacity_before = sender.capacity();
@@ -521,7 +522,7 @@ pub(crate) async fn send_logs_to_channels(
 
         let send_start = Instant::now();
         if sender
-            .send(LogMessage::Logs(batch_logs.clone()))
+            .send(LogMessage::Logs(Arc::clone(&logs)))
             .await
             .is_err()
         {
@@ -557,7 +558,7 @@ pub(crate) async fn send_logs_to_channels(
         }
 
         let send_start = Instant::now();
-        if sender.send(LogMessage::Logs(batch_logs)).await.is_err() {
+        if sender.send(LogMessage::Logs(logs)).await.is_err() {
             tracing::error!(
                 "Failed to send {} logs to log_tx - receiver dropped",
                 log_count
@@ -1145,7 +1146,7 @@ fn write_parquet(
     output_path: &Path,
 ) -> Result<(), ReceiptCollectionError> {
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
