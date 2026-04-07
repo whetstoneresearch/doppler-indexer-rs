@@ -96,6 +96,9 @@
         },
         "contract_logs_only": false        
     },
+    "metrics": {
+        "addr": "0.0.0.0:9090"
+    },
     "transformations": {
         "database_url_env_var": "DATABASE_URL",
         "mode": {
