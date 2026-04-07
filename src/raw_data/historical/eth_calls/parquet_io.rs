@@ -77,7 +77,7 @@ pub(crate) fn write_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -219,6 +219,120 @@ pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String
     index
 }
 
+/// All state extracted from a single read of a once-call parquet file.
+///
+/// Eliminates redundant file opens by reading once and extracting all
+/// validation info (schema, null positions, row count) plus the full
+/// record batches in a single pass.
+pub(crate) struct OnceParquetState {
+    /// Function names extracted from schema (stripped `_result` suffix).
+    pub column_names: HashSet<String>,
+    /// Total row count across all batches.
+    pub row_count: u64,
+    /// Per-column null entries: fn_name -> set of addresses with null values.
+    pub null_entries: HashMap<String, HashSet<[u8; 20]>>,
+    /// The full record batches (use `.take()` when ownership is needed for merge).
+    pub batches: Option<Vec<RecordBatch>>,
+}
+
+/// Read a once-call parquet file once, extracting all state needed for
+/// validation and processing in a single pass.
+pub(crate) fn read_once_parquet_state(
+    path: &Path,
+) -> Result<OnceParquetState, EthCallCollectionError> {
+    let batches = read_existing_once_parquet(path)?;
+
+    // Extract column names from schema
+    let column_names = if let Some(first) = batches.first() {
+        extract_column_names_from_schema(&first.schema())
+    } else {
+        HashSet::new()
+    };
+
+    // Compute row count
+    let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();
+
+    // Extract null entries from batches
+    let null_entries = extract_null_entries_from_batches(&batches);
+
+    Ok(OnceParquetState {
+        column_names,
+        row_count,
+        null_entries,
+        batches: Some(batches),
+    })
+}
+
+pub(crate) async fn read_once_parquet_state_async(
+    path: PathBuf,
+) -> Result<OnceParquetState, EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || read_once_parquet_state(&path))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+/// Extract function names from a schema by stripping the `_result` suffix.
+fn extract_column_names_from_schema(schema: &Schema) -> HashSet<String> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| f.name().strip_suffix("_result").map(|s| s.to_string()))
+        .collect()
+}
+
+/// Extract per-address null entries from already-read batches.
+fn extract_null_entries_from_batches(
+    batches: &[RecordBatch],
+) -> HashMap<String, HashSet<[u8; 20]>> {
+    if batches.is_empty() {
+        return HashMap::new();
+    }
+    let schema = batches[0].schema();
+    let result_fn_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .filter_map(|f| f.name().strip_suffix("_result").map(|s| s.to_string()))
+        .collect();
+    if result_fn_names.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut null_entries: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
+    for batch in batches {
+        let address_col = match batch.column_by_name("contract_address") {
+            Some(col) => col,
+            None => continue,
+        };
+        let address_arr = match address_col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for fn_name in &result_fn_names {
+            let col_name = format!("{}_result", fn_name);
+            let col = match batch.column_by_name(&col_name) {
+                Some(c) => c,
+                None => continue,
+            };
+            if col.null_count() == 0 {
+                continue;
+            }
+            for i in 0..batch.num_rows() {
+                if col.is_null(i) {
+                    let addr_bytes: [u8; 20] = match address_arr.value(i).try_into() {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    null_entries
+                        .entry(fn_name.clone())
+                        .or_default()
+                        .insert(addr_bytes);
+                }
+            }
+        }
+    }
+    null_entries
+}
+
 /// Read column names from a parquet file's schema (for fallback when index is missing).
 /// Returns function names by stripping the `_result` suffix from column names.
 pub(crate) fn read_parquet_column_names(path: &Path) -> HashSet<String> {
@@ -251,6 +365,7 @@ pub(crate) fn read_parquet_column_names(path: &Path) -> HashSet<String> {
 /// Find per-address null entries in `_result` columns.
 /// Returns a map of function_name -> set of addresses that have null values for that function.
 /// Used to identify which specific (address, column) pairs need re-fetching.
+#[allow(dead_code)]
 pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]>> {
     let batches = match read_existing_once_parquet(path) {
         Ok(b) => b,
@@ -598,7 +713,7 @@ pub(crate) fn write_once_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -610,7 +725,7 @@ pub(crate) fn write_record_batch_to_parquet(
     batch: &RecordBatch,
     output_path: &Path,
 ) -> Result<(), EthCallCollectionError> {
-    crate::storage::atomic_write_parquet(batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(batch, output_path)?;
     Ok(())
 }
 
@@ -651,12 +766,14 @@ pub(crate) async fn write_record_batch_to_parquet_async(
         .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
 }
 
+#[allow(dead_code)]
 pub(crate) async fn read_parquet_column_names_async(path: PathBuf) -> HashSet<String> {
     tokio::task::spawn_blocking(move || read_parquet_column_names(&path))
         .await
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub(crate) async fn read_parquet_row_count_async(path: PathBuf) -> u64 {
     tokio::task::spawn_blocking(move || {
         use parquet::file::reader::FileReader;
@@ -677,6 +794,7 @@ pub(crate) async fn read_parquet_row_count_async(path: PathBuf) -> u64 {
     .unwrap_or(0)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn read_existing_once_parquet_async(
     path: PathBuf,
 ) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
@@ -710,6 +828,7 @@ pub(crate) async fn write_once_column_index_async(
         .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
 }
 
+#[allow(dead_code)]
 pub(crate) async fn find_null_entries_async(path: PathBuf) -> HashMap<String, HashSet<[u8; 20]>> {
     tokio::task::spawn_blocking(move || find_null_entries(&path))
         .await

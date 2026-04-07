@@ -1432,7 +1432,7 @@ pub(crate) fn write_event_call_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 

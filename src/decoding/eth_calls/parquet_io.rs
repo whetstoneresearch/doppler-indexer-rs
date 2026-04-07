@@ -123,7 +123,7 @@ pub(super) fn write_decoded_calls_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -210,7 +210,7 @@ pub(super) fn write_decoded_event_calls_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -958,7 +958,7 @@ pub(super) fn merge_decoded_once_calls(
 
     // Write merged parquet
     let batch = RecordBatch::try_new(new_schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -1045,7 +1045,7 @@ pub(super) fn write_decoded_once_calls_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 

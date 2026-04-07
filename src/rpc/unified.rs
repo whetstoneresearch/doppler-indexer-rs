@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use alloy::primitives::{Address, BlockNumber, Bytes, B256, U256};
-use alloy::providers::Provider;
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
@@ -191,7 +190,7 @@ impl UnifiedRpcClient {
 
     /// Stream blocks as they are fetched, sending each to the provided channel.
     /// Returns a JoinHandle that completes when all blocks are fetched.
-    /// For Standard client, falls back to sequential fetching.
+    /// Both Standard and Alchemy clients use concurrent fetching.
     pub fn get_blocks_streaming(
         &self,
         block_numbers: Vec<BlockNumberOrTag>,
@@ -200,23 +199,7 @@ impl UnifiedRpcClient {
     ) -> tokio::task::JoinHandle<()> {
         match self {
             Self::Standard(client) => {
-                // Fallback: fetch sequentially and send to channel
-                let provider = client.provider().clone();
-                tokio::spawn(async move {
-                    for number in block_numbers {
-                        let result = async {
-                            let builder = provider.get_block(BlockId::Number(number));
-                            if full_transactions {
-                                builder.full().await
-                            } else {
-                                builder.await
-                            }
-                        }
-                        .await
-                        .map_err(|e| RpcError::ProviderError(format!("{:?}", e)));
-                        let _ = result_tx.send((number, result)).await;
-                    }
-                })
+                client.get_blocks_streaming(block_numbers, full_transactions, result_tx)
             }
             Self::Alchemy(client) => {
                 client.get_blocks_streaming(block_numbers, full_transactions, result_tx)

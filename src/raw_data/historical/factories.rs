@@ -699,7 +699,7 @@ fn write_factory_records_to_parquet(
     ];
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -927,7 +927,7 @@ fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollecti
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 

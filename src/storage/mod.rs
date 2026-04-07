@@ -52,7 +52,7 @@ pub use initial_sync::InitialSyncService;
 pub use local::LocalBackend;
 pub use manifest::{ManifestManager, S3Manifest};
 pub use paths::BlockRange;
-pub use parquet_writer::atomic_write_parquet;
+pub use parquet_writer::{atomic_write_parquet, atomic_write_parquet_fast};
 pub use retry::RetryQueue;
 pub use s3::S3Backend;
 pub use upload::{upload_parquet_to_s3, upload_sidecar_to_s3};

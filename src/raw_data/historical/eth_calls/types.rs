@@ -119,6 +119,8 @@ pub struct ContractProcessingInfo {
     pub patch_fn_names: Vec<String>,
     pub output_path: PathBuf,
     pub has_existing_file: bool,
+    /// Pre-read parquet state (batches for merge, avoids re-reading the file).
+    pub parquet_state: Option<super::parquet_io::OnceParquetState>,
 }
 
 /// Info needed to process a factory collection's once-calls through the
@@ -132,6 +134,8 @@ pub struct FactoryContractProcessingInfo {
     pub output_path: PathBuf,
     pub has_existing_file: bool,
     pub once_configs: Vec<OnceCallConfig>,
+    /// Pre-read parquet state (batches for merge, avoids re-reading the file).
+    pub parquet_state: Option<super::parquet_io::OnceParquetState>,
 }
 
 #[derive(Debug, Clone)]

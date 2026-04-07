@@ -128,6 +128,7 @@ pub async fn collect_factories(
 
         match message {
             LogMessage::Logs(logs) => {
+                let logs = Arc::try_unwrap(logs).unwrap_or_else(|arc| (*arc).clone());
                 for log in logs {
                     let range_start = (log.block_number / range_size) * range_size;
                     range_data.entry(range_start).or_default().push(log);

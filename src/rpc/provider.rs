@@ -801,6 +801,92 @@ impl RpcClient {
         Ok(all_results)
     }
 
+    /// Stream blocks as they are fetched concurrently, sending each to the provided channel.
+    /// Uses a bounded JoinSet pipeline for concurrent fetching with backpressure.
+    /// Returns a JoinHandle that completes when all blocks are fetched.
+    pub fn get_blocks_streaming(
+        &self,
+        block_numbers: Vec<BlockNumberOrTag>,
+        full_transactions: bool,
+        result_tx: tokio::sync::mpsc::Sender<(BlockNumberOrTag, Result<Option<Block>, RpcError>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        let max_in_flight = self.config.max_batch_size * 2;
+        let client = self.clone();
+
+        tokio::spawn(async move {
+            let mut iter = block_numbers.into_iter();
+            let mut join_set = tokio::task::JoinSet::new();
+
+            // Seed initial batch
+            for number in iter.by_ref().take(max_in_flight) {
+                let client = client.clone();
+                let tx = result_tx.clone();
+                join_set.spawn(async move {
+                    let op_name = format!("eth_getBlockByNumber({:?})", number);
+                    let result = with_retry(
+                        &client.config.retry,
+                        &op_name,
+                        &client.chain,
+                        || async {
+                            client.wait_for_rate_limit().await;
+                            let builder =
+                                client.provider.get_block(BlockId::Number(number));
+                            if full_transactions {
+                                builder
+                                    .full()
+                                    .await
+                                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                            } else {
+                                builder
+                                    .await
+                                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                            }
+                        },
+                    )
+                    .await;
+                    let _ = tx.send((number, result)).await;
+                });
+            }
+
+            // Pipeline: as tasks complete, spawn replacements
+            while let Some(join_result) = join_set.join_next().await {
+                if let Err(e) = join_result {
+                    tracing::error!("Task panicked in get_blocks_streaming: {:?}", e);
+                }
+
+                if let Some(number) = iter.next() {
+                    let client = client.clone();
+                    let tx = result_tx.clone();
+                    join_set.spawn(async move {
+                        let op_name = format!("eth_getBlockByNumber({:?})", number);
+                        let result = with_retry(
+                            &client.config.retry,
+                            &op_name,
+                            &client.chain,
+                            || async {
+                                client.wait_for_rate_limit().await;
+                                let builder =
+                                    client.provider.get_block(BlockId::Number(number));
+                                if full_transactions {
+                                    builder
+                                        .full()
+                                        .await
+                                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                                } else {
+                                    builder
+                                        .await
+                                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                                }
+                            },
+                        )
+                        .await;
+                        let _ = tx.send((number, result)).await;
+                    });
+                }
+            }
+        })
+    }
+
     pub async fn get_transaction_receipts_batch(
         &self,
         hashes: Vec<B256>,

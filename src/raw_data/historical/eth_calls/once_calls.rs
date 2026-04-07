@@ -13,10 +13,9 @@ use super::multicall::{
 };
 use super::parquet_io::{
     extract_addresses_from_once_parquet, extract_existing_results_from_parquet,
-    find_null_entries_async, merge_once_columns, read_existing_once_parquet_async,
-    read_once_column_index_async, read_parquet_column_names_async,
-    read_parquet_row_count_async, write_once_column_index_async,
-    write_once_results_to_parquet_async, write_record_batch_to_parquet_async,
+    merge_once_columns, read_once_column_index_async, read_once_parquet_state_async,
+    write_once_column_index_async, write_once_results_to_parquet_async,
+    write_record_batch_to_parquet_async,
 };
 use super::types::{
     AddressResults, BlockInfo, BlockRange, CollectionResults, ContractProcessingInfo,
@@ -60,27 +59,30 @@ pub(crate) async fn process_once_calls_regular(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) =
+        // Read the parquet file once (if it exists) to get schema, null entries,
+        // and batches. This replaces 3 separate file opens with 1.
+        let (missing_fn_names, has_existing_file, null_entries, mut parquet_state) =
             if ctx.existing_files.contains(&rel_path) {
                 let index = read_once_column_index_async(sub_dir.clone()).await;
+                let mut state = read_once_parquet_state_async(output_path.clone()).await?;
                 let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
                     cols.iter().cloned().collect()
                 } else {
                     tracing::debug!(
-                        "File {} exists but not in index, reading schema from parquet",
+                        "File {} exists but not in index, using schema from parquet state",
                         output_path.display()
                     );
-                    read_parquet_column_names_async(output_path.clone()).await
+                    state.column_names.clone()
                 };
                 let missing: Vec<String> = all_fn_names
                     .iter()
                     .filter(|f| !existing_cols.contains(*f))
                     .cloned()
                     .collect();
-                // Find addresses with null values for existing columns
-                let all_null_entries = find_null_entries_async(output_path.clone()).await;
-                let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
-                    .into_iter()
+                // Filter null entries to only existing (non-missing) columns
+                let null_entries: HashMap<String, HashSet<[u8; 20]>> = state
+                    .null_entries
+                    .drain()
                     .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
                     .collect();
                 if missing.is_empty() && null_entries.is_empty() {
@@ -113,9 +115,9 @@ pub(crate) async fn process_once_calls_regular(
                     range.end - 1,
                 );
                 }
-                (missing, true, null_entries)
+                (missing, true, null_entries, Some(state))
             } else {
-                (all_fn_names.clone(), false, HashMap::new())
+                (all_fn_names.clone(), false, HashMap::new(), None)
             };
 
         // Filter call configs to only missing functions
@@ -275,7 +277,11 @@ pub(crate) async fn process_once_calls_regular(
                 .map(|(addr, fns)| (addr.0 .0, fns))
                 .collect();
 
-            let existing_batches = read_existing_once_parquet_async(output_path.clone()).await?;
+            // Reuse batches from the single-read state instead of re-reading the file
+            let existing_batches = parquet_state
+                .as_mut()
+                .and_then(|s| s.batches.take())
+                .unwrap_or_default();
             if !existing_batches.is_empty() {
                 // Combine missing + patch function names for merge
                 let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
@@ -348,11 +354,9 @@ pub(crate) async fn process_once_calls_regular(
             .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        // Update the column index with all columns present in the file
-        let actual_cols: Vec<String> = read_parquet_column_names_async(output_path.clone())
-            .await
-            .into_iter()
-            .collect();
+        // Update the column index — use all_fn_names directly instead of
+        // re-reading the file we just wrote.
+        let actual_cols: Vec<String> = all_fn_names.clone();
         let mut index = read_once_column_index_async(sub_dir.clone()).await;
         index.insert(file_name.clone(), actual_cols.clone());
         write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
@@ -406,7 +410,9 @@ pub(crate) async fn process_factory_once_calls(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) = if ctx
+        // Read the parquet file once (if it exists) to get schema, null entries,
+        // row count, and batches. This replaces 3 separate file opens with 1.
+        let (missing_fn_names, has_existing_file, null_entries, mut parquet_state) = if ctx
             .existing_files
             .contains(&rel_path)
         {
@@ -416,8 +422,9 @@ pub(crate) async fn process_factory_once_calls(
                 .map(|cols| cols.iter().cloned().collect())
                 .unwrap_or_default();
 
-            // Check actual parquet schema to determine truly missing columns
-            let parquet_cols = read_parquet_column_names_async(output_path.clone()).await;
+            // Single read: get schema, null entries, row count, and batches
+            let mut state = read_once_parquet_state_async(output_path.clone()).await?;
+            let parquet_cols = &state.column_names;
 
             // Missing: in config but not in the parquet file
             let missing: Vec<String> = all_fn_names
@@ -432,16 +439,15 @@ pub(crate) async fn process_factory_once_calls(
             // 3) the column with nulls is not in the column index for that file
             // If a column IS in the index, nulls are considered permanent.
             let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
-                let unindexed_in_parquet: Vec<&String> = all_fn_names
+                let has_unindexed = all_fn_names
                     .iter()
-                    .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
-                    .collect();
-                if unindexed_in_parquet.is_empty() {
+                    .any(|f| parquet_cols.contains(f) && !indexed_cols.contains(f));
+                if !has_unindexed {
                     HashMap::new()
                 } else {
-                    let all_null_entries = find_null_entries_async(output_path.clone()).await;
-                    all_null_entries
-                        .into_iter()
+                    state
+                        .null_entries
+                        .drain()
                         .filter(|(k, _)| !indexed_cols.contains(k))
                         .collect()
                 }
@@ -459,7 +465,7 @@ pub(crate) async fn process_factory_once_calls(
                 };
                 if index_complete {
                     // Address-level check: compare factory address count
-                    // against file row count.
+                    // against file row count (using state.row_count).
                     let factory_addr_count = factory_data
                         .addresses_by_block
                         .values()
@@ -467,13 +473,11 @@ pub(crate) async fn process_factory_once_calls(
                         .filter(|(_, _, coll)| coll == collection_name)
                         .count() as u64;
                     if factory_addr_count > 0 {
-                        let file_rows =
-                            read_parquet_row_count_async(output_path.clone()).await;
-                        if file_rows < factory_addr_count {
+                        if state.row_count < factory_addr_count {
                             tracing::info!(
                                 "Factory once {} blocks {}-{}: file has {} rows but factory has {} addresses, re-checking",
                                 collection_name, range.start, range.end - 1,
-                                file_rows, factory_addr_count,
+                                state.row_count, factory_addr_count,
                             );
                         } else {
                             continue;
@@ -510,9 +514,9 @@ pub(crate) async fn process_factory_once_calls(
                     range.end - 1,
                 );
             }
-            (missing, true, null_entries)
+            (missing, true, null_entries, Some(state))
         } else {
-            (all_fn_names.clone(), false, HashMap::new())
+            (all_fn_names.clone(), false, HashMap::new(), None)
         };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
@@ -566,15 +570,17 @@ pub(crate) async fn process_factory_once_calls(
             continue;
         }
 
-        // C. Read parquet early to identify absent addresses
-        let (mut existing_batches_opt, existing_addr_set) = if has_existing_file {
-            let batches = read_existing_once_parquet_async(output_path.clone()).await?;
-            let addrs: HashSet<[u8; 20]> = extract_addresses_from_once_parquet(&batches)
-                .into_keys()
-                .collect();
-            (Some(batches), addrs)
+        // C. Reuse batches from parquet_state to identify absent addresses
+        let existing_addr_set = if let Some(ref state) = parquet_state {
+            if let Some(ref batches) = state.batches {
+                extract_addresses_from_once_parquet(batches)
+                    .into_keys()
+                    .collect()
+            } else {
+                HashSet::new()
+            }
         } else {
-            (None, HashSet::new())
+            HashSet::new()
         };
 
         let absent_addresses: Vec<(&Address, &(u64, u64))> = address_discovery
@@ -792,11 +798,11 @@ pub(crate) async fn process_factory_once_calls(
         tokio::fs::create_dir_all(&sub_dir).await?;
 
         if has_existing_file {
-            // E. Reuse pre-read batches from step C (or read now if not available)
-            let existing_batches = match existing_batches_opt.take() {
-                Some(batches) => batches,
-                None => read_existing_once_parquet_async(output_path.clone()).await?,
-            };
+            // E. Reuse batches from single-read parquet state
+            let existing_batches = parquet_state
+                .as_mut()
+                .and_then(|s| s.batches.take())
+                .unwrap_or_default();
             let existing_is_empty = existing_batches.is_empty()
                 || existing_batches.iter().all(|b| b.num_rows() == 0);
 
@@ -1037,11 +1043,9 @@ pub(crate) async fn process_factory_once_calls(
             .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        // Update the column index with all columns present in the file
-        let actual_cols: Vec<String> = read_parquet_column_names_async(output_path.clone())
-            .await
-            .into_iter()
-            .collect();
+        // Update the column index — use all_fn_names directly instead of
+        // re-reading the file we just wrote.
+        let actual_cols: Vec<String> = all_fn_names.clone();
         let mut index = read_once_column_index_async(sub_dir.clone()).await;
         index.insert(file_name.clone(), actual_cols.clone());
         write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
@@ -1110,31 +1114,34 @@ pub(crate) async fn process_once_calls_multicall(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) =
+        // Read the parquet file once (if it exists) to get schema, null entries,
+        // and batches. This replaces 3 separate file opens with 1.
+        let (missing_fn_names, has_existing_file, null_entries, parquet_state) =
             if ctx.existing_files.contains(&rel_path) {
                 let index = read_once_column_index_async(sub_dir.clone()).await;
+                let mut state = read_once_parquet_state_async(output_path.clone()).await?;
                 let existing_cols: HashSet<String> = if let Some(cols) = index.get(&file_name) {
                     cols.iter().cloned().collect()
                 } else {
-                    read_parquet_column_names_async(output_path.clone()).await
+                    state.column_names.clone()
                 };
                 let missing: Vec<String> = all_fn_names
                     .iter()
                     .filter(|f| !existing_cols.contains(*f))
                     .cloned()
                     .collect();
-                // Find addresses with null values for existing columns
-                let all_null_entries = find_null_entries_async(output_path.clone()).await;
-                let null_entries: HashMap<String, HashSet<[u8; 20]>> = all_null_entries
-                    .into_iter()
+                // Filter null entries to only existing (non-missing) columns
+                let null_entries: HashMap<String, HashSet<[u8; 20]>> = state
+                    .null_entries
+                    .drain()
                     .filter(|(k, _)| existing_cols.contains(k) && !missing.contains(k))
                     .collect();
                 if missing.is_empty() && null_entries.is_empty() {
                     continue;
                 }
-                (missing, true, null_entries)
+                (missing, true, null_entries, Some(state))
             } else {
-                (all_fn_names.clone(), false, HashMap::new())
+                (all_fn_names.clone(), false, HashMap::new(), None)
             };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
@@ -1247,6 +1254,7 @@ pub(crate) async fn process_once_calls_multicall(
             patch_fn_names,
             output_path,
             has_existing_file,
+            parquet_state,
         });
     }
 
@@ -1293,6 +1301,7 @@ pub(crate) async fn process_once_calls_multicall(
         patch_fn_names,
         output_path,
         has_existing_file,
+        mut parquet_state,
     } in contracts_to_process
     {
         let sub_dir = output_path.parent().unwrap();
@@ -1322,8 +1331,11 @@ pub(crate) async fn process_once_calls_multicall(
                     .map(|(addr, fns)| (addr.0 .0, fns))
                     .collect();
 
-                let existing_batches =
-                    read_existing_once_parquet_async(output_path.clone()).await?;
+                // Reuse batches from single-read parquet state
+                let existing_batches = parquet_state
+                    .as_mut()
+                    .and_then(|s| s.batches.take())
+                    .unwrap_or_default();
                 if !existing_batches.is_empty() {
                     // Combine missing + patch function names for merge
                     let all_new_fn_names: Vec<String> = missing_fn_names
@@ -1386,18 +1398,16 @@ pub(crate) async fn process_once_calls_multicall(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            // Update column index with all columns present in the file
+            // Update column index — use all_fn_names directly instead of
+            // re-reading the file we just wrote.
             let file_name = output_path
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            let actual_cols: Vec<String> = read_parquet_column_names_async(output_path.clone())
-                .await
-                .into_iter()
-                .collect();
+            let actual_cols: Vec<String> = all_fn_names.clone();
             let mut index = read_once_column_index_async(sub_dir.to_path_buf()).await;
-            index.insert(file_name.clone(), actual_cols.clone());
+            index.insert(file_name.clone(), actual_cols);
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
 
             if let Some(tx) = ctx.decoder_tx {
@@ -1449,7 +1459,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
             .map(|c| c.function_name.clone())
             .collect();
 
-        let (missing_fn_names, has_existing_file, null_entries) =
+        // Read the parquet file once (if it exists) to get schema, null entries,
+        // row count, and batches. This replaces 3 separate file opens with 1.
+        let (missing_fn_names, has_existing_file, null_entries, parquet_state) =
             if ctx.existing_files.contains(&rel_path) {
                 let index = column_indexes.get(collection_name);
                 let indexed_cols: HashSet<String> = index
@@ -1457,8 +1469,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
                     .map(|cols| cols.iter().cloned().collect())
                     .unwrap_or_default();
 
-                // Check actual parquet schema to determine truly missing columns
-                let parquet_cols = read_parquet_column_names_async(output_path.clone()).await;
+                // Single read: get schema, null entries, row count, and batches
+                let mut state = read_once_parquet_state_async(output_path.clone()).await?;
+                let parquet_cols = &state.column_names;
 
                 // Missing: in config but not in the parquet file
                 let missing: Vec<String> = all_fn_names
@@ -1467,22 +1480,16 @@ pub(crate) async fn process_factory_once_calls_multicall(
                     .cloned()
                     .collect();
 
-                // Only try to fill null results if:
-                // 1) there is no column index file (indexed_cols is empty)
-                // 2) the block range file is not in the column index
-                // 3) the column with nulls is not in the column index for that file
-                // If a column IS in the index, nulls are considered permanent.
                 let null_entries: HashMap<String, HashSet<[u8; 20]>> = {
-                    let unindexed_in_parquet: Vec<&String> = all_fn_names
+                    let has_unindexed = all_fn_names
                         .iter()
-                        .filter(|f| parquet_cols.contains(*f) && !indexed_cols.contains(*f))
-                        .collect();
-                    if unindexed_in_parquet.is_empty() {
+                        .any(|f| parquet_cols.contains(f) && !indexed_cols.contains(f));
+                    if !has_unindexed {
                         HashMap::new()
                     } else {
-                        let all_null_entries = find_null_entries_async(output_path.clone()).await;
-                        all_null_entries
-                            .into_iter()
+                        state
+                            .null_entries
+                            .drain()
                             .filter(|(k, _)| !indexed_cols.contains(k))
                             .collect()
                     }
@@ -1501,8 +1508,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         };
                     if index_complete {
                         // Address-level check: compare factory address count
-                        // against file row count. If factory has more addresses
-                        // than the file has rows, the file is incomplete.
+                        // against file row count (using state.row_count).
                         let factory_addr_count = factory_data
                             .addresses_by_block
                             .values()
@@ -1510,13 +1516,11 @@ pub(crate) async fn process_factory_once_calls_multicall(
                             .filter(|(_, _, coll)| coll == collection_name)
                             .count() as u64;
                         if factory_addr_count > 0 {
-                            let file_rows =
-                                read_parquet_row_count_async(output_path.clone()).await;
-                            if file_rows < factory_addr_count {
+                            if state.row_count < factory_addr_count {
                                 tracing::info!(
                                     "Factory once multicall {} blocks {}-{}: file has {} rows but factory has {} addresses, re-checking",
                                     collection_name, range.start, range.end - 1,
-                                    file_rows, factory_addr_count,
+                                    state.row_count, factory_addr_count,
                                 );
                             } else {
                                 continue;
@@ -1532,9 +1536,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         range.end - 1
                     );
                 }
-                (missing, true, null_entries)
+                (missing, true, null_entries, Some(state))
             } else {
-                (all_fn_names.clone(), false, HashMap::new())
+                (all_fn_names.clone(), false, HashMap::new(), None)
             };
 
         let configs_to_call: Vec<&OnceCallConfig> = call_configs
@@ -1579,12 +1583,15 @@ pub(crate) async fn process_factory_once_calls_multicall(
             continue;
         }
 
-        // C. Read parquet early to identify absent addresses
-        let existing_addr_set: HashSet<[u8; 20]> = if has_existing_file {
-            let batches = read_existing_once_parquet_async(output_path.clone()).await?;
-            extract_addresses_from_once_parquet(&batches)
-                .into_keys()
-                .collect()
+        // C. Reuse batches from parquet_state to identify absent addresses
+        let existing_addr_set: HashSet<[u8; 20]> = if let Some(ref state) = parquet_state {
+            if let Some(ref batches) = state.batches {
+                extract_addresses_from_once_parquet(batches)
+                    .into_keys()
+                    .collect()
+            } else {
+                HashSet::new()
+            }
         } else {
             HashSet::new()
         };
@@ -1765,6 +1772,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
             output_path,
             has_existing_file,
             once_configs: configs_for_backfill,
+            parquet_state,
         });
     }
 
@@ -1835,6 +1843,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
         output_path,
         has_existing_file,
         once_configs: configs_to_call,
+        mut parquet_state,
     } in collections_to_process
     {
         let sub_dir = output_path.parent().unwrap();
@@ -1869,8 +1878,11 @@ pub(crate) async fn process_factory_once_calls_multicall(
             let results_by_address = results_by_address.unwrap_or_default();
 
             if has_existing_file {
-                let existing_batches =
-                    read_existing_once_parquet_async(output_path.clone()).await?;
+                // Reuse batches from single-read parquet state
+                let existing_batches = parquet_state
+                    .as_mut()
+                    .and_then(|s| s.batches.take())
+                    .unwrap_or_default();
                 let existing_is_empty = existing_batches.is_empty()
                     || existing_batches.iter().all(|b| b.num_rows() == 0);
 
@@ -2130,18 +2142,16 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            // Update column index with all columns present in the file
+            // Update column index — use all_fn_names directly instead of
+            // re-reading the file we just wrote.
             let file_name = output_path
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            let actual_cols: Vec<String> = read_parquet_column_names_async(output_path.clone())
-                .await
-                .into_iter()
-                .collect();
+            let actual_cols: Vec<String> = all_fn_names.clone();
             let mut index = read_once_column_index_async(sub_dir.to_path_buf()).await;
-            index.insert(file_name.clone(), actual_cols.clone());
+            index.insert(file_name.clone(), actual_cols);
             write_once_column_index_async(sub_dir.to_path_buf(), index).await?;
 
             // F. Write contract index after parquet write

@@ -113,19 +113,33 @@ macro_rules! storage_entity {
 #[derive(Debug, Clone)]
 pub struct LiveStorage {
     base_dir: PathBuf,
+    /// When true, status writes call sync_all() for crash durability.
+    /// Data writes (blocks, receipts, logs, etc.) never sync — they are
+    /// rebuildable, and the status file is the crash-safety gatekeeper.
+    /// Controlled by `DOPPLER_DURABLE_WRITES` env var (default: true).
+    durable_writes: bool,
 }
 
 impl LiveStorage {
     /// Create a new LiveStorage for the given chain.
     pub fn new(chain_name: &str) -> Self {
         let base_dir = PathBuf::from(format!("data/{}/live", chain_name));
-        Self { base_dir }
+        let durable_writes = std::env::var("DOPPLER_DURABLE_WRITES")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        Self {
+            base_dir,
+            durable_writes,
+        }
     }
 
     /// Create a new LiveStorage with a custom base directory.
     #[allow(dead_code)]
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            durable_writes: true,
+        }
     }
 
     /// Get the base directory for this storage.
@@ -274,14 +288,14 @@ impl LiveStorage {
         self.base_dir.join(format!("status/{}.json", block_number))
     }
 
-    /// Write status for a block.
+    /// Write status for a block. Syncs to disk when durable_writes is enabled.
     pub fn write_status(
         &self,
         block_number: u64,
         status: &LiveBlockStatus,
     ) -> Result<(), StorageError> {
         let path = self.status_path(block_number);
-        atomic_write_with(&path, |writer| {
+        atomic_write_with(&path, self.durable_writes, |writer| {
             serde_json::to_writer_pretty(writer, status)?;
             Ok(())
         })
@@ -341,7 +355,7 @@ impl LiveStorage {
 
         // lock_file dropped here, releasing the exclusive lock
 
-        atomic_write_with(&path, |writer| {
+        atomic_write_with(&path, self.durable_writes, |writer| {
             serde_json::to_writer_pretty(writer, &status)?;
             Ok(())
         })
@@ -728,9 +742,10 @@ impl LiveStorage {
 
 /// Atomically write to a file using a caller-supplied write function.
 ///
-/// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
+/// Uses write-to-temp, flush, rename pattern for atomicity.
+/// When `durable` is true, also calls `sync_all()` before rename for crash safety.
 /// Uses unique temp file names to avoid race conditions between concurrent writers.
-fn atomic_write_with<F>(path: &Path, write_fn: F) -> Result<(), StorageError>
+fn atomic_write_with<F>(path: &Path, durable: bool, write_fn: F) -> Result<(), StorageError>
 where
     F: FnOnce(&mut BufWriter<fs::File>) -> Result<(), StorageError>,
 {
@@ -752,10 +767,10 @@ where
     let result = (|| -> Result<(), StorageError> {
         write_fn(&mut writer)?;
         writer.flush()?;
-        writer
-            .into_inner()
-            .map_err(std::io::Error::other)?
-            .sync_all()?;
+        let file = writer.into_inner().map_err(std::io::Error::other)?;
+        if durable {
+            file.sync_all()?;
+        }
         fs::rename(&temp_path, path)?;
         Ok(())
     })();
@@ -772,13 +787,12 @@ where
     result
 }
 
-/// Atomically write bincode-serialized data to a file.
+/// Atomically write bincode-serialized data to a file without sync_all().
 ///
-/// Uses write-to-temp, flush, sync_all, rename pattern for crash safety.
-/// Works with any serializable type including slices.
-/// Uses unique temp file names to avoid race conditions between concurrent writers.
+/// Data writes skip fsync because they are rebuildable — the status file
+/// is the crash-safety gatekeeper.
 fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
-    atomic_write_with(path, |writer| {
+    atomic_write_with(path, false, |writer| {
         bincode::serialize_into(writer, data)?;
         Ok(())
     })
