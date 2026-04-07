@@ -105,25 +105,21 @@ pub fn describe_rpc_metrics() {
         "rpc_rate_limit_wait_seconds",
         "Time waiting for rate limiter capacity"
     );
-    describe_counter!(
-        "rpc_retry_attempts_total",
-        "Each retry attempt"
-    );
-    describe_counter!(
-        "rpc_retries_exhausted_total",
-        "Retries fully exhausted"
-    );
-    describe_gauge!(
-        "rpc_semaphore_acquired",
-        "Currently held semaphore permits"
-    );
+    describe_counter!("rpc_retry_attempts_total", "Each retry attempt");
+    describe_counter!("rpc_retries_exhausted_total", "Retries fully exhausted");
+    describe_gauge!("rpc_semaphore_acquired", "Currently held semaphore permits");
     describe_gauge!(
         "rpc_semaphore_capacity",
         "Total semaphore permits configured"
     );
-    describe_histogram!(
-        "rpc_batch_size",
-        "Items per batch execution"
+    describe_histogram!("rpc_batch_size", "Items per batch execution");
+    describe_gauge!(
+        "receipt_pipeline_in_flight_fetches",
+        "Number of receipt fetch tasks currently in flight"
+    );
+    describe_gauge!(
+        "receipt_pipeline_pending_tx_hashes",
+        "Number of transaction hashes pending in fallback batch buffer"
     );
 }
 
@@ -193,6 +189,20 @@ pub fn set_semaphore_utilization(chain: &str, acquired: f64, capacity: f64) {
         "chain" => chain.to_string()
     )
     .set(capacity);
+}
+
+/// Set receipt collection pipeline gauges for in-flight work and buffered tx hashes.
+pub fn set_receipt_pipeline_state(chain: &str, in_flight_fetches: usize, pending_tx_hashes: usize) {
+    gauge!(
+        "receipt_pipeline_in_flight_fetches",
+        "chain" => chain.to_string()
+    )
+    .set(in_flight_fetches as f64);
+    gauge!(
+        "receipt_pipeline_pending_tx_hashes",
+        "chain" => chain.to_string()
+    )
+    .set(pending_tx_hashes as f64);
 }
 
 /// Extract a sanitized chain identifier from an RPC URL.

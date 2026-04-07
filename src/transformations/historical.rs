@@ -22,6 +22,8 @@ use crate::storage::paths::{decoded_base_dir, scan_parquet_ranges};
 
 /// Index mapping (source_name, event_or_function_name) to available parquet file ranges.
 type FileIndex = HashMap<(String, String), Vec<(u64, u64, PathBuf)>>;
+/// Cache key for historical call lookups by source/function/address up to a block.
+type CallCacheKey = (String, String, [u8; 20], u64);
 
 /// Reader for historical decoded data stored in parquet files.
 pub struct HistoricalDataReader {
@@ -30,6 +32,8 @@ pub struct HistoricalDataReader {
     decoded_base: PathBuf,
     /// Cache of available file ranges per (source, event/function)
     file_index: RwLock<FileIndex>,
+    /// Cache of latest historical call lookups by (source, function, address, to_block)
+    call_cache: RwLock<HashMap<CallCacheKey, DecodedCall>>,
 }
 
 impl HistoricalDataReader {
@@ -41,6 +45,7 @@ impl HistoricalDataReader {
             chain_name: chain_name.to_string(),
             decoded_base,
             file_index: RwLock::new(HashMap::new()),
+            call_cache: RwLock::new(HashMap::new()),
         };
 
         // Build initial index if directory exists
@@ -191,6 +196,68 @@ impl HistoricalDataReader {
         }
 
         Ok(results)
+    }
+
+    /// Get the latest call for a source/function/address up to `to_block`, cached in-memory.
+    pub async fn get_cached_call_for_address(
+        &self,
+        source: &str,
+        function_name: &str,
+        contract_address: [u8; 20],
+        to_block: u64,
+    ) -> Result<Option<DecodedCall>, TransformationError> {
+        let cache_key = (
+            source.to_string(),
+            function_name.to_string(),
+            contract_address,
+            to_block,
+        );
+
+        if let Some(cached) = self.call_cache.read().unwrap().get(&cache_key).cloned() {
+            return Ok(Some(cached));
+        }
+
+        // Freshly-decoded parquet files appear while the engine is running, so
+        // refresh the file index on cache miss before querying historical data.
+        self.rebuild_index()?;
+
+        let latest = self
+            .query_calls(HistoricalCallQuery {
+                source: Some(source.to_string()),
+                function_name: Some(function_name.to_string()),
+                contract_address: Some(contract_address),
+                from_block: 0,
+                to_block,
+                limit: None,
+            })
+            .await?
+            .into_iter()
+            .max_by_key(|call| {
+                (
+                    call.block_number,
+                    call.trigger_log_index.unwrap_or(u32::MAX),
+                )
+            });
+
+        if let Some(ref latest_call) = latest {
+            self.call_cache
+                .write()
+                .unwrap()
+                .insert(cache_key, latest_call.clone());
+        }
+
+        Ok(latest)
+    }
+
+    /// Invalidate cached historical call lookups for a given source/function.
+    /// Needed when decoded parquet files are rewritten or backfilled in place.
+    pub fn invalidate_call_cache(&self, source: &str, function_name: &str) {
+        self.call_cache
+            .write()
+            .unwrap()
+            .retain(|(cached_source, cached_function, _, _), _| {
+                !(cached_source == source && cached_function == function_name)
+            });
     }
 
     /// Read all events from a specific parquet file (no filtering).

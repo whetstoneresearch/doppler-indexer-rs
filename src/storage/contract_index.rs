@@ -47,7 +47,9 @@ pub fn range_key(start: u64, end_inclusive: u64) -> String {
 /// Build expected factory source contracts per collection from the contracts config.
 ///
 /// Returns `collection_name -> { contract_name -> [sorted hex addresses] }`.
-pub fn build_expected_factory_contracts(contracts: &Contracts) -> HashMap<String, ExpectedContracts> {
+pub fn build_expected_factory_contracts(
+    contracts: &Contracts,
+) -> HashMap<String, ExpectedContracts> {
     let mut result: HashMap<String, ExpectedContracts> = HashMap::new();
 
     for (contract_name, config) in contracts {
@@ -162,11 +164,7 @@ pub fn get_missing_contracts(
 /// Merge `contracts` into the index for the given range key.
 ///
 /// Overwrites the entry for `rk` with the provided contracts map.
-pub fn update_contract_index(
-    index: &mut ContractIndex,
-    rk: &str,
-    contracts: &ExpectedContracts,
-) {
+pub fn update_contract_index(index: &mut ContractIndex, rk: &str, contracts: &ExpectedContracts) {
     index.insert(rk.to_string(), contracts.clone());
 }
 
@@ -311,7 +309,11 @@ pub fn detect_contracts_in_log_parquet(
     use std::fs::File;
 
     let file = File::open(log_path).map_err(|e| {
-        io::Error::other(format!("Failed to open log parquet {}: {}", log_path.display(), e))
+        io::Error::other(format!(
+            "Failed to open log parquet {}: {}",
+            log_path.display(),
+            e
+        ))
     })?;
 
     let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
@@ -323,8 +325,7 @@ pub fn detect_contracts_in_log_parquet(
         Err(_) => return Ok(HashMap::new()), // no address column
     };
 
-    let mask =
-        parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), vec![addr_col_idx]);
+    let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), vec![addr_col_idx]);
     let reader = builder
         .with_projection(mask)
         .build()
@@ -338,10 +339,10 @@ pub fn detect_contracts_in_log_parquet(
             Ok(b) => b,
             Err(_) => continue,
         };
-        let col = match batch
-            .column_by_name("address")
-            .and_then(|c| c.as_any().downcast_ref::<arrow::array::FixedSizeBinaryArray>())
-        {
+        let col = match batch.column_by_name("address").and_then(|c| {
+            c.as_any()
+                .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+        }) {
             Some(c) => c,
             None => continue,
         };
@@ -391,10 +392,7 @@ mod tests {
 
     fn sample_expected() -> ExpectedContracts {
         let mut m = ExpectedContracts::new();
-        m.insert(
-            "Airlock".to_string(),
-            vec!["0xaaa".to_string()],
-        );
+        m.insert("Airlock".to_string(), vec!["0xaaa".to_string()]);
         m.insert(
             "OtherInit".to_string(),
             vec!["0xbbb".to_string(), "0xccc".to_string()],

@@ -70,6 +70,7 @@
         "block_receipt_concurrency": 100,
         "parquet_block_range": 10000,
         "rpc_batch_size": 1000,
+        "event_call_concurrency": 12,
         "fields": {
             "block_fields": [
                 "number",
@@ -95,6 +96,9 @@
             ]
         },
         "contract_logs_only": false        
+    },
+    "metrics": {
+        "addr": "0.0.0.0:9090"
     },
     "transformations": {
         "database_url_env_var": "DATABASE_URL",

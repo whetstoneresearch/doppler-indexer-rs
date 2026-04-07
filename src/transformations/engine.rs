@@ -107,7 +107,6 @@ pub struct TransformationEngineConfig {
     pub expect_eth_call_completion: bool,
 }
 
-
 /// A handler paired with the decoded calls it needs to process.
 type ReadyHandler = (
     Arc<dyn super::traits::TransformationHandler>,
@@ -1546,6 +1545,12 @@ impl TransformationEngine {
             msg.function_name,
             msg.range_start
         );
+
+        // Decoded call files can be rewritten/backfilled in place, especially for
+        // `once` calls. Invalidate cached historical lookups so handlers re-read
+        // the freshest parquet contents after new decode messages arrive.
+        self.historical_reader
+            .invalidate_call_cache(&msg.source_name, &msg.function_name);
 
         // Log reverted calls to the database for debugging
         let reverted: Vec<_> = msg.calls.iter().filter(|c| c.is_reverted).collect();

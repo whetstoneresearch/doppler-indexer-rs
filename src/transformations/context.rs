@@ -420,6 +420,50 @@ impl TransformationContext {
         })
     }
 
+    /// Get the latest call for a source/function/address from the current range,
+    /// falling back to cached historical parquet lookup when needed.
+    pub async fn current_or_historical_call_for_address(
+        &self,
+        source: &str,
+        function_name: &str,
+        address: [u8; 20],
+    ) -> Result<Option<DecodedCall>, TransformationError> {
+        let start_block = self.get_contract_start_block(source);
+
+        if let Some(current) = self
+            .calls
+            .iter()
+            .rev()
+            .find(|c| {
+                c.source_name == source
+                    && c.function_name == function_name
+                    && c.contract_address == address
+                    && start_block.is_none_or(|sb| c.block_number >= sb)
+            })
+            .cloned()
+        {
+            return Ok(Some(current));
+        }
+
+        let historical = self
+            .historical
+            .get_cached_call_for_address(source, function_name, address, self.blockrange_end)
+            .await?;
+
+        Ok(historical.filter(|call| start_block.is_none_or(|sb| call.block_number >= sb)))
+    }
+
+    /// Convenience wrapper for immutable `once` calls, which may be produced in
+    /// an earlier historical range than the event currently being processed.
+    pub async fn current_or_historical_once_call_for_address(
+        &self,
+        source: &str,
+        address: [u8; 20],
+    ) -> Result<Option<DecodedCall>, TransformationError> {
+        self.current_or_historical_call_for_address(source, "once", address)
+            .await
+    }
+
     // ===== Contract Configuration Helpers =====
 
     /// Get the start_block for a contract or collection by name.

@@ -91,7 +91,10 @@ pub fn process_swaps(
                 skipped_swap_count += swap_group.len() as u64;
                 skipped_pool_count += 1;
                 if skipped_samples.len() < 5 {
-                    let tx = swap_group.first().map(|s| hex::encode(s.transaction_hash)).unwrap_or_default();
+                    let tx = swap_group
+                        .first()
+                        .map(|s| hex::encode(s.transaction_hash))
+                        .unwrap_or_default();
                     skipped_samples.push((hex::encode(pool_id), *block_number, tx));
                 }
                 continue;

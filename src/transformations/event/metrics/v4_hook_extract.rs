@@ -140,11 +140,15 @@ mod tests {
     use alloy_primitives::{I256, U256};
 
     use crate::rpc::UnifiedRpcClient;
-    use crate::transformations::context::{DecodedCall, DecodedEvent, DecodedValue, TransformationContext};
+    use crate::transformations::context::{
+        DecodedCall, DecodedEvent, DecodedValue, TransformationContext,
+    };
     use crate::transformations::historical::HistoricalDataReader;
     use crate::types::uniswap::v4::PoolKey;
 
-    use super::{extract_flat_modify_liquidity, extract_tuple_modify_liquidity, extract_v4_hook_swaps};
+    use super::{
+        extract_flat_modify_liquidity, extract_tuple_modify_liquidity, extract_v4_hook_swaps,
+    };
 
     const SOURCE: &str = "UniswapV4MulticurveInitializerHook";
 
@@ -190,9 +194,17 @@ mod tests {
         }
     }
 
-    fn slot0_call(trigger_log_index: u32, sqrt_price_x96: U256, tick: i32, is_reverted: bool) -> DecodedCall {
+    fn slot0_call(
+        trigger_log_index: u32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        is_reverted: bool,
+    ) -> DecodedCall {
         let mut result = HashMap::new();
-        result.insert("sqrtPriceX96".to_string(), DecodedValue::Uint256(sqrt_price_x96));
+        result.insert(
+            "sqrtPriceX96".to_string(),
+            DecodedValue::Uint256(sqrt_price_x96),
+        );
         result.insert("tick".to_string(), DecodedValue::Int32(tick));
         DecodedCall {
             block_number: 100,
@@ -220,7 +232,10 @@ mod tests {
         let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE);
         assert!(result.is_err(), "missing getSlot0 should return Err");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("getSlot0"), "error should mention getSlot0: {err}");
+        assert!(
+            err.contains("getSlot0"),
+            "error should mention getSlot0: {err}"
+        );
     }
 
     #[test]
@@ -231,7 +246,10 @@ mod tests {
             vec![slot0_call(0, q96(), 0, true)],
         );
         let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE).unwrap();
-        assert!(result.is_empty(), "reverted slot0 should produce no SwapInput");
+        assert!(
+            result.is_empty(),
+            "reverted slot0 should produce no SwapInput"
+        );
     }
 
     #[test]
@@ -260,8 +278,14 @@ mod tests {
         let pool_a = [1u8; 32];
         let pool_b = [2u8; 32];
         let ctx = make_test_ctx(
-            vec![swap_event(0, pool_a, 100, -100), swap_event(1, pool_b, 200, -200)],
-            vec![slot0_call(0, q96(), 10, false), slot0_call(1, q96(), 20, false)],
+            vec![
+                swap_event(0, pool_a, 100, -100),
+                swap_event(1, pool_b, 200, -200),
+            ],
+            vec![
+                slot0_call(0, q96(), 10, false),
+                slot0_call(1, q96(), 20, false),
+            ],
         );
         let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE).unwrap();
         assert_eq!(result.len(), 2);
@@ -282,10 +306,19 @@ mod tests {
         let tick_spacing = 60i32;
 
         let mut params = HashMap::new();
-        params.insert("key.currency0".to_string(), DecodedValue::Address(currency0));
-        params.insert("key.currency1".to_string(), DecodedValue::Address(currency1));
+        params.insert(
+            "key.currency0".to_string(),
+            DecodedValue::Address(currency0),
+        );
+        params.insert(
+            "key.currency1".to_string(),
+            DecodedValue::Address(currency1),
+        );
         params.insert("key.fee".to_string(), DecodedValue::Uint32(fee));
-        params.insert("key.tickSpacing".to_string(), DecodedValue::Int32(tick_spacing));
+        params.insert(
+            "key.tickSpacing".to_string(),
+            DecodedValue::Int32(tick_spacing),
+        );
         params.insert("key.hooks".to_string(), DecodedValue::Address(hooks));
         params.insert("params.tickLower".to_string(), DecodedValue::Int32(-100));
         params.insert("params.tickUpper".to_string(), DecodedValue::Int32(100));
@@ -352,7 +385,8 @@ mod tests {
             contract_address: [0u8; 20],
             source_name: "DecayMulticurveHook".to_string(),
             event_name: "ModifyLiquidity".to_string(),
-            event_signature: "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)".to_string(),
+            event_signature: "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
+                .to_string(),
             params,
         };
 

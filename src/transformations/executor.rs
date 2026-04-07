@@ -624,10 +624,7 @@ mod tests {
     fn test_no_snapshot_for_conditional_upsert_noop() {
         // op[0]: real upsert — affected_rows[0] = 1  → snapshot expected
         // op[1]: noop conditional upsert — affected_rows[1] = 0  → no snapshot
-        let ops = vec![
-            make_upsert_op("real_table"),
-            make_upsert_op("noop_table"),
-        ];
+        let ops = vec![make_upsert_op("real_table"), make_upsert_op("noop_table")];
         let affected_rows = vec![1u64, 0u64];
 
         let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
@@ -637,10 +634,7 @@ mod tests {
     /// When all ops modify rows, all produce snapshots.
     #[test]
     fn test_snapshot_for_all_affected_upserts() {
-        let ops = vec![
-            make_upsert_op("table_a"),
-            make_upsert_op("table_b"),
-        ];
+        let ops = vec![make_upsert_op("table_a"), make_upsert_op("table_b")];
         let affected_rows = vec![1u64, 2u64];
 
         let mut survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);

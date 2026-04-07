@@ -1,0 +1,256 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Indexer Up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "max(up{job=\"doppler-indexer\"}) or vector(0)",
+          "legendFormat": "up"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "title": "RPC Success /s",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(rpc_requests_total{status=\"success\"}[$__rate_interval])) or vector(0)",
+          "legendFormat": "success"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "title": "RPC Error %",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "(100 * sum(rate(rpc_requests_total{status=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(rpc_requests_total[$__rate_interval])), 0.001)) or vector(0)",
+          "legendFormat": "error %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "title": "Pending Events",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(transformation_pending_events) or vector(0)",
+          "legendFormat": "pending"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "title": "RPC Throughput by Status",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "sum by (chain, status) (rate(rpc_requests_total[$__rate_interval]))",
+          "legendFormat": "{{chain}} {{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Collection Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "sum by (chain, mode) (rate(collection_blocks_processed_total[$__rate_interval]))",
+          "legendFormat": "blocks {{chain}} {{mode}}"
+        },
+        {
+          "expr": "sum by (chain) (rate(collection_receipts_processed_total[$__rate_interval]))",
+          "legendFormat": "receipts {{chain}}"
+        },
+        {
+          "expr": "sum by (chain) (rate(collection_eth_calls_total[$__rate_interval]))",
+          "legendFormat": "eth_call {{chain}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Transformation Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum(rate(transformation_events_processed_total[$__rate_interval]))",
+          "legendFormat": "events"
+        },
+        {
+          "expr": "sum(rate(transformation_calls_processed_total[$__rate_interval]))",
+          "legendFormat": "calls"
+        },
+        {
+          "expr": "sum(rate(transformation_retry_attempts_total[$__rate_interval]))",
+          "legendFormat": "retries"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Work In Flight",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum by (chain) (rpc_requests_in_flight)",
+          "legendFormat": "rpc in-flight {{chain}}"
+        },
+        {
+          "expr": "sum by (chain) (rpc_semaphore_acquired)",
+          "legendFormat": "rpc permits {{chain}}"
+        },
+        {
+          "expr": "sum(transformation_handlers_in_flight)",
+          "legendFormat": "handlers"
+        },
+        {
+          "expr": "sum(transformation_pending_events)",
+          "legendFormat": "pending events"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Latency Snapshot p95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, chain, method) (rate(rpc_request_duration_seconds_bucket{status=\"success\"}[$__rate_interval]))))",
+          "legendFormat": "rpc {{chain}} {{method}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, data_type) (rate(collection_parquet_write_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "parquet {{data_type}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(transformation_range_finalization_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "finalization"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Top Handler Errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (handler_key, error_type) (rate(transformation_handler_errors_total[$__rate_interval])))",
+          "legendFormat": "{{handler_key}} {{error_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["doppler", "overview", "metrics"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timezone": "browser",
+  "title": "Doppler Overview",
+  "uid": "doppler-overview",
+  "version": 1,
+  "weekStart": ""
+}

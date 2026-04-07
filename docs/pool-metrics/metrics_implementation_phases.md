@@ -298,21 +298,25 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ---
 
-## Phase 5: Migration Pool Handler
+## Phase 5: Migration Pool Handler ✅
+
+**Status**: Complete
 
 **Goal**: Handle swaps and liquidity on graduated (migrated) V4 pools.
 
-### Tasks
-1. Create `src/transformations/event/migration_pool/` module
-2. Implement `migration_pool/metrics.rs` — MigrationPoolMetricsHandler
-3. Register in `event/mod.rs`
+**Delivered**:
+- `src/transformations/event/migration_pool/mod.rs`
+- `src/transformations/event/migration_pool/create.rs` — MigrationPoolCreateHandler
+- `src/transformations/event/migration_pool/metrics.rs` — MigrationPoolSwapMetricsHandler, MigrationPoolLiquidityMetricsHandler
+- `src/transformations/util/db/pool.rs` — `MigrationPoolData` + `insert_migration_pool()`
+- All 3 handlers registered in `event/mod.rs`
 
-### Handler specifics
-- Swap source: `UniswapV4PoolManager` — Swap event has sqrtPriceX96/tick/liquidity directly
-- Liquidity source: `UniswapV4MigratorHook` — ModifyLiquidity (tuple format)
-- **Must filter PoolManager Swaps**: PoolManager emits Swap for ALL V4 pools. Use in-memory `RwLock<HashSet<Vec<u8>>>` of migration pool IDs. Rebuild on init from `pools WHERE migrated_from IS NOT NULL`.
-- Also scan for Migrate events in current context to add newly graduated pools inline
-- call_dependencies: none (all data in events)
+**Key design decisions**:
+- **Create handler required**: no existing handler inserted migration pool rows into `pools`. `MigrationPoolCreateHandler` handles `UniswapV4Migrator.Migrate`, queries the original Doppler pool via `migration_pool = poolId`, and inserts a new row with `migrated_from` set. This enables `PoolMetadataCache` to work normally for migration pools.
+- **Swap filtering**: `MigrationPoolSwapMetricsHandler` holds `RwLock<HashSet<Vec<u8>>>` of migration pool IDs. Seeded at init from `pools WHERE migrated_from IS NOT NULL`. Inline scan of `Migrate` events in the current context handles same-range Migrate+Swap edge cases.
+- **Liquidity**: `MigrationPoolLiquidityMetricsHandler` triggers on `UniswapV4MigratorHook.ModifyLiquidity` (tuple format). No filter needed — MigratorHook only handles migration pools. Uses `extract_tuple_modify_liquidity()`.
+- **Dependencies**: both metrics handlers depend on `MigrationPoolCreateHandler` so the pool row and metadata exist before metrics handlers run.
+- **Chains**: 5 chains have Migrator + MigratorHook (base, baseSepolia, mainnet, unichain, sepolia). ink and monad have PoolManager but no migration infrastructure — handlers simply find no events on those chains.
 
 ---
 
