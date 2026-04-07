@@ -726,7 +726,7 @@ pub fn build_registry_for_chain(
     let mut registry = TransformationRegistry::with_source_filter(available);
 
     // Register event handlers (filtered by available sources)
-    super::event::register_handlers(&mut registry, chain_id);
+    super::event::register_handlers_for_chain(&mut registry, chain_id, contracts);
 
     // Register eth_call handlers (filtered by available sources)
     super::eth_call::register_handlers(&mut registry);
@@ -1262,5 +1262,55 @@ mod tests {
         let mut registry = TransformationRegistry::new();
         registry.register_event_handler(mock_handler("X", vec![]));
         registry.register_call_handler(MockCallHandler { name: "X" });
+    }
+
+    #[test]
+    fn build_registry_for_chain_skips_migration_pool_handlers_without_migrator() {
+        use crate::types::config::contract::{AddressOrAddresses, ContractConfig};
+        use alloy_primitives::Address;
+
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "UniswapV4PoolManager".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::ZERO),
+                start_block: None,
+                calls: None,
+                factories: None,
+                events: None,
+            },
+        );
+
+        let registry = build_registry_for_chain(1, &contracts, &empty_factory_collections());
+
+        assert!(registry
+            .handler_key_for_name("MigrationPoolCreateHandler")
+            .is_none());
+        assert!(registry
+            .handler_key_for_name("MigrationPoolSwapMetricsHandler")
+            .is_none());
+        assert!(registry
+            .handler_key_for_name("MigrationPoolLiquidityMetricsHandler")
+            .is_none());
+    }
+
+    #[test]
+    fn build_registry_declares_all_migration_pool_create_dependencies() {
+        let registry = build_registry(1);
+        let deps = registry
+            .handler_dependency_graph()
+            .get("MigrationPoolCreateHandler")
+            .expect("MigrationPoolCreateHandler should be registered");
+
+        assert_eq!(
+            deps,
+            &vec![
+                "V4CreateHandler".to_string(),
+                "V4MulticurveCreateHandler".to_string(),
+                "V4ScheduledMulticurveCreateHandler".to_string(),
+                "V4DecayMulticurveCreateHandler".to_string(),
+                "DopplerHookCreateHandler".to_string(),
+            ]
+        );
     }
 }

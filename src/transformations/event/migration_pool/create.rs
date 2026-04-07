@@ -8,8 +8,9 @@
 //!
 //! ## Dependencies
 //!
-//! Depends on `V4CreateHandler` so the original Doppler V4 pool row exists in
-//! the DB before this handler queries for it.
+//! Depends on every Doppler pool create handler that can populate
+//! `pools.migration_pool`, so the original pool row exists in the DB before
+//! this handler queries for it during catchup.
 
 use std::sync::OnceLock;
 
@@ -151,7 +152,13 @@ impl EventHandler for MigrationPoolCreateHandler {
     }
 
     fn handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["V4CreateHandler"]
+        vec![
+            "V4CreateHandler",
+            "V4MulticurveCreateHandler",
+            "V4ScheduledMulticurveCreateHandler",
+            "V4DecayMulticurveCreateHandler",
+            "DopplerHookCreateHandler",
+        ]
     }
 }
 

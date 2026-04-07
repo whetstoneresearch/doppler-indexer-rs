@@ -138,6 +138,7 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
 
             swaps.push(SwapInput {
                 pool_id: pool_id.to_vec(),
+                transaction_hash: event.transaction_hash,
                 block_number: event.block_number,
                 block_timestamp: event.block_timestamp,
                 log_index: event.log_index,

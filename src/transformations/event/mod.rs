@@ -16,9 +16,27 @@ use std::sync::Arc;
 
 use super::registry::TransformationRegistry;
 use super::util::pool_metadata::PoolMetadataCache;
+use crate::types::config::contract::Contracts;
 
 /// Register all event handlers with the registry.
 pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
+    register_handlers_inner(registry, chain_id, None);
+}
+
+/// Register event handlers filtered by the chain's configured contracts.
+pub fn register_handlers_for_chain(
+    registry: &mut TransformationRegistry,
+    chain_id: u64,
+    contracts: &Contracts,
+) {
+    register_handlers_inner(registry, chain_id, Some(contracts));
+}
+
+fn register_handlers_inner(
+    registry: &mut TransformationRegistry,
+    chain_id: u64,
+    contracts: Option<&Contracts>,
+) {
     derc20_transfer::register_handlers(registry);
     v4::create::register_handlers(registry);
     multicurve::create::register_handlers(registry);
@@ -54,8 +72,16 @@ pub fn register_handlers(registry: &mut TransformationRegistry, chain_id: u64) {
     let v4_base_cache = Arc::new(PoolMetadataCache::new());
     v4::metrics::register_handlers(registry, chain_id, v4_base_cache);
 
-    // Migration pool (graduated Doppler V4 pools on UniswapV4PoolManager)
-    migration_pool::create::register_handlers(registry);
-    let migration_pool_cache = Arc::new(PoolMetadataCache::new());
-    migration_pool::metrics::register_handlers(registry, chain_id, migration_pool_cache);
+    // Register migration pool handlers as a group only on chains with a V4
+    // migrator. The swap handler depends on MigrationPoolCreateHandler, so
+    // letting source filtering split them apart can leave a dangling dependency
+    // on PoolManager-only chains.
+    let register_migration_pool_handlers = contracts
+        .map(|contracts| contracts.contains_key("UniswapV4Migrator"))
+        .unwrap_or(true);
+    if register_migration_pool_handlers {
+        migration_pool::create::register_handlers(registry);
+        let migration_pool_cache = Arc::new(PoolMetadataCache::new());
+        migration_pool::metrics::register_handlers(registry, chain_id, migration_pool_cache);
+    }
 }
