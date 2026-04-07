@@ -444,6 +444,24 @@ impl AlchemyClient {
         }
     }
 
+    /// Create a concurrent executor with a caller-specified concurrency cap.
+    /// The effective concurrency is the minimum of the requested value and
+    /// the client's configured `rpc_concurrency`.
+    fn create_concurrent_executor_with_concurrency(
+        &self,
+        cost_per_request: u32,
+        concurrency: usize,
+    ) -> ConcurrentExecutor {
+        let effective = concurrency.min(self.config.rpc_concurrency);
+        ConcurrentExecutor {
+            semaphore: Arc::new(Semaphore::new(effective)),
+            rate_limiter: self.rate_limiter.clone(),
+            cost_per_request,
+            max_in_flight: (effective * 2).max(1),
+            chain: self.chain_label(),
+        }
+    }
+
     /// Execute requests concurrently with semaphore-bounded parallelism and per-request rate limiting.
     /// Returns results in the same order as the input requests.
     ///
@@ -806,34 +824,81 @@ impl AlchemyClient {
     /// # Arguments
     /// * `method_name` - The RPC method name (e.g., "eth_getBlockReceipts")
     /// * `block_numbers` - Block numbers to fetch receipts for
-    /// * `_concurrency` - **Deprecated and ignored.** Concurrency is controlled by
-    ///   `rpc_concurrency` in `AlchemyConfig`. This parameter is kept for API compatibility.
+    /// * `concurrency` - Maximum concurrency for this batch. The effective concurrency
+    ///   is the minimum of this value and the client's configured `rpc_concurrency`.
     pub async fn get_block_receipts_concurrent(
         &self,
         method_name: &str,
         block_numbers: Vec<BlockNumberOrTag>,
-        #[allow(unused_variables)] _concurrency: usize,
+        concurrency: usize,
     ) -> Result<Vec<Vec<Option<TransactionReceipt>>>, RpcError> {
+        let chain = self.chain_label();
         let inner = self.inner.clone();
         let method_name = method_name.to_string();
 
-        self.execute_batch_collecting_results(
-            RpcMethod::GetBlockReceiptsConcurrent,
-            block_numbers,
-            ComputeUnitCost::GET_BLOCK_RECEIPTS.cost(),
-            move |block_number| {
+        with_metrics(RpcMethod::GetBlockReceiptsConcurrent, &chain, || async {
+            if block_numbers.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let executor = self.create_concurrent_executor_with_concurrency(
+                ComputeUnitCost::GET_BLOCK_RECEIPTS.cost(),
+                concurrency,
+            );
+            let make_request = Arc::new(move |block_number: BlockNumberOrTag| {
                 let inner = inner.clone();
                 let method_name = method_name.clone();
                 async move {
-                    // inner.get_block_receipts already has retry logic
                     inner.get_block_receipts(&method_name, block_number).await
                 }
-            },
-            |_block_numbers| async move {
-                // Batching is always enabled for this method
-                Ok(vec![])
-            },
-        )
+            });
+
+            let num_requests = block_numbers.len();
+            let mut join_set = tokio::task::JoinSet::new();
+            let mut requests_iter = block_numbers.into_iter().enumerate().peekable();
+
+            // Seed initial batch
+            while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                let (idx, request) = requests_iter.next().unwrap();
+                let make_request = make_request.clone();
+                executor.spawn_indexed(
+                    &mut join_set,
+                    idx,
+                    async move { make_request(request).await },
+                );
+            }
+
+            let mut indexed_results: Vec<(usize, Result<Vec<Option<TransactionReceipt>>, RpcError>)> =
+                Vec::with_capacity(num_requests);
+
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok((idx, value)) => indexed_results.push((idx, value)),
+                    Err(e) => {
+                        return Err(RpcError::ProviderError(format!(
+                            "Task panicked in get_block_receipts_concurrent: {:?}", e
+                        )));
+                    }
+                }
+
+                while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
+                    let (idx, request) = requests_iter.next().unwrap();
+                    let make_request = make_request.clone();
+                    executor.spawn_indexed(
+                        &mut join_set,
+                        idx,
+                        async move { make_request(request).await },
+                    );
+                }
+            }
+
+            indexed_results.sort_by_key(|(idx, _)| *idx);
+            let mut collected = Vec::with_capacity(indexed_results.len());
+            for (_, result) in indexed_results {
+                collected.push(result?);
+            }
+            Ok(collected)
+        })
         .await
     }
 

@@ -77,7 +77,9 @@ impl UnifiedRpcClient {
         } else {
             let parsed_url =
                 url::Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
-            let config = RpcClientConfig::new(parsed_url).with_batch_size(max_batch_size);
+            let config = RpcClientConfig::new(parsed_url)
+                .with_batch_size(max_batch_size)
+                .with_concurrency(rpc_concurrency);
             let client = if let Some(limiter) = shared_limiter {
                 RpcClient::new_with_shared_limiter(config, limiter)?
             } else {
