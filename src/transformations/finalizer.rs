@@ -685,7 +685,11 @@ mod tests {
         let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
         let deduped = dedupe_restore_snapshots(per_block, &mut tables_covered);
 
-        assert_eq!(deduped.len(), 2, "two distinct pool rows should both be kept");
+        assert_eq!(
+            deduped.len(),
+            2,
+            "two distinct pool rows should both be kept"
+        );
     }
 
     /// Snapshots for different tables (same key) remain separate.
@@ -726,7 +730,6 @@ mod tests {
             "expected the DELETE snapshot (previous_row = None) from block 100"
         );
     }
-
 
     /// Fix C test: when block 100 has a snapshot but block 101 does not,
     /// the fallback DELETE should target only block 101.

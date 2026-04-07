@@ -61,7 +61,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
             })?;
 
             let Some((asset_metadata, numeraire_metadata)) =
-                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
             else {
                 continue;
             };
@@ -78,9 +78,9 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                     ))
                 })?;
 
-            let num_to_sell = ctx
-                .calls_of_type("DERC20", "once")
-                .find(|call| call.contract_address == asset)
+            let asset_once_call = ctx
+                .current_or_historical_once_call_for_address("DERC20", asset)
+                .await?
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getAssetData call for asset {} at block {} tx {}",
@@ -88,8 +88,9 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                         event.block_number,
                         B256::from(event.transaction_hash)
                     ))
-                })?
-                .get("getAssetData.numTokensToSell")?;
+                })?;
+
+            let num_to_sell = asset_once_call.get("getAssetData.numTokensToSell")?;
 
             let pool_key = {
                 let field_err = |field: &str, expected: &str| {
@@ -385,8 +386,6 @@ impl EventHandler for V4DecayMulticurveCreateHandler {
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
-            ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             (
                 "DecayMulticurveInitializer".to_string(),
                 "getState".to_string(),

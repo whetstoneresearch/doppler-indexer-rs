@@ -104,14 +104,12 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
         .or_else(|| {
-            args.iter()
-                .find(|a| a.starts_with("--chains="))
-                .map(|a| {
-                    a.trim_start_matches("--chains=")
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect()
-                })
+            args.iter().find(|a| a.starts_with("--chains=")).map(|a| {
+                a.trim_start_matches("--chains=")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            })
         });
 
     let mut config = IndexerConfig::load(Path::new("config/config.json"))?;
@@ -779,16 +777,18 @@ impl FullPipelineContext {
         let s3_manifest = self.s3_manifest();
         let sm = self.storage_manager.clone();
         let log_tx = Some(log_tx);
+        let receipts_client = Arc::new(receipts_client);
 
         spawn_two_phase_async(
             tasks,
             {
                 let (chain, cfg, sm) = (chain.clone(), cfg.clone(), sm.clone());
+                let receipts_client = receipts_client.clone();
                 async move {
                     let sm_for_current = sm.clone();
                     raw_data::historical::catchup::receipts::collect_receipts(
                         &chain,
-                        &receipts_client,
+                        &*receipts_client,
                         &cfg,
                         &log_tx,
                         &factory_log_tx,
@@ -831,7 +831,7 @@ impl FullPipelineContext {
                 async move {
                     raw_data::historical::current::receipts::collect_receipts(
                         &chain,
-                        &receipts_client,
+                        receipts_client,
                         &cfg,
                         block_rx,
                         log_tx,

@@ -31,9 +31,7 @@ pub fn read_once_calls_from_parquet(
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema
-            .index_of("contract_address")
-            .ok();
+        let address_idx = schema.index_of("contract_address").ok();
 
         // Find function result columns
         let function_indices: Vec<(String, Option<usize>)> = configs

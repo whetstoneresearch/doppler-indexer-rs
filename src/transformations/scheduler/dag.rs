@@ -297,10 +297,11 @@ mod tests {
                 Box::pin(async move {
                     let key = (item.handler_name.clone(), item.range_start);
 
-                    rec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "start"));
+                    rec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "start",
+                    ));
 
                     let now = rec.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     rec.max_in_flight.fetch_max(now, Ordering::SeqCst);
@@ -314,10 +315,11 @@ mod tests {
                     }
 
                     rec.in_flight.fetch_sub(1, Ordering::SeqCst);
-                    rec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "end"));
+                    rec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "end",
+                    ));
 
                     if rec.fail_on.contains(&key) {
                         Err(format!("test-forced failure at {}:{}", key.0, key.1))
@@ -557,25 +559,25 @@ mod tests {
             move |item: WorkItem| {
                 let vrec = vrec.clone();
                 Box::pin(async move {
-                    vrec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "start"));
+                    vrec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "start",
+                    ));
                     let hold = if item.handler_name == "A" && item.range_start == 100 {
                         100u64
                     } else {
                         10u64
                     };
                     tokio::time::sleep(Duration::from_millis(hold)).await;
-                    vrec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "end"));
+                    vrec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "end",
+                    ));
                     Ok::<(), String>(())
                 })
-                    as std::pin::Pin<
-                        Box<dyn Future<Output = Result<(), String>> + Send>,
-                    >
+                    as std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
             }
         };
 

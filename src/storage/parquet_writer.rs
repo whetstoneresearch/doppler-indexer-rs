@@ -79,8 +79,8 @@ fn write_parquet_to_file(
         .set_compression(parquet::basic::Compression::SNAPPY)
         .build();
 
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
-        .map_err(std::io::Error::other)?;
+    let mut writer =
+        ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(std::io::Error::other)?;
     writer.write(batch).map_err(std::io::Error::other)?;
 
     // into_inner() writes the footer and returns the underlying File,

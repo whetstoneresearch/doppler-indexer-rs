@@ -5,9 +5,7 @@
 
 use std::time::Instant;
 
-use metrics::{
-    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
-};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 /// Register metric descriptions (call once at startup).
 pub fn describe_transformation_metrics() {

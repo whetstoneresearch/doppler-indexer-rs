@@ -56,14 +56,14 @@ impl TransformationHandler for V3CreateHandler {
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
             let Some((asset_metadata, numeraire_metadata)) =
-                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
             else {
                 continue;
             };
 
             let pool_call = ctx
-                .calls_for_address(pool_or_hook)
-                .find(|call| call.function_name == "once")
+                .current_or_historical_once_call_for_address("DopplerV3Pool", pool_or_hook)
+                .await?
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(pool_or_hook)
@@ -179,11 +179,7 @@ impl EventHandler for V3CreateHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![
-            ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
-            ("DopplerV3Pool".to_string(), "once".to_string()),
-        ]
+        vec![("DopplerV3Pool".to_string(), "once".to_string())]
     }
 }
 
@@ -225,14 +221,14 @@ impl TransformationHandler for LockableV3CreateHandler {
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
             let Some((asset_metadata, numeraire_metadata)) =
-                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
             else {
                 continue;
             };
 
             let pool_call = ctx
-                .calls_for_address(pool_or_hook)
-                .find(|call| call.function_name == "once")
+                .current_or_historical_once_call_for_address("DopplerLockableV3Pool", pool_or_hook)
+                .await?
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(pool_or_hook)
@@ -346,11 +342,7 @@ impl EventHandler for LockableV3CreateHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![
-            ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
-            ("DopplerLockableV3Pool".to_string(), "once".to_string()),
-        ]
+        vec![("DopplerLockableV3Pool".to_string(), "once".to_string())]
     }
 }
 
@@ -369,10 +361,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::rpc::UnifiedRpcClient;
     use crate::transformations::context::TransformationContext;
     use crate::transformations::historical::HistoricalDataReader;
     use crate::transformations::util::pool_metadata::PoolMetadataCache;
-    use crate::rpc::UnifiedRpcClient;
 
     fn make_empty_ctx() -> TransformationContext {
         let historical = Arc::new(

@@ -291,10 +291,7 @@ mod tests {
         let tracker = Arc::new(CompletionTracker::new());
         let tracker2 = tracker.clone();
         let handle = tokio::spawn(async move {
-            tracker2
-                .wait_ready(&names(&["A", "B"]), 100)
-                .await
-                .unwrap();
+            tracker2.wait_ready(&names(&["A", "B"]), 100).await.unwrap();
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -349,13 +346,10 @@ mod tests {
             waiters.push(tokio::spawn(async move {
                 let name = format!("H{}", i);
                 let range = (i as u64) * 10;
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    tracker.wait_ready(&[name], range),
-                )
-                .await
-                .expect("no lost wakeup")
-                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), tracker.wait_ready(&[name], range))
+                    .await
+                    .expect("no lost wakeup")
+                    .unwrap();
             }));
         }
 
@@ -379,10 +373,7 @@ mod tests {
         let tracker = CompletionTracker::new();
 
         // Waiting.
-        assert_eq!(
-            tracker.probe(&names(&["A"]), 100).await,
-            DepState::Waiting
-        );
+        assert_eq!(tracker.probe(&names(&["A"]), 100).await, DepState::Waiting);
 
         // Ready.
         tracker.mark_completed("A", 100).await;

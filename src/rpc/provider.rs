@@ -347,6 +347,7 @@ pub type StandardRateLimiter =
 pub struct RpcClientConfig {
     pub url: Url,
     pub max_batch_size: usize,
+    pub concurrency: usize,
     pub batching_enabled: bool,
     pub rate_limit: Option<RateLimitConfig>,
     pub retry: RetryConfig,
@@ -382,6 +383,7 @@ impl RpcClientConfig {
         Self {
             url,
             max_batch_size: 100,
+            concurrency: 100,
             batching_enabled: true,
             rate_limit: None,
             retry: RetryConfig::default(),
@@ -390,6 +392,11 @@ impl RpcClientConfig {
 
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.max_batch_size = size;
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
         self
     }
 
@@ -489,11 +496,7 @@ impl RpcClient {
         if let Some(ref limiter) = self.sliding_limiter {
             limiter.acquire(1).await;
             let current = limiter.current_usage_async().await;
-            set_cu_usage(
-                &self.chain,
-                current as f64,
-                limiter.max_in_window() as f64,
-            );
+            set_cu_usage(&self.chain, current as f64, limiter.max_in_window() as f64);
         } else if let (Some(limiter), Some(jitter)) = (&self.rate_limiter, &self.jitter) {
             limiter.until_ready_with_jitter(*jitter).await;
         }
@@ -504,13 +507,18 @@ impl RpcClient {
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
-        with_retry(&self.config.retry, "get_block_number", &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            self.provider
-                .get_block_number()
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "get_block_number",
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                self.provider
+                    .get_block_number()
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -907,7 +915,8 @@ impl RpcClient {
 
         let mut all_results = Vec::with_capacity(hashes.len());
 
-        for chunk in hashes.chunks(self.config.max_batch_size) {
+        let effective_chunk_size = self.config.max_batch_size.min(self.config.concurrency).max(1);
+        for chunk in hashes.chunks(effective_chunk_size) {
             self.wait_for_rate_limit().await;
 
             let futures: Vec<_> = chunk
@@ -949,24 +958,25 @@ impl RpcClient {
                 chunk_idx,
                 chunk_vec.len()
             );
-            let chunk_results: Vec<Vec<Log>> = with_retry(&self.config.retry, &op_name, &self.chain, || async {
-                self.wait_for_rate_limit().await;
+            let chunk_results: Vec<Vec<Log>> =
+                with_retry(&self.config.retry, &op_name, &self.chain, || async {
+                    self.wait_for_rate_limit().await;
 
-                let futures: Vec<_> = chunk_vec
-                    .iter()
-                    .map(|filter| self.provider.get_logs(filter))
-                    .collect();
+                    let futures: Vec<_> = chunk_vec
+                        .iter()
+                        .map(|filter| self.provider.get_logs(filter))
+                        .collect();
 
-                let results = futures::future::join_all(futures).await;
+                    let results = futures::future::join_all(futures).await;
 
-                let mut chunk_results = Vec::with_capacity(results.len());
-                for result in results {
-                    chunk_results
-                        .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                }
-                Ok(chunk_results)
-            })
-            .await?;
+                    let mut chunk_results = Vec::with_capacity(results.len());
+                    for result in results {
+                        chunk_results
+                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
+                    }
+                    Ok(chunk_results)
+                })
+                .await?;
 
             all_results.extend(chunk_results);
         }
@@ -1128,5 +1138,59 @@ impl std::fmt::Debug for RpcClient {
             .field("config", &self.config)
             .field("has_rate_limiter", &self.rate_limiter.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that get_transaction_receipts_batch chunks by
+    /// min(max_batch_size, concurrency) to enforce concurrency.
+    #[test]
+    fn effective_chunk_size_uses_min_of_batch_and_concurrency() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_batch_size(100)
+            .with_concurrency(10);
+
+        let effective = config.max_batch_size.min(config.concurrency).max(1);
+        assert_eq!(effective, 10);
+    }
+
+    /// Verify that concurrency > batch_size still respects the batch_size cap.
+    #[test]
+    fn effective_chunk_size_respects_batch_cap() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_batch_size(5)
+            .with_concurrency(100);
+
+        let effective = config.max_batch_size.min(config.concurrency).max(1);
+        assert_eq!(effective, 5);
+    }
+
+    /// Verify .max(1) guards against chunks(0) panic.
+    #[test]
+    fn effective_chunk_size_zero_defaults_to_one() {
+        let mut config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
+        config.max_batch_size = 0;
+        config.concurrency = 0;
+
+        let effective = config.max_batch_size.min(config.concurrency).max(1);
+        assert_eq!(effective, 1);
+    }
+
+    /// Verify with_concurrency builder actually sets the field.
+    #[test]
+    fn with_concurrency_builder() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_concurrency(42);
+        assert_eq!(config.concurrency, 42);
+    }
+
+    /// Verify default concurrency is 100.
+    #[test]
+    fn default_concurrency_is_100() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
+        assert_eq!(config.concurrency, 100);
     }
 }

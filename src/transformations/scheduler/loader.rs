@@ -15,7 +15,9 @@ use tokio::task::JoinSet;
 use super::dag::WorkItem;
 use crate::db::DbPool;
 use crate::rpc::UnifiedRpcClient;
-use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
+use crate::transformations::context::{
+    DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext,
+};
 use crate::transformations::engine::HandlerKind;
 use crate::transformations::error::TransformationError;
 use crate::transformations::executor::inject_source_version;
@@ -63,11 +65,7 @@ where
                 tracing::debug!("Reading decoded data from {}", file_path.display());
                 match read_fn(reader, &file_path, &src, &name) {
                     Ok(items) => {
-                        tracing::debug!(
-                            "Read {} items from {}",
-                            items.len(),
-                            file_path.display()
-                        );
+                        tracing::debug!("Read {} items from {}", items.len(), file_path.display());
                         Ok(items)
                     }
                     Err(e) => {
@@ -77,10 +75,7 @@ where
                                 if io.kind() == std::io::ErrorKind::NotFound
                         );
                         if is_not_found {
-                            tracing::debug!(
-                                "File not found, skipping: {}",
-                                file_path.display()
-                            );
+                            tracing::debug!("File not found, skipping: {}", file_path.display());
                             Ok(Vec::new())
                         } else {
                             tracing::warn!(
@@ -130,7 +125,9 @@ pub(crate) async fn read_receipt_addresses(
     .unwrap_or_else(|e| {
         tracing::error!(
             "read_receipt_addresses panicked for range {}-{}: {}",
-            range_start, range_end, e
+            range_start,
+            range_end,
+            e
         );
         HashMap::new()
     })
@@ -390,7 +387,10 @@ impl CatchupLoader {
                     {
                         tracing::warn!(
                             "on_commit_failure callback failed for {} range {}-{}: {}",
-                            handler_key, range_start, range_end, cb_err
+                            handler_key,
+                            range_start,
+                            range_end,
+                            cb_err
                         );
                     }
                     return Err(TransformationError::DatabaseError(e));
@@ -505,26 +505,27 @@ mod tests {
                + Send
                + Sync
                + Clone
-               + 'static
-        {
+               + 'static {
             let rec = self.clone();
             move |item: WorkItem| {
                 let rec = rec.clone();
                 Box::pin(async move {
                     let key = (item.handler_name.clone(), item.range_start);
-                    rec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "start"));
+                    rec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "start",
+                    ));
 
                     if rec.hold_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(rec.hold_ms)).await;
                     }
 
-                    rec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "end"));
+                    rec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "end",
+                    ));
 
                     if rec.fail_on.contains(&key) {
                         Err(format!("test-forced failure at {}:{}", key.0, key.1))
@@ -614,11 +615,7 @@ mod tests {
                     continue;
                 }
 
-                items.push(item(
-                    name,
-                    range_start,
-                    handler_deps,
-                ));
+                items.push(item(name, range_start, handler_deps));
             }
         }
 
@@ -639,9 +636,9 @@ mod tests {
 
         // Handlers in topological order: A first, then B (depends on A), then C.
         let handlers: Vec<(&str, &[&str], bool)> = vec![
-            ("A", &[], true),        // has call_deps
-            ("B", &["A"], false),    // depends on A, no call_deps
-            ("C", &[], false),       // independent
+            ("A", &[], true),     // has call_deps
+            ("B", &["A"], false), // depends on A, no call_deps
+            ("C", &[], false),    // independent
         ];
         let ranges: Vec<(u64, u64)> = vec![(100, 1100), (101, 1101), (102, 1102)];
         let completed: HashMap<String, HashSet<u64>> = HashMap::new();

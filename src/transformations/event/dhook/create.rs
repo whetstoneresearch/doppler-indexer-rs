@@ -56,7 +56,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
             let numeraire = event.extract_address("numeraire")?;
 
             let Some((asset_metadata, numeraire_metadata)) =
-                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops)?
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
             else {
                 continue;
             };
@@ -227,8 +227,6 @@ impl EventHandler for DopplerHookCreateHandler {
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
-            ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             ("DopplerHookInitializer".to_string(), "getState".to_string()),
             (
                 "DopplerHookInitializer".to_string(),

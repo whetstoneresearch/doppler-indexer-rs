@@ -109,20 +109,14 @@ pub trait TransformationHandler: Send + Sync + 'static {
     /// Called after the ops returned by `handle()` committed successfully.
     /// Lets handlers promote any in-flight optimistic state.
     #[allow(unused_variables)]
-    async fn on_commit_success(
-        &self,
-        range: (u64, u64),
-    ) -> Result<(), TransformationError> {
+    async fn on_commit_success(&self, range: (u64, u64)) -> Result<(), TransformationError> {
         Ok(())
     }
 
     /// Called after the ops returned by `handle()` failed to commit.
     /// Lets handlers revert optimistic state and mark the range for retry.
     #[allow(unused_variables)]
-    async fn on_commit_failure(
-        &self,
-        range: (u64, u64),
-    ) -> Result<(), TransformationError> {
+    async fn on_commit_failure(&self, range: (u64, u64)) -> Result<(), TransformationError> {
         Ok(())
     }
 }

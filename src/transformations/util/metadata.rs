@@ -1,14 +1,16 @@
 use alloy_primitives::{Address, B256};
 
 use crate::db::DbOperation;
-use crate::transformations::util::db::skipped_addresses::{insert_skipped_address, SkippedAddressData};
+use crate::transformations::util::db::skipped_addresses::{
+    insert_skipped_address, SkippedAddressData,
+};
 use crate::transformations::util::sanitize::is_precompile_address;
 
 use crate::transformations::{DecodedEvent, TransformationContext, TransformationError};
 use crate::types::shared::metadata::{AssetTokenMetadata, TokenMetadata};
 use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
-pub fn get_metadata(
+pub async fn get_metadata(
     asset: &[u8; 20],
     numeraire: &[u8; 20],
     event: &DecodedEvent,
@@ -25,8 +27,8 @@ pub fn get_metadata(
     }
 
     let asset_metadata = ctx
-        .calls_of_type("DERC20", "once")
-        .find(|call| call.contract_address == *asset)
+        .current_or_historical_once_call_for_address("DERC20", *asset)
+        .await?
         .ok_or_else(|| {
             let available_calls: Vec<_> = ctx
                 .calls_for_address(*asset)
@@ -146,7 +148,9 @@ pub fn get_metadata(
             decimals: 18,
         }
     } else {
-        let call = ctx.calls_of_type("Numeraires", "once").find(|call| call.contract_address == *numeraire)
+        let call = ctx
+            .current_or_historical_once_call_for_address("Numeraires", *numeraire)
+            .await?
             .ok_or_else(|| {
                 let available_calls: Vec<_> = ctx.calls_for_address(*numeraire)
                     .map(|c| format!("{}:{}", c.source_name, c.function_name))
@@ -206,16 +210,19 @@ pub fn get_metadata(
     Ok((asset_metadata, numeraire_metadata))
 }
 
-pub fn get_metadata_or_skip(
+pub async fn get_metadata_or_skip(
     asset: &[u8; 20],
     numeraire: &[u8; 20],
     event: &DecodedEvent,
     ctx: &TransformationContext,
     ops: &mut Vec<DbOperation>,
 ) -> Result<Option<(AssetTokenMetadata, TokenMetadata)>, TransformationError> {
-    match get_metadata(asset, numeraire, event, ctx) {
+    match get_metadata(asset, numeraire, event, ctx).await {
         Ok(m) => Ok(Some(m)),
-        Err(TransformationError::MissingData(msg) | TransformationError::IncludesPrecompileError(msg)) => {
+        Err(
+            TransformationError::MissingData(msg)
+            | TransformationError::IncludesPrecompileError(msg),
+        ) => {
             tracing::warn!(
                 asset = %Address::from(asset),
                 numeraire = %Address::from(numeraire),
