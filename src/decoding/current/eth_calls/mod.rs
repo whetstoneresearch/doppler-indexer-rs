@@ -33,6 +33,7 @@ pub async fn decode_eth_calls_live(
     configs: &EthCallDecodeConfigs<'_>,
     raw_data_config: &RawDataCollectionConfig,
     outputs: &EthCallDecoderOutputs<'_>,
+    repair: bool,
 ) -> Result<(), EthCallDecodingError> {
     let regular_configs = configs.regular;
     let once_configs = configs.once;
@@ -221,6 +222,7 @@ pub async fn decode_eth_calls_live(
                         event_configs,
                         raw_data_config,
                         transform_tx,
+                        repair,
                     )
                     .await?;
                 }
@@ -336,6 +338,7 @@ mod tests {
                 &configs,
                 &raw_data_config(),
                 &outputs,
+                false,
             )
             .await
         })
@@ -365,6 +368,7 @@ mod tests {
                 &configs,
                 &raw_data_config(),
                 &outputs,
+                false,
             )
             .await
         });
@@ -412,6 +416,7 @@ mod tests {
                 &configs,
                 &raw_data_config(),
                 &outputs,
+                false,
             )
             .await
         });

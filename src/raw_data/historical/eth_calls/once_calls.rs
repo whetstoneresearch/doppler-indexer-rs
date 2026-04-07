@@ -30,6 +30,17 @@ use crate::storage::contract_index::{
 use crate::storage::upload_parquet_to_s3;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
+fn unique_factory_address_count(factory_data: &FactoryAddressData, collection_name: &str) -> u64 {
+    factory_data
+        .addresses_by_block
+        .values()
+        .flat_map(|addrs| addrs.iter())
+        .filter(|(_, _, coll)| coll == collection_name)
+        .map(|(_, addr, _)| addr.0 .0)
+        .collect::<HashSet<[u8; 20]>>()
+        .len() as u64
+}
+
 pub(crate) async fn process_once_calls_regular(
     range: &BlockRange,
     blocks: &[BlockInfo],
@@ -462,35 +473,32 @@ pub(crate) async fn process_factory_once_calls(
                         get_missing_contracts(&index, &rk, expected).is_empty()
                     }
                 };
-                if index_complete {
-                    // Address-level check: compare factory address count
-                    // against file row count (using state.row_count).
-                    let factory_addr_count = factory_data
-                        .addresses_by_block
-                        .values()
-                        .flat_map(|addrs| addrs.iter())
-                        .filter(|(_, _, coll)| coll == collection_name)
-                        .count() as u64;
-                    if factory_addr_count > 0 {
-                        if state.row_count < factory_addr_count {
-                            tracing::info!(
-                                "Factory once {} blocks {}-{}: file has {} rows but factory has {} addresses, re-checking",
-                                collection_name, range.start, range.end - 1,
-                                state.row_count, factory_addr_count,
-                            );
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
+                let factory_addr_count =
+                    unique_factory_address_count(factory_data, collection_name);
+                let rows_complete =
+                    factory_addr_count == 0 || state.row_count >= factory_addr_count;
+
+                if index_complete && rows_complete {
+                    continue;
                 }
-                tracing::info!(
-                    "Factory once {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
-                    collection_name,
-                    range.start,
-                    range.end - 1
-                );
+
+                if !rows_complete {
+                    tracing::info!(
+                        "Factory once {} blocks {}-{}: file has {} rows but factory has {} unique addresses, re-checking",
+                        collection_name, range.start, range.end - 1,
+                        state.row_count, factory_addr_count,
+                    );
+                } else if !ctx.repair {
+                    continue;
+                }
+                if !index_complete {
+                    tracing::info!(
+                        "Factory once {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
+                        collection_name,
+                        range.start,
+                        range.end - 1
+                    );
+                }
             }
             if !missing.is_empty() {
                 tracing::info!(
@@ -713,6 +721,9 @@ pub(crate) async fn process_factory_once_calls(
         // H. No-op optimization: if contract-index gate fell through but no calls needed,
         // just write the missing contract_index.json and skip the parquet rewrite.
         if pending_calls.is_empty() && has_existing_file {
+            if !ctx.repair {
+                continue;
+            }
             // Rewrite empty parquet with full schema when columns are missing
             if !missing_fn_names.is_empty() && existing_addr_set.is_empty() {
                 write_once_results_to_parquet_async(
@@ -1522,35 +1533,32 @@ pub(crate) async fn process_factory_once_calls_multicall(
                         get_missing_contracts(&index, &rk, expected).is_empty()
                     }
                 };
-                if index_complete {
-                    // Address-level check: compare factory address count
-                    // against file row count (using state.row_count).
-                    let factory_addr_count = factory_data
-                        .addresses_by_block
-                        .values()
-                        .flat_map(|addrs| addrs.iter())
-                        .filter(|(_, _, coll)| coll == collection_name)
-                        .count() as u64;
-                    if factory_addr_count > 0 {
-                        if state.row_count < factory_addr_count {
-                            tracing::info!(
-                                    "Factory once multicall {} blocks {}-{}: file has {} rows but factory has {} addresses, re-checking",
-                                    collection_name, range.start, range.end - 1,
-                                    state.row_count, factory_addr_count,
-                                );
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
+                let factory_addr_count =
+                    unique_factory_address_count(factory_data, collection_name);
+                let rows_complete =
+                    factory_addr_count == 0 || state.row_count >= factory_addr_count;
+
+                if index_complete && rows_complete {
+                    continue;
                 }
-                tracing::info!(
+
+                if !rows_complete {
+                    tracing::info!(
+                        "Factory once multicall {} blocks {}-{}: file has {} rows but factory has {} unique addresses, re-checking",
+                        collection_name, range.start, range.end - 1,
+                        state.row_count, factory_addr_count,
+                    );
+                } else if !ctx.repair {
+                    continue;
+                }
+                if !index_complete {
+                    tracing::info!(
                         "Factory once multicall {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
                         collection_name,
                         range.start,
                         range.end - 1
                     );
+                }
             }
             (missing, true, null_entries, Some(state))
         } else {
@@ -1627,6 +1635,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
             && !missing_fn_names.is_empty()
             && existing_addr_set.is_empty()
         {
+            if !ctx.repair {
+                continue;
+            }
             tokio::fs::create_dir_all(&sub_dir).await?;
             write_once_results_to_parquet_async(vec![], output_path.clone(), all_fn_names.clone())
                 .await?;
@@ -1879,6 +1890,9 @@ pub(crate) async fn process_factory_once_calls_multicall(
             && missing_fn_names.is_empty()
             && patch_fn_names.is_empty()
         {
+            if !ctx.repair {
+                continue;
+            }
             if let Some(expected) = expected_contracts.and_then(|m| m.get(&collection_name)) {
                 let rk = range_key(range.start, range.end - 1);
                 let mut ci = read_contract_index(sub_dir);
@@ -2217,8 +2231,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::raw_data::historical::eth_calls::{
-        extract_addresses_from_once_parquet, read_existing_once_parquet, read_parquet_column_names,
-        write_once_results_to_parquet, EthCallContext, OnceCallConfig,
+        extract_addresses_from_once_parquet, read_existing_once_parquet, read_once_parquet_state,
+        read_parquet_column_names, write_once_results_to_parquet, EthCallContext, OnceCallConfig,
     };
     use crate::raw_data::historical::factories::FactoryAddressData;
     use crate::rpc::UnifiedRpcClient;
@@ -2418,6 +2432,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_empty_parquet_state_preserves_schema_columns() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.parquet");
+
+        write_once_results_to_parquet(&[], &path, &["getA".to_string(), "getB".to_string()])
+            .unwrap();
+
+        let state = read_once_parquet_state(&path).unwrap();
+
+        assert_eq!(state.row_count, 0, "empty parquet must have zero rows");
+        assert!(
+            state.column_names.contains("getA"),
+            "empty parquet metadata must preserve getA"
+        );
+        assert!(
+            state.column_names.contains("getB"),
+            "empty parquet metadata must preserve getB"
+        );
+    }
+
+    #[test]
+    fn test_unique_factory_address_count_dedupes_repeated_addresses() {
+        use alloy_primitives::Address;
+
+        let repeated = Address::new([0xaa; 20]);
+        let other = Address::new([0xbb; 20]);
+        let mut addresses_by_block = HashMap::new();
+        addresses_by_block.insert(
+            100,
+            vec![
+                (1, repeated, "Numeraires".to_string()),
+                (2, repeated, "Numeraires".to_string()),
+                (3, other, "Numeraires".to_string()),
+                (4, Address::new([0xcc; 20]), "OtherCollection".to_string()),
+            ],
+        );
+        let factory_data = FactoryAddressData {
+            range_start: 100,
+            range_end: 200,
+            addresses_by_block,
+        };
+
+        assert_eq!(
+            super::unique_factory_address_count(&factory_data, "Numeraires"),
+            2,
+            "row completeness should be based on unique discovered addresses"
+        );
+    }
+
     /// P3 regression: `build_expected_factory_contracts_for_range` must return
     /// correct collection→contract→addresses mapping from a Contracts config
     /// that has factory entries, so that the live/current path can write
@@ -2502,6 +2566,7 @@ mod tests {
             output_dir: tmp.path(),
             existing_files: &existing_files,
             rpc_batch_size: 10,
+            repair: false,
             decoder_tx: &decoder_tx,
             chain_name: "test",
             storage_manager: None,
@@ -2608,6 +2673,127 @@ mod tests {
                 .join("test_collection/once/contract_index.json")
                 .exists(),
             "contract_index.json must exist after empty-range write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_factory_once_existing_file_contract_index_repair_is_repair_only() {
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+        use alloy_primitives::{Address, U256};
+
+        let tmp = TempDir::new().unwrap();
+        let dummy_client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+        let range = BlockRange { start: 0, end: 100 };
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        std::fs::create_dir_all(parquet_path.parent().unwrap()).unwrap();
+        write_once_results_to_parquet(&[], &parquet_path, &["testFn".to_string()]).unwrap();
+
+        let mut existing_files: HashSet<String> = HashSet::new();
+        existing_files.insert("test_collection/once/0-99.parquet".to_string());
+        let decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>> = None;
+        let s3_manifest: Option<crate::storage::S3Manifest> = None;
+
+        let factory_data = FactoryAddressData {
+            range_start: 0,
+            range_end: 100,
+            addresses_by_block: HashMap::new(),
+        };
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "TestFactory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::new([0xaa; 20])),
+                start_block: Some(U256::from(0)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "Created(address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![0]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+        let expected = build_expected_factory_contracts_for_range(&contracts, range.end);
+
+        let ctx_no_repair = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            repair: false,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx_no_repair,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        let contract_index_path = tmp.path().join("test_collection/once/contract_index.json");
+        assert!(
+            !contract_index_path.exists(),
+            "normal catchup should not backfill legacy contract indexes"
+        );
+
+        let ctx_repair = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            repair: true,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx_repair,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            contract_index_path.exists(),
+            "repair mode should backfill legacy contract indexes"
         );
     }
 }

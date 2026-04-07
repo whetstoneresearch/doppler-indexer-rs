@@ -12,12 +12,14 @@ use tokio::task::JoinSet;
 
 use crate::decoding::eth_calls::column_index::{
     load_or_build_decoded_column_index, read_decoded_column_index, read_once_calls_from_parquet,
-    read_raw_column_index, read_raw_parquet_function_names, write_decoded_column_index,
+    read_raw_column_index, read_raw_parquet_function_names, rebuild_decoded_column_index,
+    write_decoded_column_index,
 };
 use crate::decoding::eth_calls::{
     process_event_calls, process_once_calls, process_regular_calls, CallDecodeConfig,
     EthCallDecodingError, EventCallDecodeConfig,
 };
+use crate::raw_data::historical::eth_calls::rebuild_once_column_index;
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::parquet_readers::{
     read_event_calls_from_parquet, read_regular_calls_from_parquet,
@@ -57,8 +59,15 @@ pub async fn catchup_decode_eth_calls(
     event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    repair: bool,
 ) -> Result<(), EthCallDecodingError> {
     let concurrency = raw_data_config.decoding_concurrency.unwrap_or(8);
+
+    if repair {
+        tracing::info!(
+            "Eth_call decoding catchup repair mode enabled: rebuilding once column indexes from parquet schemas"
+        );
+    }
 
     // Scan existing decoded files
     let existing_decoded = scan_existing_decoded_files(output_base);
@@ -76,31 +85,40 @@ pub async fn catchup_decode_eth_calls(
     for contract_name in &once_contract_names {
         let raw_once_dir = raw_calls_dir.join(contract_name).join("once");
         let raw_index = if raw_once_dir.exists() {
-            let mut idx = read_raw_column_index(&raw_once_dir);
-            // If index is empty, try to build from parquet schemas
-            if idx.is_empty() {
-                if let Ok(entries) = std::fs::read_dir(&raw_once_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map(|e| e == "parquet").unwrap_or(false) {
-                            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
-                            let cols: Vec<String> =
-                                read_raw_parquet_function_names(&path).into_iter().collect();
-                            if !cols.is_empty() {
-                                idx.insert(file_name, cols);
+            if repair {
+                rebuild_once_column_index(&raw_once_dir)
+            } else {
+                let mut idx = read_raw_column_index(&raw_once_dir);
+                // If index is empty, try to build from parquet schemas
+                if idx.is_empty() {
+                    if let Ok(entries) = std::fs::read_dir(&raw_once_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().map(|e| e == "parquet").unwrap_or(false) {
+                                let file_name =
+                                    path.file_name().unwrap().to_string_lossy().to_string();
+                                let cols: Vec<String> =
+                                    read_raw_parquet_function_names(&path).into_iter().collect();
+                                if !cols.is_empty() {
+                                    idx.insert(file_name, cols);
+                                }
                             }
                         }
                     }
                 }
+                idx
             }
-            idx
         } else {
             HashMap::new()
         };
         raw_column_indexes.insert(contract_name.clone(), raw_index);
 
         let decoded_once_dir = output_base.join(contract_name).join("once");
-        let decoded_index = load_or_build_decoded_column_index(&decoded_once_dir, &raw_once_dir);
+        let decoded_index = if repair {
+            rebuild_decoded_column_index(&decoded_once_dir, &raw_once_dir)
+        } else {
+            load_or_build_decoded_column_index(&decoded_once_dir, &raw_once_dir)
+        };
         decoded_column_indexes.insert(contract_name.clone(), decoded_index);
     }
 
@@ -189,6 +207,24 @@ pub async fn catchup_decode_eth_calls(
                                     .map(|cols| cols.iter().cloned().collect())
                                     .unwrap_or_default();
 
+                                let missing_decoded_cols: HashSet<String> =
+                                    raw_cols.difference(&decoded_cols).cloned().collect();
+                                let extra_decoded_cols: HashSet<String> =
+                                    decoded_cols.difference(&raw_cols).cloned().collect();
+
+                                if repair
+                                    && (!missing_decoded_cols.is_empty()
+                                        || !extra_decoded_cols.is_empty())
+                                {
+                                    tracing::warn!(
+                                        "Repair detected once schema mismatch for {}/once/{}: raw_only={:?}, decoded_only={:?}",
+                                        contract_name,
+                                        file_name,
+                                        missing_decoded_cols,
+                                        extra_decoded_cols
+                                    );
+                                }
+
                                 // Find functions that exist in raw but need decoding
                                 let missing_configs: Vec<CallDecodeConfig> = configs
                                     .iter()
@@ -199,8 +235,7 @@ pub async fn catchup_decode_eth_calls(
                                                 return false;
                                             }
                                         }
-                                        raw_cols.contains(&c.function_name)
-                                            && !decoded_cols.contains(&c.function_name)
+                                        missing_decoded_cols.contains(&c.function_name)
                                     })
                                     .cloned()
                                     .collect();

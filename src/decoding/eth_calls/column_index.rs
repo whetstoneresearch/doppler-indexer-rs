@@ -307,6 +307,59 @@ pub fn load_or_build_decoded_column_index(
         }
     }
 
+    let index = build_decoded_column_index_from_parquet(decoded_once_dir, raw_once_dir);
+
+    // Write the newly built index
+    if !index.is_empty() {
+        if let Err(e) = write_decoded_column_index(decoded_once_dir, &index) {
+            tracing::warn!(
+                "Failed to write decoded column index to {}: {}",
+                decoded_once_dir.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Built and saved decoded column index for {}: {} files tracked",
+                decoded_once_dir.display(),
+                index.len()
+            );
+        }
+    }
+
+    index
+}
+
+/// Force a rebuild of the decoded once-column index by scanning parquet files,
+/// ignoring any existing sidecar file.
+pub fn rebuild_decoded_column_index(
+    decoded_once_dir: &Path,
+    raw_once_dir: &Path,
+) -> HashMap<String, Vec<String>> {
+    let index = build_decoded_column_index_from_parquet(decoded_once_dir, raw_once_dir);
+
+    if decoded_once_dir.exists() {
+        if let Err(e) = write_decoded_column_index(decoded_once_dir, &index) {
+            tracing::warn!(
+                "Failed to rewrite decoded column index to {}: {}",
+                decoded_once_dir.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Rebuilt decoded column index for {}: {} files tracked",
+                decoded_once_dir.display(),
+                index.len()
+            );
+        }
+    }
+
+    index
+}
+
+fn build_decoded_column_index_from_parquet(
+    decoded_once_dir: &Path,
+    raw_once_dir: &Path,
+) -> HashMap<String, Vec<String>> {
     // Index doesn't exist or couldn't be loaded - build from parquet files
     if !decoded_once_dir.exists() {
         return HashMap::new();
@@ -363,23 +416,6 @@ pub fn load_or_build_decoded_column_index(
                 }
             }
             index.insert(file_name, cols);
-        }
-    }
-
-    // Write the newly built index
-    if !index.is_empty() {
-        if let Err(e) = write_decoded_column_index(decoded_once_dir, &index) {
-            tracing::warn!(
-                "Failed to write decoded column index to {}: {}",
-                decoded_once_dir.display(),
-                e
-            );
-        } else {
-            tracing::info!(
-                "Built and saved decoded column index for {}: {} files tracked",
-                decoded_once_dir.display(),
-                index.len()
-            );
         }
     }
 
@@ -478,4 +514,89 @@ pub fn read_raw_parquet_function_names(path: &Path) -> HashSet<String> {
     }
 
     fn_names
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, StringArray, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use tempfile::TempDir;
+
+    use super::{rebuild_decoded_column_index, write_decoded_column_index};
+    use crate::raw_data::historical::eth_calls::{write_once_results_to_parquet, OnceCallResult};
+
+    #[test]
+    fn rebuild_decoded_column_index_ignores_stale_sidecar_schema() {
+        let temp = TempDir::new().unwrap();
+        let raw_once_dir = temp.path().join("raw");
+        let decoded_once_dir = temp.path().join("decoded");
+        std::fs::create_dir_all(&raw_once_dir).unwrap();
+        std::fs::create_dir_all(&decoded_once_dir).unwrap();
+
+        let file_name = "100-199.parquet";
+        let raw_path = raw_once_dir.join(file_name);
+        let decoded_path = decoded_once_dir.join(file_name);
+
+        let mut raw_results = HashMap::new();
+        raw_results.insert("name".to_string(), vec![0x01]);
+        raw_results.insert("symbol".to_string(), vec![0x02]);
+        raw_results.insert("decimals".to_string(), vec![0x12]);
+        write_once_results_to_parquet(
+            &[OnceCallResult {
+                block_number: 123,
+                block_timestamp: 456,
+                contract_address: [0x11; 20],
+                function_results: raw_results,
+            }],
+            &raw_path,
+            &[
+                "name".to_string(),
+                "symbol".to_string(),
+                "decimals".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("contract_address", DataType::FixedSizeBinary(20), false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("symbol", DataType::Utf8, true),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(vec![123u64])),
+            Arc::new(UInt64Array::from(vec![456u64])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::once(&[0x11u8; 20][..])).unwrap(),
+            ),
+            Arc::new(StringArray::from(vec![Some("GRAM Ecosystem")])),
+            Arc::new(StringArray::from(vec![Some("GRAMNEWS")])),
+        ];
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
+        crate::storage::atomic_write_parquet_fast(&batch, &decoded_path).unwrap();
+
+        write_decoded_column_index(
+            &decoded_once_dir,
+            &HashMap::from([(
+                file_name.to_string(),
+                vec![
+                    "name".to_string(),
+                    "symbol".to_string(),
+                    "decimals".to_string(),
+                ],
+            )]),
+        )
+        .unwrap();
+
+        let rebuilt = rebuild_decoded_column_index(&decoded_once_dir, &raw_once_dir);
+        let cols = rebuilt.get(file_name).unwrap();
+        assert!(cols.contains(&"name".to_string()));
+        assert!(cols.contains(&"symbol".to_string()));
+        assert!(!cols.contains(&"decimals".to_string()));
+    }
 }

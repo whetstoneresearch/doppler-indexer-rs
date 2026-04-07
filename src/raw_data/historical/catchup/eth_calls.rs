@@ -72,6 +72,8 @@ pub async fn collect_eth_calls(
     chain: &ChainConfig,
     client: &UnifiedRpcClient,
     raw_data_config: &RawDataCollectionConfig,
+    repair: bool,
+    repair_only: bool,
     decoder_tx: &Option<Sender<DecoderMessage>>,
     has_factory_rx: bool,
     has_event_trigger_rx: bool,
@@ -82,6 +84,12 @@ pub async fn collect_eth_calls(
 ) -> Result<EthCallCatchupState, EthCallCollectionError> {
     let base_output_dir = raw_eth_calls_dir(&chain.name);
     tokio::fs::create_dir_all(&base_output_dir).await?;
+
+    if repair_only {
+        tracing::info!(
+            "Eth_call collection repair-only mode enabled: running repair passes without normal catchup collection"
+        );
+    }
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
@@ -142,6 +150,7 @@ pub async fn collect_eth_calls(
             has_factory_calls,
             has_factory_once_calls,
             has_event_triggered_calls,
+            repair,
             max_params: 0,
             factory_max_params: 0,
             existing_files: HashSet::new(),
@@ -195,7 +204,7 @@ pub async fn collect_eth_calls(
     let mut range_regular_done: HashSet<u64> = HashSet::new();
     let range_factory_done: HashSet<u64> = HashSet::new();
 
-    if has_regular_calls || has_once_calls {
+    if !repair_only && (has_regular_calls || has_once_calls) {
         let block_ranges =
             get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned())
                 .await;
@@ -400,6 +409,7 @@ pub async fn collect_eth_calls(
                 output_dir: &base_output_dir,
                 existing_files: &existing_files,
                 rpc_batch_size,
+                repair,
                 decoder_tx: &None,
                 chain_name: &chain.name,
                 storage_manager: storage_manager.as_ref(),
@@ -552,6 +562,7 @@ pub async fn collect_eth_calls(
                     output_dir: &base_output_dir,
                     existing_files: &existing_files,
                     rpc_batch_size,
+                    repair,
                     decoder_tx,
                     chain_name: &chain.name,
                     storage_manager: storage_manager.as_ref(),
@@ -599,7 +610,7 @@ pub async fn collect_eth_calls(
     // =========================================================================
     // Catchup phase for event-triggered calls: Read from existing log parquet files
     // =========================================================================
-    if has_event_triggered_calls {
+    if !repair_only && has_event_triggered_calls {
         // CRITICAL: Load historical factory addresses BEFORE processing event triggers
         // This ensures we can properly filter events from factory-created contracts
         let factory_collections: HashSet<String> = event_call_configs
@@ -785,6 +796,7 @@ pub async fn collect_eth_calls(
                             output_dir: &base_output_dir,
                             existing_files: &existing_files,
                             rpc_batch_size,
+                            repair,
                             decoder_tx: &decoder_tx,
                             chain_name: &chain_name,
                             storage_manager: storage_manager.as_ref(),
@@ -953,6 +965,7 @@ pub async fn collect_eth_calls(
         has_factory_calls,
         has_factory_once_calls,
         has_event_triggered_calls,
+        repair,
         max_params,
         factory_max_params,
         existing_files,
@@ -1032,6 +1045,7 @@ mod tests {
             output_dir: tmp.path(),
             existing_files: &existing_files,
             rpc_batch_size: 10,
+            repair: false,
             decoder_tx: &None,
             chain_name: "test",
             storage_manager: None,

@@ -97,6 +97,7 @@ pub struct EthCallContext<'a> {
     pub output_dir: &'a Path,
     pub existing_files: &'a HashSet<String>,
     pub rpc_batch_size: usize,
+    pub repair: bool,
     pub decoder_tx: &'a Option<Sender<DecoderMessage>>,
     pub chain_name: &'a str,
     pub storage_manager: Option<&'a Arc<StorageManager>>,
@@ -250,6 +251,7 @@ pub struct EthCallCatchupState {
     pub has_factory_calls: bool,
     pub has_factory_once_calls: bool,
     pub has_event_triggered_calls: bool,
+    pub repair: bool,
     // Derived constants
     pub max_params: usize,
     pub factory_max_params: usize,

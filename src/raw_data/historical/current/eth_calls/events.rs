@@ -52,6 +52,7 @@ pub(super) async fn handle_event_trigger_message(
                     output_dir: &state.base_output_dir,
                     existing_files: &state.existing_files,
                     rpc_batch_size: state.rpc_batch_size,
+                    repair: state.repair,
                     decoder_tx,
                     chain_name,
                     storage_manager,
