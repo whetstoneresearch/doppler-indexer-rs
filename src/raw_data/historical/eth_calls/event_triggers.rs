@@ -1122,9 +1122,41 @@ pub(crate) async fn process_event_triggers_multicall(
         .max()
         .unwrap();
 
+    // Split oversized multicalls to prevent RPC timeouts on blocks with many events.
+    // A single multicall with 50+ sub-calls can take seconds to execute on the node,
+    // causing timeouts and retries that tank throughput.
+    const MAX_SUBCALLS_PER_MULTICALL: usize = 25;
+    let total_subcalls: usize = block_multicalls.iter().map(|bm| bm.slots.len()).sum();
+    let max_subcalls = block_multicalls.iter().map(|bm| bm.slots.len()).max().unwrap_or(0);
+
+    let block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> = if max_subcalls
+        > MAX_SUBCALLS_PER_MULTICALL
+    {
+        let mut split = Vec::with_capacity(block_multicalls.len() * 2);
+        for bm in block_multicalls {
+            if bm.slots.len() <= MAX_SUBCALLS_PER_MULTICALL {
+                split.push(bm);
+            } else {
+                // Split into chunks, each becoming its own multicall at the same block
+                for chunk in bm.slots.chunks(MAX_SUBCALLS_PER_MULTICALL) {
+                    split.push(BlockMulticall {
+                        block_number: bm.block_number,
+                        block_id: bm.block_id,
+                        slots: chunk.to_vec(),
+                    });
+                }
+            }
+        }
+        split
+    } else {
+        block_multicalls
+    };
+
     tracing::info!(
-        "Executing {} multicalls for event-triggered calls in blocks {}-{}",
+        "Executing {} multicalls ({} sub-calls, max {}/block) for event-triggered calls in blocks {}-{}",
         block_multicalls.len(),
+        total_subcalls,
+        max_subcalls,
         min_block,
         max_block
     );

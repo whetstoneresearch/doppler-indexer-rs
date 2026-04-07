@@ -259,6 +259,9 @@ impl Default for AlchemyConfig {
 pub struct AlchemyClient {
     inner: Arc<RpcClient>,
     rate_limiter: Arc<SlidingWindowRateLimiter>,
+    /// Shared semaphore across all clones — limits total concurrent in-flight RPC requests
+    /// to prevent TCP connection exhaustion.
+    rpc_semaphore: Arc<Semaphore>,
     config: AlchemyConfig,
 }
 
@@ -300,6 +303,7 @@ impl ConcurrentExecutor {
                 .expect("semaphore should never be closed during operation");
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).increment(1.0);
             rate_limiter.acquire_with_metrics(cost, &chain).await;
+            metrics::counter!("rpc_individual_calls_total", "chain" => chain.clone()).increment(1);
             let result = fut.await;
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).decrement(1.0);
             drop(permit);
@@ -329,6 +333,7 @@ impl ConcurrentExecutor {
                 .expect("semaphore should never be closed during operation");
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).increment(1.0);
             rate_limiter.acquire_with_metrics(cost, &chain).await;
+            metrics::counter!("rpc_individual_calls_total", "chain" => chain.clone()).increment(1);
             let result = fut.await;
             metrics::gauge!("rpc_semaphore_acquired", "chain" => chain.clone()).decrement(1.0);
             drop(permit);
@@ -361,9 +366,12 @@ impl AlchemyClient {
             ))
         });
 
+        let rpc_semaphore = Arc::new(Semaphore::new(config.rpc_concurrency));
+
         Ok(Self {
             inner,
             rate_limiter,
+            rpc_semaphore,
             config,
         })
     }
@@ -428,7 +436,7 @@ impl AlchemyClient {
         let chain = self.chain_label();
         set_semaphore_utilization(&chain, 0.0, self.config.rpc_concurrency as f64);
         ConcurrentExecutor {
-            semaphore: Arc::new(Semaphore::new(self.config.rpc_concurrency)),
+            semaphore: self.rpc_semaphore.clone(),
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
             max_in_flight: (self.config.rpc_concurrency * 2).max(1),
@@ -484,6 +492,8 @@ impl AlchemyClient {
         // Collect results and spawn replacements as tasks complete
         let mut indexed_results: Vec<(usize, T)> = Vec::with_capacity(num_requests);
         let mut had_panic = false;
+        let batch_start = tokio::time::Instant::now();
+        let log_interval = num_requests / 4; // Log at 25%, 50%, 75%
 
         while let Some(result) = join_set.join_next().await {
             match result {
@@ -492,6 +502,16 @@ impl AlchemyClient {
                     tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
                     had_panic = true;
                 }
+            }
+
+            if log_interval > 0 && indexed_results.len() % log_interval == 0 && indexed_results.len() < num_requests {
+                tracing::debug!(
+                    "Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    indexed_results.len(),
+                    num_requests,
+                    indexed_results.len() as f64 / num_requests as f64 * 100.0,
+                    batch_start.elapsed().as_secs_f64()
+                );
             }
 
             // Spawn replacements to keep the pipeline full
