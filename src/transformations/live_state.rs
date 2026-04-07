@@ -23,6 +23,17 @@ pub(crate) struct PendingEventData {
     pub required_handlers: Vec<String>,
 }
 
+/// A pending handler/range entry that timed out during finalization.
+#[derive(Debug, Clone)]
+pub(crate) struct TimedOutPendingHandler {
+    pub handler_key: String,
+    pub source_name: String,
+    pub event_name: String,
+    pub required_calls: Vec<(String, String)>,
+    pub required_handlers: Vec<String>,
+    pub timed_out_after_secs: u64,
+}
+
 /// Default timeout for stuck pending events (5 minutes).
 pub(crate) const PENDING_EVENT_TIMEOUT_SECS: u64 = 300;
 
@@ -130,24 +141,25 @@ impl LiveProcessingState {
         range_key: (u64, u64),
         expect_logs: bool,
         expect_eth_calls: bool,
-    ) -> (bool, Vec<String>) {
+    ) -> (bool, Vec<TimedOutPendingHandler>) {
         let completion = self.completion.get(&range_key).copied().unwrap_or_default();
 
         // Check for timed-out pending events
         let timeout = Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
         let now = Instant::now();
-        let mut timed_out: Vec<String> = Vec::new();
+        let mut timed_out: HashMap<String, TimedOutPendingHandler> = HashMap::new();
 
         for (handler_key, pending_list) in &self.pending_events {
             for pending in pending_list {
                 if (pending.range_start, pending.range_end) == range_key {
                     let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
                     if let Some(&first_seen) = self.pending_event_timestamps.get(&timestamp_key) {
-                        if now.duration_since(first_seen) >= timeout {
+                        let elapsed = now.duration_since(first_seen);
+                        if elapsed >= timeout {
                             tracing::error!(
                                 "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
                                  Force-finalizing range to unblock progress.",
-                                now.duration_since(first_seen),
+                                elapsed,
                                 handler_key,
                                 pending.range_start,
                                 pending.range_end,
@@ -156,7 +168,16 @@ impl LiveProcessingState {
                                 pending.required_calls,
                                 pending.required_handlers
                             );
-                            timed_out.push(handler_key.clone());
+                            timed_out.entry(handler_key.clone()).or_insert_with(|| {
+                                TimedOutPendingHandler {
+                                    handler_key: handler_key.clone(),
+                                    source_name: pending.source_name.clone(),
+                                    event_name: pending.event_name.clone(),
+                                    required_calls: pending.required_calls.clone(),
+                                    required_handlers: pending.required_handlers.clone(),
+                                    timed_out_after_secs: elapsed.as_secs(),
+                                }
+                            });
                         }
                     }
                 }
@@ -164,12 +185,17 @@ impl LiveProcessingState {
         }
 
         // Remove timed-out pending events
-        for handler_key in &timed_out {
-            if let Some(pending_list) = self.pending_events.get_mut(handler_key) {
+        for timed_out_handler in timed_out.values() {
+            if let Some(pending_list) = self.pending_events.get_mut(&timed_out_handler.handler_key)
+            {
                 pending_list
                     .retain(|pending| (pending.range_start, pending.range_end) != range_key);
             }
-            let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
+            let timestamp_key = (
+                range_key.0,
+                range_key.1,
+                timed_out_handler.handler_key.clone(),
+            );
             self.pending_event_timestamps.remove(&timestamp_key);
         }
         self.pending_events.retain(|_, v| !v.is_empty());
@@ -201,7 +227,7 @@ impl LiveProcessingState {
         }
 
         let ready = !has_pending && completion.is_ready(expect_logs, expect_eth_calls);
-        (ready, timed_out)
+        (ready, timed_out.into_values().collect())
     }
 
     /// Mark a range as finalized. Returns false if already finalized.
