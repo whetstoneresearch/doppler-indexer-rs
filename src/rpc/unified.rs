@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use crate::rpc::alchemy::{AlchemyClient, SlidingWindowRateLimiter};
 use crate::rpc::provider::{RpcClient, RpcClientConfig, RpcError, RpcProvider};
 
+#[derive(Clone)]
 pub enum UnifiedRpcClient {
     Standard(RpcClient),
     Alchemy(AlchemyClient),

@@ -123,6 +123,7 @@ pub async fn decode_eth_calls_live(
                             output_base,
                             transform_tx,
                             false,
+                            false,
                         )
                         .await?;
                     }
@@ -271,6 +272,7 @@ mod tests {
             block_receipt_concurrency: None,
             decoding_concurrency: None,
             factory_concurrency: None,
+            event_call_concurrency: None,
             live_mode: None,
             reorg_depth: None,
             compaction_interval_secs: None,

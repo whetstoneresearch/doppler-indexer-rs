@@ -155,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
             .context("Invalid metrics.addr in config")?;
         metrics::init_metrics_server(addr);
         metrics::describe_rpc_metrics();
+        metrics::describe_transformation_metrics();
+        metrics::describe_collection_metrics();
     }
 
     // Create retry queue before StorageManager if S3 is configured

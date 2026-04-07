@@ -289,7 +289,7 @@ pub async fn collect_factories(
     };
     let mut catchup_count = 0;
 
-    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(4);
+    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8);
     let matchers = Arc::new(matchers);
     let existing_files = Arc::new(existing_files);
     let output_dir = Arc::new(output_dir);

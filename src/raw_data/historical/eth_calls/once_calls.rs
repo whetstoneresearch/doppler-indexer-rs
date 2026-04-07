@@ -14,7 +14,8 @@ use super::multicall::{
 use super::parquet_io::{
     extract_addresses_from_once_parquet, extract_existing_results_from_parquet,
     find_null_entries_async, merge_once_columns, read_existing_once_parquet_async,
-    read_once_column_index_async, read_parquet_column_names_async, write_once_column_index_async,
+    read_once_column_index_async, read_parquet_column_names_async,
+    read_parquet_row_count_async, write_once_column_index_async,
     write_once_results_to_parquet_async, write_record_batch_to_parquet_async,
 };
 use super::types::{
@@ -457,13 +458,29 @@ pub(crate) async fn process_factory_once_calls(
                     }
                 };
                 if index_complete {
-                    tracing::debug!(
-                        "Skipping factory once eth_calls for {} blocks {}-{} (all columns present and indexed)",
-                        collection_name,
-                        range.start,
-                        range.end - 1
-                    );
-                    continue;
+                    // Address-level check: compare factory address count
+                    // against file row count.
+                    let factory_addr_count = factory_data
+                        .addresses_by_block
+                        .values()
+                        .flat_map(|addrs| addrs.iter())
+                        .filter(|(_, _, coll)| coll == collection_name)
+                        .count() as u64;
+                    if factory_addr_count > 0 {
+                        let file_rows =
+                            read_parquet_row_count_async(output_path.clone()).await;
+                        if file_rows < factory_addr_count {
+                            tracing::info!(
+                                "Factory once {} blocks {}-{}: file has {} rows but factory has {} addresses, re-checking",
+                                collection_name, range.start, range.end - 1,
+                                file_rows, factory_addr_count,
+                            );
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
                 tracing::info!(
                     "Factory once {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
@@ -783,9 +800,11 @@ pub(crate) async fn process_factory_once_calls(
             let existing_is_empty = existing_batches.is_empty()
                 || existing_batches.iter().all(|b| b.num_rows() == 0);
 
-            // If existing file is empty but we have new results, treat as fresh write
-            if existing_is_empty && !results_by_address.is_empty() {
-                let results: Vec<OnceCallResult> = results_by_address
+            // If existing file is empty/incomplete and we have new results,
+            // do a full rewrite combining existing + new data.
+            let has_new_addrs = !results_by_address.is_empty();
+            if (existing_is_empty || has_new_addrs) && has_new_addrs {
+                let mut combined: Vec<OnceCallResult> = results_by_address
                     .into_iter()
                     .map(
                         |(address, (block_number, timestamp, function_results))| {
@@ -798,16 +817,47 @@ pub(crate) async fn process_factory_once_calls(
                         },
                     )
                     .collect();
+                let new_addrs: HashSet<[u8; 20]> =
+                    combined.iter().map(|r| r.contract_address).collect();
+
+                if !existing_is_empty {
+                    let existing_data =
+                        extract_addresses_from_once_parquet(&existing_batches);
+                    let existing_results = extract_existing_results_from_parquet(
+                        &existing_batches,
+                        &all_fn_names
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                    for (addr_bytes, (block_num, timestamp)) in existing_data {
+                        if new_addrs.contains(&addr_bytes) {
+                            continue;
+                        }
+                        let fn_results = existing_results
+                            .get(&addr_bytes)
+                            .cloned()
+                            .unwrap_or_default();
+                        combined.push(OnceCallResult {
+                            block_number: block_num,
+                            block_timestamp: timestamp,
+                            contract_address: addr_bytes,
+                            function_results: fn_results,
+                        });
+                    }
+                }
 
                 tracing::info!(
-                    "Writing {} factory once results (replacing empty file) to {} for {}",
-                    results.len(),
+                    "Writing {} factory once results ({} new + {} existing) to {} for {}",
+                    combined.len(),
+                    new_addrs.len(),
+                    combined.len() - new_addrs.len(),
                     output_path.display(),
                     collection_name
                 );
 
                 write_once_results_to_parquet_async(
-                    results,
+                    combined,
                     output_path.clone(),
                     all_fn_names.clone(),
                 )
@@ -1219,7 +1269,8 @@ pub(crate) async fn process_once_calls_multicall(
 
     // Execute multicall
     let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
+        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.chain_name)
+            .await?;
 
     // Group results by contract_name -> address -> function_name -> value
     let mut results_by_contract: HashMap<String, HashMap<Address, HashMap<String, Vec<u8>>>> =
@@ -1449,7 +1500,30 @@ pub(crate) async fn process_factory_once_calls_multicall(
                             }
                         };
                     if index_complete {
-                        continue;
+                        // Address-level check: compare factory address count
+                        // against file row count. If factory has more addresses
+                        // than the file has rows, the file is incomplete.
+                        let factory_addr_count = factory_data
+                            .addresses_by_block
+                            .values()
+                            .flat_map(|addrs| addrs.iter())
+                            .filter(|(_, _, coll)| coll == collection_name)
+                            .count() as u64;
+                        if factory_addr_count > 0 {
+                            let file_rows =
+                                read_parquet_row_count_async(output_path.clone()).await;
+                            if file_rows < factory_addr_count {
+                                tracing::info!(
+                                    "Factory once multicall {} blocks {}-{}: file has {} rows but factory has {} addresses, re-checking",
+                                    collection_name, range.start, range.end - 1,
+                                    file_rows, factory_addr_count,
+                                );
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
                     }
                     tracing::info!(
                         "Factory once multicall {} blocks {}-{}: columns complete but contract index incomplete, re-checking",
@@ -1734,8 +1808,13 @@ pub(crate) async fn process_factory_once_calls_multicall(
         );
 
         // Execute multicalls
-        let results =
-            execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls).await?;
+        let results = execute_multicalls_generic(
+            ctx.client,
+            multicall3_address,
+            block_multicalls,
+            ctx.chain_name,
+        )
+        .await?;
 
         for (meta, return_data, _success) in results {
             let entry = results_by_collection
@@ -1795,9 +1874,12 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 let existing_is_empty = existing_batches.is_empty()
                     || existing_batches.iter().all(|b| b.num_rows() == 0);
 
-                // If existing file is empty but we have new results, treat as fresh write
-                if existing_is_empty && !results_by_address.is_empty() {
-                    let results: Vec<OnceCallResult> = results_by_address
+                // If existing file is empty/incomplete and we have new results,
+                // do a full rewrite combining existing + new data.
+                let has_new_addrs = !results_by_address.is_empty();
+                if (existing_is_empty || has_new_addrs) && has_new_addrs {
+                    // Build combined results: new addresses + existing addresses
+                    let mut combined: Vec<OnceCallResult> = results_by_address
                         .into_iter()
                         .map(
                             |(address, (block_number, timestamp, function_results))| {
@@ -1810,16 +1892,48 @@ pub(crate) async fn process_factory_once_calls_multicall(
                             },
                         )
                         .collect();
+                    let new_addrs: HashSet<[u8; 20]> =
+                        combined.iter().map(|r| r.contract_address).collect();
+
+                    // Preserve existing rows that aren't being replaced
+                    if !existing_is_empty {
+                        let existing_data =
+                            extract_addresses_from_once_parquet(&existing_batches);
+                        let existing_results = extract_existing_results_from_parquet(
+                            &existing_batches,
+                            &all_fn_names
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>(),
+                        );
+                        for (addr_bytes, (block_num, timestamp)) in existing_data {
+                            if new_addrs.contains(&addr_bytes) {
+                                continue; // new data takes precedence
+                            }
+                            let fn_results = existing_results
+                                .get(&addr_bytes)
+                                .cloned()
+                                .unwrap_or_default();
+                            combined.push(OnceCallResult {
+                                block_number: block_num,
+                                block_timestamp: timestamp,
+                                contract_address: addr_bytes,
+                                function_results: fn_results,
+                            });
+                        }
+                    }
 
                     tracing::info!(
-                        "Writing {} multicall factory once results (replacing empty file) to {} for {}",
-                        results.len(),
+                        "Writing {} multicall factory once results ({} new + {} existing) to {} for {}",
+                        combined.len(),
+                        new_addrs.len(),
+                        combined.len() - new_addrs.len(),
                         output_path.display(),
                         collection_name
                     );
 
                     write_once_results_to_parquet_async(
-                        results,
+                        combined,
                         output_path.clone(),
                         all_fn_names.clone(),
                     )
@@ -1941,6 +2055,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
                             ctx.client,
                             multicall3_address,
                             backfill_multicalls,
+                            ctx.chain_name,
                         )
                         .await?;
 

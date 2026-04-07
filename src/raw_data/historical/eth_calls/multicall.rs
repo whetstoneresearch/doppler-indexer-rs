@@ -1,5 +1,9 @@
 //! Multicall3 infrastructure: types, calldata encoding/decoding, and generic executor.
 
+use std::time::Instant;
+
+use metrics::histogram;
+
 use super::config::compute_function_selector;
 use super::types::{BlockInfo, EthCallCollectionError};
 use crate::rpc::UnifiedRpcClient;
@@ -182,6 +186,7 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
     client: &UnifiedRpcClient,
     multicall3_address: Address,
     block_multicalls: Vec<BlockMulticall<M>>,
+    chain_name: &str,
 ) -> Result<Vec<(M, Vec<u8>, bool)>, EthCallCollectionError> {
     struct FailedCall {
         result_index: usize,
@@ -208,7 +213,13 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
         })
         .collect();
 
+    let batch_start = Instant::now();
     let results = client.call_batch(calls).await?;
+    histogram!(
+        "collection_eth_call_batch_duration_seconds",
+        "chain" => chain_name.to_string()
+    )
+    .record(batch_start.elapsed().as_secs_f64());
 
     let mut all_results: Vec<(M, Vec<u8>, bool)> = Vec::new();
     let mut failed_retries: Vec<FailedCall> = Vec::new();
@@ -284,7 +295,13 @@ pub(crate) async fn execute_multicalls_generic<M: Clone + Send + Sync>(
             })
             .collect();
 
+        let retry_start = Instant::now();
         let retry_results = client.call_batch(retry_batch).await?;
+        histogram!(
+            "collection_eth_call_batch_duration_seconds",
+            "chain" => chain_name.to_string()
+        )
+        .record(retry_start.elapsed().as_secs_f64());
 
         for (i, result) in retry_results.into_iter().enumerate() {
             let failed = &failed_retries[i];
