@@ -474,6 +474,19 @@ impl TransformationEngine {
             });
         }
 
+        // Catchup walks the union of all decoded ranges so dependency handlers
+        // can no-op complete unrelated ranges. Call deps, however, should only
+        // gate ranges where this handler actually has trigger parquet data.
+        let mut trigger_range_sets: HashMap<String, HashSet<(u64, u64)>> = HashMap::new();
+        for ch in &handlers {
+            let mut ranges: HashSet<(u64, u64)> = HashSet::new();
+            for (source, trigger_name) in &ch.triggers {
+                let dir = base_dir.join(source).join(trigger_name);
+                ranges.extend(self.scan_available_ranges(&dir).await?);
+            }
+            trigger_range_sets.insert(ch.handler.name().to_string(), ranges);
+        }
+
         // Seed CompletionTracker from _handler_progress so downstream handlers
         // can gate on upstream completion per range via the DAG scheduler.
         let tracker = Arc::new(CompletionTracker::new());
@@ -590,8 +603,15 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    // Skip range if call-dep files aren't on disk yet.
-                    if !ch.call_deps.is_empty() {
+                    let trigger_range_present = trigger_range_sets
+                        .get(&name)
+                        .is_some_and(|ranges| ranges.contains(&(range_start, range_end)));
+
+                    // Skip range if call-dep files aren't on disk yet, but
+                    // only when this handler actually has trigger data in the
+                    // range. Otherwise let it no-op complete and unblock
+                    // same-range dependents.
+                    if trigger_range_present && !ch.call_deps.is_empty() {
                         let missing_deps: Vec<&str> = ch
                             .call_deps
                             .iter()
