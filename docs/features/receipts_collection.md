@@ -5,7 +5,7 @@ The receipt collection module fetches transaction receipts via RPC and writes th
 Receipt collection is split into two phases:
 
 1. **Catchup Phase** (`catchup/receipts.rs`): On startup, processes any block ranges where blocks exist but receipts or logs are missing
-2. **Current Phase** (`current/receipts.rs`): Processes new blocks from a channel with early batch-based RPC fetching
+2. **Current Phase** (`current/receipts.rs`): Processes new blocks from a channel with eager receipt fetch dispatch
 
 ## Usage
 
@@ -531,8 +531,8 @@ The following `raw_data_collection` options affect receipt collection:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `parquet_block_range` | 1000 | Number of blocks per Parquet file |
-| `rpc_batch_size` | 100 | Transactions per RPC batch. Also controls early batch fetch threshold in current phase. |
-| `block_receipt_concurrency` | 10 | Concurrent block receipt requests (block-level fetching only) |
+| `rpc_batch_size` | 100 | Target transactions per fallback micro-batch |
+| `block_receipt_concurrency` | 10 | Concurrent receipt fetch tasks in current mode |
 
 ### Block-Receipt Mode (Current Phase)
 
@@ -540,13 +540,13 @@ When `block_receipts_method` is set, each arriving block is dispatched as a sepa
 
 ### Fallback Micro-Batching (Current Phase)
 
-When `block_receipts_method` is not set, the collector accumulates arriving blocks in a pending buffer and flushes them as batched `get_transaction_receipts_batch` calls. Flush triggers:
+When `block_receipts_method` is not set, the collector accumulates arriving blocks in a pending buffer and flushes them as tx-sized `get_transaction_receipts_batch` micro-batches. It can keep multiple micro-batches in flight, bounded by `block_receipt_concurrency`, so fallback chains can also saturate the RPC client. Flush triggers:
 
 - **Batch full**: accumulated tx count reaches `rpc_batch_size` (default 100)
-- **Range boundary**: a block from a new range arrives while blocks from the old range are pending
 - **Timeout**: 150ms after the first block entered the buffer (prevents stalling on sparse chains)
+- **Shutdown / input close**: remaining partial batches are forced out
 
-This cross-block micro-batching keeps tx batches full regardless of per-block tx density.
+This cross-block micro-batching keeps tx batches full regardless of per-block tx density while still allowing sparse chains to fill the client's concurrency window.
 
 ## Backpressure Monitoring
 

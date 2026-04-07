@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use alloy::primitives::B256;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
 
+use crate::metrics::set_receipt_pipeline_state;
 use crate::raw_data::historical::blocks::read_block_info_from_parquet_async;
 use crate::raw_data::historical::catchup::receipts::ReceiptsCatchupState;
 use crate::raw_data::historical::factories::RecollectRequest;
@@ -45,34 +46,67 @@ enum ReceiptFetchResult {
     },
 }
 
-/// Drain pending fallback blocks, spawn a batch fetch task into the JoinSet.
+/// Remove a single fallback micro-batch from the front of the pending buffer.
+///
+/// Batches are sized by cumulative tx count, but always contain whole blocks.
+/// When `allow_partial` is false, the function only drains when the pending
+/// buffer has at least `target_tx_count` tx hashes available.
+fn take_pending_fallback_batch(
+    pending: &mut VecDeque<(u64, BlockInfo)>,
+    pending_tx_count: &mut usize,
+    target_tx_count: usize,
+    allow_partial: bool,
+) -> Vec<(u64, BlockInfo)> {
+    if pending.is_empty() || (!allow_partial && *pending_tx_count < target_tx_count) {
+        return Vec::new();
+    }
+
+    let mut blocks_to_fetch = Vec::new();
+    let mut batch_tx_count = 0usize;
+
+    while let Some((range_start, block_info)) = pending.pop_front() {
+        batch_tx_count += block_info.tx_hashes.len();
+        blocks_to_fetch.push((range_start, block_info));
+
+        if batch_tx_count >= target_tx_count {
+            break;
+        }
+    }
+
+    *pending_tx_count = pending_tx_count.saturating_sub(batch_tx_count);
+    blocks_to_fetch
+}
+
+/// Drain one pending fallback micro-batch and spawn its fetch task into the JoinSet.
 fn spawn_fallback_flush(
-    pending: &mut Vec<(u64, BlockInfo)>,
+    pending: &mut VecDeque<(u64, BlockInfo)>,
     pending_tx_count: &mut usize,
     flush_deadline: &mut Option<tokio::time::Instant>,
     join_set: &mut JoinSet<ReceiptFetchResult>,
     client: &Arc<UnifiedRpcClient>,
     receipt_fields: &Option<Vec<ReceiptField>>,
-) {
-    if pending.is_empty() {
-        return;
+    target_tx_count: usize,
+    allow_partial: bool,
+) -> bool {
+    let blocks_to_fetch =
+        take_pending_fallback_batch(pending, pending_tx_count, target_tx_count, allow_partial);
+    if blocks_to_fetch.is_empty() {
+        return false;
     }
-    let blocks_to_fetch: Vec<(u64, BlockInfo)> = pending.drain(..).collect();
+
     // Build per-block (range_start, block_number) pairs for multi-range support
     let blocks_with_ranges: Vec<(u64, u64)> = blocks_to_fetch
         .iter()
         .map(|(rs, bi)| (*rs, bi.block_number))
         .collect();
-    *pending_tx_count = 0;
-    *flush_deadline = None;
+    if pending.is_empty() {
+        *flush_deadline = None;
+    }
 
     let client_clone = client.clone();
     let rf = receipt_fields.clone();
     join_set.spawn(async move {
-        let block_infos: Vec<BlockInfo> = blocks_to_fetch
-            .into_iter()
-            .map(|(_, bi)| bi)
-            .collect();
+        let block_infos: Vec<BlockInfo> = blocks_to_fetch.into_iter().map(|(_, bi)| bi).collect();
         let refs: Vec<&BlockInfo> = block_infos.iter().collect();
         let result = fetch_tx_receipts_batched(&refs, &*client_clone, &rf).await;
         ReceiptFetchResult::FallbackBatch {
@@ -80,6 +114,42 @@ fn spawn_fallback_flush(
             result,
         }
     });
+    true
+}
+
+/// Spawn as many fallback micro-batches as possible without exceeding the
+/// configured in-flight limit.
+fn spawn_ready_fallback_flushes(
+    pending: &mut VecDeque<(u64, BlockInfo)>,
+    pending_tx_count: &mut usize,
+    flush_deadline: &mut Option<tokio::time::Instant>,
+    join_set: &mut JoinSet<ReceiptFetchResult>,
+    client: &Arc<UnifiedRpcClient>,
+    receipt_fields: &Option<Vec<ReceiptField>>,
+    target_tx_count: usize,
+    max_in_flight: usize,
+    allow_partial: bool,
+) -> usize {
+    let mut spawned = 0usize;
+
+    while join_set.len() < max_in_flight {
+        let did_spawn = spawn_fallback_flush(
+            pending,
+            pending_tx_count,
+            flush_deadline,
+            join_set,
+            client,
+            receipt_fields,
+            target_tx_count,
+            allow_partial,
+        );
+        if !did_spawn {
+            break;
+        }
+        spawned += 1;
+    }
+
+    spawned
 }
 
 /// Result of a completed parquet write + its S3 metadata.
@@ -222,7 +292,10 @@ pub async fn collect_receipts(
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let receipt_fields = &raw_data_config.fields.receipt_fields;
     let schema = build_receipt_schema(receipt_fields);
-    let block_receipt_concurrency = raw_data_config.block_receipt_concurrency.unwrap_or(10);
+    let receipt_fetch_concurrency = raw_data_config
+        .block_receipt_concurrency
+        .unwrap_or(10)
+        .max(1);
 
     // Use the existing files from catchup state (already scanned)
     let existing_files = catchup_state.existing_files;
@@ -278,14 +351,16 @@ pub async fn collect_receipts(
     let block_receipts_method = chain.block_receipts_method.clone();
     let is_block_receipt_mode = block_receipts_method.is_some();
     let rpc_batch_size = raw_data_config.rpc_batch_size.unwrap_or(100) as usize;
+    let metrics_chain = chain.name.clone();
 
     // Fallback micro-batching state (only used when block_receipts_method is None).
     // Blocks accumulate until the tx count reaches rpc_batch_size, a range
     // boundary is crossed, or a flush timeout fires.
-    let mut pending_fallback_blocks: Vec<(u64, BlockInfo)> = Vec::new();
+    let mut pending_fallback_blocks: VecDeque<(u64, BlockInfo)> = VecDeque::new();
     let mut pending_tx_count: usize = 0;
     let mut flush_deadline: Option<tokio::time::Instant> = None;
     const FALLBACK_FLUSH_TIMEOUT: Duration = Duration::from_millis(150);
+    set_receipt_pipeline_state(&metrics_chain, 0, 0);
 
     loop {
         tokio::select! {
@@ -293,13 +368,14 @@ pub async fn collect_receipts(
             // Branch 1: A new block arrives from upstream
             // -----------------------------------------------------------------
             // Block-receipt mode: backpressure via JoinSet concurrency cap.
-            // Fallback mode: backpressure via pending-buffer block count.
-            // Caps at 2x rpc_batch_size blocks so the buffer stays bounded
-            // even on sparse chains where tx count stays near zero.
+            // Fallback mode: backpressure via pending tx/block buffer caps.
+            // Both caps scale with fetch concurrency so sparse chains can queue
+            // enough work to keep multiple micro-batches in flight.
             block_result = block_rx.recv(), if !block_rx_closed && if is_block_receipt_mode {
-                receipt_join_set.len() < block_receipt_concurrency
+                receipt_join_set.len() < receipt_fetch_concurrency
             } else {
-                pending_fallback_blocks.len() < rpc_batch_size * 2
+                pending_tx_count < rpc_batch_size * receipt_fetch_concurrency * 2
+                    && pending_fallback_blocks.len() < rpc_batch_size * receipt_fetch_concurrency * 2
             } => {
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
@@ -346,6 +422,11 @@ pub async fn collect_receipts(
                                 batch_states.remove(&range_start);
                                 send_range_complete(&channels.factory_log_tx, &channels.log_tx, &channels.event_trigger_tx, range.start, range.end).await?;
                             }
+                            set_receipt_pipeline_state(
+                                &metrics_chain,
+                                receipt_join_set.len(),
+                                pending_tx_count,
+                            );
                             continue;
                         }
 
@@ -409,6 +490,11 @@ pub async fn collect_receipts(
                                     result,
                                 }
                             });
+                            set_receipt_pipeline_state(
+                                &metrics_chain,
+                                receipt_join_set.len(),
+                                pending_tx_count,
+                            );
                         } else {
                             // Fallback mode: accumulate for micro-batching.
                             // The pending buffer may hold blocks from multiple
@@ -418,7 +504,7 @@ pub async fn collect_receipts(
                             // trigger premature finalization.
 
                             let fetch_tx_hashes = tx_hashes_for_dispatch.unwrap();
-                            pending_fallback_blocks.push((range_start, BlockInfo {
+                            pending_fallback_blocks.push_back((range_start, BlockInfo {
                                 block_number,
                                 timestamp,
                                 tx_hashes: fetch_tx_hashes,
@@ -429,40 +515,51 @@ pub async fn collect_receipts(
                                 flush_deadline = Some(tokio::time::Instant::now() + FALLBACK_FLUSH_TIMEOUT);
                             }
 
-                            // Flush if batch is full and no in-flight batch.
-                            // Cap at 1 concurrent fallback batch to avoid
-                            // unbounded fan-out through the RPC client.
-                            // If a batch is in-flight, the auto-flush in
-                            // Branch 2 will dispatch pending blocks when it
-                            // completes.
-                            if pending_tx_count >= rpc_batch_size && receipt_join_set.is_empty() {
-                                spawn_fallback_flush(
+                            // Flush full micro-batches eagerly, keeping up to
+                            // `receipt_fetch_concurrency` fallback batches in flight.
+                            if pending_tx_count >= rpc_batch_size {
+                                spawn_ready_fallback_flushes(
                                     &mut pending_fallback_blocks,
                                     &mut pending_tx_count,
                                     &mut flush_deadline,
                                     &mut receipt_join_set,
                                     &client,
                                     receipt_fields,
+                                    rpc_batch_size,
+                                    receipt_fetch_concurrency,
+                                    false,
                                 );
                             }
+                            set_receipt_pipeline_state(
+                                &metrics_chain,
+                                receipt_join_set.len(),
+                                pending_tx_count,
+                            );
                         }
                     }
                     None => {
                         block_rx_closed = true;
                         // Flush remaining pending fallback blocks if no
-                        // in-flight batch. If a batch IS in-flight, the
-                        // Branch 2 auto-flush will pick up pending blocks
-                        // after it completes.
-                        if !pending_fallback_blocks.is_empty() && receipt_join_set.is_empty() {
-                            spawn_fallback_flush(
+                        // in-flight slot is available. Branch 2 continues
+                        // draining any remaining work as batches complete.
+                        if !pending_fallback_blocks.is_empty() {
+                            spawn_ready_fallback_flushes(
                                 &mut pending_fallback_blocks,
                                 &mut pending_tx_count,
                                 &mut flush_deadline,
                                 &mut receipt_join_set,
                                 &client,
                                 receipt_fields,
+                                rpc_batch_size,
+                                receipt_fetch_concurrency,
+                                true,
                             );
                         }
+                        set_receipt_pipeline_state(
+                            &metrics_chain,
+                            receipt_join_set.len(),
+                            pending_tx_count,
+                        );
                     }
                 }
             }
@@ -568,22 +665,29 @@ pub async fn collect_receipts(
                     }
                 }
 
-                // Auto-flush: when a fallback batch completes and the JoinSet
-                // is now empty, immediately dispatch any blocks that accumulated
-                // in the pending buffer while the batch was in-flight.
+                // Auto-flush: when fallback batches complete, immediately
+                // dispatch additional ready work to keep the pipeline full.
                 if !is_block_receipt_mode
                     && !pending_fallback_blocks.is_empty()
-                    && receipt_join_set.is_empty()
                 {
-                    spawn_fallback_flush(
+                    let allow_partial = block_rx_closed;
+                    spawn_ready_fallback_flushes(
                         &mut pending_fallback_blocks,
                         &mut pending_tx_count,
                         &mut flush_deadline,
                         &mut receipt_join_set,
                         &client,
                         receipt_fields,
+                        rpc_batch_size,
+                        receipt_fetch_concurrency,
+                        allow_partial,
                     );
                 }
+                set_receipt_pipeline_state(
+                    &metrics_chain,
+                    receipt_join_set.len(),
+                    pending_tx_count,
+                );
             }
 
             // -----------------------------------------------------------------
@@ -638,14 +742,24 @@ pub async fn collect_receipts(
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
-            }, if !is_block_receipt_mode && !pending_fallback_blocks.is_empty() && receipt_join_set.is_empty() => {
-                spawn_fallback_flush(
+            }, if !is_block_receipt_mode
+                && !pending_fallback_blocks.is_empty()
+                && receipt_join_set.len() < receipt_fetch_concurrency => {
+                spawn_ready_fallback_flushes(
                     &mut pending_fallback_blocks,
                     &mut pending_tx_count,
                     &mut flush_deadline,
                     &mut receipt_join_set,
                     &client,
                     receipt_fields,
+                    rpc_batch_size,
+                    receipt_fetch_concurrency,
+                    true,
+                );
+                set_receipt_pipeline_state(
+                    &metrics_chain,
+                    receipt_join_set.len(),
+                    pending_tx_count,
                 );
             }
 
@@ -720,7 +834,7 @@ pub async fn collect_receipts(
                         &event_matchers,
                         &mut metrics,
                         chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                        block_receipt_concurrency,
+                        receipt_fetch_concurrency,
                     )
                     .await?;
 
@@ -772,19 +886,21 @@ pub async fn collect_receipts(
     // May span multiple ranges.
     if !pending_fallback_blocks.is_empty() {
         let blocks_to_fetch: Vec<(u64, BlockInfo)> = pending_fallback_blocks.drain(..).collect();
+        pending_tx_count = 0;
+        set_receipt_pipeline_state(&metrics_chain, receipt_join_set.len(), pending_tx_count);
 
         // Group by range for result attribution
         let mut blocks_by_range: HashMap<u64, Vec<u64>> = HashMap::new();
         let mut block_to_range: HashMap<u64, u64> = HashMap::new();
         for (rs, bi) in &blocks_to_fetch {
-            blocks_by_range.entry(*rs).or_default().push(bi.block_number);
+            blocks_by_range
+                .entry(*rs)
+                .or_default()
+                .push(bi.block_number);
             block_to_range.insert(bi.block_number, *rs);
         }
 
-        let block_infos: Vec<BlockInfo> = blocks_to_fetch
-            .into_iter()
-            .map(|(_, bi)| bi)
-            .collect();
+        let block_infos: Vec<BlockInfo> = blocks_to_fetch.into_iter().map(|(_, bi)| bi).collect();
         let refs: Vec<&BlockInfo> = block_infos.iter().collect();
         let result = fetch_tx_receipts_batched(&refs, &*client, receipt_fields).await?;
 
@@ -892,7 +1008,7 @@ pub async fn collect_receipts(
                 &*client,
                 receipt_fields,
                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
-                block_receipt_concurrency,
+                receipt_fetch_concurrency,
             )
             .await?;
 
@@ -1014,6 +1130,7 @@ pub async fn collect_receipts(
     if channels.factory_log_tx.is_some() {
         metrics.factory_log_tx_metrics.log_summary("factory_log_tx");
     }
+    set_receipt_pipeline_state(&metrics_chain, 0, 0);
 
     tracing::info!("Receipt collection complete for chain {}", chain.name);
     Ok(())
@@ -1039,172 +1156,82 @@ mod tests {
         }
     }
 
-    /// spawn_fallback_flush must drain the pending buffer, reset counters,
-    /// and spawn exactly one task into the JoinSet.
-    #[tokio::test]
-    async fn spawn_fallback_flush_drains_and_spawns() {
-        let client = Arc::new(
-            UnifiedRpcClient::from_url("http://localhost:1")
-                .expect("URL parses"),
+    #[test]
+    fn take_pending_fallback_batch_waits_for_full_batch_unless_forced() {
+        let mut pending = VecDeque::from([(0u64, make_block_info(0, 3))]);
+        let mut pending_tx_count = 3usize;
+
+        let batch = take_pending_fallback_batch(&mut pending, &mut pending_tx_count, 5, false);
+        assert!(batch.is_empty(), "should not drain a partial batch eagerly");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending_tx_count, 3);
+
+        let batch = take_pending_fallback_batch(&mut pending, &mut pending_tx_count, 5, true);
+        assert_eq!(
+            batch.len(),
+            1,
+            "forced flush should drain the available block"
         );
-        let receipt_fields: Option<Vec<ReceiptField>> = None;
-
-        let mut pending = vec![
-            (0u64, make_block_info(0, 3)),
-            (0u64, make_block_info(1, 5)),
-        ];
-        let mut tx_count: usize = 8;
-        let mut deadline = Some(tokio::time::Instant::now());
-        let mut join_set: JoinSet<ReceiptFetchResult> = JoinSet::new();
-
-        spawn_fallback_flush(
-            &mut pending,
-            &mut tx_count,
-            &mut deadline,
-            &mut join_set,
-            &client,
-            &receipt_fields,
-        );
-
-        assert!(pending.is_empty(), "pending buffer must be drained");
-        assert_eq!(tx_count, 0, "tx count must be reset");
-        assert!(deadline.is_none(), "flush deadline must be cleared");
-        assert_eq!(join_set.len(), 1, "exactly one task must be spawned");
-
-        // Abort the spawned task (it would fail trying to connect anyway)
-        join_set.abort_all();
+        assert!(pending.is_empty());
+        assert_eq!(pending_tx_count, 0);
     }
 
-    /// spawn_fallback_flush is a no-op when the pending buffer is empty.
-    #[tokio::test]
-    async fn spawn_fallback_flush_noop_when_empty() {
-        let client = Arc::new(
-            UnifiedRpcClient::from_url("http://localhost:1")
-                .expect("URL parses"),
-        );
-        let receipt_fields: Option<Vec<ReceiptField>> = None;
+    #[test]
+    fn take_pending_fallback_batch_respects_tx_target_and_order() {
+        let mut pending = VecDeque::from([
+            (0u64, make_block_info(10, 3)),
+            (0u64, make_block_info(11, 4)),
+            (1000u64, make_block_info(1000, 5)),
+        ]);
+        let mut pending_tx_count = 12usize;
 
-        let mut pending: Vec<(u64, BlockInfo)> = Vec::new();
-        let mut tx_count: usize = 0;
-        let mut deadline: Option<tokio::time::Instant> = None;
-        let mut join_set: JoinSet<ReceiptFetchResult> = JoinSet::new();
+        let batch = take_pending_fallback_batch(&mut pending, &mut pending_tx_count, 5, false);
+        let block_numbers: Vec<u64> = batch.iter().map(|(_, block)| block.block_number).collect();
+        let ranges: Vec<u64> = batch.iter().map(|(range_start, _)| *range_start).collect();
 
-        spawn_fallback_flush(
-            &mut pending,
-            &mut tx_count,
-            &mut deadline,
-            &mut join_set,
-            &client,
-            &receipt_fields,
-        );
-
-        assert_eq!(join_set.len(), 0, "no task should be spawned for empty buffer");
+        assert_eq!(block_numbers, vec![10, 11]);
+        assert_eq!(ranges, vec![0, 0]);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending_tx_count, 5);
+        assert_eq!(pending.front().unwrap().1.block_number, 1000);
     }
 
-    /// Calling spawn_fallback_flush twice without draining must not
-    /// produce a second task (buffer is empty after first call).
     #[tokio::test]
-    async fn spawn_fallback_flush_idempotent() {
-        let client = Arc::new(
-            UnifiedRpcClient::from_url("http://localhost:1")
-                .expect("URL parses"),
-        );
+    async fn spawn_ready_fallback_flushes_fills_multiple_in_flight_slots() {
+        let client =
+            Arc::new(UnifiedRpcClient::from_url("http://localhost:1").expect("URL parses"));
         let receipt_fields: Option<Vec<ReceiptField>> = None;
 
-        let mut pending = vec![(0u64, make_block_info(0, 3))];
-        let mut tx_count: usize = 3;
-        let mut deadline = Some(tokio::time::Instant::now());
-        let mut join_set: JoinSet<ReceiptFetchResult> = JoinSet::new();
-
-        // First call drains and spawns
-        spawn_fallback_flush(
-            &mut pending, &mut tx_count, &mut deadline,
-            &mut join_set, &client, &receipt_fields,
-        );
-        assert_eq!(join_set.len(), 1);
-
-        // Second call with empty buffer is a no-op
-        spawn_fallback_flush(
-            &mut pending, &mut tx_count, &mut deadline,
-            &mut join_set, &client, &receipt_fields,
-        );
-        assert_eq!(join_set.len(), 1, "second call must not spawn another task");
-
-        join_set.abort_all();
-    }
-
-    /// Verify guard conditions enforce at-most-1 in-flight invariant.
-    /// The batch-full flush guard requires `receipt_join_set.is_empty()`.
-    #[tokio::test]
-    async fn batch_full_flush_blocked_when_in_flight() {
-        let client = Arc::new(
-            UnifiedRpcClient::from_url("http://localhost:1")
-                .expect("URL parses"),
-        );
-        let receipt_fields: Option<Vec<ReceiptField>> = None;
-        let rpc_batch_size: usize = 5;
-
-        let mut pending = vec![
+        let mut pending = VecDeque::from([
             (0u64, make_block_info(0, 3)),
             (0u64, make_block_info(1, 3)),
-        ];
-        let mut tx_count: usize = 6; // > rpc_batch_size
-        let mut deadline = Some(tokio::time::Instant::now());
-        let mut join_set: JoinSet<ReceiptFetchResult> = JoinSet::new();
-
-        // Simulate an in-flight batch by spawning a dummy task
-        join_set.spawn(async { std::future::pending().await });
-
-        // Guard: batch full BUT join_set is NOT empty — must NOT flush
-        let should_flush = tx_count >= rpc_batch_size && join_set.is_empty();
-        assert!(!should_flush, "must not flush when a batch is in-flight");
-
-        // Pending buffer must still be intact
-        assert_eq!(pending.len(), 2);
-        assert_eq!(tx_count, 6);
-
-        join_set.abort_all();
-    }
-
-    /// The pending buffer can hold blocks from multiple ranges.
-    /// spawn_fallback_flush must produce a FallbackBatch with per-block
-    /// (range_start, block_number) pairs covering both ranges.
-    #[tokio::test]
-    async fn multi_range_pending_buffer() {
-        let client = Arc::new(
-            UnifiedRpcClient::from_url("http://localhost:1")
-                .expect("URL parses"),
-        );
-        let receipt_fields: Option<Vec<ReceiptField>> = None;
-
-        // Blocks from two different ranges (range_size=1000)
-        let mut pending = vec![
-            (0u64, make_block_info(998, 2)),
-            (0u64, make_block_info(999, 1)),
             (1000u64, make_block_info(1000, 3)),
-            (1000u64, make_block_info(1001, 0)),
-        ];
-        let mut tx_count: usize = 6;
+            (1000u64, make_block_info(1001, 3)),
+        ]);
+        let mut pending_tx_count = 12usize;
         let mut deadline = Some(tokio::time::Instant::now());
         let mut join_set: JoinSet<ReceiptFetchResult> = JoinSet::new();
 
-        spawn_fallback_flush(
+        let spawned = spawn_ready_fallback_flushes(
             &mut pending,
-            &mut tx_count,
+            &mut pending_tx_count,
             &mut deadline,
             &mut join_set,
             &client,
             &receipt_fields,
+            5,
+            2,
+            false,
         );
 
+        assert_eq!(spawned, 2, "should fill both available in-flight slots");
+        assert_eq!(join_set.len(), 2);
         assert!(pending.is_empty());
-        assert_eq!(join_set.len(), 1);
-
-        // We can't easily inspect the spawned task's FallbackBatch without
-        // awaiting it (which would fail on connection), but we verified that
-        // spawn_fallback_flush correctly builds (range_start, block_number)
-        // pairs from the pending buffer's (range_start, BlockInfo) tuples.
-        // The flush drained all 4 blocks from both ranges into one task.
+        assert_eq!(pending_tx_count, 0);
+        assert!(
+            deadline.is_none(),
+            "deadline should clear when buffer drains"
+        );
 
         join_set.abort_all();
     }
