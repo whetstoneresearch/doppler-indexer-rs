@@ -454,7 +454,7 @@ All RPC tasks share the same rate limiter (`SlidingWindowRateLimiter`), which ma
 The system uses `oneshot` channels as barriers to coordinate catchup ordering:
 
 1. **Factory catchup barrier**: Factory catchup must complete before factory-dependent eth_call catchup begins.
-2. **Eth_call decode catchup barrier**: Eth_call decode catchup must complete before the transformation engine runs its own catchup, ensuring decoded parquet files are available.
+2. **Eth_call decode catchup barrier**: Eth_call decode catchup must complete before the transformation engine runs its own catchup, ensuring decoded parquet files are available. After this barrier is released, the transformation engine uses the DAG scheduler (see [DAG-Based Catchup Execution](#dag-based-catchup-execution)) rather than sequential execution, enabling pipelined, dependency-aware handler processing across all pending ranges.
 
 ## Transformation Engine Parallelism
 
@@ -501,6 +501,41 @@ This ensures:
 - **Independent progress**: Each handler tracks its own progress in `_handler_progress`
 - **Independent transactions**: Each handler's operations execute in their own transaction
 - **Fault isolation**: One handler's failure doesn't affect others
+
+### DAG-Based Catchup Execution
+
+The transformation engine uses a DAG (Directed Acyclic Graph) scheduler for catchup processing that enables pipelined, dependency-aware execution:
+
+```
+┌─────────────────────────────────────────────────┐
+│              CompletionTracker                    │
+│   Tracks per-(handler, range) completion state   │
+│   Seeded from _handler_progress on startup       │
+└─────────────────────────┬───────────────────────┘
+                          │
+┌─────────────────────────▼───────────────────────┐
+│              DagScheduler                         │
+│   1. Spawn task per WorkItem                     │
+│   2. Await dependency satisfaction               │
+│   3. Acquire sequential semaphore (if needed)    │
+│   4. Acquire global concurrency permit           │
+│   5. Execute handler                             │
+│   6. Mark completed/failed, wake dependents      │
+└─────────────────────────────────────────────────┘
+```
+
+Key properties:
+- **Pipelined execution**: Range R+1 for handler A can start while R is still running for dependent handler B
+- **Cascade failures**: If handler A fails on range R, all dependents immediately cascade-fail on that range
+- **Sequential handlers**: Per-handler FIFO semaphore (capacity 1) ensures strict range ordering for state-dependent handlers
+- **Multi-pass deferral**: Catchup runs multiple passes, deferring ranges where call-dependency files don't yet exist
+
+Configuration:
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `handler_concurrency` | 4 | Global concurrency limit for DAG scheduler |
+
+The DAG scheduler replaces the previous sequential per-handler catchup, enabling much higher throughput when handlers have independent dependency chains.
 
 ## Performance Tuning
 
