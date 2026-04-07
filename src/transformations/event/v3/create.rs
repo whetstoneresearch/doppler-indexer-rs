@@ -179,7 +179,10 @@ impl EventHandler for V3CreateHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![("DopplerV3Pool".to_string(), "once".to_string())]
+        vec![
+            ("DERC20".to_string(), "once".to_string()),
+            ("DopplerV3Pool".to_string(), "once".to_string()),
+        ]
     }
 }
 
@@ -342,7 +345,10 @@ impl EventHandler for LockableV3CreateHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![("DopplerLockableV3Pool".to_string(), "once".to_string())]
+        vec![
+            ("DERC20".to_string(), "once".to_string()),
+            ("DopplerLockableV3Pool".to_string(), "once".to_string()),
+        ]
     }
 }
 

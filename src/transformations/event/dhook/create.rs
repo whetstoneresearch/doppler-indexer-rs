@@ -227,6 +227,7 @@ impl EventHandler for DopplerHookCreateHandler {
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
+            ("DERC20".to_string(), "once".to_string()),
             ("DopplerHookInitializer".to_string(), "getState".to_string()),
             (
                 "DopplerHookInitializer".to_string(),

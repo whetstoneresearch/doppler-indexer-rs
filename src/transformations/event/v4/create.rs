@@ -214,7 +214,10 @@ impl EventHandler for V4CreateHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![("DopplerV4Hook".to_string(), "once".to_string())]
+        vec![
+            ("DERC20".to_string(), "once".to_string()),
+            ("DopplerV4Hook".to_string(), "once".to_string()),
+        ]
     }
 }
 

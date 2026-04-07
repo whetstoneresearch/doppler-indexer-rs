@@ -386,6 +386,7 @@ impl EventHandler for V4MulticurveCreateHandler {
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
+            ("DERC20".to_string(), "once".to_string()),
             (
                 "UniswapV4MulticurveInitializer".to_string(),
                 "getState".to_string(),

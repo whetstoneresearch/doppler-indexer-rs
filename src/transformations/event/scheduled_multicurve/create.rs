@@ -430,6 +430,7 @@ impl EventHandler for V4ScheduledMulticurveCreateHandler {
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
+            ("DERC20".to_string(), "once".to_string()),
             (
                 "UniswapV4ScheduledMulticurveInitializer".to_string(),
                 "getState".to_string(),

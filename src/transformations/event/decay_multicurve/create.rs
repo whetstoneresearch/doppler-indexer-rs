@@ -386,6 +386,7 @@ impl EventHandler for V4DecayMulticurveCreateHandler {
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
+            ("DERC20".to_string(), "once".to_string()),
             (
                 "DecayMulticurveInitializer".to_string(),
                 "getState".to_string(),
