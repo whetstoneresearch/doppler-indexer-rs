@@ -384,11 +384,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Once, OnceLock};
 
+    use crate::rpc::UnifiedRpcClient;
     use crate::transformations::context::TransformationContext;
     use crate::transformations::historical::HistoricalDataReader;
     use crate::transformations::traits::EventHandler;
     use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
-    use crate::rpc::UnifiedRpcClient;
 
     fn make_empty_ctx() -> TransformationContext {
         let historical = Arc::new(

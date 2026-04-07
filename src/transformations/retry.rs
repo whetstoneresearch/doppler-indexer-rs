@@ -14,7 +14,6 @@ use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, Transforma
 use super::engine::HandlerKind;
 use super::error::TransformationError;
 use super::executor::{execute_with_snapshot_capture, inject_source_version};
-use crate::metrics::HandlerMetricsGuard;
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
@@ -25,6 +24,7 @@ use crate::decoding::eth_calls::{
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
+use crate::metrics::HandlerMetricsGuard;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::eth_call::EvmType;
@@ -613,10 +613,8 @@ impl RetryProcessor {
 
                     match commit_result {
                         Ok(()) => {
-                            if let Err(e) = rh
-                                .handler
-                                .on_commit_success((range_start, range_end))
-                                .await
+                            if let Err(e) =
+                                rh.handler.on_commit_success((range_start, range_end)).await
                             {
                                 tracing::error!(
                                     "Handler {} on_commit_success failed for block {}: {}",
@@ -665,10 +663,8 @@ impl RetryProcessor {
                                 "outcome" => "failure",
                             )
                             .increment(1);
-                            if let Err(hook_err) = rh
-                                .handler
-                                .on_commit_failure((range_start, range_end))
-                                .await
+                            if let Err(hook_err) =
+                                rh.handler.on_commit_failure((range_start, range_end)).await
                             {
                                 tracing::error!(
                                     "Handler {} on_commit_failure hook also failed for block {}: {}",

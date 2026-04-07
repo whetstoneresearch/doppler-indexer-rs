@@ -104,14 +104,12 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
         .or_else(|| {
-            args.iter()
-                .find(|a| a.starts_with("--chains="))
-                .map(|a| {
-                    a.trim_start_matches("--chains=")
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .collect()
-                })
+            args.iter().find(|a| a.starts_with("--chains=")).map(|a| {
+                a.trim_start_matches("--chains=")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            })
         });
 
     let mut config = IndexerConfig::load(Path::new("config/config.json"))?;

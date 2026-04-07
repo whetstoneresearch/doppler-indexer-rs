@@ -3,7 +3,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::config::chain::{resolve_chain_config, ChainConfig, ChainConfigRaw, RpcRateLimitGroup};
+use crate::types::config::chain::{
+    resolve_chain_config, ChainConfig, ChainConfigRaw, RpcRateLimitGroup,
+};
 use crate::types::config::metrics::MetricsConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::config::storage::StorageConfig;
@@ -66,7 +68,8 @@ impl IndexerConfig {
                     );
                 }
             }
-            if chain.rpc.rate_limit_group.is_some() && chain.rpc.compute_units_per_second.is_some() {
+            if chain.rpc.rate_limit_group.is_some() && chain.rpc.compute_units_per_second.is_some()
+            {
                 anyhow::bail!(
                     "Chain '{}' has both rate_limit_group and compute_units_per_second; the group defines the rate budget",
                     chain.name

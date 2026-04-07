@@ -496,11 +496,7 @@ impl RpcClient {
         if let Some(ref limiter) = self.sliding_limiter {
             limiter.acquire(1).await;
             let current = limiter.current_usage_async().await;
-            set_cu_usage(
-                &self.chain,
-                current as f64,
-                limiter.max_in_window() as f64,
-            );
+            set_cu_usage(&self.chain, current as f64, limiter.max_in_window() as f64);
         } else if let (Some(limiter), Some(jitter)) = (&self.rate_limiter, &self.jitter) {
             limiter.until_ready_with_jitter(*jitter).await;
         }
@@ -511,13 +507,18 @@ impl RpcClient {
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
-        with_retry(&self.config.retry, "get_block_number", &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            self.provider
-                .get_block_number()
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "get_block_number",
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                self.provider
+                    .get_block_number()
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -871,24 +872,25 @@ impl RpcClient {
                 chunk_idx,
                 chunk_vec.len()
             );
-            let chunk_results: Vec<Vec<Log>> = with_retry(&self.config.retry, &op_name, &self.chain, || async {
-                self.wait_for_rate_limit().await;
+            let chunk_results: Vec<Vec<Log>> =
+                with_retry(&self.config.retry, &op_name, &self.chain, || async {
+                    self.wait_for_rate_limit().await;
 
-                let futures: Vec<_> = chunk_vec
-                    .iter()
-                    .map(|filter| self.provider.get_logs(filter))
-                    .collect();
+                    let futures: Vec<_> = chunk_vec
+                        .iter()
+                        .map(|filter| self.provider.get_logs(filter))
+                        .collect();
 
-                let results = futures::future::join_all(futures).await;
+                    let results = futures::future::join_all(futures).await;
 
-                let mut chunk_results = Vec::with_capacity(results.len());
-                for result in results {
-                    chunk_results
-                        .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                }
-                Ok(chunk_results)
-            })
-            .await?;
+                    let mut chunk_results = Vec::with_capacity(results.len());
+                    for result in results {
+                        chunk_results
+                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
+                    }
+                    Ok(chunk_results)
+                })
+                .await?;
 
             all_results.extend(chunk_results);
         }

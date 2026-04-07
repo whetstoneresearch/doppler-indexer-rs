@@ -425,9 +425,7 @@ impl AlchemyClient {
     /// Consume a raw number of compute units, waiting if necessary.
     async fn consume_compute_units_raw(&self, units: u32) {
         let chain = self.chain_label();
-        self.rate_limiter
-            .acquire_with_metrics(units, &chain)
-            .await;
+        self.rate_limiter.acquire_with_metrics(units, &chain).await;
     }
 
     /// Create a bounded concurrent executor with semaphore and rate limiter.
@@ -522,7 +520,10 @@ impl AlchemyClient {
                 }
             }
 
-            if log_interval > 0 && indexed_results.len() % log_interval == 0 && indexed_results.len() < num_requests {
+            if log_interval > 0
+                && indexed_results.len() % log_interval == 0
+                && indexed_results.len() < num_requests
+            {
                 tracing::debug!(
                     "Batch progress: {}/{} ({:.0}%) in {:.1}s",
                     indexed_results.len(),
