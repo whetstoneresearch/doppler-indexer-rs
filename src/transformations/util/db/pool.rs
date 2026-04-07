@@ -207,9 +207,9 @@ pub fn insert_migration_pool(
             DbValue::Null, // migration_pool
             DbValue::Bytes(data.migrated_from.to_vec()),
             DbValue::VarChar("v4".to_string()), // migration_type
-            DbValue::Null,                       // lock_duration
-            DbValue::Null,                       // beneficiaries
-            DbValue::Null,                       // pool_key
+            DbValue::Null,                      // lock_duration
+            DbValue::Null,                      // beneficiaries
+            DbValue::Null,                      // pool_key
             DbValue::Timestamp(data.block_timestamp as i64), // starting_time = migration time
             DbValue::Timestamp(data.block_timestamp as i64), // ending_time = migration time
         ],

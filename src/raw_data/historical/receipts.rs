@@ -328,9 +328,7 @@ pub(crate) async fn execute_receipt_write(
             schema,
             fields,
             output_path,
-        } => {
-            write_minimal_receipts_to_parquet_async(records, schema, fields, output_path).await
-        }
+        } => write_minimal_receipts_to_parquet_async(records, schema, fields, output_path).await,
         PendingReceiptWrite::Full {
             records,
             schema,
@@ -652,8 +650,7 @@ pub(crate) async fn fetch_block_receipts_bounded(
                     minimal_records.extend(records);
                 }
                 None => {
-                    let records =
-                        process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+                    let records = process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
                     full_records.extend(records);
                 }
             }
@@ -707,13 +704,11 @@ pub(crate) async fn fetch_tx_receipts_batched(
     let process_start = Instant::now();
     match receipt_fields {
         Some(_) => {
-            let records =
-                process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
+            let records = process_receipts_minimal(&receipts, &tx_block_info, &mut all_logs)?;
             minimal_records.extend(records);
         }
         None => {
-            let records =
-                process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
+            let records = process_receipts_full(&receipts, &tx_block_info, &mut all_logs)?;
             full_records.extend(records);
         }
     }
@@ -740,7 +735,14 @@ pub(crate) async fn fetch_receipts_for_blocks(
     block_receipt_concurrency: usize,
 ) -> Result<BatchFetchResult, ReceiptCollectionError> {
     if let Some(method) = block_receipts_method {
-        fetch_block_receipts_bounded(blocks, client, receipt_fields, method, block_receipt_concurrency).await
+        fetch_block_receipts_bounded(
+            blocks,
+            client,
+            receipt_fields,
+            method,
+            block_receipt_concurrency,
+        )
+        .await
     } else {
         fetch_tx_receipts_batched(blocks, client, receipt_fields).await
     }

@@ -22,7 +22,9 @@ use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use super::error::TransformationError;
-use super::executor::{DbExecMode, HandlerExecutor, HandlerTask, ProcessRangePayload, run_handler_task};
+use super::executor::{
+    run_handler_task, DbExecMode, HandlerExecutor, HandlerTask, ProcessRangePayload,
+};
 use super::finalizer::RangeFinalizer;
 use super::historical::HistoricalDataReader;
 use super::live_state::{LiveProcessingState, PendingEventData};
@@ -575,25 +577,21 @@ impl TransformationEngine {
                 let completed = self_completed.get(&name).cloned().unwrap_or_default();
 
                 // On retry passes only re-try handlers that had pending ranges.
-                let candidate_ranges: Vec<(u64, u64)> =
-                    if let Some(ref pending) = ranges_pending {
-                        match pending.get(&name) {
-                            Some(r) => r.clone(),
-                            None => continue,
-                        }
-                    } else {
-                        available.clone()
-                    };
+                let candidate_ranges: Vec<(u64, u64)> = if let Some(ref pending) = ranges_pending {
+                    match pending.get(&name) {
+                        Some(r) => r.clone(),
+                        None => continue,
+                    }
+                } else {
+                    available.clone()
+                };
 
                 // Scan call-dep file availability once per handler per pass.
                 let mut call_range_sets: Vec<HashSet<(u64, u64)>> =
                     Vec::with_capacity(ch.call_deps.len());
                 for (source, func) in &ch.call_deps {
                     let dir = self.decoded_calls_dir.join(source).join(func);
-                    let ranges = self
-                        .scan_available_ranges(&dir)
-                        .await
-                        .unwrap_or_default();
+                    let ranges = self.scan_available_ranges(&dir).await.unwrap_or_default();
                     call_range_sets.push(ranges.into_iter().collect());
                 }
 
@@ -725,10 +723,8 @@ impl TransformationEngine {
             // Iterate `handlers` for deterministic topological ordering.
             for ch in &handlers {
                 let name = ch.handler.name();
-                let (submitted, call_dep_def, cascade_def) = per_handler_counts
-                    .get(name)
-                    .copied()
-                    .unwrap_or((0, 0, 0));
+                let (submitted, call_dep_def, cascade_def) =
+                    per_handler_counts.get(name).copied().unwrap_or((0, 0, 0));
                 if submitted == 0 && call_dep_def == 0 && cascade_def == 0 {
                     continue;
                 }
@@ -769,9 +765,7 @@ impl TransformationEngine {
                 let outcomes = scheduler
                     .execute(items, move |item| {
                         let loader = loader_ref.clone();
-                        Box::pin(async move {
-                            loader.run(item).await.map_err(|e| e.to_string())
-                        })
+                        Box::pin(async move { loader.run(item).await.map_err(|e| e.to_string()) })
                     })
                     .await;
 
@@ -841,8 +835,11 @@ impl TransformationEngine {
                                 .find(|ch| ch.handler.name() == outcome.handler_name)
                                 .map(|ch| ch.handler.handler_key())
                                 .unwrap_or_else(|| outcome.handler_name.clone());
-                            failed_items
-                                .push((key, outcome.range_start, "task panicked".to_string()));
+                            failed_items.push((
+                                key,
+                                outcome.range_start,
+                                "task panicked".to_string(),
+                            ));
                             counts.3 += 1;
                         }
                     }
@@ -852,8 +849,7 @@ impl TransformationEngine {
                 // activity at info, clean runs at debug to reduce log noise.
                 for ch in &handlers {
                     let name = ch.handler.name();
-                    let Some(&(ok, failed, cascade, panicked)) =
-                        per_handler_outcomes.get(name)
+                    let Some(&(ok, failed, cascade, panicked)) = per_handler_outcomes.get(name)
                     else {
                         continue;
                     };
@@ -1323,7 +1319,9 @@ impl TransformationEngine {
         }
 
         // Build HandlerTasks and use executor
-        let tx_addresses = self.read_receipt_addresses(msg.range_start, msg.range_end).await;
+        let tx_addresses = self
+            .read_receipt_addresses(msg.range_start, msg.range_end)
+            .await;
         let tasks: Vec<HandlerTask> = ready_handlers
             .into_iter()
             .map(|(handler, calls)| HandlerTask {
@@ -1790,8 +1788,9 @@ impl TransformationEngine {
             // Build HandlerTasks and use executor
             let mut tasks = Vec::new();
             for (_handler_key, event_data, handler) in ready_events {
-                let tx_addresses =
-                    self.read_receipt_addresses(event_data.range_start, event_data.range_end).await;
+                let tx_addresses = self
+                    .read_receipt_addresses(event_data.range_start, event_data.range_end)
+                    .await;
                 tasks.push(HandlerTask {
                     handler,
                     events: Arc::new(event_data.events),
@@ -1824,12 +1823,7 @@ impl TransformationEngine {
                 .await;
             outcomes.extend(
                 self.executor
-                    .execute_handlers(
-                        direct_tasks,
-                        range_key.0,
-                        range_key.1,
-                        &DbExecMode::Direct,
-                    )
+                    .execute_handlers(direct_tasks, range_key.0, range_key.1, &DbExecMode::Direct)
                     .await,
             );
 
@@ -2215,10 +2209,7 @@ impl TransformationEngine {
         // don't hang waiting on a mark_completed that will never arrive.
         let tracker = Arc::new(CompletionTracker::new());
         {
-            let item_names: HashSet<&str> = items
-                .iter()
-                .map(|i| i.handler_name.as_str())
-                .collect();
+            let item_names: HashSet<&str> = items.iter().map(|i| i.handler_name.as_str()).collect();
             let missing_deps: HashSet<&str> = items
                 .iter()
                 .flat_map(|i| i.dep_names.iter().map(|d| d.as_str()))

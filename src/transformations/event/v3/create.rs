@@ -346,13 +346,14 @@ impl EventHandler for LockableV3CreateHandler {
     }
 }
 
-pub fn register_handlers(registry: &mut TransformationRegistry, metadata_cache: Arc<PoolMetadataCache>) {
+pub fn register_handlers(
+    registry: &mut TransformationRegistry,
+    metadata_cache: Arc<PoolMetadataCache>,
+) {
     registry.register_event_handler(V3CreateHandler {
         metadata_cache: metadata_cache.clone(),
     });
-    registry.register_event_handler(LockableV3CreateHandler {
-        metadata_cache,
-    });
+    registry.register_event_handler(LockableV3CreateHandler { metadata_cache });
 }
 
 #[cfg(test)]

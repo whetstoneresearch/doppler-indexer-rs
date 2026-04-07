@@ -507,7 +507,12 @@ fn batch_to_calls(
         .transpose()?;
 
     // Get result columns (exclude standard + log_index)
-    let standard_cols = ["block_number", "block_timestamp", "contract_address", "log_index"];
+    let standard_cols = [
+        "block_number",
+        "block_timestamp",
+        "contract_address",
+        "log_index",
+    ];
     let schema = batch.schema();
     let result_columns: Vec<_> = schema
         .fields()

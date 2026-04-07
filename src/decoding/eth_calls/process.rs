@@ -5,9 +5,7 @@ use std::path::Path;
 
 use tokio::sync::mpsc::Sender;
 
-use super::column_index::{
-    read_decoded_column_index, write_decoded_column_index,
-};
+use super::column_index::{read_decoded_column_index, write_decoded_column_index};
 use super::decode::decode_value;
 use super::parquet_io::{
     merge_decoded_once_calls, write_decoded_calls_to_parquet, write_decoded_event_calls_to_parquet,

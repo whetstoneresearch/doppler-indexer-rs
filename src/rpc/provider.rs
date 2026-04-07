@@ -831,14 +831,10 @@ impl RpcClient {
                 let tx = result_tx.clone();
                 join_set.spawn(async move {
                     let op_name = format!("eth_getBlockByNumber({:?})", number);
-                    let result = with_retry(
-                        &client.config.retry,
-                        &op_name,
-                        &client.chain,
-                        || async {
+                    let result =
+                        with_retry(&client.config.retry, &op_name, &client.chain, || async {
                             client.wait_for_rate_limit().await;
-                            let builder =
-                                client.provider.get_block(BlockId::Number(number));
+                            let builder = client.provider.get_block(BlockId::Number(number));
                             if full_transactions {
                                 builder
                                     .full()
@@ -849,9 +845,8 @@ impl RpcClient {
                                     .await
                                     .map_err(|e| RpcError::ProviderError(error_chain(&e)))
                             }
-                        },
-                    )
-                    .await;
+                        })
+                        .await;
                     let _ = tx.send((number, result)).await;
                 });
             }
@@ -867,14 +862,10 @@ impl RpcClient {
                     let tx = result_tx.clone();
                     join_set.spawn(async move {
                         let op_name = format!("eth_getBlockByNumber({:?})", number);
-                        let result = with_retry(
-                            &client.config.retry,
-                            &op_name,
-                            &client.chain,
-                            || async {
+                        let result =
+                            with_retry(&client.config.retry, &op_name, &client.chain, || async {
                                 client.wait_for_rate_limit().await;
-                                let builder =
-                                    client.provider.get_block(BlockId::Number(number));
+                                let builder = client.provider.get_block(BlockId::Number(number));
                                 if full_transactions {
                                     builder
                                         .full()
@@ -885,9 +876,8 @@ impl RpcClient {
                                         .await
                                         .map_err(|e| RpcError::ProviderError(error_chain(&e)))
                                 }
-                            },
-                        )
-                        .await;
+                            })
+                            .await;
                         let _ = tx.send((number, result)).await;
                     });
                 }
@@ -915,7 +905,11 @@ impl RpcClient {
 
         let mut all_results = Vec::with_capacity(hashes.len());
 
-        let effective_chunk_size = self.config.max_batch_size.min(self.config.concurrency).max(1);
+        let effective_chunk_size = self
+            .config
+            .max_batch_size
+            .min(self.config.concurrency)
+            .max(1);
         for chunk in hashes.chunks(effective_chunk_size) {
             self.wait_for_rate_limit().await;
 
@@ -1182,8 +1176,8 @@ mod tests {
     /// Verify with_concurrency builder actually sets the field.
     #[test]
     fn with_concurrency_builder() {
-        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
-            .with_concurrency(42);
+        let config =
+            RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap()).with_concurrency(42);
         assert_eq!(config.concurrency, 42);
     }
 

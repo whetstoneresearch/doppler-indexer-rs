@@ -849,9 +849,7 @@ impl AlchemyClient {
             let make_request = Arc::new(move |block_number: BlockNumberOrTag| {
                 let inner = inner.clone();
                 let method_name = method_name.clone();
-                async move {
-                    inner.get_block_receipts(&method_name, block_number).await
-                }
+                async move { inner.get_block_receipts(&method_name, block_number).await }
             });
 
             let num_requests = block_numbers.len();
@@ -869,15 +867,18 @@ impl AlchemyClient {
                 );
             }
 
-            let mut indexed_results: Vec<(usize, Result<Vec<Option<TransactionReceipt>>, RpcError>)> =
-                Vec::with_capacity(num_requests);
+            let mut indexed_results: Vec<(
+                usize,
+                Result<Vec<Option<TransactionReceipt>>, RpcError>,
+            )> = Vec::with_capacity(num_requests);
 
             while let Some(result) = join_set.join_next().await {
                 match result {
                     Ok((idx, value)) => indexed_results.push((idx, value)),
                     Err(e) => {
                         return Err(RpcError::ProviderError(format!(
-                            "Task panicked in get_block_receipts_concurrent: {:?}", e
+                            "Task panicked in get_block_receipts_concurrent: {:?}",
+                            e
                         )));
                     }
                 }
@@ -885,11 +886,9 @@ impl AlchemyClient {
                 while requests_iter.peek().is_some() && join_set.len() < executor.max_in_flight {
                     let (idx, request) = requests_iter.next().unwrap();
                     let make_request = make_request.clone();
-                    executor.spawn_indexed(
-                        &mut join_set,
-                        idx,
-                        async move { make_request(request).await },
-                    );
+                    executor.spawn_indexed(&mut join_set, idx, async move {
+                        make_request(request).await
+                    });
                 }
             }
 
