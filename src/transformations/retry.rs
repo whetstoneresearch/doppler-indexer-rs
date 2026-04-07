@@ -13,8 +13,7 @@ use tokio::sync::Mutex;
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use super::engine::HandlerKind;
 use super::error::TransformationError;
-use super::executor::{DbExecMode, run_handler_task};
-use crate::metrics::HandlerMetricsGuard;
+use super::executor::{run_handler_task, DbExecMode};
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
@@ -539,6 +538,7 @@ impl RetryProcessor {
         let contracts = self.contracts.clone();
         let chain_name = self.chain_name.clone();
         let chain_id = self.chain_id;
+        let progress_tracker = self.progress_tracker.clone();
 
         let scheduler = DagScheduler::new(tracker, self.handler_concurrency);
         let outcomes = scheduler
@@ -548,6 +548,7 @@ impl RetryProcessor {
                 let rpc_client = rpc_client.clone();
                 let contracts = contracts.clone();
                 let chain_name = chain_name.clone();
+                let progress_tracker = progress_tracker.clone();
                 Box::pin(async move {
                     let WorkItem {
                         range_start,
@@ -559,7 +560,6 @@ impl RetryProcessor {
                         .downcast::<RetryPayload>()
                         .expect("execute_live_retry_handlers WorkItem payload type mismatch");
                     let handler_key = payload.handler.handler_key();
-                    let guard = HandlerMetricsGuard::new(&handler_key, "retry");
                     let db_exec_mode = DbExecMode::WithSnapshotCapture {
                         chain_name: chain_name.clone(),
                     };
@@ -575,13 +575,22 @@ impl RetryProcessor {
                         historical,
                         rpc_client,
                         contracts,
-                        db_pool,
+                        db_pool.clone(),
                         &db_exec_mode,
                     )
                     .await;
                     match result {
                         Ok(_) => {
-                            guard.success();
+                            RetryProcessor::persist_handler_retry_progress(
+                                db_pool.clone(),
+                                progress_tracker,
+                                chain_id,
+                                &handler_key,
+                                range_start,
+                                range_end,
+                                block_number,
+                            )
+                            .await;
                             counter!(
                                 "transformation_retry_attempts_total",
                                 "handler_key" => handler_key.clone(),
@@ -591,7 +600,6 @@ impl RetryProcessor {
                             Ok(())
                         }
                         Err(e) => {
-                            guard.failure("handler_error");
                             counter!(
                                 "transformation_retry_attempts_total",
                                 "handler_key" => handler_key.clone(),
@@ -626,22 +634,19 @@ impl RetryProcessor {
             .await;
         }
 
-        // DAG outcomes.
+        // DAG outcomes. Successful items already wrote `_handler_progress`
+        // and updated the live tracker in-task immediately after commit.
         for outcome in &outcomes {
             match &outcome.status {
                 OutcomeStatus::Succeeded => {
                     if let Some(key) = name_to_key.get(&outcome.handler_name) {
                         attempted_keys.insert(key.clone());
-                        self.record_handler_retry_success(
+                        self.note_handler_retry_success(
                             key,
                             &outcome.handler_name,
-                            range_start,
-                            range_end,
-                            block_number,
                             &mut succeeded_keys,
                             &mut succeeded_names,
-                        )
-                        .await;
+                        );
                     }
                 }
                 OutcomeStatus::HandlerFailed { .. } | OutcomeStatus::Panicked => {
@@ -695,12 +700,20 @@ impl RetryProcessor {
         Ok(blocked_handlers)
     }
 
-    /// Record shared bookkeeping for a successfully retried handler (no-op or real).
-    ///
-    /// Operations in order (matching the normal success path):
-    /// 1. Insert into succeeded_keys / succeeded_names
-    /// 2. Upsert `_handler_progress` so catchup won't re-run this range
-    /// 3. Mark complete in progress_tracker (`_live_progress`)
+    /// Track a handler as successfully retried in the aggregate status sets.
+    fn note_handler_retry_success(
+        &self,
+        handler_key: &str,
+        handler_name: &str,
+        succeeded_keys: &mut HashSet<String>,
+        succeeded_names: &mut HashSet<String>,
+    ) {
+        succeeded_keys.insert(handler_key.to_string());
+        succeeded_names.insert(handler_name.to_string());
+    }
+
+    /// Record full retry-success bookkeeping for handlers that resolve
+    /// immediately and never enter the DAG.
     async fn record_handler_retry_success(
         &self,
         handler_key: &str,
@@ -711,11 +724,32 @@ impl RetryProcessor {
         succeeded_keys: &mut HashSet<String>,
         succeeded_names: &mut HashSet<String>,
     ) {
-        succeeded_keys.insert(handler_key.to_string());
-        succeeded_names.insert(handler_name.to_string());
+        self.note_handler_retry_success(handler_key, handler_name, succeeded_keys, succeeded_names);
 
-        if let Err(e) = self
-            .db_pool
+        Self::persist_handler_retry_progress(
+            self.db_pool.clone(),
+            self.progress_tracker.clone(),
+            self.chain_id,
+            handler_key,
+            range_start,
+            range_end,
+            block_number,
+        )
+        .await;
+    }
+
+    /// Persist retry progress eagerly so a crash after commit does not cause
+    /// the handler to re-run on restart.
+    async fn persist_handler_retry_progress(
+        db_pool: Arc<DbPool>,
+        progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+        chain_id: u64,
+        handler_key: &str,
+        range_start: u64,
+        range_end: u64,
+        block_number: u64,
+    ) {
+        if let Err(e) = db_pool
             .execute_transaction(vec![crate::db::DbOperation::Upsert {
                 table: "_handler_progress".to_string(),
                 columns: vec![
@@ -725,7 +759,7 @@ impl RetryProcessor {
                     "range_end".to_string(),
                 ],
                 values: vec![
-                    crate::db::DbValue::Int64(self.chain_id as i64),
+                    crate::db::DbValue::Int64(chain_id as i64),
                     crate::db::DbValue::Text(handler_key.to_string()),
                     crate::db::DbValue::Int64(range_start as i64),
                     crate::db::DbValue::Int64(range_end as i64),
@@ -748,7 +782,7 @@ impl RetryProcessor {
             );
         }
 
-        if let Some(ref tracker) = self.progress_tracker {
+        if let Some(tracker) = progress_tracker {
             let mut tracker = tracker.lock().await;
             if let Err(e) = tracker.mark_complete(block_number, handler_key).await {
                 tracing::warn!(
