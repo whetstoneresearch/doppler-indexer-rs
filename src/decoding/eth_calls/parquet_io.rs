@@ -798,15 +798,17 @@ pub(super) fn merge_decoded_once_calls(
         .collect();
 
     // Extract address column from existing batch
-    let address_col_idx = existing_schema
-        .index_of("contract_address")
-        .map_err(|e| EthCallDecodingError::Decode(format!("Missing contract_address column: {}", e)))?;
+    let address_col_idx = existing_schema.index_of("contract_address").map_err(|e| {
+        EthCallDecodingError::Decode(format!("Missing contract_address column: {}", e))
+    })?;
     let address_arr = existing_batch
         .column(address_col_idx)
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
         .ok_or_else(|| {
-            EthCallDecodingError::Decode("contract_address column is not FixedSizeBinaryArray".to_string())
+            EthCallDecodingError::Decode(
+                "contract_address column is not FixedSizeBinaryArray".to_string(),
+            )
         })?;
 
     // Build new schema with existing fields + new fields

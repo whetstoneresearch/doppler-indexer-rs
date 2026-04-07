@@ -333,8 +333,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use alloy::primitives::{Address, U256};
-    use crate::raw_data::historical::eth_calls::{BlockInfo, OnceCallConfig, FrequencyState};
+    use crate::raw_data::historical::eth_calls::{BlockInfo, FrequencyState, OnceCallConfig};
     use crate::raw_data::historical::factories::FactoryAddressData;
     use crate::rpc::UnifiedRpcClient;
     use crate::types::config::chain::ChainConfig;
@@ -342,6 +341,7 @@ mod tests {
         AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
         FactoryEventConfigOrArray, FactoryParameterLocation,
     };
+    use alloy::primitives::{Address, U256};
 
     fn test_chain() -> ChainConfig {
         ChainConfig {
@@ -443,9 +443,13 @@ mod tests {
         let mut state = factory_once_only_state(tmp.path());
 
         // Pre-populate range_data with one block
-        state
-            .range_data
-            .insert(0, vec![BlockInfo { block_number: 0, timestamp: 100 }]);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
         // Do NOT insert range_factory_data — factory hasn't arrived yet
 
         process_complete_range(0, &mut state, &client, &chain, &None, None)
@@ -480,7 +484,10 @@ mod tests {
             },
         );
 
-        let blocks = vec![BlockInfo { block_number: 0, timestamp: 100 }];
+        let blocks = vec![BlockInfo {
+            block_number: 0,
+            timestamp: 100,
+        }];
 
         process_incomplete_range(0, blocks, &mut state, &client, &chain, &None, None)
             .await

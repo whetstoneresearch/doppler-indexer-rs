@@ -23,12 +23,12 @@ use crate::raw_data::historical::eth_calls::{
     EthCallContext, FrequencyState, OnceCallConfig,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
+use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
+use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, range_key, read_contract_index,
     update_contract_index, write_contract_index,
 };
-use crate::raw_data::historical::receipts::{build_event_trigger_matchers, extract_event_triggers};
-use crate::rpc::UnifiedRpcClient;
 use crate::storage::factory_data::{
     load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
 };
@@ -975,16 +975,15 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use alloy::primitives::{Address, U256};
     use crate::raw_data::historical::eth_calls::parquet_io::{
-        extract_addresses_from_once_parquet, read_existing_once_parquet,
-        read_parquet_column_names,
+        extract_addresses_from_once_parquet, read_existing_once_parquet, read_parquet_column_names,
     };
     use crate::rpc::UnifiedRpcClient;
     use crate::types::config::contract::{
         AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
         FactoryEventConfigOrArray, FactoryParameterLocation,
     };
+    use alloy::primitives::{Address, U256};
 
     #[tokio::test]
     async fn test_factory_once_catchup_zero_address_range_still_processes() {

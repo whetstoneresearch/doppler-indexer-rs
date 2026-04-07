@@ -301,7 +301,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use alloy::primitives::{Address, U256};
     use crate::raw_data::historical::eth_calls::{
         BlockInfo, EthCallCatchupState, FrequencyState, OnceCallConfig,
     };
@@ -311,6 +310,7 @@ mod tests {
         AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
         FactoryEventConfigOrArray, FactoryParameterLocation,
     };
+    use alloy::primitives::{Address, U256};
 
     fn dummy_client() -> Arc<UnifiedRpcClient> {
         Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
@@ -395,9 +395,13 @@ mod tests {
 
         // Pre-populate: regular processing done, block data available
         state.range_regular_done.insert(0);
-        state
-            .range_data
-            .insert(0, vec![BlockInfo { block_number: 0, timestamp: 100 }]);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
         state.range_factory_data.insert(
             0,
             FactoryAddressData {

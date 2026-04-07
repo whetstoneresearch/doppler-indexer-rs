@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::types::EthCallCollectionError;
-use crate::storage::contract_index::{get_missing_contracts, range_key, read_contract_index, ExpectedContracts};
+use crate::storage::contract_index::{
+    get_missing_contracts, range_key, read_contract_index, ExpectedContracts,
+};
 use crate::storage::paths::{parse_range_from_filename, raw_logs_dir};
 use crate::storage::S3Manifest;
 
@@ -240,9 +242,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use crate::storage::contract_index::{
-        write_contract_index, range_key, ExpectedContracts,
-    };
+    use crate::storage::contract_index::{range_key, write_contract_index, ExpectedContracts};
     use crate::storage::S3Manifest;
 
     #[test]
@@ -266,7 +266,10 @@ mod tests {
             Some(&expected),
         );
 
-        assert!(result, "S3 manifest hit should be trusted when no local sidecar exists");
+        assert!(
+            result,
+            "S3 manifest hit should be trusted when no local sidecar exists"
+        );
     }
 
     #[test]
@@ -307,6 +310,9 @@ mod tests {
             Some(&expected),
         );
 
-        assert!(!result, "Should return false when local sidecar shows missing contracts");
+        assert!(
+            !result,
+            "Should return false when local sidecar shows missing contracts"
+        );
     }
 }

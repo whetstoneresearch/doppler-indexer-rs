@@ -515,7 +515,11 @@ pub(crate) async fn process_event_triggers(
             )
             .await?;
             if !skip_contract_index {
-                let sub_dir = ctx.output_dir.join(contract_name).join(function_name).join("on_events");
+                let sub_dir = ctx
+                    .output_dir
+                    .join(contract_name)
+                    .join(function_name)
+                    .join("on_events");
                 let expected_for_range =
                     build_expected_factory_contracts_for_range(contracts, range_end + 1);
                 if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
@@ -523,10 +527,7 @@ pub(crate) async fn process_event_triggers(
                     let mut ci = read_contract_index(&sub_dir);
                     update_contract_index(&mut ci, &rk, expected);
                     if let Err(e) = write_contract_index(&sub_dir, &ci) {
-                        tracing::warn!(
-                            "Failed to write contract index (empty on_events): {}",
-                            e
-                        );
+                        tracing::warn!("Failed to write contract index (empty on_events): {}", e);
                     }
                 }
             }
@@ -637,7 +638,11 @@ pub(crate) async fn process_event_triggers(
         }
         written_pairs.insert((contract_name.clone(), function_name.clone()));
 
-        let max_params = calls.iter().map(|c| c.encoded_params.len()).max().unwrap_or(0);
+        let max_params = calls
+            .iter()
+            .map(|c| c.encoded_params.len())
+            .max()
+            .unwrap_or(0);
 
         for call in calls {
             let calldata =
@@ -738,25 +743,24 @@ pub(crate) async fn process_event_triggers(
             let output_path = sub_dir.join(format!("{}-{}.parquet", range_start, range_end));
             let result_count = results.len();
 
-            let decoder_results: Option<Vec<DecoderEventCallResult>> =
-                if ctx.decoder_tx.is_some() {
-                    Some(
-                        results
-                            .iter()
-                            .map(|r| DecoderEventCallResult {
-                                block_number: r.block_number,
-                                block_timestamp: r.block_timestamp,
-                                log_index: r.log_index,
-                                target_address: r.target_address,
-                                value: r.value_bytes.clone(),
-                                is_reverted: r.is_reverted,
-                                revert_reason: r.revert_reason.clone(),
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
+            let decoder_results: Option<Vec<DecoderEventCallResult>> = if ctx.decoder_tx.is_some() {
+                Some(
+                    results
+                        .iter()
+                        .map(|r| DecoderEventCallResult {
+                            block_number: r.block_number,
+                            block_timestamp: r.block_timestamp,
+                            log_index: r.log_index,
+                            target_address: r.target_address,
+                            value: r.value_bytes.clone(),
+                            is_reverted: r.is_reverted,
+                            revert_reason: r.revert_reason.clone(),
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
 
             let storage_manager = ctx.storage_manager.cloned();
             let chain_name = ctx.chain_name.to_string();
@@ -854,8 +858,10 @@ pub(crate) async fn process_event_triggers(
                     )
                     .await?;
                     if !skip_ci {
-                        let sub_dir =
-                            output_dir.join(&contract_name).join(&function_name).join("on_events");
+                        let sub_dir = output_dir
+                            .join(&contract_name)
+                            .join(&function_name)
+                            .join("on_events");
                         let expected_for_range =
                             build_expected_factory_contracts_for_range(&contracts, range_end + 1);
                         if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
@@ -944,7 +950,11 @@ pub(crate) async fn process_event_triggers_multicall(
             )
             .await?;
             if !skip_contract_index {
-                let sub_dir = ctx.output_dir.join(contract_name).join(function_name).join("on_events");
+                let sub_dir = ctx
+                    .output_dir
+                    .join(contract_name)
+                    .join(function_name)
+                    .join("on_events");
                 let expected_for_range =
                     build_expected_factory_contracts_for_range(contracts, range_end + 1);
                 if let Some(expected) = expected_for_range.get(contract_name.as_str()) {
@@ -952,10 +962,7 @@ pub(crate) async fn process_event_triggers_multicall(
                     let mut ci = read_contract_index(&sub_dir);
                     update_contract_index(&mut ci, &rk, expected);
                     if let Err(e) = write_contract_index(&sub_dir, &ci) {
-                        tracing::warn!(
-                            "Failed to write contract index (empty on_events): {}",
-                            e
-                        );
+                        tracing::warn!("Failed to write contract index (empty on_events): {}", e);
                     }
                 }
             }
@@ -1127,30 +1134,33 @@ pub(crate) async fn process_event_triggers_multicall(
     // causing timeouts and retries that tank throughput.
     const MAX_SUBCALLS_PER_MULTICALL: usize = 25;
     let total_subcalls: usize = block_multicalls.iter().map(|bm| bm.slots.len()).sum();
-    let max_subcalls = block_multicalls.iter().map(|bm| bm.slots.len()).max().unwrap_or(0);
+    let max_subcalls = block_multicalls
+        .iter()
+        .map(|bm| bm.slots.len())
+        .max()
+        .unwrap_or(0);
 
-    let block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> = if max_subcalls
-        > MAX_SUBCALLS_PER_MULTICALL
-    {
-        let mut split = Vec::with_capacity(block_multicalls.len() * 2);
-        for bm in block_multicalls {
-            if bm.slots.len() <= MAX_SUBCALLS_PER_MULTICALL {
-                split.push(bm);
-            } else {
-                // Split into chunks, each becoming its own multicall at the same block
-                for chunk in bm.slots.chunks(MAX_SUBCALLS_PER_MULTICALL) {
-                    split.push(BlockMulticall {
-                        block_number: bm.block_number,
-                        block_id: bm.block_id,
-                        slots: chunk.to_vec(),
-                    });
+    let block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> =
+        if max_subcalls > MAX_SUBCALLS_PER_MULTICALL {
+            let mut split = Vec::with_capacity(block_multicalls.len() * 2);
+            for bm in block_multicalls {
+                if bm.slots.len() <= MAX_SUBCALLS_PER_MULTICALL {
+                    split.push(bm);
+                } else {
+                    // Split into chunks, each becoming its own multicall at the same block
+                    for chunk in bm.slots.chunks(MAX_SUBCALLS_PER_MULTICALL) {
+                        split.push(BlockMulticall {
+                            block_number: bm.block_number,
+                            block_id: bm.block_id,
+                            slots: chunk.to_vec(),
+                        });
+                    }
                 }
             }
-        }
-        split
-    } else {
-        block_multicalls
-    };
+            split
+        } else {
+            block_multicalls
+        };
 
     tracing::info!(
         "Executing {} multicalls ({} sub-calls, max {}/block) for event-triggered calls in blocks {}-{}",
@@ -1162,9 +1172,13 @@ pub(crate) async fn process_event_triggers_multicall(
     );
 
     // Execute all multicalls
-    let results =
-        execute_multicalls_generic(ctx.client, multicall3_address, block_multicalls, ctx.chain_name)
-            .await?;
+    let results = execute_multicalls_generic(
+        ctx.client,
+        multicall3_address,
+        block_multicalls,
+        ctx.chain_name,
+    )
+    .await?;
 
     // Distribute results back to groups
     let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
@@ -1355,8 +1369,10 @@ pub(crate) async fn process_event_triggers_multicall(
                 )
                 .await?;
                 if !skip_ci {
-                    let sub_dir =
-                        output_dir.join(&contract_name).join(&function_name).join("on_events");
+                    let sub_dir = output_dir
+                        .join(&contract_name)
+                        .join(&function_name)
+                        .join("on_events");
                     let expected_for_range =
                         build_expected_factory_contracts_for_range(&contracts, range_end + 1);
                     if let Some(expected) = expected_for_range.get(contract_name.as_str()) {

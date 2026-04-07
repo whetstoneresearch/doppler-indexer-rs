@@ -217,13 +217,31 @@ pub async fn catchup_decode_eth_calls(
                                         use parquet::file::reader::FileReader;
                                         let raw_rows = std::fs::File::open(&file_path)
                                             .ok()
-                                            .and_then(|f| parquet::file::reader::SerializedFileReader::new(f).ok())
-                                            .map(|r| (0..r.metadata().num_row_groups()).map(|i| r.metadata().row_group(i).num_rows() as u64).sum::<u64>())
+                                            .and_then(|f| {
+                                                parquet::file::reader::SerializedFileReader::new(f)
+                                                    .ok()
+                                            })
+                                            .map(|r| {
+                                                (0..r.metadata().num_row_groups())
+                                                    .map(|i| {
+                                                        r.metadata().row_group(i).num_rows() as u64
+                                                    })
+                                                    .sum::<u64>()
+                                            })
                                             .unwrap_or(0);
                                         let dec_rows = std::fs::File::open(&decoded_path)
                                             .ok()
-                                            .and_then(|f| parquet::file::reader::SerializedFileReader::new(f).ok())
-                                            .map(|r| (0..r.metadata().num_row_groups()).map(|i| r.metadata().row_group(i).num_rows() as u64).sum::<u64>())
+                                            .and_then(|f| {
+                                                parquet::file::reader::SerializedFileReader::new(f)
+                                                    .ok()
+                                            })
+                                            .map(|r| {
+                                                (0..r.metadata().num_row_groups())
+                                                    .map(|i| {
+                                                        r.metadata().row_group(i).num_rows() as u64
+                                                    })
+                                                    .sum::<u64>()
+                                            })
                                             .unwrap_or(0);
                                         raw_rows > dec_rows
                                     };
@@ -238,7 +256,9 @@ pub async fn catchup_decode_eth_calls(
                                         .iter()
                                         .filter(|c| {
                                             if let Some(start) = c.start_block {
-                                                if start >= range_end { return false; }
+                                                if start >= range_end {
+                                                    return false;
+                                                }
                                             }
                                             raw_cols.contains(&c.function_name)
                                         })
