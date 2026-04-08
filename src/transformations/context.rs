@@ -11,6 +11,7 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use crate::rpc::UnifiedRpcClient;
+use crate::types::chain::ChainAddress;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
 pub use crate::types::decoded::DecodedValue;
@@ -231,6 +232,50 @@ impl FieldExtractor for DecodedCall {
         format!(
             "call {}:{} at block {} address {:?}",
             self.source_name, self.function_name, self.block_number, self.contract_address
+        )
+    }
+}
+
+/// A decoded Solana account state ready for transformation.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DecodedAccountState {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub account_address: ChainAddress,
+    pub owner_program: ChainAddress,
+    /// Program or collection name from config
+    pub source_name: String,
+    /// Account type name from IDL (e.g., "Whirlpool")
+    pub account_type: String,
+    /// Decoded field values keyed by field name
+    pub fields: HashMap<String, DecodedValue>,
+}
+
+#[allow(dead_code)]
+impl DecodedAccountState {
+    /// Get a field by name, returning an error if missing.
+    pub fn get(&self, name: &str) -> Result<&DecodedValue, TransformationError> {
+        self.fields
+            .get(name)
+            .ok_or_else(|| TransformationError::MissingField(name.to_string()))
+    }
+
+    /// Try to get a field by name.
+    pub fn try_get(&self, name: &str) -> Option<&DecodedValue> {
+        self.fields.get(name)
+    }
+}
+
+impl FieldExtractor for DecodedAccountState {
+    fn field_values(&self) -> &HashMap<String, DecodedValue> {
+        &self.fields
+    }
+
+    fn context_info(&self) -> String {
+        format!(
+            "account_state {}:{} at block {}",
+            self.source_name, self.account_type, self.block_number
         )
     }
 }
@@ -736,6 +781,16 @@ fn encode_calldata(
     }
 
     Ok(calldata)
+}
+
+/// Chain-specific services available to handlers via the transformation context.
+/// Phase 1: only Evm variant defined. Solana variant added in Phase 4.
+#[allow(dead_code)]
+pub enum ChainServices {
+    Evm {
+        rpc: Arc<UnifiedRpcClient>,
+        contracts: Arc<Contracts>,
+    },
 }
 
 #[cfg(test)]

@@ -68,7 +68,8 @@ pub(crate) mod scheduler;
 pub mod traits;
 pub mod util;
 
-pub use context::{DecodedCall, DecodedEvent, TransformationContext};
+pub use context::{DecodedAccountState, DecodedCall, DecodedEvent, TransformationContext};
+pub use traits::{AccountStateHandler, AccountStateTrigger};
 pub use engine::{
     DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteKind,
     RangeCompleteMessage, ReorgMessage, TransformationEngine, TransformationEngineConfig,

@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::traits::{
-    EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler,
+    AccountStateHandler, AccountStateTrigger, EthCallHandler, EthCallTrigger, EventHandler,
+    EventTrigger, TransformationHandler,
 };
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
@@ -55,6 +56,8 @@ pub struct TransformationRegistry {
     event_handlers: HashMap<(String, String), Vec<Arc<dyn EventHandler>>>,
     /// Call handlers indexed by (source, function_name)
     call_handlers: HashMap<(String, String), Vec<Arc<dyn EthCallHandler>>>,
+    /// Account state handlers indexed by (source, account_type)
+    account_state_handlers: HashMap<(String, String), Vec<Arc<dyn AccountStateHandler>>>,
     /// All handlers for initialization (de-duplicated)
     all_handlers: Vec<Arc<dyn TransformationHandler>>,
     /// When set, only handlers whose trigger sources are all present in this
@@ -84,6 +87,7 @@ impl TransformationRegistry {
         Self {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
+            account_state_handlers: HashMap::new(),
             all_handlers: Vec::new(),
             available_sources: None,
             handler_dependency_graph: HashMap::new(),
@@ -104,6 +108,7 @@ impl TransformationRegistry {
         Self {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
+            account_state_handlers: HashMap::new(),
             all_handlers: Vec::new(),
             available_sources: Some(sources),
             handler_dependency_graph: HashMap::new(),
@@ -232,6 +237,53 @@ impl TransformationRegistry {
         self.all_handlers.push(handler);
     }
 
+    /// Register an account state handler.
+    #[allow(dead_code)]
+    pub fn register_account_state_handler<H: AccountStateHandler + 'static>(
+        &mut self,
+        handler: H,
+    ) {
+        let handler = Arc::new(handler);
+        let name = handler.name().to_string();
+        let key = handler.handler_key();
+
+        if let Some(existing_key) = self.handler_name_to_key.get(&name) {
+            panic!(
+                "duplicate handler name '{}': already registered with key '{}', \
+                 cannot register again with key '{}'",
+                name, existing_key, key
+            );
+        }
+
+        let triggers = handler.triggers();
+
+        if let Some(ref sources) = self.available_sources {
+            if !triggers.iter().all(|t| sources.contains(&t.source)) {
+                tracing::debug!(
+                    "Skipping account state handler {} — trigger sources not available",
+                    handler.name(),
+                );
+                return;
+            }
+        }
+
+        if triggers.len() > 1 {
+            self.multi_trigger_handler_keys.insert(key.clone());
+        }
+
+        for trigger in &triggers {
+            let trigger_key = (trigger.source.clone(), trigger.account_type.clone());
+            self.account_state_handlers
+                .entry(trigger_key)
+                .or_default()
+                .push(handler.clone());
+        }
+
+        self.handler_key_to_name.insert(key.clone(), name.clone());
+        self.handler_name_to_key.insert(name, key);
+        self.all_handlers.push(handler);
+    }
+
     /// Get handlers for a specific event.
     pub fn handlers_for_event(&self, source: &str, event_name: &str) -> Vec<Arc<dyn EventHandler>> {
         let key = (source.to_string(), event_name.to_string());
@@ -256,6 +308,26 @@ impl TransformationRegistry {
     /// Get all registered call triggers.
     pub fn all_call_triggers(&self) -> Vec<(String, String)> {
         self.call_handlers.keys().cloned().collect()
+    }
+
+    /// Get handlers for a specific account state type.
+    #[allow(dead_code)]
+    pub fn handlers_for_account_state(
+        &self,
+        source: &str,
+        account_type: &str,
+    ) -> Vec<Arc<dyn AccountStateHandler>> {
+        let key = (source.to_string(), account_type.to_string());
+        self.account_state_handlers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get all registered account state triggers.
+    #[allow(dead_code)]
+    pub fn all_account_state_triggers(&self) -> Vec<(String, String)> {
+        self.account_state_handlers.keys().cloned().collect()
     }
 
     /// Get all handlers for initialization.
@@ -1322,5 +1394,91 @@ mod tests {
                 "DopplerHookCreateHandler".to_string(),
             ]
         );
+    }
+
+    // ─── Account state handler tests ───────────────────────────────────
+
+    use crate::transformations::traits::{AccountStateHandler, AccountStateTrigger};
+
+    struct MockAccountStateHandler {
+        name: &'static str,
+        source: String,
+        account_type: String,
+    }
+
+    impl MockAccountStateHandler {
+        fn new(name: &'static str, source: &str, account_type: &str) -> Self {
+            Self {
+                name,
+                source: source.to_string(),
+                account_type: account_type.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TransformationHandler for MockAccountStateHandler {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &TransformationContext,
+        ) -> Result<Vec<DbOperation>, TransformationError> {
+            Ok(vec![])
+        }
+    }
+
+    impl AccountStateHandler for MockAccountStateHandler {
+        fn triggers(&self) -> Vec<AccountStateTrigger> {
+            vec![AccountStateTrigger::new(&self.source, &self.account_type)]
+        }
+    }
+
+    #[test]
+    fn test_chain_type_default_is_evm() {
+        use crate::types::chain::ChainType;
+        // MockEventHandler already implements TransformationHandler
+        let handler = mock_handler("test", vec![]);
+        assert_eq!(handler.chain_type(), ChainType::Evm);
+    }
+
+    #[test]
+    fn test_register_account_state_handler() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_account_state_handler(MockAccountStateHandler::new(
+            "test_acct",
+            "orca",
+            "Whirlpool",
+        ));
+        let handlers = registry.handlers_for_account_state("orca", "Whirlpool");
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].name(), "test_acct");
+    }
+
+    #[test]
+    fn test_account_state_handler_source_filter() {
+        let sources: HashSet<String> = HashSet::from(["other_source".to_string()]);
+        let mut registry = TransformationRegistry::with_source_filter(sources);
+        registry.register_account_state_handler(MockAccountStateHandler::new(
+            "test_acct",
+            "orca",
+            "Whirlpool",
+        ));
+        let handlers = registry.handlers_for_account_state("orca", "Whirlpool");
+        assert_eq!(handlers.len(), 0); // skipped because "orca" not in sources
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate handler name")]
+    fn test_duplicate_account_state_handler_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_account_state_handler(MockAccountStateHandler::new(
+            "dupe", "src1", "type1",
+        ));
+        registry.register_account_state_handler(MockAccountStateHandler::new(
+            "dupe", "src2", "type2",
+        ));
     }
 }
