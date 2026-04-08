@@ -11,6 +11,7 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use crate::rpc::UnifiedRpcClient;
+use crate::types::chain::ChainAddress;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
 pub use crate::types::decoded::DecodedValue;
@@ -86,6 +87,19 @@ pub trait FieldExtractor {
     impl_field_extractor!(extract_string, as_string, &str, "a string");
     impl_field_extractor!(extract_bytes32, as_bytes32, [u8; 32], "bytes32");
     impl_field_extractor!(extract_bytes, as_bytes, &[u8], "bytes");
+    impl_field_extractor!(extract_pubkey, as_pubkey, [u8; 32], "a pubkey");
+
+    fn extract_chain_address(&self, name: &str) -> Result<ChainAddress, TransformationError> {
+        self.get_field(name)?
+            .as_chain_address()
+            .ok_or_else(|| {
+                TransformationError::TypeConversion(format!(
+                    "'{}' is not an address or pubkey in {}",
+                    name,
+                    self.context_info()
+                ))
+            })
+    }
 
     /// Extract a u64 field with flexible parsing (handles i64, u64, or numeric strings).
     /// This is useful for timestamp fields that may come from different encoding formats.

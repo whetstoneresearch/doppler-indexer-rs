@@ -24,6 +24,8 @@ pub enum DbValue {
     Bytes(Vec<u8>),
     /// Ethereum address (20 bytes, stored as BYTEA)
     Address([u8; 20]),
+    /// Solana pubkey (32 bytes, stored as BYTEA)
+    Pubkey([u8; 32]),
     /// 32-byte hash (stored as BYTEA)
     Bytes32([u8; 32]),
     /// Numeric string for uint256/int256 (stored as NUMERIC)

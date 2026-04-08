@@ -468,6 +468,7 @@ fn convert_db_value(value: &DbValue) -> SqlParam {
         DbValue::VarChar(v) => SqlParam::Text(v.clone()),
         DbValue::Bytes(v) => SqlParam::Bytes(v.clone()),
         DbValue::Address(v) => SqlParam::Bytes(v.to_vec()),
+        DbValue::Pubkey(v) => SqlParam::Bytes(v.to_vec()),
         DbValue::Bytes32(v) => SqlParam::Bytes(v.to_vec()),
         DbValue::Numeric(v) => SqlParam::Text(v.clone()),
         DbValue::Timestamp(v) => SqlParam::Float64(*v as f64),

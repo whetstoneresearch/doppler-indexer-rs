@@ -3,11 +3,14 @@ use std::str::FromStr;
 use alloy::primitives::{I256, U256};
 use serde::{Deserialize, Serialize};
 
+use crate::types::chain::ChainAddress;
+
 /// A decoded value from an event parameter or eth_call result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum DecodedValue {
     Address([u8; 20]),
+    Pubkey([u8; 32]),
     Uint256(U256),
     Int256(I256),
     Uint128(u128),
@@ -36,6 +39,23 @@ impl DecodedValue {
     pub fn as_address(&self) -> Option<[u8; 20]> {
         match self {
             DecodedValue::Address(a) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// Try to get as a Solana pubkey.
+    pub fn as_pubkey(&self) -> Option<[u8; 32]> {
+        match self {
+            DecodedValue::Pubkey(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// Try to get as a chain-agnostic address.
+    pub fn as_chain_address(&self) -> Option<ChainAddress> {
+        match self {
+            DecodedValue::Address(a) => Some(ChainAddress::Evm(*a)),
+            DecodedValue::Pubkey(p) => Some(ChainAddress::Solana(*p)),
             _ => None,
         }
     }
@@ -153,6 +173,7 @@ impl DecodedValue {
             DecodedValue::Bytes(b) => Some(b),
             DecodedValue::Bytes32(b) => Some(b),
             DecodedValue::Address(a) => Some(a),
+            DecodedValue::Pubkey(p) => Some(p),
             _ => None,
         }
     }
