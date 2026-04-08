@@ -44,6 +44,7 @@ use types::config::chain::ChainConfig;
 use types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
 use types::config::indexer::IndexerConfig;
 use types::config::raw_data::RawDataCollectionConfig;
+use types::shared::repair::RepairScope;
 
 fn has_items<T>(opt: &Option<Vec<T>>) -> bool {
     opt.as_ref().is_some_and(|v| !v.is_empty())
@@ -58,6 +59,109 @@ fn optional_channel<T>(
         (Some(tx), Some(rx))
     } else {
         (None, None)
+    }
+}
+
+fn collect_flag_values(args: &[String], flag: &str) -> anyhow::Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == flag {
+            let Some(next) = args.get(idx + 1) else {
+                anyhow::bail!("Missing value for {}", flag);
+            };
+            if next.starts_with("--") {
+                anyhow::bail!("Missing value for {}", flag);
+            }
+            values.extend(
+                next.split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToString::to_string),
+            );
+            idx += 2;
+            continue;
+        }
+
+        let prefix = format!("{}=", flag);
+        if let Some(raw) = arg.strip_prefix(&prefix) {
+            values.extend(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToString::to_string),
+            );
+        }
+
+        idx += 1;
+    }
+
+    Ok(values)
+}
+
+fn parse_optional_u64_flag(args: &[String], flag: &str) -> anyhow::Result<Option<u64>> {
+    let mut value = None;
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == flag {
+            let Some(next) = args.get(idx + 1) else {
+                anyhow::bail!("Missing value for {}", flag);
+            };
+            if next.starts_with("--") {
+                anyhow::bail!("Missing value for {}", flag);
+            }
+            value = Some(
+                next.parse::<u64>()
+                    .with_context(|| format!("Invalid numeric value '{}' for {}", next, flag))?,
+            );
+            idx += 2;
+            continue;
+        }
+
+        let prefix = format!("{}=", flag);
+        if let Some(raw) = arg.strip_prefix(&prefix) {
+            value = Some(
+                raw.parse::<u64>()
+                    .with_context(|| format!("Invalid numeric value '{}' for {}", raw, flag))?,
+            );
+        }
+
+        idx += 1;
+    }
+
+    Ok(value)
+}
+
+fn build_repair_scope(args: &[String]) -> anyhow::Result<Option<RepairScope>> {
+    let from_block = parse_optional_u64_flag(args, "--from-block")?;
+    let to_block = parse_optional_u64_flag(args, "--to-block")?;
+    let sources = collect_flag_values(args, "--source")?;
+    let functions = collect_flag_values(args, "--function")?;
+
+    if let (Some(from_block), Some(to_block)) = (from_block, to_block) {
+        anyhow::ensure!(
+            from_block <= to_block,
+            "--from-block ({}) cannot be greater than --to-block ({})",
+            from_block,
+            to_block
+        );
+    }
+
+    let scope = RepairScope {
+        from_block,
+        to_block,
+        sources: (!sources.is_empty()).then(|| sources.into_iter().collect()),
+        functions: (!functions.is_empty()).then(|| functions.into_iter().collect()),
+    };
+
+    if scope.is_unscoped() {
+        Ok(None)
+    } else {
+        Ok(Some(scope))
     }
 }
 
@@ -90,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
     let repair_only = args.iter().any(|a| a == "--repair-only");
     let repair_flag = args.iter().any(|a| a == "--repair");
     let repair = repair_flag || repair_only;
+    let repair_scope = build_repair_scope(&args)?;
 
     if live_only && decode_only {
         anyhow::bail!("Cannot use --live-only and --decode-only together");
@@ -111,6 +216,11 @@ async fn main() -> anyhow::Result<()> {
     }
     if repair_flag && live_only {
         anyhow::bail!("Cannot use --repair and --live-only together");
+    }
+    if repair_scope.is_some() && !repair {
+        anyhow::bail!(
+            "--from-block/--to-block/--source/--function require --repair or --repair-only"
+        );
     }
 
     let chains_filter: Option<Vec<String>> = args
@@ -311,6 +421,9 @@ async fn main() -> anyhow::Result<()> {
             "Repair mode enabled: rebuilding once indexes from parquet, auditing raw-vs-decoded once schema drift, and repairing legacy factory-once sidecars"
         );
     }
+    if let Some(scope) = &repair_scope {
+        tracing::info!("Repair scope: {:?}", scope);
+    }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
@@ -353,14 +466,15 @@ async fn main() -> anyhow::Result<()> {
         let storage_manager = storage_manager.clone();
         let shared_db_pool = shared_db_pool.clone();
         let chain = chain.clone();
+        let repair_scope = repair_scope.clone();
 
         chain_tasks.spawn(async move {
             let result = if live_only {
                 process_chain_live_only(&config, &chain, shared_db_pool).await
             } else if repair_only {
-                repair_only_chain(&config, &chain, storage_manager).await
+                repair_only_chain(&config, &chain, storage_manager, repair_scope).await
             } else if decode_only {
-                decode_only_chain(&config, &chain, repair).await
+                decode_only_chain(&config, &chain, repair, repair_scope).await
             } else {
                 process_chain(
                     &config,
@@ -368,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_manager,
                     catch_up_only,
                     repair,
+                    repair_scope,
                     shared_db_pool,
                 )
                 .await
@@ -465,6 +580,7 @@ async fn decode_only_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
     repair: bool,
+    repair_scope: Option<RepairScope>,
 ) -> anyhow::Result<()> {
     tracing::info!("Decode-only processing for chain: {}", chain.name);
 
@@ -505,6 +621,7 @@ async fn decode_only_chain(
     if has_calls {
         tasks.spawn({
             let (chain, cfg) = (chain.clone(), raw_config.clone());
+            let repair_scope = repair_scope.clone();
             async move {
                 let (_tx, rx) = mpsc::channel::<DecoderMessage>(1);
                 drop(_tx);
@@ -513,9 +630,19 @@ async fn decode_only_chain(
                     complete_tx: None,
                     retry_tx: None,
                 };
-                decode_eth_calls(&chain, &cfg, rx, outputs, None, None, false, repair)
-                    .await
-                    .context("eth call decoding failed")
+                decode_eth_calls(
+                    &chain,
+                    &cfg,
+                    rx,
+                    outputs,
+                    None,
+                    None,
+                    false,
+                    repair,
+                    repair_scope,
+                )
+                .await
+                .context("eth call decoding failed")
             }
         });
     }
@@ -538,6 +665,7 @@ async fn repair_only_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
     storage_manager: Arc<StorageManager>,
+    repair_scope: Option<RepairScope>,
 ) -> anyhow::Result<()> {
     tracing::info!("Repair-only processing for chain: {}", chain.name);
 
@@ -574,9 +702,10 @@ async fn repair_only_chain(
         &config.raw_data_collection,
         true,
         true,
+        repair_scope.clone(),
         &no_decoder_tx,
         features.has_factory_calls,
-        false,
+        features.has_event_triggered_calls,
         None,
         None,
         s3_manifest,
@@ -601,6 +730,7 @@ async fn repair_only_chain(
         None,
         false,
         true,
+        repair_scope,
     )
     .await
     .context("eth_call decode repair failed")?;
@@ -745,7 +875,7 @@ async fn process_chain_live_only(
                 complete_tx: transform_complete_tx.as_ref(),
                 retry_tx: transform_retry_tx.as_ref(),
             };
-            decode_eth_calls(&chain, &cfg, rx, outputs, None, None, true, false)
+            decode_eth_calls(&chain, &cfg, rx, outputs, None, None, true, false, None)
                 .await
                 .context("eth_call decoding failed")
         });
@@ -827,6 +957,7 @@ struct FullPipelineContext {
     catch_up_only: bool,
     live_mode_enabled: bool,
     repair: bool,
+    repair_scope: Option<RepairScope>,
 }
 
 impl FullPipelineContext {
@@ -1022,6 +1153,7 @@ impl FullPipelineContext {
         let has_factory_rx = eth_calls_factory_rx.is_some();
         let has_event_trigger_rx = event_trigger_rx.is_some();
         let repair = self.repair;
+        let repair_scope = self.repair_scope.clone();
 
         spawn_two_phase_async(
             tasks,
@@ -1035,6 +1167,7 @@ impl FullPipelineContext {
                         &cfg,
                         repair,
                         false,
+                        repair_scope.clone(),
                         &call_decoder_tx,
                         has_factory_rx,
                         has_event_trigger_rx,
@@ -1213,6 +1346,7 @@ impl FullPipelineContext {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
         let repair = self.repair;
+        let repair_scope = self.repair_scope.clone();
 
         tasks.spawn(async move {
             let outputs = decoding::EthCallDecoderOutputs {
@@ -1229,6 +1363,7 @@ impl FullPipelineContext {
                 decode_catchup_done_tx,
                 false,
                 repair,
+                repair_scope,
             )
             .await
             .context("eth call decoding failed")
@@ -1242,6 +1377,7 @@ async fn process_chain(
     storage_manager: Arc<StorageManager>,
     catch_up_only: bool,
     repair: bool,
+    repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
@@ -1374,6 +1510,7 @@ async fn process_chain(
         catch_up_only,
         live_mode_enabled,
         repair,
+        repair_scope,
     };
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();

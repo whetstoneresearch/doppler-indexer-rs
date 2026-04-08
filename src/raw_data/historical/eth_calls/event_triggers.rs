@@ -481,6 +481,56 @@ pub fn build_event_call_params(
     Ok((params, encoded_params))
 }
 
+/// Build expected per-output trigger key counts for event-triggered calls without
+/// performing any RPC. This mirrors the filtering logic in `process_event_triggers`
+/// closely enough to audit whether an existing on-events parquet contains the
+/// right triggering `(block_number, log_index)` rows for each output file.
+pub(crate) fn expected_event_call_key_counts_by_output(
+    triggers: &[EventTriggerData],
+    event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
+    factory_addresses: &HashMap<String, HashSet<Address>>,
+) -> HashMap<(String, String), HashMap<(u64, u32), usize>> {
+    let mut counts: HashMap<(String, String), HashMap<(u64, u32), usize>> = HashMap::new();
+
+    for trigger in triggers {
+        let key = (trigger.source_name.clone(), trigger.event_signature);
+
+        if let Some(configs) = event_call_configs.get(&key) {
+            for config in configs {
+                if let Some(sb) = config.start_block {
+                    if trigger.block_number < sb {
+                        continue;
+                    }
+                }
+
+                if config.target_address.is_none() {
+                    let emitter = Address::from(trigger.emitter_address);
+                    let Some(known_addresses) = factory_addresses.get(&config.contract_name) else {
+                        continue;
+                    };
+                    if !known_addresses.contains(&emitter) {
+                        continue;
+                    }
+                }
+
+                if build_event_call_params(trigger, &config.params).is_err() {
+                    continue;
+                }
+
+                let output_key = (config.contract_name.clone(), config.function_name.clone());
+                let trigger_key = (trigger.block_number, trigger.log_index);
+                *counts
+                    .entry(output_key)
+                    .or_default()
+                    .entry(trigger_key)
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    counts
+}
+
 /// Process event triggers and make eth_calls
 pub(crate) async fn process_event_triggers(
     triggers: Vec<EventTriggerData>,

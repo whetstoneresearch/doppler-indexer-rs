@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
+
 use super::types::EthCallCollectionError;
 use crate::storage::contract_index::{
     get_missing_contracts, range_key, read_contract_index, ExpectedContracts,
@@ -12,6 +14,7 @@ use crate::storage::paths::{parse_range_from_filename, raw_logs_dir};
 use crate::storage::S3Manifest;
 
 // Re-export from shared modules for callers that used these from this module.
+pub(crate) use crate::storage::parquet_readers::read_event_trigger_log_batches_from_parquet;
 pub(crate) use crate::storage::parquet_readers::read_raw_logs_from_parquet as read_logs_from_parquet;
 
 /// Existing log range info for catchup
@@ -192,6 +195,19 @@ pub(crate) async fn read_logs_from_parquet_async(
     crate::storage::parquet_readers::ParquetReadError,
 > {
     tokio::task::spawn_blocking(move || read_logs_from_parquet(&file_path))
+        .await
+        .map_err(|e| {
+            crate::storage::parquet_readers::ParquetReadError::Io(std::io::Error::other(
+                e.to_string(),
+            ))
+        })?
+}
+
+/// Async wrapper for read_event_trigger_log_batches_from_parquet
+pub(crate) async fn read_event_trigger_log_batches_from_parquet_async(
+    file_path: PathBuf,
+) -> Result<Vec<RecordBatch>, crate::storage::parquet_readers::ParquetReadError> {
+    tokio::task::spawn_blocking(move || read_event_trigger_log_batches_from_parquet(&file_path))
         .await
         .map_err(|e| {
             crate::storage::parquet_readers::ParquetReadError::Io(std::io::Error::other(

@@ -10,7 +10,7 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::ReceiptField;
 use alloy::primitives::{keccak256, B256};
 use alloy::rpc::types::Log;
-use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use thiserror::Error;
@@ -277,6 +277,135 @@ pub fn extract_event_triggers(
                 topics: log.topics.clone(),
                 data: log.data.clone(),
             });
+        }
+    }
+
+    triggers
+}
+
+/// Extract event triggers from projected Arrow record batches.
+///
+/// This avoids materializing full `LogData` rows when only event-trigger audit
+/// data is needed from historical log parquet.
+pub fn extract_event_triggers_from_batches(
+    batches: &[RecordBatch],
+    matchers: &[EventTriggerMatcher],
+) -> Vec<EventTriggerData> {
+    let mut triggers = Vec::new();
+    let mut seen: HashSet<(u64, u32, String)> = HashSet::new();
+    let mut matchers_by_topic: HashMap<[u8; 32], Vec<&EventTriggerMatcher>> = HashMap::new();
+
+    for matcher in matchers {
+        matchers_by_topic
+            .entry(matcher.event_topic0)
+            .or_default()
+            .push(matcher);
+    }
+
+    for batch in batches {
+        let Some(block_numbers) = batch
+            .column_by_name("block_number")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        else {
+            continue;
+        };
+        let Some(block_timestamps) = batch
+            .column_by_name("block_timestamp")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        else {
+            continue;
+        };
+        let Some(log_indices) = batch
+            .column_by_name("log_index")
+            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
+        else {
+            continue;
+        };
+        let Some(addresses) = batch
+            .column_by_name("address")
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+        else {
+            continue;
+        };
+        let Some(topics_list) = batch
+            .column_by_name("topics")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::ListArray>())
+        else {
+            continue;
+        };
+        let Some(data_array) = batch
+            .column_by_name("data")
+            .and_then(|c| c.as_any().downcast_ref::<arrow::array::BinaryArray>())
+        else {
+            continue;
+        };
+
+        for row in 0..batch.num_rows() {
+            let address_bytes = addresses.value(row);
+            if address_bytes.len() != 20 {
+                continue;
+            }
+            let mut emitter_address = [0u8; 20];
+            emitter_address.copy_from_slice(address_bytes);
+
+            let topics_values = topics_list.value(row);
+            let Some(topics_array) = topics_values
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+            else {
+                continue;
+            };
+            if topics_array.len() == 0 {
+                continue;
+            }
+
+            let mut topics = Vec::with_capacity(topics_array.len());
+            let mut malformed_topic = false;
+            for idx in 0..topics_array.len() {
+                let topic_bytes = topics_array.value(idx);
+                if topic_bytes.len() != 32 {
+                    malformed_topic = true;
+                    break;
+                }
+                let mut topic = [0u8; 32];
+                topic.copy_from_slice(topic_bytes);
+                topics.push(topic);
+            }
+            if malformed_topic || topics.is_empty() {
+                continue;
+            }
+
+            let topic0 = topics[0];
+            let Some(candidate_matchers) = matchers_by_topic.get(&topic0) else {
+                continue;
+            };
+
+            let block_number = block_numbers.value(row);
+            let block_timestamp = block_timestamps.value(row);
+            let log_index = log_indices.value(row);
+            let data = data_array.value(row).to_vec();
+
+            for matcher in candidate_matchers {
+                if !matcher.is_factory && !matcher.addresses.contains(&emitter_address) {
+                    continue;
+                }
+
+                let key = (block_number, log_index, matcher.source_name.clone());
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                triggers.push(EventTriggerData {
+                    block_number,
+                    block_timestamp,
+                    log_index,
+                    emitter_address,
+                    source_name: matcher.source_name.clone(),
+                    event_signature: topic0,
+                    topics: topics.clone(),
+                    data: data.clone(),
+                });
+            }
         }
     }
 
