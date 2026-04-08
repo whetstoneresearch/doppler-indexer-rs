@@ -144,10 +144,18 @@ impl TransformationHandler for V3SwapMetricsHandler {
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            self.name(),
+            "DopplerV3Pool",
         )
         .await?;
 
-        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
+        Ok(process_swaps(
+            &swaps,
+            &self.metadata_cache,
+            ctx.chain_id,
+            self.name(),
+            "DopplerV3Pool",
+        ))
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
@@ -271,10 +279,18 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            self.name(),
+            "DopplerLockableV3Pool",
         )
         .await?;
 
-        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
+        Ok(process_swaps(
+            &swaps,
+            &self.metadata_cache,
+            ctx.chain_id,
+            self.name(),
+            "DopplerLockableV3Pool",
+        ))
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {

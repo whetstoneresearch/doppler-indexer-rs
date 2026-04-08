@@ -56,6 +56,8 @@ pub fn process_swaps(
     swaps: &[SwapInput],
     metadata_cache: &PoolMetadataCache,
     chain_id: u64,
+    handler_name: &str,
+    source_name: &str,
 ) -> Vec<DbOperation> {
     if swaps.is_empty() {
         return Vec::new();
@@ -141,6 +143,8 @@ pub fn process_swaps(
             .map(|(pool, block, tx)| format!("pool={} block={} tx={}", pool, block, tx))
             .collect();
         tracing::warn!(
+            handler = handler_name,
+            source = source_name,
             "Skipped {} swap(s) across {} pool(s) due to missing metadata. Samples: [{}]",
             skipped_swap_count,
             skipped_pool_count,
@@ -224,6 +228,8 @@ pub async fn refresh_cache_if_needed(
     db_pool: &OnceLock<Pool>,
     chain_id: u64,
     contracts: &crate::types::config::contract::Contracts,
+    handler_name: &str,
+    source_name: &str,
 ) -> Result<(), TransformationError> {
     let missing: Vec<_> = {
         let unique: HashSet<&Vec<u8>> = pool_ids.collect();
@@ -243,6 +249,8 @@ pub async fn refresh_cache_if_needed(
     match cache.refresh(pool, chain_id, contracts).await {
         Ok(new_count) if new_count > 0 => {
             tracing::info!(
+                handler = handler_name,
+                source = source_name,
                 "Metadata cache refreshed: {} new pool(s) discovered ({} were missing)",
                 new_count,
                 missing.len()
@@ -266,6 +274,8 @@ pub async fn refresh_cache_if_needed(
             .map(|id| hex::encode(id))
             .collect();
         tracing::warn!(
+            handler = handler_name,
+            source = source_name,
             "{} pool(s) not in pools table — metrics will be skipped (sample: {})",
             still_missing.len(),
             sample.join(", "),
@@ -320,7 +330,7 @@ mod tests {
             liquidity: U256::from(1000u64),
         }];
 
-        let ops = process_swaps(&swaps, &cache, 8453);
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test");
         assert!(ops.is_empty(), "zero sqrtPrice should produce no ops");
     }
 
@@ -357,7 +367,7 @@ mod tests {
             },
         ];
 
-        let ops = process_swaps(&swaps, &cache, 8453);
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test");
         assert!(ops.is_empty(), "all-invalid swaps should produce no ops");
     }
 
@@ -379,7 +389,7 @@ mod tests {
             liquidity: U256::from(1000u64),
         }];
 
-        let ops = process_swaps(&swaps, &cache, 8453);
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test");
         // Expect one pool_snapshots upsert + one pool_state upsert
         assert_eq!(ops.len(), 2, "valid swap should emit snapshot + state");
     }

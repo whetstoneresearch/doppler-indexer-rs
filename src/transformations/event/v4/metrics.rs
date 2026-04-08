@@ -155,6 +155,8 @@ impl TransformationHandler for V4BaseMetricsHandler {
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            self.name(),
+            SOURCE,
         )
         .await?;
 
@@ -191,7 +193,13 @@ impl TransformationHandler for V4BaseMetricsHandler {
             return Ok(Vec::new());
         }
 
-        let mut ops = process_swaps(&swaps, &self.metadata_cache, self.chain_id);
+        let mut ops = process_swaps(
+            &swaps,
+            &self.metadata_cache,
+            self.chain_id,
+            self.name(),
+            SOURCE,
+        );
 
         // Durably checkpoint the new cumulative totals.
         for (pool_id, (total_proceeds, total_tokens_sold)) in &new_cumulative {

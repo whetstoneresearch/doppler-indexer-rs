@@ -160,10 +160,18 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            self.name(),
+            POOL_MANAGER_SOURCE,
         )
         .await?;
 
-        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
+        Ok(process_swaps(
+            &swaps,
+            &self.metadata_cache,
+            ctx.chain_id,
+            self.name(),
+            POOL_MANAGER_SOURCE,
+        ))
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {

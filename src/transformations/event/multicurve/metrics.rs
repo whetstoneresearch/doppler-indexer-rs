@@ -69,10 +69,18 @@ impl TransformationHandler for MulticurveSwapMetricsHandler {
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            self.name(),
+            SOURCE,
         )
         .await?;
 
-        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
+        Ok(process_swaps(
+            &swaps,
+            &self.metadata_cache,
+            ctx.chain_id,
+            self.name(),
+            SOURCE,
+        ))
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
