@@ -33,6 +33,18 @@ pub fn describe_transformation_metrics() {
         "transformation_range_finalization_duration_seconds",
         "Duration of range finalization in seconds"
     );
+    describe_counter!(
+        "transformation_catchup_ranges_completed_total",
+        "Total ranges completed per handler during catchup"
+    );
+    describe_gauge!(
+        "transformation_catchup_ranges_remaining",
+        "Remaining work items for catchup (set at start of each pass)"
+    );
+    describe_histogram!(
+        "transformation_catchup_pass_duration_seconds",
+        "Duration of a single catchup scheduler pass in seconds"
+    );
     describe_gauge!(
         "transformation_pending_events",
         "Pending event batches waiting for dependencies"

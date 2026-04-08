@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -528,6 +528,12 @@ impl TransformationEngine {
             handlers.len()
         );
 
+        gauge!(
+            "transformation_catchup_ranges_remaining",
+            "kind" => kind_label,
+        )
+        .set(total_todo as f64);
+
         let loader = Arc::new(CatchupLoader {
             decoded_logs_dir: self.decoded_logs_dir.clone(),
             decoded_calls_dir: self.decoded_calls_dir.clone(),
@@ -761,6 +767,7 @@ impl TransformationEngine {
                     items.len()
                 );
 
+                let pass_start = Instant::now();
                 let loader_ref = loader.clone();
                 let outcomes = scheduler
                     .execute(items, move |item| {
@@ -768,6 +775,12 @@ impl TransformationEngine {
                         Box::pin(async move { loader.run(item).await.map_err(|e| e.to_string()) })
                     })
                     .await;
+
+                histogram!(
+                    "transformation_catchup_pass_duration_seconds",
+                    "kind" => kind_label,
+                )
+                .record(pass_start.elapsed().as_secs_f64());
 
                 let mut succeeded = 0usize;
                 let mut cascade_failed = 0usize;
@@ -787,6 +800,17 @@ impl TransformationEngine {
                                 .insert(outcome.range_start);
                             succeeded += 1;
                             counts.0 += 1;
+                            let key = handlers
+                                .iter()
+                                .find(|ch| ch.handler.name() == outcome.handler_name)
+                                .map(|ch| ch.handler.handler_key())
+                                .unwrap_or_else(|| outcome.handler_name.clone());
+                            counter!(
+                                "transformation_catchup_ranges_completed_total",
+                                "handler_key" => key,
+                                "kind" => kind_label,
+                            )
+                            .increment(1);
                         }
                         OutcomeStatus::HandlerFailed { reason } => {
                             tracing::error!(
@@ -883,6 +907,23 @@ impl TransformationEngine {
                     succeeded,
                     cascade_failed
                 );
+
+                // Update remaining gauge: recompute from self_completed
+                let remaining: usize = handlers
+                    .iter()
+                    .map(|ch| {
+                        let done = self_completed
+                            .get(ch.handler.name())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        available.len().saturating_sub(done)
+                    })
+                    .sum();
+                gauge!(
+                    "transformation_catchup_ranges_remaining",
+                    "kind" => kind_label,
+                )
+                .set(remaining as f64);
             }
 
             if next_pending.is_empty() {
