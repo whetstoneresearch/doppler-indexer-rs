@@ -93,23 +93,8 @@ Dots and hyphens in hostnames are replaced with underscores. For Alchemy and Inf
 
 ## Live Mode Metrics
 
-`describe_live_metrics()` registers metrics for the WebSocket-based live processing pipeline:
-
-| Name | Type | Labels | Description |
-|---|---|---|---|
-| `live_ws_disconnects_total` | counter | `chain` | WebSocket disconnection count |
-| `live_ws_reconnects_total` | counter | `chain` | WebSocket reconnection count |
-| `live_reorgs_total` | counter | `chain` | Chain reorganizations detected |
-| `live_reorg_depth` | histogram | `chain` | Depth of detected reorgs (blocks rolled back) |
-| `live_compaction_cycle_duration_seconds` | histogram | `chain` | Duration of compaction cycles |
-| `live_compaction_stuck_blocks` | gauge | `chain` | Blocks stuck awaiting transformation |
-| `live_compaction_blocks_pending` | gauge | `chain` | Blocks pending compaction |
-| `live_block_arrival_interval_seconds` | histogram | `chain` | Time between consecutive block arrivals |
-| `live_block_processing_duration_seconds` | histogram | `chain` | Time to process a single live block |
-| `live_blocks_processed_total` | counter | `chain` | Total live blocks processed |
-| `live_gap_detections_total` | counter | `chain` | Gap detections (missing block sequences) |
-| `live_backfill_duration_seconds` | histogram | `chain` | Duration of gap backfill operations |
-| `live_backfill_blocks_total` | counter | `chain` | Total blocks backfilled |
+Live mode metrics are not yet instrumented. The following metrics are planned but not currently emitted:
+`live_ws_disconnects_total`, `live_reorgs_total`, `live_reorg_depth`, `live_compaction_cycle_duration_seconds`, `live_block_arrival_interval_seconds`, `live_block_processing_duration_seconds`, `live_blocks_processed_total`, `live_gap_detections_total`, `live_backfill_duration_seconds`.
 
 ## Collection Metrics
 
@@ -136,11 +121,11 @@ Dots and hyphens in hostnames are replaced with underscores. For Alchemy and Inf
 |---|---|---|---|
 | `transformation_handler_duration_seconds` | histogram | `handler_key`, `mode`, `status` | Handler execution time |
 | `transformation_handler_errors_total` | counter | `handler_key`, `error_type` | Handler error count |
-| `transformation_events_processed_total` | counter | `handler_key` | Events processed by handler |
-| `transformation_calls_processed_total` | counter | `handler_key` | Calls processed by handler |
-| `transformation_retry_attempts_total` | counter | `chain` | Live mode retry attempts |
+| `transformation_events_processed_total` | counter | `source_name`, `event_name` | Events processed through the engine |
+| `transformation_calls_processed_total` | counter | `source_name`, `function_name` | Calls processed through the engine |
+| `transformation_retry_attempts_total` | counter | `handler_key`, `outcome` | Live mode retry attempts |
 | `transformation_range_finalization_duration_seconds` | histogram | `chain` | Range finalization time |
-| `transformation_pending_events` | gauge | `chain` | Events buffered pending call dependencies |
+| `transformation_pending_events` | gauge | `handler_key` | Events buffered pending call dependencies |
 | `transformation_handlers_in_flight` | gauge | `handler_key`, `mode` | Handlers currently executing |
 
 **HandlerMetricsGuard** - RAII guard for handler execution: increments `transformation_handlers_in_flight` on creation, records `transformation_handler_duration_seconds` with status label on `success()`/`failure()`, decrements the gauge on drop. Labels include `handler_key` and `mode` (either `"catchup"` or `"live"`).
@@ -153,7 +138,6 @@ Dots and hyphens in hostnames are replaced with underscores. For Alchemy and Inf
 |---|---|---|
 | `src/metrics/mod.rs` | Module root, Prometheus server initialization | `init_metrics_server(addr: SocketAddr)`, re-exports from submodules |
 | `src/metrics/rpc.rs` | RPC request metrics: registration, RAII guard, async wrapper | `RpcMethod`, `RpcMetricsGuard`, `with_metrics()`, `describe_rpc_metrics()`, `chain_label_from_url()` |
-| `src/metrics/live.rs` | Live mode metrics registration | `describe_live_metrics()` |
 | `src/metrics/collection.rs` | Collection metrics registration and recording | `describe_collection_metrics()`, `record_parquet_write()` |
 | `src/metrics/transformations.rs` | Transformation metrics registration, RAII guard | `describe_transformation_metrics()`, `HandlerMetricsGuard` |
 

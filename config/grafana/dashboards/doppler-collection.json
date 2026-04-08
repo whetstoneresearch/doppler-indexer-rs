@@ -8,9 +8,11 @@
     {
       "title": "Blocks /s",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(collection_blocks_processed_total[$__rate_interval])) or vector(0)",
           "legendFormat": "blocks"
         }
@@ -31,9 +33,11 @@
     {
       "title": "Receipts /s",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(collection_receipts_processed_total[$__rate_interval])) or vector(0)",
           "legendFormat": "receipts"
         }
@@ -54,9 +58,11 @@
     {
       "title": "Eth Calls /s",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(collection_eth_calls_total[$__rate_interval])) or vector(0)",
           "legendFormat": "eth_call"
         }
@@ -77,9 +83,11 @@
     {
       "title": "Parquet Write p95",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le) (rate(collection_parquet_write_duration_seconds_bucket[$__rate_interval]))) or vector(0)",
           "legendFormat": "p95"
         }
@@ -100,9 +108,11 @@
     {
       "title": "Blocks Processed /s",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain, mode) (rate(collection_blocks_processed_total[$__rate_interval]))",
           "legendFormat": "{{chain}} {{mode}}"
         }
@@ -115,9 +125,11 @@
     {
       "title": "Block Processing Duration p95",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain, mode) (rate(collection_block_processing_duration_seconds_bucket[$__rate_interval])))",
           "legendFormat": "{{chain}} {{mode}}"
         }
@@ -130,13 +142,16 @@
     {
       "title": "Receipts and Eth Calls Throughput",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain) (rate(collection_receipts_processed_total[$__rate_interval]))",
           "legendFormat": "receipts {{chain}}"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain) (rate(collection_eth_calls_total[$__rate_interval]))",
           "legendFormat": "eth_call {{chain}}"
         }
@@ -149,9 +164,11 @@
     {
       "title": "Eth Call Batch Duration p95",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain) (rate(collection_eth_call_batch_duration_seconds_bucket[$__rate_interval])))",
           "legendFormat": "{{chain}}"
         }
@@ -164,13 +181,16 @@
     {
       "title": "Block Transaction Count",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.50, sum by (le, chain) (rate(collection_block_transactions_bucket[$__rate_interval])))",
           "legendFormat": "p50 {{chain}}"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain) (rate(collection_block_transactions_bucket[$__rate_interval])))",
           "legendFormat": "p95 {{chain}}"
         }
@@ -183,9 +203,11 @@
     {
       "title": "Parquet Write Duration p95",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain, data_type) (rate(collection_parquet_write_duration_seconds_bucket[$__rate_interval])))",
           "legendFormat": "{{chain}} {{data_type}}"
         }
@@ -198,13 +220,16 @@
     {
       "title": "Parquet File Size",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.50, sum by (le, chain, data_type) (rate(collection_parquet_file_size_bytes_bucket[$__rate_interval])))",
           "legendFormat": "p50 {{chain}} {{data_type}}"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain, data_type) (rate(collection_parquet_file_size_bytes_bucket[$__rate_interval])))",
           "legendFormat": "p95 {{chain}} {{data_type}}"
         }

@@ -62,6 +62,7 @@ impl HandlerMetricsGuard {
         gauge!(
             "transformation_handlers_in_flight",
             "handler_key" => handler_key.to_string(),
+            "mode" => mode,
         )
         .increment(1.0);
 
@@ -107,6 +108,7 @@ impl HandlerMetricsGuard {
         gauge!(
             "transformation_handlers_in_flight",
             "handler_key" => self.handler_key.clone(),
+            "mode" => self.mode,
         )
         .decrement(1.0);
     }
@@ -118,6 +120,7 @@ impl Drop for HandlerMetricsGuard {
             gauge!(
                 "transformation_handlers_in_flight",
                 "handler_key" => self.handler_key.clone(),
+                "mode" => self.mode,
             )
             .decrement(1.0);
         }

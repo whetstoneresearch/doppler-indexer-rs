@@ -15,12 +15,10 @@ use tokio::task::JoinSet;
 use super::dag::WorkItem;
 use crate::db::DbPool;
 use crate::rpc::UnifiedRpcClient;
-use crate::transformations::context::{
-    DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext,
-};
+use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use crate::transformations::engine::HandlerKind;
 use crate::transformations::error::TransformationError;
-use crate::transformations::executor::inject_source_version;
+use crate::transformations::executor::{run_handler_task, DbExecMode};
 use crate::transformations::finalizer::RangeFinalizer;
 use crate::transformations::historical::HistoricalDataReader;
 use crate::transformations::retry::{filter_calls_by_start_block, filter_events_by_start_block};
@@ -355,53 +353,22 @@ impl CatchupLoader {
             HandlerKind::Call => HashMap::new(),
         };
 
-        let ctx = TransformationContext::new(
+        run_handler_task(
+            payload.handler,
+            Arc::new(events),
+            Arc::new(calls),
+            tx_addresses,
             self.chain_name.clone(),
             self.chain_id,
             range_start,
             range_end,
-            Arc::new(events),
-            Arc::new(calls),
-            tx_addresses,
             self.historical_reader.clone(),
             self.rpc_client.clone(),
             self.contracts.clone(),
-        );
-
-        let ops = payload.handler.handle(&ctx).await?;
-
-        if !ops.is_empty() {
-            let ops = inject_source_version(ops, payload.handler_name, payload.handler_version);
-            match self.db_pool.execute_transaction(ops).await {
-                Ok(()) => {
-                    payload
-                        .handler
-                        .on_commit_success((range_start, range_end))
-                        .await?;
-                }
-                Err(e) => {
-                    if let Err(cb_err) = payload
-                        .handler
-                        .on_commit_failure((range_start, range_end))
-                        .await
-                    {
-                        tracing::warn!(
-                            "on_commit_failure callback failed for {} range {}-{}: {}",
-                            handler_key,
-                            range_start,
-                            range_end,
-                            cb_err
-                        );
-                    }
-                    return Err(TransformationError::DatabaseError(e));
-                }
-            }
-        } else {
-            payload
-                .handler
-                .on_commit_success((range_start, range_end))
-                .await?;
-        }
+            self.db_pool.clone(),
+            &DbExecMode::Direct,
+        )
+        .await?;
 
         self.finalizer
             .record_completed_range_for_handler(handler_key, range_start, range_end)

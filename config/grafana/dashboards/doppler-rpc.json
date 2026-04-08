@@ -8,9 +8,11 @@
     {
       "title": "RPC Success /s",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(rpc_requests_total{status=\"success\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "success"
         }
@@ -31,9 +33,11 @@
     {
       "title": "RPC Error %",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "(100 * sum(rate(rpc_requests_total{status=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(rpc_requests_total[$__rate_interval])), 0.001)) or vector(0)",
           "legendFormat": "error %"
         }
@@ -64,9 +68,11 @@
     {
       "title": "Semaphore Saturation",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "(100 * sum(rpc_semaphore_acquired) / clamp_min(sum(rpc_semaphore_capacity), 1)) or vector(0)",
           "legendFormat": "semaphore %"
         }
@@ -97,9 +103,11 @@
     {
       "title": "CU Window Saturation",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "(100 * sum(rpc_rate_limiter_cu_used) / clamp_min(sum(rpc_rate_limiter_cu_capacity), 1)) or vector(0)",
           "legendFormat": "cu %"
         }
@@ -130,9 +138,11 @@
     {
       "title": "Batch Requests /s",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain, method, status) (rate(rpc_requests_total[$__rate_interval]))",
           "legendFormat": "{{chain}} {{method}} {{status}}"
         }
@@ -145,9 +155,11 @@
     {
       "title": "Individual Calls /s",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain) (rate(rpc_individual_calls_total[$__rate_interval]))",
           "legendFormat": "{{chain}}"
         }
@@ -160,9 +172,11 @@
     {
       "title": "RPC Duration p95",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "topk(10, histogram_quantile(0.95, sum by (le, chain, method) (rate(rpc_request_duration_seconds_bucket{status=\"success\"}[$__rate_interval]))))",
           "legendFormat": "{{chain}} {{method}}"
         }
@@ -175,9 +189,11 @@
     {
       "title": "RPC Errors /s",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain, method, error_type) (rate(rpc_errors_total[$__rate_interval]))",
           "legendFormat": "{{chain}} {{method}} {{error_type}}"
         }
@@ -190,9 +206,11 @@
     {
       "title": "Rate Limit Wait p95",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain) (rate(rpc_rate_limit_wait_seconds_bucket[$__rate_interval])))",
           "legendFormat": "{{chain}}"
         }
@@ -205,9 +223,11 @@
     {
       "title": "Batch Size p95",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "histogram_quantile(0.95, sum by (le, chain, method) (rate(rpc_batch_size_bucket[$__rate_interval])))",
           "legendFormat": "{{chain}} {{method}}"
         }
@@ -220,13 +240,16 @@
     {
       "title": "Semaphore Usage",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "rpc_semaphore_acquired",
           "legendFormat": "acquired {{chain}}"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "rpc_semaphore_capacity",
           "legendFormat": "capacity {{chain}}"
         }
@@ -239,13 +262,16 @@
     {
       "title": "CU Window Usage",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "rpc_rate_limiter_cu_used",
           "legendFormat": "used {{chain}}"
         },
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "rpc_rate_limiter_cu_capacity",
           "legendFormat": "capacity {{chain}}"
         }
@@ -258,9 +284,11 @@
     {
       "title": "Retry Attempts /s",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain, operation, outcome) (rate(rpc_retry_attempts_total[$__rate_interval]))",
           "legendFormat": "{{chain}} {{operation}} {{outcome}}"
         }
@@ -273,9 +301,11 @@
     {
       "title": "Retries Exhausted /s",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (chain, operation) (rate(rpc_retries_exhausted_total[$__rate_interval]))",
           "legendFormat": "{{chain}} {{operation}}"
         }
