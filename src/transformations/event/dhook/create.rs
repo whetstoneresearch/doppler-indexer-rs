@@ -63,7 +63,10 @@ impl TransformationHandler for DopplerHookCreateHandler {
 
             let get_state_call = ctx
                 .calls_of_type("DopplerHookInitializer", "getState")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call at block {} tx index {}",
@@ -154,7 +157,10 @@ impl TransformationHandler for DopplerHookCreateHandler {
 
             let beneficiaries: Option<BeneficiariesData> = ctx
                 .calls_of_type("DopplerHookInitializer", "getBeneficiaries")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
                     DecodedValue::Array(elements) => elements

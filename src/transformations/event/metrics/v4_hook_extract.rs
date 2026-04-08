@@ -26,9 +26,12 @@ pub fn extract_v4_hook_swaps(
 ) -> Result<Vec<SwapInput>, TransformationError> {
     // Build a lookup map once so each swap event can find its matching getSlot0 result
     // in O(1) rather than re-scanning the full call list for every event (O(n²)).
-    let slot0_by_log_index: HashMap<u32, _> = ctx
+    let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
         .calls_of_type(call_source, "getSlot0")
-        .filter_map(|call| call.trigger_log_index.map(|idx| (idx, call)))
+        .filter_map(|call| {
+            call.trigger_log_index
+                .map(|idx| ((call.block_number, idx), call))
+        })
         .collect();
 
     let mut swaps = Vec::new();
@@ -36,7 +39,10 @@ pub fn extract_v4_hook_swaps(
     for event in ctx.events_of_type(event_source, "Swap") {
         let pool_id = event.extract_bytes32("poolId")?;
 
-        let Some(slot0) = slot0_by_log_index.get(&event.log_index).copied() else {
+        let Some(slot0) = slot0_by_event_key
+            .get(&(event.block_number, event.log_index))
+            .copied()
+        else {
             return Err(TransformationError::MissingData(format!(
                 "No getSlot0 call for swap at block {} log_index {} (source: {})",
                 event.block_number, event.log_index, call_source
@@ -177,12 +183,22 @@ mod tests {
     }
 
     fn swap_event(log_index: u32, pool_id: [u8; 32], amount0: i128, amount1: i128) -> DecodedEvent {
+        swap_event_at_block(100, log_index, pool_id, amount0, amount1)
+    }
+
+    fn swap_event_at_block(
+        block_number: u64,
+        log_index: u32,
+        pool_id: [u8; 32],
+        amount0: i128,
+        amount1: i128,
+    ) -> DecodedEvent {
         let mut params = HashMap::new();
         params.insert("poolId".to_string(), DecodedValue::Bytes32(pool_id));
         params.insert("amount0".to_string(), DecodedValue::Int128(amount0));
         params.insert("amount1".to_string(), DecodedValue::Int128(amount1));
         DecodedEvent {
-            block_number: 100,
+            block_number,
             block_timestamp: 1000,
             transaction_hash: [0u8; 32],
             log_index,
@@ -200,6 +216,16 @@ mod tests {
         tick: i32,
         is_reverted: bool,
     ) -> DecodedCall {
+        slot0_call_at_block(100, trigger_log_index, sqrt_price_x96, tick, is_reverted)
+    }
+
+    fn slot0_call_at_block(
+        block_number: u64,
+        trigger_log_index: u32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        is_reverted: bool,
+    ) -> DecodedCall {
         let mut result = HashMap::new();
         result.insert(
             "sqrtPriceX96".to_string(),
@@ -207,7 +233,7 @@ mod tests {
         );
         result.insert("tick".to_string(), DecodedValue::Int32(tick));
         DecodedCall {
-            block_number: 100,
+            block_number,
             block_timestamp: 1000,
             contract_address: [0u8; 20],
             source_name: SOURCE.to_string(),
@@ -292,6 +318,31 @@ mod tests {
         assert_eq!(result[0].pool_id, pool_a.to_vec());
         assert_eq!(result[0].tick, 10);
         assert_eq!(result[1].pool_id, pool_b.to_vec());
+        assert_eq!(result[1].tick, 20);
+    }
+
+    #[test]
+    fn test_swap_duplicate_log_index_across_blocks_matches_on_block_and_log_index() {
+        let pool_a = [1u8; 32];
+        let pool_b = [2u8; 32];
+        let ctx = make_test_ctx(
+            vec![
+                swap_event_at_block(100, 0, pool_a, 100, -100),
+                swap_event_at_block(101, 0, pool_b, 200, -200),
+            ],
+            vec![
+                slot0_call_at_block(100, 0, q96(), 10, false),
+                slot0_call_at_block(101, 0, q96(), 20, false),
+            ],
+        );
+
+        let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].pool_id, pool_a.to_vec());
+        assert_eq!(result[0].block_number, 100);
+        assert_eq!(result[0].tick, 10);
+        assert_eq!(result[1].pool_id, pool_b.to_vec());
+        assert_eq!(result[1].block_number, 101);
         assert_eq!(result[1].tick, 20);
     }
 
