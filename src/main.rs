@@ -437,7 +437,7 @@ async fn main() -> anyhow::Result<()> {
                         tc.database_url_env_var
                     )
                 })?;
-                let pool = DbPool::new(&database_url)
+                let pool = DbPool::new(&database_url, tc.db_pool_size)
                     .await
                     .context("failed to create shared database pool")?;
                 pool.run_migrations()

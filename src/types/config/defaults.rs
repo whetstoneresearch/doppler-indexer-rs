@@ -12,8 +12,12 @@ pub mod database {
 
 /// Transformation system defaults
 pub mod transformations {
-    /// Default number of concurrent handler executions
-    pub const HANDLER_CONCURRENCY: usize = 4;
+    /// Default number of concurrent handler executions.
+    ///
+    /// Catchup work items are heavily I/O-bound (parquet reads + DB transactions),
+    /// so concurrency must be well above the target CPU core count. At ~80% I/O
+    /// duty cycle, 32 concurrent tasks yields ~6 cores of CPU utilization.
+    pub const HANDLER_CONCURRENCY: usize = 32;
 
     /// Default maximum operations per transaction batch
     pub const BATCH_SIZE: usize = 1000;
@@ -68,8 +72,12 @@ pub mod rpc {
 /// Database pool defaults
 #[allow(dead_code)]
 pub mod db_pool {
-    /// Default maximum pool size
-    pub const MAX_SIZE: usize = 16;
+    /// Default maximum pool size.
+    ///
+    /// Must be at least as large as `transformations::HANDLER_CONCURRENCY` to
+    /// avoid connection starvation during catchup, where each concurrent handler
+    /// needs a DB connection for its transaction.
+    pub const MAX_SIZE: usize = 32;
 }
 
 #[cfg(test)]
@@ -83,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_transformation_defaults() {
-        assert_eq!(transformations::HANDLER_CONCURRENCY, 4);
+        assert_eq!(transformations::HANDLER_CONCURRENCY, 32);
         assert_eq!(transformations::BATCH_SIZE, 1000);
         assert!(transformations::BATCH_FOR_CATCHUP);
         assert_eq!(transformations::CATCHUP_BATCH_SIZE, 10000);
@@ -110,6 +118,6 @@ mod tests {
 
     #[test]
     fn test_db_pool_defaults() {
-        assert_eq!(db_pool::MAX_SIZE, 16);
+        assert_eq!(db_pool::MAX_SIZE, 32);
     }
 }
