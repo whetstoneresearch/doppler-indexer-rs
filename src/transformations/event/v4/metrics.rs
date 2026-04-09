@@ -46,6 +46,7 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::tick_math::tick_to_sqrt_price_x96;
+use crate::transformations::util::usd_price::{build_usd_price_context, OraclePriceCache};
 
 const SOURCE: &str = "DopplerV4Hook";
 
@@ -53,6 +54,7 @@ const SOURCE: &str = "DopplerV4Hook";
 
 pub struct V4BaseMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -86,6 +88,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
             "migrations/tables/v4_base_proceeds_state.sql",
         ]
     }
@@ -193,13 +196,19 @@ impl TransformationHandler for V4BaseMetricsHandler {
             return Ok(Vec::new());
         }
 
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx, &self.oracle_cache, &self.db_pool, self.chain_id, &ctx.contracts,
+        ).await;
         let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
             self.chain_id,
             self.name(),
             SOURCE,
+            Some(&usd_ctx),
+            self.version(),
         );
+        ops.extend(price_ops);
 
         // Durably checkpoint the new cumulative totals.
         for (pool_id, (total_proceeds, total_tokens_sold)) in &new_cumulative {
@@ -750,9 +759,11 @@ pub fn register_handlers(
     registry: &mut TransformationRegistry,
     chain_id: u64,
     cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
 ) {
     registry.register_event_handler(V4BaseMetricsHandler {
         metadata_cache: cache,
+        oracle_cache,
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
@@ -803,6 +814,7 @@ mod tests {
     fn make_handler(chain_id: u64) -> V4BaseMetricsHandler {
         V4BaseMetricsHandler {
             metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
             decimals_init: Once::new(),
             chain_id,
             db_pool: OnceLock::new(),

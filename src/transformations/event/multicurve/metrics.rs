@@ -20,6 +20,7 @@ use crate::transformations::event::metrics::v4_hook_extract::{
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::usd_price::{build_usd_price_context, OraclePriceCache};
 
 const SOURCE: &str = "UniswapV4MulticurveInitializerHook";
 
@@ -27,6 +28,7 @@ const SOURCE: &str = "UniswapV4MulticurveInitializerHook";
 
 pub struct MulticurveSwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -46,6 +48,7 @@ impl TransformationHandler for MulticurveSwapMetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
 
@@ -74,13 +77,21 @@ impl TransformationHandler for MulticurveSwapMetricsHandler {
         )
         .await?;
 
-        Ok(process_swaps(
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx, &self.oracle_cache, &self.db_pool, self.chain_id, &ctx.contracts,
+        ).await;
+
+        let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
             ctx.chain_id,
             self.name(),
             SOURCE,
-        ))
+            Some(&usd_ctx),
+            self.version(),
+        );
+        ops.extend(price_ops);
+        Ok(ops)
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
@@ -162,9 +173,11 @@ pub fn register_handlers(
     registry: &mut TransformationRegistry,
     chain_id: u64,
     cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
 ) {
     registry.register_event_handler(MulticurveSwapMetricsHandler {
         metadata_cache: cache,
+        oracle_cache,
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
