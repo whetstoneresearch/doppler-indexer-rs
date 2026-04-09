@@ -1,7 +1,9 @@
 use std::future::Future;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use regex::RegexSet;
 
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, BlockNumber, Bytes, B256, U256};
@@ -186,31 +188,39 @@ impl RpcError {
     }
 
     fn is_retryable_message(msg: &str) -> bool {
-        let msg_lower = msg.to_lowercase();
-        // Network/connection errors
-        msg_lower.contains("connection")
-            || msg_lower.contains("timeout")
-            || msg_lower.contains("timed out")
-            || msg_lower.contains("reset")
-            || msg_lower.contains("broken pipe")
-            || msg_lower.contains("network")
-            || msg_lower.contains("eof")
-            || msg_lower.contains("sending request")
-            // Rate limiting indicators
-            || msg_lower.contains("rate limit")
-            || msg_lower.contains("too many requests")
-            || msg_lower.contains("429")
-            // Server errors (5xx)
-            || msg_lower.contains("502")
-            || msg_lower.contains("503")
-            || msg_lower.contains("504")
-            || msg_lower.contains("internal server error")
-            || msg_lower.contains("service unavailable")
-            || msg_lower.contains("bad gateway")
-            // Temporary failures
-            || msg_lower.contains("temporarily")
-            || msg_lower.contains("try again")
-            || msg_lower.contains("retry")
+        /// Case-insensitive regex set compiled once. Avoids per-call `to_lowercase()`
+        /// and linear chain of `contains()` checks.
+        static RETRYABLE_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+            RegexSet::new([
+                // Network/connection errors
+                "(?i)connection",
+                "(?i)timeout",
+                "(?i)timed out",
+                "(?i)reset",
+                "(?i)broken pipe",
+                "(?i)network",
+                "(?i)eof",
+                "(?i)sending request",
+                // Rate limiting indicators
+                "(?i)rate limit",
+                "(?i)too many requests",
+                "429",
+                // Server errors (5xx)
+                "502",
+                "503",
+                "504",
+                "(?i)internal server error",
+                "(?i)service unavailable",
+                "(?i)bad gateway",
+                // Temporary failures
+                "(?i)temporarily",
+                "(?i)try again",
+                "(?i)retry",
+            ])
+            .expect("retryable patterns should compile")
+        });
+
+        RETRYABLE_PATTERNS.is_match(msg)
     }
 }
 
