@@ -289,10 +289,14 @@ impl RetryConfig {
 /// Retries the operation up to `config.max_retries` times with exponential backoff
 /// for retryable errors. All retry attempts are logged for debugging.
 ///
-/// The `chain` parameter is used for metrics labeling. Pass an empty string to skip
-/// metrics recording.
+/// * `method_name` — static RPC method name used as a low-cardinality metrics label
+///   (e.g. `"eth_getBlockByNumber"`). Pass an empty string to skip metrics recording.
+/// * `operation_name` — human-readable description with per-call details, used only in
+///   log messages (e.g. `"eth_getBlockByNumber(Number(123))"`).
+/// * `chain` — chain label for metrics. Pass an empty string to skip metrics recording.
 pub async fn with_retry<F, Fut, T>(
     config: &RetryConfig,
+    method_name: &'static str,
     operation_name: &str,
     chain: &str,
     mut operation: F,
@@ -301,7 +305,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, RpcError>>,
 {
-    let has_chain = !chain.is_empty();
+    let has_chain = !chain.is_empty() && !method_name.is_empty();
     let mut errors: Vec<String> = Vec::new();
 
     for attempt in 0..=config.max_retries {
@@ -327,7 +331,7 @@ where
                         attempt
                     );
                     if has_chain {
-                        record_retry_attempt(chain, operation_name, "success_after_retry");
+                        record_retry_attempt(chain, method_name, "success_after_retry");
                     }
                 }
                 return Ok(result);
@@ -345,7 +349,7 @@ where
                     );
                     errors.push(format!("attempt {}: {}", attempt + 1, error_msg));
                     if has_chain {
-                        record_retry_attempt(chain, operation_name, "retry");
+                        record_retry_attempt(chain, method_name, "retry");
                     }
                 } else {
                     // Non-retryable error or exhausted retries
@@ -360,7 +364,7 @@ where
                             errors.join("; ")
                         );
                         if has_chain {
-                            record_retries_exhausted(chain, operation_name);
+                            record_retries_exhausted(chain, method_name);
                         }
                     }
                     return Err(e);
@@ -371,7 +375,7 @@ where
 
     // This should be unreachable, but provide a meaningful error if it happens
     if has_chain {
-        record_retries_exhausted(chain, operation_name);
+        record_retries_exhausted(chain, method_name);
     }
     Err(RpcError::ProviderError(format!(
         "RPC '{}' exhausted retries. Errors: [{}]",
@@ -568,7 +572,8 @@ impl RpcClient {
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
         with_retry(
             &self.config.retry,
-            "get_block_number",
+            "eth_blockNumber",
+            "eth_blockNumber",
             &self.chain,
             || async {
                 self.wait_for_rate_limit().await;
@@ -587,7 +592,7 @@ impl RpcClient {
         full_transactions: bool,
     ) -> Result<Option<Block>, RpcError> {
         let op_name = format!("eth_getBlockByNumber({:?})", block_id);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getBlockByNumber", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let builder = self.provider.get_block(block_id);
             if full_transactions {
@@ -615,7 +620,7 @@ impl RpcClient {
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getTransactionByHash", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             self.provider
                 .get_transaction_by_hash(hash)
@@ -630,7 +635,7 @@ impl RpcClient {
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getTransactionReceipt", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             self.provider
                 .get_transaction_receipt(hash)
@@ -655,9 +660,11 @@ impl RpcClient {
             BlockNumberOrTag::Finalized => "finalized".to_string(),
         };
 
+        let op_name = format!("{}({:?})", method_name, block_number);
         let raw_receipts: Vec<serde_json::Value> = with_retry(
             &self.config.retry,
-            &format!("{}({:?})", method_name, block_number),
+            "eth_getBlockReceipts",
+            &op_name,
             &self.chain,
             || async {
                 self.wait_for_rate_limit().await;
@@ -742,7 +749,7 @@ impl RpcClient {
             filter.get_from_block(),
             filter.get_to_block()
         );
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getLogs", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             self.provider
                 .get_logs(&filter)
@@ -758,7 +765,7 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getBalance", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             self.provider
                 .get_balance(address)
@@ -775,7 +782,7 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
         let op_name = format!("eth_getCode({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getCode", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             self.provider
                 .get_code_at(address)
@@ -793,7 +800,7 @@ impl RpcClient {
     ) -> Result<Bytes, RpcError> {
         let tx = tx.clone();
         let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_call", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             self.provider
                 .call(tx.clone())
@@ -834,7 +841,7 @@ impl RpcClient {
                 chunk_idx, first_block, last_block
             );
             let chunk_results: Vec<Option<Block>> =
-                with_retry(&self.config.retry, &op_name, &self.chain, || async {
+                with_retry(&self.config.retry, "eth_getBlockByNumber_batch", &op_name, &self.chain, || async {
                     self.wait_for_rate_limit().await;
 
                     let futures: Vec<_> = chunk_vec
@@ -891,7 +898,7 @@ impl RpcClient {
                 join_set.spawn(async move {
                     let op_name = format!("eth_getBlockByNumber({:?})", number);
                     let result =
-                        with_retry(&client.config.retry, &op_name, &client.chain, || async {
+                        with_retry(&client.config.retry, "eth_getBlockByNumber", &op_name, &client.chain, || async {
                             client.wait_for_rate_limit().await;
                             let builder = client.provider.get_block(BlockId::Number(number));
                             if full_transactions {
@@ -922,7 +929,7 @@ impl RpcClient {
                     join_set.spawn(async move {
                         let op_name = format!("eth_getBlockByNumber({:?})", number);
                         let result =
-                            with_retry(&client.config.retry, &op_name, &client.chain, || async {
+                            with_retry(&client.config.retry, "eth_getBlockByNumber", &op_name, &client.chain, || async {
                                 client.wait_for_rate_limit().await;
                                 let builder = client.provider.get_block(BlockId::Number(number));
                                 if full_transactions {
@@ -1012,7 +1019,7 @@ impl RpcClient {
                 chunk_vec.len()
             );
             let chunk_results: Vec<Vec<Log>> =
-                with_retry(&self.config.retry, &op_name, &self.chain, || async {
+                with_retry(&self.config.retry, "eth_getLogs_batch", &op_name, &self.chain, || async {
                     self.wait_for_rate_limit().await;
 
                     let futures: Vec<_> = chunk_vec
@@ -1075,7 +1082,7 @@ impl RpcClient {
                 chunk_vec.len()
             );
             let chunk_results: Vec<Result<Bytes, RpcError>> =
-                with_retry(&self.config.retry, &op_name, &self.chain, || async {
+                with_retry(&self.config.retry, "eth_call_batch", &op_name, &self.chain, || async {
                     self.wait_for_rate_limit().await;
 
                     let futures: Vec<_> = chunk_vec
