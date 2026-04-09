@@ -475,7 +475,7 @@ impl LiveCollector {
                 .send(DecoderMessage::LogsReady {
                     range_start: block_number,
                     range_end: block_number + 1, // Exclusive end for single block
-                    logs: log_data,
+                    logs: std::sync::Arc::new(log_data),
                     live_mode: true, // Live mode: write to bincode
                     has_factory_matchers: !self.factory_matchers.is_empty(),
                 })
@@ -1164,7 +1164,7 @@ impl LiveCollector {
             .send(DecoderMessage::LogsReady {
                 range_start: block_number,
                 range_end: block_number + 1,
-                logs: log_data,
+                logs: std::sync::Arc::new(log_data),
                 live_mode: true,
                 has_factory_matchers: !self.factory_matchers.is_empty(),
             })
@@ -1634,6 +1634,7 @@ mod tests {
         ChainConfig {
             name: name.to_string(),
             chain_id: 1,
+            chain_type: crate::types::chain::ChainType::Evm,
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,

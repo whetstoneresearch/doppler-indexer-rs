@@ -11,7 +11,9 @@ use metrics::counter;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
+use super::context::{
+    DecodedAccountState, DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext,
+};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use super::traits::TransformationHandler;
@@ -42,6 +44,7 @@ pub(crate) struct HandlerTask {
     pub handler: Arc<dyn TransformationHandler>,
     pub events: Arc<Vec<DecodedEvent>>,
     pub calls: Arc<Vec<DecodedCall>>,
+    pub account_states: Arc<Vec<DecodedAccountState>>,
     pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
 }
 
@@ -56,6 +59,7 @@ pub(crate) struct ProcessRangePayload {
     pub handler: Arc<dyn TransformationHandler>,
     pub events: Arc<Vec<DecodedEvent>>,
     pub calls: Arc<Vec<DecodedCall>>,
+    pub account_states: Arc<Vec<DecodedAccountState>>,
     pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
     /// `Some(chain_name)` → snapshot-capture mode (live); `None` → direct (historical).
     pub snapshot_chain: Option<String>,
@@ -101,6 +105,7 @@ impl HandlerExecutor {
             let handler = task.handler;
             let events = task.events;
             let calls = task.calls;
+            let account_states = task.account_states;
             let tx_addresses = task.tx_addresses;
             let snapshot_chain = match db_exec_mode {
                 DbExecMode::Direct => None,
@@ -120,6 +125,7 @@ impl HandlerExecutor {
                     handler,
                     events,
                     calls,
+                    account_states,
                     tx_addresses,
                     chain_name,
                     chain_id,
@@ -179,6 +185,7 @@ pub(crate) async fn run_handler_task(
     handler: Arc<dyn TransformationHandler>,
     events: Arc<Vec<DecodedEvent>>,
     calls: Arc<Vec<DecodedCall>>,
+    account_states: Arc<Vec<DecodedAccountState>>,
     tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
     chain_name: String,
     chain_id: u64,
@@ -207,6 +214,7 @@ pub(crate) async fn run_handler_task(
         range_end,
         events,
         calls,
+        account_states,
         tx_addresses,
         historical,
         rpc,
@@ -215,6 +223,17 @@ pub(crate) async fn run_handler_task(
 
     let ops = match handler.handle(&ctx).await {
         Ok(ops) => ops,
+        Err(TransformationError::TransientBlocked(msg)) => {
+            tracing::info!(
+                "Handler {} blocked for range {}-{}: {}",
+                handler_key,
+                range_start,
+                range_end,
+                msg
+            );
+            guard.failure("transient_blocked");
+            return Err(TransformationError::TransientBlocked(msg));
+        }
         Err(e) => {
             tracing::error!(
                 "Handler {} failed for range {}-{}: {}",

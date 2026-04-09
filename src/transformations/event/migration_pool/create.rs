@@ -48,6 +48,10 @@ impl TransformationHandler for MigrationPoolCreateHandler {
         vec!["pools"]
     }
 
+    fn requires_sequential(&self) -> bool {
+        false
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,
@@ -151,7 +155,7 @@ impl EventHandler for MigrationPoolCreateHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec![
             "V4CreateHandler",
             "V4MulticurveCreateHandler",

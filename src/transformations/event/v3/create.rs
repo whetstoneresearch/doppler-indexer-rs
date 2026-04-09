@@ -44,6 +44,10 @@ impl TransformationHandler for V3CreateHandler {
         vec!["tokens", "pools"]
     }
 
+    fn requires_sequential(&self) -> bool {
+        false
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,
@@ -210,6 +214,10 @@ impl TransformationHandler for LockableV3CreateHandler {
 
     fn reorg_tables(&self) -> Vec<&'static str> {
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        true
     }
 
     async fn handle(
@@ -387,6 +395,7 @@ mod tests {
             8453,
             100,
             200,
+            Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             HashMap::new(),

@@ -40,106 +40,94 @@ macro_rules! build_typed_array {
     }};
 }
 
-pub(super) fn write_decoded_calls_to_parquet(
-    records: &[DecodedCallRecord],
-    output_type: &EvmType,
-    output_path: &Path,
-) -> Result<(), EthCallDecodingError> {
-    // Build schema based on output type
-    let mut fields = vec![
-        Field::new("block_number", DataType::UInt64, false),
-        Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
-    ];
+// ─── DecodedRecord trait: abstracts over DecodedCallRecord / DecodedEventCallRecord ───
 
-    // Add value fields based on output type
-    match output_type {
-        EvmType::Named { name, inner } => {
-            // Named single value: use the name as column name
-            fields.push(Field::new(name, inner.to_arrow_type(), true));
-        }
-        EvmType::NamedTuple(tuple_fields) => {
-            // Named tuple: flatten nested tuples into dot-notation columns
-            for (field_name, field_type) in tuple_fields {
-                add_flattened_fields(&mut fields, field_name, field_type);
-            }
-        }
-        _ => {
-            // Simple type: use "decoded_value"
-            fields.push(Field::new(
-                "decoded_value",
-                output_type.to_arrow_type(),
-                true,
-            ));
-        }
-    }
-
-    let schema = Arc::new(Schema::new(fields));
-    let mut arrays: Vec<ArrayRef> = Vec::new();
-
-    // block_number
-    let arr: UInt64Array = records.iter().map(|r| Some(r.block_number)).collect();
-    arrays.push(Arc::new(arr));
-
-    // block_timestamp
-    let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp)).collect();
-    arrays.push(Arc::new(arr));
-
-    // contract_address
-    if records.is_empty() {
-        arrays.push(Arc::new(FixedSizeBinaryBuilder::new(20).finish()));
-    } else {
-        let arr = FixedSizeBinaryArray::try_from_iter(
-            records.iter().map(|r| r.contract_address.as_slice()),
-        )?;
-        arrays.push(Arc::new(arr));
-    }
-
-    // Add value arrays based on output type
-    match output_type {
-        EvmType::Named { inner, .. } => {
-            // Named single value: build array using inner type
-            let value_array = build_value_array(records, inner)?;
-            arrays.push(value_array);
-        }
-        EvmType::NamedTuple(tuple_fields) => {
-            // Named tuple: flatten nested tuples into leaf arrays
-            let leaves = collect_flat_leaves(tuple_fields);
-            for (_, access_path, leaf_type) in &leaves {
-                let values: Vec<Option<&DecodedValue>> = records
-                    .iter()
-                    .map(|r| extract_nested_value(&r.decoded_value, access_path))
-                    .collect();
-                let arr = build_array_from_decoded_values(&values, leaf_type)?;
-                arrays.push(arr);
-            }
-        }
-        _ => {
-            // Simple type
-            let value_array = build_value_array(records, output_type)?;
-            arrays.push(value_array);
-        }
-    }
-
-    // Write to parquet
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
-    Ok(())
+/// Trait abstracting the differences between `DecodedCallRecord` and
+/// `DecodedEventCallRecord` so that the write / value-array builder logic can
+/// be shared via generics.
+trait DecodedRecord {
+    fn block_number(&self) -> u64;
+    fn block_timestamp(&self) -> u64;
+    fn address_bytes(&self) -> &[u8; 20];
+    fn decoded_value(&self) -> &DecodedValue;
+    /// Additional schema fields inserted between `block_timestamp` and the address column.
+    fn extra_schema_fields() -> Vec<Field>;
+    /// Build Arrow arrays for the extra fields (same order as `extra_schema_fields`).
+    fn build_extra_arrays(records: &[Self]) -> Vec<ArrayRef>
+    where
+        Self: Sized;
+    /// Name of the address column in the parquet schema.
+    fn address_column_name() -> &'static str;
 }
 
-/// Write decoded event-triggered calls to parquet
-pub(super) fn write_decoded_event_calls_to_parquet(
-    records: &[DecodedEventCallRecord],
+impl DecodedRecord for DecodedCallRecord {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+    fn block_timestamp(&self) -> u64 {
+        self.block_timestamp
+    }
+    fn address_bytes(&self) -> &[u8; 20] {
+        &self.contract_address
+    }
+    fn decoded_value(&self) -> &DecodedValue {
+        &self.decoded_value
+    }
+    fn extra_schema_fields() -> Vec<Field> {
+        vec![]
+    }
+    fn build_extra_arrays(_records: &[Self]) -> Vec<ArrayRef> {
+        vec![]
+    }
+    fn address_column_name() -> &'static str {
+        "contract_address"
+    }
+}
+
+impl DecodedRecord for DecodedEventCallRecord {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+    fn block_timestamp(&self) -> u64 {
+        self.block_timestamp
+    }
+    fn address_bytes(&self) -> &[u8; 20] {
+        &self.target_address
+    }
+    fn decoded_value(&self) -> &DecodedValue {
+        &self.decoded_value
+    }
+    fn extra_schema_fields() -> Vec<Field> {
+        vec![Field::new("log_index", DataType::UInt32, false)]
+    }
+    fn build_extra_arrays(records: &[Self]) -> Vec<ArrayRef> {
+        let arr: UInt32Array = records.iter().map(|r| Some(r.log_index)).collect();
+        vec![Arc::new(arr)]
+    }
+    fn address_column_name() -> &'static str {
+        "contract_address"
+    }
+}
+
+// ─── Generic write / value-array / array-value-array functions ───────────────
+
+/// Generic write function shared by both record types.
+fn write_decoded_records_to_parquet<R: DecodedRecord>(
+    records: &[R],
     output_type: &EvmType,
     output_path: &Path,
 ) -> Result<(), EthCallDecodingError> {
-    // Build schema based on output type - includes log_index for event-triggered calls
+    // Build schema: block_number, block_timestamp, [extra fields...], address, value columns
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("log_index", DataType::UInt32, false),
-        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
+    fields.extend(R::extra_schema_fields());
+    fields.push(Field::new(
+        R::address_column_name(),
+        DataType::FixedSizeBinary(20),
+        false,
+    ));
 
     // Add value fields based on output type
     match output_type {
@@ -164,23 +152,22 @@ pub(super) fn write_decoded_event_calls_to_parquet(
     let mut arrays: Vec<ArrayRef> = Vec::new();
 
     // block_number
-    let arr: UInt64Array = records.iter().map(|r| Some(r.block_number)).collect();
+    let arr: UInt64Array = records.iter().map(|r| Some(r.block_number())).collect();
     arrays.push(Arc::new(arr));
 
     // block_timestamp
-    let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp)).collect();
+    let arr: UInt64Array = records.iter().map(|r| Some(r.block_timestamp())).collect();
     arrays.push(Arc::new(arr));
 
-    // log_index
-    let arr: UInt32Array = records.iter().map(|r| Some(r.log_index)).collect();
-    arrays.push(Arc::new(arr));
+    // Extra arrays (e.g. log_index for event records)
+    arrays.extend(R::build_extra_arrays(records));
 
-    // target_address
+    // Address column
     if records.is_empty() {
         arrays.push(Arc::new(FixedSizeBinaryBuilder::new(20).finish()));
     } else {
         let arr = FixedSizeBinaryArray::try_from_iter(
-            records.iter().map(|r| r.target_address.as_slice()),
+            records.iter().map(|r| r.address_bytes().as_slice()),
         )?;
         arrays.push(Arc::new(arr));
     }
@@ -188,7 +175,7 @@ pub(super) fn write_decoded_event_calls_to_parquet(
     // Add value arrays based on output type
     match output_type {
         EvmType::Named { inner, .. } => {
-            let value_array = build_event_value_array(records, inner)?;
+            let value_array = build_generic_value_array(records, inner)?;
             arrays.push(value_array);
         }
         EvmType::NamedTuple(tuple_fields) => {
@@ -196,14 +183,14 @@ pub(super) fn write_decoded_event_calls_to_parquet(
             for (_, access_path, leaf_type) in &leaves {
                 let values: Vec<Option<&DecodedValue>> = records
                     .iter()
-                    .map(|r| extract_nested_value(&r.decoded_value, access_path))
+                    .map(|r| extract_nested_value(r.decoded_value(), access_path))
                     .collect();
-                let arr = build_array_from_decoded_values(&values, leaf_type)?;
+                let arr = build_array_from_decoded_values(&values, &leaf_type)?;
                 arrays.push(arr);
             }
         }
         _ => {
-            let value_array = build_event_value_array(records, output_type)?;
+            let value_array = build_generic_value_array(records, output_type)?;
             arrays.push(value_array);
         }
     }
@@ -214,9 +201,9 @@ pub(super) fn write_decoded_event_calls_to_parquet(
     Ok(())
 }
 
-/// Build an Arrow array for event call decoded values
-pub(super) fn build_event_value_array(
-    records: &[DecodedEventCallRecord],
+/// Generic value-array builder shared by both record types.
+fn build_generic_value_array<R: DecodedRecord>(
+    records: &[R],
     output_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
     match output_type {
@@ -225,7 +212,7 @@ pub(super) fn build_event_value_array(
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
             } else {
                 let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match &r.decoded_value {
+                    match r.decoded_value() {
                         DecodedValue::Address(addr) => addr.as_slice(),
                         _ => &[0u8; 20][..],
                     }
@@ -234,14 +221,14 @@ pub(super) fn build_event_value_array(
             }
         }
         EvmType::Uint8 => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
+            records.iter().map(|r| r.decoded_value()),
             DecodedValue::Uint8(v) => *v,
             UInt8Array
         ),
         EvmType::Uint64 => {
             let arr: UInt64Array = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Uint64(v) => Some(*v),
                     DecodedValue::Uint256(v) => (*v).try_into().ok(),
                     _ => None,
@@ -252,7 +239,7 @@ pub(super) fn build_event_value_array(
         EvmType::Uint32 | EvmType::Uint24 => {
             let arr: UInt32Array = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Uint64(v) => (*v).try_into().ok(),
                     DecodedValue::Uint256(v) => (*v).try_into().ok(),
                     _ => None,
@@ -263,7 +250,7 @@ pub(super) fn build_event_value_array(
         EvmType::Uint16 => {
             let arr: UInt16Array = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Uint64(v) => (*v).try_into().ok(),
                     DecodedValue::Uint256(v) => (*v).try_into().ok(),
                     _ => None,
@@ -278,7 +265,7 @@ pub(super) fn build_event_value_array(
         | EvmType::Uint80 => {
             let arr: StringArray = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Uint256(v) => Some(v.to_string()),
                     DecodedValue::Uint64(v) => Some(v.to_string()),
                     _ => None,
@@ -287,14 +274,14 @@ pub(super) fn build_event_value_array(
             Ok(Arc::new(arr))
         }
         EvmType::Int8 => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
+            records.iter().map(|r| r.decoded_value()),
             DecodedValue::Int8(v) => *v,
             Int8Array
         ),
         EvmType::Int64 => {
             let arr: Int64Array = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Int64(v) => Some(*v),
                     DecodedValue::Int256(v) => (*v).try_into().ok(),
                     _ => None,
@@ -305,7 +292,7 @@ pub(super) fn build_event_value_array(
         EvmType::Int32 | EvmType::Int24 => {
             let arr: Int32Array = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Int64(v) => (*v).try_into().ok(),
                     DecodedValue::Int256(v) => (*v).try_into().ok(),
                     _ => None,
@@ -316,7 +303,7 @@ pub(super) fn build_event_value_array(
         EvmType::Int16 => {
             let arr: Int16Array = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Int64(v) => (*v).try_into().ok(),
                     DecodedValue::Int256(v) => (*v).try_into().ok(),
                     _ => None,
@@ -327,7 +314,7 @@ pub(super) fn build_event_value_array(
         EvmType::Int256 | EvmType::Int128 => {
             let arr: StringArray = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Int256(v) => Some(v.to_string()),
                     DecodedValue::Int64(v) => Some(v.to_string()),
                     _ => None,
@@ -336,7 +323,7 @@ pub(super) fn build_event_value_array(
             Ok(Arc::new(arr))
         }
         EvmType::Bool => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
+            records.iter().map(|r| r.decoded_value()),
             DecodedValue::Bool(v) => *v,
             BooleanArray
         ),
@@ -345,7 +332,7 @@ pub(super) fn build_event_value_array(
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
             } else {
                 let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match &r.decoded_value {
+                    match r.decoded_value() {
                         DecodedValue::Bytes32(b) => b.as_slice(),
                         _ => &[0u8; 32][..],
                     }
@@ -354,14 +341,14 @@ pub(super) fn build_event_value_array(
             }
         }
         EvmType::String => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
+            records.iter().map(|r| r.decoded_value()),
             DecodedValue::String(s) => s.as_str(),
             StringArray
         ),
         EvmType::Bytes => {
             let arr: BinaryArray = records
                 .iter()
-                .map(|r| match &r.decoded_value {
+                .map(|r| match r.decoded_value() {
                     DecodedValue::Bytes(b) => Some(b.as_slice()),
                     DecodedValue::Bytes32(b) => Some(b.as_slice()),
                     _ => None,
@@ -369,20 +356,20 @@ pub(super) fn build_event_value_array(
                 .collect();
             Ok(Arc::new(arr))
         }
-        EvmType::Named { inner, .. } => build_event_value_array(records, inner),
+        EvmType::Named { inner, .. } => build_generic_value_array(records, inner),
         EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
-            "NamedTuple should use build_event_tuple_field_array".to_string(),
+            "NamedTuple should use build_named_tuple_arrays".to_string(),
         )),
         EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
             "UnnamedTuple should use specialized handling".to_string(),
         )),
-        EvmType::Array(inner) => build_event_array_value_array(records, inner),
+        EvmType::Array(inner) => build_generic_array_value_array(records, inner),
     }
 }
 
-/// Build an Arrow ListArray for array-typed decoded values in event calls
-pub(super) fn build_event_array_value_array(
-    records: &[DecodedEventCallRecord],
+/// Generic array-value-array builder shared by both record types.
+fn build_generic_array_value_array<R: DecodedRecord>(
+    records: &[R],
     inner_type: &EvmType,
 ) -> Result<ArrayRef, EthCallDecodingError> {
     use arrow::array::{ListBuilder, StringBuilder};
@@ -391,7 +378,7 @@ pub(super) fn build_event_array_value_array(
     // Extract array elements from each record
     let arrays: Vec<Option<&Vec<DecodedValue>>> = records
         .iter()
-        .map(|r| match &r.decoded_value {
+        .map(|r| match r.decoded_value() {
             DecodedValue::Array(arr) => Some(arr),
             _ => None,
         })
@@ -400,7 +387,6 @@ pub(super) fn build_event_array_value_array(
     // Build ListArray based on inner type
     match inner_type {
         EvmType::NamedTuple(_) | EvmType::UnnamedTuple(_) => {
-            // For tuple arrays, build a List of Structs
             let (field_names, field_types): (Vec<String>, Vec<&EvmType>) = match inner_type {
                 EvmType::NamedTuple(fields) => {
                     let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
@@ -422,8 +408,7 @@ pub(super) fn build_event_array_value_array(
                 .collect();
             let struct_fields: Fields = arrow_fields.clone().into();
 
-            // Build struct arrays for each element in each record's array
-            let mut all_struct_arrays: Vec<arrow::array::StructArray> = Vec::new();
+            let mut all_struct_arrays: Vec<StructArray> = Vec::new();
             let mut offsets: Vec<i32> = vec![0];
             let mut current_offset: i32 = 0;
 
@@ -439,9 +424,7 @@ pub(super) fn build_event_array_value_array(
                 offsets.push(current_offset);
             }
 
-            // Concatenate all struct arrays
             if all_struct_arrays.is_empty() {
-                // Empty list - create struct array with 0 length
                 let empty_struct = StructArray::new_null(struct_fields.clone(), 0);
                 let list_arr = arrow::array::ListArray::try_new(
                     Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
@@ -506,10 +489,61 @@ pub(super) fn build_event_array_value_array(
             Ok(Arc::new(builder.finish()))
         }
         _ => Err(EthCallDecodingError::Decode(format!(
-            "Unsupported array inner type for event calls: {:?}",
+            "Unsupported array inner type: {:?}",
             inner_type
         ))),
     }
+}
+
+// ─── Public wrappers (signatures unchanged) ──────────────────────────────────
+
+pub(super) fn write_decoded_calls_to_parquet(
+    records: &[DecodedCallRecord],
+    output_type: &EvmType,
+    output_path: &Path,
+) -> Result<(), EthCallDecodingError> {
+    write_decoded_records_to_parquet(records, output_type, output_path)
+}
+
+/// Write decoded event-triggered calls to parquet
+pub(super) fn write_decoded_event_calls_to_parquet(
+    records: &[DecodedEventCallRecord],
+    output_type: &EvmType,
+    output_path: &Path,
+) -> Result<(), EthCallDecodingError> {
+    write_decoded_records_to_parquet(records, output_type, output_path)
+}
+
+/// Build an Arrow array for decoded values
+pub(super) fn build_value_array(
+    records: &[DecodedCallRecord],
+    output_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    build_generic_value_array(records, output_type)
+}
+
+/// Build an Arrow array for event call decoded values
+pub(super) fn build_event_value_array(
+    records: &[DecodedEventCallRecord],
+    output_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    build_generic_value_array(records, output_type)
+}
+
+/// Build an Arrow ListArray for array-typed decoded values
+pub(super) fn build_array_value_array(
+    records: &[DecodedCallRecord],
+    inner_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    build_generic_array_value_array(records, inner_type)
+}
+
+/// Build an Arrow ListArray for array-typed decoded values in event calls
+pub(super) fn build_event_array_value_array(
+    records: &[DecodedEventCallRecord],
+    inner_type: &EvmType,
+) -> Result<ArrayRef, EthCallDecodingError> {
+    build_generic_array_value_array(records, inner_type)
 }
 
 // ─── Flat leaf helpers for nested NamedTuple flattening ─────────────
@@ -1049,307 +1083,6 @@ pub(super) fn write_decoded_once_calls_to_parquet(
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
     crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
-}
-
-/// Build an Arrow array for decoded values
-pub(super) fn build_value_array(
-    records: &[DecodedCallRecord],
-    output_type: &EvmType,
-) -> Result<ArrayRef, EthCallDecodingError> {
-    match output_type {
-        EvmType::Address => {
-            if records.is_empty() {
-                Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
-            } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match &r.decoded_value {
-                        DecodedValue::Address(addr) => addr.as_slice(),
-                        _ => &[0u8; 20][..],
-                    }
-                }))?;
-                Ok(Arc::new(arr))
-            }
-        }
-        EvmType::Uint8 => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
-            DecodedValue::Uint8(v) => *v,
-            UInt8Array
-        ),
-        EvmType::Uint64 => {
-            let arr: UInt64Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Uint64(v) => Some(*v),
-                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Uint32 | EvmType::Uint24 => {
-            let arr: UInt32Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Uint64(v) => (*v).try_into().ok(),
-                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Uint16 => {
-            let arr: UInt16Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Uint64(v) => (*v).try_into().ok(),
-                    DecodedValue::Uint256(v) => (*v).try_into().ok(),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Uint256
-        | EvmType::Uint160
-        | EvmType::Uint128
-        | EvmType::Uint96
-        | EvmType::Uint80 => {
-            let arr: StringArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Uint256(v) => Some(v.to_string()),
-                    DecodedValue::Uint64(v) => Some(v.to_string()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Int8 => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
-            DecodedValue::Int8(v) => *v,
-            Int8Array
-        ),
-        EvmType::Int64 => {
-            let arr: Int64Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Int64(v) => Some(*v),
-                    DecodedValue::Int256(v) => (*v).try_into().ok(),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Int32 | EvmType::Int24 => {
-            let arr: Int32Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Int64(v) => (*v).try_into().ok(),
-                    DecodedValue::Int256(v) => (*v).try_into().ok(),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Int16 => {
-            let arr: Int16Array = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Int64(v) => (*v).try_into().ok(),
-                    DecodedValue::Int256(v) => (*v).try_into().ok(),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Int256 | EvmType::Int128 => {
-            let arr: StringArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Int256(v) => Some(v.to_string()),
-                    DecodedValue::Int64(v) => Some(v.to_string()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        EvmType::Bool => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
-            DecodedValue::Bool(v) => *v,
-            BooleanArray
-        ),
-        EvmType::Bytes32 => {
-            if records.is_empty() {
-                Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
-            } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match &r.decoded_value {
-                        DecodedValue::Bytes32(b) => b.as_slice(),
-                        _ => &[0u8; 32][..],
-                    }
-                }))?;
-                Ok(Arc::new(arr))
-            }
-        }
-        EvmType::String => build_typed_array!(
-            records.iter().map(|r| &r.decoded_value),
-            DecodedValue::String(s) => s.as_str(),
-            StringArray
-        ),
-        EvmType::Bytes => {
-            let arr: BinaryArray = records
-                .iter()
-                .map(|r| match &r.decoded_value {
-                    DecodedValue::Bytes(b) => Some(b.as_slice()),
-                    DecodedValue::Bytes32(b) => Some(b.as_slice()),
-                    _ => None,
-                })
-                .collect();
-            Ok(Arc::new(arr))
-        }
-        // Named types delegate to their inner type
-        EvmType::Named { inner, .. } => build_value_array(records, inner),
-        // NamedTuple should not use this function directly - use build_named_tuple_arrays
-        EvmType::NamedTuple(_) => Err(EthCallDecodingError::Decode(
-            "NamedTuple should use build_named_tuple_arrays".to_string(),
-        )),
-        // UnnamedTuple and Array need special handling
-        EvmType::UnnamedTuple(_) => Err(EthCallDecodingError::Decode(
-            "UnnamedTuple should use specialized handling".to_string(),
-        )),
-        EvmType::Array(inner) => build_array_value_array(records, inner),
-    }
-}
-
-/// Build an Arrow ListArray for array-typed decoded values
-pub(super) fn build_array_value_array(
-    records: &[DecodedCallRecord],
-    inner_type: &EvmType,
-) -> Result<ArrayRef, EthCallDecodingError> {
-    use arrow::array::{ListBuilder, StringBuilder, StructArray};
-    use arrow::datatypes::Fields;
-
-    // Extract array elements from each record
-    let arrays: Vec<Option<&Vec<DecodedValue>>> = records
-        .iter()
-        .map(|r| match &r.decoded_value {
-            DecodedValue::Array(arr) => Some(arr),
-            _ => None,
-        })
-        .collect();
-
-    // Build ListArray based on inner type
-    match inner_type {
-        EvmType::NamedTuple(_) | EvmType::UnnamedTuple(_) => {
-            // For tuple arrays, build a List of Structs
-            let (field_names, field_types): (Vec<String>, Vec<&EvmType>) = match inner_type {
-                EvmType::NamedTuple(fields) => {
-                    let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
-                    let types: Vec<&EvmType> = fields.iter().map(|(_, t)| t.as_ref()).collect();
-                    (names, types)
-                }
-                EvmType::UnnamedTuple(fields) => {
-                    let names: Vec<String> = (0..fields.len()).map(|i| i.to_string()).collect();
-                    let types: Vec<&EvmType> = fields.iter().collect();
-                    (names, types)
-                }
-                _ => unreachable!(),
-            };
-
-            let arrow_fields: Vec<Field> = field_names
-                .iter()
-                .zip(field_types.iter())
-                .map(|(name, ty)| Field::new(name, ty.to_arrow_type(), true))
-                .collect();
-            let struct_fields: Fields = arrow_fields.clone().into();
-
-            // Build struct arrays for each element in each record's array
-            let mut all_struct_arrays: Vec<StructArray> = Vec::new();
-            let mut offsets: Vec<i32> = vec![0];
-            let mut current_offset: i32 = 0;
-
-            for arr_opt in &arrays {
-                if let Some(arr) = arr_opt {
-                    for elem in arr.iter() {
-                        let struct_arr =
-                            build_decoded_value_struct(elem, &field_names, &field_types)?;
-                        all_struct_arrays.push(struct_arr);
-                        current_offset += 1;
-                    }
-                }
-                offsets.push(current_offset);
-            }
-
-            // Concatenate all struct arrays
-            if all_struct_arrays.is_empty() {
-                // Empty list - create struct array with 0 length
-                let empty_struct = StructArray::new_null(struct_fields.clone(), 0);
-                let list_arr = arrow::array::ListArray::try_new(
-                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
-                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
-                    Arc::new(empty_struct),
-                    None,
-                )?;
-                Ok(Arc::new(list_arr))
-            } else {
-                let struct_refs: Vec<&dyn Array> =
-                    all_struct_arrays.iter().map(|a| a as &dyn Array).collect();
-                let concatenated = arrow::compute::concat(&struct_refs)?;
-                let list_arr = arrow::array::ListArray::try_new(
-                    Arc::new(Field::new("item", DataType::Struct(struct_fields), true)),
-                    arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets)),
-                    concatenated,
-                    None,
-                )?;
-                Ok(Arc::new(list_arr))
-            }
-        }
-        EvmType::Address => {
-            let mut builder = ListBuilder::new(FixedSizeBinaryBuilder::new(20));
-            for arr_opt in &arrays {
-                if let Some(arr) = arr_opt {
-                    for elem in arr.iter() {
-                        if let DecodedValue::Address(addr) = elem {
-                            builder.values().append_value(addr)?;
-                        } else {
-                            builder.values().append_value([0u8; 20])?;
-                        }
-                    }
-                    builder.append(true);
-                } else {
-                    builder.append(false);
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        EvmType::Uint256
-        | EvmType::Uint160
-        | EvmType::Uint128
-        | EvmType::Uint96
-        | EvmType::Uint80 => {
-            let mut builder = ListBuilder::new(StringBuilder::new());
-            for arr_opt in &arrays {
-                if let Some(arr) = arr_opt {
-                    for elem in arr.iter() {
-                        match elem {
-                            DecodedValue::Uint256(v) => {
-                                builder.values().append_value(v.to_string())
-                            }
-                            DecodedValue::Uint64(v) => builder.values().append_value(v.to_string()),
-                            _ => builder.values().append_null(),
-                        }
-                    }
-                    builder.append(true);
-                } else {
-                    builder.append(false);
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        _ => Err(EthCallDecodingError::Decode(format!(
-            "Unsupported array inner type: {:?}",
-            inner_type
-        ))),
-    }
 }
 
 /// Build a StructArray from a single DecodedValue (NamedTuple or UnnamedTuple)

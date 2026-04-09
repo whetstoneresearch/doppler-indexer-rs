@@ -1,5 +1,24 @@
 # Solana Support: Codebase Analysis
 
+## Update From Branch Commits
+
+This analysis predated the current `feat/solana-phase1-traits` implementation work. The branch has now landed some of the proposed groundwork:
+
+- `ChainType` is part of chain config and feeds chain-filtered handler registration.
+- `TransformationHandler::chain_type()`, `DecodedAccountState`, `AccountStateHandler`, and registry account-state indices are implemented.
+- The transformation runtime now has account-state message/context plumbing.
+- `DecodedValue` did not gain a dedicated `Pubkey` variant; the branch uses `DecodedValue::ChainAddress(ChainAddress)` instead.
+
+Still not landed:
+
+- `DbValue::Pubkey` / `LiveDbValue::Pubkey`
+- `ChainServices` wiring in `TransformationContext`
+- generalized `DecodedEvent` / `DecodedCall`
+- `main.rs` dispatch by chain type
+- Solana RPC / raw-data / decoding / live modules
+
+Read the tables below as target analysis plus branch notes, not a literal inventory of what is already implemented.
+
 ## Solana vs EVM: Fundamental Differences
 
 | Concept | EVM | Solana |
@@ -103,17 +122,17 @@
 
 | Component | Chain-agnostic? | Changes needed |
 |---|---|---|
-| `TransformationHandler` trait | **Yes** | Add `chain_type()` method for registry validation at startup |
+| `TransformationHandler` trait | **Yes** | `chain_type()` has now landed; it defaults to `Evm` and is used for registry filtering |
 | `EventHandler` / `EthCallHandler` traits | **Yes** | Solana event handlers implement `EventHandler`. New `AccountStateHandler` trait for Solana account reads (not shoehorned into `EthCallHandler`) |
-| `TransformationRegistry` | **Yes** | Add `account_state_handlers` index map, chain_type validation on registration |
-| `engine.rs` | **Yes** | No changes needed |
+| `TransformationRegistry` | **Yes** | `account_state_handlers` and chain-type validation have now landed |
+| `engine.rs` | **Yes** | Branch now includes account-state channel/message plumbing; Solana producers are still missing |
 | `scheduler/dag.rs` | **Yes** | No changes needed |
-| `TransformationContext` | **Partially** | Generalize addresses via `ChainAddress` enum. Replace `rpc`+`contracts` with `ChainServices` enum (dispatches EVM vs Solana services). Add `account_states: Arc<Vec<DecodedAccountState>>` for Solana |
-| `DecodedValue` enum | **No** | Needs `Pubkey([u8; 32])` variant. Existing alloy types stay for EVM |
+| `TransformationContext` | **Partially** | Branch adds `account_states` plus account-state extractors/helpers. `ChainServices` is still only a placeholder; `rpc` and `contracts` remain in use |
+| `DecodedValue` enum | **No** | Branch adds `ChainAddress(ChainAddress)` rather than a dedicated `Pubkey([u8; 32])` variant |
 | Handler implementations (v3/, v4/) | **No** | These stay as EVM handlers. Write new Solana-specific handlers |
 | `util/` (tick_math, sanitize, etc.) | **No** | EVM/Uniswap-specific. Solana handlers get their own utils |
 
-**Approach:** The trait system and DAG scheduler work unchanged. `DecodedEvent` and `DecodedCall` are generalized with `ChainAddress`/`TxId`/`LogPosition` enums (stack-allocated, not `Vec<u8>`). Solana account reads get their own `DecodedAccountState` type and `AccountStateHandler` trait rather than reusing `DecodedCall`/`EthCallHandler` — the semantics are different enough (no `is_reverted`, no `trigger_log_index`) that reuse would be misleading. Handler implementations are inherently chain-specific.
+**Approach:** The trait system and DAG scheduler remain the shared core. This branch has already landed `DecodedAccountState`, `AccountStateHandler`, and account-state engine plumbing. `DecodedEvent` and `DecodedCall` have not yet been generalized with `ChainAddress`/`TxId`/`LogPosition`; that is still future work.
 
 ---
 

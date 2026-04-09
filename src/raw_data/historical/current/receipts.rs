@@ -716,21 +716,51 @@ pub async fn collect_receipts(
                 // Signal log/factory RangeComplete now that the parquet file exists.
                 // EventTriggerMessage::RangeComplete was already sent in try_finalize_range
                 // to keep trigger batches aligned per-range.
-                let log_message = LogMessage::RangeComplete {
+                if channels.factory_log_tx.is_none() && channels.log_tx.is_none() {
+                    // No log channels are consuming range completion notifications.
+                    // Event trigger completion was already sent above.
+                    continue;
+                }
+
+                let message = LogMessage::RangeComplete {
                     range_start: write_result.range_start,
                     range_end: write_result.range_end,
                 };
-                if let Some(sender) = &channels.factory_log_tx {
-                    sender.send(log_message.clone()).await
-                        .map_err(|_| ReceiptCollectionError::ChannelSend(
-                            format!("factory_log_tx (RangeComplete {}-{}) - receiver dropped",
-                                write_result.range_start, write_result.range_end)))?;
-                }
-                if let Some(sender) = &channels.log_tx {
-                    sender.send(log_message).await
-                        .map_err(|_| ReceiptCollectionError::ChannelSend(
-                            format!("log_tx (RangeComplete {}-{}) - receiver dropped",
-                                write_result.range_start, write_result.range_end)))?;
+                if channels.factory_log_tx.is_some() && channels.log_tx.is_some() {
+                    if let Some(sender) = &channels.factory_log_tx {
+                        sender
+                            .send(message.clone())
+                            .await
+                            .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                                "factory_log_tx (RangeComplete {}-{}) - receiver dropped",
+                                write_result.range_start, write_result.range_end
+                            )))?;
+                    }
+                    if let Some(sender) = &channels.log_tx {
+                        sender
+                            .send(message)
+                            .await
+                            .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                                "log_tx (RangeComplete {}-{}) - receiver dropped",
+                                write_result.range_start, write_result.range_end
+                            )))?;
+                    }
+                } else if let Some(sender) = &channels.factory_log_tx {
+                    sender
+                        .send(message)
+                        .await
+                        .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                            "factory_log_tx (RangeComplete {}-{}) - receiver dropped",
+                            write_result.range_start, write_result.range_end
+                        )))?;
+                } else if let Some(sender) = &channels.log_tx {
+                    sender
+                        .send(message)
+                        .await
+                        .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                            "log_tx (RangeComplete {}-{}) - receiver dropped",
+                            write_result.range_start, write_result.range_end
+                        )))?;
                 }
             }
 

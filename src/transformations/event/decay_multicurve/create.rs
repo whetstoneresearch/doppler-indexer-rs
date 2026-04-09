@@ -45,6 +45,10 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
         vec!["tokens", "pools"]
     }
 
+    fn requires_sequential(&self) -> bool {
+        false
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,

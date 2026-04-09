@@ -105,7 +105,7 @@ impl EventHandler for MulticurveSwapMetricsHandler {
         vec![(SOURCE.to_string(), "getSlot0".to_string())]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V4MulticurveCreateHandler"]
     }
 }
@@ -151,7 +151,7 @@ impl EventHandler for MulticurveLiquidityMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V4MulticurveCreateHandler"]
     }
 }

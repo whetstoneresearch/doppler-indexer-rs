@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 
 use crate::db::{DbOperation, DbPool};
+use crate::types::chain::ChainType;
 
 use super::context::TransformationContext;
 use super::error::TransformationError;
@@ -33,6 +34,12 @@ pub trait TransformationHandler: Send + Sync + 'static {
     /// Used for progress tracking in the `_handler_progress` table.
     fn handler_key(&self) -> String {
         format!("{}_v{}", self.name(), self.version())
+    }
+
+    /// The chain type this handler is designed for.
+    /// Defaults to Evm — existing handlers need no changes.
+    fn chain_type(&self) -> ChainType {
+        ChainType::Evm
     }
 
     /// Migration paths for this handler's SQL files, relative to the project root.
@@ -158,6 +165,24 @@ impl EthCallTrigger {
     }
 }
 
+/// Trigger for account-state-based handlers (Solana).
+#[derive(Debug, Clone)]
+pub struct AccountStateTrigger {
+    /// Program name or collection name from config.
+    pub source: String,
+    /// Account type name (e.g., "Whirlpool", "PoolState").
+    pub account_type: String,
+}
+
+impl AccountStateTrigger {
+    pub fn new(source: impl Into<String>, account_type: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            account_type: account_type.into(),
+        }
+    }
+}
+
 /// Marker trait for handlers that respond to events.
 pub trait EventHandler: TransformationHandler {
     /// Event triggers this handler responds to.
@@ -175,10 +200,29 @@ pub trait EventHandler: TransformationHandler {
     fn handler_dependencies(&self) -> Vec<&'static str> {
         vec![]
     }
+
+    /// Handler names that must be completed contiguously through the current
+    /// range before this handler can execute in catchup mode.
+    ///
+    /// Use this for dependencies whose outputs can be referenced by later
+    /// ranges, such as pool-create handlers that populate metadata consumed by
+    /// swap/liquidity handlers in subsequent ranges.
+    ///
+    /// Live/retry processing currently treats these the same as
+    /// `handler_dependencies()`, since those paths operate on a single range.
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+        vec![]
+    }
 }
 
 /// Marker trait for handlers that respond to eth_call results.
 pub trait EthCallHandler: TransformationHandler {
     /// eth_call triggers this handler responds to.
     fn triggers(&self) -> Vec<EthCallTrigger>;
+}
+
+/// Marker trait for handlers that respond to Solana account state reads.
+pub trait AccountStateHandler: TransformationHandler {
+    /// Account state triggers this handler responds to.
+    fn triggers(&self) -> Vec<AccountStateTrigger>;
 }

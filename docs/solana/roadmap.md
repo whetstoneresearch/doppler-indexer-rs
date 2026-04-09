@@ -10,7 +10,34 @@ Rather than abstracting everything behind traits, we use a **parallel implementa
 - Solana-specific modules live in `src/solana/`, feature-gated behind `#[cfg(feature = "solana")]`
 - Existing EVM code stays in place (not moved)
 - The two pipelines converge at the transformation layer via shared `DecodedEvent`/`DecodedCall` types
-- Pipeline dispatch happens via `match chain_type` in `main.rs`
+- Target end-state: pipeline dispatch happens via `match chain_type` in `main.rs`
+
+## Branch Status
+
+This roadmap is still the target end-state. The current `feat/solana-phase1-traits` branch has landed groundwork, not a runnable Solana pipeline.
+
+Implemented on this branch:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `ChainConfig.chain_type` with a backward-compatible default of `evm`
+- `TransformationHandler::chain_type()` defaulting to `ChainType::Evm`
+- `DecodedAccountState`, `AccountStateTrigger`, and `AccountStateHandler`
+- `TransformationContext.account_states` plus `extract_chain_address`, `extract_pubkey`, and account-state lookup helpers
+- `DecodedValue::ChainAddress(ChainAddress)` and canonical Solana pubkey rendering via `ChainAddress::Display`
+- registry chain-type filtering and account-state handler indices
+- runtime / engine / executor / finalizer / live-state account-state plumbing
+- UTF-8-safe RPC error truncation
+- a follow-up fix so EVM "stuck pending event" warnings still key off expected completions
+
+Not yet implemented on this branch:
+- `DbValue::Pubkey` / `LiveDbValue::Pubkey`
+- generalized `DecodedEvent` / `DecodedCall`
+- `ChainServices` wiring in `TransformationContext` (only a placeholder enum exists)
+- Solana config types such as `programs`, `idl_path`, or account-read config
+- `main.rs` chain-type dispatch or a real Solana pipeline
+- Solana RPC, raw-data, decoding, and live modules under `src/solana/`
+
+Practical implication:
+- `chain_type: solana` is parsed and used for handler filtering, but it does not yet activate Solana collection, decoding, or live processing.
 
 ---
 
@@ -43,15 +70,25 @@ pub enum ChainType { Evm, Solana }
 
 `ChainAddress` and `LogPosition` are `Copy`, stack-allocated. `TxId` is `Clone` only — at 65 bytes for the Solana variant, implicit copies in hot loops are invisible overhead (see design.md §3.2).
 
-### 1b. Add `Pubkey([u8; 32])` to `DecodedValue` (`src/types/decoded.rs`)
+### 1b. Extend `DecodedValue` for chain-aware addresses (`src/types/decoded.rs`)
 
-New variant alongside existing `Address([u8; 20])`. Add methods:
-- `as_pubkey() -> Option<[u8; 32]>`
+The original plan proposed a dedicated `Pubkey([u8; 32])` variant. This branch instead adds:
+
+```rust
+DecodedValue::ChainAddress(ChainAddress)
+```
+
+alongside existing `Address([u8; 20])` so bincode ordinals for legacy variants remain stable while handlers gain:
 - `as_chain_address() -> Option<ChainAddress>`
+- `as_pubkey() -> Option<[u8; 32]>`
+- `extract_chain_address(...)`
+- `extract_pubkey(...)`
 
 ### 1c. Add `Pubkey([u8; 32])` to `DbValue` (`src/db/types.rs`)
 
 Wire through `db_value_to_param` in `src/db/pool.rs` as 32-byte BYTEA. Same for `LiveDbValue` in `src/live/types.rs`.
+
+Status on this branch: not implemented.
 
 ### 1d. Add `extract_pubkey` to `FieldExtractor` (`src/transformations/context.rs`)
 
@@ -63,11 +100,11 @@ Also add `extract_chain_address` for generic address extraction.
 
 ### 1e. Add `chain_type()` to `TransformationHandler` trait (`src/transformations/traits.rs`)
 
-New required method so the registry can reject handlers registered on the wrong chain type:
+The branch adds this as a defaulted method so existing EVM handlers need no changes:
 ```rust
 fn chain_type(&self) -> ChainType;
 ```
-All existing EVM handlers return `ChainType::Evm`. Registry validates at registration time.
+Registry validation uses this to reject handlers registered on the wrong chain type.
 
 ### 1f. Add `DecodedAccountState` type (`src/transformations/context.rs`)
 
@@ -101,6 +138,8 @@ pub enum ChainServices {
     Solana { rpc: Arc<SolanaRpcClient>, programs: Arc<SolanaPrograms> },
 }
 ```
+
+Status on this branch: a placeholder `ChainServices::Evm` enum exists, but the context still uses the existing `rpc` and `contracts` fields in production code.
 
 **Files modified**: `src/types/decoded.rs`, `src/types/chain.rs` (new), `src/types/mod.rs`, `src/db/types.rs`, `src/db/pool.rs`, `src/live/types.rs`, `src/transformations/context.rs`, `src/transformations/traits.rs`
 
@@ -374,6 +413,8 @@ Three functions mirroring EVM:
 - `decode_only_chain()` — decode existing parquet
 
 ### 7b. Dispatch in `main.rs`
+
+Target end-state only; not yet implemented on this branch.
 
 ```rust
 match chain.chain_type() {

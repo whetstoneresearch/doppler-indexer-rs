@@ -6,13 +6,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::traits::{
-    EthCallHandler, EthCallTrigger, EventHandler, EventTrigger, TransformationHandler,
+    AccountStateHandler, EthCallHandler, EthCallTrigger, EventHandler, EventTrigger,
+    TransformationHandler,
 };
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
     build_once_call_configs,
 };
 use crate::raw_data::historical::factories::get_factory_call_configs;
+use crate::types::chain::ChainType;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 
 /// Generic helper to deduplicate handlers by their `handler_key()`.
@@ -55,11 +57,15 @@ pub struct TransformationRegistry {
     event_handlers: HashMap<(String, String), Vec<Arc<dyn EventHandler>>>,
     /// Call handlers indexed by (source, function_name)
     call_handlers: HashMap<(String, String), Vec<Arc<dyn EthCallHandler>>>,
+    /// Account state handlers indexed by (source, account_type)
+    account_state_handlers: HashMap<(String, String), Vec<Arc<dyn AccountStateHandler>>>,
     /// All handlers for initialization (de-duplicated)
     all_handlers: Vec<Arc<dyn TransformationHandler>>,
     /// When set, only handlers whose trigger sources are all present in this
     /// set will be registered. Used to filter handlers per-chain.
     available_sources: Option<HashSet<String>>,
+    /// When set, only handlers matching this chain type are registered.
+    target_chain_type: Option<ChainType>,
     /// Maps handler name() to its declared handler dependency names
     handler_dependency_graph: HashMap<String, Vec<String>>,
     /// Topological ordering of handler names (computed after all handlers registered)
@@ -84,8 +90,10 @@ impl TransformationRegistry {
         Self {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
+            account_state_handlers: HashMap::new(),
             all_handlers: Vec::new(),
             available_sources: None,
+            target_chain_type: None,
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
@@ -104,8 +112,10 @@ impl TransformationRegistry {
         Self {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
+            account_state_handlers: HashMap::new(),
             all_handlers: Vec::new(),
             available_sources: Some(sources),
+            target_chain_type: None,
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
@@ -114,6 +124,18 @@ impl TransformationRegistry {
             event_handler_names: HashSet::new(),
             multi_trigger_handler_keys: HashSet::new(),
         }
+    }
+
+    /// Create a registry that filters handlers by available sources and chain type.
+    pub fn with_source_and_chain_filter(sources: HashSet<String>, chain_type: ChainType) -> Self {
+        let mut registry = Self::with_source_filter(sources);
+        registry.target_chain_type = Some(chain_type);
+        registry
+    }
+
+    fn chain_type_matches(&self, handler: &dyn TransformationHandler) -> bool {
+        self.target_chain_type
+            .is_none_or(|chain_type| handler.chain_type() == chain_type)
     }
 
     /// Register an event handler.
@@ -135,6 +157,16 @@ impl TransformationRegistry {
         }
 
         let triggers = handler.triggers();
+
+        if !self.chain_type_matches(handler.as_ref()) {
+            tracing::debug!(
+                "Skipping event handler {} — chain type {:?} does not match {:?}",
+                handler.name(),
+                handler.chain_type(),
+                self.target_chain_type,
+            );
+            return;
+        }
 
         if let Some(ref sources) = self.available_sources {
             if !triggers.iter().all(|t| sources.contains(&t.source)) {
@@ -164,8 +196,11 @@ impl TransformationRegistry {
 
         let deps: Vec<String> = handler
             .handler_dependencies()
-            .iter()
+            .into_iter()
+            .chain(handler.contiguous_handler_dependencies())
             .map(|d| d.to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
         if !deps.is_empty() {
             self.handler_dependency_graph
@@ -202,6 +237,16 @@ impl TransformationRegistry {
 
         let triggers = handler.triggers();
 
+        if !self.chain_type_matches(handler.as_ref()) {
+            tracing::debug!(
+                "Skipping call handler {} — chain type {:?} does not match {:?}",
+                handler.name(),
+                handler.chain_type(),
+                self.target_chain_type,
+            );
+            return;
+        }
+
         if let Some(ref sources) = self.available_sources {
             if !triggers.iter().all(|t| sources.contains(&t.source)) {
                 tracing::debug!(
@@ -232,6 +277,60 @@ impl TransformationRegistry {
         self.all_handlers.push(handler);
     }
 
+    /// Register an account state handler.
+    #[allow(dead_code)]
+    pub fn register_account_state_handler<H: AccountStateHandler + 'static>(&mut self, handler: H) {
+        let handler = Arc::new(handler);
+        let name = handler.name().to_string();
+        let key = handler.handler_key();
+
+        if let Some(existing_key) = self.handler_name_to_key.get(&name) {
+            panic!(
+                "duplicate handler name '{}': already registered with key '{}', \
+                 cannot register again with key '{}'",
+                name, existing_key, key
+            );
+        }
+
+        let triggers = handler.triggers();
+
+        if !self.chain_type_matches(handler.as_ref()) {
+            tracing::debug!(
+                "Skipping account state handler {} — chain type {:?} does not match {:?}",
+                handler.name(),
+                handler.chain_type(),
+                self.target_chain_type,
+            );
+            return;
+        }
+
+        if let Some(ref sources) = self.available_sources {
+            if !triggers.iter().all(|t| sources.contains(&t.source)) {
+                tracing::debug!(
+                    "Skipping account state handler {} — trigger sources not available",
+                    handler.name(),
+                );
+                return;
+            }
+        }
+
+        if triggers.len() > 1 {
+            self.multi_trigger_handler_keys.insert(key.clone());
+        }
+
+        for trigger in &triggers {
+            let trigger_key = (trigger.source.clone(), trigger.account_type.clone());
+            self.account_state_handlers
+                .entry(trigger_key)
+                .or_default()
+                .push(handler.clone());
+        }
+
+        self.handler_key_to_name.insert(key.clone(), name.clone());
+        self.handler_name_to_key.insert(name, key);
+        self.all_handlers.push(handler);
+    }
+
     /// Get handlers for a specific event.
     pub fn handlers_for_event(&self, source: &str, event_name: &str) -> Vec<Arc<dyn EventHandler>> {
         let key = (source.to_string(), event_name.to_string());
@@ -258,6 +357,26 @@ impl TransformationRegistry {
         self.call_handlers.keys().cloned().collect()
     }
 
+    /// Get handlers for a specific account state type.
+    #[allow(dead_code)]
+    pub fn handlers_for_account_state(
+        &self,
+        source: &str,
+        account_type: &str,
+    ) -> Vec<Arc<dyn AccountStateHandler>> {
+        let key = (source.to_string(), account_type.to_string());
+        self.account_state_handlers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get all registered account state triggers.
+    #[allow(dead_code)]
+    pub fn all_account_state_triggers(&self) -> Vec<(String, String)> {
+        self.account_state_handlers.keys().cloned().collect()
+    }
+
     /// Get all handlers for initialization.
     pub fn all_handlers(&self) -> &[Arc<dyn TransformationHandler>] {
         &self.all_handlers
@@ -271,6 +390,11 @@ impl TransformationRegistry {
     /// Get count of registered handlers.
     pub fn handler_count(&self) -> usize {
         self.all_handlers.len()
+    }
+
+    /// Whether any account state handlers are registered.
+    pub fn has_account_state_handlers(&self) -> bool {
+        !self.account_state_handlers.is_empty()
     }
 
     /// Get all unique event handlers with their triggers grouped.
@@ -323,8 +447,9 @@ impl TransformationRegistry {
 
         if !missing.is_empty() {
             let mut msg = String::from(
-                "missing handler dependency: one or more handlers declare handler_dependencies \
-                 that do not match any registered handler name:\n",
+                "missing handler dependency: one or more handlers declare \
+                 handler_dependencies()/contiguous_handler_dependencies() that do not \
+                 match any registered handler name:\n",
             );
             for (handler_name, unresolved) in &missing {
                 msg.push_str(&format!("\n  Handler '{}':\n", handler_name));
@@ -356,8 +481,9 @@ impl TransformationRegistry {
 
         if !non_event_deps.is_empty() {
             let mut msg = String::from(
-                "invalid handler dependency: handler_dependencies can only reference event \
-                 handler names, not call handler names:\n",
+                "invalid handler dependency: handler_dependencies()/\
+                 contiguous_handler_dependencies() can only reference event handler \
+                 names, not call handler names:\n",
             );
             for (handler_name, bad) in &non_event_deps {
                 msg.push_str(&format!("\n  Handler '{}':\n", handler_name));
@@ -717,6 +843,7 @@ pub fn build_registry(chain_id: u64) -> TransformationRegistry {
 /// chain from being initialized, migrated, or validated on another.
 pub fn build_registry_for_chain(
     chain_id: u64,
+    chain_type: ChainType,
     contracts: &Contracts,
     factory_collections: &FactoryCollections,
 ) -> TransformationRegistry {
@@ -733,7 +860,7 @@ pub fn build_registry_for_chain(
         }
     }
 
-    let mut registry = TransformationRegistry::with_source_filter(available);
+    let mut registry = TransformationRegistry::with_source_and_chain_filter(available, chain_type);
 
     // Register event handlers (filtered by available sources)
     super::event::register_handlers_for_chain(&mut registry, chain_id, contracts);
@@ -768,6 +895,7 @@ mod tests {
         triggers: Vec<EventTrigger>,
         call_deps: Vec<(String, String)>,
         handler_deps: Vec<&'static str>,
+        contiguous_handler_deps: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -796,6 +924,10 @@ mod tests {
         fn handler_dependencies(&self) -> Vec<&'static str> {
             self.handler_deps.clone()
         }
+
+        fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+            self.contiguous_handler_deps.clone()
+        }
     }
 
     fn empty_contracts() -> Contracts {
@@ -812,6 +944,7 @@ mod tests {
             triggers: vec![EventTrigger::new("Test", format!("{}()", name))],
             call_deps: vec![],
             handler_deps,
+            contiguous_handler_deps: vec![],
         }
     }
 
@@ -836,6 +969,7 @@ mod tests {
             )],
             call_deps: vec![],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -858,6 +992,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "getState".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -893,6 +1028,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -916,6 +1052,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -955,6 +1092,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "once".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -1202,8 +1340,36 @@ mod tests {
             ],
             call_deps: vec![],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
         assert!(registry.is_multi_trigger("multi_v1"));
+    }
+
+    #[test]
+    fn contiguous_handler_dependencies_participate_in_dependency_graph() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("Create", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "Metrics",
+            triggers: vec![EventTrigger::new("Test", "Metrics()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec!["Create"],
+        });
+
+        registry.validate_and_sort_handler_dependencies();
+
+        let deps = registry
+            .handler_dependency_graph()
+            .get("Metrics")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(deps, vec!["Create".to_string()]);
+
+        let topo = registry.handler_topological_order();
+        let create_pos = topo.iter().position(|name| name == "Create").unwrap();
+        let metrics_pos = topo.iter().position(|name| name == "Metrics").unwrap();
+        assert!(create_pos < metrics_pos);
     }
 
     #[test]
@@ -1291,7 +1457,8 @@ mod tests {
             },
         );
 
-        let registry = build_registry_for_chain(1, &contracts, &empty_factory_collections());
+        let registry =
+            build_registry_for_chain(1, ChainType::Evm, &contracts, &empty_factory_collections());
 
         assert!(registry
             .handler_key_for_name("MigrationPoolCreateHandler")
@@ -1322,5 +1489,126 @@ mod tests {
                 "DopplerHookCreateHandler".to_string(),
             ]
         );
+    }
+
+    // ─── Account state handler tests ───────────────────────────────────
+
+    use crate::transformations::traits::{AccountStateHandler, AccountStateTrigger};
+
+    struct MockAccountStateHandler {
+        name: &'static str,
+        source: String,
+        account_type: String,
+    }
+
+    impl MockAccountStateHandler {
+        fn new(name: &'static str, source: &str, account_type: &str) -> Self {
+            Self {
+                name,
+                source: source.to_string(),
+                account_type: account_type.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TransformationHandler for MockAccountStateHandler {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &TransformationContext,
+        ) -> Result<Vec<DbOperation>, TransformationError> {
+            Ok(vec![])
+        }
+    }
+
+    impl AccountStateHandler for MockAccountStateHandler {
+        fn triggers(&self) -> Vec<AccountStateTrigger> {
+            vec![AccountStateTrigger::new(&self.source, &self.account_type)]
+        }
+    }
+
+    #[test]
+    fn test_chain_type_default_is_evm() {
+        use crate::types::chain::ChainType;
+        // MockEventHandler already implements TransformationHandler
+        let handler = mock_handler("test", vec![]);
+        assert_eq!(handler.chain_type(), ChainType::Evm);
+    }
+
+    struct SolanaEventHandler;
+
+    #[async_trait]
+    impl TransformationHandler for SolanaEventHandler {
+        fn name(&self) -> &'static str {
+            "solana_event"
+        }
+
+        fn chain_type(&self) -> ChainType {
+            ChainType::Solana
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &TransformationContext,
+        ) -> Result<Vec<DbOperation>, TransformationError> {
+            Ok(vec![])
+        }
+    }
+
+    impl EventHandler for SolanaEventHandler {
+        fn triggers(&self) -> Vec<EventTrigger> {
+            vec![EventTrigger::new("Test", "Ping()")]
+        }
+    }
+
+    #[test]
+    fn test_chain_filtered_registry_skips_handler_with_wrong_chain_type() {
+        let sources: HashSet<String> = HashSet::from(["Test".to_string()]);
+        let mut registry =
+            TransformationRegistry::with_source_and_chain_filter(sources, ChainType::Evm);
+
+        registry.register_event_handler(SolanaEventHandler);
+
+        assert!(registry.handlers_for_event("Test", "Ping").is_empty());
+    }
+
+    #[test]
+    fn test_register_account_state_handler() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_account_state_handler(MockAccountStateHandler::new(
+            "test_acct",
+            "orca",
+            "Whirlpool",
+        ));
+        let handlers = registry.handlers_for_account_state("orca", "Whirlpool");
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].name(), "test_acct");
+    }
+
+    #[test]
+    fn test_account_state_handler_source_filter() {
+        let sources: HashSet<String> = HashSet::from(["other_source".to_string()]);
+        let mut registry = TransformationRegistry::with_source_filter(sources);
+        registry.register_account_state_handler(MockAccountStateHandler::new(
+            "test_acct",
+            "orca",
+            "Whirlpool",
+        ));
+        let handlers = registry.handlers_for_account_state("orca", "Whirlpool");
+        assert_eq!(handlers.len(), 0); // skipped because "orca" not in sources
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate handler name")]
+    fn test_duplicate_account_state_handler_panics() {
+        let mut registry = TransformationRegistry::new();
+        registry
+            .register_account_state_handler(MockAccountStateHandler::new("dupe", "src1", "type1"));
+        registry
+            .register_account_state_handler(MockAccountStateHandler::new("dupe", "src2", "type2"));
     }
 }

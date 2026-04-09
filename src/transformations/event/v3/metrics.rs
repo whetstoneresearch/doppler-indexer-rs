@@ -176,7 +176,7 @@ impl EventHandler for V3SwapMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V3CreateHandler"]
     }
 }
@@ -228,7 +228,7 @@ impl EventHandler for V3LiquidityMetricsHandler {
         ]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V3CreateHandler"]
     }
 }
@@ -311,7 +311,7 @@ impl EventHandler for LockableV3SwapMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["LockableV3CreateHandler"]
     }
 }
@@ -363,7 +363,7 @@ impl EventHandler for LockableV3LiquidityMetricsHandler {
         ]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["LockableV3CreateHandler"]
     }
 }
@@ -422,6 +422,7 @@ mod tests {
             200,
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
             HashMap::new(),
             historical,
             rpc,
@@ -429,11 +430,11 @@ mod tests {
         )
     }
 
-    /// Fix F: V3LiquidityMetricsHandler must declare V3CreateHandler as a dependency.
+    /// Fix F: V3LiquidityMetricsHandler must declare V3CreateHandler as a contiguous dependency.
     #[test]
     fn test_v3_liquidity_handler_deps() {
         let handler = V3LiquidityMetricsHandler { chain_id: 8453 };
-        let deps = handler.handler_dependencies();
+        let deps = handler.contiguous_handler_dependencies();
         assert_eq!(deps, vec!["V3CreateHandler"]);
     }
 

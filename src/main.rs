@@ -771,6 +771,7 @@ async fn process_chain_live_only(
         config,
         &runtime.features,
         runtime.transformations_enabled,
+        runtime.registry.has_account_state_handlers(),
     );
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
@@ -794,6 +795,7 @@ async fn process_chain_live_only(
                 handler_concurrency: tc.handler_concurrency,
                 expect_log_completion: runtime.features.has_events,
                 expect_eth_call_completion: runtime.features.has_calls,
+                expect_account_state_completion: false,
             },
             runtime.progress_tracker.clone(),
         )
@@ -813,6 +815,7 @@ async fn process_chain_live_only(
 
         let transform_events_rx = channels.transform_events_rx;
         let transform_calls_rx = channels.transform_calls_rx;
+        let transform_account_states_rx = channels.transform_account_states_rx;
         let transform_complete_rx = channels.transform_complete_rx;
         let transform_reorg_rx = channels.transform_reorg_rx;
         let transform_retry_rx = channels.transform_retry_rx;
@@ -822,6 +825,7 @@ async fn process_chain_live_only(
                 .run(
                     transform_events_rx.unwrap(),
                     transform_calls_rx.unwrap(),
+                    transform_account_states_rx,
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
                     transform_retry_rx,
@@ -1405,6 +1409,8 @@ async fn process_chain(
         transform_events_rx,
         transform_calls_tx,
         transform_calls_rx,
+        transform_account_states_tx: _transform_account_states_tx,
+        transform_account_states_rx,
         transform_complete_tx,
         transform_complete_rx,
         transform_reorg_tx,
@@ -1413,7 +1419,12 @@ async fn process_chain(
         transform_retry_rx,
         decode_catchup_done_tx,
         decode_catchup_done_rx,
-    } = CommonChannels::build_for_full(config, features, transformations_enabled);
+    } = CommonChannels::build_for_full(
+        config,
+        features,
+        transformations_enabled,
+        runtime.registry.has_account_state_handlers(),
+    );
 
     // Historical-only channels
     let channel_cap = config
@@ -1629,6 +1640,7 @@ async fn process_chain(
                 handler_concurrency: tc.handler_concurrency,
                 expect_log_completion: has_events,
                 expect_eth_call_completion: has_calls,
+                expect_account_state_completion: false,
             },
             pipeline.runtime.progress_tracker.clone(),
         )
@@ -1652,6 +1664,7 @@ async fn process_chain(
                 .run(
                     transform_events_rx.unwrap(),
                     transform_calls_rx.unwrap(),
+                    transform_account_states_rx,
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
                     retry_rx,

@@ -58,10 +58,15 @@ impl LiveProgressTracker {
         handler_key: &str,
     ) -> Result<(), LiveError> {
         // Update in-memory state
-        self.completed
+        let is_new = self
+            .completed
             .entry(block_number)
             .or_default()
             .insert(handler_key.to_string());
+
+        if !is_new {
+            return Ok(());
+        }
 
         // Persist to database if available
         if let Some(ref db_pool) = self.db_pool {
@@ -85,10 +90,16 @@ impl LiveProgressTracker {
         // Persist handler completion to status file using atomic update
         // to prevent race conditions when multiple handlers complete simultaneously
         let storage = LiveStorage::new(&self.chain_name);
-        let handler_key_owned = handler_key.to_string();
         let all_complete = self.is_block_complete(block_number);
         let handler_count = self.handler_keys.len();
-        let pending = self.get_pending_handlers(block_number);
+        let pending = if all_complete {
+            None
+        } else if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(self.get_pending_handlers(block_number))
+        } else {
+            None
+        };
+        let handler_key_owned = handler_key.to_string();
 
         let update_result = storage.update_status_atomic(block_number, |status| {
             status.completed_handlers.insert(handler_key_owned.clone());
@@ -106,13 +117,13 @@ impl LiveProgressTracker {
                         block_number,
                         handler_count
                     );
-                } else {
+                } else if let Some(remaining) = pending.as_ref() {
                     tracing::debug!(
                         "Block {} handler '{}' complete, {} remaining: {:?}",
                         block_number,
                         handler_key,
-                        pending.len(),
-                        pending
+                        remaining.len(),
+                        remaining
                     );
                 }
             }
@@ -134,8 +145,10 @@ impl LiveProgressTracker {
         }
 
         if let Some(completed) = self.completed.get(&block_number) {
-            completed.len() == self.handler_keys.len()
-                && self.handler_keys.iter().all(|k| completed.contains(k))
+            if completed.len() != self.handler_keys.len() {
+                return false;
+            }
+            self.handler_keys.iter().all(|k| completed.contains(k))
         } else {
             false
         }
