@@ -108,7 +108,7 @@ fn spawn_fallback_flush(
     join_set.spawn(async move {
         let block_infos: Vec<BlockInfo> = blocks_to_fetch.into_iter().map(|(_, bi)| bi).collect();
         let refs: Vec<&BlockInfo> = block_infos.iter().collect();
-        let result = fetch_tx_receipts_batched(&refs, &*client_clone, &rf).await;
+        let result = fetch_tx_receipts_batched(&refs, &client_clone, &rf).await;
         ReceiptFetchResult::FallbackBatch {
             blocks: blocks_with_ranges,
             result,
@@ -479,7 +479,7 @@ pub async fn collect_receipts(
                                 let block_refs: Vec<&BlockInfo> = vec![&block_info];
                                 let result = fetch_block_receipts_bounded(
                                     &block_refs,
-                                    &*client,
+                                    &client,
                                     &receipt_fields,
                                     &method_str,
                                     1, // single-block fetch
@@ -716,21 +716,51 @@ pub async fn collect_receipts(
                 // Signal log/factory RangeComplete now that the parquet file exists.
                 // EventTriggerMessage::RangeComplete was already sent in try_finalize_range
                 // to keep trigger batches aligned per-range.
-                let log_message = LogMessage::RangeComplete {
+                if channels.factory_log_tx.is_none() && channels.log_tx.is_none() {
+                    // No log channels are consuming range completion notifications.
+                    // Event trigger completion was already sent above.
+                    continue;
+                }
+
+                let message = LogMessage::RangeComplete {
                     range_start: write_result.range_start,
                     range_end: write_result.range_end,
                 };
-                if let Some(sender) = &channels.factory_log_tx {
-                    sender.send(log_message.clone()).await
-                        .map_err(|_| ReceiptCollectionError::ChannelSend(
-                            format!("factory_log_tx (RangeComplete {}-{}) - receiver dropped",
-                                write_result.range_start, write_result.range_end)))?;
-                }
-                if let Some(sender) = &channels.log_tx {
-                    sender.send(log_message).await
-                        .map_err(|_| ReceiptCollectionError::ChannelSend(
-                            format!("log_tx (RangeComplete {}-{}) - receiver dropped",
-                                write_result.range_start, write_result.range_end)))?;
+                if channels.factory_log_tx.is_some() && channels.log_tx.is_some() {
+                    if let Some(sender) = &channels.factory_log_tx {
+                        sender
+                            .send(message.clone())
+                            .await
+                            .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                                "factory_log_tx (RangeComplete {}-{}) - receiver dropped",
+                                write_result.range_start, write_result.range_end
+                            )))?;
+                    }
+                    if let Some(sender) = &channels.log_tx {
+                        sender
+                            .send(message)
+                            .await
+                            .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                                "log_tx (RangeComplete {}-{}) - receiver dropped",
+                                write_result.range_start, write_result.range_end
+                            )))?;
+                    }
+                } else if let Some(sender) = &channels.factory_log_tx {
+                    sender
+                        .send(message)
+                        .await
+                        .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                            "factory_log_tx (RangeComplete {}-{}) - receiver dropped",
+                            write_result.range_start, write_result.range_end
+                        )))?;
+                } else if let Some(sender) = &channels.log_tx {
+                    sender
+                        .send(message)
+                        .await
+                        .map_err(|_| ReceiptCollectionError::ChannelSend(format!(
+                            "log_tx (RangeComplete {}-{}) - receiver dropped",
+                            write_result.range_start, write_result.range_end
+                        )))?;
                 }
             }
 
@@ -826,7 +856,7 @@ pub async fn collect_receipts(
                     let pr = process_range(
                         &range,
                         blocks,
-                        &*client,
+                        &client,
                         receipt_fields,
                         &schema,
                         &output_dir,
@@ -902,7 +932,7 @@ pub async fn collect_receipts(
 
         let block_infos: Vec<BlockInfo> = blocks_to_fetch.into_iter().map(|(_, bi)| bi).collect();
         let refs: Vec<&BlockInfo> = block_infos.iter().collect();
-        let result = fetch_tx_receipts_batched(&refs, &*client, receipt_fields).await?;
+        let result = fetch_tx_receipts_batched(&refs, &client, receipt_fields).await?;
 
         // Partition records by range
         let mut minimal_by_range: HashMap<u64, Vec<_>> = HashMap::new();
@@ -1005,7 +1035,7 @@ pub async fn collect_receipts(
 
             let result = fetch_receipts_for_blocks(
                 &block_refs,
-                &*client,
+                &client,
                 receipt_fields,
                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
                 receipt_fetch_concurrency,

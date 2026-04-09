@@ -108,18 +108,26 @@ pub(super) async fn handle_block_complete(
     complete_tx: Option<&Sender<RangeCompleteMessage>>,
     transform_retry_tx: Option<&Sender<TransformRetryRequest>>,
 ) {
-    match live_storage.update_status_atomic(range_start, |status| {
-        status.eth_calls_decoded = true;
-    }) {
-        Ok(()) => {
-            tracing::debug!("Block {} eth_calls decoded", range_start);
+    if range_end.saturating_sub(range_start) == 1 {
+        match live_storage.update_status_atomic(range_start, |status| {
+            status.eth_calls_decoded = true;
+        }) {
+            Ok(()) => {
+                tracing::debug!("Block {} eth_calls decoded", range_start);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to update block status after eth_call block completion: {}",
+                    e
+                );
+            }
         }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to update block status after eth_call block completion: {}",
-                e
-            );
-        }
+    } else {
+        tracing::debug!(
+            "Eth_call range {}-{} decoded",
+            range_start,
+            range_end.saturating_sub(1)
+        );
     }
 
     if !retry_transform_after_decode {

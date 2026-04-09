@@ -80,7 +80,7 @@ impl DbPool {
         let transaction = client.transaction().await?;
 
         for op in operations {
-            let (sql, params) = build_operation_sql(op.clone());
+            let (sql, params) = build_operation_sql(op);
 
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -122,7 +122,7 @@ impl DbPool {
         // Execute all operations and collect affected row counts
         let mut affected_rows = Vec::with_capacity(operations.len());
         for op in operations {
-            let (sql, params) = build_operation_sql(op);
+            let (sql, params) = build_operation_sql(&op);
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
@@ -195,7 +195,7 @@ fn is_deadlock(err: &DbError) -> bool {
 }
 
 /// Build SQL and parameters from a DbOperation.
-fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
+fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
     match op {
         DbOperation::Upsert {
             table,
@@ -205,23 +205,23 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
             update_columns,
             update_condition,
         } => build_upsert_sql(
-            &table,
-            &columns,
-            &values,
-            &conflict_columns,
-            &update_columns,
+            table,
+            columns,
+            values,
+            conflict_columns,
+            update_columns,
             update_condition.as_deref(),
         ),
         DbOperation::Insert {
             table,
             columns,
             values,
-        } => build_insert_sql(&table, &columns, &values),
+        } => build_insert_sql(table, columns, values),
         DbOperation::Update {
             table,
             set_columns,
             where_clause,
-        } => build_update_sql(&table, &set_columns, &where_clause),
+        } => build_update_sql(table, set_columns, where_clause),
         DbOperation::Delete {
             table,
             where_clause,
@@ -310,20 +310,6 @@ fn extract_db_value_from_row(
 
     let col_name = col.name();
     let col_type = col.type_();
-
-    // Handle NULL values first
-    let _is_null: bool = row
-        .try_get::<_, Option<bool>>(col_name)
-        .map(|v| v.is_none())
-        .unwrap_or(false)
-        || row
-            .try_get::<_, Option<i64>>(col_name)
-            .map(|v| v.is_none())
-            .unwrap_or(false)
-        || row
-            .try_get::<_, Option<String>>(col_name)
-            .map(|v| v.is_none())
-            .unwrap_or(false);
 
     match *col_type {
         Type::BOOL => Ok(try_extract_column::<bool>(row, col_name)
@@ -664,7 +650,7 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
 /// acquires row locks in the same deterministic order, preventing deadlocks
 /// when concurrent transactions touch overlapping rows.
 fn sort_operations_for_lock_ordering(ops: &mut [DbOperation]) {
-    ops.sort_by(|a, b| operation_sort_key(a).cmp(&operation_sort_key(b)));
+    ops.sort_by_cached_key(operation_sort_key);
 }
 
 /// Extract a comparable sort key from a DbOperation.

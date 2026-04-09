@@ -386,7 +386,7 @@ pub async fn refresh_cache_if_needed(
         let sample: Vec<String> = still_missing
             .iter()
             .take(10)
-            .map(|id| hex::encode(id))
+            .map(hex::encode)
             .collect();
         tracing::warn!(
             handler = handler_name,

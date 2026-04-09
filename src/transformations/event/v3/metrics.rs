@@ -64,7 +64,7 @@ fn extract_v3_liquidity(
             TransformationError::TypeConversion(format!(
                 "Mint amount {} overflows I256 (pool {}, block {})",
                 amount,
-                hex::encode(&event.contract_address),
+                hex::encode(event.contract_address),
                 event.block_number,
             ))
         })?;
@@ -84,7 +84,7 @@ fn extract_v3_liquidity(
             TransformationError::TypeConversion(format!(
                 "Burn amount {} overflows I256 (pool {}, block {})",
                 amount,
-                hex::encode(&event.contract_address),
+                hex::encode(event.contract_address),
                 event.block_number,
             ))
         })?;

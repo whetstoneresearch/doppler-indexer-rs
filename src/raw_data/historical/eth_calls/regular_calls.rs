@@ -11,6 +11,7 @@ use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
 
 use super::config::{compute_function_selector, generate_param_combinations};
 use super::frequency::filter_blocks_for_frequency;
+use super::helpers::{collect_factory_addresses_by_collection, parse_function_name};
 use super::multicall::{
     execute_multicalls_generic, BlockMulticall, FactoryCallMeta, FactoryGroupInfo,
     MulticallSlotGeneric, RegularCallMeta, RegularGroupInfo,
@@ -43,15 +44,7 @@ pub(crate) async fn process_factory_range(
     mut pending_writes: Option<&mut AbortOnDropHandles>,
     contracts: &Contracts,
 ) -> Result<(), EthCallCollectionError> {
-    let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
-    for addrs in factory_data.addresses_by_block.values() {
-        for (_, addr, collection_name) in addrs {
-            addresses_by_collection
-                .entry(collection_name.clone())
-                .or_default()
-                .insert(*addr);
-        }
-    }
+    let addresses_by_collection = collect_factory_addresses_by_collection(factory_data);
 
     for (collection_name, call_configs) in factory_call_configs {
         let addresses = match addresses_by_collection.get(collection_name) {
@@ -65,12 +58,7 @@ pub(crate) async fn process_factory_range(
             }
 
             let selector = compute_function_selector(&call_config.function);
-            let function_name = call_config
-                .function
-                .split('(')
-                .next()
-                .unwrap_or(&call_config.function)
-                .to_string();
+            let function_name = parse_function_name(&call_config.function);
 
             let file_name = range.file_name("");
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
@@ -339,15 +327,7 @@ pub(crate) async fn process_factory_range_multicall(
     contracts: &Contracts,
 ) -> Result<(), EthCallCollectionError> {
     // Collect factory addresses by collection
-    let mut addresses_by_collection: HashMap<String, HashSet<Address>> = HashMap::new();
-    for addrs in factory_data.addresses_by_block.values() {
-        for (_, addr, collection_name) in addrs {
-            addresses_by_collection
-                .entry(collection_name.clone())
-                .or_default()
-                .insert(*addr);
-        }
-    }
+    let addresses_by_collection = collect_factory_addresses_by_collection(factory_data);
 
     // Build per-group info for active groups
     let mut active_groups: Vec<FactoryGroupInfo> = Vec::new();
@@ -364,12 +344,7 @@ pub(crate) async fn process_factory_range_multicall(
             }
 
             let selector = compute_function_selector(&call_config.function);
-            let function_name = call_config
-                .function
-                .split('(')
-                .next()
-                .unwrap_or(&call_config.function)
-                .to_string();
+            let function_name = parse_function_name(&call_config.function);
 
             let file_name = range.file_name("");
             let rel_path = format!("{}/{}/{}", collection_name, function_name, file_name);
