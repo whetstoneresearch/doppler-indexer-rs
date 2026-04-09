@@ -412,7 +412,7 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    if !path.extension().is_some_and(|ext| ext == "parquet") {
+                    if path.extension().is_none_or(|ext| ext != "parquet") {
                         continue;
                     }
 

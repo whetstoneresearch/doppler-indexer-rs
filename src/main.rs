@@ -1028,7 +1028,7 @@ impl FullPipelineContext {
                     let sm_for_current = sm.clone();
                     raw_data::historical::catchup::receipts::collect_receipts(
                         &chain,
-                        &*receipts_client,
+                        &receipts_client,
                         &cfg,
                         &log_tx,
                         &factory_log_tx,

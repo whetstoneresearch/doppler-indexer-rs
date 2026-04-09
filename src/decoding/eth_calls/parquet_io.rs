@@ -185,7 +185,7 @@ fn write_decoded_records_to_parquet<R: DecodedRecord>(
                     .iter()
                     .map(|r| extract_nested_value(r.decoded_value(), access_path))
                     .collect();
-                let arr = build_array_from_decoded_values(&values, &leaf_type)?;
+                let arr = build_array_from_decoded_values(&values, leaf_type)?;
                 arrays.push(arr);
             }
         }
