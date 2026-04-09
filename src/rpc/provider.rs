@@ -111,15 +111,21 @@ pub trait RpcProvider: Send + Sync {
 /// Keeps log output readable when alloy includes full response bodies in errors.
 const ERROR_SEGMENT_MAX_LEN: usize = 300;
 
-/// Truncate a single error message to a reasonable length.
-fn truncate_error_segment(msg: &str, max_len: usize) -> String {
-    if msg.len() <= max_len {
+/// Truncate a single error message to a reasonable byte length without
+/// splitting UTF-8 code points.
+fn truncate_error_segment(msg: &str, max_bytes: usize) -> String {
+    if msg.len() <= max_bytes {
         msg.to_string()
     } else {
+        let mut truncation_point = max_bytes;
+        while !msg.is_char_boundary(truncation_point) {
+            truncation_point -= 1;
+        }
+
         format!(
             "{}... [{} bytes truncated]",
-            &msg[..max_len],
-            msg.len() - max_len
+            &msg[..truncation_point],
+            msg.len() - truncation_point
         )
     }
 }
@@ -1233,5 +1239,20 @@ mod tests {
     fn default_concurrency_is_100() {
         let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
         assert_eq!(config.concurrency, 100);
+    }
+
+    #[test]
+    fn truncate_error_segment_respects_utf8_boundaries() {
+        let msg = format!("{}é", "a".repeat(ERROR_SEGMENT_MAX_LEN - 1));
+
+        let truncated = truncate_error_segment(&msg, ERROR_SEGMENT_MAX_LEN);
+
+        assert_eq!(
+            truncated,
+            format!(
+                "{}... [2 bytes truncated]",
+                "a".repeat(ERROR_SEGMENT_MAX_LEN - 1)
+            )
+        );
     }
 }
