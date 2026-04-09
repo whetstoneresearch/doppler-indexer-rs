@@ -45,7 +45,7 @@ impl TransformationHandler for V3CreateHandler {
     }
 
     fn requires_sequential(&self) -> bool {
-        true
+        false
     }
 
     async fn handle(

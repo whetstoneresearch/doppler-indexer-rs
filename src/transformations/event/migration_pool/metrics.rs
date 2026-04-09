@@ -216,7 +216,7 @@ impl EventHandler for MigrationPoolSwapMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["MigrationPoolCreateHandler"]
     }
 }
@@ -262,7 +262,7 @@ impl EventHandler for MigrationPoolLiquidityMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["MigrationPoolCreateHandler"]
     }
 }

@@ -17,7 +17,7 @@ use super::executor::{run_handler_task, DbExecMode};
 use super::historical::HistoricalDataReader;
 use super::live_state::LiveProcessingState;
 use super::registry::{extract_event_name, TransformationRegistry};
-use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem};
+use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
 use super::scheduler::tracker::CompletionTracker;
 use crate::decoding::eth_calls::{
     build_decode_configs, build_result_map, build_result_map_for_merge, CallDecodeConfig,
@@ -26,7 +26,6 @@ use crate::decoding::eth_calls::{
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
-use crate::metrics::HandlerMetricsGuard;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::eth_call::EvmType;
@@ -522,6 +521,8 @@ impl RetryProcessor {
                 range_start,
                 range_end,
                 dep_names,
+                contiguous_dep_names: Vec::new(),
+                call_dep_keys: Vec::new(),
                 sequential: false,
                 payload: Box::new(RetryPayload {
                     handler: rh.handler.clone(),
@@ -598,7 +599,16 @@ impl RetryProcessor {
                                 "outcome" => "success",
                             )
                             .increment(1);
-                            Ok(())
+                            WorkItemRunResult::Succeeded
+                        }
+                        Err(TransformationError::TransientBlocked(msg)) => {
+                            counter!(
+                                "transformation_retry_attempts_total",
+                                "handler_key" => handler_key.clone(),
+                                "outcome" => "blocked",
+                            )
+                            .increment(1);
+                            WorkItemRunResult::Blocked(msg)
                         }
                         Err(e) => {
                             counter!(
@@ -607,7 +617,7 @@ impl RetryProcessor {
                                 "outcome" => "failure",
                             )
                             .increment(1);
-                            Err(e.to_string())
+                            WorkItemRunResult::Failed(e.to_string())
                         }
                     }
                 })
@@ -655,6 +665,17 @@ impl RetryProcessor {
                         attempted_keys.insert(key.clone());
                     }
                 }
+                OutcomeStatus::Blocked { reason } => {
+                    if let Some(key) = name_to_key.get(&outcome.handler_name) {
+                        tracing::warn!(
+                            "Live retry for handler {} on block {} blocked: {}",
+                            key,
+                            block_number,
+                            reason,
+                        );
+                        cascade_blocked_keys.insert(key.clone());
+                    }
+                }
                 OutcomeStatus::DepCascadeFailed { dep_name } => {
                     if let Some(key) = name_to_key.get(&outcome.handler_name) {
                         tracing::warn!(
@@ -669,6 +690,17 @@ impl RetryProcessor {
                             "outcome" => "blocked",
                         )
                         .increment(1);
+                        cascade_blocked_keys.insert(key.clone());
+                    }
+                }
+                OutcomeStatus::DepCascadeBlocked { dep_name } => {
+                    if let Some(key) = name_to_key.get(&outcome.handler_name) {
+                        tracing::warn!(
+                            "Live retry for handler {} on block {} cascade-blocked: dep {} blocked",
+                            key,
+                            block_number,
+                            dep_name,
+                        );
                         cascade_blocked_keys.insert(key.clone());
                     }
                 }
@@ -833,7 +865,8 @@ impl RetryProcessor {
             let handler_deps: Vec<String> = info
                 .handler
                 .handler_dependencies()
-                .iter()
+                .into_iter()
+                .chain(info.handler.contiguous_handler_dependencies())
                 .map(|s| s.to_string())
                 .collect();
             handlers.push(RetryHandler {

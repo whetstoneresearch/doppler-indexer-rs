@@ -47,7 +47,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
     }
 
     fn requires_sequential(&self) -> bool {
-        true
+        false
     }
 
     async fn handle(

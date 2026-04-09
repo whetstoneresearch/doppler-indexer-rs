@@ -152,7 +152,7 @@ pub async fn collect_factories(
     // =========================================================================
     let needs_migration = factory_collection_names
         .iter()
-        .any(|c| contract_indexes.get(c).map_or(true, |idx| idx.is_empty()));
+        .any(|c| contract_indexes.get(c).is_none_or(|idx| idx.is_empty()));
 
     if needs_migration {
         tracing::info!(
@@ -560,7 +560,7 @@ pub async fn collect_factories(
             }
             if wrote_any {
                 let dir = output_dir.join(collection);
-                write_contract_index(&dir, index).map_err(|e| FactoryCollectionError::Io(e))?;
+                write_contract_index(&dir, index).map_err(FactoryCollectionError::Io)?;
 
                 // Upload contract index to S3
                 if let Some(ref sm) = storage_manager.as_ref() {

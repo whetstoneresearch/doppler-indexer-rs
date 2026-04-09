@@ -135,7 +135,7 @@ migrations/
 - **doc**: `docs/features/decoding.md`
 
 ### transformations
-- **description**: Custom Rust handlers process decoded events/calls and produce PostgreSQL operations. DAG-based catchup with dependency-aware pipelined execution. Per-handler progress tracking, version injection, sequential execution support, and transactional execution with deadlock retry.
+- **description**: Custom Rust handlers process decoded events/calls and produce PostgreSQL operations. Single-submit continuous DAG scheduler: all `(handler, range)` work items are submitted upfront with call-dep readiness gated by a background file scanner, eliminating pass-based batching. Per-handler progress tracking, version injection, sequential execution support, and transactional execution with deadlock retry.
 - **entry_points**: `src/transformations/traits.rs`, `src/transformations/registry.rs`, `src/transformations/engine.rs`, `src/transformations/executor.rs`, `src/transformations/scheduler/`
 - **depends_on**: [decoding, database]
 - **doc**: `docs/features/transformations.md`
@@ -229,7 +229,7 @@ src/
       "block_receipts_method": "eth_getBlockReceipts",
       "rpc": {
         "concurrency": 100,
-        "compute_units_per_second": 7500,
+        "requests_per_second": 7500,
         "batch_size": 1000
       }
     }

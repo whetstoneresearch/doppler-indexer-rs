@@ -238,21 +238,39 @@ pub fn extract_event_triggers(
     logs: &[LogData],
     matchers: &[EventTriggerMatcher],
 ) -> Vec<EventTriggerData> {
-    let mut triggers = Vec::new();
-    // Track which (block_number, log_index, source_name) tuples we've already added
+    let mut triggers = Vec::with_capacity(logs.len());
+    // Track which (block_number, log_index, source_id) tuples we've already added
     // to avoid duplicates when multiple matchers have the same event signature
-    let mut seen: HashSet<(u64, u32, String)> = HashSet::new();
+    let mut seen: HashSet<(u64, u32, usize)> = HashSet::with_capacity(logs.len());
+    let mut matchers_by_topic: HashMap<[u8; 32], Vec<(usize, &EventTriggerMatcher)>> =
+        HashMap::with_capacity(matchers.len());
+    let mut source_ids: HashMap<&str, usize> = HashMap::with_capacity(matchers.len());
+    let mut source_names: Vec<String> = Vec::with_capacity(matchers.len());
+
+    for matcher in matchers {
+        let source_key = matcher.source_name.as_str();
+        let source_id = *source_ids.entry(source_key).or_insert_with(|| {
+            source_names.push(source_key.to_string());
+            source_names.len() - 1
+        });
+
+        matchers_by_topic
+            .entry(matcher.event_topic0)
+            .or_default()
+            .push((source_id, matcher));
+    }
 
     for log in logs {
         if log.topics.is_empty() {
             continue;
         }
 
-        for matcher in matchers {
-            // Check topic0 match
-            if log.topics[0] != matcher.event_topic0 {
-                continue;
-            }
+        let Some(candidates) = matchers_by_topic.get(&log.topics[0]) else {
+            continue;
+        };
+
+        for (source_id, matcher) in candidates {
+            // Topic0 match is guaranteed by hash map lookup.
 
             // Check address match (for non-factory matchers)
             // For factory matchers, we send all matching events - eth_calls will filter
@@ -261,7 +279,7 @@ pub fn extract_event_triggers(
             }
 
             // Avoid duplicate triggers for the same log and source
-            let key = (log.block_number, log.log_index, matcher.source_name.clone());
+            let key = (log.block_number, log.log_index, *source_id);
             if seen.contains(&key) {
                 continue;
             }
@@ -272,7 +290,7 @@ pub fn extract_event_triggers(
                 block_timestamp: log.block_timestamp,
                 log_index: log.log_index,
                 emitter_address: log.address,
-                source_name: matcher.source_name.clone(),
+                source_name: source_names[*source_id].clone(),
                 event_signature: log.topics[0],
                 topics: log.topics.clone(),
                 data: log.data.clone(),
@@ -292,14 +310,23 @@ pub fn extract_event_triggers_from_batches(
     matchers: &[EventTriggerMatcher],
 ) -> Vec<EventTriggerData> {
     let mut triggers = Vec::new();
-    let mut seen: HashSet<(u64, u32, String)> = HashSet::new();
-    let mut matchers_by_topic: HashMap<[u8; 32], Vec<&EventTriggerMatcher>> = HashMap::new();
+    let mut seen: HashSet<(u64, u32, usize)> = HashSet::new();
+    let mut matchers_by_topic: HashMap<[u8; 32], Vec<(usize, &EventTriggerMatcher)>> =
+        HashMap::new();
+    let mut source_ids: HashMap<&str, usize> = HashMap::with_capacity(matchers.len());
+    let mut source_names: Vec<String> = Vec::with_capacity(matchers.len());
 
     for matcher in matchers {
+        let source_key = matcher.source_name.as_str();
+        let source_id = *source_ids.entry(source_key).or_insert_with(|| {
+            source_names.push(source_key.to_string());
+            source_names.len() - 1
+        });
+
         matchers_by_topic
             .entry(matcher.event_topic0)
             .or_default()
-            .push(matcher);
+            .push((source_id, matcher));
     }
 
     for batch in batches {
@@ -359,6 +386,17 @@ pub fn extract_event_triggers_from_batches(
                 continue;
             }
 
+            let topic0_bytes = topics_array.value(0);
+            if topic0_bytes.len() != 32 {
+                continue;
+            }
+            let mut topic0 = [0u8; 32];
+            topic0.copy_from_slice(topic0_bytes);
+
+            let Some(candidate_matchers) = matchers_by_topic.get(&topic0) else {
+                continue;
+            };
+
             let mut topics = Vec::with_capacity(topics_array.len());
             let mut malformed_topic = false;
             for idx in 0..topics_array.len() {
@@ -371,36 +409,31 @@ pub fn extract_event_triggers_from_batches(
                 topic.copy_from_slice(topic_bytes);
                 topics.push(topic);
             }
-            if malformed_topic || topics.is_empty() {
+            if malformed_topic {
                 continue;
             }
-
-            let topic0 = topics[0];
-            let Some(candidate_matchers) = matchers_by_topic.get(&topic0) else {
-                continue;
-            };
 
             let block_number = block_numbers.value(row);
             let block_timestamp = block_timestamps.value(row);
             let log_index = log_indices.value(row);
-            let data = data_array.value(row).to_vec();
 
-            for matcher in candidate_matchers {
+            for (source_id, matcher) in candidate_matchers {
                 if !matcher.is_factory && !matcher.addresses.contains(&emitter_address) {
                     continue;
                 }
 
-                let key = (block_number, log_index, matcher.source_name.clone());
+                let key = (block_number, log_index, *source_id);
                 if !seen.insert(key) {
                     continue;
                 }
 
+                let data = data_array.value(row).to_vec();
                 triggers.push(EventTriggerData {
                     block_number,
                     block_timestamp,
                     log_index,
                     emitter_address,
-                    source_name: matcher.source_name.clone(),
+                    source_name: source_names[*source_id].clone(),
                     event_signature: topic0,
                     topics: topics.clone(),
                     data: data.clone(),
@@ -572,6 +605,10 @@ pub(crate) async fn send_range_complete(
     range_start: u64,
     range_end: u64,
 ) -> Result<(), ReceiptCollectionError> {
+    if factory_log_tx.is_none() && log_tx.is_none() && event_trigger_tx.is_none() {
+        return Ok(());
+    }
+
     let message = LogMessage::RangeComplete {
         range_start,
         range_end,
@@ -632,76 +669,146 @@ pub(crate) async fn send_logs_to_channels(
     channels: &ReceiptOutputChannels,
     metrics: &mut ChannelMetricsState,
 ) -> Result<(), ReceiptCollectionError> {
-    let log_count = batch_logs.len();
-    let logs = Arc::new(batch_logs);
-
-    if let Some(sender) = &channels.factory_log_tx {
-        let capacity_before = sender.capacity();
-        let fill_pct =
-            100.0 * (1.0 - capacity_before as f64 / metrics.factory_log_tx_capacity as f64);
-
-        if fill_pct > 90.0 {
-            tracing::warn!(
-                "factory_log_tx channel at {:.1}% capacity - downstream may be slow",
-                fill_pct
-            );
-        }
-
-        let send_start = Instant::now();
-        if sender
-            .send(LogMessage::Logs(Arc::clone(&logs)))
-            .await
-            .is_err()
-        {
-            tracing::error!(
-                "Failed to send {} logs to factory_log_tx - receiver dropped",
-                log_count
-            );
-            return Err(ReceiptCollectionError::ChannelSend(format!(
-                "factory_log_tx (Logs batch of {}) - receiver dropped",
-                log_count
-            )));
-        }
-        let send_time = send_start.elapsed();
-        metrics.total_channel_send_time += send_time;
-
-        metrics.factory_log_tx_metrics.record_send(
-            send_time,
-            capacity_before,
-            metrics.factory_log_tx_capacity,
-        );
-        metrics.factory_log_tx_metrics.total_logs_sent += log_count as u64;
+    if channels.factory_log_tx.is_none() && channels.log_tx.is_none() {
+        return Ok(());
     }
 
-    if let Some(sender) = &channels.log_tx {
-        let capacity_before = sender.capacity();
-        let fill_pct = 100.0 * (1.0 - capacity_before as f64 / metrics.log_tx_capacity as f64);
+    let log_count = batch_logs.len();
+    match (&channels.factory_log_tx, &channels.log_tx) {
+        (Some(factory_sender), Some(log_sender)) => {
+            let logs = Arc::new(batch_logs);
 
-        if fill_pct > 90.0 {
-            tracing::warn!(
-                "log_tx channel at {:.1}% capacity - downstream may be slow",
-                fill_pct
+            let capacity_before = factory_sender.capacity();
+            let fill_pct =
+                100.0 * (1.0 - capacity_before as f64 / metrics.factory_log_tx_capacity as f64);
+
+            if fill_pct > 90.0 {
+                tracing::warn!(
+                    "factory_log_tx channel at {:.1}% capacity - downstream may be slow",
+                    fill_pct
+                );
+            }
+
+            let send_start = Instant::now();
+            if factory_sender
+                .send(LogMessage::Logs(Arc::clone(&logs)))
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    "Failed to send {} logs to factory_log_tx - receiver dropped",
+                    log_count
+                );
+                return Err(ReceiptCollectionError::ChannelSend(format!(
+                    "factory_log_tx (Logs batch of {}) - receiver dropped",
+                    log_count
+                )));
+            }
+            let send_time = send_start.elapsed();
+            metrics.total_channel_send_time += send_time;
+
+            metrics.factory_log_tx_metrics.record_send(
+                send_time,
+                capacity_before,
+                metrics.factory_log_tx_capacity,
             );
-        }
+            metrics.factory_log_tx_metrics.total_logs_sent += log_count as u64;
 
-        let send_start = Instant::now();
-        if sender.send(LogMessage::Logs(logs)).await.is_err() {
-            tracing::error!(
-                "Failed to send {} logs to log_tx - receiver dropped",
-                log_count
+            let capacity_before = log_sender.capacity();
+            let fill_pct = 100.0 * (1.0 - capacity_before as f64 / metrics.log_tx_capacity as f64);
+
+            if fill_pct > 90.0 {
+                tracing::warn!(
+                    "log_tx channel at {:.1}% capacity - downstream may be slow",
+                    fill_pct
+                );
+            }
+
+            let send_start = Instant::now();
+            if log_sender.send(LogMessage::Logs(logs)).await.is_err() {
+                tracing::error!(
+                    "Failed to send {} logs to log_tx - receiver dropped",
+                    log_count
+                );
+                return Err(ReceiptCollectionError::ChannelSend(format!(
+                    "log_tx (Logs batch of {}) - receiver dropped",
+                    log_count
+                )));
+            }
+            let send_time = send_start.elapsed();
+            metrics.total_channel_send_time += send_time;
+
+            metrics
+                .log_tx_metrics
+                .record_send(send_time, capacity_before, metrics.log_tx_capacity);
+            metrics.log_tx_metrics.total_logs_sent += log_count as u64;
+        }
+        (Some(factory_sender), None) => {
+            let capacity_before = factory_sender.capacity();
+            let fill_pct =
+                100.0 * (1.0 - capacity_before as f64 / metrics.factory_log_tx_capacity as f64);
+
+            if fill_pct > 90.0 {
+                tracing::warn!(
+                    "factory_log_tx channel at {:.1}% capacity - downstream may be slow",
+                    fill_pct
+                );
+            }
+
+            let send_start = Instant::now();
+            let logs = Arc::new(batch_logs);
+            if factory_sender.send(LogMessage::Logs(logs)).await.is_err() {
+                tracing::error!(
+                    "Failed to send {} logs to factory_log_tx - receiver dropped",
+                    log_count
+                );
+                return Err(ReceiptCollectionError::ChannelSend(format!(
+                    "factory_log_tx (Logs batch of {}) - receiver dropped",
+                    log_count
+                )));
+            }
+            let send_time = send_start.elapsed();
+            metrics.total_channel_send_time += send_time;
+
+            metrics.factory_log_tx_metrics.record_send(
+                send_time,
+                capacity_before,
+                metrics.factory_log_tx_capacity,
             );
-            return Err(ReceiptCollectionError::ChannelSend(format!(
-                "log_tx (Logs batch of {}) - receiver dropped",
-                log_count
-            )));
+            metrics.factory_log_tx_metrics.total_logs_sent += log_count as u64;
         }
-        let send_time = send_start.elapsed();
-        metrics.total_channel_send_time += send_time;
+        (None, Some(log_sender)) => {
+            let capacity_before = log_sender.capacity();
+            let fill_pct = 100.0 * (1.0 - capacity_before as f64 / metrics.log_tx_capacity as f64);
 
-        metrics
-            .log_tx_metrics
-            .record_send(send_time, capacity_before, metrics.log_tx_capacity);
-        metrics.log_tx_metrics.total_logs_sent += log_count as u64;
+            if fill_pct > 90.0 {
+                tracing::warn!(
+                    "log_tx channel at {:.1}% capacity - downstream may be slow",
+                    fill_pct
+                );
+            }
+
+            let send_start = Instant::now();
+            let logs = Arc::new(batch_logs);
+            if log_sender.send(LogMessage::Logs(logs)).await.is_err() {
+                tracing::error!(
+                    "Failed to send {} logs to log_tx - receiver dropped",
+                    log_count
+                );
+                return Err(ReceiptCollectionError::ChannelSend(format!(
+                    "log_tx (Logs batch of {}) - receiver dropped",
+                    log_count
+                )));
+            }
+            let send_time = send_start.elapsed();
+            metrics.total_channel_send_time += send_time;
+
+            metrics
+                .log_tx_metrics
+                .record_send(send_time, capacity_before, metrics.log_tx_capacity);
+            metrics.log_tx_metrics.total_logs_sent += log_count as u64;
+        }
+        (None, None) => {}
     }
 
     Ok(())
