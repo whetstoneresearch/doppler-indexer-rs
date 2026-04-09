@@ -52,7 +52,7 @@
             "ws_url_env_var": "MONAD_WS_URL",
             "start_block": 34746370,
             "contracts": "contracts/monad",
-            "rpc": { "compute_units_per_second": 25 }
+            "rpc": { "requests_per_second": 25, "concurrency": 8 }
         },
         {
             "name": "sepolia",
@@ -78,7 +78,7 @@
     "raw_data_collection": {
         "channel_capacity": 5000,
         "factory_channel_capacity": 5000,
-        "block_receipt_concurrency": 100,
+        "block_receipt_concurrency": 50,
         "parquet_block_range": 10000,
         "rpc_batch_size": 1000,
         "event_call_concurrency": 12,
