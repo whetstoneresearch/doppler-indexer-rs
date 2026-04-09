@@ -26,8 +26,22 @@ pub enum InlineOrPath<T> {
     Path(String),
 }
 
+impl<T> From<T> for InlineOrPath<T> {
+    fn from(value: T) -> Self {
+        InlineOrPath::Inline(value)
+    }
+}
+
 #[allow(dead_code)]
 impl<T> InlineOrPath<T> {
+    /// Create an `InlineOrPath::Path` from anything convertible to `String`.
+    ///
+    /// A named constructor avoids a blanket `From<String>` that would conflict
+    /// when `T = String`.
+    pub fn from_path(path: impl Into<String>) -> Self {
+        InlineOrPath::Path(path.into())
+    }
+
     /// Returns true if this is an inline value
     pub fn is_inline(&self) -> bool {
         matches!(self, InlineOrPath::Inline(_))
@@ -160,6 +174,18 @@ impl<T> SingleOrMultiple<T> {
             SingleOrMultiple::Single(item) => vec![item],
             SingleOrMultiple::Multiple(items) => items.iter().collect(),
         }
+    }
+}
+
+impl<T> From<T> for SingleOrMultiple<T> {
+    fn from(item: T) -> Self {
+        SingleOrMultiple::Single(item)
+    }
+}
+
+impl<T> From<Vec<T>> for SingleOrMultiple<T> {
+    fn from(items: Vec<T>) -> Self {
+        SingleOrMultiple::Multiple(items)
     }
 }
 
@@ -315,6 +341,21 @@ mod tests {
                 InlineOrPath::Path("./test".to_string());
             assert!(path.into_inline().is_none());
         }
+
+        #[test]
+        fn test_from_inline() {
+            let map: HashMap<String, String> = HashMap::new();
+            let iop: InlineOrPath<HashMap<String, String>> = map.into();
+            assert!(iop.is_inline());
+        }
+
+        #[test]
+        fn test_from_path() {
+            let iop: InlineOrPath<HashMap<String, String>> =
+                InlineOrPath::from_path("./config.json");
+            assert!(iop.is_path());
+            assert_eq!(iop.as_path(), Some("./config.json"));
+        }
     }
 
     // Tests for SingleOrMultiple
@@ -411,6 +452,43 @@ mod tests {
             assert_eq!(iter.size_hint(), (3, Some(3)));
             iter.next();
             assert_eq!(iter.size_hint(), (2, Some(2)));
+        }
+
+        #[test]
+        fn test_from_single() {
+            let config = TestConfig {
+                name: "test".to_string(),
+                value: 42,
+            };
+            let som: SingleOrMultiple<TestConfig> = config.into();
+            assert_eq!(som.len(), 1);
+            if let SingleOrMultiple::Single(c) = &som {
+                assert_eq!(c.name, "test");
+            } else {
+                panic!("expected Single variant");
+            }
+        }
+
+        #[test]
+        fn test_from_vec() {
+            let configs = vec![
+                TestConfig {
+                    name: "a".to_string(),
+                    value: 1,
+                },
+                TestConfig {
+                    name: "b".to_string(),
+                    value: 2,
+                },
+            ];
+            let som: SingleOrMultiple<TestConfig> = configs.into();
+            assert_eq!(som.len(), 2);
+            if let SingleOrMultiple::Multiple(items) = &som {
+                assert_eq!(items[0].name, "a");
+                assert_eq!(items[1].name, "b");
+            } else {
+                panic!("expected Multiple variant");
+            }
         }
     }
 }
