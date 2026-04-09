@@ -46,6 +46,10 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
         vec!["tokens", "pools"]
     }
 
+    fn requires_sequential(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,

@@ -48,6 +48,10 @@ impl TransformationHandler for MigrationPoolCreateHandler {
         vec!["pools"]
     }
 
+    fn requires_sequential(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         ctx: &TransformationContext,
