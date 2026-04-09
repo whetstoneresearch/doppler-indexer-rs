@@ -32,8 +32,8 @@ use super::registry::{extract_event_name, TransformationRegistry};
 use super::retry::{filter_calls_by_start_block, filter_events_by_start_block, RetryProcessor};
 use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
 use super::scheduler::loader::{
-    read_receipt_addresses, CallDepScanner, CatchupLoader, CatchupPayload,
-    run_call_dep_scanner_loop,
+    read_receipt_addresses, run_call_dep_scanner_loop, CallDepScanner, CatchupLoader,
+    CatchupPayload,
 };
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
@@ -677,7 +677,9 @@ impl TransformationEngine {
         // Seed CompletionTracker from _handler_progress so downstream handlers
         // can gate on upstream completion per range via the DAG scheduler.
         // Use `with_available_starts` so the tracker can maintain contiguous watermarks.
-        let tracker = Arc::new(CompletionTracker::with_available_starts(available_starts.clone()));
+        let tracker = Arc::new(CompletionTracker::with_available_starts(
+            available_starts.clone(),
+        ));
         // self_completed: handler_name → set of range_starts already processed.
         // Used to skip building WorkItems for ranges already done.
         let mut self_completed: HashMap<String, HashSet<u64>> = HashMap::new();
@@ -846,7 +848,9 @@ impl TransformationEngine {
             // wait for the first 2s tick.
             let initial = scanner.scan_all().await;
             for ((source, func), ranges) in initial {
-                tracker.register_call_dep_ranges(&source, &func, ranges).await;
+                tracker
+                    .register_call_dep_ranges(&source, &func, ranges)
+                    .await;
             }
             Some(tokio::spawn(run_call_dep_scanner_loop(
                 scanner,
@@ -886,7 +890,10 @@ impl TransformationEngine {
                 for (name, (completed, failed, blocked)) in &snap {
                     let remaining = total_available.saturating_sub(*completed);
                     if remaining > 0 || *failed > 0 || *blocked > 0 {
-                        let key = handler_keys.get(name).cloned().unwrap_or_else(|| name.clone());
+                        let key = handler_keys
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
                         tracing::info!(
                             "  {} — {} done, {} remaining, {} failed, {} blocked",
                             key,
@@ -2730,7 +2737,11 @@ mod tests {
         ));
 
         let mut complete_index = HashMap::new();
-        update_contract_index(&mut complete_index, &range_key(100, 199), &expected_for_source);
+        update_contract_index(
+            &mut complete_index,
+            &range_key(100, 199),
+            &expected_for_source,
+        );
         write_contract_index(dir.path(), &complete_index).unwrap();
         assert!(call_dependency_contract_index_complete(
             dir.path(),

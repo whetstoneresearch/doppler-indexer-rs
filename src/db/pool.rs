@@ -80,7 +80,7 @@ impl DbPool {
         let transaction = client.transaction().await?;
 
         for op in operations {
-            let (sql, params) = build_operation_sql(op.clone());
+            let (sql, params) = build_operation_sql(&op);
 
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -122,7 +122,7 @@ impl DbPool {
         // Execute all operations and collect affected row counts
         let mut affected_rows = Vec::with_capacity(operations.len());
         for op in operations {
-            let (sql, params) = build_operation_sql(op);
+            let (sql, params) = build_operation_sql(&op);
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
@@ -195,7 +195,7 @@ fn is_deadlock(err: &DbError) -> bool {
 }
 
 /// Build SQL and parameters from a DbOperation.
-fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
+fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
     match op {
         DbOperation::Upsert {
             table,
@@ -226,7 +226,7 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
             table,
             where_clause,
         } => build_delete_sql(&table, &where_clause),
-        DbOperation::RawSql { query, params } => (query, convert_values_to_params(&params)),
+        DbOperation::RawSql { query, params } => (query.clone(), convert_values_to_params(&params)),
     }
 }
 
@@ -310,20 +310,6 @@ fn extract_db_value_from_row(
 
     let col_name = col.name();
     let col_type = col.type_();
-
-    // Handle NULL values first
-    let _is_null: bool = row
-        .try_get::<_, Option<bool>>(col_name)
-        .map(|v| v.is_none())
-        .unwrap_or(false)
-        || row
-            .try_get::<_, Option<i64>>(col_name)
-            .map(|v| v.is_none())
-            .unwrap_or(false)
-        || row
-            .try_get::<_, Option<String>>(col_name)
-            .map(|v| v.is_none())
-            .unwrap_or(false);
 
     match *col_type {
         Type::BOOL => Ok(try_extract_column::<bool>(row, col_name)
@@ -664,7 +650,7 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
 /// acquires row locks in the same deterministic order, preventing deadlocks
 /// when concurrent transactions touch overlapping rows.
 fn sort_operations_for_lock_ordering(ops: &mut [DbOperation]) {
-    ops.sort_by(|a, b| operation_sort_key(a).cmp(&operation_sort_key(b)));
+    ops.sort_by_cached_key(|op| operation_sort_key(op));
 }
 
 /// Extract a comparable sort key from a DbOperation.
@@ -692,11 +678,7 @@ fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
             }
             (0, key)
         }
-        DbOperation::Insert {
-            table,
-            values,
-            ..
-        } => {
+        DbOperation::Insert { table, values, .. } => {
             let mut key = table.as_bytes().to_vec();
             key.push(0);
             for val in values {
@@ -723,9 +705,7 @@ fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
             append_where_clause_bytes(where_clause, &mut key);
             (3, key)
         }
-        DbOperation::RawSql { query, .. } => {
-            (4, query.as_bytes().to_vec())
-        }
+        DbOperation::RawSql { query, .. } => (4, query.as_bytes().to_vec()),
     }
 }
 
@@ -916,10 +896,7 @@ mod tests {
         let addr_b = [0xFF; 20];
 
         // Reverse order: B before A
-        let mut ops = vec![
-            upsert_user(1, addr_b),
-            upsert_user(1, addr_a),
-        ];
+        let mut ops = vec![upsert_user(1, addr_b), upsert_user(1, addr_a)];
 
         sort_operations_for_lock_ordering(&mut ops);
 
@@ -962,10 +939,7 @@ mod tests {
     #[test]
     fn sort_is_stable_for_identical_keys() {
         let addr = [0x42; 20];
-        let mut ops = vec![
-            upsert_user(1, addr),
-            upsert_user(1, addr),
-        ];
+        let mut ops = vec![upsert_user(1, addr), upsert_user(1, addr)];
 
         // Should not panic or reorder arbitrarily
         sort_operations_for_lock_ordering(&mut ops);

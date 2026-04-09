@@ -475,7 +475,7 @@ impl LiveCollector {
                 .send(DecoderMessage::LogsReady {
                     range_start: block_number,
                     range_end: block_number + 1, // Exclusive end for single block
-                    logs: log_data,
+                    logs: std::sync::Arc::new(log_data),
                     live_mode: true, // Live mode: write to bincode
                     has_factory_matchers: !self.factory_matchers.is_empty(),
                 })
@@ -1164,7 +1164,7 @@ impl LiveCollector {
             .send(DecoderMessage::LogsReady {
                 range_start: block_number,
                 range_end: block_number + 1,
-                logs: log_data,
+                logs: std::sync::Arc::new(log_data),
                 live_mode: true,
                 has_factory_matchers: !self.factory_matchers.is_empty(),
             })

@@ -468,9 +468,7 @@ impl CallDepScanner {
     }
 
     /// Scan all `(source, function)` pairs and return available ranges.
-    pub(crate) async fn scan_all(
-        &self,
-    ) -> HashMap<(String, String), HashSet<(u64, u64)>> {
+    pub(crate) async fn scan_all(&self) -> HashMap<(String, String), HashSet<(u64, u64)>> {
         let mut results = HashMap::new();
         for (source, function) in &self.call_dep_pairs {
             match self.scan_one(source, function).await {
@@ -480,12 +478,7 @@ impl CallDepScanner {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Call-dep scan failed for {}/{}: {}",
-                        source,
-                        function,
-                        e
-                    );
+                    tracing::warn!("Call-dep scan failed for {}/{}: {}", source, function, e);
                 }
             }
         }
@@ -544,8 +537,7 @@ impl CallDepScanner {
                         continue;
                     };
                     let range_end = range_end_inclusive + 1;
-                    let expected =
-                        build_expected_factory_contracts_for_range(contracts, range_end);
+                    let expected = build_expected_factory_contracts_for_range(contracts, range_end);
                     let parent_dir = path.parent().unwrap_or(decoded_base);
                     let relative_parent = parent_dir
                         .strip_prefix(decoded_base)
@@ -603,7 +595,9 @@ pub(crate) async fn run_call_dep_scanner_loop(
     loop {
         let results = scanner.scan_all().await;
         for ((source, func), ranges) in results {
-            tracker.register_call_dep_ranges(&source, &func, ranges).await;
+            tracker
+                .register_call_dep_ranges(&source, &func, ranges)
+                .await;
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
