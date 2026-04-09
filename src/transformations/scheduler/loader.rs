@@ -270,8 +270,8 @@ pub(crate) struct CatchupPayload {
     pub handler_key: String,
     pub handler_name: &'static str,
     pub handler_version: u32,
-    pub triggers: Vec<(String, String)>,
-    pub call_deps: Vec<(String, String)>,
+    pub triggers: Arc<Vec<(String, String)>>,
+    pub call_deps: Arc<Vec<(String, String)>>,
     pub kind: HandlerKind,
 }
 
@@ -694,9 +694,9 @@ mod tests {
             handler_name: name.to_string(),
             range_start,
             range_end: range_start + 1000,
-            dep_names: deps.iter().map(|s| s.to_string()).collect(),
-            contiguous_dep_names: Vec::new(),
-            call_dep_keys: Vec::new(),
+            dep_names: Arc::new(deps.iter().map(|s| s.to_string()).collect()),
+            contiguous_dep_names: Arc::new(Vec::new()),
+            call_dep_keys: Arc::new(Vec::new()),
             sequential: false,
             payload: Box::new(()),
         }

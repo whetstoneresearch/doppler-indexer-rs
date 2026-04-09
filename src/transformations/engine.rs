@@ -139,14 +139,14 @@ pub(crate) enum HandlerKind {
 struct CatchupHandler {
     handler: Arc<dyn super::traits::TransformationHandler>,
     /// (source, name) pairs — event names for Event, function names for Call.
-    triggers: Vec<(String, String)>,
+    triggers: Arc<Vec<(String, String)>>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
-    call_deps: Vec<(String, String)>,
+    call_deps: Arc<Vec<(String, String)>>,
     /// Same-range handler dependencies gated by the DAG scheduler.
-    handler_deps: Vec<String>,
+    handler_deps: Arc<Vec<String>>,
     /// Catchup-only dependencies that require the upstream handler to be
     /// completed contiguously through this range before submission.
-    contiguous_handler_deps: Vec<String>,
+    contiguous_handler_deps: Arc<Vec<String>>,
     kind: HandlerKind,
     /// When true, the scheduler processes ranges one at a time in ascending order.
     sequential: bool,
@@ -597,10 +597,10 @@ impl TransformationEngine {
                     let sequential = info.handler.requires_sequential();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
-                        triggers,
-                        call_deps,
-                        handler_deps,
-                        contiguous_handler_deps,
+                        triggers: Arc::new(triggers),
+                        call_deps: Arc::new(call_deps),
+                        handler_deps: Arc::new(handler_deps),
+                        contiguous_handler_deps: Arc::new(contiguous_handler_deps),
                         kind: HandlerKind::Event,
                         sequential,
                     }
@@ -619,10 +619,10 @@ impl TransformationEngine {
                     let sequential = info.handler.requires_sequential();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
-                        triggers,
-                        call_deps: Vec::new(),
-                        handler_deps: Vec::new(),
-                        contiguous_handler_deps: Vec::new(),
+                        triggers: Arc::new(triggers),
+                        call_deps: Arc::new(Vec::new()),
+                        handler_deps: Arc::new(Vec::new()),
+                        contiguous_handler_deps: Arc::new(Vec::new()),
                         kind: HandlerKind::Call,
                         sequential,
                     }
@@ -652,7 +652,7 @@ impl TransformationEngine {
         let mut trigger_range_sets: HashMap<String, HashSet<(u64, u64)>> = HashMap::new();
         for ch in &handlers {
             let mut ranges: HashSet<(u64, u64)> = HashSet::new();
-            for (source, trigger_name) in &ch.triggers {
+            for (source, trigger_name) in ch.triggers.iter() {
                 let dir = base_dir.join(source).join(trigger_name);
                 ranges.extend(self.scan_available_ranges(&dir).await?);
             }
@@ -752,7 +752,7 @@ impl TransformationEngine {
                 // Skip if any handler dep already failed — the tracker retains
                 // failure state, so submitting would immediately cascade-fail.
                 let mut dep_failed = false;
-                for dep in &ch.handler_deps {
+                for dep in ch.handler_deps.iter() {
                     if tracker.is_failed(dep, range_start).await {
                         dep_failed = true;
                         break;
@@ -769,11 +769,11 @@ impl TransformationEngine {
                     .get(&name)
                     .is_some_and(|ranges| ranges.contains(&(range_start, range_end)));
 
-                let call_dep_keys: Vec<(String, String)> =
+                let call_dep_keys: Arc<Vec<(String, String)>> =
                     if trigger_range_present && !ch.call_deps.is_empty() {
                         ch.call_deps.clone()
                     } else {
-                        Vec::new()
+                        Arc::new(Vec::new())
                     };
 
                 *per_handler_submitted.entry(name.clone()).or_default() += 1;
@@ -829,7 +829,7 @@ impl TransformationEngine {
         // Collect unique (source, function) pairs across all handlers.
         let mut unique_call_deps: HashSet<(String, String)> = HashSet::new();
         for ch in &handlers {
-            for dep in &ch.call_deps {
+            for dep in ch.call_deps.iter() {
                 unique_call_deps.insert(dep.clone());
             }
         }
@@ -2425,9 +2425,9 @@ impl TransformationEngine {
                     handler_name: name,
                     range_start,
                     range_end,
-                    dep_names,
-                    contiguous_dep_names: Vec::new(),
-                    call_dep_keys: Vec::new(),
+                    dep_names: Arc::new(dep_names),
+                    contiguous_dep_names: Arc::new(Vec::new()),
+                    call_dep_keys: Arc::new(Vec::new()),
                     sequential: false,
                     payload: Box::new(ProcessRangePayload {
                         handler,
@@ -2455,9 +2455,9 @@ impl TransformationEngine {
                     handler_name: name,
                     range_start,
                     range_end,
-                    dep_names: vec![],
-                    contiguous_dep_names: Vec::new(),
-                    call_dep_keys: Vec::new(),
+                    dep_names: Arc::new(vec![]),
+                    contiguous_dep_names: Arc::new(Vec::new()),
+                    call_dep_keys: Arc::new(Vec::new()),
                     sequential: false,
                     payload: Box::new(ProcessRangePayload {
                         handler,

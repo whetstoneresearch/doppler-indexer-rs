@@ -30,14 +30,14 @@ pub(crate) struct WorkItem {
     pub handler_name: String,
     pub range_start: u64,
     pub range_end: u64,
-    pub dep_names: Vec<String>,
+    pub dep_names: Arc<Vec<String>>,
     /// Handler names whose contiguous watermark must be >= `range_start` before
     /// this item can execute. Used for `contiguous_handler_dependencies`.
-    pub contiguous_dep_names: Vec<String>,
+    pub contiguous_dep_names: Arc<Vec<String>>,
     /// `(source, function)` pairs whose decoded call parquet files must be
     /// available on disk for `(range_start, range_end)` before this item can
     /// execute. Empty if no call deps or no trigger data in this range.
-    pub call_dep_keys: Vec<(String, String)>,
+    pub call_dep_keys: Arc<Vec<(String, String)>>,
     /// When `true`, the scheduler enforces one-at-a-time FIFO execution for this
     /// handler via a per-handler capacity-1 semaphore. Items must be submitted in
     /// ascending `range_start` order for the FIFO guarantee to hold.
@@ -443,9 +443,9 @@ mod tests {
             handler_name: name.to_string(),
             range_start,
             range_end: range_start + 1,
-            dep_names: deps.iter().map(|s| s.to_string()).collect(),
-            contiguous_dep_names: Vec::new(),
-            call_dep_keys: Vec::new(),
+            dep_names: Arc::new(deps.iter().map(|s| s.to_string()).collect()),
+            contiguous_dep_names: Arc::new(Vec::new()),
+            call_dep_keys: Arc::new(Vec::new()),
             sequential: false,
             payload: Box::new(()),
         }
