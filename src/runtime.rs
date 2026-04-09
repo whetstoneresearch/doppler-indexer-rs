@@ -387,7 +387,7 @@ impl ChainRuntime {
                     )
                 })?;
 
-                let pool = DbPool::new(&database_url)
+                let pool = DbPool::new(&database_url, tc.db_pool_size)
                     .await
                     .context("failed to create database pool")?;
                 pool.run_migrations()

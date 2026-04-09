@@ -13,7 +13,7 @@ pub fn insert_skipped_address(
     data: &SkippedAddressData<'_>,
     ctx: &TransformationContext,
 ) -> DbOperation {
-    DbOperation::Insert {
+    DbOperation::Upsert {
         table: "_skipped_addresses".to_string(),
         columns: vec![
             "chain_id".to_string(),
@@ -31,5 +31,12 @@ pub fn insert_skipped_address(
             DbValue::Address(*data.numeraire_address),
             DbValue::Text(data.reason.to_string()),
         ],
+        conflict_columns: vec![
+            "chain_id".to_string(),
+            "tx_hash".to_string(),
+            "asset_address".to_string(),
+        ],
+        update_columns: vec![],
+        update_condition: None,
     }
 }
