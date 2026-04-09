@@ -425,7 +425,7 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    if !path.extension().is_some_and(|ext| ext == "parquet") {
+                    if path.extension().is_none_or(|ext| ext != "parquet") {
                         continue;
                     }
 
@@ -2005,7 +2005,7 @@ impl TransformationEngine {
         for call in calls {
             let chain_id = self.chain_id as i64;
             let block_number = call.block_number as i64;
-            let log_index = call.trigger_log_index.map(|i| i as i32);
+            let log_index = call.trigger_log_index.map(i64::from);
             let source_name = &call.source_name;
             let function_name = &call.function_name;
             let target_address = call.contract_address.as_slice();

@@ -48,14 +48,27 @@ pub struct RpcRateLimitGroup {
 pub struct RpcConfig {
     /// Max concurrent in-flight RPC requests (default: 100)
     pub concurrency: Option<usize>,
-    /// Compute units per second rate limit (default: 7500, for Alchemy)
+    /// Generic rate limit units per second.
+    /// For standard providers this is requests/sec; for Alchemy-like providers it is CU/sec.
+    pub requests_per_second: Option<u32>,
+    /// Legacy alias for `requests_per_second`, kept for backward compatibility.
     pub compute_units_per_second: Option<u32>,
     /// Max batch size for RPC requests (default: 100)
     pub batch_size: Option<u32>,
     /// Name of a shared rate limit group (defined in top-level rpc_rate_limits).
-    /// Mutually exclusive with compute_units_per_second.
+    /// Mutually exclusive with `requests_per_second` and `compute_units_per_second`.
     #[serde(default)]
     pub rate_limit_group: Option<String>,
+}
+
+impl RpcConfig {
+    pub fn units_per_second(&self) -> Option<u32> {
+        self.requests_per_second.or(self.compute_units_per_second)
+    }
+
+    pub fn has_explicit_rate_limit(&self) -> bool {
+        self.requests_per_second.is_some() || self.compute_units_per_second.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +220,19 @@ mod tests {
             config.block_receipts_method.unwrap().as_str(),
             "eth_getBlockReceipts"
         );
+    }
+
+    #[test]
+    fn test_rpc_config_prefers_requests_per_second() {
+        let rpc = RpcConfig {
+            concurrency: None,
+            requests_per_second: Some(25),
+            compute_units_per_second: Some(7500),
+            batch_size: None,
+            rate_limit_group: None,
+        };
+
+        assert_eq!(rpc.units_per_second(), Some(25));
     }
 
     #[test]

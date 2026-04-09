@@ -14,30 +14,31 @@ Rather than abstracting everything behind traits, we use a **parallel implementa
 
 ## Branch Status
 
-This roadmap is still the target end-state. The current `feat/solana-phase1-traits` branch has landed groundwork, not a runnable Solana pipeline.
+This branch combines groundwork from data types and trait/runtime phases. Not a runnable Solana pipeline yet.
 
-Implemented on this branch:
+Implemented:
 - `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
 - `ChainConfig.chain_type` with a backward-compatible default of `evm`
 - `TransformationHandler::chain_type()` defaulting to `ChainType::Evm`
 - `DecodedAccountState`, `AccountStateTrigger`, and `AccountStateHandler`
 - `TransformationContext.account_states` plus `extract_chain_address`, `extract_pubkey`, and account-state lookup helpers
 - `DecodedValue::ChainAddress(ChainAddress)` and canonical Solana pubkey rendering via `ChainAddress::Display`
-- registry chain-type filtering and account-state handler indices
-- runtime / engine / executor / finalizer / live-state account-state plumbing
+- `DbValue::Pubkey`, `LiveDbValue::Pubkey`
+- Registry chain-type filtering and account-state handler indices
+- Runtime / engine / executor / finalizer / live-state account-state plumbing
+- `LogPosition::sort_key()` and `LogPosition::packed_ordinal_i64()` for BIGINT-backed storage
+- `BIGINT` widening for persisted `log_index` columns
+- `serde-big-array` support for serializing `[u8; 64]` in `TxId::Solana`
 - UTF-8-safe RPC error truncation
-- a follow-up fix so EVM "stuck pending event" warnings still key off expected completions
 
-Not yet implemented on this branch:
-- `DbValue::Pubkey` / `LiveDbValue::Pubkey`
-- generalized `DecodedEvent` / `DecodedCall`
+Not yet implemented:
+- Generalized `DecodedEvent` / `DecodedCall`
 - `ChainServices` wiring in `TransformationContext` (only a placeholder enum exists)
 - Solana config types such as `programs`, `idl_path`, or account-read config
 - `main.rs` chain-type dispatch or a real Solana pipeline
 - Solana RPC, raw-data, decoding, and live modules under `src/solana/`
 
-Practical implication:
-- `chain_type: solana` is parsed and used for handler filtering, but it does not yet activate Solana collection, decoding, or live processing.
+Practical implication: `chain_type: solana` is parsed and used for handler filtering, but it does not yet activate Solana collection, decoding, or live processing.
 
 ---
 
@@ -72,13 +73,7 @@ pub enum ChainType { Evm, Solana }
 
 ### 1b. Extend `DecodedValue` for chain-aware addresses (`src/types/decoded.rs`)
 
-The original plan proposed a dedicated `Pubkey([u8; 32])` variant. This branch instead adds:
-
-```rust
-DecodedValue::ChainAddress(ChainAddress)
-```
-
-alongside existing `Address([u8; 20])` so bincode ordinals for legacy variants remain stable while handlers gain:
+`DecodedValue::ChainAddress(ChainAddress)` added alongside existing `Address([u8; 20])` to preserve bincode ordinals for legacy variants. Handlers gain:
 - `as_chain_address() -> Option<ChainAddress>`
 - `as_pubkey() -> Option<[u8; 32]>`
 - `extract_chain_address(...)`
@@ -87,8 +82,6 @@ alongside existing `Address([u8; 20])` so bincode ordinals for legacy variants r
 ### 1c. Add `Pubkey([u8; 32])` to `DbValue` (`src/db/types.rs`)
 
 Wire through `db_value_to_param` in `src/db/pool.rs` as 32-byte BYTEA. Same for `LiveDbValue` in `src/live/types.rs`.
-
-Status on this branch: not implemented.
 
 ### 1d. Add `extract_pubkey` to `FieldExtractor` (`src/transformations/context.rs`)
 
@@ -100,7 +93,7 @@ Also add `extract_chain_address` for generic address extraction.
 
 ### 1e. Add `chain_type()` to `TransformationHandler` trait (`src/transformations/traits.rs`)
 
-The branch adds this as a defaulted method so existing EVM handlers need no changes:
+Defaulted method so existing EVM handlers need no changes:
 ```rust
 fn chain_type(&self) -> ChainType;
 ```
@@ -139,7 +132,7 @@ pub enum ChainServices {
 }
 ```
 
-Status on this branch: a placeholder `ChainServices::Evm` enum exists, but the context still uses the existing `rpc` and `contracts` fields in production code.
+Status: a placeholder `ChainServices::Evm` enum exists, but the context still uses `rpc` and `contracts` fields in production code.
 
 **Files modified**: `src/types/decoded.rs`, `src/types/chain.rs` (new), `src/types/mod.rs`, `src/db/types.rs`, `src/db/pool.rs`, `src/live/types.rs`, `src/transformations/context.rs`, `src/transformations/traits.rs`
 
@@ -414,7 +407,7 @@ Three functions mirroring EVM:
 
 ### 7b. Dispatch in `main.rs`
 
-Target end-state only; not yet implemented on this branch.
+Not yet implemented.
 
 ```rust
 match chain.chain_type() {
@@ -500,11 +493,13 @@ borsh = { version = "1.5", optional = true }
 bs58 = { version = "0.5", optional = true }
 ```
 
+Current branch note: `serde-big-array = "0.5"` has landed for `TxId::Solana`. The Solana feature flag and runtime crates above are planned work.
+
 ---
 
 ## Implementation Order
 
-1. **Phase 1** — additive type changes, new traits, ChainServices (no breakage)
+1. **Phase 1** — additive type changes, new traits, ChainServices (no breakage). Mostly complete: types, values, traits, registry, and runtime plumbing landed. `ChainServices` is placeholder only.
 2. **Phase 2** — migrate `DecodedEvent`/`DecodedCall` (mechanical updates across ~40 files)
 3. **Phase 3** — config extensions (+ discovery config)
 4. **Phase 4** — Solana RPC client

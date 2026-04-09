@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS _call_revert_log (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,
     block_number BIGINT NOT NULL,
-    log_index INTEGER,
+    log_index BIGINT,
     source_name VARCHAR(255) NOT NULL,
     function_name VARCHAR(255) NOT NULL,
     target_address BYTEA NOT NULL,

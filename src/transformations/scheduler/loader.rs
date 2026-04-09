@@ -529,7 +529,7 @@ impl CallDepScanner {
                         )?;
                         continue;
                     }
-                    if !path.extension().is_some_and(|ext| ext == "parquet") {
+                    if path.extension().is_none_or(|ext| ext != "parquet") {
                         continue;
                     }
                     let Some((range_start, range_end_inclusive)) =

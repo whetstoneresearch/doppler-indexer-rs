@@ -1651,7 +1651,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
         // H. No-op optimization: if contract-index gate fell through but no slots were
         // queued for this collection and the parquet already exists, just write the
         // missing contract_index.json and skip the parquet rewrite.
-        let has_results = results_by_address.as_ref().map_or(false, |r| !r.is_empty());
+        let has_results = results_by_address.as_ref().is_some_and(|r| !r.is_empty());
         if !has_results
             && has_existing_file
             && missing_fn_names.is_empty()

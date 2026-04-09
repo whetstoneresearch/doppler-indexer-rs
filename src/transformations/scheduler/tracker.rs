@@ -476,7 +476,7 @@ impl CompletionTracker {
             let watermarks = self.contiguous_watermarks.read().await;
             for dep in contiguous_deps {
                 let watermark = watermarks.get(dep).copied().flatten();
-                if !watermark.is_some_and(|w| w >= range_start) {
+                if watermark.is_none_or(|w| w < range_start) {
                     return DepState::Waiting;
                 }
             }

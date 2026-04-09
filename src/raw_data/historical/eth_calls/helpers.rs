@@ -239,10 +239,8 @@ pub(crate) async fn check_factory_once_file_state(
                     get_missing_contracts(&ci, &rk, expected).is_empty()
                 }
             };
-            let factory_addr_count =
-                unique_factory_address_count(factory_data, collection_name);
-            let rows_complete =
-                factory_addr_count == 0 || state.row_count >= factory_addr_count;
+            let factory_addr_count = unique_factory_address_count(factory_data, collection_name);
+            let rows_complete = factory_addr_count == 0 || state.row_count >= factory_addr_count;
 
             if index_complete && rows_complete {
                 return Ok(None);
@@ -336,12 +334,8 @@ pub(crate) async fn write_empty_once_file(
     all_fn_names: &[String],
 ) -> Result<(), EthCallCollectionError> {
     tokio::fs::create_dir_all(sub_dir).await?;
-    write_once_results_to_parquet_async(
-        vec![],
-        output_path.to_path_buf(),
-        all_fn_names.to_vec(),
-    )
-    .await?;
+    write_once_results_to_parquet_async(vec![], output_path.to_path_buf(), all_fn_names.to_vec())
+        .await?;
     update_column_index(sub_dir, file_name, all_fn_names).await
 }
 

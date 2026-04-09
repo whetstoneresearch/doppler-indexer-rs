@@ -264,7 +264,7 @@ RPC concurrency, rate limiting, and batch size are configured per chain in the `
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `rpc.concurrency` | 100 | Max concurrent in-flight RPC requests across all collectors |
-| `rpc.compute_units_per_second` | 7500 | Alchemy compute units per second (match your plan) |
+| `rpc.requests_per_second` | 7500 | Generic rate-limit units per second. For standard providers this is requests/sec; for Alchemy-like providers it is CU/sec |
 | `rpc.batch_size` | 100 | Max batch size for RPC requests (fallback: `raw_data_collection.rpc_batch_size`) |
 
 ```json
@@ -273,7 +273,7 @@ RPC concurrency, rate limiting, and batch size are configured per chain in the `
     "name": "base",
     "rpc": {
       "concurrency": 500,
-      "compute_units_per_second": 7500,
+      "requests_per_second": 7500,
       "batch_size": 100
     }
   }]

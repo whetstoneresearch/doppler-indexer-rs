@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS liquidity_deltas (
     chain_id        BIGINT NOT NULL,
     pool_id         BYTEA NOT NULL,
     block_number    BIGINT NOT NULL,
-    log_index       INT NOT NULL,
+    log_index       BIGINT NOT NULL,
     tick_lower      INT NOT NULL,
     tick_upper      INT NOT NULL,
     liquidity_delta NUMERIC NOT NULL,

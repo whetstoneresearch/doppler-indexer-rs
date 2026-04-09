@@ -316,6 +316,7 @@ pub enum LiveDbValue {
     Json(String),  // JSON stored as string for bincode
     JsonB(String), // JSONB stored as string for bincode
     Float64(f64),
+    Pubkey([u8; 32]),
 }
 
 /// Snapshot of a row before modification, for reorg rollback.
@@ -351,6 +352,7 @@ impl LiveDbValue {
             DbValue::VarChar(v) => LiveDbValue::VarChar(v.clone()),
             DbValue::Bytes(v) => LiveDbValue::Bytes(v.clone()),
             DbValue::Address(v) => LiveDbValue::Address(*v),
+            DbValue::Pubkey(v) => LiveDbValue::Pubkey(*v),
             DbValue::Bytes32(v) => LiveDbValue::Bytes32(*v),
             DbValue::Numeric(v) => LiveDbValue::Numeric(v.clone()),
             DbValue::Timestamp(v) => LiveDbValue::Timestamp(*v),
@@ -374,6 +376,7 @@ impl LiveDbValue {
             LiveDbValue::VarChar(v) => DbValue::VarChar(v.clone()),
             LiveDbValue::Bytes(v) => DbValue::Bytes(v.clone()),
             LiveDbValue::Address(v) => DbValue::Address(*v),
+            LiveDbValue::Pubkey(v) => DbValue::Pubkey(*v),
             LiveDbValue::Bytes32(v) => DbValue::Bytes32(*v),
             LiveDbValue::Numeric(v) => DbValue::Numeric(v.clone()),
             LiveDbValue::Timestamp(v) => DbValue::Timestamp(*v),

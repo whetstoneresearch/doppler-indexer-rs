@@ -1,19 +1,23 @@
 # Solana Support: Codebase Analysis
 
-## Update From Branch Commits
+## Branch Status
 
-This analysis predated the current `feat/solana-phase1-traits` implementation work. The branch has now landed some of the proposed groundwork:
+This branch combines groundwork from both `feat/solana-phase1-data-types` and `feat/solana-support`.
 
-- `ChainType` is part of chain config and feeds chain-filtered handler registration.
-- `TransformationHandler::chain_type()`, `DecodedAccountState`, `AccountStateHandler`, and registry account-state indices are implemented.
-- The transformation runtime now has account-state message/context plumbing.
-- `DecodedValue` did not gain a dedicated `Pubkey` variant; the branch uses `DecodedValue::ChainAddress(ChainAddress)` instead.
+Implemented:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `ChainType` in chain config with chain-filtered handler registration
+- `TransformationHandler::chain_type()`, `DecodedAccountState`, `AccountStateHandler`, and registry account-state indices
+- Transformation runtime account-state message/context plumbing
+- `DecodedValue::ChainAddress(ChainAddress)` for chain-aware address/pubkey values
+- `DbValue::Pubkey`, `LiveDbValue::Pubkey`
+- `FieldExtractor::extract_pubkey()` and `extract_chain_address()`
+- Lossless Solana position packing via `LogPosition::packed_ordinal_i64()`
+- `BIGINT` widening for persisted `log_index` columns
 
 Still not landed:
-
-- `DbValue::Pubkey` / `LiveDbValue::Pubkey`
 - `ChainServices` wiring in `TransformationContext`
-- generalized `DecodedEvent` / `DecodedCall`
+- Generalized `DecodedEvent` / `DecodedCall`
 - `main.rs` dispatch by chain type
 - Solana RPC / raw-data / decoding / live modules
 
@@ -122,17 +126,17 @@ Read the tables below as target analysis plus branch notes, not a literal invent
 
 | Component | Chain-agnostic? | Changes needed |
 |---|---|---|
-| `TransformationHandler` trait | **Yes** | `chain_type()` has now landed; it defaults to `Evm` and is used for registry filtering |
-| `EventHandler` / `EthCallHandler` traits | **Yes** | Solana event handlers implement `EventHandler`. New `AccountStateHandler` trait for Solana account reads (not shoehorned into `EthCallHandler`) |
-| `TransformationRegistry` | **Yes** | `account_state_handlers` and chain-type validation have now landed |
-| `engine.rs` | **Yes** | Branch now includes account-state channel/message plumbing; Solana producers are still missing |
+| `TransformationHandler` trait | **Yes** | `chain_type()` landed; defaults to `Evm`, used for registry filtering |
+| `EventHandler` / `EthCallHandler` traits | **Yes** | Solana event handlers implement `EventHandler`. `AccountStateHandler` trait landed for Solana account reads |
+| `TransformationRegistry` | **Yes** | `account_state_handlers` and chain-type validation landed |
+| `engine.rs` | **Yes** | Account-state channel/message plumbing landed; Solana producers still missing |
 | `scheduler/dag.rs` | **Yes** | No changes needed |
-| `TransformationContext` | **Partially** | Branch adds `account_states` plus account-state extractors/helpers. `ChainServices` is still only a placeholder; `rpc` and `contracts` remain in use |
-| `DecodedValue` enum | **No** | Branch adds `ChainAddress(ChainAddress)` rather than a dedicated `Pubkey([u8; 32])` variant |
+| `TransformationContext` | **Partially** | `account_states` plus extractors/helpers landed. `ChainServices` is still only a placeholder; `rpc` and `contracts` remain in use |
+| `DecodedValue` enum | **No** | `ChainAddress(ChainAddress)` variant added (preserves bincode ordinals). `DbValue::Pubkey` and `LiveDbValue::Pubkey` also landed |
 | Handler implementations (v3/, v4/) | **No** | These stay as EVM handlers. Write new Solana-specific handlers |
 | `util/` (tick_math, sanitize, etc.) | **No** | EVM/Uniswap-specific. Solana handlers get their own utils |
 
-**Approach:** The trait system and DAG scheduler remain the shared core. This branch has already landed `DecodedAccountState`, `AccountStateHandler`, and account-state engine plumbing. `DecodedEvent` and `DecodedCall` have not yet been generalized with `ChainAddress`/`TxId`/`LogPosition`; that is still future work.
+**Approach:** The trait system and DAG scheduler remain the shared core. `DecodedAccountState`, `AccountStateHandler`, and account-state engine plumbing have landed. `DecodedEvent` and `DecodedCall` have not yet been generalized with `ChainAddress`/`TxId`/`LogPosition`; that is still future work.
 
 ---
 
@@ -180,7 +184,7 @@ Read the tables below as target analysis plus branch notes, not a literal invent
 
 **Cross-chain table compatibility:** The existing schema is more portable than it appears. Every table has `chain_id`, all address columns use variable-length `BYTEA` (not `BYTEA(20)`), and `tx_hash` columns are also `BYTEA`. A Solana handler can write 32-byte pubkeys to the same `tokens.address` column that holds 20-byte EVM addresses. Cross-chain queries like `SELECT * FROM tokens WHERE symbol = 'USDC'` return results from both chains.
 
-Protocol-specific columns (`is_derc20`, `graduation_tick`, `migration_pool`, etc.) are already nullable in most cases and would simply be NULL for Solana rows. For `log_index INT` columns (e.g., `liquidity_deltas`), Solana stores the packed ordinal from `LogPosition::ordinal()`.
+Protocol-specific columns (`is_derc20`, `graduation_tick`, `migration_pool`, etc.) are already nullable in most cases and would simply be NULL for Solana rows. For `log_index`-style ordering columns, Solana uses `BIGINT` packed ordinals via `LogPosition::packed_ordinal_i64()`. Existing `INT` columns have been widened to `BIGINT` to support lossless Solana packing.
 
 Solana handlers should write to the **same canonical tables** (tokens, pools, swaps, pool_state, etc.) with appropriate `chain_id`. Protocol-specific extensions (e.g., Orca-specific pool metadata) go in separate handler-owned tables that JOIN to the canonical ones. This enables unified cross-chain querying from day one.
 
@@ -205,6 +209,8 @@ Solana handlers should write to the **same canonical tables** (tokens, pools, sw
 | `alloy` + `alloy-primitives` | Keep for EVM. Add behind `evm` feature flag |
 | None for Solana | Add `solana-sdk`, `solana-client`, `solana-transaction-status`, `anchor-lang` (for IDL parsing), `borsh` |
 | Feature flags | Add `features = ["evm", "solana"]` with `default = ["evm", "solana"]` |
+
+Current branch note: `serde-big-array = "0.5"` has been added for `TxId::Solana` serde. Solana runtime crates and feature flags are still future work.
 
 ---
 

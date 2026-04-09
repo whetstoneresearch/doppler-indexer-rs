@@ -57,6 +57,14 @@ impl IndexerConfig {
 
         // Validate rate limit group references
         for chain in &chains {
+            if chain.rpc.requests_per_second.is_some()
+                && chain.rpc.compute_units_per_second.is_some()
+            {
+                anyhow::bail!(
+                    "Chain '{}' has both requests_per_second and compute_units_per_second; use requests_per_second going forward",
+                    chain.name
+                );
+            }
             if let Some(ref group_name) = chain.rpc.rate_limit_group {
                 let valid = rpc_rate_limits
                     .as_ref()
@@ -68,10 +76,9 @@ impl IndexerConfig {
                     );
                 }
             }
-            if chain.rpc.rate_limit_group.is_some() && chain.rpc.compute_units_per_second.is_some()
-            {
+            if chain.rpc.rate_limit_group.is_some() && chain.rpc.has_explicit_rate_limit() {
                 anyhow::bail!(
-                    "Chain '{}' has both rate_limit_group and compute_units_per_second; the group defines the rate budget",
+                    "Chain '{}' has both rate_limit_group and an explicit per-chain rate limit; the group defines the rate budget",
                     chain.name
                 );
             }

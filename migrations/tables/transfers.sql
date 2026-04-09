@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS transfers (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,
     block_number BIGINT NOT NULL,
-    log_index INT NOT NULL,
+    log_index BIGINT NOT NULL,
     "timestamp" TIMESTAMPTZ NOT NULL,
     token BYTEA NOT NULL,
     "from" BYTEA NOT NULL,
