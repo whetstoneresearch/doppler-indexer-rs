@@ -1,4 +1,9 @@
 {
+    "rpc_rate_limits": {
+        "alchemy": {
+            "units_per_second": 7500
+        }
+    },
     "chains": [
         {
             "name": "base",
@@ -7,7 +12,8 @@
             "ws_url_env_var": "BASE_WS_URL",
             "start_block": 26602741,
             "contracts": "contracts/base",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         },
         {
             "name": "mainnet",
@@ -16,7 +22,8 @@
             "ws_url_env_var": "MAINNET_WS_URL",
             "start_block": 21781000,
             "contracts": "contracts/mainnet",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         },
         {
             "name": "unichain",
@@ -25,7 +32,8 @@
             "ws_url_env_var": "UNICHAIN_WS_URL",
             "start_block": 8536880,
             "contracts": "contracts/unichain",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         },
         {
             "name": "ink",
@@ -34,7 +42,8 @@
             "ws_url_env_var": "INK_WS_URL",
             "start_block": 9508011,
             "contracts": "contracts/ink",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         },
         {
             "name": "monad",
@@ -52,7 +61,8 @@
             "ws_url_env_var": "SEPOLIA_WS_URL",
             "start_block": 10134362,
             "contracts": "contracts/sepolia",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         },
         {
             "name": "baseSepolia",
@@ -61,7 +71,8 @@
             "ws_url_env_var": "BASE_SEPOLIA_WS_URL",
             "start_block": 28109000,
             "contracts": "contracts/baseSepolia",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         }
     ],
     "raw_data_collection": {
@@ -102,11 +113,12 @@
     },
     "transformations": {
         "database_url_env_var": "DATABASE_URL",
+        "db_pool_size": 48,
         "mode": {
             "batch_for_catchup": true,
             "catchup_batch_size": 10000
         },
-        "handler_concurrency": 4,
+        "handler_concurrency": 48,
         "max_batch_size": 1000
     }
 }

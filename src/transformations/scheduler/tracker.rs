@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Notify, RwLock};
 
 /// In-memory state of per-`(handler_name, range_start)` completion/failure.
 ///
@@ -34,8 +34,8 @@ use tokio::sync::{Mutex, Notify};
 /// [`WorkItem`]: super::dag::WorkItem
 /// [`wait_ready`]: CompletionTracker::wait_ready
 pub(crate) struct CompletionTracker {
-    completed: Mutex<HashMap<String, HashSet<u64>>>,
-    failed: Mutex<HashMap<String, HashSet<u64>>>,
+    completed: RwLock<HashMap<String, HashSet<u64>>>,
+    failed: RwLock<HashMap<String, HashSet<u64>>>,
     notify: Notify,
 }
 
@@ -63,8 +63,8 @@ pub(crate) struct DepFailed {
 impl CompletionTracker {
     pub(crate) fn new() -> Self {
         Self {
-            completed: Mutex::new(HashMap::new()),
-            failed: Mutex::new(HashMap::new()),
+            completed: RwLock::new(HashMap::new()),
+            failed: RwLock::new(HashMap::new()),
             notify: Notify::new(),
         }
     }
@@ -79,7 +79,7 @@ impl CompletionTracker {
         ranges: impl IntoIterator<Item = u64>,
     ) {
         {
-            let mut completed = self.completed.lock().await;
+            let mut completed = self.completed.write().await;
             let entry = completed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new);
@@ -94,7 +94,7 @@ impl CompletionTracker {
     pub(crate) async fn probe(&self, deps: &[String], range_start: u64) -> DepState {
         // Check failed first so a failed dep is reported even if others are completed.
         {
-            let failed = self.failed.lock().await;
+            let failed = self.failed.read().await;
             for dep in deps {
                 if failed
                     .get(dep)
@@ -107,7 +107,7 @@ impl CompletionTracker {
                 }
             }
         }
-        let completed = self.completed.lock().await;
+        let completed = self.completed.read().await;
         for dep in deps {
             let has = completed
                 .get(dep)
@@ -156,7 +156,7 @@ impl CompletionTracker {
     /// Mark `(handler_name, range_start)` as completed and wake all waiters.
     pub(crate) async fn mark_completed(&self, handler_name: &str, range_start: u64) {
         {
-            let mut completed = self.completed.lock().await;
+            let mut completed = self.completed.write().await;
             completed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
@@ -171,7 +171,7 @@ impl CompletionTracker {
     /// deps failed in a previous scheduler pass, avoiding wasted submissions
     /// that would immediately cascade-fail.
     pub(crate) async fn is_failed(&self, handler_name: &str, range_start: u64) -> bool {
-        let failed = self.failed.lock().await;
+        let failed = self.failed.read().await;
         failed
             .get(handler_name)
             .map(|ranges| ranges.contains(&range_start))
@@ -181,7 +181,7 @@ impl CompletionTracker {
     /// Mark `(handler_name, range_start)` as failed and wake all waiters.
     pub(crate) async fn mark_failed(&self, handler_name: &str, range_start: u64) {
         {
-            let mut failed = self.failed.lock().await;
+            let mut failed = self.failed.write().await;
             failed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
