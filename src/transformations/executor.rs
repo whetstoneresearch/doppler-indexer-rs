@@ -223,6 +223,17 @@ pub(crate) async fn run_handler_task(
 
     let ops = match handler.handle(&ctx).await {
         Ok(ops) => ops,
+        Err(TransformationError::TransientBlocked(msg)) => {
+            tracing::info!(
+                "Handler {} blocked for range {}-{}: {}",
+                handler_key,
+                range_start,
+                range_end,
+                msg
+            );
+            guard.failure("transient_blocked");
+            return Err(TransformationError::TransientBlocked(msg));
+        }
         Err(e) => {
             tracing::error!(
                 "Handler {} failed for range {}-{}: {}",

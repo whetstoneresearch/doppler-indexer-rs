@@ -83,7 +83,7 @@ pub enum DecoderMessage {
     LogsReady {
         range_start: u64,
         range_end: u64,
-        logs: Vec<LogData>,
+        logs: std::sync::Arc<Vec<LogData>>,
         /// If true, write to live bincode storage instead of parquet
         live_mode: bool,
         /// If true, decoder should wait for FactoryAddresses before processing

@@ -105,7 +105,7 @@ impl EventHandler for DecayMulticurveSwapMetricsHandler {
         vec![(SOURCE.to_string(), "getSlot0".to_string())]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V4DecayMulticurveCreateHandler"]
     }
 }
@@ -151,7 +151,7 @@ impl EventHandler for DecayMulticurveLiquidityMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V4DecayMulticurveCreateHandler"]
     }
 }

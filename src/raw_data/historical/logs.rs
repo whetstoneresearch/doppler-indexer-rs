@@ -135,29 +135,42 @@ pub(crate) async fn process_completed_range(
         );
     }
 
-    // Send logs to decoder before processing (decoder will receive them for live decoding)
+    // Send logs to decoder before processing (decoder will receive them for decoding).
+    // Wrap in Arc so we can share without cloning when process_range also needs ownership.
     if let Some(tx) = decoder_tx {
+        let logs = std::sync::Arc::new(logs);
         let _ = tx
             .send(DecoderMessage::LogsReady {
                 range_start,
                 range_end,
-                logs: logs.clone(),
+                logs: std::sync::Arc::clone(&logs),
                 live_mode: false,            // Historical mode: write to parquet
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })
             .await;
-    }
 
-    process_range(
-        &range,
-        logs,
-        log_fields,
-        schema,
-        output_dir,
-        storage_manager,
-        chain_name,
-    )
-    .await
+        process_range(
+            &range,
+            logs.as_ref(),
+            log_fields,
+            schema,
+            output_dir,
+            storage_manager,
+            chain_name,
+        )
+        .await
+    } else {
+        process_range(
+            &range,
+            &logs,
+            log_fields,
+            schema,
+            output_dir,
+            storage_manager,
+            chain_name,
+        )
+        .await
+    }
 }
 
 pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
@@ -179,7 +192,7 @@ pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 
 
 pub(crate) async fn process_range(
     range: &BlockRange,
-    logs: Vec<LogData>,
+    logs: &[LogData],
     log_fields: &Option<Vec<LogField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
@@ -194,20 +207,21 @@ pub(crate) async fn process_range(
     );
 
     let write_start = Instant::now();
+    let log_count = logs.len();
     match log_fields {
         Some(fields) => {
-            let records: Vec<MinimalLogRecord> = logs
-                .into_iter()
-                .map(|l| MinimalLogRecord {
+            let mut records: Vec<MinimalLogRecord> = Vec::with_capacity(log_count);
+            for l in logs {
+                records.push(MinimalLogRecord {
                     block_number: l.block_number,
                     block_timestamp: l.block_timestamp,
                     transaction_hash: l.transaction_hash.0,
                     log_index: l.log_index,
                     address: l.address,
-                    topics: l.topics,
-                    data: l.data,
-                })
-                .collect();
+                    topics: l.topics.clone(),
+                    data: l.data.clone(),
+                });
+            }
             let output_path = output_dir.join(range.file_name("logs"));
             write_minimal_logs_to_parquet_async(
                 records,
@@ -218,18 +232,18 @@ pub(crate) async fn process_range(
             .await?;
         }
         None => {
-            let records: Vec<FullLogRecord> = logs
-                .into_iter()
-                .map(|l| FullLogRecord {
+            let mut records: Vec<FullLogRecord> = Vec::with_capacity(log_count);
+            for l in logs {
+                records.push(FullLogRecord {
                     block_number: l.block_number,
                     block_timestamp: l.block_timestamp,
                     transaction_hash: l.transaction_hash.0,
                     log_index: l.log_index,
                     address: l.address,
-                    topics: l.topics,
-                    data: l.data,
-                })
-                .collect();
+                    topics: l.topics.clone(),
+                    data: l.data.clone(),
+                });
+            }
             let output_path = output_dir.join(range.file_name("logs"));
             write_full_logs_to_parquet_async(records, schema.clone(), output_path).await?;
         }

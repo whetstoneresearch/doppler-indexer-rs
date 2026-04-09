@@ -431,9 +431,185 @@ impl CatchupLoader {
     }
 }
 
+// ─── CallDepScanner ────────────────────────────────────────────────────────
+
+use std::collections::HashSet;
+
+use crate::storage::contract_index::build_expected_factory_contracts_for_range;
+use crate::transformations::engine::call_dependency_contract_index_complete;
+use crate::transformations::scheduler::tracker::CompletionTracker;
+
+/// Standalone call-dependency file scanner.
+///
+/// Periodically scans the decoded-calls directory for each unique `(source,
+/// function)` pair to discover which parquet ranges are available on disk.
+/// Registers newly-found ranges with the [`CompletionTracker`] so that
+/// `wait_ready_extended` can unblock items whose call deps have arrived.
+pub(crate) struct CallDepScanner {
+    decoded_calls_dir: PathBuf,
+    raw_eth_calls_dir: PathBuf,
+    contracts: Arc<Contracts>,
+    /// Unique `(source, function)` pairs to scan for.
+    call_dep_pairs: Vec<(String, String)>,
+}
+
+impl CallDepScanner {
+    pub(crate) fn new(
+        decoded_calls_dir: PathBuf,
+        raw_eth_calls_dir: PathBuf,
+        contracts: Arc<Contracts>,
+        call_dep_pairs: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            decoded_calls_dir,
+            raw_eth_calls_dir,
+            contracts,
+            call_dep_pairs,
+        }
+    }
+
+    /// Scan all `(source, function)` pairs and return available ranges.
+    pub(crate) async fn scan_all(&self) -> HashMap<(String, String), HashSet<(u64, u64)>> {
+        let mut results = HashMap::new();
+        for (source, function) in &self.call_dep_pairs {
+            match self.scan_one(source, function).await {
+                Ok(ranges) => {
+                    if !ranges.is_empty() {
+                        results.insert((source.clone(), function.clone()), ranges);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Call-dep scan failed for {}/{}: {}", source, function, e);
+                }
+            }
+        }
+        results
+    }
+
+    /// Scan one `(source, function)` pair for available decoded call parquet files.
+    ///
+    /// This is the same logic as `TransformationEngine::scan_available_call_dependency_ranges`
+    /// but extracted to avoid borrowing `&self` across a spawn boundary.
+    async fn scan_one(
+        &self,
+        source: &str,
+        function_name: &str,
+    ) -> Result<HashSet<(u64, u64)>, std::io::Error> {
+        let source = source.to_string();
+        let function_name = function_name.to_string();
+        let decoded_base = self.decoded_calls_dir.join(&source).join(&function_name);
+        let raw_base = self.raw_eth_calls_dir.join(&source).join(&function_name);
+        let contracts = self.contracts.clone();
+
+        tokio::task::spawn_blocking(move || {
+            fn scan_recursive(
+                dir: &Path,
+                decoded_base: &Path,
+                raw_base: &Path,
+                source: &str,
+                function_name: &str,
+                contracts: &Contracts,
+                ranges: &mut HashSet<(u64, u64)>,
+            ) -> std::io::Result<()> {
+                if !dir.exists() {
+                    return Ok(());
+                }
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan_recursive(
+                            &path,
+                            decoded_base,
+                            raw_base,
+                            source,
+                            function_name,
+                            contracts,
+                            ranges,
+                        )?;
+                        continue;
+                    }
+                    if !path.extension().is_some_and(|ext| ext == "parquet") {
+                        continue;
+                    }
+                    let Some((range_start, range_end_inclusive)) =
+                        crate::storage::paths::parse_range_from_filename(&path)
+                    else {
+                        continue;
+                    };
+                    let range_end = range_end_inclusive + 1;
+                    let expected = build_expected_factory_contracts_for_range(contracts, range_end);
+                    let parent_dir = path.parent().unwrap_or(decoded_base);
+                    let relative_parent = parent_dir
+                        .strip_prefix(decoded_base)
+                        .ok()
+                        .filter(|rel| !rel.as_os_str().is_empty());
+                    let raw_index_dir = match relative_parent {
+                        Some(rel) => raw_base.join(rel),
+                        None => raw_base.to_path_buf(),
+                    };
+                    if !call_dependency_contract_index_complete(
+                        &raw_index_dir,
+                        source,
+                        range_start,
+                        range_end,
+                        &expected,
+                    ) {
+                        continue;
+                    }
+                    ranges.insert((range_start, range_end));
+                }
+                Ok(())
+            }
+
+            let mut ranges = HashSet::new();
+            if !decoded_base.exists() {
+                return Ok(ranges);
+            }
+            scan_recursive(
+                &decoded_base,
+                &decoded_base,
+                &raw_base,
+                &source,
+                &function_name,
+                contracts.as_ref(),
+                &mut ranges,
+            )?;
+            Ok(ranges)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+}
+
+/// Background scanner loop that periodically discovers call-dep files and
+/// registers them with the tracker.
+///
+/// The loop runs until the `cancel` watch receives `true`, or the task is
+/// aborted. Callers typically abort the returned `JoinHandle` when catchup
+/// finishes.
+pub(crate) async fn run_call_dep_scanner_loop(
+    scanner: CallDepScanner,
+    tracker: Arc<CompletionTracker>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let results = scanner.scan_all().await;
+        for ((source, func), ranges) in results {
+            tracker
+                .register_call_dep_ranges(&source, &func, ranges)
+                .await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+            _ = cancel.changed() => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem};
+    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
     use super::super::tracker::CompletionTracker;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -469,7 +645,7 @@ mod tests {
 
         fn runner(
             self: &Arc<Self>,
-        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = WorkItemRunResult> + Send>>
                + Send
                + Sync
                + Clone
@@ -496,9 +672,12 @@ mod tests {
                     ));
 
                     if rec.fail_on.contains(&key) {
-                        Err(format!("test-forced failure at {}:{}", key.0, key.1))
+                        WorkItemRunResult::Failed(format!(
+                            "test-forced failure at {}:{}",
+                            key.0, key.1
+                        ))
                     } else {
-                        Ok(())
+                        WorkItemRunResult::Succeeded
                     }
                 })
             }
@@ -511,6 +690,8 @@ mod tests {
             range_start,
             range_end: range_start + 1000,
             dep_names: deps.iter().map(|s| s.to_string()).collect(),
+            contiguous_dep_names: Vec::new(),
+            call_dep_keys: Vec::new(),
             sequential: false,
             payload: Box::new(()),
         }

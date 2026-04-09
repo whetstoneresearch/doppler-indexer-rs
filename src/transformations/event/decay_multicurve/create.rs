@@ -46,7 +46,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
     }
 
     fn requires_sequential(&self) -> bool {
-        true
+        false
     }
 
     async fn handle(

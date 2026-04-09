@@ -134,10 +134,16 @@ fn truncate_error_segment(msg: &str, max_bytes: usize) -> String {
 /// Individual segments are truncated to keep logs readable.
 /// Use `error_chain_full` when you need the complete untruncated output.
 pub fn error_chain(err: &dyn std::error::Error) -> String {
-    let mut chain = vec![truncate_error_segment(&err.to_string(), ERROR_SEGMENT_MAX_LEN)];
+    let mut chain = vec![truncate_error_segment(
+        &err.to_string(),
+        ERROR_SEGMENT_MAX_LEN,
+    )];
     let mut source = err.source();
     while let Some(s) = source {
-        chain.push(truncate_error_segment(&s.to_string(), ERROR_SEGMENT_MAX_LEN));
+        chain.push(truncate_error_segment(
+            &s.to_string(),
+            ERROR_SEGMENT_MAX_LEN,
+        ));
         source = s.source();
     }
     chain.join(": ")
@@ -474,8 +480,7 @@ fn build_provider(url: &Url) -> Result<RootProvider<Ethereum>, RpcError> {
         .timeout(RPC_HTTP_TIMEOUT)
         .build()
         .map_err(|e| RpcError::Transport(format!("failed to build HTTP client: {e}")))?;
-    let rpc_client =
-        alloy::rpc::client::RpcClient::new_http_with_client(client, url.clone());
+    let rpc_client = alloy::rpc::client::RpcClient::new_http_with_client(client, url.clone());
     Ok(RootProvider::<Ethereum>::new(rpc_client))
 }
 

@@ -10,6 +10,11 @@ use crate::transformations::{DecodedEvent, TransformationContext, Transformation
 use crate::types::shared::metadata::{AssetTokenMetadata, TokenMetadata};
 use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
+fn should_block_for_missing_metadata(msg: &str) -> bool {
+    msg.starts_with("No DERC20 'once' call found")
+        || msg.starts_with("No Numeraires 'once' call found")
+}
+
 pub async fn get_metadata(
     asset: &[u8; 20],
     numeraire: &[u8; 20],
@@ -219,6 +224,16 @@ pub async fn get_metadata_or_skip(
 ) -> Result<Option<(AssetTokenMetadata, TokenMetadata)>, TransformationError> {
     match get_metadata(asset, numeraire, event, ctx).await {
         Ok(m) => Ok(Some(m)),
+        Err(TransformationError::MissingData(msg)) if should_block_for_missing_metadata(&msg) => {
+            tracing::info!(
+                asset = %Address::from(asset),
+                numeraire = %Address::from(numeraire),
+                block = event.block_number,
+                "Deferring create event until metadata is available: {}",
+                msg
+            );
+            Err(TransformationError::TransientBlocked(msg))
+        }
         Err(
             TransformationError::MissingData(msg)
             | TransformationError::IncludesPrecompileError(msg),
@@ -243,5 +258,27 @@ pub async fn get_metadata_or_skip(
             Ok(None)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_block_for_missing_metadata;
+
+    #[test]
+    fn once_call_misses_are_retryable() {
+        assert!(should_block_for_missing_metadata(
+            "No DERC20 'once' call found for asset 0x0 at block 1 tx 0x0. Available calls: []"
+        ));
+        assert!(should_block_for_missing_metadata(
+            "No Numeraires 'once' call found for numeraire 0x0 at block 1 tx 0x0. Available calls: []"
+        ));
+    }
+
+    #[test]
+    fn malformed_metadata_stays_terminal() {
+        assert!(!should_block_for_missing_metadata(
+            "asset 0x0 missing field 'symbol' at block 1 tx 0x0. Available fields: []"
+        ));
     }
 }

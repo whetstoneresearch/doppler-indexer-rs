@@ -105,7 +105,7 @@ impl EventHandler for DhookSwapMetricsHandler {
         vec![(SOURCE.to_string(), "getSlot0".to_string())]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["DopplerHookCreateHandler"]
     }
 }
@@ -151,7 +151,7 @@ impl EventHandler for DhookLiquidityMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["DopplerHookCreateHandler"]
     }
 }
