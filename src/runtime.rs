@@ -3,15 +3,22 @@
 //! This module provides unified setup for both full (historical + live) and
 //! live-only modes, ensuring consistent configuration and avoiding duplication.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinSet;
 
+use crate::cli::IndexerMode;
 use crate::db::DbPool;
-use crate::decoding::DecoderMessage;
+use crate::decoding::{self, decode_eth_calls, decode_logs, DecoderMessage};
 use crate::live::{LiveProgressTracker, TransformRetryRequest};
+use crate::raw_data::historical::catchup::blocks::collect_blocks;
+use crate::raw_data::historical::factories::{FactoryAddressData, FactoryMessage, RecollectRequest};
+use crate::raw_data::historical::receipts::{EventTriggerMessage, LogMessage};
 use crate::rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
+use crate::storage::{self, StorageManager};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::{
     build_registry_for_chain, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage,
@@ -22,6 +29,7 @@ use crate::types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_d
 use crate::types::config::eth_call::Frequency;
 use crate::types::config::indexer::IndexerConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::shared::repair::RepairScope;
 use crate::{has_items, optional_channel};
 
 /// Feature flags derived from chain configuration.
@@ -461,5 +469,464 @@ impl ChainRuntime {
         let mut cfg = base.clone();
         cfg.rpc_batch_size = Some(self.rpc_batch_size as u32);
         Arc::new(cfg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full pipeline context
+// ---------------------------------------------------------------------------
+
+/// Spawn a two-phase (catchup then current) stage into a JoinSet.
+///
+/// `catchup_fut` runs first and produces a state value.
+/// `current_fn` receives that state and returns a future for the current phase.
+///
+/// The current phase always runs, even in catch-up-only mode. In that mode,
+/// upstream senders (block_tx, eth_call_tx) are pre-dropped so the current
+/// phases see closed input channels and exit promptly — but they must still
+/// run to drain any work enqueued by the catchup phase (e.g. LogMessages)
+/// and write the corresponding output artifacts.
+pub fn spawn_two_phase_async<S, CatchupFut, CurrentFut, CurrentFn>(
+    tasks: &mut JoinSet<anyhow::Result<()>>,
+    catchup_fut: CatchupFut,
+    current_fn: CurrentFn,
+    stage_name: &'static str,
+) where
+    S: Send + 'static,
+    CatchupFut: Future<Output = anyhow::Result<S>> + Send + 'static,
+    CurrentFut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    CurrentFn: FnOnce(S) -> CurrentFut + Send + 'static,
+{
+    tasks.spawn(async move {
+        let state = catchup_fut
+            .await
+            .with_context(|| format!("{} catchup failed", stage_name))?;
+        current_fn(state)
+            .await
+            .with_context(|| format!("{} current phase failed", stage_name))?;
+        Ok(())
+    });
+}
+
+/// Bundles the shared state needed by the full (historical + live) pipeline.
+///
+/// Methods on this struct spawn collection/decoding stages into the provided
+/// `JoinSet`, consuming the channels they need and cloning shared state.
+pub struct FullPipelineContext {
+    pub runtime: ChainRuntime,
+    pub raw_config: Arc<RawDataCollectionConfig>,
+    pub storage_manager: Arc<StorageManager>,
+    pub mode: IndexerMode,
+    pub live_mode_enabled: bool,
+}
+
+impl FullPipelineContext {
+    pub fn chain(&self) -> &Arc<ChainConfig> {
+        &self.runtime.chain
+    }
+
+    pub fn s3_manifest(&self) -> Option<storage::S3Manifest> {
+        self.storage_manager.manifest_for(&self.chain().name)
+    }
+
+    /// Spawn the block collection stage.
+    pub fn spawn_blocks(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        blocks_client: UnifiedRpcClient,
+        block_tx: Option<mpsc::Sender<(u64, u64, Vec<alloy::primitives::B256>)>>,
+        eth_call_tx: Option<mpsc::Sender<(u64, u64)>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+        let s3_manifest = self.s3_manifest();
+        let sm = self.storage_manager.clone();
+        let catch_up_only = self.mode.is_catch_up_only();
+
+        tasks.spawn(async move {
+            collect_blocks(
+                &chain,
+                &blocks_client,
+                &cfg,
+                block_tx,
+                eth_call_tx,
+                s3_manifest.as_ref(),
+                Some(sm),
+                catch_up_only,
+            )
+            .await
+            .context("block collection failed")
+        });
+    }
+
+    /// Spawn the receipt collection stage (catchup + current).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_receipts(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        receipts_client: UnifiedRpcClient,
+        block_rx: mpsc::Receiver<(u64, u64, Vec<alloy::primitives::B256>)>,
+        log_tx: mpsc::Sender<LogMessage>,
+        factory_log_tx: Option<mpsc::Sender<LogMessage>>,
+        event_trigger_tx: Option<mpsc::Sender<EventTriggerMessage>>,
+        event_matchers: Vec<crate::raw_data::historical::receipts::EventTriggerMatcher>,
+        recollect_rx: Option<mpsc::Receiver<RecollectRequest>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+        let s3_manifest = self.s3_manifest();
+        let sm = self.storage_manager.clone();
+        let log_tx = Some(log_tx);
+        let receipts_client = Arc::new(receipts_client);
+
+        spawn_two_phase_async(
+            tasks,
+            {
+                let (chain, cfg, sm) = (chain.clone(), cfg.clone(), sm.clone());
+                let receipts_client = receipts_client.clone();
+                async move {
+                    let sm_for_current = sm.clone();
+                    crate::raw_data::historical::catchup::receipts::collect_receipts(
+                        &chain,
+                        &*receipts_client,
+                        &cfg,
+                        &log_tx,
+                        &factory_log_tx,
+                        &event_trigger_tx,
+                        &event_matchers,
+                        s3_manifest,
+                        Some(sm),
+                    )
+                    .await
+                    .context("receipt catchup failed")
+                    .map(|state| {
+                        (
+                            state,
+                            receipts_client,
+                            chain,
+                            cfg,
+                            log_tx,
+                            factory_log_tx,
+                            event_trigger_tx,
+                            event_matchers,
+                            recollect_rx,
+                            sm_for_current,
+                        )
+                    })
+                }
+            },
+            |args| {
+                let (
+                    catchup_state,
+                    receipts_client,
+                    chain,
+                    cfg,
+                    log_tx,
+                    factory_log_tx,
+                    event_trigger_tx,
+                    event_matchers,
+                    recollect_rx,
+                    sm,
+                ) = args;
+                async move {
+                    crate::raw_data::historical::current::receipts::collect_receipts(
+                        &chain,
+                        receipts_client,
+                        &cfg,
+                        block_rx,
+                        log_tx,
+                        factory_log_tx,
+                        event_trigger_tx,
+                        event_matchers,
+                        recollect_rx,
+                        catchup_state,
+                        Some(sm),
+                    )
+                    .await
+                    .context("receipt collection failed")
+                }
+            },
+            "receipts",
+        );
+    }
+
+    /// Spawn the log collection stage (catchup + current).
+    pub fn spawn_logs(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        log_rx: mpsc::Receiver<LogMessage>,
+        logs_factory_rx: Option<mpsc::Receiver<FactoryAddressData>>,
+        log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+        let s3_manifest = self.s3_manifest();
+        let sm = self.storage_manager.clone();
+
+        spawn_two_phase_async(
+            tasks,
+            {
+                let (chain, cfg) = (chain.clone(), cfg.clone());
+                async move {
+                    crate::raw_data::historical::catchup::logs::collect_logs(
+                        &chain,
+                        &cfg,
+                        s3_manifest,
+                        Some(sm),
+                    )
+                    .await
+                    .context("log catchup failed")
+                }
+            },
+            move |catchup_state| async move {
+                crate::raw_data::historical::current::logs::collect_logs(
+                    &chain,
+                    log_rx,
+                    logs_factory_rx,
+                    log_decoder_tx,
+                    catchup_state,
+                )
+                .await
+                .context("log collection failed")
+            },
+            "logs",
+        );
+    }
+
+    /// Spawn the eth_call collection stage (catchup + current).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_eth_calls(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        eth_calls_client: UnifiedRpcClient,
+        eth_call_rx: mpsc::Receiver<(u64, u64)>,
+        call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
+        eth_calls_factory_rx: Option<mpsc::Receiver<FactoryMessage>>,
+        event_trigger_rx: Option<mpsc::Receiver<EventTriggerMessage>>,
+        factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
+        eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+        let s3_manifest = self.s3_manifest();
+        let sm = self.storage_manager.clone();
+        let has_factory_rx = eth_calls_factory_rx.is_some();
+        let has_event_trigger_rx = event_trigger_rx.is_some();
+        let repair = self.mode.is_repair();
+        let repair_scope = self.mode.repair_scope().cloned();
+
+        spawn_two_phase_async(
+            tasks,
+            {
+                let (chain, cfg, sm) = (chain.clone(), cfg.clone(), sm.clone());
+                async move {
+                    let sm_for_current = sm.clone();
+                    crate::raw_data::historical::catchup::eth_calls::collect_eth_calls(
+                        &chain,
+                        &eth_calls_client,
+                        &cfg,
+                        repair,
+                        false,
+                        repair_scope.clone(),
+                        &call_decoder_tx,
+                        has_factory_rx,
+                        has_event_trigger_rx,
+                        factory_catchup_done_rx,
+                        eth_calls_catchup_done_tx,
+                        s3_manifest,
+                        Some(sm),
+                    )
+                    .await
+                    .context("eth_calls catchup failed")
+                    .map(|state| {
+                        (
+                            state,
+                            eth_calls_client,
+                            chain,
+                            cfg,
+                            call_decoder_tx,
+                            eth_calls_factory_rx,
+                            event_trigger_rx,
+                            sm_for_current,
+                        )
+                    })
+                }
+            },
+            |args| {
+                let (
+                    catchup_state,
+                    eth_calls_client,
+                    chain,
+                    cfg,
+                    call_decoder_tx,
+                    eth_calls_factory_rx,
+                    event_trigger_rx,
+                    sm,
+                ) = args;
+                let _ = cfg; // cfg not needed in current phase
+                async move {
+                    crate::raw_data::historical::current::eth_calls::collect_eth_calls(
+                        &chain,
+                        &eth_calls_client,
+                        eth_call_rx,
+                        eth_calls_factory_rx,
+                        event_trigger_rx,
+                        call_decoder_tx,
+                        catchup_state,
+                        Some(sm),
+                    )
+                    .await
+                    .context("eth_calls collection failed")
+                }
+            },
+            "eth_calls",
+        );
+    }
+
+    /// Spawn the factory collection stage (catchup + current).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_factories(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        factory_log_rx: mpsc::Receiver<LogMessage>,
+        logs_factory_tx: Option<mpsc::Sender<FactoryAddressData>>,
+        eth_calls_factory_tx: Option<mpsc::Sender<FactoryMessage>>,
+        log_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
+        call_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
+        recollect_tx_for_factories: Option<mpsc::Sender<RecollectRequest>>,
+        factory_catchup_done_tx: Option<oneshot::Sender<()>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+        let s3_manifest = self.s3_manifest();
+        let sm = self.storage_manager.clone();
+
+        spawn_two_phase_async(
+            tasks,
+            {
+                let (chain, cfg) = (chain.clone(), cfg.clone());
+                async move {
+                    crate::raw_data::historical::catchup::factories::collect_factories(
+                        &chain,
+                        &cfg,
+                        &logs_factory_tx,
+                        &log_decoder_tx_for_factories,
+                        &recollect_tx_for_factories,
+                        factory_catchup_done_tx,
+                        s3_manifest,
+                        Some(sm),
+                    )
+                    .await
+                    .context("factory catchup failed")
+                    .map(|state| {
+                        (
+                            state,
+                            chain,
+                            cfg,
+                            logs_factory_tx,
+                            log_decoder_tx_for_factories,
+                            call_decoder_tx_for_factories,
+                            eth_calls_factory_tx,
+                        )
+                    })
+                }
+            },
+            |args| {
+                let (
+                    catchup_state,
+                    chain,
+                    cfg,
+                    logs_factory_tx,
+                    log_decoder_tx_for_factories,
+                    call_decoder_tx_for_factories,
+                    eth_calls_factory_tx,
+                ) = args;
+                async move {
+                    crate::raw_data::historical::current::factories::collect_factories(
+                        &chain,
+                        &cfg,
+                        factory_log_rx,
+                        logs_factory_tx,
+                        eth_calls_factory_tx,
+                        log_decoder_tx_for_factories,
+                        call_decoder_tx_for_factories,
+                        catchup_state.matchers,
+                        catchup_state.existing_files,
+                        catchup_state.output_dir,
+                        catchup_state.s3_manifest,
+                        catchup_state.storage_manager,
+                    )
+                    .await
+                    .context("factory collection failed")
+                }
+            },
+            "factories",
+        );
+    }
+
+    /// Spawn the log decoder stage.
+    pub fn spawn_log_decoder(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        log_decoder_rx: mpsc::Receiver<DecoderMessage>,
+        transform_events_tx: Option<mpsc::Sender<DecodedEventsMessage>>,
+        recollect_tx_for_log_decoder: Option<mpsc::Sender<RecollectRequest>>,
+        transform_complete_tx: Option<mpsc::Sender<RangeCompleteMessage>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+
+        tasks.spawn(async move {
+            decode_logs(
+                &chain,
+                &cfg,
+                log_decoder_rx,
+                transform_events_tx,
+                recollect_tx_for_log_decoder,
+                transform_complete_tx,
+                false,
+            )
+            .await
+            .context("log decoding failed")
+        });
+    }
+
+    /// Spawn the eth_call decoder stage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_eth_call_decoder(
+        &self,
+        tasks: &mut JoinSet<anyhow::Result<()>>,
+        call_decoder_rx: mpsc::Receiver<DecoderMessage>,
+        transform_calls_tx: Option<mpsc::Sender<DecodedCallsMessage>>,
+        transform_complete_tx: Option<mpsc::Sender<RangeCompleteMessage>>,
+        transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
+        eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
+        decode_catchup_done_tx: Option<oneshot::Sender<()>>,
+    ) {
+        let chain = self.chain().clone();
+        let cfg = self.raw_config.clone();
+        let repair = self.mode.is_repair();
+        let repair_scope = self.mode.repair_scope().cloned();
+
+        tasks.spawn(async move {
+            let outputs = decoding::EthCallDecoderOutputs {
+                transform_tx: transform_calls_tx.as_ref(),
+                complete_tx: transform_complete_tx.as_ref(),
+                retry_tx: transform_retry_tx.as_ref(),
+            };
+            decode_eth_calls(
+                &chain,
+                &cfg,
+                call_decoder_rx,
+                outputs,
+                eth_calls_catchup_done_rx,
+                decode_catchup_done_tx,
+                false,
+                repair,
+                repair_scope,
+            )
+            .await
+            .context("eth call decoding failed")
+        });
     }
 }
