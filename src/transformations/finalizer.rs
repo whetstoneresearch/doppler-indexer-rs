@@ -386,8 +386,8 @@ impl RangeFinalizer {
     }
 
     /// Check if this range requires eth_call completion signal before finalization.
-    fn range_requires_eth_call_completion(&self, range_key: (u64, u64)) -> bool {
-        self.expect_eth_call_completion && range_key.1.saturating_sub(range_key.0) == 1
+    fn range_requires_eth_call_completion(&self, _range_key: (u64, u64)) -> bool {
+        self.expect_eth_call_completion
     }
 
     // ─── Reorg Cleanup ─────────────────────────────────────────────────
