@@ -310,13 +310,13 @@ pub enum LiveDbValue {
     VarChar(String),
     Bytes(Vec<u8>),
     Address([u8; 20]),
-    Pubkey([u8; 32]),
     Bytes32([u8; 32]),
     Numeric(String),
     Timestamp(i64),
     Json(String),  // JSON stored as string for bincode
     JsonB(String), // JSONB stored as string for bincode
     Float64(f64),
+    Pubkey([u8; 32]),
 }
 
 /// Snapshot of a row before modification, for reorg rollback.

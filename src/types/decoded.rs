@@ -10,7 +10,6 @@ use crate::types::chain::ChainAddress;
 #[allow(dead_code)]
 pub enum DecodedValue {
     Address([u8; 20]),
-    Pubkey([u8; 32]),
     Uint256(U256),
     Int256(I256),
     Uint128(u128),
@@ -31,6 +30,7 @@ pub enum DecodedValue {
     UnnamedTuple(Vec<DecodedValue>),
     /// Array of values
     Array(Vec<DecodedValue>),
+    Pubkey([u8; 32]),
 }
 
 #[allow(dead_code)]
