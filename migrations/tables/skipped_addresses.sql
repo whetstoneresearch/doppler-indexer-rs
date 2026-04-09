@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS _skipped_addresses (
     reason TEXT NOT NULL,
     source VARCHAR(255) NOT NULL,
     source_version INT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE (chain_id, tx_hash, asset_address, source, source_version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_skipped_addresses_lookup

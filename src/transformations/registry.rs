@@ -723,6 +723,16 @@ pub fn build_registry_for_chain(
     let mut available: HashSet<String> = contracts.keys().cloned().collect();
     available.extend(factory_collections.keys().cloned());
 
+    // Include factory collection names from contract configs so that handlers
+    // triggering on collection sources (e.g., "DERC20") pass the source filter.
+    for contract in contracts.values() {
+        if let Some(factories) = &contract.factories {
+            for factory in factories {
+                available.insert(factory.collection.clone());
+            }
+        }
+    }
+
     let mut registry = TransformationRegistry::with_source_filter(available);
 
     // Register event handlers (filtered by available sources)

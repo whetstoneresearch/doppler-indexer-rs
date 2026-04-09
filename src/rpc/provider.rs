@@ -9,6 +9,7 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
+use alloy::transports::http::reqwest;
 use async_trait::async_trait;
 use governor::clock::{QuantaClock, QuantaInstant};
 use governor::middleware::NoOpMiddleware;
@@ -106,10 +107,39 @@ pub trait RpcProvider: Send + Sync {
     ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError>;
 }
 
+/// Maximum length for individual error messages in the chain.
+/// Keeps log output readable when alloy includes full response bodies in errors.
+const ERROR_SEGMENT_MAX_LEN: usize = 300;
+
+/// Truncate a single error message to a reasonable length.
+fn truncate_error_segment(msg: &str, max_len: usize) -> String {
+    if msg.len() <= max_len {
+        msg.to_string()
+    } else {
+        format!(
+            "{}... [{} bytes truncated]",
+            &msg[..max_len],
+            msg.len() - max_len
+        )
+    }
+}
+
 /// Extracts the full error chain from an error, including all source errors.
-/// This is useful for debugging because alloy errors like "error decoding response body"
-/// often have underlying serde errors that explain exactly what field failed.
+/// Individual segments are truncated to keep logs readable.
+/// Use `error_chain_full` when you need the complete untruncated output.
 pub fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = vec![truncate_error_segment(&err.to_string(), ERROR_SEGMENT_MAX_LEN)];
+    let mut source = err.source();
+    while let Some(s) = source {
+        chain.push(truncate_error_segment(&s.to_string(), ERROR_SEGMENT_MAX_LEN));
+        source = s.source();
+    }
+    chain.join(": ")
+}
+
+/// Extracts the full error chain without any truncation.
+/// Useful for debug-level logging when you need to see the complete response body.
+pub fn error_chain_full(err: &dyn std::error::Error) -> String {
     let mut chain = vec![err.to_string()];
     let mut source = err.source();
     while let Some(s) = source {
@@ -426,10 +456,27 @@ pub struct RpcClient {
     chain: String,
 }
 
+/// Default HTTP read timeout for RPC requests (2 minutes).
+/// Large blocks with many receipts/logs can produce multi-MB responses
+/// that need more time than reqwest's default 30s.
+const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Build an alloy RootProvider with a custom reqwest client configured
+/// for large RPC responses.
+fn build_provider(url: &Url) -> Result<RootProvider<Ethereum>, RpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(RPC_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| RpcError::Transport(format!("failed to build HTTP client: {e}")))?;
+    let rpc_client =
+        alloy::rpc::client::RpcClient::new_http_with_client(client, url.clone());
+    Ok(RootProvider::<Ethereum>::new(rpc_client))
+}
+
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        let provider = build_provider(&config.url)?;
         let chain = chain_label_from_url(&config.url);
 
         let (rate_limiter, jitter) = if let Some(ref rate_config) = config.rate_limit {
@@ -458,7 +505,7 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        let provider = build_provider(&config.url)?;
         let chain = chain_label_from_url(&config.url);
         Ok(Self {
             provider,

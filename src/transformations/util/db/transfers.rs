@@ -3,6 +3,7 @@ use crate::transformations::TransformationContext;
 
 pub fn insert_transfer(
     block_number: u64,
+    log_index: u32,
     block_timestamp: u64,
     token: &[u8; 20],
     from: &[u8; 20],
@@ -10,11 +11,12 @@ pub fn insert_transfer(
     value: &alloy_primitives::Uint<256, 4>,
     ctx: &TransformationContext,
 ) -> DbOperation {
-    DbOperation::Insert {
+    DbOperation::Upsert {
         table: "transfers".to_string(),
         columns: vec![
             "chain_id".to_string(),
             "block_number".to_string(),
+            "log_index".to_string(),
             "timestamp".to_string(),
             "token".to_string(),
             "from".to_string(),
@@ -24,11 +26,19 @@ pub fn insert_transfer(
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
             DbValue::Int64(block_number as i64),
+            DbValue::Int32(log_index as i32),
             DbValue::Timestamp(block_timestamp as i64),
             DbValue::Address(*token),
             DbValue::Address(*from),
             DbValue::Address(*to),
             DbValue::Numeric(value.to_string()),
         ],
+        conflict_columns: vec![
+            "chain_id".to_string(),
+            "block_number".to_string(),
+            "log_index".to_string(),
+        ],
+        update_columns: vec![],
+        update_condition: None,
     }
 }
