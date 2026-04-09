@@ -36,6 +36,10 @@ use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
+    read_contract_index, ExpectedContracts,
+};
 use crate::types::config::contract::{Contracts, FactoryCollections};
 
 /// Message containing decoded events for a block range.
@@ -155,6 +159,7 @@ pub struct TransformationEngine {
     mode: ExecutionMode,
     decoded_logs_dir: PathBuf,
     decoded_calls_dir: PathBuf,
+    raw_eth_calls_dir: PathBuf,
     raw_receipts_dir: PathBuf,
     contracts: Arc<Contracts>,
     handler_concurrency: usize,
@@ -184,6 +189,7 @@ impl TransformationEngine {
         let historical_reader = Arc::new(HistoricalDataReader::new(&chain_name)?);
         let decoded_logs_dir = crate::storage::paths::decoded_logs_dir(&chain_name);
         let decoded_calls_dir = crate::storage::paths::decoded_eth_calls_dir(&chain_name);
+        let raw_eth_calls_dir = crate::storage::paths::raw_eth_calls_dir(&chain_name);
         let raw_receipts_dir = crate::storage::paths::raw_receipts_dir(&chain_name);
 
         let contracts = Arc::new(config.contracts);
@@ -231,6 +237,7 @@ impl TransformationEngine {
             mode,
             decoded_logs_dir,
             decoded_calls_dir,
+            raw_eth_calls_dir,
             raw_receipts_dir,
             contracts,
             handler_concurrency,
@@ -356,6 +363,155 @@ impl TransformationEngine {
         })
         .await
         .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))?
+    }
+
+    async fn scan_available_call_dependency_ranges(
+        &self,
+        source: &str,
+        function_name: &str,
+    ) -> Result<HashSet<(u64, u64)>, TransformationError> {
+        let source = source.to_string();
+        let function_name = function_name.to_string();
+        let decoded_base = self.decoded_calls_dir.join(&source).join(&function_name);
+        let raw_base = self.raw_eth_calls_dir.join(&source).join(&function_name);
+        let contracts = self.contracts.clone();
+
+        tokio::task::spawn_blocking(move || -> std::io::Result<HashSet<(u64, u64)>> {
+            fn scan_recursive(
+                dir: &Path,
+                decoded_base: &Path,
+                raw_base: &Path,
+                source: &str,
+                function_name: &str,
+                contracts: &Contracts,
+                ranges: &mut HashSet<(u64, u64)>,
+            ) -> std::io::Result<()> {
+                if !dir.exists() {
+                    return Ok(());
+                }
+
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan_recursive(
+                            &path,
+                            decoded_base,
+                            raw_base,
+                            source,
+                            function_name,
+                            contracts,
+                            ranges,
+                        )?;
+                        continue;
+                    }
+
+                    if !path.extension().is_some_and(|ext| ext == "parquet") {
+                        continue;
+                    }
+
+                    let Some((range_start, range_end_inclusive)) =
+                        crate::storage::paths::parse_range_from_filename(&path)
+                    else {
+                        continue;
+                    };
+
+                    let range_end = range_end_inclusive + 1;
+                    let expected =
+                        build_expected_factory_contracts_for_range(contracts, range_end);
+                    let parent_dir = path.parent().unwrap_or(decoded_base);
+                    let relative_parent = parent_dir
+                        .strip_prefix(decoded_base)
+                        .ok()
+                        .filter(|rel| !rel.as_os_str().is_empty());
+                    let raw_index_dir = match relative_parent {
+                        Some(rel) => raw_base.join(rel),
+                        None => raw_base.to_path_buf(),
+                    };
+
+                    if !call_dependency_contract_index_complete(
+                        &raw_index_dir,
+                        source,
+                        range_start,
+                        range_end,
+                        &expected,
+                    ) {
+                        tracing::debug!(
+                            "Deferring call dependency {}/{} range {}-{} until raw contract index is complete",
+                            source,
+                            function_name,
+                            range_start,
+                            range_end_inclusive
+                        );
+                        continue;
+                    }
+
+                    ranges.insert((range_start, range_end));
+                }
+
+                Ok(())
+            }
+
+            let mut ranges = HashSet::new();
+            if !decoded_base.exists() {
+                return Ok(ranges);
+            }
+
+            scan_recursive(
+                &decoded_base,
+                &decoded_base,
+                &raw_base,
+                &source,
+                &function_name,
+                contracts.as_ref(),
+                &mut ranges,
+            )?;
+
+            Ok(ranges)
+        })
+        .await
+        .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))?
+        .map_err(TransformationError::IoError)
+    }
+
+    fn raw_call_dependency_index_dir(
+        &self,
+        source: &str,
+        function_name: &str,
+        decoded_file_path: &Path,
+    ) -> PathBuf {
+        let decoded_base = self.decoded_calls_dir.join(source).join(function_name);
+        let raw_base = self.raw_eth_calls_dir.join(source).join(function_name);
+        let relative_parent = decoded_file_path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(&decoded_base).ok())
+            .filter(|rel| !rel.as_os_str().is_empty());
+
+        match relative_parent {
+            Some(rel) => raw_base.join(rel),
+            None => raw_base,
+        }
+    }
+
+    fn call_dependency_path_ready(
+        &self,
+        source: &str,
+        function_name: &str,
+        range_key: (u64, u64),
+        decoded_file_path: &Path,
+    ) -> bool {
+        let expected =
+            build_expected_factory_contracts_for_range(self.contracts.as_ref(), range_key.1);
+        let raw_index_dir =
+            self.raw_call_dependency_index_dir(source, function_name, decoded_file_path);
+
+        call_dependency_contract_index_complete(
+            &raw_index_dir,
+            source,
+            range_key.0,
+            range_key.1,
+            &expected,
+        )
     }
 
     // ─── Per-Handler Catchup ─────────────────────────────────────────
@@ -596,9 +752,11 @@ impl TransformationEngine {
                 let mut call_range_sets: Vec<HashSet<(u64, u64)>> =
                     Vec::with_capacity(ch.call_deps.len());
                 for (source, func) in &ch.call_deps {
-                    let dir = self.decoded_calls_dir.join(source).join(func);
-                    let ranges = self.scan_available_ranges(&dir).await.unwrap_or_default();
-                    call_range_sets.push(ranges.into_iter().collect());
+                    let ranges = self
+                        .scan_available_call_dependency_ranges(source, func)
+                        .await
+                        .unwrap_or_default();
+                    call_range_sets.push(ranges);
                 }
 
                 for (range_start, range_end) in candidate_ranges {
@@ -1013,6 +1171,9 @@ impl TransformationEngine {
         let Some(file_path) = self.resolve_decoded_call_path(range_key, &dep.0, &dep.1) else {
             return Ok(false);
         };
+        if !self.call_dependency_path_ready(&dep.0, &dep.1, range_key, &file_path) {
+            return Ok(false);
+        }
 
         let historical_reader = self.historical_reader.clone();
         let source_name = dep.0.clone();
@@ -2497,5 +2658,87 @@ impl super::retry::RecordAndFinalize for TransformationEngine {
         self.finalizer
             .finalize_range(range_start, range_end, &self.live_state)
             .await
+    }
+}
+
+fn call_dependency_contract_index_complete(
+    raw_index_dir: &Path,
+    source: &str,
+    range_start: u64,
+    range_end_exclusive: u64,
+    expected_factory_contracts: &HashMap<String, ExpectedContracts>,
+) -> bool {
+    if !raw_index_dir.join("contract_index.json").exists() {
+        // Backward-compatible fallback for older ranges that predate the sidecar.
+        return true;
+    }
+
+    let Some(expected) = expected_factory_contracts.get(source) else {
+        return true;
+    };
+
+    let index = read_contract_index(raw_index_dir);
+    let rk = range_key(range_start, range_end_exclusive - 1);
+    get_missing_contracts(&index, &rk, expected).is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tempfile::tempdir;
+
+    use super::call_dependency_contract_index_complete;
+    use crate::storage::contract_index::{range_key, update_contract_index, write_contract_index};
+
+    #[test]
+    fn contract_index_gate_defaults_open_without_sidecar() {
+        let dir = tempdir().unwrap();
+        let expected = HashMap::from([(
+            "DERC20".to_string(),
+            HashMap::from([(
+                "Airlock".to_string(),
+                vec!["0x660eaaedebc968f8f3694354fa8ec0b4c5ba8d12".to_string()],
+            )]),
+        )]);
+
+        assert!(call_dependency_contract_index_complete(
+            dir.path(),
+            "DERC20",
+            100,
+            200,
+            &expected
+        ));
+    }
+
+    #[test]
+    fn contract_index_gate_blocks_until_range_coverage_is_complete() {
+        let dir = tempdir().unwrap();
+        let expected_for_source = HashMap::from([(
+            "Airlock".to_string(),
+            vec!["0x660eaaedebc968f8f3694354fa8ec0b4c5ba8d12".to_string()],
+        )]);
+        let expected = HashMap::from([("DERC20".to_string(), expected_for_source.clone())]);
+
+        let empty_index: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        write_contract_index(dir.path(), &empty_index).unwrap();
+        assert!(!call_dependency_contract_index_complete(
+            dir.path(),
+            "DERC20",
+            100,
+            200,
+            &expected
+        ));
+
+        let mut complete_index = HashMap::new();
+        update_contract_index(&mut complete_index, &range_key(100, 199), &expected_for_source);
+        write_contract_index(dir.path(), &complete_index).unwrap();
+        assert!(call_dependency_contract_index_complete(
+            dir.path(),
+            "DERC20",
+            100,
+            200,
+            &expected
+        ));
     }
 }
