@@ -263,6 +263,9 @@ pub struct AlchemyClient {
     /// to prevent TCP connection exhaustion.
     rpc_semaphore: Arc<Semaphore>,
     config: AlchemyConfig,
+    /// Cached chain label for metrics. Computed once from the URL in the constructor,
+    /// so repeated `.clone()` is a cheap refcount bump instead of re-parsing.
+    chain_label: Arc<str>,
 }
 
 /// Helper struct that captures concurrency control for batch operations.
@@ -275,8 +278,9 @@ struct ConcurrentExecutor {
     /// Tasks beyond this limit are spawned only as earlier tasks complete,
     /// preventing unbounded task creation for large request sets.
     max_in_flight: usize,
-    /// Chain label for metrics.
-    chain: String,
+    /// Chain label for metrics. Uses `Arc<str>` so clones into spawned tasks
+    /// are cheap refcount bumps instead of heap allocations.
+    chain: Arc<str>,
 }
 
 impl ConcurrentExecutor {
@@ -367,12 +371,14 @@ impl AlchemyClient {
         });
 
         let rpc_semaphore = Arc::new(Semaphore::new(config.rpc_concurrency));
+        let chain_label: Arc<str> = chain_label_from_url(&config.url).into();
 
         Ok(Self {
             inner,
             rate_limiter,
             rpc_semaphore,
             config,
+            chain_label,
         })
     }
 
@@ -408,9 +414,10 @@ impl AlchemyClient {
         &self.config.retry
     }
 
-    /// Get the chain label for metrics, derived from the RPC URL.
-    fn chain_label(&self) -> String {
-        chain_label_from_url(&self.config.url)
+    /// Get the cached chain label for metrics.
+    /// Returns a cheap `Arc<str>` clone (refcount bump) instead of re-parsing the URL.
+    fn chain_label(&self) -> Arc<str> {
+        self.chain_label.clone()
     }
 
     /// Consume compute units, waiting if necessary.
@@ -438,7 +445,7 @@ impl AlchemyClient {
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
             max_in_flight: (self.config.rpc_concurrency * 2).max(1),
-            chain,
+            chain: self.chain_label(),
         }
     }
 

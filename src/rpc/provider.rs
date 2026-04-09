@@ -453,7 +453,9 @@ pub struct RpcClient {
     rate_limiter: Option<Arc<StandardRateLimiter>>,
     jitter: Option<Jitter>,
     sliding_limiter: Option<Arc<SlidingWindowRateLimiter>>,
-    chain: String,
+    /// Cached chain label for metrics. Uses `Arc<str>` so clones into spawned
+    /// tasks are cheap refcount bumps instead of heap allocations.
+    chain: Arc<str>,
 }
 
 /// Default HTTP read timeout for RPC requests (2 minutes).
@@ -477,7 +479,7 @@ fn build_provider(url: &Url) -> Result<RootProvider<Ethereum>, RpcError> {
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
         let provider = build_provider(&config.url)?;
-        let chain = chain_label_from_url(&config.url);
+        let chain: Arc<str> = chain_label_from_url(&config.url).into();
 
         let (rate_limiter, jitter) = if let Some(ref rate_config) = config.rate_limit {
             let quota = Quota::per_second(rate_config.requests_per_second);
@@ -506,7 +508,7 @@ impl RpcClient {
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
         let provider = build_provider(&config.url)?;
-        let chain = chain_label_from_url(&config.url);
+        let chain: Arc<str> = chain_label_from_url(&config.url).into();
         Ok(Self {
             provider,
             config,
