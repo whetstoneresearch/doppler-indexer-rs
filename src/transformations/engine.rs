@@ -30,7 +30,9 @@ use super::historical::HistoricalDataReader;
 use super::live_state::{LiveProcessingState, PendingEventData};
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::retry::{filter_calls_by_start_block, filter_events_by_start_block, RetryProcessor};
-use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
+use super::scheduler::dag::{
+    DagScheduler, OutcomeStatus, WorkItem, WorkItemOutcome, WorkItemRunResult,
+};
 use super::scheduler::loader::{
     read_receipt_addresses, CallDepScanner, CatchupLoader, CatchupPayload,
     run_call_dep_scanner_loop,
@@ -558,7 +560,6 @@ impl TransformationEngine {
         };
 
         let mut available = self.scan_available_ranges(base_dir).await?;
-        let mut available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
 
         if available.is_empty() {
             tracing::info!(
@@ -569,8 +570,155 @@ impl TransformationEngine {
             return Ok(());
         }
 
-        // Collect handler descriptors uniformly across both kinds.
-        let mut handlers: Vec<CatchupHandler> = match kind {
+        // 1. Collect and sort handler descriptors.
+        let mut handlers = self.collect_catchup_handlers(kind);
+        let trigger_range_sets = self
+            .prepare_catchup_handlers(kind, &mut handlers, base_dir, &mut available)
+            .await?;
+        let available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
+
+        // 2. Seed tracker from DB progress.
+        let tracker = Arc::new(CompletionTracker::with_available_starts(
+            available_starts.clone(),
+        ));
+        let self_completed = self
+            .seed_tracker_from_progress(&handlers, &tracker)
+            .await?;
+
+        // 3. Early exit if nothing to do.
+        let total_todo: usize = handlers
+            .iter()
+            .map(|ch| {
+                let done = self_completed
+                    .get(ch.handler.name())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                available.len().saturating_sub(done)
+            })
+            .sum();
+
+        if total_todo == 0 {
+            tracing::info!("{} handler catchup: all handlers up to date", kind_label);
+            return Ok(());
+        }
+
+        tracing::info!(
+            "{} handler catchup: {} work items to process across {} handlers",
+            kind_label,
+            total_todo,
+            handlers.len()
+        );
+
+        gauge!(
+            "transformation_catchup_ranges_remaining",
+            "kind" => kind_label,
+        )
+        .set(total_todo as f64);
+
+        // 4. Build work items.
+        let (items, per_handler_submitted) = self
+            .build_catchup_work_items(
+                &handlers,
+                &available,
+                &self_completed,
+                &trigger_range_sets,
+                &tracker,
+            )
+            .await;
+
+        // Per-handler submission summary.
+        for ch in &handlers {
+            let count = per_handler_submitted
+                .get(ch.handler.name())
+                .copied()
+                .unwrap_or(0);
+            if count > 0 {
+                tracing::info!(
+                    "Handler {} catchup: submitting {} range(s)",
+                    ch.handler.handler_key(),
+                    count
+                );
+            }
+        }
+
+        if items.is_empty() {
+            tracing::info!("{} handler catchup: no work items to submit", kind_label);
+            return Ok(());
+        }
+
+        tracing::info!(
+            "{} catchup: executing {} work items across {} handlers",
+            kind_label,
+            items.len(),
+            per_handler_submitted.len()
+        );
+
+        // 5. Spawn background call-dep scanner.
+        let (cancel_tx, scanner_handle) = self
+            .spawn_call_dep_scanner(&handlers, &tracker)
+            .await;
+
+        // 6. Spawn progress reporter.
+        let progress_handle = Self::spawn_progress_reporter(
+            tracker.clone(),
+            kind_label,
+            available.len(),
+            &handlers,
+        );
+
+        // 7. Execute all items.
+        let loader = Arc::new(CatchupLoader {
+            decoded_logs_dir: self.decoded_logs_dir.clone(),
+            decoded_calls_dir: self.decoded_calls_dir.clone(),
+            raw_receipts_dir: self.raw_receipts_dir.clone(),
+            historical_reader: self.historical_reader.clone(),
+            rpc_client: self.executor.rpc_client.clone(),
+            contracts: self.contracts.clone(),
+            chain_name: self.chain_name.clone(),
+            chain_id: self.chain_id,
+            db_pool: self.db_pool.clone(),
+            finalizer: self.finalizer.clone(),
+        });
+
+        let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
+        let catchup_start = Instant::now();
+        let loader_ref = loader.clone();
+        let outcomes = scheduler
+            .execute(items, move |item| {
+                let loader = loader_ref.clone();
+                Box::pin(async move {
+                    match loader.run(item).await {
+                        Ok(()) => WorkItemRunResult::Succeeded,
+                        Err(TransformationError::TransientBlocked(msg)) => {
+                            WorkItemRunResult::Blocked(msg)
+                        }
+                        Err(e) => WorkItemRunResult::Failed(e.to_string()),
+                    }
+                })
+            })
+            .await;
+
+        histogram!(
+            "transformation_catchup_total_duration_seconds",
+            "kind" => kind_label,
+        )
+        .record(catchup_start.elapsed().as_secs_f64());
+
+        // 8. Cancel background tasks and process outcomes.
+        let _ = cancel_tx.send(true);
+        if let Some(handle) = scanner_handle {
+            handle.abort();
+        }
+        progress_handle.abort();
+
+        Self::process_catchup_outcomes(outcomes, &handlers, kind_label, catchup_start)
+    }
+
+    // ─── Catchup Sub-steps ──────────────────────────────────────────
+
+    /// Collect handler descriptors uniformly across event and call handlers.
+    fn collect_catchup_handlers(&self, kind: HandlerKind) -> Vec<CatchupHandler> {
+        match kind {
             HandlerKind::Event => self
                 .registry
                 .unique_event_handlers()
@@ -628,9 +776,19 @@ impl TransformationEngine {
                     }
                 })
                 .collect(),
-        };
+        }
+    }
 
-        // Sort event handlers by topological order so dependencies are processed first
+    /// Sort handlers by topological order, scan per-handler trigger ranges,
+    /// and narrow the available set for call handlers.
+    async fn prepare_catchup_handlers(
+        &self,
+        kind: HandlerKind,
+        handlers: &mut Vec<CatchupHandler>,
+        base_dir: &Path,
+        available: &mut Vec<(u64, u64)>,
+    ) -> Result<HashMap<String, HashSet<(u64, u64)>>, TransformationError> {
+        // Sort event handlers by topological order so dependencies are processed first.
         if kind == HandlerKind::Event {
             let topo_order = self.registry.handler_topological_order();
             let position: HashMap<&str, usize> = topo_order
@@ -646,11 +804,9 @@ impl TransformationEngine {
             });
         }
 
-        // Catchup walks the union of all decoded ranges so dependency handlers
-        // can no-op complete unrelated ranges. Call deps, however, should only
-        // gate ranges where this handler actually has trigger parquet data.
+        // Build per-handler trigger range sets.
         let mut trigger_range_sets: HashMap<String, HashSet<(u64, u64)>> = HashMap::new();
-        for ch in &handlers {
+        for ch in handlers.iter() {
             let mut ranges: HashSet<(u64, u64)> = HashSet::new();
             for (source, trigger_name) in ch.triggers.iter() {
                 let dir = base_dir.join(source).join(trigger_name);
@@ -659,10 +815,7 @@ impl TransformationEngine {
             trigger_range_sets.insert(ch.handler.name().to_string(), ranges);
         }
 
-        // For call handlers, the base_dir scan picks up on_events/ files that
-        // belong to event-triggered call collection, polluting the available set
-        // with non-standard range sizes. Narrow available to only ranges that
-        // appear in at least one call handler's trigger directories.
+        // For call handlers, narrow available to only trigger-present ranges.
         if kind == HandlerKind::Call {
             let trigger_union: HashSet<(u64, u64)> = trigger_range_sets
                 .values()
@@ -670,18 +823,21 @@ impl TransformationEngine {
                 .collect();
             let mut narrowed: Vec<(u64, u64)> = trigger_union.into_iter().collect();
             narrowed.sort_by_key(|(start, _)| *start);
-            available = narrowed;
-            available_starts = available.iter().map(|(start, _)| *start).collect();
+            *available = narrowed;
         }
 
-        // Seed CompletionTracker from _handler_progress so downstream handlers
-        // can gate on upstream completion per range via the DAG scheduler.
-        // Use `with_available_starts` so the tracker can maintain contiguous watermarks.
-        let tracker = Arc::new(CompletionTracker::with_available_starts(available_starts.clone()));
-        // self_completed: handler_name → set of range_starts already processed.
-        // Used to skip building WorkItems for ranges already done.
+        Ok(trigger_range_sets)
+    }
+
+    /// Seed CompletionTracker from `_handler_progress` and return the per-handler
+    /// completed range_starts.
+    async fn seed_tracker_from_progress(
+        &self,
+        handlers: &[CatchupHandler],
+        tracker: &Arc<CompletionTracker>,
+    ) -> Result<HashMap<String, HashSet<u64>>, TransformationError> {
         let mut self_completed: HashMap<String, HashSet<u64>> = HashMap::new();
-        for ch in &handlers {
+        for ch in handlers {
             let completed = self
                 .finalizer
                 .get_completed_ranges_for_handler(&ch.handler.handler_key())
@@ -691,66 +847,31 @@ impl TransformationEngine {
                 .await;
             self_completed.insert(ch.handler.name().to_string(), completed);
         }
+        Ok(self_completed)
+    }
 
-        let total_todo: usize = handlers
-            .iter()
-            .map(|ch| {
-                let done = self_completed
-                    .get(ch.handler.name())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                available.len().saturating_sub(done)
-            })
-            .sum();
-
-        if total_todo == 0 {
-            tracing::info!("{} handler catchup: all handlers up to date", kind_label);
-            return Ok(());
-        }
-
-        tracing::info!(
-            "{} handler catchup: {} work items to process across {} handlers",
-            kind_label,
-            total_todo,
-            handlers.len()
-        );
-
-        gauge!(
-            "transformation_catchup_ranges_remaining",
-            "kind" => kind_label,
-        )
-        .set(total_todo as f64);
-
-        let loader = Arc::new(CatchupLoader {
-            decoded_logs_dir: self.decoded_logs_dir.clone(),
-            decoded_calls_dir: self.decoded_calls_dir.clone(),
-            raw_receipts_dir: self.raw_receipts_dir.clone(),
-            historical_reader: self.historical_reader.clone(),
-            rpc_client: self.executor.rpc_client.clone(),
-            contracts: self.contracts.clone(),
-            chain_name: self.chain_name.clone(),
-            chain_id: self.chain_id,
-            db_pool: self.db_pool.clone(),
-            finalizer: self.finalizer.clone(),
-        });
-
-        let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
-
-        // ── Build ALL work items upfront ────────────────────────────────
+    /// Build all catchup work items upfront.
+    async fn build_catchup_work_items(
+        &self,
+        handlers: &[CatchupHandler],
+        available: &[(u64, u64)],
+        self_completed: &HashMap<String, HashSet<u64>>,
+        trigger_range_sets: &HashMap<String, HashSet<(u64, u64)>>,
+        tracker: &Arc<CompletionTracker>,
+    ) -> (Vec<WorkItem>, HashMap<String, usize>) {
         let mut items: Vec<WorkItem> = Vec::new();
         let mut per_handler_submitted: HashMap<String, usize> = HashMap::new();
 
-        for ch in &handlers {
+        for ch in handlers {
             let name = ch.handler.name().to_string();
             let completed = self_completed.get(&name).cloned().unwrap_or_default();
 
-            for &(range_start, range_end) in &available {
+            for &(range_start, range_end) in available {
                 if completed.contains(&range_start) {
                     continue;
                 }
 
-                // Skip if any handler dep already failed — the tracker retains
-                // failure state, so submitting would immediately cascade-fail.
+                // Skip if any handler dep already failed.
                 let mut dep_failed = false;
                 for dep in ch.handler_deps.iter() {
                     if tracker.is_failed(dep, range_start).await {
@@ -762,9 +883,6 @@ impl TransformationEngine {
                     continue;
                 }
 
-                // Determine if this handler has trigger parquet data in this
-                // range. If not, call-dep gating is skipped (the handler will
-                // no-op and unblock same-range dependents).
                 let trigger_range_present = trigger_range_sets
                     .get(&name)
                     .is_some_and(|ranges| ranges.contains(&(range_start, range_end)));
@@ -798,55 +916,39 @@ impl TransformationEngine {
             }
         }
 
-        // Per-handler submission summary.
-        for ch in &handlers {
-            let count = per_handler_submitted
-                .get(ch.handler.name())
-                .copied()
-                .unwrap_or(0);
-            if count > 0 {
-                tracing::info!(
-                    "Handler {} catchup: submitting {} range(s)",
-                    ch.handler.handler_key(),
-                    count
-                );
-            }
-        }
+        (items, per_handler_submitted)
+    }
 
-        if items.is_empty() {
-            tracing::info!("{} handler catchup: no work items to submit", kind_label);
-            return Ok(());
-        }
-
-        tracing::info!(
-            "{} catchup: executing {} work items across {} handlers",
-            kind_label,
-            items.len(),
-            per_handler_submitted.len()
-        );
-
-        // ── Spawn background call-dep scanner ──────────────────────────
-        // Collect unique (source, function) pairs across all handlers.
+    /// Spawn the background call-dep scanner if any handler has call dependencies.
+    ///
+    /// Returns the cancel channel sender and optional scanner task handle.
+    async fn spawn_call_dep_scanner(
+        &self,
+        handlers: &[CatchupHandler],
+        tracker: &Arc<CompletionTracker>,
+    ) -> (
+        tokio::sync::watch::Sender<bool>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
         let mut unique_call_deps: HashSet<(String, String)> = HashSet::new();
-        for ch in &handlers {
+        for ch in handlers {
             for dep in ch.call_deps.iter() {
                 unique_call_deps.insert(dep.clone());
             }
         }
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let scanner_handle = if !unique_call_deps.is_empty() {
+        let handle = if !unique_call_deps.is_empty() {
             let scanner = CallDepScanner::new(
                 self.decoded_calls_dir.clone(),
                 self.raw_eth_calls_dir.clone(),
                 self.contracts.clone(),
                 unique_call_deps.into_iter().collect(),
             );
-            // Run one initial scan synchronously before spawning the loop so
-            // that items whose call deps are already on disk don't have to
-            // wait for the first 2s tick.
             let initial = scanner.scan_all().await;
             for ((source, func), ranges) in initial {
-                tracker.register_call_dep_ranges(&source, &func, ranges).await;
+                tracker
+                    .register_call_dep_ranges(&source, &func, ranges)
+                    .await;
             }
             Some(tokio::spawn(run_call_dep_scanner_loop(
                 scanner,
@@ -856,33 +958,37 @@ impl TransformationEngine {
         } else {
             None
         };
+        (cancel_tx, handle)
+    }
 
-        // ── Spawn background progress reporter ─────────────────────────
-        let progress_tracker = tracker.clone();
-        let progress_kind: &'static str = kind_label;
-        let total_available = available.len();
+    /// Spawn a background task that periodically logs catchup progress.
+    fn spawn_progress_reporter(
+        tracker: Arc<CompletionTracker>,
+        kind_label: &'static str,
+        total_available: usize,
+        handlers: &[CatchupHandler],
+    ) -> tokio::task::JoinHandle<()> {
         let handler_keys: HashMap<String, String> = handlers
             .iter()
             .map(|ch| (ch.handler.name().to_string(), ch.handler.handler_key()))
             .collect();
-        let progress_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.tick().await; // skip immediate first tick
             loop {
                 interval.tick().await;
-                let snap = progress_tracker.snapshot_progress().await;
+                let snap = tracker.snapshot_progress().await;
                 let total_completed: usize = snap.values().map(|(c, _, _)| c).sum();
                 let total_failed: usize = snap.values().map(|(_, f, _)| f).sum();
                 let total_blocked: usize = snap.values().map(|(_, _, b)| b).sum();
                 tracing::info!(
                     "{} catchup progress: {}/{} completed, {} failed, {} blocked",
-                    progress_kind,
+                    kind_label,
                     total_completed,
                     total_available * snap.len(),
                     total_failed,
                     total_blocked,
                 );
-                // Log per-handler detail for handlers that are behind.
                 for (name, (completed, failed, blocked)) in &snap {
                     let remaining = total_available.saturating_sub(*completed);
                     if remaining > 0 || *failed > 0 || *blocked > 0 {
@@ -899,7 +1005,7 @@ impl TransformationEngine {
                 }
                 gauge!(
                     "transformation_catchup_ranges_remaining",
-                    "kind" => progress_kind,
+                    "kind" => kind_label,
                 )
                 .set(
                     snap.values()
@@ -907,40 +1013,16 @@ impl TransformationEngine {
                         .sum::<usize>() as f64,
                 );
             }
-        });
+        })
+    }
 
-        // ── Execute all items ──────────────────────────────────────────
-        let catchup_start = Instant::now();
-        let loader_ref = loader.clone();
-        let outcomes = scheduler
-            .execute(items, move |item| {
-                let loader = loader_ref.clone();
-                Box::pin(async move {
-                    match loader.run(item).await {
-                        Ok(()) => WorkItemRunResult::Succeeded,
-                        Err(TransformationError::TransientBlocked(msg)) => {
-                            WorkItemRunResult::Blocked(msg)
-                        }
-                        Err(e) => WorkItemRunResult::Failed(e.to_string()),
-                    }
-                })
-            })
-            .await;
-
-        histogram!(
-            "transformation_catchup_total_duration_seconds",
-            "kind" => kind_label,
-        )
-        .record(catchup_start.elapsed().as_secs_f64());
-
-        // ── Cancel background tasks ────────────────────────────────────
-        let _ = cancel_tx.send(true);
-        if let Some(handle) = scanner_handle {
-            handle.abort();
-        }
-        progress_handle.abort();
-
-        // ── Process outcomes ───────────────────────────────────────────
+    /// Process DAG scheduler outcomes: log, collect metrics, and return errors.
+    fn process_catchup_outcomes(
+        outcomes: Vec<WorkItemOutcome>,
+        handlers: &[CatchupHandler],
+        kind_label: &'static str,
+        catchup_start: Instant,
+    ) -> Result<(), TransformationError> {
         let handler_name_to_key: HashMap<String, String> = handlers
             .iter()
             .map(|ch| (ch.handler.name().to_string(), ch.handler.handler_key()))
@@ -1059,7 +1141,7 @@ impl TransformationEngine {
         }
 
         // Per-handler outcome summary.
-        for ch in &handlers {
+        for ch in handlers {
             let name = ch.handler.name();
             let Some(&(ok, failed, blocked_count, cascade, cascade_blocked_count, panicked)) =
                 per_handler_outcomes.get(name)
