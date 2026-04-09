@@ -143,7 +143,7 @@ pub(crate) async fn process_completed_range(
             .send(DecoderMessage::LogsReady {
                 range_start,
                 range_end,
-                logs: std::sync::Arc::clone(&logs),
+                logs: (*logs).clone(),
                 live_mode: false,            // Historical mode: write to parquet
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })
