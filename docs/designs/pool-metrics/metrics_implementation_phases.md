@@ -320,21 +320,21 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ---
 
-## Phase 6: USD Pricing & Rolling Metrics
+## Phase 6: USD Pricing & Rolling Metrics ✅
+
+**Status**: Complete
 
 **Goal**: Add USD-denominated values to snapshots and rolling metrics to pool_state.
 
-### Tasks
-1. Read ChainlinkEthOracle latestAnswer from transformation context (calls_of_type)
-2. Read reference pool prices from `prices` table (written by existing PriceHandler)
-3. Resolve quote token → USD price (WETH via ETH/USD, USDC/USDT directly, others via reference pools)
-4. Add volume_usd to pool_snapshots
-5. Add rolling aggregation queries for pool_state: volume_24h_usd, price_change_1h, price_change_24h, swap_count_24h
-
-### Design notes
-- Price resolution: for each swap, look up quote token USD price. If quote is WETH, multiply by latest ETH/USD. If quote is USDC/USDT, use 1.0. If quote is another token, chain through reference pool prices.
-- Rolling metrics: query pool_snapshots for the relevant time window. This can be done as part of pool_state upsert or as a separate periodic handler.
-- Leave architecture open for future price graph traversal.
+### Implementation
+- **New module**: `src/transformations/util/usd_price.rs` — `OraclePriceCache` (shared, DB-backed) + `UsdPriceContext` (per-invocation)
+- **Migration**: `pool_snapshots_add_volume_usd.sql` adds nullable `volume_usd` column
+- **USD resolution**: WETH via ChainlinkEthOracle `latestAnswer` (8 decimals), USDC/USDT at $1, EURC via prices table (EURC/USDC from PriceHandler)
+- **Volume**: Single-side (quote-side only), standard DeFi convention
+- **Rolling metrics**: `DbOperation::RawSql` UPDATE with backward-looking LATERAL subqueries on `pool_snapshots`, executed in-transaction after snapshot inserts
+- **Price change**: Backward-looking — compares current `price_close` to last known `price_close` at or before the 1h/24h mark
+- **Oracle persistence**: ETH/USD written to `prices` table (source = "chainlink"). `OraclePriceCache` shared across all 8 swap handlers, seeded from DB on startup
+- **All 8 swap handlers** updated with shared `Arc<OraclePriceCache>`, new `process_swaps()` signature
 
 ---
 

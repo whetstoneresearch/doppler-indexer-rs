@@ -377,6 +377,7 @@ impl RangeFinalizer {
                         DbValue::Text(error_message),
                         DbValue::JsonB(debug_context),
                     ],
+                    snapshot: None,
                 }
             })
             .collect();

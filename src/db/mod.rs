@@ -5,4 +5,4 @@ pub mod types;
 
 pub use error::DbError;
 pub use pool::DbPool;
-pub use types::{DbOperation, DbValue, WhereClause};
+pub use types::{DbOperation, DbSnapshot, DbValue, WhereClause};
