@@ -19,11 +19,32 @@
 //! `watch<HashSet<u64>>` would be an isolated drop-in swap if profiling shows
 //! contention.
 //!
+//! # Lock ordering
+//!
+//! Three independent RwLocks: `state`, `contiguous`, `call_dep_ranges`.
+//!
+//! **Invariant**: never hold `state` write lock and `contiguous` write lock
+//! simultaneously. `advance_contiguous_watermark` reads `state` then writes
+//! `contiguous` — safe ordering. `call_dep_ranges` is independent.
+//!
 //! [`DagScheduler`]: super::dag::DagScheduler
 
 use std::collections::{HashMap, HashSet};
 
 use tokio::sync::{Notify, RwLock};
+
+/// Per-handler completed/failed/blocked range state, grouped under one lock.
+struct HandlerRangeState {
+    completed: HashMap<String, HashSet<u64>>,
+    failed: HashMap<String, HashSet<u64>>,
+    blocked: HashMap<String, HashSet<u64>>,
+}
+
+/// Per-handler contiguous watermark state, grouped under one lock.
+struct ContiguousState {
+    watermarks: HashMap<String, Option<u64>>,
+    positions: HashMap<String, usize>,
+}
 
 /// In-memory state of per-`(handler_name, range_start)` completion/failure.
 ///
@@ -44,21 +65,15 @@ use tokio::sync::{Notify, RwLock};
 /// [`WorkItem`]: super::dag::WorkItem
 /// [`wait_ready`]: CompletionTracker::wait_ready
 pub(crate) struct CompletionTracker {
-    completed: RwLock<HashMap<String, HashSet<u64>>>,
-    failed: RwLock<HashMap<String, HashSet<u64>>>,
-    blocked: RwLock<HashMap<String, HashSet<u64>>>,
-    notify: Notify,
-    /// Sorted list of all available range_starts (immutable after construction).
-    available_starts: Vec<u64>,
-    /// Per-handler contiguous watermark: highest `range_start` where all ranges
-    /// from the first available through this one are completed with no gaps.
-    contiguous_watermarks: RwLock<HashMap<String, Option<u64>>>,
-    /// Per-handler index into `available_starts` for O(1) amortized watermark advance.
-    contiguous_positions: RwLock<HashMap<String, usize>>,
+    state: RwLock<HandlerRangeState>,
+    contiguous: RwLock<ContiguousState>,
     /// Per-`(source, function)` set of available call-dep range_starts.
     /// Matched by range_start only (log and call-dep files may have different range sizes).
     /// Updated by the background `CallDepScanner`.
     call_dep_ranges: RwLock<HashMap<(String, String), HashSet<u64>>>,
+    notify: Notify,
+    /// Sorted list of all available range_starts (immutable after construction).
+    available_starts: Vec<u64>,
 }
 
 /// Snapshot view of whether a set of dependencies is satisfied for a range.
@@ -88,14 +103,18 @@ pub(crate) enum DepWaitError {
 impl CompletionTracker {
     pub(crate) fn new() -> Self {
         Self {
-            completed: RwLock::new(HashMap::new()),
-            failed: RwLock::new(HashMap::new()),
-            blocked: RwLock::new(HashMap::new()),
+            state: RwLock::new(HandlerRangeState {
+                completed: HashMap::new(),
+                failed: HashMap::new(),
+                blocked: HashMap::new(),
+            }),
+            contiguous: RwLock::new(ContiguousState {
+                watermarks: HashMap::new(),
+                positions: HashMap::new(),
+            }),
+            call_dep_ranges: RwLock::new(HashMap::new()),
             notify: Notify::new(),
             available_starts: Vec::new(),
-            contiguous_watermarks: RwLock::new(HashMap::new()),
-            contiguous_positions: RwLock::new(HashMap::new()),
-            call_dep_ranges: RwLock::new(HashMap::new()),
         }
     }
 
@@ -106,14 +125,18 @@ impl CompletionTracker {
     pub(crate) fn with_available_starts(starts: Vec<u64>) -> Self {
         debug_assert!(starts.windows(2).all(|w| w[0] < w[1]), "starts must be sorted");
         Self {
-            completed: RwLock::new(HashMap::new()),
-            failed: RwLock::new(HashMap::new()),
-            blocked: RwLock::new(HashMap::new()),
+            state: RwLock::new(HandlerRangeState {
+                completed: HashMap::new(),
+                failed: HashMap::new(),
+                blocked: HashMap::new(),
+            }),
+            contiguous: RwLock::new(ContiguousState {
+                watermarks: HashMap::new(),
+                positions: HashMap::new(),
+            }),
+            call_dep_ranges: RwLock::new(HashMap::new()),
             notify: Notify::new(),
             available_starts: starts,
-            contiguous_watermarks: RwLock::new(HashMap::new()),
-            contiguous_positions: RwLock::new(HashMap::new()),
-            call_dep_ranges: RwLock::new(HashMap::new()),
         }
     }
 
@@ -129,8 +152,9 @@ impl CompletionTracker {
         ranges: impl IntoIterator<Item = u64>,
     ) {
         {
-            let mut completed = self.completed.write().await;
-            let entry = completed
+            let mut state = self.state.write().await;
+            let entry = state
+                .completed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new);
             for range in ranges {
@@ -145,42 +169,38 @@ impl CompletionTracker {
     }
 
     /// Snapshot check: are all `deps` completed for `range_start`?
+    ///
+    /// Takes ONE read lock on `state` for all failed/blocked/completed checks.
     pub(crate) async fn probe(&self, deps: &[String], range_start: u64) -> DepState {
+        let state = self.state.read().await;
         // Check failed first so a failed dep is reported even if others are completed.
-        {
-            let failed = self.failed.read().await;
-            for dep in deps {
-                if failed
-                    .get(dep)
-                    .map(|ranges| ranges.contains(&range_start))
-                    .unwrap_or(false)
-                {
-                    return DepState::DepFailed {
-                        dep_name: dep.clone(),
-                    };
-                }
-            }
-        }
-        {
-            let blocked = self.blocked.read().await;
-            for dep in deps {
-                if blocked
-                    .get(dep)
-                    .map(|ranges| ranges.contains(&range_start))
-                    .unwrap_or(false)
-                {
-                    return DepState::DepBlocked {
-                        dep_name: dep.clone(),
-                    };
-                }
-            }
-        }
-        let completed = self.completed.read().await;
         for dep in deps {
-            let has = completed
+            if state
+                .failed
                 .get(dep)
-                .map(|ranges| ranges.contains(&range_start))
-                .unwrap_or(false);
+                .is_some_and(|ranges| ranges.contains(&range_start))
+            {
+                return DepState::DepFailed {
+                    dep_name: dep.clone(),
+                };
+            }
+        }
+        for dep in deps {
+            if state
+                .blocked
+                .get(dep)
+                .is_some_and(|ranges| ranges.contains(&range_start))
+            {
+                return DepState::DepBlocked {
+                    dep_name: dep.clone(),
+                };
+            }
+        }
+        for dep in deps {
+            let has = state
+                .completed
+                .get(dep)
+                .is_some_and(|ranges| ranges.contains(&range_start));
             if !has {
                 return DepState::Waiting;
             }
@@ -229,21 +249,22 @@ impl CompletionTracker {
 
     /// Mark `(handler_name, range_start)` as completed and wake all waiters.
     ///
+    /// Takes ONE write lock on `state` for both the completed insert and the
+    /// blocked cleanup (was 2 separate locks).
+    ///
     /// Also advances the contiguous watermark for this handler if applicable.
     pub(crate) async fn mark_completed(&self, handler_name: &str, range_start: u64) {
         {
-            let mut completed = self.completed.write().await;
-            completed
+            let mut state = self.state.write().await;
+            state
+                .completed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
-        }
-        {
-            let mut blocked = self.blocked.write().await;
-            if let Some(ranges) = blocked.get_mut(handler_name) {
+            if let Some(ranges) = state.blocked.get_mut(handler_name) {
                 ranges.remove(&range_start);
                 if ranges.is_empty() {
-                    blocked.remove(handler_name);
+                    state.blocked.remove(handler_name);
                 }
             }
         }
@@ -259,28 +280,29 @@ impl CompletionTracker {
     /// deps failed in a previous scheduler pass, avoiding wasted submissions
     /// that would immediately cascade-fail.
     pub(crate) async fn is_failed(&self, handler_name: &str, range_start: u64) -> bool {
-        let failed = self.failed.read().await;
-        failed
+        let state = self.state.read().await;
+        state
+            .failed
             .get(handler_name)
-            .map(|ranges| ranges.contains(&range_start))
-            .unwrap_or(false)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 
     /// Mark `(handler_name, range_start)` as failed and wake all waiters.
+    ///
+    /// Takes ONE write lock on `state` for both the failed insert and the
+    /// blocked cleanup (was 2 separate locks).
     pub(crate) async fn mark_failed(&self, handler_name: &str, range_start: u64) {
         {
-            let mut failed = self.failed.write().await;
-            failed
+            let mut state = self.state.write().await;
+            state
+                .failed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
-        }
-        {
-            let mut blocked = self.blocked.write().await;
-            if let Some(ranges) = blocked.get_mut(handler_name) {
+            if let Some(ranges) = state.blocked.get_mut(handler_name) {
                 ranges.remove(&range_start);
                 if ranges.is_empty() {
-                    blocked.remove(handler_name);
+                    state.blocked.remove(handler_name);
                 }
             }
         }
@@ -290,8 +312,9 @@ impl CompletionTracker {
     /// Mark `(handler_name, range_start)` as transiently blocked for this pass.
     pub(crate) async fn mark_blocked(&self, handler_name: &str, range_start: u64) {
         {
-            let mut blocked = self.blocked.write().await;
-            blocked
+            let mut state = self.state.write().await;
+            state
+                .blocked
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
@@ -301,11 +324,11 @@ impl CompletionTracker {
 
     /// Clear a transient blocked mark before the next scheduler pass.
     pub(crate) async fn clear_blocked(&self, handler_name: &str, range_start: u64) {
-        let mut blocked = self.blocked.write().await;
-        if let Some(ranges) = blocked.get_mut(handler_name) {
+        let mut state = self.state.write().await;
+        if let Some(ranges) = state.blocked.get_mut(handler_name) {
             ranges.remove(&range_start);
             if ranges.is_empty() {
-                blocked.remove(handler_name);
+                state.blocked.remove(handler_name);
             }
         }
     }
@@ -313,20 +336,22 @@ impl CompletionTracker {
     /// Check whether `(handler_name, range_start)` is transiently blocked.
     #[cfg(test)]
     pub(crate) async fn is_blocked(&self, handler_name: &str, range_start: u64) -> bool {
-        let blocked = self.blocked.read().await;
-        blocked
+        let state = self.state.read().await;
+        state
+            .blocked
             .get(handler_name)
-            .map(|ranges| ranges.contains(&range_start))
-            .unwrap_or(false)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 
     // ─── Contiguous watermark tracking ──────────────────────────────────
 
     /// Full recomputation of contiguous watermark from position 0.
     /// Used during `seed_completed`.
+    ///
+    /// Reads `state` (read lock) then writes `contiguous` (write lock).
     async fn recompute_contiguous_watermark(&self, handler_name: &str) {
-        let completed = self.completed.read().await;
-        let handler_completed = completed.get(handler_name);
+        let state = self.state.read().await;
+        let handler_completed = state.completed.get(handler_name);
         let mut pos = 0usize;
         let mut watermark: Option<u64> = None;
         for (i, &start) in self.available_starts.iter().enumerate() {
@@ -337,11 +362,10 @@ impl CompletionTracker {
                 break;
             }
         }
-        drop(completed);
-        let mut watermarks = self.contiguous_watermarks.write().await;
-        watermarks.insert(handler_name.to_string(), watermark);
-        let mut positions = self.contiguous_positions.write().await;
-        positions.insert(handler_name.to_string(), pos);
+        drop(state);
+        let mut contiguous = self.contiguous.write().await;
+        contiguous.watermarks.insert(handler_name.to_string(), watermark);
+        contiguous.positions.insert(handler_name.to_string(), pos);
     }
 
     /// Incrementally advance the contiguous watermark after a new completion.
@@ -350,25 +374,28 @@ impl CompletionTracker {
     /// `available_starts` while each successive range_start is in
     /// `completed[handler_name]`. O(k) amortized where k = newly-contiguous
     /// ranges (typically 0 or 1).
+    ///
+    /// Reads `state` (read lock), then reads/writes `contiguous` as needed.
+    /// Never holds both write locks simultaneously.
     async fn advance_contiguous_watermark(&self, handler_name: &str) {
-        let completed = self.completed.read().await;
-        let handler_completed = match completed.get(handler_name) {
+        let state = self.state.read().await;
+        let handler_completed = match state.completed.get(handler_name) {
             Some(c) => c,
             None => return,
         };
 
-        let watermarks_read = self.contiguous_watermarks.read().await;
-        let current_watermark = watermarks_read
+        let contiguous_read = self.contiguous.read().await;
+        let current_watermark = contiguous_read
+            .watermarks
             .get(handler_name)
             .copied()
             .flatten();
-        let positions_read = self.contiguous_positions.read().await;
-        let current_pos = positions_read
+        let current_pos = contiguous_read
+            .positions
             .get(handler_name)
             .copied()
             .unwrap_or(0);
-        drop(positions_read);
-        drop(watermarks_read);
+        drop(contiguous_read);
 
         // Determine the starting index for the walk. If there is no watermark
         // yet, start from 0 (the handler might now have completed the first
@@ -390,20 +417,19 @@ impl CompletionTracker {
             }
         }
 
-        // Only take write locks if something changed.
+        // Only take write lock if something changed.
         if new_watermark != current_watermark {
-            drop(completed);
-            let mut watermarks = self.contiguous_watermarks.write().await;
-            watermarks.insert(handler_name.to_string(), new_watermark);
-            let mut positions = self.contiguous_positions.write().await;
-            positions.insert(handler_name.to_string(), new_pos);
+            drop(state);
+            let mut contiguous = self.contiguous.write().await;
+            contiguous.watermarks.insert(handler_name.to_string(), new_watermark);
+            contiguous.positions.insert(handler_name.to_string(), new_pos);
         }
     }
 
     /// Read the current contiguous watermark for a handler.
     pub(crate) async fn contiguous_watermark(&self, handler_name: &str) -> Option<u64> {
-        let watermarks = self.contiguous_watermarks.read().await;
-        watermarks.get(handler_name).copied().flatten()
+        let contiguous = self.contiguous.read().await;
+        contiguous.watermarks.get(handler_name).copied().flatten()
     }
 
     // ─── Call-dep range tracking ────────────────────────────────────────
@@ -437,6 +463,9 @@ impl CompletionTracker {
     // ─── Extended wait (handler deps + contiguous deps + call deps) ─────
 
     /// Snapshot check for the extended readiness condition.
+    ///
+    /// Takes ONE read lock on `state` for all failed/blocked/completed checks
+    /// (was 3 separate locks).
     pub(crate) async fn probe_extended(
         &self,
         handler_deps: &[String],
@@ -444,27 +473,21 @@ impl CompletionTracker {
         call_dep_keys: &[(String, String)],
         range_start: u64,
     ) -> DepState {
-        // 1. Check handler deps failed/blocked/waiting (existing logic).
+        // 1. Check handler deps failed/blocked/waiting under one read lock.
         {
-            let failed = self.failed.read().await;
+            let state = self.state.read().await;
             for dep in handler_deps {
-                if failed.get(dep).is_some_and(|r| r.contains(&range_start)) {
+                if state.failed.get(dep).is_some_and(|r| r.contains(&range_start)) {
                     return DepState::DepFailed { dep_name: dep.clone() };
                 }
             }
-        }
-        {
-            let blocked = self.blocked.read().await;
             for dep in handler_deps {
-                if blocked.get(dep).is_some_and(|r| r.contains(&range_start)) {
+                if state.blocked.get(dep).is_some_and(|r| r.contains(&range_start)) {
                     return DepState::DepBlocked { dep_name: dep.clone() };
                 }
             }
-        }
-        {
-            let completed = self.completed.read().await;
             for dep in handler_deps {
-                if !completed.get(dep).is_some_and(|r| r.contains(&range_start)) {
+                if !state.completed.get(dep).is_some_and(|r| r.contains(&range_start)) {
                     return DepState::Waiting;
                 }
             }
@@ -472,9 +495,9 @@ impl CompletionTracker {
 
         // 2. Check contiguous handler deps.
         if !contiguous_deps.is_empty() {
-            let watermarks = self.contiguous_watermarks.read().await;
+            let contiguous = self.contiguous.read().await;
             for dep in contiguous_deps {
-                let watermark = watermarks.get(dep).copied().flatten();
+                let watermark = contiguous.watermarks.get(dep).copied().flatten();
                 if !watermark.is_some_and(|w| w >= range_start) {
                     return DepState::Waiting;
                 }
@@ -533,21 +556,20 @@ impl CompletionTracker {
     /// Snapshot of per-handler progress for periodic logging.
     ///
     /// Returns `(completed_count, failed_count, blocked_count)` per handler.
+    /// Takes ONE read lock on `state` (was 3 separate locks).
     pub(crate) async fn snapshot_progress(
         &self,
     ) -> HashMap<String, (usize, usize, usize)> {
-        let completed = self.completed.read().await;
-        let failed = self.failed.read().await;
-        let blocked = self.blocked.read().await;
+        let state = self.state.read().await;
 
         let mut result: HashMap<String, (usize, usize, usize)> = HashMap::new();
-        for (name, ranges) in completed.iter() {
+        for (name, ranges) in state.completed.iter() {
             result.entry(name.clone()).or_default().0 = ranges.len();
         }
-        for (name, ranges) in failed.iter() {
+        for (name, ranges) in state.failed.iter() {
             result.entry(name.clone()).or_default().1 = ranges.len();
         }
-        for (name, ranges) in blocked.iter() {
+        for (name, ranges) in state.blocked.iter() {
             result.entry(name.clone()).or_default().2 = ranges.len();
         }
         result
