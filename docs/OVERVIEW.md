@@ -6,7 +6,7 @@
 
 Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rust. It collects raw blockchain data (blocks, receipts, logs), tracks dynamically created contracts via factory events, reads historical on-chain state via `eth_call`, decodes events and call results into typed Parquet files, and runs custom transformation handlers that write to PostgreSQL.
 
-Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`).
+Operating modes (see `src/cli.rs` `IndexerMode` enum): Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`), Repair-Only (`--repair-only`).
 
 ### Subsystems
 
@@ -178,7 +178,7 @@ migrations/
 
 ### parallelism
 - **description**: Cross-cutting architecture documentation covering async task design, channel-based communication, synchronization barriers, and concurrency controls across the pipeline.
-- **entry_points**: `src/main.rs`, `src/runtime.rs` (cross-cutting)
+- **entry_points**: `src/main.rs`, `src/cli.rs`, `src/runtime.rs` (cross-cutting)
 - **depends_on**: []
 - **doc**: `docs/features/parallelism.md`
 
@@ -201,7 +201,8 @@ migrations/
 ```
 src/
 ├── main.rs              # Entry point, orchestrates the pipeline
-├── runtime.rs           # Chain runtime setup (RPC clients, features, channels)
+├── cli.rs               # CLI argument parsing, IndexerMode enum
+├── runtime.rs           # Chain runtime setup (RPC clients, features, channels, FullPipelineContext)
 ├── db/                  # Database layer (pool, migrations, types, errors)
 ├── rpc/                 # RPC clients (unified, alchemy, standard, websocket)
 ├── raw_data/historical/ # Raw data collection (blocks, receipts, logs, eth_calls, factories)
