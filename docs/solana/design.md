@@ -4,6 +4,25 @@
 
 Doppler Indexer currently supports EVM chains exclusively. Adding Solana support requires addressing fundamental data model differences while preserving the existing EVM pipeline unchanged. This document specifies the exact types, interfaces, data flows, and module designs required.
 
+## 1.1 Branch Delta
+
+This document is still the intended end-state design. The current `feat/solana-phase1-traits` branch only implements a subset of it.
+
+What has landed:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `chain_type` in chain config, with default `evm`
+- `TransformationHandler::chain_type()`, `DecodedAccountState`, `AccountStateHandler`, and registry account-state indices
+- transformation runtime / engine / live-state plumbing for account-state messages
+- UTF-8-safe RPC error truncation and a follow-up fix to keep EVM stuck-event warnings working after the new completion plumbing
+
+Where the branch currently differs from the design below:
+- `DecodedValue` uses `ChainAddress(ChainAddress)` rather than a dedicated `Pubkey([u8; 32])` variant
+- `TransformationContext` still uses the existing `rpc` and `contracts` fields in production code; `ChainServices` exists only as a placeholder enum
+- `main.rs` does not yet dispatch to a Solana pipeline by `chain_type`
+- no Solana RPC, raw-data, decoding, or live modules have landed yet
+
+Use the rest of this file as the target architecture, not a claim that every section is already implemented on this branch.
+
 ---
 
 ## 2. Solana vs EVM: Data Model Mapping
