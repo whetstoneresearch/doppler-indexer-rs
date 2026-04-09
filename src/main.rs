@@ -1,5 +1,6 @@
 #[cfg(feature = "bench")]
 mod bench;
+mod cli;
 mod db;
 mod decoding;
 mod live;
@@ -21,6 +22,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
+use cli::IndexerMode;
 use db::DbPool;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use live::{
@@ -62,109 +64,6 @@ fn optional_channel<T>(
     }
 }
 
-fn collect_flag_values(args: &[String], flag: &str) -> anyhow::Result<Vec<String>> {
-    let mut values = Vec::new();
-    let mut idx = 0usize;
-
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg == flag {
-            let Some(next) = args.get(idx + 1) else {
-                anyhow::bail!("Missing value for {}", flag);
-            };
-            if next.starts_with("--") {
-                anyhow::bail!("Missing value for {}", flag);
-            }
-            values.extend(
-                next.split(',')
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(ToString::to_string),
-            );
-            idx += 2;
-            continue;
-        }
-
-        let prefix = format!("{}=", flag);
-        if let Some(raw) = arg.strip_prefix(&prefix) {
-            values.extend(
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(ToString::to_string),
-            );
-        }
-
-        idx += 1;
-    }
-
-    Ok(values)
-}
-
-fn parse_optional_u64_flag(args: &[String], flag: &str) -> anyhow::Result<Option<u64>> {
-    let mut value = None;
-    let mut idx = 0usize;
-
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg == flag {
-            let Some(next) = args.get(idx + 1) else {
-                anyhow::bail!("Missing value for {}", flag);
-            };
-            if next.starts_with("--") {
-                anyhow::bail!("Missing value for {}", flag);
-            }
-            value = Some(
-                next.parse::<u64>()
-                    .with_context(|| format!("Invalid numeric value '{}' for {}", next, flag))?,
-            );
-            idx += 2;
-            continue;
-        }
-
-        let prefix = format!("{}=", flag);
-        if let Some(raw) = arg.strip_prefix(&prefix) {
-            value = Some(
-                raw.parse::<u64>()
-                    .with_context(|| format!("Invalid numeric value '{}' for {}", raw, flag))?,
-            );
-        }
-
-        idx += 1;
-    }
-
-    Ok(value)
-}
-
-fn build_repair_scope(args: &[String]) -> anyhow::Result<Option<RepairScope>> {
-    let from_block = parse_optional_u64_flag(args, "--from-block")?;
-    let to_block = parse_optional_u64_flag(args, "--to-block")?;
-    let sources = collect_flag_values(args, "--source")?;
-    let functions = collect_flag_values(args, "--function")?;
-
-    if let (Some(from_block), Some(to_block)) = (from_block, to_block) {
-        anyhow::ensure!(
-            from_block <= to_block,
-            "--from-block ({}) cannot be greater than --to-block ({})",
-            from_block,
-            to_block
-        );
-    }
-
-    let scope = RepairScope {
-        from_block,
-        to_block,
-        sources: (!sources.is_empty()).then(|| sources.into_iter().collect()),
-        functions: (!functions.is_empty()).then(|| functions.into_iter().collect()),
-    };
-
-    if scope.is_unscoped() {
-        Ok(None)
-    } else {
-        Ok(Some(scope))
-    }
-}
-
 fn live_pipeline_expectations(
     expect_log_decode: bool,
     expect_eth_call_collection: bool,
@@ -188,40 +87,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = env::args().collect();
-    let decode_only = args.iter().any(|a| a == "--decode-only");
-    let live_only = args.iter().any(|a| a == "--live-only");
-    let catch_up_only = args.iter().any(|a| a == "--catch-up-only");
-    let repair_only = args.iter().any(|a| a == "--repair-only");
-    let repair_flag = args.iter().any(|a| a == "--repair");
-    let repair = repair_flag || repair_only;
-    let repair_scope = build_repair_scope(&args)?;
-
-    if live_only && decode_only {
-        anyhow::bail!("Cannot use --live-only and --decode-only together");
-    }
-    if catch_up_only && live_only {
-        anyhow::bail!("Cannot use --catch-up-only and --live-only together");
-    }
-    if catch_up_only && decode_only {
-        anyhow::bail!("Cannot use --catch-up-only and --decode-only together");
-    }
-    if repair_only && live_only {
-        anyhow::bail!("Cannot use --repair-only and --live-only together");
-    }
-    if repair_only && decode_only {
-        anyhow::bail!("Cannot use --repair-only and --decode-only together");
-    }
-    if repair_only && catch_up_only {
-        anyhow::bail!("Cannot use --repair-only and --catch-up-only together");
-    }
-    if repair_flag && live_only {
-        anyhow::bail!("Cannot use --repair and --live-only together");
-    }
-    if repair_scope.is_some() && !repair {
-        anyhow::bail!(
-            "--from-block/--to-block/--source/--function require --repair or --repair-only"
-        );
-    }
+    let mode = cli::parse_mode(&args)?;
 
     let chains_filter: Option<Vec<String>> = args
         .iter()
@@ -259,8 +125,8 @@ async fn main() -> anyhow::Result<()> {
             filter
         );
     }
-    if !decode_only {
-        let require_ws = !catch_up_only && !repair_only;
+    if !mode.is_decode_only() {
+        let require_ws = mode.needs_websocket();
         load_required_env_vars(&config, require_ws)?;
     }
 
@@ -407,27 +273,40 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if decode_only {
-        tracing::info!("Running in decode-only mode (no collection, no transformations)");
-    } else if live_only {
-        tracing::info!("Running in live-only mode (skips historical processing)");
-    } else if catch_up_only {
-        tracing::info!("Running in catch-up-only mode (fills gaps in existing data, no live mode)");
+    match &mode {
+        IndexerMode::DecodeOnly { .. } => {
+            tracing::info!("Running in decode-only mode (no collection, no transformations)");
+        }
+        IndexerMode::LiveOnly => {
+            tracing::info!("Running in live-only mode (skips historical processing)");
+        }
+        IndexerMode::Full {
+            catch_up_only: true,
+            ..
+        } => {
+            tracing::info!(
+                "Running in catch-up-only mode (fills gaps in existing data, no live mode)"
+            );
+        }
+        IndexerMode::RepairOnly { .. } => {
+            tracing::info!(
+                "Running in repair-only mode (eth_call repair passes only, no live mode)"
+            );
+        }
+        IndexerMode::Full { repair: true, .. } => {
+            tracing::info!(
+                "Repair mode enabled: rebuilding once indexes from parquet, auditing raw-vs-decoded once schema drift, and repairing legacy factory-once sidecars"
+            );
+        }
+        _ => {}
     }
-    if repair_only {
-        tracing::info!("Running in repair-only mode (eth_call repair passes only, no live mode)");
-    } else if repair {
-        tracing::info!(
-            "Repair mode enabled: rebuilding once indexes from parquet, auditing raw-vs-decoded once schema drift, and repairing legacy factory-once sidecars"
-        );
-    }
-    if let Some(scope) = &repair_scope {
+    if let Some(scope) = mode.repair_scope() {
         tracing::info!("Repair scope: {:?}", scope);
     }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
-    let shared_db_pool: Option<Arc<DbPool>> = if !decode_only && !repair_only {
+    let shared_db_pool: Option<Arc<DbPool>> = if mode.needs_database() {
         if let Some(ref tc) = config.transformations {
             let registry = transformations::build_registry(0);
             if !registry.is_empty() {
@@ -466,26 +345,25 @@ async fn main() -> anyhow::Result<()> {
         let storage_manager = storage_manager.clone();
         let shared_db_pool = shared_db_pool.clone();
         let chain = chain.clone();
-        let repair_scope = repair_scope.clone();
+        let mode = mode.clone();
 
         chain_tasks.spawn(async move {
-            let result = if live_only {
-                process_chain_live_only(&config, &chain, shared_db_pool).await
-            } else if repair_only {
-                repair_only_chain(&config, &chain, storage_manager, repair_scope).await
-            } else if decode_only {
-                decode_only_chain(&config, &chain, repair, repair_scope).await
-            } else {
-                process_chain(
-                    &config,
-                    &chain,
-                    storage_manager,
-                    catch_up_only,
+            let result = match &mode {
+                IndexerMode::LiveOnly => {
+                    process_chain_live_only(&config, &chain, shared_db_pool).await
+                }
+                IndexerMode::RepairOnly { repair_scope } => {
+                    repair_only_chain(&config, &chain, storage_manager, repair_scope.clone()).await
+                }
+                IndexerMode::DecodeOnly {
                     repair,
                     repair_scope,
-                    shared_db_pool,
-                )
-                .await
+                } => {
+                    decode_only_chain(&config, &chain, *repair, repair_scope.clone()).await
+                }
+                IndexerMode::Full { .. } => {
+                    process_chain(&config, &chain, storage_manager, &mode, shared_db_pool).await
+                }
             };
             (chain_name, result)
         });
@@ -1375,11 +1253,12 @@ async fn process_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
     storage_manager: Arc<StorageManager>,
-    catch_up_only: bool,
-    repair: bool,
-    repair_scope: Option<RepairScope>,
+    mode: &IndexerMode,
     shared_db_pool: Option<Arc<DbPool>>,
 ) -> anyhow::Result<()> {
+    let catch_up_only = mode.is_catch_up_only();
+    let repair = mode.is_repair();
+    let repair_scope = mode.repair_scope().cloned();
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
