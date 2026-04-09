@@ -397,6 +397,7 @@ mod tests {
             200,
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
             HashMap::new(),
             historical,
             rpc,

@@ -141,6 +141,7 @@ impl LiveProcessingState {
         range_key: (u64, u64),
         expect_logs: bool,
         expect_eth_calls: bool,
+        expect_account_states: bool,
     ) -> (bool, Vec<TimedOutPendingHandler>) {
         let completion = self.completion.get(&range_key).copied().unwrap_or_default();
 
@@ -206,7 +207,11 @@ impl LiveProcessingState {
                 .any(|pending| (pending.range_start, pending.range_end) == range_key)
         });
 
-        if has_pending && completion.logs_complete && completion.eth_calls_complete {
+        if has_pending
+            && completion.logs_complete
+            && completion.eth_calls_complete
+            && completion.account_states_complete
+        {
             for (handler_key, pending_list) in &self.pending_events {
                 for pending in pending_list {
                     if (pending.range_start, pending.range_end) == range_key {
@@ -226,7 +231,8 @@ impl LiveProcessingState {
             }
         }
 
-        let ready = !has_pending && completion.is_ready(expect_logs, expect_eth_calls);
+        let ready = !has_pending
+            && completion.is_ready(expect_logs, expect_eth_calls, expect_account_states);
         (ready, timed_out.into_values().collect())
     }
 
@@ -274,6 +280,7 @@ impl LiveProcessingState {
 pub(crate) struct RangeCompletionState {
     pub logs_complete: bool,
     pub eth_calls_complete: bool,
+    pub account_states_complete: bool,
 }
 
 impl RangeCompletionState {
@@ -281,11 +288,19 @@ impl RangeCompletionState {
         match kind {
             RangeCompleteKind::Logs => self.logs_complete = true,
             RangeCompleteKind::EthCalls => self.eth_calls_complete = true,
+            RangeCompleteKind::AccountStates => self.account_states_complete = true,
         }
     }
 
-    pub fn is_ready(self, expect_logs: bool, expect_eth_calls: bool) -> bool {
-        (!expect_logs || self.logs_complete) && (!expect_eth_calls || self.eth_calls_complete)
+    pub fn is_ready(
+        self,
+        expect_logs: bool,
+        expect_eth_calls: bool,
+        expect_account_states: bool,
+    ) -> bool {
+        (!expect_logs || self.logs_complete)
+            && (!expect_eth_calls || self.eth_calls_complete)
+            && (!expect_account_states || self.account_states_complete)
     }
 }
 
@@ -297,23 +312,30 @@ mod tests {
     fn range_completion_requires_both_streams_when_calls_expected() {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::Logs);
-        assert!(!state.is_ready(true, true));
+        assert!(!state.is_ready(true, true, false));
         state.mark(RangeCompleteKind::EthCalls);
-        assert!(state.is_ready(true, true));
+        assert!(state.is_ready(true, true, false));
     }
 
     #[test]
     fn range_completion_only_requires_logs_without_calls() {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::Logs);
-        assert!(state.is_ready(true, false));
+        assert!(state.is_ready(true, false, false));
     }
 
     #[test]
     fn range_completion_can_finalize_call_only_ranges() {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::EthCalls);
-        assert!(state.is_ready(false, true));
+        assert!(state.is_ready(false, true, false));
+    }
+
+    #[test]
+    fn range_completion_can_require_account_states() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::AccountStates);
+        assert!(state.is_ready(false, false, true));
     }
 
     /// Helper: check whether a handler has remaining pending entries for a range.

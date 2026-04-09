@@ -14,8 +14,8 @@ use crate::live::{LiveProgressTracker, TransformRetryRequest};
 use crate::rpc::{SlidingWindowRateLimiter, UnifiedRpcClient};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::{
-    build_registry_for_chain, DecodedCallsMessage, DecodedEventsMessage, RangeCompleteMessage,
-    ReorgMessage,
+    build_registry_for_chain, DecodedAccountStatesMessage, DecodedCallsMessage,
+    DecodedEventsMessage, RangeCompleteMessage, ReorgMessage,
 };
 use crate::types::config::chain::{ChainConfig, RpcConfig};
 use crate::types::config::defaults::{raw_data as raw_data_defaults, rpc as rpc_defaults};
@@ -189,6 +189,8 @@ pub struct CommonChannels {
     pub transform_events_rx: Option<mpsc::Receiver<DecodedEventsMessage>>,
     pub transform_calls_tx: Option<mpsc::Sender<DecodedCallsMessage>>,
     pub transform_calls_rx: Option<mpsc::Receiver<DecodedCallsMessage>>,
+    pub transform_account_states_tx: Option<mpsc::Sender<DecodedAccountStatesMessage>>,
+    pub transform_account_states_rx: Option<mpsc::Receiver<DecodedAccountStatesMessage>>,
     pub transform_complete_tx: Option<mpsc::Sender<RangeCompleteMessage>>,
     pub transform_complete_rx: Option<mpsc::Receiver<RangeCompleteMessage>>,
     pub transform_reorg_tx: Option<mpsc::Sender<ReorgMessage>>,
@@ -210,6 +212,7 @@ impl CommonChannels {
         config: &IndexerConfig,
         features: &ChainFeatures,
         transformations_enabled: bool,
+        has_account_state_handlers: bool,
     ) -> Self {
         let channel_cap = config
             .raw_data_collection
@@ -236,6 +239,11 @@ impl CommonChannels {
             optional_channel::<DecodedEventsMessage>(transformations_enabled, channel_cap);
         let (transform_calls_tx, transform_calls_rx) =
             optional_channel::<DecodedCallsMessage>(transformations_enabled, channel_cap);
+        let (transform_account_states_tx, transform_account_states_rx) =
+            optional_channel::<DecodedAccountStatesMessage>(
+                transformations_enabled && has_account_state_handlers,
+                channel_cap,
+            );
         let (transform_complete_tx, transform_complete_rx) =
             optional_channel::<RangeCompleteMessage>(transformations_enabled, channel_cap);
         let (transform_reorg_tx, transform_reorg_rx) =
@@ -252,6 +260,8 @@ impl CommonChannels {
             transform_events_rx,
             transform_calls_tx,
             transform_calls_rx,
+            transform_account_states_tx,
+            transform_account_states_rx,
             transform_complete_tx,
             transform_complete_rx,
             transform_reorg_tx,
@@ -271,8 +281,14 @@ impl CommonChannels {
         config: &IndexerConfig,
         features: &ChainFeatures,
         transformations_enabled: bool,
+        has_account_state_handlers: bool,
     ) -> Self {
-        let mut channels = Self::build_for_live_only(config, features, transformations_enabled);
+        let mut channels = Self::build_for_live_only(
+            config,
+            features,
+            transformations_enabled,
+            has_account_state_handlers,
+        );
 
         // Add decode catchup barrier for full mode
         if transformations_enabled && features.has_calls {
@@ -359,8 +375,12 @@ impl ChainRuntime {
         };
 
         // Build transformation registry filtered to this chain's contracts
-        let registry =
-            build_registry_for_chain(chain.chain_id, &chain.contracts, &chain.factory_collections);
+        let registry = build_registry_for_chain(
+            chain.chain_id,
+            chain.chain_type,
+            &chain.contracts,
+            &chain.factory_collections,
+        );
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
         // Validate that all handler call dependencies are satisfied by config

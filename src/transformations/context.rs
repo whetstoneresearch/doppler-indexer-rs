@@ -362,6 +362,8 @@ pub struct TransformationContext {
     pub events: Arc<Vec<DecodedEvent>>,
     /// All decoded eth_call results in this range
     pub calls: Arc<Vec<DecodedCall>>,
+    /// All decoded account states in this range
+    pub account_states: Arc<Vec<DecodedAccountState>>,
 
     // ===== Transaction Address Data =====
     /// Transaction hash -> from/to addresses from receipt data
@@ -388,6 +390,7 @@ impl TransformationContext {
         blockrange_end: u64,
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
+        account_states: Arc<Vec<DecodedAccountState>>,
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
@@ -400,6 +403,7 @@ impl TransformationContext {
             blockrange_end,
             events,
             calls,
+            account_states,
             tx_addresses,
             historical,
             rpc,
@@ -470,6 +474,29 @@ impl TransformationContext {
             let start_block = self.get_contract_start_block(&c.source_name);
             start_block.is_none_or(|sb| c.block_number >= sb)
         })
+    }
+
+    /// Get account states of a specific type from the current block range.
+    pub fn account_states_of_type(
+        &self,
+        source: &str,
+        account_type: &str,
+    ) -> impl Iterator<Item = &DecodedAccountState> {
+        let source = source.to_string();
+        let account_type = account_type.to_string();
+        self.account_states.iter().filter(move |account_state| {
+            account_state.source_name == source && account_state.account_type == account_type
+        })
+    }
+
+    /// Get account states owned by a specific program from the current block range.
+    pub fn account_states_for_program(
+        &self,
+        owner_program: ChainAddress,
+    ) -> impl Iterator<Item = &DecodedAccountState> + '_ {
+        self.account_states
+            .iter()
+            .filter(move |account_state| account_state.owner_program == owner_program)
     }
 
     /// Get the latest call for a source/function/address from the current range,

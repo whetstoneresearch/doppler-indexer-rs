@@ -68,11 +68,15 @@ pub(crate) mod scheduler;
 pub mod traits;
 pub mod util;
 
+#[allow(unused_imports)]
 pub use context::{DecodedAccountState, DecodedCall, DecodedEvent, TransformationContext};
-pub use traits::{AccountStateHandler, AccountStateTrigger};
+#[allow(unused_imports)]
 pub use engine::{
-    DecodedCallsMessage, DecodedEventsMessage, ExecutionMode, RangeCompleteKind,
-    RangeCompleteMessage, ReorgMessage, TransformationEngine, TransformationEngineConfig,
+    DecodedAccountStatesMessage, DecodedCallsMessage, DecodedEventsMessage, ExecutionMode,
+    RangeCompleteKind, RangeCompleteMessage, ReorgMessage, TransformationEngine,
+    TransformationEngineConfig,
 };
 pub use error::TransformationError;
 pub use registry::{build_registry, build_registry_for_chain};
+#[allow(unused_imports)]
+pub use traits::{AccountStateHandler, AccountStateTrigger};

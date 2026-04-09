@@ -26,7 +26,6 @@ use crate::decoding::eth_calls::{
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
-use crate::metrics::HandlerMetricsGuard;
 use crate::rpc::UnifiedRpcClient;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::eth_call::EvmType;
@@ -568,6 +567,7 @@ impl RetryProcessor {
                         payload.handler,
                         payload.handler_events,
                         payload.handler_calls,
+                        Arc::new(Vec::new()),
                         payload.tx_addresses,
                         chain_name,
                         chain_id,

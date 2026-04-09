@@ -175,6 +175,7 @@ mod tests {
             200,
             Arc::new(events),
             Arc::new(calls),
+            Arc::new(Vec::new()),
             HashMap::new(),
             historical,
             rpc,
