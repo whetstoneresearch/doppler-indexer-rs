@@ -24,7 +24,9 @@ use crate::transformations::event::metrics::swap_data::{
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
-use crate::transformations::util::usd_price::{build_usd_price_context, OraclePriceCache};
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 // --- Shared extraction functions ---
 
@@ -153,8 +155,13 @@ impl TransformationHandler for V3SwapMetricsHandler {
         .await?;
 
         let (usd_ctx, price_ops) = build_usd_price_context(
-            ctx, &self.oracle_cache, &self.db_pool, self.chain_id, &ctx.contracts,
-        ).await;
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
         let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
@@ -170,6 +177,9 @@ impl TransformationHandler for V3SwapMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -188,6 +198,10 @@ impl EventHandler for V3SwapMetricsHandler {
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V3CreateHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 }
 
@@ -297,8 +311,13 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
         .await?;
 
         let (usd_ctx, price_ops) = build_usd_price_context(
-            ctx, &self.oracle_cache, &self.db_pool, self.chain_id, &ctx.contracts,
-        ).await;
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
         let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
@@ -314,6 +333,9 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -332,6 +354,10 @@ impl EventHandler for LockableV3SwapMetricsHandler {
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["LockableV3CreateHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 }
 
@@ -542,5 +568,30 @@ mod tests {
             cache.get(&pool_id).is_some(),
             "pool entry should still be in cache after concurrent handle() calls"
         );
+    }
+
+    #[test]
+    fn test_swap_handlers_declare_chainlink_dependency() {
+        let v3_handler = V3SwapMetricsHandler {
+            metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
+            decimals_init: Once::new(),
+            chain_id: 8453,
+            db_pool: OnceLock::new(),
+        };
+        assert!(v3_handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
+
+        let lockable_handler = LockableV3SwapMetricsHandler {
+            metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
+            decimals_init: Once::new(),
+            chain_id: 8453,
+            db_pool: OnceLock::new(),
+        };
+        assert!(lockable_handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
     }
 }

@@ -46,7 +46,9 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::tick_math::tick_to_sqrt_price_x96;
-use crate::transformations::util::usd_price::{build_usd_price_context, OraclePriceCache};
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 const SOURCE: &str = "DopplerV4Hook";
 
@@ -197,8 +199,13 @@ impl TransformationHandler for V4BaseMetricsHandler {
         }
 
         let (usd_ctx, price_ops) = build_usd_price_context(
-            ctx, &self.oracle_cache, &self.db_pool, self.chain_id, &ctx.contracts,
-        ).await;
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
         let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
@@ -250,6 +257,9 @@ impl TransformationHandler for V4BaseMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -298,6 +308,10 @@ impl TransformationHandler for V4BaseMetricsHandler {
 impl EventHandler for V4BaseMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(SOURCE, "Swap(int24,uint256,uint256)")]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
@@ -1060,6 +1074,14 @@ mod tests {
             }
             _ => panic!("expected Upsert"),
         }
+    }
+
+    #[test]
+    fn test_handler_declares_chainlink_dependency() {
+        let handler = make_handler(8453);
+        assert!(handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
     }
 
     // ── commit hooks / gate / reorg ───────────────────────────────────────────

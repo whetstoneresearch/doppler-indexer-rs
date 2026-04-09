@@ -9,6 +9,7 @@
 //! - USDC, USDT: 1.0 (stablecoin assumption)
 //! - EURC: multiply by EURC/USDC from prices table
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -24,8 +25,8 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 /// Chainlink oracle returns int256 with 8 decimals.
 const CHAINLINK_DECIMALS: u32 = 8;
 
-/// Source name written to prices table for oracle prices.
-const ORACLE_PRICE_SOURCE: &str = "chainlink";
+/// Oracle rows use the zero address as a synthetic "USD quote token".
+const USD_QUOTE_TOKEN: [u8; 20] = [0u8; 20];
 
 // ─── OraclePriceCache ────────────────────────────────────────────────
 
@@ -34,6 +35,9 @@ const ORACLE_PRICE_SOURCE: &str = "chainlink";
 /// from ChainlinkEthOracle calls during processing.
 pub struct OraclePriceCache {
     inner: RwLock<CachedPrices>,
+    weth_address: Option<[u8; 20]>,
+    eurc_address: Option<[u8; 20]>,
+    seeded_from_db: AtomicBool,
 }
 
 #[derive(Default)]
@@ -46,6 +50,18 @@ impl OraclePriceCache {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(CachedPrices::default()),
+            weth_address: None,
+            eurc_address: None,
+            seeded_from_db: AtomicBool::new(false),
+        }
+    }
+
+    pub fn with_contracts(contracts: &Contracts) -> Self {
+        Self {
+            inner: RwLock::new(CachedPrices::default()),
+            weth_address: resolve_contract_address(contracts, "Weth"),
+            eurc_address: resolve_contract_address(contracts, "Eurc"),
+            seeded_from_db: AtomicBool::new(false),
         }
     }
 
@@ -55,54 +71,20 @@ impl OraclePriceCache {
         &self,
         db_pool: &Pool,
         chain_id: u64,
-        contracts: &Contracts,
     ) -> Result<(), TransformationError> {
-        let client = db_pool
-            .get()
-            .await
-            .map_err(|e| TransformationError::DatabaseError(e.into()))?;
-
-        // Load ETH/USD (written by us as chainlink source with WETH token address)
-        if let Some(weth_addr) = resolve_contract_address(contracts, "Weth") {
-            let row = client
-                .query_opt(
-                    "SELECT price FROM prices \
-                     WHERE chain_id = $1 AND token = $2 AND source = $3 \
-                     ORDER BY block_number DESC LIMIT 1",
-                    &[
-                        &(chain_id as i64),
-                        &weth_addr.as_slice(),
-                        &ORACLE_PRICE_SOURCE,
-                    ],
-                )
-                .await
-                .map_err(|e| TransformationError::DatabaseError(e.into()))?;
-
-            if let Some(row) = row {
-                let price_str: rust_decimal::Decimal = row.get("price");
-                if let Ok(price) = price_str.to_string().parse::<BigDecimal>() {
-                    self.inner.write().unwrap().eth_usd = Some(price);
-                }
+        if let Some(weth_addr) = self.weth_address {
+            if let Ok(price) =
+                query_latest_price(db_pool, chain_id, &weth_addr, Some(&USD_QUOTE_TOKEN)).await
+            {
+                self.inner.write().unwrap().eth_usd = Some(price);
             }
         }
 
-        // Load EURC/USD (written by PriceHandler as EURC/USDC ≈ EURC/USD)
-        if let Some(eurc_addr) = resolve_contract_address(contracts, "Eurc") {
-            let row = client
-                .query_opt(
-                    "SELECT price FROM prices \
-                     WHERE chain_id = $1 AND token = $2 \
-                     ORDER BY block_number DESC LIMIT 1",
-                    &[&(chain_id as i64), &eurc_addr.as_slice()],
-                )
-                .await
-                .map_err(|e| TransformationError::DatabaseError(e.into()))?;
-
-            if let Some(row) = row {
-                let price_str: rust_decimal::Decimal = row.get("price");
-                if let Ok(price) = price_str.to_string().parse::<BigDecimal>() {
-                    self.inner.write().unwrap().eurc_usd = Some(price);
-                }
+        // EURC/USD is written by PriceHandler as EURC/USDC, which we treat as
+        // EURC/USD for the metrics use case.
+        if let Some(eurc_addr) = self.eurc_address {
+            if let Ok(price) = query_latest_price(db_pool, chain_id, &eurc_addr, None).await {
+                self.inner.write().unwrap().eurc_usd = Some(price);
             }
         }
 
@@ -114,6 +96,22 @@ impl OraclePriceCache {
             chain_id,
         );
 
+        Ok(())
+    }
+
+    /// Best-effort one-time DB seed for the shared cache during handler
+    /// initialization. Runtime handlers are initialized sequentially, so a
+    /// simple atomic guard is sufficient here.
+    pub async fn load_from_db_once(
+        &self,
+        db_pool: &Pool,
+        chain_id: u64,
+    ) -> Result<(), TransformationError> {
+        if self.seeded_from_db.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.load_from_db(db_pool, chain_id).await?;
+        self.seeded_from_db.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -138,6 +136,10 @@ impl Default for OraclePriceCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub fn chainlink_latest_answer_dependency() -> (String, String) {
+    ("ChainlinkEthOracle".to_string(), "latestAnswer".to_string())
 }
 
 // ─── UsdPriceContext ─────────────────────────────────────────────────
@@ -236,8 +238,24 @@ pub async fn build_usd_price_context(
     let usdt_address = resolve_contract_address(contracts, "Usdt");
     let eurc_address = resolve_contract_address(contracts, "Eurc");
 
-    // Extract ETH/USD from oracle calls in the current block range
-    let eth_usd = extract_eth_usd_from_oracle(ctx, cache, &weth_address, chain_id, &mut price_ops);
+    // Extract ETH/USD from oracle calls in the current block range.
+    let mut eth_usd =
+        extract_eth_usd_from_oracle(ctx, cache, &weth_address, chain_id, &mut price_ops);
+
+    // Cold-start safety net: if the shared cache is still empty, fall back to
+    // the latest persisted ETH/USD row.
+    if eth_usd.is_none() {
+        if let Some(pool) = db_pool.get() {
+            if let Some(weth_addr) = &weth_address {
+                if let Ok(price) =
+                    query_latest_price(pool, chain_id, weth_addr, Some(&USD_QUOTE_TOKEN)).await
+                {
+                    cache.set_eth_usd(price.clone());
+                    eth_usd = Some(price);
+                }
+            }
+        }
+    }
 
     // EURC/USD: try to refresh from DB if cache is empty
     let mut eurc_usd = cache.get_eurc_usd();
@@ -333,9 +351,6 @@ fn build_oracle_price_op(
     token_address: &[u8; 20],
     price: &BigDecimal,
 ) -> DbOperation {
-    // Use a stable "quote_token" for oracle prices — all zeros signals "USD"
-    let usd_quote: [u8; 20] = [0u8; 20];
-
     DbOperation::Upsert {
         table: "prices".into(),
         columns: vec![
@@ -345,26 +360,17 @@ fn build_oracle_price_op(
             "token".into(),
             "quote_token".into(),
             "price".into(),
-            "source".into(),
-            "source_version".into(),
         ],
         values: vec![
             DbValue::Timestamp(block_timestamp as i64),
             DbValue::Int64(block_number as i64),
             DbValue::Int64(chain_id as i64),
             DbValue::Address(*token_address),
-            DbValue::Address(usd_quote),
+            DbValue::Address(USD_QUOTE_TOKEN),
             DbValue::Numeric(price.to_string()),
-            DbValue::VarChar(ORACLE_PRICE_SOURCE.into()),
-            DbValue::Int32(1),
         ],
-        conflict_columns: vec![
-            "timestamp".into(),
-            "chain_id".into(),
-            "token".into(),
-            "source".into(),
-            "source_version".into(),
-        ],
+        // Handler-level source/source_version are injected later by the executor.
+        conflict_columns: vec!["timestamp".into(), "chain_id".into(), "token".into()],
         update_columns: vec!["block_number".into(), "quote_token".into(), "price".into()],
         update_condition: None,
     }
@@ -388,7 +394,7 @@ async fn query_latest_price(
     pool: &Pool,
     chain_id: u64,
     token_address: &[u8; 20],
-    source_filter: Option<&str>,
+    quote_token_filter: Option<&[u8; 20]>,
 ) -> Result<BigDecimal, TransformationError> {
     let client = pool
         .get()
@@ -398,14 +404,14 @@ async fn query_latest_price(
     let chain_id_param = chain_id as i64;
     let token_param = token_address.to_vec();
 
-    let row = if let Some(source) = source_filter {
-        let source_param = source.to_string();
+    let row = if let Some(quote_token) = quote_token_filter {
+        let quote_token_param = quote_token.to_vec();
         client
             .query_opt(
                 "SELECT price FROM prices \
-                 WHERE chain_id = $1 AND token = $2 AND source = $3 \
+                 WHERE chain_id = $1 AND token = $2 AND quote_token = $3 \
                  ORDER BY block_number DESC LIMIT 1",
-                &[&chain_id_param, &token_param, &source_param],
+                &[&chain_id_param, &token_param, &quote_token_param],
             )
             .await
     } else {
@@ -452,14 +458,13 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    use crate::transformations::executor::inject_source_version;
+
     fn bd(s: &str) -> BigDecimal {
         BigDecimal::from_str(s).unwrap()
     }
 
-    fn make_ctx(
-        eth_usd: Option<&str>,
-        eurc_usd: Option<&str>,
-    ) -> UsdPriceContext {
+    fn make_ctx(eth_usd: Option<&str>, eurc_usd: Option<&str>) -> UsdPriceContext {
         UsdPriceContext {
             eth_usd: eth_usd.map(|s| bd(s)),
             eurc_usd: eurc_usd.map(|s| bd(s)),
@@ -544,5 +549,55 @@ mod tests {
         let raw = U256::from(500_000_000u64);
         let result = u256_to_decimal_adjusted(&raw, 6);
         assert_eq!(result, bd("500"));
+    }
+
+    #[test]
+    fn test_oracle_price_op_relies_on_executor_for_source_injection() {
+        let op = build_oracle_price_op(8453, 123, 456, &[0x01; 20], &bd("2000"));
+        let ops = inject_source_version(vec![op], "SwapHandler", 7);
+        let op = ops.into_iter().next().unwrap();
+
+        let DbOperation::Upsert {
+            columns,
+            values,
+            conflict_columns,
+            ..
+        } = op
+        else {
+            panic!("expected upsert");
+        };
+
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "source")
+                .count(),
+            1
+        );
+        assert_eq!(
+            columns
+                .iter()
+                .filter(|column| column.as_str() == "source_version")
+                .count(),
+            1
+        );
+        assert_eq!(
+            conflict_columns
+                .iter()
+                .filter(|column| column.as_str() == "source")
+                .count(),
+            1
+        );
+        assert_eq!(
+            conflict_columns
+                .iter()
+                .filter(|column| column.as_str() == "source_version")
+                .count(),
+            1
+        );
+        assert!(
+            matches!(values.get(values.len() - 2), Some(DbValue::Text(source)) if source == "SwapHandler")
+        );
+        assert!(matches!(values.last(), Some(DbValue::Int32(7))));
     }
 }

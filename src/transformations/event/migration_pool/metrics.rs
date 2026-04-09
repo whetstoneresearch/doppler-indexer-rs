@@ -34,7 +34,9 @@ use crate::transformations::event::metrics::v4_hook_extract::extract_tuple_modif
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
-use crate::transformations::util::usd_price::{build_usd_price_context, OraclePriceCache};
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 const POOL_MANAGER_SOURCE: &str = "UniswapV4PoolManager";
 const MIGRATOR_HOOK_SOURCE: &str = "UniswapV4MigratorHook";
@@ -169,8 +171,13 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
         .await?;
 
         let (usd_ctx, price_ops) = build_usd_price_context(
-            ctx, &self.oracle_cache, &self.db_pool, self.chain_id, &ctx.contracts,
-        ).await;
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
 
         let mut ops = process_swaps(
             &swaps,
@@ -187,6 +194,9 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -229,6 +239,10 @@ impl EventHandler for MigrationPoolSwapMetricsHandler {
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["MigrationPoolCreateHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 }
 

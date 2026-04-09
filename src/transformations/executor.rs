@@ -367,11 +367,19 @@ pub(crate) fn inject_source_version(
                     where_clause,
                 }
             }
-            DbOperation::RawSql { query, params } => {
+            DbOperation::RawSql {
+                query,
+                params,
+                snapshot,
+            } => {
                 tracing::warn!(
                     "RawSql operation skipped for source/version injection — handler must manage source/source_version manually"
                 );
-                DbOperation::RawSql { query, params }
+                DbOperation::RawSql {
+                    query,
+                    params,
+                    snapshot,
+                }
             }
         })
         .collect()
@@ -408,7 +416,8 @@ fn inject_where_clause(clause: WhereClause, source: &str, version: u32) -> Where
 /// Execute a transaction with optional snapshot capture for reorg rollback.
 ///
 /// For live mode (single-block ranges), this function:
-/// 1. Collects snapshot specs (table + key columns) for upserts with update_columns
+/// 1. Collects snapshot specs (table + key columns) for row-modifying ops that
+///    opt into rollback capture
 /// 2. Executes snapshot reads and writes inside the same database transaction
 /// 3. Writes snapshots to storage after the transaction commits
 ///
@@ -435,14 +444,13 @@ pub(crate) async fn execute_with_snapshot_capture(
         }
     };
 
-    // Collect snapshot specs from upserts with update_columns
+    // Collect snapshot specs from row-modifying operations that opt into
+    // rollback capture.
     let mut snapshot_specs: Vec<(String, Vec<(String, DbValue)>)> = Vec::new();
-    // Track metadata for building LiveUpsertSnapshot after the transaction
+    // Track metadata for building LiveUpsertSnapshot after the transaction.
     struct SnapshotMeta {
         table: String,
-        conflict_columns: Vec<String>,
-        values: Vec<DbValue>,
-        columns: Vec<String>,
+        key_columns: Vec<(String, DbValue)>,
         /// Index into `ops` for this snapshot, used to check affected_rows.
         op_index: usize,
     }
@@ -463,20 +471,31 @@ pub(crate) async fn execute_with_snapshot_capture(
                 continue;
             }
 
-            // Build key columns from conflict_columns
-            let mut key_columns: Vec<(String, DbValue)> = Vec::new();
-            for conflict_col in conflict_columns {
-                if let Some(idx) = columns.iter().position(|c| c == conflict_col) {
-                    key_columns.push((conflict_col.clone(), values[idx].clone()));
-                }
-            }
+            let key_columns: Vec<(String, DbValue)> = conflict_columns
+                .iter()
+                .filter_map(|conflict_col| {
+                    columns
+                        .iter()
+                        .position(|c| c == conflict_col)
+                        .map(|idx| (conflict_col.clone(), values[idx].clone()))
+                })
+                .collect();
 
-            snapshot_specs.push((table.clone(), key_columns));
+            snapshot_specs.push((table.clone(), key_columns.clone()));
             snapshot_metas.push(SnapshotMeta {
                 table: table.clone(),
-                conflict_columns: conflict_columns.clone(),
-                values: values.clone(),
-                columns: columns.clone(),
+                key_columns,
+                op_index,
+            });
+        } else if let DbOperation::RawSql {
+            snapshot: Some(snapshot),
+            ..
+        } = op
+        {
+            snapshot_specs.push((snapshot.table.clone(), snapshot.key_columns.clone()));
+            snapshot_metas.push(SnapshotMeta {
+                table: snapshot.table.clone(),
+                key_columns: snapshot.key_columns.clone(),
                 op_index,
             });
         }
@@ -506,18 +525,10 @@ pub(crate) async fn execute_with_snapshot_capture(
 
         let previous_row = snapshot_results.get(i).cloned().flatten();
 
-        let key_columns: Vec<(String, DbValue)> = meta
-            .conflict_columns
+        let live_key_columns: Vec<(String, LiveDbValue)> = meta
+            .key_columns
             .iter()
-            .filter_map(|col| {
-                meta.columns
-                    .iter()
-                    .position(|c| c == col)
-                    .map(|idx| (col.clone(), meta.values[idx].clone()))
-            })
-            .collect();
-
-        let live_key_columns: Vec<(String, LiveDbValue)> = key_columns
+            .cloned()
             .into_iter()
             .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
             .collect();
@@ -556,7 +567,7 @@ pub(crate) async fn execute_with_snapshot_capture(
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{DbOperation, DbValue};
+    use crate::db::{DbOperation, DbSnapshot, DbValue};
 
     /// Helper to build a upsert op with update_columns (triggers snapshot).
     fn make_upsert_op(table: &str) -> DbOperation {
@@ -590,6 +601,24 @@ mod tests {
         }
     }
 
+    /// Helper to build a RawSql op with explicit snapshot metadata.
+    fn make_raw_sql_snapshot_op(table: &str) -> DbOperation {
+        DbOperation::RawSql {
+            query: format!("UPDATE {} SET value = value + 1 WHERE chain_id = $1", table),
+            params: vec![DbValue::Int64(1)],
+            snapshot: Some(DbSnapshot {
+                table: table.to_string(),
+                key_columns: vec![
+                    ("chain_id".to_string(), DbValue::Int64(1)),
+                    (
+                        "pool_address".to_string(),
+                        DbValue::Text("0xABC".to_string()),
+                    ),
+                ],
+            }),
+        }
+    }
+
     /// Simulate the snapshot-filtering logic from `execute_with_snapshot_capture`
     /// in isolation: given `ops` and `affected_rows`, return the snapshot metas
     /// that would survive the filter.
@@ -606,19 +635,30 @@ mod tests {
 
         let mut metas: Vec<SnapshotMeta> = Vec::new();
         for (op_index, op) in ops.iter().enumerate() {
-            if let DbOperation::Upsert {
-                table,
-                update_columns,
-                ..
-            } = op
-            {
-                if update_columns.is_empty() {
-                    continue;
+            match op {
+                DbOperation::Upsert {
+                    table,
+                    update_columns,
+                    ..
+                } => {
+                    if update_columns.is_empty() {
+                        continue;
+                    }
+                    metas.push(SnapshotMeta {
+                        table: table.clone(),
+                        op_index,
+                    });
                 }
-                metas.push(SnapshotMeta {
-                    table: table.clone(),
-                    op_index,
-                });
+                DbOperation::RawSql {
+                    snapshot: Some(snapshot),
+                    ..
+                } => {
+                    metas.push(SnapshotMeta {
+                        table: snapshot.table.clone(),
+                        op_index,
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -662,6 +702,24 @@ mod tests {
     fn test_no_snapshot_for_insert_only_ops() {
         let ops = vec![make_insert_only_op("insert_table")];
         let affected_rows = vec![1u64]; // row was inserted, but still no snapshot wanted
+
+        let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        assert!(survivors.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_for_raw_sql_with_snapshot_metadata() {
+        let ops = vec![make_raw_sql_snapshot_op("pool_state")];
+        let affected_rows = vec![1u64];
+
+        let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
+        assert_eq!(survivors, vec!["pool_state".to_string()]);
+    }
+
+    #[test]
+    fn test_no_snapshot_for_raw_sql_when_no_rows_modified() {
+        let ops = vec![make_raw_sql_snapshot_op("pool_state")];
+        let affected_rows = vec![0u64];
 
         let survivors = collect_surviving_snapshot_tables(&ops, &affected_rows);
         assert!(survivors.is_empty());

@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use alloy_primitives::{I256, U256};
 use deadpool_postgres::Pool;
 
-use crate::db::{DbOperation, DbValue};
+use crate::db::{DbOperation, DbSnapshot, DbValue};
 use crate::transformations::error::TransformationError;
 use crate::transformations::util::db::pool_metrics::{
     insert_liquidity_delta, insert_pool_snapshot, upsert_pool_state, LiquidityDeltaData,
@@ -222,6 +222,7 @@ pub fn process_swaps(
                 chain_id,
                 pool_id,
                 &price_close,
+                *block_number,
                 acc.block_timestamp,
                 handler_name,
                 source_version,
@@ -240,6 +241,7 @@ fn build_rolling_metrics_update(
     chain_id: u64,
     pool_id: &[u8],
     price_close: &str,
+    block_number: u64,
     block_timestamp: u64,
     handler_name: &str,
     source_version: u32,
@@ -278,8 +280,9 @@ FROM (
 ) sub
 WHERE pool_state.chain_id = $1
   AND pool_state.pool_id = $2
-  AND pool_state.source = $5
-  AND pool_state.source_version = $6
+  AND pool_state.block_number = $5
+  AND pool_state.source = $6
+  AND pool_state.source_version = $7
 "#;
 
     DbOperation::RawSql {
@@ -289,9 +292,25 @@ WHERE pool_state.chain_id = $1
             DbValue::Bytes(pool_id.to_vec()),
             DbValue::Numeric(price_close.to_string()),
             DbValue::Int64(block_timestamp as i64),
+            DbValue::Int64(block_number as i64),
             DbValue::VarChar(handler_name.to_string()),
             DbValue::Int32(source_version as i32),
         ],
+        snapshot: Some(DbSnapshot {
+            table: "pool_state".to_string(),
+            key_columns: vec![
+                ("chain_id".to_string(), DbValue::Int64(chain_id as i64)),
+                ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
+                (
+                    "source".to_string(),
+                    DbValue::Text(handler_name.to_string()),
+                ),
+                (
+                    "source_version".to_string(),
+                    DbValue::Int32(source_version as i32),
+                ),
+            ],
+        }),
     }
 }
 
@@ -519,14 +538,28 @@ mod tests {
 
         let ops = process_swaps(&swaps, &cache, 8453, "test", "test", Some(&usd_ctx), 1);
         // snapshot + pool_state + rolling_metrics RawSql
-        assert_eq!(ops.len(), 3, "USD context should add rolling metrics RawSql");
+        assert_eq!(
+            ops.len(),
+            3,
+            "USD context should add rolling metrics RawSql"
+        );
 
         // Verify the third op is a RawSql
         match &ops[2] {
-            DbOperation::RawSql { query, params } => {
+            DbOperation::RawSql {
+                query,
+                params,
+                snapshot,
+            } => {
                 assert!(query.contains("volume_24h_usd"));
                 assert!(query.contains("price_change_1h"));
-                assert_eq!(params.len(), 6);
+                assert!(query.contains("pool_state.block_number = $5"));
+                assert_eq!(params.len(), 7);
+                let snapshot = snapshot
+                    .as_ref()
+                    .expect("rolling metrics should be snapshotted");
+                assert_eq!(snapshot.table, "pool_state");
+                assert_eq!(snapshot.key_columns.len(), 4);
             }
             _ => panic!("Expected RawSql for rolling metrics"),
         }

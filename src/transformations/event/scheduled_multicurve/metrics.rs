@@ -20,7 +20,9 @@ use crate::transformations::event::metrics::v4_hook_extract::{
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
-use crate::transformations::util::usd_price::{build_usd_price_context, OraclePriceCache};
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 const SOURCE: &str = "UniswapV4ScheduledMulticurveInitializerHook";
 
@@ -101,6 +103,9 @@ impl TransformationHandler for ScheduledMulticurveSwapMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -118,7 +123,10 @@ impl EventHandler for ScheduledMulticurveSwapMetricsHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![(SOURCE.to_string(), "getSlot0".to_string())]
+        vec![
+            (SOURCE.to_string(), "getSlot0".to_string()),
+            chainlink_latest_answer_dependency(),
+        ]
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
