@@ -170,7 +170,6 @@ impl DagScheduler {
                         &contiguous_dep_names,
                         &call_dep_keys,
                         range_start,
-                        (range_start, range_end),
                     )
                     .await
                 {

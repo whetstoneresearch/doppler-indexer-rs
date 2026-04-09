@@ -35,8 +35,10 @@ use tokio::sync::{Notify, RwLock};
 /// - **Contiguous watermarks**: per-handler highest `range_start` with no gap
 ///   from the first available range. Used to gate handlers with
 ///   `contiguous_handler_dependencies`.
-/// - **Call-dep ranges**: per-`(source, function)` set of `(range_start,
-///   range_end)` pairs where decoded call parquet files are available on disk.
+/// - **Call-dep ranges**: per-`(source, function)` set of `range_start`
+///   values where decoded call parquet files are available on disk.
+///   Matched by range_start only (not range_end) since log and call-dep
+///   parquet files may use different range sizes.
 ///   Updated by a background scanner task.
 ///
 /// [`WorkItem`]: super::dag::WorkItem
@@ -53,9 +55,10 @@ pub(crate) struct CompletionTracker {
     contiguous_watermarks: RwLock<HashMap<String, Option<u64>>>,
     /// Per-handler index into `available_starts` for O(1) amortized watermark advance.
     contiguous_positions: RwLock<HashMap<String, usize>>,
-    /// Per-`(source, function)` set of available call-dep range keys.
+    /// Per-`(source, function)` set of available call-dep range_starts.
+    /// Matched by range_start only (log and call-dep files may have different range sizes).
     /// Updated by the background `CallDepScanner`.
-    call_dep_ranges: RwLock<HashMap<(String, String), HashSet<(u64, u64)>>>,
+    call_dep_ranges: RwLock<HashMap<(String, String), HashSet<u64>>>,
 }
 
 /// Snapshot view of whether a set of dependencies is satisfied for a range.
@@ -407,6 +410,10 @@ impl CompletionTracker {
 
     /// Bulk-register available call-dep ranges for a `(source, function)` pair.
     ///
+    /// Accepts `(range_start, range_end)` tuples from the scanner but stores
+    /// only `range_start` values — call-dep and log parquet files may use
+    /// different range sizes, so matching on range_start alone is correct.
+    ///
     /// Called by the background `CallDepScanner`. Only calls `notify_waiters`
     /// if at least one new range was added.
     pub(crate) async fn register_call_dep_ranges(
@@ -419,7 +426,7 @@ impl CompletionTracker {
         let mut call_deps = self.call_dep_ranges.write().await;
         let entry = call_deps.entry(key).or_insert_with(HashSet::new);
         let old_len = entry.len();
-        entry.extend(ranges);
+        entry.extend(ranges.into_iter().map(|(start, _end)| start));
         let grew = entry.len() > old_len;
         drop(call_deps);
         if grew {
@@ -436,7 +443,6 @@ impl CompletionTracker {
         contiguous_deps: &[String],
         call_dep_keys: &[(String, String)],
         range_start: u64,
-        range_key: (u64, u64),
     ) -> DepState {
         // 1. Check handler deps failed/blocked/waiting (existing logic).
         {
@@ -475,12 +481,12 @@ impl CompletionTracker {
             }
         }
 
-        // 3. Check call-dep file availability.
+        // 3. Check call-dep file availability (matched by range_start only).
         if !call_dep_keys.is_empty() {
             let call_deps = self.call_dep_ranges.read().await;
             for (source, function) in call_dep_keys {
                 let key = (source.clone(), function.clone());
-                if !call_deps.get(&key).is_some_and(|r| r.contains(&range_key)) {
+                if !call_deps.get(&key).is_some_and(|r| r.contains(&range_start)) {
                     return DepState::Waiting;
                 }
             }
@@ -490,7 +496,10 @@ impl CompletionTracker {
     }
 
     /// Await until handler deps, contiguous watermark deps, and call-dep files
-    /// are all satisfied for `(range_start, range_end)`.
+    /// are all satisfied for `range_start`.
+    ///
+    /// Call-dep availability is matched by `range_start` only (not range_end)
+    /// since log and call-dep parquet files may use different range sizes.
     ///
     /// Same wake-safety invariant as [`wait_ready`]: `notified()` is constructed
     /// before probing.
@@ -500,12 +509,11 @@ impl CompletionTracker {
         contiguous_deps: &[String],
         call_dep_keys: &[(String, String)],
         range_start: u64,
-        range_key: (u64, u64),
     ) -> Result<(), DepWaitError> {
         loop {
             let notified = self.notify.notified();
             match self
-                .probe_extended(handler_deps, contiguous_deps, call_dep_keys, range_start, range_key)
+                .probe_extended(handler_deps, contiguous_deps, call_dep_keys, range_start)
                 .await
             {
                 DepState::Ready => return Ok(()),
@@ -896,7 +904,7 @@ mod tests {
         let tracker2 = tracker.clone();
         let handle = tokio::spawn(async move {
             tracker2
-                .wait_ready_extended(&[], &names(&["A"]), &[], 200, (200, 300))
+                .wait_ready_extended(&[], &names(&["A"]), &[], 200)
                 .await
                 .unwrap();
         });
@@ -919,21 +927,21 @@ mod tests {
         let handle = tokio::spawn(async move {
             let call_deps = vec![("src".to_string(), "func".to_string())];
             tracker2
-                .wait_ready_extended(&[], &[], &call_deps, 100, (100, 200))
+                .wait_ready_extended(&[], &[], &call_deps, 100)
                 .await
                 .unwrap();
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!handle.is_finished(), "should wait for call-dep");
 
-        // Register the call-dep range.
+        // Register the call-dep range (range_end differs from log's range_end — only range_start matters).
         let mut ranges = HashSet::new();
-        ranges.insert((100u64, 200u64));
+        ranges.insert((100u64, 250u64)); // Different range_end than log's (100, 200)
         tracker.register_call_dep_ranges("src", "func", ranges).await;
 
         tokio::time::timeout(Duration::from_millis(100), handle)
             .await
-            .expect("waiter should resolve after call-dep registered")
+            .expect("waiter should resolve after call-dep registered (matched by range_start only)")
             .unwrap();
     }
 
@@ -941,7 +949,7 @@ mod tests {
     async fn wait_ready_extended_combined_gating() {
         let tracker = Arc::new(CompletionTracker::with_available_starts(vec![100, 200, 300]));
         // Need: handler dep B completed for range 200, contiguous dep A >= 200,
-        // call dep (src, func) available for (200, 300).
+        // call dep (src, func) available for range_start 200.
         tracker.seed_completed("A", [100]).await;
 
         let tracker2 = tracker.clone();
@@ -953,7 +961,6 @@ mod tests {
                     &names(&["A"]),
                     &call_deps,
                     200,
-                    (200, 300),
                 )
                 .await
                 .unwrap();
@@ -971,9 +978,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!handle.is_finished(), "still waiting on call dep");
 
-        // Satisfy call dep.
+        // Satisfy call dep (call-dep file has different range_end — only range_start matters).
         let mut ranges = HashSet::new();
-        ranges.insert((200u64, 300u64));
+        ranges.insert((200u64, 400u64));
         tracker.register_call_dep_ranges("src", "func", ranges).await;
         tokio::time::timeout(Duration::from_millis(100), handle)
             .await
@@ -986,7 +993,7 @@ mod tests {
         let tracker = CompletionTracker::with_available_starts(vec![100, 200]);
         tracker.mark_failed("A", 100).await;
         let state = tracker
-            .probe_extended(&names(&["A"]), &[], &[], 100, (100, 200))
+            .probe_extended(&names(&["A"]), &[], &[], 100)
             .await;
         assert_eq!(
             state,
