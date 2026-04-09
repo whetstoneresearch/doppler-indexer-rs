@@ -17,7 +17,7 @@ mod reorg;
 mod storage;
 mod types;
 
-pub use collector::LiveCollector;
+pub use collector::{LiveCollector, LiveCollectorConfig};
 pub use compaction::{CompactionService, TransformRetryRequest};
 pub use eth_calls::LiveEthCallCollector;
 pub use progress::LiveProgressTracker;
