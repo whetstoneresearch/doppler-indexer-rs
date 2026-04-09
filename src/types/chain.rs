@@ -2,9 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
 const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-/// Reserve ordinal slot 0 for the outer instruction itself and one slot for
-/// every possible `u16` inner instruction index, preserving a one-to-one mapping.
-const SOLANA_ORDINAL_STRIDE: u64 = u16::MAX as u64 + 2;
+/// Reserve sort slot 0 for the outer instruction itself.
+/// Inner instructions are shifted by 1 so the first CPI sorts immediately after
+/// the outer instruction without colliding with it.
+const SOLANA_OUTER_INSTRUCTION_SORT_SLOT: u64 = 0;
+const SOLANA_INNER_INSTRUCTION_OFFSET: u64 = 1;
+/// Lossless packed stride for BIGINT-backed storage. This intentionally exceeds
+/// i32::MAX at the upper bound, so it must not be used with INT/INTEGER columns.
+const SOLANA_PACKED_ORDINAL_STRIDE: i64 = u16::MAX as i64 + 2;
 
 /// A blockchain address, sized appropriately for the source chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -114,18 +119,34 @@ pub enum LogPosition {
 }
 
 impl LogPosition {
-    pub fn ordinal(&self) -> u64 {
+    /// Stable ordering within a transaction without flattening away the
+    /// instruction/inner-instruction structure.
+    pub fn sort_key(&self) -> (u64, u64) {
         match self {
-            LogPosition::Evm { log_index } => *log_index as u64,
+            LogPosition::Evm { log_index } => (*log_index as u64, 0),
             LogPosition::Solana {
                 instruction_index,
                 inner_instruction_index,
-            } => {
-                (*instruction_index as u64) * SOLANA_ORDINAL_STRIDE
-                    + match inner_instruction_index {
-                        None => 0,
-                        Some(inner) => *inner as u64 + 1,
-                    }
+            } => (
+                *instruction_index as u64,
+                match inner_instruction_index {
+                    None => SOLANA_OUTER_INSTRUCTION_SORT_SLOT,
+                    Some(inner) => *inner as u64 + SOLANA_INNER_INSTRUCTION_OFFSET,
+                },
+            ),
+        }
+    }
+
+    /// Lossless packed ordinal for BIGINT-backed database columns.
+    pub fn packed_ordinal_i64(&self) -> i64 {
+        match self {
+            LogPosition::Evm { log_index } => i64::from(*log_index),
+            LogPosition::Solana { .. } => {
+                let (instruction_index, inner_slot) = self.sort_key();
+                let instruction_index =
+                    i64::try_from(instruction_index).expect("u16 instruction index fits in i64");
+                let inner_slot = i64::try_from(inner_slot).expect("inner sort slot fits in i64");
+                instruction_index * SOLANA_PACKED_ORDINAL_STRIDE + inner_slot
             }
         }
     }
@@ -237,31 +258,37 @@ mod tests {
     }
 
     #[test]
-    fn log_position_evm_ordinal() {
+    fn log_position_evm_sort_key() {
         let pos = LogPosition::Evm { log_index: 42 };
-        assert_eq!(pos.ordinal(), 42);
+        assert_eq!(pos.sort_key(), (42, 0));
     }
 
     #[test]
-    fn log_position_solana_ordinal_no_inner() {
+    fn log_position_evm_packed_ordinal() {
+        let pos = LogPosition::Evm { log_index: 42 };
+        assert_eq!(pos.packed_ordinal_i64(), 42);
+    }
+
+    #[test]
+    fn log_position_solana_sort_key_no_inner() {
         let pos = LogPosition::Solana {
             instruction_index: 3,
             inner_instruction_index: None,
         };
-        assert_eq!(pos.ordinal(), 3 * SOLANA_ORDINAL_STRIDE);
+        assert_eq!(pos.sort_key(), (3, 0));
     }
 
     #[test]
-    fn log_position_solana_ordinal_with_inner() {
+    fn log_position_solana_sort_key_with_inner() {
         let pos = LogPosition::Solana {
             instruction_index: 2,
             inner_instruction_index: Some(5),
         };
-        assert_eq!(pos.ordinal(), 2 * SOLANA_ORDINAL_STRIDE + 6);
+        assert_eq!(pos.sort_key(), (2, 6));
     }
 
     #[test]
-    fn log_position_solana_outer_and_first_inner_have_distinct_ordinals() {
+    fn log_position_solana_outer_and_first_inner_have_distinct_sort_keys() {
         let outer = LogPosition::Solana {
             instruction_index: 7,
             inner_instruction_index: None,
@@ -270,11 +297,11 @@ mod tests {
             instruction_index: 7,
             inner_instruction_index: Some(0),
         };
-        assert_ne!(outer.ordinal(), first_inner.ordinal());
+        assert_ne!(outer.sort_key(), first_inner.sort_key());
     }
 
     #[test]
-    fn log_position_solana_ordinals_are_ordered() {
+    fn log_position_solana_sort_keys_are_ordered() {
         let pos_a = LogPosition::Solana {
             instruction_index: 1,
             inner_instruction_index: Some(u16::MAX),
@@ -283,7 +310,7 @@ mod tests {
             instruction_index: 2,
             inner_instruction_index: None,
         };
-        assert!(pos_a.ordinal() < pos_b.ordinal());
+        assert!(pos_a.sort_key() < pos_b.sort_key());
     }
 
     #[test]
@@ -296,8 +323,54 @@ mod tests {
             instruction_index: 12,
             inner_instruction_index: None,
         };
-        assert_ne!(last_inner.ordinal(), next_outer.ordinal());
-        assert!(last_inner.ordinal() < next_outer.ordinal());
+        assert_ne!(last_inner.sort_key(), next_outer.sort_key());
+        assert!(last_inner.sort_key() < next_outer.sort_key());
+    }
+
+    #[test]
+    fn log_position_solana_packed_ordinal_no_inner() {
+        let pos = LogPosition::Solana {
+            instruction_index: 3,
+            inner_instruction_index: None,
+        };
+        assert_eq!(
+            pos.packed_ordinal_i64(),
+            3 * SOLANA_PACKED_ORDINAL_STRIDE
+        );
+    }
+
+    #[test]
+    fn log_position_solana_packed_ordinal_with_inner() {
+        let pos = LogPosition::Solana {
+            instruction_index: 2,
+            inner_instruction_index: Some(5),
+        };
+        assert_eq!(
+            pos.packed_ordinal_i64(),
+            2 * SOLANA_PACKED_ORDINAL_STRIDE + 6
+        );
+    }
+
+    #[test]
+    fn log_position_solana_packed_ordinals_are_ordered() {
+        let last_inner = LogPosition::Solana {
+            instruction_index: 11,
+            inner_instruction_index: Some(u16::MAX),
+        };
+        let next_outer = LogPosition::Solana {
+            instruction_index: 12,
+            inner_instruction_index: None,
+        };
+        assert!(last_inner.packed_ordinal_i64() < next_outer.packed_ordinal_i64());
+    }
+
+    #[test]
+    fn log_position_solana_packed_ordinal_requires_bigint_storage() {
+        let max_pos = LogPosition::Solana {
+            instruction_index: u16::MAX,
+            inner_instruction_index: Some(u16::MAX),
+        };
+        assert!(max_pos.packed_ordinal_i64() > i64::from(i32::MAX));
     }
 
     #[test]

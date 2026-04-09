@@ -158,7 +158,7 @@ pub fn insert_liquidity_delta(data: &LiquidityDeltaData) -> DbOperation {
             DbValue::Int64(data.chain_id as i64),
             DbValue::Bytes(data.pool_id.clone()),
             DbValue::Int64(data.block_number as i64),
-            DbValue::Int32(i32::try_from(data.log_index).unwrap_or(i32::MAX)),
+            DbValue::Int64(data.log_index as i64),
             DbValue::Int32(data.tick_lower),
             DbValue::Int32(data.tick_upper),
             DbValue::Numeric(data.liquidity_delta.clone()),

@@ -26,7 +26,7 @@ pub fn insert_transfer(
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
             DbValue::Int64(block_number as i64),
-            DbValue::Int32(log_index as i32),
+            DbValue::Int64(log_index as i64),
             DbValue::Timestamp(block_timestamp as i64),
             DbValue::Address(*token),
             DbValue::Address(*from),
