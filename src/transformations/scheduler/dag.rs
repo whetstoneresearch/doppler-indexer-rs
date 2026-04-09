@@ -6,7 +6,7 @@
 //!   1. awaits [`CompletionTracker::wait_ready`] on its `(dep_names, range_start)`,
 //!   2. acquires a permit from the global concurrency semaphore,
 //!   3. invokes a caller-supplied runner closure with the item,
-//!   4. marks itself completed or failed on the tracker, waking dependents.
+//!   4. marks itself completed, blocked, or failed on the tracker, waking dependents.
 //!
 //! Waiting happens *before* permit acquisition to prevent a permit-deadlock
 //! where all permits are held by waiters.
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::{Id, JoinSet};
 
 use super::tracker::CompletionTracker;
@@ -51,12 +51,24 @@ pub(crate) struct WorkItemOutcome {
 pub(crate) enum OutcomeStatus {
     /// Runner returned `Ok(())`.
     Succeeded,
+    /// Runner returned a transient blocked result; item should be retried.
+    Blocked { reason: String },
     /// Runner returned `Err(reason)`.
     HandlerFailed { reason: String },
+    /// A dependency was marked blocked, so this item was cascade-blocked.
+    DepCascadeBlocked { dep_name: String },
     /// A dependency was marked failed, so this item was cascade-skipped.
     DepCascadeFailed { dep_name: String },
     /// Runner panicked or the task was cancelled.
     Panicked,
+}
+
+/// Runner result for one work item execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkItemRunResult {
+    Succeeded,
+    Failed(String),
+    Blocked(String),
 }
 
 /// Pure DAG scheduler — owns the [`CompletionTracker`] and a concurrency semaphore.
@@ -83,9 +95,9 @@ impl DagScheduler {
     ///
     /// Items whose deps are already satisfied start immediately (modulo the
     /// concurrency bound). Items with unsatisfied deps park in
-    /// [`CompletionTracker::wait_ready`] until their deps complete or fail.
-    /// Cascade failures short-circuit downstream items with
-    /// [`OutcomeStatus::DepCascadeFailed`].
+    /// [`CompletionTracker::wait_ready`] until their deps complete, block, or fail.
+    /// Cascade failures/blocks short-circuit downstream items with
+    /// [`OutcomeStatus::DepCascadeFailed`] / [`OutcomeStatus::DepCascadeBlocked`].
     pub(crate) async fn execute<R, Fut>(
         &self,
         items: Vec<WorkItem>,
@@ -93,7 +105,7 @@ impl DagScheduler {
     ) -> Vec<WorkItemOutcome>
     where
         R: Fn(WorkItem) -> Fut + Send + Sync + Clone + 'static,
-        Fut: Future<Output = Result<(), String>> + Send + 'static,
+        Fut: Future<Output = WorkItemRunResult> + Send + 'static,
     {
         if items.is_empty() {
             return Vec::new();
@@ -112,6 +124,16 @@ impl DagScheduler {
             }
             Arc::new(m)
         };
+        let seq_blocked: Arc<HashMap<String, Arc<Mutex<Option<u64>>>>> = {
+            let mut m = HashMap::new();
+            for item in &items {
+                if item.sequential {
+                    m.entry(item.handler_name.clone())
+                        .or_insert_with(|| Arc::new(Mutex::new(None)));
+                }
+            }
+            Arc::new(m)
+        };
 
         let mut join_set: JoinSet<WorkItemOutcome> = JoinSet::new();
         // Tracks identity per Tokio task ID so we can report a full outcome
@@ -126,23 +148,35 @@ impl DagScheduler {
             let tracker = self.tracker.clone();
             let permits = self.global_permits.clone();
             let seq_sems = seq_sems.clone();
+            let seq_blocked = seq_blocked.clone();
             let runner = runner.clone();
 
             // Data captured by the spawned task:
             let name_for_task = name.clone();
             let handle = join_set.spawn(async move {
                 // 1. Gate on dependencies.
-                if let Err(dep_failed) = tracker.wait_ready(&dep_names, range_start).await {
-                    // Cascade: our own dependents must also short-circuit.
-                    tracker.mark_failed(&name_for_task, range_start).await;
-                    return WorkItemOutcome {
-                        handler_name: name_for_task,
-                        range_start,
-                        range_end,
-                        status: OutcomeStatus::DepCascadeFailed {
-                            dep_name: dep_failed.dep_name,
-                        },
-                    };
+                if let Err(dep_wait) = tracker.wait_ready(&dep_names, range_start).await {
+                    match dep_wait {
+                        super::tracker::DepWaitError::DepFailed { dep_name, .. } => {
+                            // Cascade: our own dependents must also short-circuit.
+                            tracker.mark_failed(&name_for_task, range_start).await;
+                            return WorkItemOutcome {
+                                handler_name: name_for_task,
+                                range_start,
+                                range_end,
+                                status: OutcomeStatus::DepCascadeFailed { dep_name },
+                            };
+                        }
+                        super::tracker::DepWaitError::DepBlocked { dep_name, .. } => {
+                            tracker.mark_blocked(&name_for_task, range_start).await;
+                            return WorkItemOutcome {
+                                handler_name: name_for_task,
+                                range_start,
+                                range_end,
+                                status: OutcomeStatus::DepCascadeBlocked { dep_name },
+                            };
+                        }
+                    }
                 }
 
                 // 2. Per-handler sequential gate (capacity-1 FIFO).
@@ -159,6 +193,23 @@ impl DagScheduler {
                     None => None,
                 };
 
+                if let Some(blocked) = seq_blocked.get(&name_for_task) {
+                    let blocking_range = *blocked.lock().await;
+                    if let Some(blocking_range) = blocking_range.filter(|r| *r < range_start) {
+                        let reason = format!(
+                            "waiting on earlier blocked range {} before processing {}",
+                            blocking_range, range_start
+                        );
+                        tracker.mark_blocked(&name_for_task, range_start).await;
+                        return WorkItemOutcome {
+                            handler_name: name_for_task,
+                            range_start,
+                            range_end,
+                            status: OutcomeStatus::Blocked { reason },
+                        };
+                    }
+                }
+
                 // 3. Acquire global permit AFTER waiting to avoid permit-deadlock.
                 let _permit = permits
                     .acquire_owned()
@@ -170,7 +221,7 @@ impl DagScheduler {
 
                 // 5. Propagate result to tracker + return outcome.
                 match result {
-                    Ok(()) => {
+                    WorkItemRunResult::Succeeded => {
                         tracker.mark_completed(&name_for_task, range_start).await;
                         WorkItemOutcome {
                             handler_name: name_for_task,
@@ -179,13 +230,28 @@ impl DagScheduler {
                             status: OutcomeStatus::Succeeded,
                         }
                     }
-                    Err(reason) => {
+                    WorkItemRunResult::Failed(reason) => {
                         tracker.mark_failed(&name_for_task, range_start).await;
                         WorkItemOutcome {
                             handler_name: name_for_task,
                             range_start,
                             range_end,
                             status: OutcomeStatus::HandlerFailed { reason },
+                        }
+                    }
+                    WorkItemRunResult::Blocked(reason) => {
+                        if let Some(blocked) = seq_blocked.get(&name_for_task) {
+                            let mut blocked_range = blocked.lock().await;
+                            if blocked_range.is_none_or(|existing| range_start < existing) {
+                                *blocked_range = Some(range_start);
+                            }
+                        }
+                        tracker.mark_blocked(&name_for_task, range_start).await;
+                        WorkItemOutcome {
+                            handler_name: name_for_task,
+                            range_start,
+                            range_end,
+                            status: OutcomeStatus::Blocked { reason },
                         }
                     }
                 }
@@ -246,6 +312,7 @@ mod tests {
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         fail_on: HashSet<(String, u64)>,
+        block_on: HashSet<(String, u64)>,
         panic_on: HashSet<(String, u64)>,
         hold_ms: u64,
     }
@@ -257,6 +324,7 @@ mod tests {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 fail_on: HashSet::new(),
+                block_on: HashSet::new(),
                 panic_on: HashSet::new(),
                 hold_ms,
             })
@@ -268,6 +336,19 @@ mod tests {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 fail_on: fail_on.iter().map(|(n, r)| (n.to_string(), *r)).collect(),
+                block_on: HashSet::new(),
+                panic_on: HashSet::new(),
+                hold_ms,
+            })
+        }
+
+        fn with_blocks(hold_ms: u64, block_on: &[(&str, u64)]) -> Arc<Self> {
+            Arc::new(Self {
+                events: Arc::new(TokioMutex::new(Vec::new())),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::new(AtomicUsize::new(0)),
+                fail_on: HashSet::new(),
+                block_on: block_on.iter().map(|(n, r)| (n.to_string(), *r)).collect(),
                 panic_on: HashSet::new(),
                 hold_ms,
             })
@@ -279,6 +360,7 @@ mod tests {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 fail_on: HashSet::new(),
+                block_on: HashSet::new(),
                 panic_on: panic_on.iter().map(|(n, r)| (n.to_string(), *r)).collect(),
                 hold_ms,
             })
@@ -286,7 +368,7 @@ mod tests {
 
         fn runner(
             self: &Arc<Self>,
-        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = WorkItemRunResult> + Send>>
                + Send
                + Sync
                + Clone
@@ -322,9 +404,17 @@ mod tests {
                     ));
 
                     if rec.fail_on.contains(&key) {
-                        Err(format!("test-forced failure at {}:{}", key.0, key.1))
+                        WorkItemRunResult::Failed(format!(
+                            "test-forced failure at {}:{}",
+                            key.0, key.1
+                        ))
+                    } else if rec.block_on.contains(&key) {
+                        WorkItemRunResult::Blocked(format!(
+                            "test-forced block at {}:{}",
+                            key.0, key.1
+                        ))
                     } else {
-                        Ok(())
+                        WorkItemRunResult::Succeeded
                     }
                 })
             }
@@ -575,9 +665,9 @@ mod tests {
                         item.range_start,
                         "end",
                     ));
-                    Ok::<(), String>(())
+                    WorkItemRunResult::Succeeded
                 })
-                    as std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+                    as std::pin::Pin<Box<dyn Future<Output = WorkItemRunResult> + Send>>
             }
         };
 
@@ -725,6 +815,7 @@ mod tests {
             in_flight: Arc::new(AtomicUsize::new(0)),
             max_in_flight: Arc::new(AtomicUsize::new(0)),
             fail_on: HashSet::new(),
+            block_on: HashSet::new(),
             panic_on: HashSet::new(),
             hold_ms: 10,
         });
@@ -878,5 +969,47 @@ mod tests {
             OutcomeStatus::HandlerFailed { .. }
         ));
         assert_eq!(get(102).status, OutcomeStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn blocked_dep_cascades_and_sequential_ranges_hold() {
+        let tracker = Arc::new(CompletionTracker::new());
+        let scheduler = DagScheduler::new(tracker.clone(), 4);
+        let rec = Recorder::with_blocks(10, &[("S", 100)]);
+        let items = vec![
+            seq_item("S", 100, &[]),
+            seq_item("S", 101, &[]),
+            item("D", 100, &["S"]),
+            item("D", 101, &["S"]),
+        ];
+        let outcomes = scheduler.execute(items, rec.runner()).await;
+        assert_eq!(outcomes.len(), 4);
+
+        let get = |name: &str, r: u64| {
+            outcomes
+                .iter()
+                .find(|o| o.handler_name == name && o.range_start == r)
+                .cloned()
+                .unwrap()
+        };
+
+        assert!(matches!(get("S", 100).status, OutcomeStatus::Blocked { .. }));
+        assert!(matches!(get("S", 101).status, OutcomeStatus::Blocked { .. }));
+        assert_eq!(
+            get("D", 100).status,
+            OutcomeStatus::DepCascadeBlocked {
+                dep_name: "S".to_string()
+            }
+        );
+        assert_eq!(
+            get("D", 101).status,
+            OutcomeStatus::DepCascadeBlocked {
+                dep_name: "S".to_string()
+            }
+        );
+        assert!(tracker.is_blocked("S", 100).await);
+        assert!(tracker.is_blocked("S", 101).await);
+        assert!(tracker.is_blocked("D", 100).await);
+        assert!(tracker.is_blocked("D", 101).await);
     }
 }

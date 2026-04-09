@@ -432,7 +432,7 @@ impl CatchupLoader {
 
 #[cfg(test)]
 mod tests {
-    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem};
+    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
     use super::super::tracker::CompletionTracker;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -468,7 +468,7 @@ mod tests {
 
         fn runner(
             self: &Arc<Self>,
-        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = WorkItemRunResult> + Send>>
                + Send
                + Sync
                + Clone
@@ -495,9 +495,12 @@ mod tests {
                     ));
 
                     if rec.fail_on.contains(&key) {
-                        Err(format!("test-forced failure at {}:{}", key.0, key.1))
+                        WorkItemRunResult::Failed(format!(
+                            "test-forced failure at {}:{}",
+                            key.0, key.1
+                        ))
                     } else {
-                        Ok(())
+                        WorkItemRunResult::Succeeded
                     }
                 })
             }

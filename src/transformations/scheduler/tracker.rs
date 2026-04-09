@@ -36,6 +36,7 @@ use tokio::sync::{Notify, RwLock};
 pub(crate) struct CompletionTracker {
     completed: RwLock<HashMap<String, HashSet<u64>>>,
     failed: RwLock<HashMap<String, HashSet<u64>>>,
+    blocked: RwLock<HashMap<String, HashSet<u64>>>,
     notify: Notify,
 }
 
@@ -48,16 +49,19 @@ pub(crate) enum DepState {
     Waiting,
     /// At least one dep has the range marked failed.
     DepFailed { dep_name: String },
+    /// At least one dep is transiently blocked for this pass.
+    DepBlocked { dep_name: String },
 }
 
-/// Returned by [`wait_ready`] when a dependency has failed.
+/// Returned by [`wait_ready`] when a dependency cannot be satisfied this pass.
 ///
 /// [`wait_ready`]: CompletionTracker::wait_ready
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("dependency '{dep_name}' failed for range_start {range_start}")]
-pub(crate) struct DepFailed {
-    pub dep_name: String,
-    pub range_start: u64,
+pub(crate) enum DepWaitError {
+    #[error("dependency '{dep_name}' failed for range_start {range_start}")]
+    DepFailed { dep_name: String, range_start: u64 },
+    #[error("dependency '{dep_name}' blocked for range_start {range_start}")]
+    DepBlocked { dep_name: String, range_start: u64 },
 }
 
 impl CompletionTracker {
@@ -65,6 +69,7 @@ impl CompletionTracker {
         Self {
             completed: RwLock::new(HashMap::new()),
             failed: RwLock::new(HashMap::new()),
+            blocked: RwLock::new(HashMap::new()),
             notify: Notify::new(),
         }
     }
@@ -107,6 +112,20 @@ impl CompletionTracker {
                 }
             }
         }
+        {
+            let blocked = self.blocked.read().await;
+            for dep in deps {
+                if blocked
+                    .get(dep)
+                    .map(|ranges| ranges.contains(&range_start))
+                    .unwrap_or(false)
+                {
+                    return DepState::DepBlocked {
+                        dep_name: dep.clone(),
+                    };
+                }
+            }
+        }
         let completed = self.completed.read().await;
         for dep in deps {
             let has = completed
@@ -134,7 +153,7 @@ impl CompletionTracker {
         &self,
         deps: &[String],
         range_start: u64,
-    ) -> Result<(), DepFailed> {
+    ) -> Result<(), DepWaitError> {
         loop {
             // MUST be created before probing: the stored notify_waiters_calls
             // counter is the mechanism that catches a mark that fires after
@@ -143,7 +162,13 @@ impl CompletionTracker {
             match self.probe(deps, range_start).await {
                 DepState::Ready => return Ok(()),
                 DepState::DepFailed { dep_name } => {
-                    return Err(DepFailed {
+                    return Err(DepWaitError::DepFailed {
+                        dep_name,
+                        range_start,
+                    })
+                }
+                DepState::DepBlocked { dep_name } => {
+                    return Err(DepWaitError::DepBlocked {
                         dep_name,
                         range_start,
                     })
@@ -161,6 +186,15 @@ impl CompletionTracker {
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
+        }
+        {
+            let mut blocked = self.blocked.write().await;
+            if let Some(ranges) = blocked.get_mut(handler_name) {
+                ranges.remove(&range_start);
+                if ranges.is_empty() {
+                    blocked.remove(handler_name);
+                }
+            }
         }
         self.notify.notify_waiters();
     }
@@ -187,7 +221,49 @@ impl CompletionTracker {
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
         }
+        {
+            let mut blocked = self.blocked.write().await;
+            if let Some(ranges) = blocked.get_mut(handler_name) {
+                ranges.remove(&range_start);
+                if ranges.is_empty() {
+                    blocked.remove(handler_name);
+                }
+            }
+        }
         self.notify.notify_waiters();
+    }
+
+    /// Mark `(handler_name, range_start)` as transiently blocked for this pass.
+    pub(crate) async fn mark_blocked(&self, handler_name: &str, range_start: u64) {
+        {
+            let mut blocked = self.blocked.write().await;
+            blocked
+                .entry(handler_name.to_string())
+                .or_insert_with(HashSet::new)
+                .insert(range_start);
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Clear a transient blocked mark before the next scheduler pass.
+    pub(crate) async fn clear_blocked(&self, handler_name: &str, range_start: u64) {
+        let mut blocked = self.blocked.write().await;
+        if let Some(ranges) = blocked.get_mut(handler_name) {
+            ranges.remove(&range_start);
+            if ranges.is_empty() {
+                blocked.remove(handler_name);
+            }
+        }
+    }
+
+    /// Check whether `(handler_name, range_start)` is transiently blocked.
+    #[cfg(test)]
+    pub(crate) async fn is_blocked(&self, handler_name: &str, range_start: u64) -> bool {
+        let blocked = self.blocked.read().await;
+        blocked
+            .get(handler_name)
+            .map(|ranges| ranges.contains(&range_start))
+            .unwrap_or(false)
     }
 }
 
@@ -266,8 +342,13 @@ mod tests {
         let tracker = CompletionTracker::new();
         tracker.mark_failed("A", 100).await;
         let err = tracker.wait_ready(&names(&["A"]), 100).await.unwrap_err();
-        assert_eq!(err.dep_name, "A");
-        assert_eq!(err.range_start, 100);
+        assert_eq!(
+            err,
+            DepWaitError::DepFailed {
+                dep_name: "A".to_string(),
+                range_start: 100,
+            }
+        );
     }
 
     #[tokio::test]
@@ -282,8 +363,13 @@ mod tests {
             .await
             .expect("waiter should resolve")
             .unwrap();
-        let err = result.unwrap_err();
-        assert_eq!(err.dep_name, "A");
+        assert_eq!(
+            result.unwrap_err(),
+            DepWaitError::DepFailed {
+                dep_name: "A".to_string(),
+                range_start: 100,
+            }
+        );
     }
 
     #[tokio::test]
@@ -388,8 +474,13 @@ mod tests {
                 dep_name: "B".to_string()
             }
         );
-        let err = tracker.wait_ready(&names(&["B"]), 200).await.unwrap_err();
-        assert_eq!(err.dep_name, "B");
+        assert_eq!(
+            tracker.wait_ready(&names(&["B"]), 200).await.unwrap_err(),
+            DepWaitError::DepFailed {
+                dep_name: "B".to_string(),
+                range_start: 200,
+            }
+        );
     }
 
     #[tokio::test]
@@ -402,7 +493,13 @@ mod tests {
             .wait_ready(&names(&["A", "B"]), 100)
             .await
             .unwrap_err();
-        assert_eq!(err.dep_name, "B");
+        assert_eq!(
+            err,
+            DepWaitError::DepFailed {
+                dep_name: "B".to_string(),
+                range_start: 100,
+            }
+        );
     }
 
     #[tokio::test]
@@ -428,5 +525,28 @@ mod tests {
         tracker.wait_ready(&names(&["A"]), 100).await.unwrap();
         tracker.wait_ready(&names(&["A"]), 101).await.unwrap();
         tracker.wait_ready(&names(&["A"]), 102).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_returns_dep_blocked_on_block() {
+        let tracker = CompletionTracker::new();
+        tracker.mark_blocked("A", 100).await;
+        assert_eq!(
+            tracker.wait_ready(&names(&["A"]), 100).await.unwrap_err(),
+            DepWaitError::DepBlocked {
+                dep_name: "A".to_string(),
+                range_start: 100,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_blocked_removes_transient_state() {
+        let tracker = CompletionTracker::new();
+        tracker.mark_blocked("A", 100).await;
+        assert!(tracker.is_blocked("A", 100).await);
+        tracker.clear_blocked("A", 100).await;
+        assert!(!tracker.is_blocked("A", 100).await);
+        assert_eq!(tracker.probe(&names(&["A"]), 100).await, DepState::Waiting);
     }
 }

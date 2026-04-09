@@ -30,7 +30,7 @@ use super::historical::HistoricalDataReader;
 use super::live_state::{LiveProcessingState, PendingEventData};
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::retry::{filter_calls_by_start_block, filter_events_by_start_block, RetryProcessor};
-use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem};
+use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
 use super::scheduler::loader::{read_receipt_addresses, CatchupLoader, CatchupPayload};
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
@@ -712,19 +712,21 @@ impl TransformationEngine {
         //
         // `ranges_pending` is None on the first pass (try every available range).
         // On subsequent passes it holds only the ranges that were skipped because
-        // the call-dep parquet files weren't on disk yet.
+        // dependencies were not ready or a prior pass ended transiently blocked.
         let mut ranges_pending: Option<HashMap<String, Vec<(u64, u64)>>> = None;
         let mut pass = 0u32;
         // Bail only after several consecutive passes make zero progress, so that
-        // slowly-arriving call-dep files don't get abandoned.
+        // slowly-arriving dependencies don't get abandoned.
         const MAX_CONSECUTIVE_NO_PROGRESS: u32 = 3;
         let mut consecutive_no_progress: u32 = 0;
+        let mut stranded_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
 
         loop {
             pass += 1;
 
             let mut items: Vec<WorkItem> = Vec::new();
             let mut next_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+            let mut pending_index: HashSet<(String, u64, u64)> = HashSet::new();
             // Parallel index into next_pending for O(1) cascade lookups.
             // Updated in lock-step with next_pending whenever we defer a range.
             let mut deferred_starts: HashMap<String, HashSet<u64>> = HashMap::new();
@@ -802,10 +804,13 @@ impl TransformationEngine {
                             per_handler_missing_call_deps
                                 .entry(name.clone())
                                 .or_insert_with(|| missing_formatted);
-                            next_pending
-                                .entry(name.clone())
-                                .or_default()
-                                .push((range_start, range_end));
+                            queue_pending_range(
+                                &mut next_pending,
+                                &mut pending_index,
+                                &name,
+                                range_start,
+                                range_end,
+                            );
                             deferred_starts
                                 .entry(name.clone())
                                 .or_default()
@@ -834,10 +839,13 @@ impl TransformationEngine {
                             range_end,
                             blocking
                         );
-                        next_pending
-                            .entry(name.clone())
-                            .or_default()
-                            .push((range_start, range_end));
+                        queue_pending_range(
+                            &mut next_pending,
+                            &mut pending_index,
+                            &name,
+                            range_start,
+                            range_end,
+                        );
                         deferred_starts
                             .entry(name.clone())
                             .or_default()
@@ -930,7 +938,15 @@ impl TransformationEngine {
                 let outcomes = scheduler
                     .execute(items, move |item| {
                         let loader = loader_ref.clone();
-                        Box::pin(async move { loader.run(item).await.map_err(|e| e.to_string()) })
+                        Box::pin(async move {
+                            match loader.run(item).await {
+                                Ok(()) => WorkItemRunResult::Succeeded,
+                                Err(TransformationError::TransientBlocked(msg)) => {
+                                    WorkItemRunResult::Blocked(msg)
+                                }
+                                Err(e) => WorkItemRunResult::Failed(e.to_string()),
+                            }
+                        })
                     })
                     .await;
 
@@ -941,9 +957,13 @@ impl TransformationEngine {
                 .record(pass_start.elapsed().as_secs_f64());
 
                 let mut succeeded = 0usize;
+                let mut blocked = 0usize;
+                let mut cascade_blocked = 0usize;
                 let mut cascade_failed = 0usize;
-                // Per-handler: (succeeded, failed, cascade_failed, panicked).
-                let mut per_handler_outcomes: HashMap<String, (usize, usize, usize, usize)> =
+                let mut blocked_marks_to_clear: Vec<(String, u64)> = Vec::new();
+                // Per-handler: (succeeded, failed, blocked, cascade_failed, cascade_blocked, panicked).
+                let mut per_handler_outcomes:
+                    HashMap<String, (usize, usize, usize, usize, usize, usize)> =
                     HashMap::new();
 
                 for outcome in &outcomes {
@@ -969,6 +989,30 @@ impl TransformationEngine {
                                 "kind" => kind_label,
                             )
                             .increment(1);
+                        }
+                        OutcomeStatus::Blocked { reason } => {
+                            tracing::info!(
+                                "Handler {} blocked on range {}-{}: {}",
+                                outcome.handler_name,
+                                outcome.range_start,
+                                outcome.range_end,
+                                reason
+                            );
+                            queue_pending_range(
+                                &mut next_pending,
+                                &mut pending_index,
+                                &outcome.handler_name,
+                                outcome.range_start,
+                                outcome.range_end,
+                            );
+                            deferred_starts
+                                .entry(outcome.handler_name.clone())
+                                .or_default()
+                                .insert(outcome.range_start);
+                            blocked_marks_to_clear
+                                .push((outcome.handler_name.clone(), outcome.range_start));
+                            blocked += 1;
+                            counts.2 += 1;
                         }
                         OutcomeStatus::HandlerFailed { reason } => {
                             tracing::error!(
@@ -1004,7 +1048,30 @@ impl TransformationEngine {
                                 format!("cascade-failed: dep '{}' failed", dep_name),
                             ));
                             cascade_failed += 1;
-                            counts.2 += 1;
+                            counts.3 += 1;
+                        }
+                        OutcomeStatus::DepCascadeBlocked { dep_name } => {
+                            tracing::info!(
+                                "Handler {} cascade-blocked on range {} due to dep '{}'",
+                                outcome.handler_name,
+                                outcome.range_start,
+                                dep_name
+                            );
+                            queue_pending_range(
+                                &mut next_pending,
+                                &mut pending_index,
+                                &outcome.handler_name,
+                                outcome.range_start,
+                                outcome.range_end,
+                            );
+                            deferred_starts
+                                .entry(outcome.handler_name.clone())
+                                .or_default()
+                                .insert(outcome.range_start);
+                            blocked_marks_to_clear
+                                .push((outcome.handler_name.clone(), outcome.range_start));
+                            cascade_blocked += 1;
+                            counts.4 += 1;
                         }
                         OutcomeStatus::Panicked => {
                             tracing::error!(
@@ -1022,30 +1089,43 @@ impl TransformationEngine {
                                 outcome.range_start,
                                 "task panicked".to_string(),
                             ));
-                            counts.3 += 1;
+                            counts.5 += 1;
                         }
                     }
+                }
+
+                for (handler_name, range_start) in blocked_marks_to_clear {
+                    tracker.clear_blocked(&handler_name, range_start).await;
                 }
 
                 // Per-handler outcome summary. Log anything with non-success
                 // activity at info, clean runs at debug to reduce log noise.
                 for ch in &handlers {
                     let name = ch.handler.name();
-                    let Some(&(ok, failed, cascade, panicked)) = per_handler_outcomes.get(name)
+                    let Some(&(ok, failed, blocked_count, cascade, cascade_blocked_count, panicked)) =
+                        per_handler_outcomes.get(name)
                     else {
                         continue;
                     };
-                    let total = ok + failed + cascade + panicked;
-                    if failed > 0 || cascade > 0 || panicked > 0 {
+                    let total =
+                        ok + failed + blocked_count + cascade + cascade_blocked_count + panicked;
+                    if failed > 0
+                        || blocked_count > 0
+                        || cascade > 0
+                        || cascade_blocked_count > 0
+                        || panicked > 0
+                    {
                         tracing::info!(
                             "Handler {} catchup pass {} result: {}/{} succeeded \
-                             ({} failed, {} cascade-failed, {} panicked)",
+                             ({} failed, {} blocked, {} cascade-failed, {} cascade-blocked, {} panicked)",
                             ch.handler.handler_key(),
                             pass,
                             ok,
                             total,
                             failed,
+                            blocked_count,
                             cascade,
+                            cascade_blocked_count,
                             panicked
                         );
                     } else {
@@ -1059,10 +1139,12 @@ impl TransformationEngine {
                 }
 
                 tracing::info!(
-                    "{} catchup pass {} complete: {} succeeded, {} cascade-failed",
+                    "{} catchup pass {} complete: {} succeeded, {} blocked, {} cascade-blocked, {} cascade-failed",
                     kind_label,
                     pass,
                     succeeded,
+                    blocked,
+                    cascade_blocked,
                     cascade_failed
                 );
 
@@ -1085,10 +1167,11 @@ impl TransformationEngine {
             }
 
             if next_pending.is_empty() {
+                stranded_pending.clear();
                 break;
             }
 
-            // Check for progress on call-dep-waiting ranges; bail only after
+            // Check for progress on pending ranges; bail only after
             // repeated passes with strictly zero progress.
             if let Some(ref prev) = ranges_pending {
                 let prev_count: usize = prev.values().map(|v| v.len()).sum();
@@ -1097,13 +1180,14 @@ impl TransformationEngine {
                     consecutive_no_progress += 1;
                     if consecutive_no_progress >= MAX_CONSECUTIVE_NO_PROGRESS {
                         tracing::warn!(
-                            "{} catchup: {} ranges still blocked by call dependencies, \
+                            "{} catchup: {} ranges still blocked by dependencies, \
                              no progress for {} consecutive passes after pass {}. Giving up.",
                             kind_label,
                             next_count,
                             consecutive_no_progress,
                             pass
                         );
+                        stranded_pending = next_pending;
                         break;
                     }
                 } else {
@@ -1113,13 +1197,31 @@ impl TransformationEngine {
 
             let pending_count: usize = next_pending.values().map(|v| v.len()).sum();
             tracing::info!(
-                "{} catchup pass {}: {} ranges pending call dependencies, retrying in 1s...",
+                "{} catchup pass {}: {} ranges pending dependencies or blocked upstream work, retrying in 1s...",
                 kind_label,
                 pass,
                 pending_count
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
+            stranded_pending = next_pending.clone();
             ranges_pending = Some(next_pending);
+        }
+
+        if !stranded_pending.is_empty() {
+            for (handler_name, ranges) in stranded_pending {
+                let key = handlers
+                    .iter()
+                    .find(|ch| ch.handler.name() == handler_name)
+                    .map(|ch| ch.handler.handler_key())
+                    .unwrap_or(handler_name.clone());
+                for (range_start, _) in ranges {
+                    failed_items.push((
+                        key.clone(),
+                        range_start,
+                        "range remained blocked after retry passes".to_string(),
+                    ));
+                }
+            }
         }
 
         if failed_items.is_empty() {
@@ -2605,8 +2707,13 @@ impl TransformationEngine {
                         &db_exec_mode,
                     )
                     .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                    .map(|_| WorkItemRunResult::Succeeded)
+                    .unwrap_or_else(|e| match e {
+                        TransformationError::TransientBlocked(msg) => {
+                            WorkItemRunResult::Blocked(msg)
+                        }
+                        other => WorkItemRunResult::Failed(other.to_string()),
+                    })
                 })
             })
             .await;
@@ -2658,6 +2765,22 @@ impl super::retry::RecordAndFinalize for TransformationEngine {
         self.finalizer
             .finalize_range(range_start, range_end, &self.live_state)
             .await
+    }
+}
+
+fn queue_pending_range(
+    next_pending: &mut HashMap<String, Vec<(u64, u64)>>,
+    pending_index: &mut HashSet<(String, u64, u64)>,
+    handler_name: &str,
+    range_start: u64,
+    range_end: u64,
+) {
+    let key = (handler_name.to_string(), range_start, range_end);
+    if pending_index.insert(key) {
+        next_pending
+            .entry(handler_name.to_string())
+            .or_default()
+            .push((range_start, range_end));
     }
 }
 
