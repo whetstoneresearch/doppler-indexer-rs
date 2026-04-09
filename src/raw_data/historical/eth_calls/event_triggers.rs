@@ -15,6 +15,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use super::config::compute_function_selector;
+use super::helpers::parse_function_name;
 use super::types::{
     EthCallCollectionError, EthCallContext, EventCallKey, EventCallResult, EventTriggeredCallConfig,
 };
@@ -86,12 +87,7 @@ pub fn build_event_triggered_call_configs(
                     let key = (trigger_config.source.clone(), event_hash);
 
                     let selector = compute_function_selector(&call.function);
-                    let function_name = call
-                        .function
-                        .split('(')
-                        .next()
-                        .unwrap_or(&call.function)
-                        .to_string();
+                    let function_name = parse_function_name(&call.function);
 
                     // Resolve target override if specified, otherwise use contract addresses
                     let target_addrs = if let Some(target) = &call.target {
@@ -139,12 +135,7 @@ pub fn build_event_triggered_call_configs(
                             let key = (trigger_config.source.clone(), event_hash);
 
                             let selector = compute_function_selector(&call.function);
-                            let function_name = call
-                                .function
-                                .split('(')
-                                .next()
-                                .unwrap_or(&call.function)
-                                .to_string();
+                            let function_name = parse_function_name(&call.function);
 
                             // If target is specified, use resolved target; otherwise use event emitter at runtime
                             let target_address = call.target.as_ref().and_then(|t| {
