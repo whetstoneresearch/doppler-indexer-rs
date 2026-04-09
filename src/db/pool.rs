@@ -693,11 +693,7 @@ fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
             }
             (0, key)
         }
-        DbOperation::Insert {
-            table,
-            values,
-            ..
-        } => {
+        DbOperation::Insert { table, values, .. } => {
             let mut key = table.as_bytes().to_vec();
             key.push(0);
             for val in values {
@@ -724,9 +720,7 @@ fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
             append_where_clause_bytes(where_clause, &mut key);
             (3, key)
         }
-        DbOperation::RawSql { query, .. } => {
-            (4, query.as_bytes().to_vec())
-        }
+        DbOperation::RawSql { query, .. } => (4, query.as_bytes().to_vec()),
     }
 }
 
@@ -918,10 +912,7 @@ mod tests {
         let addr_b = [0xFF; 20];
 
         // Reverse order: B before A
-        let mut ops = vec![
-            upsert_user(1, addr_b),
-            upsert_user(1, addr_a),
-        ];
+        let mut ops = vec![upsert_user(1, addr_b), upsert_user(1, addr_a)];
 
         sort_operations_for_lock_ordering(&mut ops);
 
@@ -964,10 +955,7 @@ mod tests {
     #[test]
     fn sort_is_stable_for_identical_keys() {
         let addr = [0x42; 20];
-        let mut ops = vec![
-            upsert_user(1, addr),
-            upsert_user(1, addr),
-        ];
+        let mut ops = vec![upsert_user(1, addr), upsert_user(1, addr)];
 
         // Should not panic or reorder arbitrarily
         sort_operations_for_lock_ordering(&mut ops);

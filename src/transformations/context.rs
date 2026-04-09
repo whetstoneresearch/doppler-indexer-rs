@@ -90,15 +90,13 @@ pub trait FieldExtractor {
     impl_field_extractor!(extract_pubkey, as_pubkey, [u8; 32], "a pubkey");
 
     fn extract_chain_address(&self, name: &str) -> Result<ChainAddress, TransformationError> {
-        self.get_field(name)?
-            .as_chain_address()
-            .ok_or_else(|| {
-                TransformationError::TypeConversion(format!(
-                    "'{}' is not an address or pubkey in {}",
-                    name,
-                    self.context_info()
-                ))
-            })
+        self.get_field(name)?.as_chain_address().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not an address or pubkey in {}",
+                name,
+                self.context_info()
+            ))
+        })
     }
 
     /// Extract a u64 field with flexible parsing (handles i64, u64, or numeric strings).

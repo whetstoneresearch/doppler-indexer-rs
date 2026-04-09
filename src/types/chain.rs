@@ -1,12 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-/// Maximum inner instructions per outer instruction for ordinal packing.
-/// Solana's runtime limits CPI depth to 4, but a single instruction can
-/// emit many inner instructions. 10,000 provides ample headroom.
-const MAX_INNER_INSTRUCTIONS: u64 = 10_000;
-/// Reserve ordinal slot 0 for the outer instruction itself.
-const SOLANA_ORDINAL_STRIDE: u64 = MAX_INNER_INSTRUCTIONS + 1;
+const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+/// Reserve ordinal slot 0 for the outer instruction itself and one slot for
+/// every possible `u16` inner instruction index, preserving a one-to-one mapping.
+const SOLANA_ORDINAL_STRIDE: u64 = u16::MAX as u64 + 2;
 
 /// A blockchain address, sized appropriately for the source chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -44,8 +42,45 @@ impl ChainAddress {
 
 impl std::fmt::Display for ChainAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_hex())
+        match self {
+            ChainAddress::Evm(_) => write!(f, "{}", self.to_hex()),
+            ChainAddress::Solana(pubkey) => write!(f, "{}", encode_base58(pubkey)),
+        }
     }
+}
+
+fn encode_base58(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+
+    let mut digits = bytes.to_vec();
+    let leading_zeroes = digits.iter().take_while(|&&byte| byte == 0).count();
+    let mut start_at = leading_zeroes;
+    let mut encoded = Vec::with_capacity(bytes.len() * 138 / 100 + 1);
+
+    while start_at < digits.len() {
+        let mut remainder = 0u32;
+        for digit in digits.iter_mut().skip(start_at) {
+            let value = (remainder << 8) + u32::from(*digit);
+            *digit = (value / 58) as u8;
+            remainder = value % 58;
+        }
+
+        encoded.push(BASE58_ALPHABET[remainder as usize]);
+        while start_at < digits.len() && digits[start_at] == 0 {
+            start_at += 1;
+        }
+    }
+
+    let mut output = String::with_capacity(leading_zeroes + encoded.len());
+    for _ in 0..leading_zeroes {
+        output.push('1');
+    }
+    for ch in encoded.iter().rev() {
+        output.push(*ch as char);
+    }
+    output
 }
 
 /// A transaction identifier, sized for the source chain.
@@ -69,7 +104,9 @@ impl TxId {
 /// Position of an event within its transaction/block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogPosition {
-    Evm { log_index: u32 },
+    Evm {
+        log_index: u32,
+    },
     Solana {
         instruction_index: u16,
         inner_instruction_index: Option<u16>,
@@ -169,9 +206,12 @@ mod tests {
 
     #[test]
     fn chain_address_display() {
-        let addr = ChainAddress::Evm([0xff; 20]);
-        let display = format!("{}", addr);
-        assert_eq!(display, addr.to_hex());
+        let evm = ChainAddress::Evm([0xff; 20]);
+        let display = format!("{}", evm);
+        assert_eq!(display, evm.to_hex());
+
+        let sol = ChainAddress::Solana([0u8; 32]);
+        assert_eq!(format!("{}", sol), "11111111111111111111111111111111");
     }
 
     #[test]
@@ -237,13 +277,27 @@ mod tests {
     fn log_position_solana_ordinals_are_ordered() {
         let pos_a = LogPosition::Solana {
             instruction_index: 1,
-            inner_instruction_index: Some(9999),
+            inner_instruction_index: Some(u16::MAX),
         };
         let pos_b = LogPosition::Solana {
             instruction_index: 2,
             inner_instruction_index: None,
         };
         assert!(pos_a.ordinal() < pos_b.ordinal());
+    }
+
+    #[test]
+    fn log_position_solana_max_inner_and_next_outer_do_not_collide() {
+        let last_inner = LogPosition::Solana {
+            instruction_index: 11,
+            inner_instruction_index: Some(u16::MAX),
+        };
+        let next_outer = LogPosition::Solana {
+            instruction_index: 12,
+            inner_instruction_index: None,
+        };
+        assert_ne!(last_inner.ordinal(), next_outer.ordinal());
+        assert!(last_inner.ordinal() < next_outer.ordinal());
     }
 
     #[test]

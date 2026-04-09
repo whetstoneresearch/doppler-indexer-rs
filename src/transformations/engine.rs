@@ -2731,7 +2731,11 @@ mod tests {
         ));
 
         let mut complete_index = HashMap::new();
-        update_contract_index(&mut complete_index, &range_key(100, 199), &expected_for_source);
+        update_contract_index(
+            &mut complete_index,
+            &range_key(100, 199),
+            &expected_for_source,
+        );
         write_contract_index(dir.path(), &complete_index).unwrap();
         assert!(call_dependency_contract_index_complete(
             dir.path(),
