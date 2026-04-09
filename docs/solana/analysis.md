@@ -15,6 +15,23 @@
 | **Transaction model** | Account-based, single `to` + `data` | Instructions with program_id + accounts[] + data |
 | **Hashing** | Keccak-256 | SHA-256 (for most things) |
 
+## Current Branch Snapshot
+
+The current `feat/solana-phase1-data-types` branch is still groundwork rather than end-to-end Solana support.
+
+Implemented on this branch:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `DecodedValue::Pubkey`, `DbValue::Pubkey`, and `LiveDbValue::Pubkey`
+- `FieldExtractor::extract_pubkey()` and `extract_chain_address()`
+- Lossless Solana position packing via `LogPosition::packed_ordinal_i64()`
+- `BIGINT` widening for persisted `log_index` columns used by transfers, liquidity deltas, and call revert logs
+
+Still not implemented on this branch:
+- `TransformationHandler::chain_type()`
+- `DecodedAccountState`, `AccountStateHandler`, and `ChainServices`
+- Generalized `DecodedEvent` / `DecodedCall`
+- Any Solana RPC, collector, decoder, config, or live-mode modules
+
 ---
 
 ## Subsystem-by-Subsystem Breakdown
@@ -187,6 +204,10 @@ Solana handlers should write to the **same canonical tables** (tokens, pools, sw
 | None for Solana | Add `solana-sdk`, `solana-client`, `solana-transaction-status`, `anchor-lang` (for IDL parsing), `borsh` |
 | Feature flags | Add `features = ["evm", "solana"]` with `default = ["evm", "solana"]` |
 
+Current branch note:
+- The only new dependency actually landed so far is `serde-big-array = "0.5"` to support serde on `[u8; 64]`
+- Solana runtime crates and Solana feature flags are still future work
+
 ---
 
 ## Recommended Architecture
@@ -220,7 +241,7 @@ src/
 
 **What gets parallel implementations:** RPC client, raw data collectors, decoders, live collector, config types, WebSocket subscription, address discovery.
 
-**Key design decisions:**
+**Target design decisions for later phases:**
 - `DecodedCall` stays EVM-only; Solana account reads use new `DecodedAccountState` type with `AccountStateHandler` trait
 - `TransformationContext` uses `ChainServices` enum instead of bare EVM-specific fields
 - `TransformationHandler` gains `chain_type()` for startup validation

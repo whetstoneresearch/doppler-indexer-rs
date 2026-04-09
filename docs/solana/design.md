@@ -4,6 +4,23 @@
 
 Doppler Indexer currently supports EVM chains exclusively. Adding Solana support requires addressing fundamental data model differences while preserving the existing EVM pipeline unchanged. This document specifies the exact types, interfaces, data flows, and module designs required.
 
+## 1.1 Current Branch Status
+
+This document describes the target Solana design, but the current `feat/solana-phase1-data-types` branch only implements the first slice of that plan.
+
+Implemented on this branch:
+- `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `DecodedValue::Pubkey`, `DbValue::Pubkey`, and `LiveDbValue::Pubkey`
+- `FieldExtractor::extract_pubkey()` and `FieldExtractor::extract_chain_address()`
+- `LogPosition::sort_key()` and `LogPosition::packed_ordinal_i64()`
+- `BIGINT` widening for persisted `log_index` columns via `migrations/004_log_index_bigint.sql`
+
+Still pending on this branch:
+- `TransformationHandler::chain_type()`
+- `DecodedAccountState`, `AccountStateHandler`, and `ChainServices`
+- Generalizing `DecodedEvent` and `DecodedCall`
+- Solana config/RPC/raw-data/decoder/live-mode modules
+
 ---
 
 ## 2. Solana vs EVM: Data Model Mapping
@@ -69,15 +86,19 @@ impl ChainAddress {
         }
     }
 
-    /// Display-friendly string (hex for EVM, base58 for Solana)
-    pub fn to_display(&self) -> String {
+}
+
+impl std::fmt::Display for ChainAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChainAddress::Evm(a) => format!("0x{}", hex::encode(a)),
-            ChainAddress::Solana(p) => bs58::encode(p).into_string(),
+            ChainAddress::Evm(_) => write!(f, "{}", self.to_hex()),
+            ChainAddress::Solana(pubkey) => write!(f, "{}", encode_base58(pubkey)),
         }
     }
 }
 ```
+
+Implementation note: the current branch uses an in-tree base58 helper for `Display` formatting rather than pulling in `bs58` during this initial type-only phase.
 
 **Why not alternatives:**
 - `Vec<u8>`: Heap-allocated. Addresses appear in every `DecodedEvent` in every block — this is a hot path. Unacceptable allocation overhead.
@@ -99,7 +120,7 @@ pub enum TxId {
     /// EVM transaction hash: 32 bytes (keccak-256)
     Evm([u8; 32]),
     /// Solana transaction signature: 64 bytes (Ed25519)
-    Solana([u8; 64]),
+    Solana(#[serde(with = "BigArray")] [u8; 64]),
 }
 
 impl TxId {
@@ -111,6 +132,8 @@ impl TxId {
     }
 }
 ```
+
+Implementation note: the current branch adds `serde-big-array` to support serde on `[u8; 64]`.
 
 **Why Clone and not Copy:** `ChainAddress` at 33 bytes is small enough for `Copy` — comparable to common `Copy` types. `TxId::Solana` at 65 bytes crosses the threshold where implicit copies become invisible overhead. When iterating thousands of `DecodedEvent`s per block, each `let id = event.transaction_id` is a 65-byte memcpy. With `Clone`, these copies are explicit (`.clone()`), making hot-path code reviewable. The EVM variant at 33 bytes pays the minor cost of `.clone()` syntax for consistency.
 
@@ -1639,6 +1662,10 @@ bs58 = { version = "0.5", optional = true }
 # Note: anchor-lang is NOT a dependency. IDL parsing is done from JSON directly.
 # This keeps the dependency tree lean and avoids pulling in the entire Anchor framework.
 ```
+
+Current branch note:
+- The only Solana-adjacent dependency actually added so far is `serde-big-array = "0.5"` for `TxId::Solana`
+- The `solana` feature and Solana runtime crates above remain planned work for later phases
 
 **Compile-time isolation**: All Solana code is behind `#[cfg(feature = "solana")]`. Building without `--features solana` produces a binary identical in behavior to today's EVM-only indexer with zero additional dependencies.
 

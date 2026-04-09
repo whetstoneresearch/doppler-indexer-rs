@@ -12,6 +12,24 @@ Rather than abstracting everything behind traits, we use a **parallel implementa
 - The two pipelines converge at the transformation layer via shared `DecodedEvent`/`DecodedCall` types
 - Pipeline dispatch happens via `match chain_type` in `main.rs`
 
+## Current Branch Status
+
+The current `feat/solana-phase1-data-types` branch implements only a subset of the roadmap so far.
+
+Implemented on this branch:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `DecodedValue::Pubkey`, `DbValue::Pubkey`, and `LiveDbValue::Pubkey`
+- `FieldExtractor::extract_pubkey()` and `FieldExtractor::extract_chain_address()`
+- Solana pubkey rendering via `Display` on `ChainAddress`
+- `serde-big-array` support for serializing `[u8; 64]` in `TxId::Solana`
+- `migrations/004_log_index_bigint.sql` plus table-definition updates widening persisted `log_index` columns to `BIGINT`
+
+Still planned, not yet implemented on this branch:
+- `TransformationHandler::chain_type()`
+- `DecodedAccountState`, `AccountStateHandler`, and `ChainServices`
+- Generalizing `DecodedEvent` / `DecodedCall`
+- Solana config, RPC, decoding, raw-data, and live-mode modules
+
 ---
 
 ## Phase 1: Core Type Generalizations (Additive, No Breaking Changes)
@@ -459,11 +477,16 @@ borsh = { version = "1.5", optional = true }
 bs58 = { version = "0.5", optional = true }
 ```
 
+Current branch note:
+- Only `serde-big-array = "0.5"` has landed so far, to support serde on `[u8; 64]` for `TxId::Solana`
+- The Solana feature flag and Solana runtime crates shown above are still planned work, not part of the current branch yet
+
 ---
 
 ## Implementation Order
 
 1. **Phase 1** — additive type changes, new traits, ChainServices (no breakage)
+   Current branch status: partially complete. Types/value plumbing are in; trait/context generalization is still pending.
 2. **Phase 2** — migrate `DecodedEvent`/`DecodedCall` (mechanical updates across ~40 files)
 3. **Phase 3** — config extensions (+ discovery config)
 4. **Phase 4** — Solana RPC client
