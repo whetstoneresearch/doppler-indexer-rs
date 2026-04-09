@@ -291,7 +291,7 @@ impl EventHandler for V4BaseMetricsHandler {
         vec![EventTrigger::new(SOURCE, "Swap(int24,uint256,uint256)")]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V4CreateHandler"]
     }
 }

@@ -863,7 +863,8 @@ impl RetryProcessor {
             let handler_deps: Vec<String> = info
                 .handler
                 .handler_dependencies()
-                .iter()
+                .into_iter()
+                .chain(info.handler.contiguous_handler_dependencies())
                 .map(|s| s.to_string())
                 .collect();
             handlers.push(RetryHandler {

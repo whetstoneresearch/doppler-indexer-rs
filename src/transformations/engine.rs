@@ -139,8 +139,11 @@ struct CatchupHandler {
     triggers: Vec<(String, String)>,
     /// Call dependencies (Event handlers only; empty for Call handlers).
     call_deps: Vec<(String, String)>,
-    /// Handler dependencies: handler name() values that must complete first.
+    /// Same-range handler dependencies gated by the DAG scheduler.
     handler_deps: Vec<String>,
+    /// Catchup-only dependencies that require the upstream handler to be
+    /// completed contiguously through this range before submission.
+    contiguous_handler_deps: Vec<String>,
     kind: HandlerKind,
     /// When true, the scheduler processes ranges one at a time in ascending order.
     sequential: bool,
@@ -552,6 +555,7 @@ impl TransformationEngine {
         };
 
         let available = self.scan_available_ranges(base_dir).await?;
+        let available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
 
         if available.is_empty() {
             tracing::info!(
@@ -581,12 +585,19 @@ impl TransformationEngine {
                         .iter()
                         .map(|s| s.to_string())
                         .collect();
+                    let contiguous_handler_deps: Vec<String> = info
+                        .handler
+                        .contiguous_handler_dependencies()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
                     let sequential = info.handler.requires_sequential();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
                         triggers,
                         call_deps,
                         handler_deps,
+                        contiguous_handler_deps,
                         kind: HandlerKind::Event,
                         sequential,
                     }
@@ -608,6 +619,7 @@ impl TransformationEngine {
                         triggers,
                         call_deps: Vec::new(),
                         handler_deps: Vec::new(),
+                        contiguous_handler_deps: Vec::new(),
                         kind: HandlerKind::Call,
                         sequential,
                     }
@@ -731,10 +743,23 @@ impl TransformationEngine {
             // Updated in lock-step with next_pending whenever we defer a range.
             let mut deferred_starts: HashMap<String, HashSet<u64>> = HashMap::new();
             // Per-handler per-pass counters for observability.
-            // (submitted, call_dep_deferred, cascade_deferred).
+            // (submitted, call_dep_deferred, upstream_deferred).
             let mut per_handler_counts: HashMap<String, (usize, usize, usize)> = HashMap::new();
             // First missing call dep paths per handler (for summary log).
             let mut per_handler_missing_call_deps: HashMap<String, Vec<String>> = HashMap::new();
+            let contiguous_watermarks: HashMap<String, Option<u64>> = handlers
+                .iter()
+                .map(|ch| {
+                    let completed = self_completed
+                        .get(ch.handler.name())
+                        .cloned()
+                        .unwrap_or_default();
+                    (
+                        ch.handler.name().to_string(),
+                        contiguous_completed_through(&available_starts, &completed),
+                    )
+                })
+                .collect();
 
             for ch in &handlers {
                 let name = ch.handler.name().to_string();
@@ -820,6 +845,35 @@ impl TransformationEngine {
                         }
                     }
 
+                    if let Some(blocking) = ch.contiguous_handler_deps.iter().find(|dep_name| {
+                        !contiguous_watermarks
+                            .get(dep_name.as_str())
+                            .copied()
+                            .flatten()
+                            .is_some_and(|watermark| watermark >= range_start)
+                    }) {
+                        tracing::debug!(
+                            "Handler {} deferring range {}-{}: upstream dep '{}' has not completed contiguously through this range",
+                            ch.handler.handler_key(),
+                            range_start,
+                            range_end,
+                            blocking
+                        );
+                        queue_pending_range(
+                            &mut next_pending,
+                            &mut pending_index,
+                            &name,
+                            range_start,
+                            range_end,
+                        );
+                        deferred_starts
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(range_start);
+                        per_handler_counts.entry(name.clone()).or_default().2 += 1;
+                        continue;
+                    }
+
                     // Cascade: if any handler_dep is already deferred for this
                     // range_start, defer this (handler, range) too. Submitting
                     // it would hang the scheduler because its dep will never
@@ -876,7 +930,12 @@ impl TransformationEngine {
                         handler_name: name.clone(),
                         range_start,
                         range_end,
-                        dep_names: ch.handler_deps.clone(),
+                        dep_names: ch
+                            .handler_deps
+                            .iter()
+                            .chain(ch.contiguous_handler_deps.iter())
+                            .cloned()
+                            .collect(),
                         sequential: ch.sequential,
                         payload: Box::new(CatchupPayload {
                             handler: ch.handler.clone(),
@@ -914,7 +973,7 @@ impl TransformationEngine {
                         .unwrap_or_default();
                     tracing::info!(
                         "Handler {} catchup pass {}: submitting {} range(s), \
-                         deferring {} (call_deps not ready) + {} (upstream deferred){}",
+                         deferring {} (call_deps not ready) + {} (upstream not ready){}",
                         ch.handler.handler_key(),
                         pass,
                         submitted,
@@ -1561,7 +1620,8 @@ impl TransformationEngine {
                 let call_deps = handler.call_dependencies();
                 let handler_deps: Vec<String> = handler
                     .handler_dependencies()
-                    .iter()
+                    .into_iter()
+                    .chain(handler.contiguous_handler_dependencies())
                     .map(|s| s.to_string())
                     .collect();
                 let handler_key = handler.handler_key();
@@ -2500,8 +2560,8 @@ impl TransformationEngine {
     ///
     /// Deduplicates by `handler_key` so multi-trigger handlers produce exactly
     /// one `WorkItem` even when several triggers match the same block. Each
-    /// `WorkItem` carries `dep_names` derived from `handler_dependencies()` so
-    /// the scheduler gates execution on those deps completing first.
+    /// `WorkItem` carries `dep_names` derived from both dependency modes so the
+    /// scheduler gates execution on those deps completing first.
     fn build_process_range_items(
         &self,
         event_triggers: &[(String, String)],
@@ -2523,8 +2583,9 @@ impl TransformationEngine {
                 // method lives on EventHandler, not on TransformationHandler.
                 let dep_names: Vec<String> = handler
                     .handler_dependencies()
-                    .iter()
-                    .map(|s: &&str| s.to_string())
+                    .into_iter()
+                    .chain(handler.contiguous_handler_dependencies())
+                    .map(|s| s.to_string())
                     .collect();
                 let handler: Arc<dyn super::traits::TransformationHandler> = handler;
                 let key = handler.handler_key();
@@ -2584,10 +2645,10 @@ impl TransformationEngine {
     /// Process a block range with dep-aware concurrent per-handler transactions.
     ///
     /// Routes all triggered handlers through the [`DagScheduler`], which gates
-    /// each handler on its `handler_dependencies()` completing first. Replaces
-    /// the old `HandlerExecutor::execute_handlers` call that ran handlers in
-    /// parallel with no dependency ordering, which was incorrect for handlers
-    /// with `handler_dependencies` in the retry/reorg path.
+    /// each handler on its declared upstream dependencies completing first.
+    /// Replaces the old `HandlerExecutor::execute_handlers` call that ran
+    /// handlers in parallel with no dependency ordering, which was incorrect
+    /// for handlers with upstream ordering constraints in the retry/reorg path.
     async fn process_range(
         &self,
         range_start: u64,
@@ -2784,6 +2845,21 @@ fn queue_pending_range(
     }
 }
 
+fn contiguous_completed_through(
+    available_starts: &[u64],
+    completed: &HashSet<u64>,
+) -> Option<u64> {
+    let mut last = None;
+    for range_start in available_starts {
+        if completed.contains(range_start) {
+            last = Some(*range_start);
+        } else {
+            break;
+        }
+    }
+    last
+}
+
 fn call_dependency_contract_index_complete(
     raw_index_dir: &Path,
     source: &str,
@@ -2807,12 +2883,29 @@ fn call_dependency_contract_index_complete(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
+    use super::{call_dependency_contract_index_complete, contiguous_completed_through};
+    use crate::storage::contract_index::{range_key, update_contract_index, write_contract_index};
     use tempfile::tempdir;
 
-    use super::call_dependency_contract_index_complete;
-    use crate::storage::contract_index::{range_key, update_contract_index, write_contract_index};
+    #[test]
+    fn contiguous_completed_through_returns_none_when_first_range_is_missing() {
+        let completed = HashSet::from([200, 300]);
+        assert_eq!(
+            contiguous_completed_through(&[100, 200, 300], &completed),
+            None
+        );
+    }
+
+    #[test]
+    fn contiguous_completed_through_stops_at_first_gap() {
+        let completed = HashSet::from([100, 200, 400]);
+        assert_eq!(
+            contiguous_completed_through(&[100, 200, 300, 400], &completed),
+            Some(200)
+        );
+    }
 
     #[test]
     fn contract_index_gate_defaults_open_without_sidecar() {

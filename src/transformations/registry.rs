@@ -164,8 +164,11 @@ impl TransformationRegistry {
 
         let deps: Vec<String> = handler
             .handler_dependencies()
-            .iter()
+            .into_iter()
+            .chain(handler.contiguous_handler_dependencies())
             .map(|d| d.to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
         if !deps.is_empty() {
             self.handler_dependency_graph
@@ -323,8 +326,9 @@ impl TransformationRegistry {
 
         if !missing.is_empty() {
             let mut msg = String::from(
-                "missing handler dependency: one or more handlers declare handler_dependencies \
-                 that do not match any registered handler name:\n",
+                "missing handler dependency: one or more handlers declare \
+                 handler_dependencies()/contiguous_handler_dependencies() that do not \
+                 match any registered handler name:\n",
             );
             for (handler_name, unresolved) in &missing {
                 msg.push_str(&format!("\n  Handler '{}':\n", handler_name));
@@ -356,8 +360,9 @@ impl TransformationRegistry {
 
         if !non_event_deps.is_empty() {
             let mut msg = String::from(
-                "invalid handler dependency: handler_dependencies can only reference event \
-                 handler names, not call handler names:\n",
+                "invalid handler dependency: handler_dependencies()/\
+                 contiguous_handler_dependencies() can only reference event handler \
+                 names, not call handler names:\n",
             );
             for (handler_name, bad) in &non_event_deps {
                 msg.push_str(&format!("\n  Handler '{}':\n", handler_name));
@@ -768,6 +773,7 @@ mod tests {
         triggers: Vec<EventTrigger>,
         call_deps: Vec<(String, String)>,
         handler_deps: Vec<&'static str>,
+        contiguous_handler_deps: Vec<&'static str>,
     }
 
     #[async_trait]
@@ -796,6 +802,10 @@ mod tests {
         fn handler_dependencies(&self) -> Vec<&'static str> {
             self.handler_deps.clone()
         }
+
+        fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+            self.contiguous_handler_deps.clone()
+        }
     }
 
     fn empty_contracts() -> Contracts {
@@ -812,6 +822,7 @@ mod tests {
             triggers: vec![EventTrigger::new("Test", format!("{}()", name))],
             call_deps: vec![],
             handler_deps,
+            contiguous_handler_deps: vec![],
         }
     }
 
@@ -836,6 +847,7 @@ mod tests {
             )],
             call_deps: vec![],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -858,6 +870,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "getState".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -893,6 +906,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let contracts = empty_contracts();
@@ -916,6 +930,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -955,6 +970,7 @@ mod tests {
             triggers: vec![EventTrigger::new("TestContract", "Swap(address,uint256)")],
             call_deps: vec![("TestContract".to_string(), "once".to_string())],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -1202,8 +1218,36 @@ mod tests {
             ],
             call_deps: vec![],
             handler_deps: vec![],
+            contiguous_handler_deps: vec![],
         });
         assert!(registry.is_multi_trigger("multi_v1"));
+    }
+
+    #[test]
+    fn contiguous_handler_dependencies_participate_in_dependency_graph() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("Create", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "Metrics",
+            triggers: vec![EventTrigger::new("Test", "Metrics()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec!["Create"],
+        });
+
+        registry.validate_and_sort_handler_dependencies();
+
+        let deps = registry
+            .handler_dependency_graph()
+            .get("Metrics")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(deps, vec!["Create".to_string()]);
+
+        let topo = registry.handler_topological_order();
+        let create_pos = topo.iter().position(|name| name == "Create").unwrap();
+        let metrics_pos = topo.iter().position(|name| name == "Metrics").unwrap();
+        assert!(create_pos < metrics_pos);
     }
 
     #[test]

@@ -175,6 +175,19 @@ pub trait EventHandler: TransformationHandler {
     fn handler_dependencies(&self) -> Vec<&'static str> {
         vec![]
     }
+
+    /// Handler names that must be completed contiguously through the current
+    /// range before this handler can execute in catchup mode.
+    ///
+    /// Use this for dependencies whose outputs can be referenced by later
+    /// ranges, such as pool-create handlers that populate metadata consumed by
+    /// swap/liquidity handlers in subsequent ranges.
+    ///
+    /// Live/retry processing currently treats these the same as
+    /// `handler_dependencies()`, since those paths operate on a single range.
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+        vec![]
+    }
 }
 
 /// Marker trait for handlers that respond to eth_call results.
