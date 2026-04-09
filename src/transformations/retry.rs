@@ -521,6 +521,8 @@ impl RetryProcessor {
                 range_start,
                 range_end,
                 dep_names,
+                contiguous_dep_names: Vec::new(),
+                call_dep_keys: Vec::new(),
                 sequential: false,
                 payload: Box::new(RetryPayload {
                     handler: rh.handler.clone(),

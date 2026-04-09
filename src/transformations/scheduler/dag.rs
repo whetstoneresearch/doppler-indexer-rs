@@ -31,6 +31,13 @@ pub(crate) struct WorkItem {
     pub range_start: u64,
     pub range_end: u64,
     pub dep_names: Vec<String>,
+    /// Handler names whose contiguous watermark must be >= `range_start` before
+    /// this item can execute. Used for `contiguous_handler_dependencies`.
+    pub contiguous_dep_names: Vec<String>,
+    /// `(source, function)` pairs whose decoded call parquet files must be
+    /// available on disk for `(range_start, range_end)` before this item can
+    /// execute. Empty if no call deps or no trigger data in this range.
+    pub call_dep_keys: Vec<(String, String)>,
     /// When `true`, the scheduler enforces one-at-a-time FIFO execution for this
     /// handler via a per-handler capacity-1 semaphore. Items must be submitted in
     /// ascending `range_start` order for the FIFO guarantee to hold.
@@ -145,6 +152,8 @@ impl DagScheduler {
             let range_start = item.range_start;
             let range_end = item.range_end;
             let dep_names = item.dep_names.clone();
+            let contiguous_dep_names = item.contiguous_dep_names.clone();
+            let call_dep_keys = item.call_dep_keys.clone();
             let tracker = self.tracker.clone();
             let permits = self.global_permits.clone();
             let seq_sems = seq_sems.clone();
@@ -154,8 +163,17 @@ impl DagScheduler {
             // Data captured by the spawned task:
             let name_for_task = name.clone();
             let handle = join_set.spawn(async move {
-                // 1. Gate on dependencies.
-                if let Err(dep_wait) = tracker.wait_ready(&dep_names, range_start).await {
+                // 1. Gate on dependencies (handler deps + contiguous deps + call deps).
+                if let Err(dep_wait) = tracker
+                    .wait_ready_extended(
+                        &dep_names,
+                        &contiguous_dep_names,
+                        &call_dep_keys,
+                        range_start,
+                        (range_start, range_end),
+                    )
+                    .await
+                {
                     match dep_wait {
                         super::tracker::DepWaitError::DepFailed { dep_name, .. } => {
                             // Cascade: our own dependents must also short-circuit.
@@ -427,6 +445,8 @@ mod tests {
             range_start,
             range_end: range_start + 1,
             dep_names: deps.iter().map(|s| s.to_string()).collect(),
+            contiguous_dep_names: Vec::new(),
+            call_dep_keys: Vec::new(),
             sequential: false,
             payload: Box::new(()),
         }
