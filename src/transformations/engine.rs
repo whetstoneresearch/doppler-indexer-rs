@@ -557,8 +557,8 @@ impl TransformationEngine {
             HandlerKind::Call => "Call",
         };
 
-        let available = self.scan_available_ranges(base_dir).await?;
-        let available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
+        let mut available = self.scan_available_ranges(base_dir).await?;
+        let mut available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
 
         if available.is_empty() {
             tracing::info!(
@@ -657,6 +657,21 @@ impl TransformationEngine {
                 ranges.extend(self.scan_available_ranges(&dir).await?);
             }
             trigger_range_sets.insert(ch.handler.name().to_string(), ranges);
+        }
+
+        // For call handlers, the base_dir scan picks up on_events/ files that
+        // belong to event-triggered call collection, polluting the available set
+        // with non-standard range sizes. Narrow available to only ranges that
+        // appear in at least one call handler's trigger directories.
+        if kind == HandlerKind::Call {
+            let trigger_union: HashSet<(u64, u64)> = trigger_range_sets
+                .values()
+                .flat_map(|s| s.iter().copied())
+                .collect();
+            let mut narrowed: Vec<(u64, u64)> = trigger_union.into_iter().collect();
+            narrowed.sort_by_key(|(start, _)| *start);
+            available = narrowed;
+            available_starts = available.iter().map(|(start, _)| *start).collect();
         }
 
         // Seed CompletionTracker from _handler_progress so downstream handlers
