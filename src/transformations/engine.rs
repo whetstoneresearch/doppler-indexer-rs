@@ -31,7 +31,10 @@ use super::live_state::{LiveProcessingState, PendingEventData};
 use super::registry::{extract_event_name, TransformationRegistry};
 use super::retry::{filter_calls_by_start_block, filter_events_by_start_block, RetryProcessor};
 use super::scheduler::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
-use super::scheduler::loader::{read_receipt_addresses, CatchupLoader, CatchupPayload};
+use super::scheduler::loader::{
+    read_receipt_addresses, CallDepScanner, CatchupLoader, CatchupPayload,
+    run_call_dep_scanner_loop,
+};
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
@@ -554,8 +557,8 @@ impl TransformationEngine {
             HandlerKind::Call => "Call",
         };
 
-        let available = self.scan_available_ranges(base_dir).await?;
-        let available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
+        let mut available = self.scan_available_ranges(base_dir).await?;
+        let mut available_starts: Vec<u64> = available.iter().map(|(start, _)| *start).collect();
 
         if available.is_empty() {
             tracing::info!(
@@ -656,9 +659,25 @@ impl TransformationEngine {
             trigger_range_sets.insert(ch.handler.name().to_string(), ranges);
         }
 
+        // For call handlers, the base_dir scan picks up on_events/ files that
+        // belong to event-triggered call collection, polluting the available set
+        // with non-standard range sizes. Narrow available to only ranges that
+        // appear in at least one call handler's trigger directories.
+        if kind == HandlerKind::Call {
+            let trigger_union: HashSet<(u64, u64)> = trigger_range_sets
+                .values()
+                .flat_map(|s| s.iter().copied())
+                .collect();
+            let mut narrowed: Vec<(u64, u64)> = trigger_union.into_iter().collect();
+            narrowed.sort_by_key(|(start, _)| *start);
+            available = narrowed;
+            available_starts = available.iter().map(|(start, _)| *start).collect();
+        }
+
         // Seed CompletionTracker from _handler_progress so downstream handlers
         // can gate on upstream completion per range via the DAG scheduler.
-        let tracker = Arc::new(CompletionTracker::new());
+        // Use `with_available_starts` so the tracker can maintain contiguous watermarks.
+        let tracker = Arc::new(CompletionTracker::with_available_starts(available_starts.clone()));
         // self_completed: handler_name → set of range_starts already processed.
         // Used to skip building WorkItems for ranges already done.
         let mut self_completed: HashMap<String, HashSet<u64>> = HashMap::new();
@@ -717,571 +736,380 @@ impl TransformationEngine {
 
         let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
 
-        // (handler_key, range_start, error_message) for each item-level failure.
-        let mut failed_items: Vec<(String, u64, String)> = vec![];
+        // ── Build ALL work items upfront ────────────────────────────────
+        let mut items: Vec<WorkItem> = Vec::new();
+        let mut per_handler_submitted: HashMap<String, usize> = HashMap::new();
 
-        // Call-dep retry loop.
-        //
-        // `ranges_pending` is None on the first pass (try every available range).
-        // On subsequent passes it holds only the ranges that were skipped because
-        // dependencies were not ready or a prior pass ended transiently blocked.
-        let mut ranges_pending: Option<HashMap<String, Vec<(u64, u64)>>> = None;
-        let mut pass = 0u32;
-        // Bail only after several consecutive passes make zero progress, so that
-        // slowly-arriving dependencies don't get abandoned.
-        const MAX_CONSECUTIVE_NO_PROGRESS: u32 = 3;
-        let mut consecutive_no_progress: u32 = 0;
-        let mut stranded_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+        for ch in &handlers {
+            let name = ch.handler.name().to_string();
+            let completed = self_completed.get(&name).cloned().unwrap_or_default();
 
-        loop {
-            pass += 1;
-
-            let mut items: Vec<WorkItem> = Vec::new();
-            let mut next_pending: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
-            let mut pending_index: HashSet<(String, u64, u64)> = HashSet::new();
-            // Parallel index into next_pending for O(1) cascade lookups.
-            // Updated in lock-step with next_pending whenever we defer a range.
-            let mut deferred_starts: HashMap<String, HashSet<u64>> = HashMap::new();
-            // Per-handler per-pass counters for observability.
-            // (submitted, call_dep_deferred, upstream_deferred).
-            let mut per_handler_counts: HashMap<String, (usize, usize, usize)> = HashMap::new();
-            // First missing call dep paths per handler (for summary log).
-            let mut per_handler_missing_call_deps: HashMap<String, Vec<String>> = HashMap::new();
-            let contiguous_watermarks: HashMap<String, Option<u64>> = handlers
-                .iter()
-                .map(|ch| {
-                    let completed = self_completed
-                        .get(ch.handler.name())
-                        .cloned()
-                        .unwrap_or_default();
-                    (
-                        ch.handler.name().to_string(),
-                        contiguous_completed_through(&available_starts, &completed),
-                    )
-                })
-                .collect();
-
-            for ch in &handlers {
-                let name = ch.handler.name().to_string();
-                let completed = self_completed.get(&name).cloned().unwrap_or_default();
-
-                // On retry passes only re-try handlers that had pending ranges.
-                let candidate_ranges: Vec<(u64, u64)> = if let Some(ref pending) = ranges_pending {
-                    match pending.get(&name) {
-                        Some(r) => r.clone(),
-                        None => continue,
-                    }
-                } else {
-                    available.clone()
-                };
-
-                // Scan call-dep file availability once per handler per pass.
-                let mut call_range_sets: Vec<HashSet<(u64, u64)>> =
-                    Vec::with_capacity(ch.call_deps.len());
-                for (source, func) in &ch.call_deps {
-                    let ranges = self
-                        .scan_available_call_dependency_ranges(source, func)
-                        .await
-                        .unwrap_or_default();
-                    call_range_sets.push(ranges);
-                }
-
-                for (range_start, range_end) in candidate_ranges {
-                    if completed.contains(&range_start) {
-                        continue;
-                    }
-
-                    let trigger_range_present = trigger_range_sets
-                        .get(&name)
-                        .is_some_and(|ranges| ranges.contains(&(range_start, range_end)));
-
-                    // Skip range if call-dep files aren't on disk yet, but
-                    // only when this handler actually has trigger data in the
-                    // range. Otherwise let it no-op complete and unblock
-                    // same-range dependents.
-                    if trigger_range_present && !ch.call_deps.is_empty() {
-                        let missing_deps: Vec<&str> = ch
-                            .call_deps
-                            .iter()
-                            .zip(call_range_sets.iter())
-                            .filter(|(_, set)| !set.contains(&(range_start, range_end)))
-                            .map(|((source, func), _)| {
-                                // Leak-free: just reference the source since it
-                                // lives as long as the handler.
-                                if func.is_empty() {
-                                    source.as_str()
-                                } else {
-                                    // Can't return a formatted &str, so store in
-                                    // per_handler_missing_deps below instead.
-                                    source.as_str()
-                                }
-                            })
-                            .collect();
-                        if !missing_deps.is_empty() {
-                            // Track which call deps are missing for the summary log.
-                            let missing_formatted: Vec<String> = ch
-                                .call_deps
-                                .iter()
-                                .zip(call_range_sets.iter())
-                                .filter(|(_, set)| !set.contains(&(range_start, range_end)))
-                                .map(|((source, func), _)| format!("{}/{}", source, func))
-                                .collect();
-                            per_handler_missing_call_deps
-                                .entry(name.clone())
-                                .or_insert_with(|| missing_formatted);
-                            queue_pending_range(
-                                &mut next_pending,
-                                &mut pending_index,
-                                &name,
-                                range_start,
-                                range_end,
-                            );
-                            deferred_starts
-                                .entry(name.clone())
-                                .or_default()
-                                .insert(range_start);
-                            per_handler_counts.entry(name.clone()).or_default().1 += 1;
-                            continue;
-                        }
-                    }
-
-                    if let Some(blocking) = ch.contiguous_handler_deps.iter().find(|dep_name| {
-                        !contiguous_watermarks
-                            .get(dep_name.as_str())
-                            .copied()
-                            .flatten()
-                            .is_some_and(|watermark| watermark >= range_start)
-                    }) {
-                        tracing::debug!(
-                            "Handler {} deferring range {}-{}: upstream dep '{}' has not completed contiguously through this range",
-                            ch.handler.handler_key(),
-                            range_start,
-                            range_end,
-                            blocking
-                        );
-                        queue_pending_range(
-                            &mut next_pending,
-                            &mut pending_index,
-                            &name,
-                            range_start,
-                            range_end,
-                        );
-                        deferred_starts
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(range_start);
-                        per_handler_counts.entry(name.clone()).or_default().2 += 1;
-                        continue;
-                    }
-
-                    // Cascade: if any handler_dep is already deferred for this
-                    // range_start, defer this (handler, range) too. Submitting
-                    // it would hang the scheduler because its dep will never
-                    // be marked in the tracker for this pass. Topological
-                    // handler iteration (sorted above) guarantees deps are
-                    // processed before dependents in the same pass, so a
-                    // single-level check composes into full transitive cascade.
-                    if let Some(blocking) = ch.handler_deps.iter().find(|dep_name| {
-                        deferred_starts
-                            .get(dep_name.as_str())
-                            .is_some_and(|starts| starts.contains(&range_start))
-                    }) {
-                        tracing::debug!(
-                            "Handler {} deferring range {}-{}: upstream dep '{}' deferred",
-                            ch.handler.handler_key(),
-                            range_start,
-                            range_end,
-                            blocking
-                        );
-                        queue_pending_range(
-                            &mut next_pending,
-                            &mut pending_index,
-                            &name,
-                            range_start,
-                            range_end,
-                        );
-                        deferred_starts
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(range_start);
-                        per_handler_counts.entry(name.clone()).or_default().2 += 1;
-                        continue;
-                    }
-
-                    // Skip if any handler dep already failed in a previous
-                    // pass — the tracker retains failure state across
-                    // scheduler.execute() calls, so submitting this item
-                    // would immediately cascade-fail.
-                    {
-                        let mut dep_failed = false;
-                        for dep in &ch.handler_deps {
-                            if tracker.is_failed(dep, range_start).await {
-                                dep_failed = true;
-                                break;
-                            }
-                        }
-                        if dep_failed {
-                            continue;
-                        }
-                    }
-
-                    per_handler_counts.entry(name.clone()).or_default().0 += 1;
-                    items.push(WorkItem {
-                        handler_name: name.clone(),
-                        range_start,
-                        range_end,
-                        dep_names: ch
-                            .handler_deps
-                            .iter()
-                            .chain(ch.contiguous_handler_deps.iter())
-                            .cloned()
-                            .collect(),
-                        sequential: ch.sequential,
-                        payload: Box::new(CatchupPayload {
-                            handler: ch.handler.clone(),
-                            handler_key: ch.handler.handler_key(),
-                            handler_name: ch.handler.name(),
-                            handler_version: ch.handler.version(),
-                            triggers: ch.triggers.clone(),
-                            call_deps: ch.call_deps.clone(),
-                            kind: ch.kind,
-                        }),
-                    });
-                }
-            }
-
-            // Per-handler summary of this pass's work (submitted / deferred).
-            // Iterate `handlers` for deterministic topological ordering.
-            for ch in &handlers {
-                let name = ch.handler.name();
-                let (submitted, call_dep_def, cascade_def) =
-                    per_handler_counts.get(name).copied().unwrap_or((0, 0, 0));
-                if submitted == 0 && call_dep_def == 0 && cascade_def == 0 {
+            for &(range_start, range_end) in &available {
+                if completed.contains(&range_start) {
                     continue;
                 }
-                if call_dep_def == 0 && cascade_def == 0 {
-                    tracing::info!(
-                        "Handler {} catchup pass {}: submitting {} range(s)",
-                        ch.handler.handler_key(),
-                        pass,
-                        submitted
-                    );
-                } else {
-                    let missing_info = per_handler_missing_call_deps
-                        .get(ch.handler.name())
-                        .map(|deps| format!(" [missing: {}]", deps.join(", ")))
-                        .unwrap_or_default();
-                    tracing::info!(
-                        "Handler {} catchup pass {}: submitting {} range(s), \
-                         deferring {} (call_deps not ready) + {} (upstream not ready){}",
-                        ch.handler.handler_key(),
-                        pass,
-                        submitted,
-                        call_dep_def,
-                        cascade_def,
-                        missing_info
-                    );
-                }
-            }
 
-            if !items.is_empty() {
-                tracing::info!(
-                    "{} catchup pass {}: executing {} work items",
-                    kind_label,
-                    pass,
-                    items.len()
-                );
-
-                let pass_start = Instant::now();
-                let loader_ref = loader.clone();
-                let outcomes = scheduler
-                    .execute(items, move |item| {
-                        let loader = loader_ref.clone();
-                        Box::pin(async move {
-                            match loader.run(item).await {
-                                Ok(()) => WorkItemRunResult::Succeeded,
-                                Err(TransformationError::TransientBlocked(msg)) => {
-                                    WorkItemRunResult::Blocked(msg)
-                                }
-                                Err(e) => WorkItemRunResult::Failed(e.to_string()),
-                            }
-                        })
-                    })
-                    .await;
-
-                histogram!(
-                    "transformation_catchup_pass_duration_seconds",
-                    "kind" => kind_label,
-                )
-                .record(pass_start.elapsed().as_secs_f64());
-
-                let mut succeeded = 0usize;
-                let mut blocked = 0usize;
-                let mut cascade_blocked = 0usize;
-                let mut cascade_failed = 0usize;
-                let mut blocked_marks_to_clear: Vec<(String, u64)> = Vec::new();
-                // Per-handler: (succeeded, failed, blocked, cascade_failed, cascade_blocked, panicked).
-                let mut per_handler_outcomes:
-                    HashMap<String, (usize, usize, usize, usize, usize, usize)> =
-                    HashMap::new();
-
-                for outcome in &outcomes {
-                    let counts = per_handler_outcomes
-                        .entry(outcome.handler_name.clone())
-                        .or_default();
-                    match &outcome.status {
-                        OutcomeStatus::Succeeded => {
-                            self_completed
-                                .entry(outcome.handler_name.clone())
-                                .or_default()
-                                .insert(outcome.range_start);
-                            succeeded += 1;
-                            counts.0 += 1;
-                            let key = handlers
-                                .iter()
-                                .find(|ch| ch.handler.name() == outcome.handler_name)
-                                .map(|ch| ch.handler.handler_key())
-                                .unwrap_or_else(|| outcome.handler_name.clone());
-                            counter!(
-                                "transformation_catchup_ranges_completed_total",
-                                "handler_key" => key,
-                                "kind" => kind_label,
-                            )
-                            .increment(1);
-                        }
-                        OutcomeStatus::Blocked { reason } => {
-                            tracing::info!(
-                                "Handler {} blocked on range {}-{}: {}",
-                                outcome.handler_name,
-                                outcome.range_start,
-                                outcome.range_end,
-                                reason
-                            );
-                            queue_pending_range(
-                                &mut next_pending,
-                                &mut pending_index,
-                                &outcome.handler_name,
-                                outcome.range_start,
-                                outcome.range_end,
-                            );
-                            deferred_starts
-                                .entry(outcome.handler_name.clone())
-                                .or_default()
-                                .insert(outcome.range_start);
-                            blocked_marks_to_clear
-                                .push((outcome.handler_name.clone(), outcome.range_start));
-                            blocked += 1;
-                            counts.2 += 1;
-                        }
-                        OutcomeStatus::HandlerFailed { reason } => {
-                            tracing::error!(
-                                "Handler {} failed on range {}-{}: {}",
-                                outcome.handler_name,
-                                outcome.range_start,
-                                outcome.range_end,
-                                reason
-                            );
-                            let key = handlers
-                                .iter()
-                                .find(|ch| ch.handler.name() == outcome.handler_name)
-                                .map(|ch| ch.handler.handler_key())
-                                .unwrap_or_else(|| outcome.handler_name.clone());
-                            failed_items.push((key, outcome.range_start, reason.clone()));
-                            counts.1 += 1;
-                        }
-                        OutcomeStatus::DepCascadeFailed { dep_name } => {
-                            tracing::warn!(
-                                "Handler {} cascade-failed on range {} due to dep '{}'",
-                                outcome.handler_name,
-                                outcome.range_start,
-                                dep_name
-                            );
-                            let key = handlers
-                                .iter()
-                                .find(|ch| ch.handler.name() == outcome.handler_name)
-                                .map(|ch| ch.handler.handler_key())
-                                .unwrap_or_else(|| outcome.handler_name.clone());
-                            failed_items.push((
-                                key,
-                                outcome.range_start,
-                                format!("cascade-failed: dep '{}' failed", dep_name),
-                            ));
-                            cascade_failed += 1;
-                            counts.3 += 1;
-                        }
-                        OutcomeStatus::DepCascadeBlocked { dep_name } => {
-                            tracing::info!(
-                                "Handler {} cascade-blocked on range {} due to dep '{}'",
-                                outcome.handler_name,
-                                outcome.range_start,
-                                dep_name
-                            );
-                            queue_pending_range(
-                                &mut next_pending,
-                                &mut pending_index,
-                                &outcome.handler_name,
-                                outcome.range_start,
-                                outcome.range_end,
-                            );
-                            deferred_starts
-                                .entry(outcome.handler_name.clone())
-                                .or_default()
-                                .insert(outcome.range_start);
-                            blocked_marks_to_clear
-                                .push((outcome.handler_name.clone(), outcome.range_start));
-                            cascade_blocked += 1;
-                            counts.4 += 1;
-                        }
-                        OutcomeStatus::Panicked => {
-                            tracing::error!(
-                                "Handler {} panicked on range {}",
-                                outcome.handler_name,
-                                outcome.range_start
-                            );
-                            let key = handlers
-                                .iter()
-                                .find(|ch| ch.handler.name() == outcome.handler_name)
-                                .map(|ch| ch.handler.handler_key())
-                                .unwrap_or_else(|| outcome.handler_name.clone());
-                            failed_items.push((
-                                key,
-                                outcome.range_start,
-                                "task panicked".to_string(),
-                            ));
-                            counts.5 += 1;
-                        }
-                    }
-                }
-
-                for (handler_name, range_start) in blocked_marks_to_clear {
-                    tracker.clear_blocked(&handler_name, range_start).await;
-                }
-
-                // Per-handler outcome summary. Log anything with non-success
-                // activity at info, clean runs at debug to reduce log noise.
-                for ch in &handlers {
-                    let name = ch.handler.name();
-                    let Some(&(ok, failed, blocked_count, cascade, cascade_blocked_count, panicked)) =
-                        per_handler_outcomes.get(name)
-                    else {
-                        continue;
-                    };
-                    let total =
-                        ok + failed + blocked_count + cascade + cascade_blocked_count + panicked;
-                    if failed > 0
-                        || blocked_count > 0
-                        || cascade > 0
-                        || cascade_blocked_count > 0
-                        || panicked > 0
-                    {
-                        tracing::info!(
-                            "Handler {} catchup pass {} result: {}/{} succeeded \
-                             ({} failed, {} blocked, {} cascade-failed, {} cascade-blocked, {} panicked)",
-                            ch.handler.handler_key(),
-                            pass,
-                            ok,
-                            total,
-                            failed,
-                            blocked_count,
-                            cascade,
-                            cascade_blocked_count,
-                            panicked
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Handler {} catchup pass {} result: {} range(s) ok",
-                            ch.handler.handler_key(),
-                            pass,
-                            ok
-                        );
-                    }
-                }
-
-                tracing::info!(
-                    "{} catchup pass {} complete: {} succeeded, {} blocked, {} cascade-blocked, {} cascade-failed",
-                    kind_label,
-                    pass,
-                    succeeded,
-                    blocked,
-                    cascade_blocked,
-                    cascade_failed
-                );
-
-                // Update remaining gauge: recompute from self_completed
-                let remaining: usize = handlers
-                    .iter()
-                    .map(|ch| {
-                        let done = self_completed
-                            .get(ch.handler.name())
-                            .map(|s| s.len())
-                            .unwrap_or(0);
-                        available.len().saturating_sub(done)
-                    })
-                    .sum();
-                gauge!(
-                    "transformation_catchup_ranges_remaining",
-                    "kind" => kind_label,
-                )
-                .set(remaining as f64);
-            }
-
-            if next_pending.is_empty() {
-                stranded_pending.clear();
-                break;
-            }
-
-            // Check for progress on pending ranges; bail only after
-            // repeated passes with strictly zero progress.
-            if let Some(ref prev) = ranges_pending {
-                let prev_count: usize = prev.values().map(|v| v.len()).sum();
-                let next_count: usize = next_pending.values().map(|v| v.len()).sum();
-                if next_count >= prev_count {
-                    consecutive_no_progress += 1;
-                    if consecutive_no_progress >= MAX_CONSECUTIVE_NO_PROGRESS {
-                        tracing::warn!(
-                            "{} catchup: {} ranges still blocked by dependencies, \
-                             no progress for {} consecutive passes after pass {}. Giving up.",
-                            kind_label,
-                            next_count,
-                            consecutive_no_progress,
-                            pass
-                        );
-                        stranded_pending = next_pending;
+                // Skip if any handler dep already failed — the tracker retains
+                // failure state, so submitting would immediately cascade-fail.
+                let mut dep_failed = false;
+                for dep in &ch.handler_deps {
+                    if tracker.is_failed(dep, range_start).await {
+                        dep_failed = true;
                         break;
                     }
-                } else {
-                    consecutive_no_progress = 0;
                 }
-            }
+                if dep_failed {
+                    continue;
+                }
 
-            let pending_count: usize = next_pending.values().map(|v| v.len()).sum();
-            tracing::info!(
-                "{} catchup pass {}: {} ranges pending dependencies or blocked upstream work, retrying in 1s...",
-                kind_label,
-                pass,
-                pending_count
+                // Determine if this handler has trigger parquet data in this
+                // range. If not, call-dep gating is skipped (the handler will
+                // no-op and unblock same-range dependents).
+                let trigger_range_present = trigger_range_sets
+                    .get(&name)
+                    .is_some_and(|ranges| ranges.contains(&(range_start, range_end)));
+
+                let call_dep_keys: Vec<(String, String)> =
+                    if trigger_range_present && !ch.call_deps.is_empty() {
+                        ch.call_deps.clone()
+                    } else {
+                        Vec::new()
+                    };
+
+                *per_handler_submitted.entry(name.clone()).or_default() += 1;
+                items.push(WorkItem {
+                    handler_name: name.clone(),
+                    range_start,
+                    range_end,
+                    dep_names: ch.handler_deps.clone(),
+                    contiguous_dep_names: ch.contiguous_handler_deps.clone(),
+                    call_dep_keys,
+                    sequential: ch.sequential,
+                    payload: Box::new(CatchupPayload {
+                        handler: ch.handler.clone(),
+                        handler_key: ch.handler.handler_key(),
+                        handler_name: ch.handler.name(),
+                        handler_version: ch.handler.version(),
+                        triggers: ch.triggers.clone(),
+                        call_deps: ch.call_deps.clone(),
+                        kind: ch.kind,
+                    }),
+                });
+            }
+        }
+
+        // Per-handler submission summary.
+        for ch in &handlers {
+            let count = per_handler_submitted
+                .get(ch.handler.name())
+                .copied()
+                .unwrap_or(0);
+            if count > 0 {
+                tracing::info!(
+                    "Handler {} catchup: submitting {} range(s)",
+                    ch.handler.handler_key(),
+                    count
+                );
+            }
+        }
+
+        if items.is_empty() {
+            tracing::info!("{} handler catchup: no work items to submit", kind_label);
+            return Ok(());
+        }
+
+        tracing::info!(
+            "{} catchup: executing {} work items across {} handlers",
+            kind_label,
+            items.len(),
+            per_handler_submitted.len()
+        );
+
+        // ── Spawn background call-dep scanner ──────────────────────────
+        // Collect unique (source, function) pairs across all handlers.
+        let mut unique_call_deps: HashSet<(String, String)> = HashSet::new();
+        for ch in &handlers {
+            for dep in &ch.call_deps {
+                unique_call_deps.insert(dep.clone());
+            }
+        }
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let scanner_handle = if !unique_call_deps.is_empty() {
+            let scanner = CallDepScanner::new(
+                self.decoded_calls_dir.clone(),
+                self.raw_eth_calls_dir.clone(),
+                self.contracts.clone(),
+                unique_call_deps.into_iter().collect(),
             );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            stranded_pending = next_pending.clone();
-            ranges_pending = Some(next_pending);
-        }
+            // Run one initial scan synchronously before spawning the loop so
+            // that items whose call deps are already on disk don't have to
+            // wait for the first 2s tick.
+            let initial = scanner.scan_all().await;
+            for ((source, func), ranges) in initial {
+                tracker.register_call_dep_ranges(&source, &func, ranges).await;
+            }
+            Some(tokio::spawn(run_call_dep_scanner_loop(
+                scanner,
+                tracker.clone(),
+                cancel_rx,
+            )))
+        } else {
+            None
+        };
 
-        if !stranded_pending.is_empty() {
-            for (handler_name, ranges) in stranded_pending {
-                let key = handlers
-                    .iter()
-                    .find(|ch| ch.handler.name() == handler_name)
-                    .map(|ch| ch.handler.handler_key())
-                    .unwrap_or(handler_name.clone());
-                for (range_start, _) in ranges {
+        // ── Spawn background progress reporter ─────────────────────────
+        let progress_tracker = tracker.clone();
+        let progress_kind: &'static str = kind_label;
+        let total_available = available.len();
+        let handler_keys: HashMap<String, String> = handlers
+            .iter()
+            .map(|ch| (ch.handler.name().to_string(), ch.handler.handler_key()))
+            .collect();
+        let progress_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                let snap = progress_tracker.snapshot_progress().await;
+                let total_completed: usize = snap.values().map(|(c, _, _)| c).sum();
+                let total_failed: usize = snap.values().map(|(_, f, _)| f).sum();
+                let total_blocked: usize = snap.values().map(|(_, _, b)| b).sum();
+                tracing::info!(
+                    "{} catchup progress: {}/{} completed, {} failed, {} blocked",
+                    progress_kind,
+                    total_completed,
+                    total_available * snap.len(),
+                    total_failed,
+                    total_blocked,
+                );
+                // Log per-handler detail for handlers that are behind.
+                for (name, (completed, failed, blocked)) in &snap {
+                    let remaining = total_available.saturating_sub(*completed);
+                    if remaining > 0 || *failed > 0 || *blocked > 0 {
+                        let key = handler_keys.get(name).cloned().unwrap_or_else(|| name.clone());
+                        tracing::info!(
+                            "  {} — {} done, {} remaining, {} failed, {} blocked",
+                            key,
+                            completed,
+                            remaining,
+                            failed,
+                            blocked,
+                        );
+                    }
+                }
+                gauge!(
+                    "transformation_catchup_ranges_remaining",
+                    "kind" => progress_kind,
+                )
+                .set(
+                    snap.values()
+                        .map(|(c, _, _)| total_available.saturating_sub(*c))
+                        .sum::<usize>() as f64,
+                );
+            }
+        });
+
+        // ── Execute all items ──────────────────────────────────────────
+        let catchup_start = Instant::now();
+        let loader_ref = loader.clone();
+        let outcomes = scheduler
+            .execute(items, move |item| {
+                let loader = loader_ref.clone();
+                Box::pin(async move {
+                    match loader.run(item).await {
+                        Ok(()) => WorkItemRunResult::Succeeded,
+                        Err(TransformationError::TransientBlocked(msg)) => {
+                            WorkItemRunResult::Blocked(msg)
+                        }
+                        Err(e) => WorkItemRunResult::Failed(e.to_string()),
+                    }
+                })
+            })
+            .await;
+
+        histogram!(
+            "transformation_catchup_total_duration_seconds",
+            "kind" => kind_label,
+        )
+        .record(catchup_start.elapsed().as_secs_f64());
+
+        // ── Cancel background tasks ────────────────────────────────────
+        let _ = cancel_tx.send(true);
+        if let Some(handle) = scanner_handle {
+            handle.abort();
+        }
+        progress_handle.abort();
+
+        // ── Process outcomes ───────────────────────────────────────────
+        let mut failed_items: Vec<(String, u64, String)> = Vec::new();
+        let mut succeeded = 0usize;
+        let mut blocked = 0usize;
+        let mut cascade_blocked = 0usize;
+        let mut cascade_failed = 0usize;
+        let mut per_handler_outcomes: HashMap<String, (usize, usize, usize, usize, usize, usize)> =
+            HashMap::new();
+
+        for outcome in &outcomes {
+            let counts = per_handler_outcomes
+                .entry(outcome.handler_name.clone())
+                .or_default();
+            match &outcome.status {
+                OutcomeStatus::Succeeded => {
+                    succeeded += 1;
+                    counts.0 += 1;
+                    let key = handlers
+                        .iter()
+                        .find(|ch| ch.handler.name() == outcome.handler_name)
+                        .map(|ch| ch.handler.handler_key())
+                        .unwrap_or_else(|| outcome.handler_name.clone());
+                    counter!(
+                        "transformation_catchup_ranges_completed_total",
+                        "handler_key" => key,
+                        "kind" => kind_label,
+                    )
+                    .increment(1);
+                }
+                OutcomeStatus::Blocked { reason } => {
+                    tracing::info!(
+                        "Handler {} blocked on range {}-{}: {}",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        outcome.range_end,
+                        reason
+                    );
+                    blocked += 1;
+                    counts.2 += 1;
+                    let key = handlers
+                        .iter()
+                        .find(|ch| ch.handler.name() == outcome.handler_name)
+                        .map(|ch| ch.handler.handler_key())
+                        .unwrap_or_else(|| outcome.handler_name.clone());
+                    failed_items.push((key, outcome.range_start, format!("blocked: {}", reason)));
+                }
+                OutcomeStatus::HandlerFailed { reason } => {
+                    tracing::error!(
+                        "Handler {} failed on range {}-{}: {}",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        outcome.range_end,
+                        reason
+                    );
+                    let key = handlers
+                        .iter()
+                        .find(|ch| ch.handler.name() == outcome.handler_name)
+                        .map(|ch| ch.handler.handler_key())
+                        .unwrap_or_else(|| outcome.handler_name.clone());
+                    failed_items.push((key, outcome.range_start, reason.clone()));
+                    counts.1 += 1;
+                }
+                OutcomeStatus::DepCascadeFailed { dep_name } => {
+                    tracing::warn!(
+                        "Handler {} cascade-failed on range {} due to dep '{}'",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        dep_name
+                    );
+                    let key = handlers
+                        .iter()
+                        .find(|ch| ch.handler.name() == outcome.handler_name)
+                        .map(|ch| ch.handler.handler_key())
+                        .unwrap_or_else(|| outcome.handler_name.clone());
                     failed_items.push((
-                        key.clone(),
-                        range_start,
-                        "range remained blocked after retry passes".to_string(),
+                        key,
+                        outcome.range_start,
+                        format!("cascade-failed: dep '{}' failed", dep_name),
                     ));
+                    cascade_failed += 1;
+                    counts.3 += 1;
+                }
+                OutcomeStatus::DepCascadeBlocked { dep_name } => {
+                    tracing::info!(
+                        "Handler {} cascade-blocked on range {} due to dep '{}'",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        dep_name
+                    );
+                    let key = handlers
+                        .iter()
+                        .find(|ch| ch.handler.name() == outcome.handler_name)
+                        .map(|ch| ch.handler.handler_key())
+                        .unwrap_or_else(|| outcome.handler_name.clone());
+                    failed_items.push((
+                        key,
+                        outcome.range_start,
+                        format!("cascade-blocked: dep '{}' blocked", dep_name),
+                    ));
+                    cascade_blocked += 1;
+                    counts.4 += 1;
+                }
+                OutcomeStatus::Panicked => {
+                    tracing::error!(
+                        "Handler {} panicked on range {}",
+                        outcome.handler_name,
+                        outcome.range_start
+                    );
+                    let key = handlers
+                        .iter()
+                        .find(|ch| ch.handler.name() == outcome.handler_name)
+                        .map(|ch| ch.handler.handler_key())
+                        .unwrap_or_else(|| outcome.handler_name.clone());
+                    failed_items.push((key, outcome.range_start, "task panicked".to_string()));
+                    counts.5 += 1;
                 }
             }
         }
+
+        // Per-handler outcome summary.
+        for ch in &handlers {
+            let name = ch.handler.name();
+            let Some(&(ok, failed, blocked_count, cascade, cascade_blocked_count, panicked)) =
+                per_handler_outcomes.get(name)
+            else {
+                continue;
+            };
+            let total = ok + failed + blocked_count + cascade + cascade_blocked_count + panicked;
+            if failed > 0
+                || blocked_count > 0
+                || cascade > 0
+                || cascade_blocked_count > 0
+                || panicked > 0
+            {
+                tracing::info!(
+                    "Handler {} catchup result: {}/{} succeeded \
+                     ({} failed, {} blocked, {} cascade-failed, {} cascade-blocked, {} panicked)",
+                    ch.handler.handler_key(),
+                    ok,
+                    total,
+                    failed,
+                    blocked_count,
+                    cascade,
+                    cascade_blocked_count,
+                    panicked
+                );
+            } else {
+                tracing::debug!(
+                    "Handler {} catchup result: {} range(s) ok",
+                    ch.handler.handler_key(),
+                    ok
+                );
+            }
+        }
+
+        tracing::info!(
+            "{} catchup complete: {} succeeded, {} blocked, {} cascade-blocked, {} cascade-failed in {:.1}s",
+            kind_label,
+            succeeded,
+            blocked,
+            cascade_blocked,
+            cascade_failed,
+            catchup_start.elapsed().as_secs_f64()
+        );
+
+        gauge!(
+            "transformation_catchup_ranges_remaining",
+            "kind" => kind_label,
+        )
+        .set(0.0f64);
 
         if failed_items.is_empty() {
             return Ok(());
@@ -2599,6 +2427,8 @@ impl TransformationEngine {
                     range_start,
                     range_end,
                     dep_names,
+                    contiguous_dep_names: Vec::new(),
+                    call_dep_keys: Vec::new(),
                     sequential: false,
                     payload: Box::new(ProcessRangePayload {
                         handler,
@@ -2627,6 +2457,8 @@ impl TransformationEngine {
                     range_start,
                     range_end,
                     dep_names: vec![],
+                    contiguous_dep_names: Vec::new(),
+                    call_dep_keys: Vec::new(),
                     sequential: false,
                     payload: Box::new(ProcessRangePayload {
                         handler,
@@ -2829,38 +2661,7 @@ impl super::retry::RecordAndFinalize for TransformationEngine {
     }
 }
 
-fn queue_pending_range(
-    next_pending: &mut HashMap<String, Vec<(u64, u64)>>,
-    pending_index: &mut HashSet<(String, u64, u64)>,
-    handler_name: &str,
-    range_start: u64,
-    range_end: u64,
-) {
-    let key = (handler_name.to_string(), range_start, range_end);
-    if pending_index.insert(key) {
-        next_pending
-            .entry(handler_name.to_string())
-            .or_default()
-            .push((range_start, range_end));
-    }
-}
-
-fn contiguous_completed_through(
-    available_starts: &[u64],
-    completed: &HashSet<u64>,
-) -> Option<u64> {
-    let mut last = None;
-    for range_start in available_starts {
-        if completed.contains(range_start) {
-            last = Some(*range_start);
-        } else {
-            break;
-        }
-    }
-    last
-}
-
-fn call_dependency_contract_index_complete(
+pub(crate) fn call_dependency_contract_index_complete(
     raw_index_dir: &Path,
     source: &str,
     range_start: u64,
@@ -2883,29 +2684,11 @@ fn call_dependency_contract_index_complete(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
-    use super::{call_dependency_contract_index_complete, contiguous_completed_through};
+    use super::call_dependency_contract_index_complete;
     use crate::storage::contract_index::{range_key, update_contract_index, write_contract_index};
     use tempfile::tempdir;
-
-    #[test]
-    fn contiguous_completed_through_returns_none_when_first_range_is_missing() {
-        let completed = HashSet::from([200, 300]);
-        assert_eq!(
-            contiguous_completed_through(&[100, 200, 300], &completed),
-            None
-        );
-    }
-
-    #[test]
-    fn contiguous_completed_through_stops_at_first_gap() {
-        let completed = HashSet::from([100, 200, 400]);
-        assert_eq!(
-            contiguous_completed_through(&[100, 200, 300, 400], &completed),
-            Some(200)
-        );
-    }
 
     #[test]
     fn contract_index_gate_defaults_open_without_sidecar() {
