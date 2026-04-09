@@ -753,19 +753,22 @@ impl LiveCollector {
         &self,
         block_number: u64,
     ) -> Result<(Vec<LiveReceipt>, Vec<LiveLog>), CollectorError> {
-        let method_name = self
-            .chain
-            .block_receipts_method
-            .as_ref()
-            .map(|m| m.as_str())
-            .unwrap_or("eth_getBlockReceipts");
-
-        let receipts = self
-            .http_client
-            .get_block_receipts(method_name, BlockNumberOrTag::Number(block_number))
-            .await?;
-
         let block = self.storage.read_block(block_number)?;
+        let receipts = match self.chain.block_receipts_method.as_ref() {
+            Some(method) => {
+                self.http_client
+                    .get_block_receipts(method.as_str(), BlockNumberOrTag::Number(block_number))
+                    .await?
+            }
+            None if block.tx_hashes.is_empty() => Vec::new(),
+            None => {
+                let tx_hashes: Vec<B256> =
+                    block.tx_hashes.iter().copied().map(B256::from).collect();
+                self.http_client
+                    .get_transaction_receipts_batch(tx_hashes)
+                    .await?
+            }
+        };
 
         let mut live_receipts = Vec::new();
         let mut all_logs = Vec::new();
