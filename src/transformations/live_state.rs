@@ -208,9 +208,11 @@ impl LiveProcessingState {
         });
 
         if has_pending
-            && completion.logs_complete
-            && completion.eth_calls_complete
-            && completion.account_states_complete
+            && completion.has_required_completions(
+                expect_logs,
+                expect_eth_calls,
+                expect_account_states,
+            )
         {
             for (handler_key, pending_list) in &self.pending_events {
                 for pending in pending_list {
@@ -292,7 +294,7 @@ impl RangeCompletionState {
         }
     }
 
-    pub fn is_ready(
+    fn has_required_completions(
         self,
         expect_logs: bool,
         expect_eth_calls: bool,
@@ -301,6 +303,15 @@ impl RangeCompletionState {
         (!expect_logs || self.logs_complete)
             && (!expect_eth_calls || self.eth_calls_complete)
             && (!expect_account_states || self.account_states_complete)
+    }
+
+    pub fn is_ready(
+        self,
+        expect_logs: bool,
+        expect_eth_calls: bool,
+        expect_account_states: bool,
+    ) -> bool {
+        self.has_required_completions(expect_logs, expect_eth_calls, expect_account_states)
     }
 }
 
@@ -336,6 +347,16 @@ mod tests {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::AccountStates);
         assert!(state.is_ready(false, false, true));
+    }
+
+    #[test]
+    fn range_completion_does_not_require_account_states_when_not_expected() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::Logs);
+        state.mark(RangeCompleteKind::EthCalls);
+
+        assert!(state.has_required_completions(true, true, false));
+        assert!(!state.has_required_completions(true, true, true));
     }
 
     /// Helper: check whether a handler has remaining pending entries for a range.

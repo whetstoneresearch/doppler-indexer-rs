@@ -2576,6 +2576,8 @@ impl TransformationEngine {
                     range_start,
                     range_end,
                     dep_names: vec![],
+                    contiguous_dep_names: Vec::new(),
+                    call_dep_keys: Vec::new(),
                     sequential: false,
                     payload: Box::new(ProcessRangePayload {
                         handler,
