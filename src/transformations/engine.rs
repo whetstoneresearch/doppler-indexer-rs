@@ -941,6 +941,11 @@ impl TransformationEngine {
         progress_handle.abort();
 
         // ── Process outcomes ───────────────────────────────────────────
+        let handler_name_to_key: HashMap<String, String> = handlers
+            .iter()
+            .map(|ch| (ch.handler.name().to_string(), ch.handler.handler_key()))
+            .collect();
+
         let mut failed_items: Vec<(String, u64, String)> = Vec::new();
         let mut succeeded = 0usize;
         let mut blocked = 0usize;
@@ -957,10 +962,9 @@ impl TransformationEngine {
                 OutcomeStatus::Succeeded => {
                     succeeded += 1;
                     counts.0 += 1;
-                    let key = handlers
-                        .iter()
-                        .find(|ch| ch.handler.name() == outcome.handler_name)
-                        .map(|ch| ch.handler.handler_key())
+                    let key = handler_name_to_key
+                        .get(&outcome.handler_name)
+                        .cloned()
                         .unwrap_or_else(|| outcome.handler_name.clone());
                     counter!(
                         "transformation_catchup_ranges_completed_total",
@@ -979,10 +983,9 @@ impl TransformationEngine {
                     );
                     blocked += 1;
                     counts.2 += 1;
-                    let key = handlers
-                        .iter()
-                        .find(|ch| ch.handler.name() == outcome.handler_name)
-                        .map(|ch| ch.handler.handler_key())
+                    let key = handler_name_to_key
+                        .get(&outcome.handler_name)
+                        .cloned()
                         .unwrap_or_else(|| outcome.handler_name.clone());
                     failed_items.push((key, outcome.range_start, format!("blocked: {}", reason)));
                 }
@@ -994,10 +997,9 @@ impl TransformationEngine {
                         outcome.range_end,
                         reason
                     );
-                    let key = handlers
-                        .iter()
-                        .find(|ch| ch.handler.name() == outcome.handler_name)
-                        .map(|ch| ch.handler.handler_key())
+                    let key = handler_name_to_key
+                        .get(&outcome.handler_name)
+                        .cloned()
                         .unwrap_or_else(|| outcome.handler_name.clone());
                     failed_items.push((key, outcome.range_start, reason.clone()));
                     counts.1 += 1;
@@ -1009,10 +1011,9 @@ impl TransformationEngine {
                         outcome.range_start,
                         dep_name
                     );
-                    let key = handlers
-                        .iter()
-                        .find(|ch| ch.handler.name() == outcome.handler_name)
-                        .map(|ch| ch.handler.handler_key())
+                    let key = handler_name_to_key
+                        .get(&outcome.handler_name)
+                        .cloned()
                         .unwrap_or_else(|| outcome.handler_name.clone());
                     failed_items.push((
                         key,
@@ -1029,10 +1030,9 @@ impl TransformationEngine {
                         outcome.range_start,
                         dep_name
                     );
-                    let key = handlers
-                        .iter()
-                        .find(|ch| ch.handler.name() == outcome.handler_name)
-                        .map(|ch| ch.handler.handler_key())
+                    let key = handler_name_to_key
+                        .get(&outcome.handler_name)
+                        .cloned()
                         .unwrap_or_else(|| outcome.handler_name.clone());
                     failed_items.push((
                         key,
@@ -1048,10 +1048,9 @@ impl TransformationEngine {
                         outcome.handler_name,
                         outcome.range_start
                     );
-                    let key = handlers
-                        .iter()
-                        .find(|ch| ch.handler.name() == outcome.handler_name)
-                        .map(|ch| ch.handler.handler_key())
+                    let key = handler_name_to_key
+                        .get(&outcome.handler_name)
+                        .cloned()
                         .unwrap_or_else(|| outcome.handler_name.clone());
                     failed_items.push((key, outcome.range_start, "task panicked".to_string()));
                     counts.5 += 1;
