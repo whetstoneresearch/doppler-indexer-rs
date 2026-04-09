@@ -3,11 +3,14 @@ use std::str::FromStr;
 use alloy::primitives::{I256, U256};
 use serde::{Deserialize, Serialize};
 
-/// A decoded value from an event parameter or eth_call result.
+use crate::types::chain::ChainAddress;
+
+/// A decoded value from an event parameter, eth_call result, or account-state field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum DecodedValue {
     Address([u8; 20]),
+    ChainAddress(ChainAddress),
     Uint256(U256),
     Int256(I256),
     Uint128(u128),
@@ -36,6 +39,24 @@ impl DecodedValue {
     pub fn as_address(&self) -> Option<[u8; 20]> {
         match self {
             DecodedValue::Address(a) => Some(*a),
+            DecodedValue::ChainAddress(ChainAddress::Evm(a)) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// Try to get as a chain-specific address.
+    pub fn as_chain_address(&self) -> Option<ChainAddress> {
+        match self {
+            DecodedValue::Address(a) => Some(ChainAddress::Evm(*a)),
+            DecodedValue::ChainAddress(address) => Some(*address),
+            _ => None,
+        }
+    }
+
+    /// Try to get as a Solana pubkey.
+    pub fn as_pubkey(&self) -> Option<[u8; 32]> {
+        match self {
+            DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)) => Some(*pubkey),
             _ => None,
         }
     }
@@ -44,6 +65,7 @@ impl DecodedValue {
     pub fn as_bytes32(&self) -> Option<[u8; 32]> {
         match self {
             DecodedValue::Bytes32(b) => Some(*b),
+            DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)) => Some(*pubkey),
             _ => None,
         }
     }
@@ -153,6 +175,8 @@ impl DecodedValue {
             DecodedValue::Bytes(b) => Some(b),
             DecodedValue::Bytes32(b) => Some(b),
             DecodedValue::Address(a) => Some(a),
+            DecodedValue::ChainAddress(ChainAddress::Evm(address)) => Some(address),
+            DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)) => Some(pubkey),
             _ => None,
         }
     }

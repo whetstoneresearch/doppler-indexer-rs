@@ -76,6 +76,13 @@ pub trait FieldExtractor {
     }
 
     impl_field_extractor!(extract_address, as_address, [u8; 20], "an address");
+    impl_field_extractor!(
+        extract_chain_address,
+        as_chain_address,
+        ChainAddress,
+        "a chain address"
+    );
+    impl_field_extractor!(extract_pubkey, as_pubkey, [u8; 32], "a pubkey");
     impl_field_extractor!(extract_uint256, as_uint256, U256, "a uint256");
     impl_field_extractor!(extract_int256, as_int256, I256, "an int256");
     impl_field_extractor!(extract_u64, as_u64, u64, "a u64");
@@ -825,6 +832,18 @@ mod tests {
         }
     }
 
+    fn make_test_account_state(fields: HashMap<String, DecodedValue>) -> DecodedAccountState {
+        DecodedAccountState {
+            block_number: 100,
+            block_timestamp: 1234567890,
+            account_address: ChainAddress::Solana([1u8; 32]),
+            owner_program: ChainAddress::Solana([2u8; 32]),
+            source_name: "TestProgram".to_string(),
+            account_type: "TestAccount".to_string(),
+            fields,
+        }
+    }
+
     #[test]
     fn test_field_extractor_extract_address() {
         let mut params = HashMap::new();
@@ -833,6 +852,45 @@ mod tests {
 
         let addr = event.extract_address("from").unwrap();
         assert_eq!(addr, [42u8; 20]);
+    }
+
+    #[test]
+    fn test_field_extractor_extract_address_from_chain_address() {
+        let mut params = HashMap::new();
+        params.insert(
+            "from".to_string(),
+            DecodedValue::ChainAddress(ChainAddress::Evm([42u8; 20])),
+        );
+        let event = make_test_event(params);
+
+        let addr = event.extract_address("from").unwrap();
+        assert_eq!(addr, [42u8; 20]);
+    }
+
+    #[test]
+    fn test_field_extractor_extract_pubkey_from_account_state() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "authority".to_string(),
+            DecodedValue::ChainAddress(ChainAddress::Solana([42u8; 32])),
+        );
+        let account_state = make_test_account_state(fields);
+
+        let pubkey = account_state.extract_pubkey("authority").unwrap();
+        assert_eq!(pubkey, [42u8; 32]);
+    }
+
+    #[test]
+    fn test_field_extractor_extract_chain_address_from_account_state() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "pool".to_string(),
+            DecodedValue::ChainAddress(ChainAddress::Solana([7u8; 32])),
+        );
+        let account_state = make_test_account_state(fields);
+
+        let address = account_state.extract_chain_address("pool").unwrap();
+        assert_eq!(address, ChainAddress::Solana([7u8; 32]));
     }
 
     #[test]
@@ -966,6 +1024,16 @@ mod tests {
 
         let info = call.context_info();
         assert!(info.contains("TestContract:testFunction"));
+        assert!(info.contains("block 100"));
+    }
+
+    #[test]
+    fn test_field_extractor_context_info_account_state() {
+        let fields = HashMap::new();
+        let account_state = make_test_account_state(fields);
+
+        let info = account_state.context_info();
+        assert!(info.contains("TestProgram:TestAccount"));
         assert!(info.contains("block 100"));
     }
 
