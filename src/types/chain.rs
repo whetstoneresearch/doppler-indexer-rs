@@ -5,6 +5,8 @@ use serde_big_array::BigArray;
 /// Solana's runtime limits CPI depth to 4, but a single instruction can
 /// emit many inner instructions. 10,000 provides ample headroom.
 const MAX_INNER_INSTRUCTIONS: u64 = 10_000;
+/// Reserve ordinal slot 0 for the outer instruction itself.
+const SOLANA_ORDINAL_STRIDE: u64 = MAX_INNER_INSTRUCTIONS + 1;
 
 /// A blockchain address, sized appropriately for the source chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -82,8 +84,11 @@ impl LogPosition {
                 instruction_index,
                 inner_instruction_index,
             } => {
-                (*instruction_index as u64) * MAX_INNER_INSTRUCTIONS
-                    + inner_instruction_index.unwrap_or(0) as u64
+                (*instruction_index as u64) * SOLANA_ORDINAL_STRIDE
+                    + match inner_instruction_index {
+                        None => 0,
+                        Some(inner) => *inner as u64 + 1,
+                    }
             }
         }
     }
@@ -203,7 +208,7 @@ mod tests {
             instruction_index: 3,
             inner_instruction_index: None,
         };
-        assert_eq!(pos.ordinal(), 3 * MAX_INNER_INSTRUCTIONS);
+        assert_eq!(pos.ordinal(), 3 * SOLANA_ORDINAL_STRIDE);
     }
 
     #[test]
@@ -212,7 +217,20 @@ mod tests {
             instruction_index: 2,
             inner_instruction_index: Some(5),
         };
-        assert_eq!(pos.ordinal(), 2 * MAX_INNER_INSTRUCTIONS + 5);
+        assert_eq!(pos.ordinal(), 2 * SOLANA_ORDINAL_STRIDE + 6);
+    }
+
+    #[test]
+    fn log_position_solana_outer_and_first_inner_have_distinct_ordinals() {
+        let outer = LogPosition::Solana {
+            instruction_index: 7,
+            inner_instruction_index: None,
+        };
+        let first_inner = LogPosition::Solana {
+            instruction_index: 7,
+            inner_instruction_index: Some(0),
+        };
+        assert_ne!(outer.ordinal(), first_inner.ordinal());
     }
 
     #[test]

@@ -745,6 +745,7 @@ fn append_db_value_bytes(val: &DbValue, out: &mut Vec<u8>) {
         }
         DbValue::Bytes(v) => out.extend_from_slice(v),
         DbValue::Address(v) => out.extend_from_slice(v),
+        DbValue::Pubkey(v) => out.extend_from_slice(v),
         DbValue::Bytes32(v) => out.extend_from_slice(v),
         DbValue::Timestamp(v) => out.extend_from_slice(&v.to_be_bytes()),
         DbValue::Json(v) | DbValue::JsonB(v) => {
