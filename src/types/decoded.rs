@@ -10,7 +10,6 @@ use crate::types::chain::ChainAddress;
 #[allow(dead_code)]
 pub enum DecodedValue {
     Address([u8; 20]),
-    ChainAddress(ChainAddress),
     Uint256(U256),
     Int256(I256),
     Uint128(u128),
@@ -31,6 +30,8 @@ pub enum DecodedValue {
     UnnamedTuple(Vec<DecodedValue>),
     /// Array of values
     Array(Vec<DecodedValue>),
+    /// Chain-aware address/pubkey value. Kept last to preserve bincode enum ordinals.
+    ChainAddress(ChainAddress),
 }
 
 #[allow(dead_code)]
@@ -213,5 +214,32 @@ impl DecodedValue {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bincode_ordinals_for_legacy_variants_are_stable() {
+        let address = bincode::serialize(&DecodedValue::Address([0x11; 20])).unwrap();
+        assert_eq!(&address[..4], &[0, 0, 0, 0]);
+
+        let uint64 = bincode::serialize(&DecodedValue::Uint64(7)).unwrap();
+        assert_eq!(uint64, vec![5, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]);
+
+        let bytes32 = bincode::serialize(&DecodedValue::Bytes32([0x22; 32])).unwrap();
+        assert_eq!(&bytes32[..4], &[12, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_bincode_appends_chain_address_variant() {
+        let encoded = bincode::serialize(&DecodedValue::ChainAddress(ChainAddress::Solana(
+            [0x33; 32],
+        )))
+        .unwrap();
+
+        assert_eq!(&encoded[..4], &[18, 0, 0, 0]);
     }
 }
