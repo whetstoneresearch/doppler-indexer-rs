@@ -20,7 +20,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 
-use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
+use super::context::{DecodedAccountState, DecodedCall, DecodedEvent, TransactionAddresses};
 use super::error::TransformationError;
 use super::executor::{
     run_handler_task, DbExecMode, HandlerExecutor, HandlerTask, ProcessRangePayload,
@@ -65,6 +65,16 @@ pub struct DecodedCallsMessage {
     pub calls: Vec<DecodedCall>,
 }
 
+/// Message containing decoded account states for a block range.
+#[derive(Debug)]
+pub struct DecodedAccountStatesMessage {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub source_name: String,
+    pub account_type: String,
+    pub account_states: Vec<DecodedAccountState>,
+}
+
 /// Signal that all decoding for a range is complete.
 #[derive(Debug)]
 pub struct RangeCompleteMessage {
@@ -78,6 +88,7 @@ pub struct RangeCompleteMessage {
 pub enum RangeCompleteKind {
     Logs,
     EthCalls,
+    AccountStates,
 }
 
 /// Signal that a reorg occurred and orphaned blocks need cleanup.
@@ -114,6 +125,7 @@ pub struct TransformationEngineConfig {
     pub handler_concurrency: usize,
     pub expect_log_completion: bool,
     pub expect_eth_call_completion: bool,
+    pub expect_account_state_completion: bool,
 }
 
 /// A handler paired with the decoded calls it needs to process.
@@ -219,6 +231,7 @@ impl TransformationEngine {
             progress_tracker: progress_tracker.clone(),
             expect_log_completion: config.expect_log_completion,
             expect_eth_call_completion: config.expect_eth_call_completion,
+            expect_account_state_completion: config.expect_account_state_completion,
         });
 
         let retry_processor = RetryProcessor {
@@ -1240,6 +1253,7 @@ impl TransformationEngine {
         &self,
         mut events_rx: Receiver<DecodedEventsMessage>,
         mut calls_rx: Receiver<DecodedCallsMessage>,
+        mut account_states_rx: Option<Receiver<DecodedAccountStatesMessage>>,
         mut complete_rx: Receiver<RangeCompleteMessage>,
         mut reorg_rx: Option<Receiver<ReorgMessage>>,
         mut retry_rx: Option<Receiver<TransformRetryRequest>>,
@@ -1279,6 +1293,18 @@ impl TransformationEngine {
                         continue;
                     }
                     self.process_calls_message(msg).await?;
+                }
+
+                Some(msg) = async {
+                    match account_states_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if msg.account_states.is_empty() {
+                        continue;
+                    }
+                    self.process_account_states_message(msg).await?;
                 }
 
                 Some(msg) = complete_rx.recv() => {
@@ -1639,6 +1665,7 @@ impl TransformationEngine {
                 handler,
                 events: events.clone(),
                 calls,
+                account_states: Arc::new(Vec::new()),
                 tx_addresses: tx_addresses.clone(),
             })
             .collect();
@@ -1902,8 +1929,14 @@ impl TransformationEngine {
             .increment(filtered_calls.len() as u64);
         }
 
-        self.process_range(msg.range_start, msg.range_end, Vec::new(), filtered_calls)
-            .await?;
+        self.process_range(
+            msg.range_start,
+            msg.range_end,
+            Vec::new(),
+            filtered_calls,
+            Vec::new(),
+        )
+        .await?;
 
         self.try_process_pending_events(range_key).await?;
         self.finalizer
@@ -1911,6 +1944,49 @@ impl TransformationEngine {
             .await?;
 
         Ok(())
+    }
+
+    /// Process an account-state message.
+    async fn process_account_states_message(
+        &self,
+        msg: DecodedAccountStatesMessage,
+    ) -> Result<(), TransformationError> {
+        let handlers = self
+            .registry
+            .handlers_for_account_state(&msg.source_name, &msg.account_type);
+        if handlers.is_empty() {
+            tracing::debug!(
+                "No account state handlers registered for {}/{}",
+                msg.source_name,
+                msg.account_type
+            );
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Processing {} account states for {}/{} block {} with {} handlers",
+            msg.account_states.len(),
+            msg.source_name,
+            msg.account_type,
+            msg.range_start,
+            handlers.len()
+        );
+
+        counter!(
+            "transformation_account_states_processed_total",
+            "source_name" => msg.source_name.clone(),
+            "account_type" => msg.account_type.clone(),
+        )
+        .increment(msg.account_states.len() as u64);
+
+        self.process_range(
+            msg.range_start,
+            msg.range_end,
+            Vec::new(),
+            Vec::new(),
+            msg.account_states,
+        )
+        .await
     }
 
     /// Batch-insert reverted call information into the `_call_revert_log` table.
@@ -2130,6 +2206,7 @@ impl TransformationEngine {
                     handler,
                     events: Arc::new(event_data.events),
                     calls: calls.clone(),
+                    account_states: Arc::new(Vec::new()),
                     tx_addresses,
                 });
             }
@@ -2401,8 +2478,10 @@ impl TransformationEngine {
         &self,
         event_triggers: &[(String, String)],
         call_triggers: &[(String, String)],
+        account_state_triggers: &[(String, String)],
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
+        account_states: Arc<Vec<DecodedAccountState>>,
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
         range_start: u64,
         range_end: u64,
@@ -2441,6 +2520,7 @@ impl TransformationEngine {
                         handler,
                         events: events.clone(),
                         calls: calls.clone(),
+                        account_states: account_states.clone(),
                         tx_addresses: tx_addresses.clone(),
                         snapshot_chain: snapshot_chain.clone(),
                     }),
@@ -2471,6 +2551,39 @@ impl TransformationEngine {
                         handler,
                         events: events.clone(),
                         calls: calls.clone(),
+                        account_states: account_states.clone(),
+                        tx_addresses: tx_addresses.clone(),
+                        snapshot_chain: snapshot_chain.clone(),
+                    }),
+                });
+            }
+        }
+
+        for (source, account_type) in account_state_triggers {
+            for handler in self
+                .registry
+                .handlers_for_account_state(source, account_type)
+            {
+                let handler: Arc<dyn super::traits::TransformationHandler> = handler;
+                let key = handler.handler_key();
+                if !seen_keys.insert(key.clone()) {
+                    continue;
+                }
+                let name = handler.name().to_string();
+                name_to_key.insert(name.clone(), key);
+                items.push(WorkItem {
+                    handler_name: name,
+                    range_start,
+                    range_end,
+                    dep_names: vec![],
+                    contiguous_dep_names: Vec::new(),
+                    call_dep_keys: Vec::new(),
+                    sequential: false,
+                    payload: Box::new(ProcessRangePayload {
+                        handler,
+                        events: events.clone(),
+                        calls: calls.clone(),
+                        account_states: account_states.clone(),
                         tx_addresses: tx_addresses.clone(),
                         snapshot_chain: snapshot_chain.clone(),
                     }),
@@ -2494,13 +2607,15 @@ impl TransformationEngine {
         range_end: u64,
         events: Vec<DecodedEvent>,
         calls: Vec<DecodedCall>,
+        account_states: Vec<DecodedAccountState>,
     ) -> Result<(), TransformationError> {
         tracing::debug!(
-            "Processing range {}-{} with {} events and {} calls",
+            "Processing range {}-{} with {} events, {} calls, and {} account states",
             range_start,
             range_end,
             events.len(),
-            calls.len()
+            calls.len(),
+            account_states.len()
         );
 
         let event_triggers: Vec<(String, String)> = events
@@ -2515,10 +2630,22 @@ impl TransformationEngine {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        let account_state_triggers: Vec<(String, String)> = account_states
+            .iter()
+            .map(|account_state| {
+                (
+                    account_state.source_name.clone(),
+                    account_state.account_type.clone(),
+                )
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
 
         let tx_addresses = self.read_receipt_addresses(range_start, range_end).await;
         let events = Arc::new(events);
         let calls = Arc::new(calls);
+        let account_states = Arc::new(account_states);
 
         let is_live_mode = range_end - range_start == 1;
         let snapshot_chain = if is_live_mode {
@@ -2530,8 +2657,10 @@ impl TransformationEngine {
         let (items, name_to_key) = self.build_process_range_items(
             &event_triggers,
             &call_triggers,
+            &account_state_triggers,
             events,
             calls,
+            account_states,
             tx_addresses,
             range_start,
             range_end,
@@ -2595,6 +2724,7 @@ impl TransformationEngine {
                         payload.handler,
                         payload.events,
                         payload.calls,
+                        payload.account_states,
                         payload.tx_addresses,
                         chain_name,
                         chain_id,

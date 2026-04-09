@@ -1,5 +1,28 @@
 # Solana Support: Codebase Analysis
 
+## Branch Status
+
+This branch combines groundwork from both `feat/solana-phase1-data-types` and `feat/solana-support`.
+
+Implemented:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `ChainType` in chain config with chain-filtered handler registration
+- `TransformationHandler::chain_type()`, `DecodedAccountState`, `AccountStateHandler`, and registry account-state indices
+- Transformation runtime account-state message/context plumbing
+- `DecodedValue::ChainAddress(ChainAddress)` for chain-aware address/pubkey values
+- `DbValue::Pubkey`, `LiveDbValue::Pubkey`
+- `FieldExtractor::extract_pubkey()` and `extract_chain_address()`
+- Lossless Solana position packing via `LogPosition::packed_ordinal_i64()`
+- `BIGINT` widening for persisted `log_index` columns
+
+Still not landed:
+- `ChainServices` wiring in `TransformationContext`
+- Generalized `DecodedEvent` / `DecodedCall`
+- `main.rs` dispatch by chain type
+- Solana RPC / raw-data / decoding / live modules
+
+Read the tables below as target analysis plus branch notes, not a literal inventory of what is already implemented.
+
 ## Solana vs EVM: Fundamental Differences
 
 | Concept | EVM | Solana |
@@ -14,23 +37,6 @@
 | **WebSocket** | `eth_subscribe("newHeads")` | `slotSubscribe`, `programSubscribe`, `logsSubscribe` |
 | **Transaction model** | Account-based, single `to` + `data` | Instructions with program_id + accounts[] + data |
 | **Hashing** | Keccak-256 | SHA-256 (for most things) |
-
-## Current Branch Snapshot
-
-The current `feat/solana-phase1-data-types` branch is still groundwork rather than end-to-end Solana support.
-
-Implemented on this branch:
-- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
-- `DecodedValue::Pubkey`, `DbValue::Pubkey`, and `LiveDbValue::Pubkey`
-- `FieldExtractor::extract_pubkey()` and `extract_chain_address()`
-- Lossless Solana position packing via `LogPosition::packed_ordinal_i64()`
-- `BIGINT` widening for persisted `log_index` columns used by transfers, liquidity deltas, and call revert logs
-
-Still not implemented on this branch:
-- `TransformationHandler::chain_type()`
-- `DecodedAccountState`, `AccountStateHandler`, and `ChainServices`
-- Generalized `DecodedEvent` / `DecodedCall`
-- Any Solana RPC, collector, decoder, config, or live-mode modules
 
 ---
 
@@ -120,17 +126,17 @@ Still not implemented on this branch:
 
 | Component | Chain-agnostic? | Changes needed |
 |---|---|---|
-| `TransformationHandler` trait | **Yes** | Add `chain_type()` method for registry validation at startup |
-| `EventHandler` / `EthCallHandler` traits | **Yes** | Solana event handlers implement `EventHandler`. New `AccountStateHandler` trait for Solana account reads (not shoehorned into `EthCallHandler`) |
-| `TransformationRegistry` | **Yes** | Add `account_state_handlers` index map, chain_type validation on registration |
-| `engine.rs` | **Yes** | No changes needed |
+| `TransformationHandler` trait | **Yes** | `chain_type()` landed; defaults to `Evm`, used for registry filtering |
+| `EventHandler` / `EthCallHandler` traits | **Yes** | Solana event handlers implement `EventHandler`. `AccountStateHandler` trait landed for Solana account reads |
+| `TransformationRegistry` | **Yes** | `account_state_handlers` and chain-type validation landed |
+| `engine.rs` | **Yes** | Account-state channel/message plumbing landed; Solana producers still missing |
 | `scheduler/dag.rs` | **Yes** | No changes needed |
-| `TransformationContext` | **Partially** | Generalize addresses via `ChainAddress` enum. Replace `rpc`+`contracts` with `ChainServices` enum (dispatches EVM vs Solana services). Add `account_states: Arc<Vec<DecodedAccountState>>` for Solana |
-| `DecodedValue` enum | **No** | Needs `Pubkey([u8; 32])` variant. Existing alloy types stay for EVM |
+| `TransformationContext` | **Partially** | `account_states` plus extractors/helpers landed. `ChainServices` is still only a placeholder; `rpc` and `contracts` remain in use |
+| `DecodedValue` enum | **No** | `ChainAddress(ChainAddress)` variant added (preserves bincode ordinals). `DbValue::Pubkey` and `LiveDbValue::Pubkey` also landed |
 | Handler implementations (v3/, v4/) | **No** | These stay as EVM handlers. Write new Solana-specific handlers |
 | `util/` (tick_math, sanitize, etc.) | **No** | EVM/Uniswap-specific. Solana handlers get their own utils |
 
-**Approach:** The trait system and DAG scheduler work unchanged. `DecodedEvent` and `DecodedCall` are generalized with `ChainAddress`/`TxId`/`LogPosition` enums (stack-allocated, not `Vec<u8>`). Solana account reads get their own `DecodedAccountState` type and `AccountStateHandler` trait rather than reusing `DecodedCall`/`EthCallHandler` — the semantics are different enough (no `is_reverted`, no `trigger_log_index`) that reuse would be misleading. Handler implementations are inherently chain-specific.
+**Approach:** The trait system and DAG scheduler remain the shared core. `DecodedAccountState`, `AccountStateHandler`, and account-state engine plumbing have landed. `DecodedEvent` and `DecodedCall` have not yet been generalized with `ChainAddress`/`TxId`/`LogPosition`; that is still future work.
 
 ---
 
@@ -178,7 +184,7 @@ Still not implemented on this branch:
 
 **Cross-chain table compatibility:** The existing schema is more portable than it appears. Every table has `chain_id`, all address columns use variable-length `BYTEA` (not `BYTEA(20)`), and `tx_hash` columns are also `BYTEA`. A Solana handler can write 32-byte pubkeys to the same `tokens.address` column that holds 20-byte EVM addresses. Cross-chain queries like `SELECT * FROM tokens WHERE symbol = 'USDC'` return results from both chains.
 
-Protocol-specific columns (`is_derc20`, `graduation_tick`, `migration_pool`, etc.) are already nullable in most cases and would simply be NULL for Solana rows. For `log_index`-style ordering columns, Solana should either use a `BIGINT` packed ordinal (`LogPosition::packed_ordinal_i64()`) or store `instruction_index` and `inner_instruction_index` separately. Existing `INT` columns are not wide enough for lossless Solana packing.
+Protocol-specific columns (`is_derc20`, `graduation_tick`, `migration_pool`, etc.) are already nullable in most cases and would simply be NULL for Solana rows. For `log_index`-style ordering columns, Solana uses `BIGINT` packed ordinals via `LogPosition::packed_ordinal_i64()`. Existing `INT` columns have been widened to `BIGINT` to support lossless Solana packing.
 
 Solana handlers should write to the **same canonical tables** (tokens, pools, swaps, pool_state, etc.) with appropriate `chain_id`. Protocol-specific extensions (e.g., Orca-specific pool metadata) go in separate handler-owned tables that JOIN to the canonical ones. This enables unified cross-chain querying from day one.
 
@@ -204,9 +210,7 @@ Solana handlers should write to the **same canonical tables** (tokens, pools, sw
 | None for Solana | Add `solana-sdk`, `solana-client`, `solana-transaction-status`, `anchor-lang` (for IDL parsing), `borsh` |
 | Feature flags | Add `features = ["evm", "solana"]` with `default = ["evm", "solana"]` |
 
-Current branch note:
-- The only new dependency actually landed so far is `serde-big-array = "0.5"` to support serde on `[u8; 64]`
-- Solana runtime crates and Solana feature flags are still future work
+Current branch note: `serde-big-array = "0.5"` has been added for `TxId::Solana` serde. Solana runtime crates and feature flags are still future work.
 
 ---
 
@@ -241,7 +245,7 @@ src/
 
 **What gets parallel implementations:** RPC client, raw data collectors, decoders, live collector, config types, WebSocket subscription, address discovery.
 
-**Target design decisions for later phases:**
+**Key design decisions:**
 - `DecodedCall` stays EVM-only; Solana account reads use new `DecodedAccountState` type with `AccountStateHandler` trait
 - `TransformationContext` uses `ChainServices` enum instead of bare EVM-specific fields
 - `TransformationHandler` gains `chain_type()` for startup validation

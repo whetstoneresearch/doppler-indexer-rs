@@ -3,6 +3,7 @@ use std::path::Path;
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 
+use crate::types::chain::ChainType;
 use crate::types::config::contract::{
     load_contracts_from_path, load_factory_collections_from_path, Contracts, FactoryCollections,
 };
@@ -74,6 +75,8 @@ impl RpcConfig {
 pub struct ChainConfigRaw {
     pub name: String,
     pub chain_id: u64,
+    #[serde(default)]
+    pub chain_type: ChainType,
     pub rpc_url_env_var: String,
     /// Environment variable name for WebSocket URL (for live mode).
     pub ws_url_env_var: Option<String>,
@@ -91,6 +94,7 @@ pub struct ChainConfigRaw {
 pub struct ChainConfig {
     pub name: String,
     pub chain_id: u64,
+    pub chain_type: ChainType,
     pub rpc_url_env_var: String,
     /// Environment variable name for WebSocket URL (for live mode).
     pub ws_url_env_var: Option<String>,
@@ -125,6 +129,7 @@ pub fn resolve_chain_config(
     Ok(ChainConfig {
         name: raw_config.name,
         chain_id: raw_config.chain_id,
+        chain_type: raw_config.chain_type,
         rpc_url_env_var: raw_config.rpc_url_env_var,
         ws_url_env_var: raw_config.ws_url_env_var,
         start_block: raw_config.start_block,
@@ -179,6 +184,7 @@ mod tests {
         let raw = ChainConfigRaw {
             name: "test".to_string(),
             chain_id: 1,
+            chain_type: ChainType::Evm,
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
@@ -196,6 +202,7 @@ mod tests {
         let raw = ChainConfigRaw {
             name: "test".to_string(),
             chain_id: 1,
+            chain_type: ChainType::Evm,
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
@@ -208,6 +215,7 @@ mod tests {
         assert!(result.is_ok());
         let config = result.unwrap();
         assert_eq!(config.name, "test");
+        assert_eq!(config.chain_type, ChainType::Evm);
         assert_eq!(
             config.block_receipts_method.unwrap().as_str(),
             "eth_getBlockReceipts"
@@ -225,5 +233,32 @@ mod tests {
         };
 
         assert_eq!(rpc.units_per_second(), Some(25));
+    }
+
+    #[test]
+    fn test_chain_type_defaults_to_evm() {
+        let json = r#"{
+            "name": "test",
+            "chain_id": 1,
+            "rpc_url_env_var": "RPC_URL",
+            "contracts": {}
+        }"#;
+
+        let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
+        assert_eq!(raw.chain_type, ChainType::Evm);
+    }
+
+    #[test]
+    fn test_chain_type_deserializes() {
+        let json = r#"{
+            "name": "test",
+            "chain_id": 1,
+            "chain_type": "solana",
+            "rpc_url_env_var": "RPC_URL",
+            "contracts": {}
+        }"#;
+
+        let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
+        assert_eq!(raw.chain_type, ChainType::Solana);
     }
 }

@@ -76,6 +76,13 @@ pub trait FieldExtractor {
     }
 
     impl_field_extractor!(extract_address, as_address, [u8; 20], "an address");
+    impl_field_extractor!(
+        extract_chain_address,
+        as_chain_address,
+        ChainAddress,
+        "a chain address"
+    );
+    impl_field_extractor!(extract_pubkey, as_pubkey, [u8; 32], "a pubkey");
     impl_field_extractor!(extract_uint256, as_uint256, U256, "a uint256");
     impl_field_extractor!(extract_int256, as_int256, I256, "an int256");
     impl_field_extractor!(extract_u64, as_u64, u64, "a u64");
@@ -87,17 +94,6 @@ pub trait FieldExtractor {
     impl_field_extractor!(extract_string, as_string, &str, "a string");
     impl_field_extractor!(extract_bytes32, as_bytes32, [u8; 32], "bytes32");
     impl_field_extractor!(extract_bytes, as_bytes, &[u8], "bytes");
-    impl_field_extractor!(extract_pubkey, as_pubkey, [u8; 32], "a pubkey");
-
-    fn extract_chain_address(&self, name: &str) -> Result<ChainAddress, TransformationError> {
-        self.get_field(name)?.as_chain_address().ok_or_else(|| {
-            TransformationError::TypeConversion(format!(
-                "'{}' is not an address or pubkey in {}",
-                name,
-                self.context_info()
-            ))
-        })
-    }
 
     /// Extract a u64 field with flexible parsing (handles i64, u64, or numeric strings).
     /// This is useful for timestamp fields that may come from different encoding formats.
@@ -247,6 +243,50 @@ impl FieldExtractor for DecodedCall {
     }
 }
 
+/// A decoded Solana account state ready for transformation.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DecodedAccountState {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub account_address: ChainAddress,
+    pub owner_program: ChainAddress,
+    /// Program or collection name from config
+    pub source_name: String,
+    /// Account type name from IDL (e.g., "Whirlpool")
+    pub account_type: String,
+    /// Decoded field values keyed by field name
+    pub fields: HashMap<String, DecodedValue>,
+}
+
+#[allow(dead_code)]
+impl DecodedAccountState {
+    /// Get a field by name, returning an error if missing.
+    pub fn get(&self, name: &str) -> Result<&DecodedValue, TransformationError> {
+        self.fields
+            .get(name)
+            .ok_or_else(|| TransformationError::MissingField(name.to_string()))
+    }
+
+    /// Try to get a field by name.
+    pub fn try_get(&self, name: &str) -> Option<&DecodedValue> {
+        self.fields.get(name)
+    }
+}
+
+impl FieldExtractor for DecodedAccountState {
+    fn field_values(&self) -> &HashMap<String, DecodedValue> {
+        &self.fields
+    }
+
+    fn context_info(&self) -> String {
+        format!(
+            "account_state {}:{} at block {}",
+            self.source_name, self.account_type, self.block_number
+        )
+    }
+}
+
 /// Query for historical events from parquet files.
 #[derive(Debug, Clone, Default)]
 pub struct HistoricalEventQuery {
@@ -322,6 +362,8 @@ pub struct TransformationContext {
     pub events: Arc<Vec<DecodedEvent>>,
     /// All decoded eth_call results in this range
     pub calls: Arc<Vec<DecodedCall>>,
+    /// All decoded account states in this range
+    pub account_states: Arc<Vec<DecodedAccountState>>,
 
     // ===== Transaction Address Data =====
     /// Transaction hash -> from/to addresses from receipt data
@@ -348,6 +390,7 @@ impl TransformationContext {
         blockrange_end: u64,
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
+        account_states: Arc<Vec<DecodedAccountState>>,
         tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
@@ -360,6 +403,7 @@ impl TransformationContext {
             blockrange_end,
             events,
             calls,
+            account_states,
             tx_addresses,
             historical,
             rpc,
@@ -430,6 +474,29 @@ impl TransformationContext {
             let start_block = self.get_contract_start_block(&c.source_name);
             start_block.is_none_or(|sb| c.block_number >= sb)
         })
+    }
+
+    /// Get account states of a specific type from the current block range.
+    pub fn account_states_of_type(
+        &self,
+        source: &str,
+        account_type: &str,
+    ) -> impl Iterator<Item = &DecodedAccountState> {
+        let source = source.to_string();
+        let account_type = account_type.to_string();
+        self.account_states.iter().filter(move |account_state| {
+            account_state.source_name == source && account_state.account_type == account_type
+        })
+    }
+
+    /// Get account states owned by a specific program from the current block range.
+    pub fn account_states_for_program(
+        &self,
+        owner_program: ChainAddress,
+    ) -> impl Iterator<Item = &DecodedAccountState> + '_ {
+        self.account_states
+            .iter()
+            .filter(move |account_state| account_state.owner_program == owner_program)
     }
 
     /// Get the latest call for a source/function/address from the current range,
@@ -750,6 +817,16 @@ fn encode_calldata(
     Ok(calldata)
 }
 
+/// Chain-specific services available to handlers via the transformation context.
+/// Phase 1: only Evm variant defined. Solana variant added in Phase 4.
+#[allow(dead_code)]
+pub enum ChainServices {
+    Evm {
+        rpc: Arc<UnifiedRpcClient>,
+        contracts: Arc<Contracts>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +859,18 @@ mod tests {
         }
     }
 
+    fn make_test_account_state(fields: HashMap<String, DecodedValue>) -> DecodedAccountState {
+        DecodedAccountState {
+            block_number: 100,
+            block_timestamp: 1234567890,
+            account_address: ChainAddress::Solana([1u8; 32]),
+            owner_program: ChainAddress::Solana([2u8; 32]),
+            source_name: "TestProgram".to_string(),
+            account_type: "TestAccount".to_string(),
+            fields,
+        }
+    }
+
     #[test]
     fn test_field_extractor_extract_address() {
         let mut params = HashMap::new();
@@ -790,6 +879,45 @@ mod tests {
 
         let addr = event.extract_address("from").unwrap();
         assert_eq!(addr, [42u8; 20]);
+    }
+
+    #[test]
+    fn test_field_extractor_extract_address_from_chain_address() {
+        let mut params = HashMap::new();
+        params.insert(
+            "from".to_string(),
+            DecodedValue::ChainAddress(ChainAddress::Evm([42u8; 20])),
+        );
+        let event = make_test_event(params);
+
+        let addr = event.extract_address("from").unwrap();
+        assert_eq!(addr, [42u8; 20]);
+    }
+
+    #[test]
+    fn test_field_extractor_extract_pubkey_from_account_state() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "authority".to_string(),
+            DecodedValue::ChainAddress(ChainAddress::Solana([42u8; 32])),
+        );
+        let account_state = make_test_account_state(fields);
+
+        let pubkey = account_state.extract_pubkey("authority").unwrap();
+        assert_eq!(pubkey, [42u8; 32]);
+    }
+
+    #[test]
+    fn test_field_extractor_extract_chain_address_from_account_state() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "pool".to_string(),
+            DecodedValue::ChainAddress(ChainAddress::Solana([7u8; 32])),
+        );
+        let account_state = make_test_account_state(fields);
+
+        let address = account_state.extract_chain_address("pool").unwrap();
+        assert_eq!(address, ChainAddress::Solana([7u8; 32]));
     }
 
     #[test]
@@ -923,6 +1051,16 @@ mod tests {
 
         let info = call.context_info();
         assert!(info.contains("TestContract:testFunction"));
+        assert!(info.contains("block 100"));
+    }
+
+    #[test]
+    fn test_field_extractor_context_info_account_state() {
+        let fields = HashMap::new();
+        let account_state = make_test_account_state(fields);
+
+        let info = account_state.context_info();
+        assert!(info.contains("TestProgram:TestAccount"));
         assert!(info.contains("block 100"));
     }
 

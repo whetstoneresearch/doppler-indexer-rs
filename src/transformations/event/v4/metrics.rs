@@ -1184,6 +1184,7 @@ mod tests {
             range_end,
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
             StdHashMap::new(),
             historical,
             rpc,

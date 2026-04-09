@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::chain::ChainAddress;
 
-/// A decoded value from an event parameter or eth_call result.
+/// A decoded value from an event parameter, eth_call result, or account-state field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum DecodedValue {
@@ -30,7 +30,8 @@ pub enum DecodedValue {
     UnnamedTuple(Vec<DecodedValue>),
     /// Array of values
     Array(Vec<DecodedValue>),
-    Pubkey([u8; 32]),
+    /// Chain-aware address/pubkey value. Kept last to preserve bincode enum ordinals.
+    ChainAddress(ChainAddress),
 }
 
 #[allow(dead_code)]
@@ -39,6 +40,16 @@ impl DecodedValue {
     pub fn as_address(&self) -> Option<[u8; 20]> {
         match self {
             DecodedValue::Address(a) => Some(*a),
+            DecodedValue::ChainAddress(ChainAddress::Evm(a)) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// Try to get as a chain-specific address.
+    pub fn as_chain_address(&self) -> Option<ChainAddress> {
+        match self {
+            DecodedValue::Address(a) => Some(ChainAddress::Evm(*a)),
+            DecodedValue::ChainAddress(address) => Some(*address),
             _ => None,
         }
     }
@@ -46,16 +57,7 @@ impl DecodedValue {
     /// Try to get as a Solana pubkey.
     pub fn as_pubkey(&self) -> Option<[u8; 32]> {
         match self {
-            DecodedValue::Pubkey(p) => Some(*p),
-            _ => None,
-        }
-    }
-
-    /// Try to get as a chain-agnostic address.
-    pub fn as_chain_address(&self) -> Option<ChainAddress> {
-        match self {
-            DecodedValue::Address(a) => Some(ChainAddress::Evm(*a)),
-            DecodedValue::Pubkey(p) => Some(ChainAddress::Solana(*p)),
+            DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)) => Some(*pubkey),
             _ => None,
         }
     }
@@ -64,6 +66,7 @@ impl DecodedValue {
     pub fn as_bytes32(&self) -> Option<[u8; 32]> {
         match self {
             DecodedValue::Bytes32(b) => Some(*b),
+            DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)) => Some(*pubkey),
             _ => None,
         }
     }
@@ -173,7 +176,8 @@ impl DecodedValue {
             DecodedValue::Bytes(b) => Some(b),
             DecodedValue::Bytes32(b) => Some(b),
             DecodedValue::Address(a) => Some(a),
-            DecodedValue::Pubkey(p) => Some(p),
+            DecodedValue::ChainAddress(ChainAddress::Evm(address)) => Some(address),
+            DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)) => Some(pubkey),
             _ => None,
         }
     }
@@ -210,5 +214,32 @@ impl DecodedValue {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bincode_ordinals_for_legacy_variants_are_stable() {
+        let address = bincode::serialize(&DecodedValue::Address([0x11; 20])).unwrap();
+        assert_eq!(&address[..4], &[0, 0, 0, 0]);
+
+        let uint64 = bincode::serialize(&DecodedValue::Uint64(7)).unwrap();
+        assert_eq!(uint64, vec![5, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]);
+
+        let bytes32 = bincode::serialize(&DecodedValue::Bytes32([0x22; 32])).unwrap();
+        assert_eq!(&bytes32[..4], &[12, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_bincode_appends_chain_address_variant() {
+        let encoded = bincode::serialize(&DecodedValue::ChainAddress(ChainAddress::Solana(
+            [0x33; 32],
+        )))
+        .unwrap();
+
+        assert_eq!(&encoded[..4], &[18, 0, 0, 0]);
     }
 }

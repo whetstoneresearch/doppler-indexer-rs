@@ -236,6 +236,15 @@ mod tests {
     }
 
     #[test]
+    fn chain_address_display_preserves_leading_zeroes_for_solana() {
+        let mut pubkey = [0u8; 32];
+        pubkey[31] = 1;
+
+        let address = ChainAddress::Solana(pubkey);
+        assert_eq!(address.to_string(), "11111111111111111111111111111112");
+    }
+
+    #[test]
     fn txid_clone_not_copy() {
         let a = TxId::Evm([1u8; 32]);
         let b = a.clone(); // Must use .clone()

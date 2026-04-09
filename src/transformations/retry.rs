@@ -569,6 +569,7 @@ impl RetryProcessor {
                         payload.handler,
                         payload.handler_events,
                         payload.handler_calls,
+                        Arc::new(Vec::new()),
                         payload.tx_addresses,
                         chain_name,
                         chain_id,

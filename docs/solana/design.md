@@ -4,22 +4,27 @@
 
 Doppler Indexer currently supports EVM chains exclusively. Adding Solana support requires addressing fundamental data model differences while preserving the existing EVM pipeline unchanged. This document specifies the exact types, interfaces, data flows, and module designs required.
 
-## 1.1 Current Branch Status
+## 1.1 Branch Status
 
-This document describes the target Solana design, but the current `feat/solana-phase1-data-types` branch only implements the first slice of that plan.
+This document is the intended end-state design. The branch implements a subset.
 
-Implemented on this branch:
-- `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
-- `DecodedValue::Pubkey`, `DbValue::Pubkey`, and `LiveDbValue::Pubkey`
-- `FieldExtractor::extract_pubkey()` and `FieldExtractor::extract_chain_address()`
+What has landed:
+- `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
+- `chain_type` in chain config, with default `evm`
+- `TransformationHandler::chain_type()`, `DecodedAccountState`, `AccountStateHandler`, and registry account-state indices
+- Transformation runtime / engine / live-state plumbing for account-state messages
+- `DecodedValue::ChainAddress(ChainAddress)`, `DbValue::Pubkey`, `LiveDbValue::Pubkey`
+- `FieldExtractor::extract_pubkey()` and `extract_chain_address()`
 - `LogPosition::sort_key()` and `LogPosition::packed_ordinal_i64()`
 - `BIGINT` widening for persisted `log_index` columns via `migrations/004_log_index_bigint.sql`
+- UTF-8-safe RPC error truncation
 
-Still pending on this branch:
-- `TransformationHandler::chain_type()`
-- `DecodedAccountState`, `AccountStateHandler`, and `ChainServices`
-- Generalizing `DecodedEvent` and `DecodedCall`
-- Solana config/RPC/raw-data/decoder/live-mode modules
+Where the branch currently differs from the design below:
+- `TransformationContext` still uses `rpc` and `contracts` fields; `ChainServices` is only a placeholder enum
+- `main.rs` does not yet dispatch to a Solana pipeline by `chain_type`
+- No Solana RPC, raw-data, decoding, or live modules have landed yet
+
+Use the rest of this file as the target architecture, not a claim that every section is already implemented.
 
 ---
 
@@ -98,7 +103,7 @@ impl std::fmt::Display for ChainAddress {
 }
 ```
 
-Implementation note: the current branch uses an in-tree base58 helper for `Display` formatting rather than pulling in `bs58` during this initial type-only phase.
+Implementation note: the branch uses an in-tree base58 helper for `Display` formatting rather than pulling in `bs58` during this phase.
 
 **Why not alternatives:**
 - `Vec<u8>`: Heap-allocated. Addresses appear in every `DecodedEvent` in every block — this is a hot path. Unacceptable allocation overhead.
@@ -133,7 +138,7 @@ impl TxId {
 }
 ```
 
-Implementation note: the current branch adds `serde-big-array` to support serde on `[u8; 64]`.
+Implementation note: the branch uses `serde-big-array` to support serde on `[u8; 64]`.
 
 **Why Clone and not Copy:** `ChainAddress` at 33 bytes is small enough for `Copy` — comparable to common `Copy` types. `TxId::Solana` at 65 bytes crosses the threshold where implicit copies become invisible overhead. When iterating thousands of `DecodedEvent`s per block, each `let id = event.transaction_id` is a 65-byte memcpy. With `Clone`, these copies are explicit (`.clone()`), making hot-path code reviewable. The EVM variant at 33 bytes pays the minor cost of `.clone()` syntax for consistency.
 
@@ -1603,7 +1608,7 @@ The existing database tables are **already cross-chain-ready** and Solana handle
 | `chain_id BIGINT` | Every table has it | Solana mainnet = -1, devnet = -2 (negative to avoid EVM collision, see §14.7) |
 | `address BYTEA` | Variable-length, not `BYTEA(20)` | 32-byte Solana pubkeys fit natively |
 | `tx_hash BYTEA` | Variable-length, not `BYTEA(32)` | 64-byte Solana signatures fit natively |
-| `log_index INT` | Used in uniqueness constraints | Not wide enough for lossless Solana packing; widen to `BIGINT` or store `(instruction_index, inner_instruction_index)` separately |
+| `log_index BIGINT` | Widened from INT; used in uniqueness constraints | Store `LogPosition::packed_ordinal_i64()` for Solana |
 | `source VARCHAR` | Handler provenance | `"orca_whirlpool"`, `"raydium_clmm"`, etc. |
 
 **Shared tables** (Solana handlers write to these):
@@ -1663,9 +1668,7 @@ bs58 = { version = "0.5", optional = true }
 # This keeps the dependency tree lean and avoids pulling in the entire Anchor framework.
 ```
 
-Current branch note:
-- The only Solana-adjacent dependency actually added so far is `serde-big-array = "0.5"` for `TxId::Solana`
-- The `solana` feature and Solana runtime crates above remain planned work for later phases
+Current branch note: `serde-big-array = "0.5"` has been added for `TxId::Solana`. The `solana` feature and Solana runtime crates above remain planned work.
 
 **Compile-time isolation**: All Solana code is behind `#[cfg(feature = "solana")]`. Building without `--features solana` produces a binary identical in behavior to today's EVM-only indexer with zero additional dependencies.
 

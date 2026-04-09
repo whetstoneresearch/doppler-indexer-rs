@@ -27,6 +27,7 @@ pub(crate) struct RangeFinalizer {
     pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     pub expect_log_completion: bool,
     pub expect_eth_call_completion: bool,
+    pub expect_account_state_completion: bool,
 }
 
 impl RangeFinalizer {
@@ -119,6 +120,7 @@ impl RangeFinalizer {
                 range_key,
                 self.expect_log_completion,
                 self.range_requires_eth_call_completion(range_key),
+                self.range_requires_account_state_completion(range_key),
             )
         };
 
@@ -388,6 +390,11 @@ impl RangeFinalizer {
     /// Check if this range requires eth_call completion signal before finalization.
     fn range_requires_eth_call_completion(&self, _range_key: (u64, u64)) -> bool {
         self.expect_eth_call_completion
+    }
+
+    /// Check if this range requires account-state completion before finalization.
+    fn range_requires_account_state_completion(&self, range_key: (u64, u64)) -> bool {
+        self.expect_account_state_completion && range_key.1.saturating_sub(range_key.0) == 1
     }
 
     // ─── Reorg Cleanup ─────────────────────────────────────────────────

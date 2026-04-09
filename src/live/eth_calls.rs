@@ -822,6 +822,7 @@ mod tests {
         ChainConfig {
             name: name.to_string(),
             chain_id: 1,
+            chain_type: crate::types::chain::ChainType::Evm,
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,

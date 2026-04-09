@@ -357,6 +357,7 @@ impl CatchupLoader {
             payload.handler,
             Arc::new(events),
             Arc::new(calls),
+            Arc::new(Vec::new()),
             tx_addresses,
             self.chain_name.clone(),
             self.chain_id,

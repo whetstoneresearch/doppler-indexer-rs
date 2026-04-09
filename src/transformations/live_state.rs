@@ -141,9 +141,11 @@ impl LiveProcessingState {
         range_key: (u64, u64),
         expect_logs: bool,
         expect_eth_calls: bool,
+        expect_account_states: bool,
     ) -> (bool, Vec<TimedOutPendingHandler>) {
         let completion = self.completion.get(&range_key).copied().unwrap_or_default();
-        let streams_ready = completion.is_ready(expect_logs, expect_eth_calls);
+        let streams_ready =
+            completion.is_ready(expect_logs, expect_eth_calls, expect_account_states);
 
         // Check for timed-out pending events
         let timeout = Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
@@ -230,7 +232,8 @@ impl LiveProcessingState {
             }
         }
 
-        let ready = !has_pending && completion.is_ready(expect_logs, expect_eth_calls);
+        let ready = !has_pending
+            && completion.is_ready(expect_logs, expect_eth_calls, expect_account_states);
         (ready, timed_out.into_values().collect())
     }
 
@@ -278,6 +281,7 @@ impl LiveProcessingState {
 pub(crate) struct RangeCompletionState {
     pub logs_complete: bool,
     pub eth_calls_complete: bool,
+    pub account_states_complete: bool,
 }
 
 impl RangeCompletionState {
@@ -285,11 +289,28 @@ impl RangeCompletionState {
         match kind {
             RangeCompleteKind::Logs => self.logs_complete = true,
             RangeCompleteKind::EthCalls => self.eth_calls_complete = true,
+            RangeCompleteKind::AccountStates => self.account_states_complete = true,
         }
     }
 
-    pub fn is_ready(self, expect_logs: bool, expect_eth_calls: bool) -> bool {
-        (!expect_logs || self.logs_complete) && (!expect_eth_calls || self.eth_calls_complete)
+    fn has_required_completions(
+        self,
+        expect_logs: bool,
+        expect_eth_calls: bool,
+        expect_account_states: bool,
+    ) -> bool {
+        (!expect_logs || self.logs_complete)
+            && (!expect_eth_calls || self.eth_calls_complete)
+            && (!expect_account_states || self.account_states_complete)
+    }
+
+    pub fn is_ready(
+        self,
+        expect_logs: bool,
+        expect_eth_calls: bool,
+        expect_account_states: bool,
+    ) -> bool {
+        self.has_required_completions(expect_logs, expect_eth_calls, expect_account_states)
     }
 }
 
@@ -301,23 +322,40 @@ mod tests {
     fn range_completion_requires_both_streams_when_calls_expected() {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::Logs);
-        assert!(!state.is_ready(true, true));
+        assert!(!state.is_ready(true, true, false));
         state.mark(RangeCompleteKind::EthCalls);
-        assert!(state.is_ready(true, true));
+        assert!(state.is_ready(true, true, false));
     }
 
     #[test]
     fn range_completion_only_requires_logs_without_calls() {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::Logs);
-        assert!(state.is_ready(true, false));
+        assert!(state.is_ready(true, false, false));
     }
 
     #[test]
     fn range_completion_can_finalize_call_only_ranges() {
         let mut state = RangeCompletionState::default();
         state.mark(RangeCompleteKind::EthCalls);
-        assert!(state.is_ready(false, true));
+        assert!(state.is_ready(false, true, false));
+    }
+
+    #[test]
+    fn range_completion_can_require_account_states() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::AccountStates);
+        assert!(state.is_ready(false, false, true));
+    }
+
+    #[test]
+    fn range_completion_does_not_require_account_states_when_not_expected() {
+        let mut state = RangeCompletionState::default();
+        state.mark(RangeCompleteKind::Logs);
+        state.mark(RangeCompleteKind::EthCalls);
+
+        assert!(state.has_required_completions(true, true, false));
+        assert!(!state.has_required_completions(true, true, true));
     }
 
     /// Helper: check whether a handler has remaining pending entries for a range.
@@ -572,7 +610,7 @@ mod tests {
             .or_default()
             .mark(RangeCompleteKind::Logs);
 
-        let (ready, timed_out) = state.check_finalization_readiness(range_key, true, true);
+        let (ready, timed_out) = state.check_finalization_readiness(range_key, true, true, false);
         assert!(!ready);
         assert!(
             timed_out.is_empty(),
@@ -584,7 +622,7 @@ mod tests {
             .entry(range_key)
             .or_default()
             .mark(RangeCompleteKind::EthCalls);
-        let (_, timed_out) = state.check_finalization_readiness(range_key, true, true);
+        let (_, timed_out) = state.check_finalization_readiness(range_key, true, true, false);
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].handler_key, "handler_v1");
     }
