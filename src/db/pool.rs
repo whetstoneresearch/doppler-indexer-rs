@@ -3,21 +3,25 @@ use std::time::Instant;
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use metrics::{counter, histogram};
+use rand::Rng;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
 
 use super::error::DbError;
 use super::types::{DbOperation, DbValue, WhereClause};
 
+/// Maximum number of retries for deadlock errors (40P01).
+const DEADLOCK_MAX_RETRIES: u32 = 3;
+/// Base delay between deadlock retries (doubled each attempt).
+const DEADLOCK_BASE_DELAY_MS: u64 = 50;
+
 pub struct DbPool {
     pool: Pool,
 }
 
-/// Default pool size if DB_POOL_SIZE is not set.
-const DEFAULT_POOL_SIZE: usize = 16;
-
 impl DbPool {
-    pub async fn new(database_url: &str) -> Result<Self, DbError> {
+    pub async fn new(database_url: &str, pool_size: usize) -> Result<Self, DbError> {
         let config = database_url
             .parse::<tokio_postgres::Config>()
             .map_err(|e| DbError::InvalidConnectionString(e.to_string()))?;
@@ -27,11 +31,6 @@ impl DbPool {
         };
 
         let manager = Manager::from_config(config, NoTls, manager_config);
-
-        let pool_size = std::env::var("DB_POOL_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_POOL_SIZE);
 
         let pool = Pool::builder(manager)
             .max_size(pool_size)
@@ -64,8 +63,72 @@ impl DbPool {
             return Ok(());
         }
 
-        let op_count = operations.len();
+        let mut operations = operations;
+        sort_operations_for_lock_ordering(&mut operations);
 
+        let op_count = operations.len();
+        let txn_start = Instant::now();
+
+
+        counter!(
+            "db_transaction_operations_total",
+            "method" => "execute_transaction"
+        )
+        .increment(op_count as u64);
+
+        for attempt in 0..=DEADLOCK_MAX_RETRIES {
+            match self.try_execute_transaction(&operations).await {
+                Ok(()) => {
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction",
+                        "status" => "success"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction",
+                        "status" => "success"
+                    )
+                    .increment(1);
+                    return Ok(());
+                }
+                Err(e) if is_deadlock(&e) && attempt < DEADLOCK_MAX_RETRIES => {
+                    let base_delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    let jitter_range = base_delay_ms / 5;
+                    let jitter_offset = rand::rng().random_range(0..=(jitter_range * 2));
+                    let delay_ms = base_delay_ms - jitter_range + jitter_offset;
+                    tracing::warn!(
+                        "Deadlock detected (attempt {}/{}), retrying in {}ms (base={}ms)",
+                        attempt + 1,
+                        DEADLOCK_MAX_RETRIES + 1,
+                        delay_ms,
+                        base_delay_ms,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => {
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction",
+                        "status" => "error"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction",
+                        "status" => "error"
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
+    async fn try_execute_transaction(&self, operations: &[DbOperation]) -> Result<(), DbError> {
         let acquire_start = Instant::now();
         let mut client = match self.pool.get().await {
             Ok(c) => {
@@ -76,24 +139,11 @@ impl DbPool {
             Err(e) => {
                 histogram!("db_connection_acquire_duration_seconds")
                     .record(acquire_start.elapsed().as_secs_f64());
-                counter!(
-                    "db_transactions_total",
-                    "method" => "execute_transaction",
-                    "status" => "error"
-                )
-                .increment(1);
                 return Err(e.into());
             }
         };
 
-        let txn_start = Instant::now();
         let transaction = client.transaction().await?;
-
-        counter!(
-            "db_transaction_operations_total",
-            "method" => "execute_transaction"
-        )
-        .increment(op_count as u64);
 
         for op in operations {
             let (sql, params) = build_operation_sql(op);
@@ -104,37 +154,11 @@ impl DbPool {
             if let Err(e) = transaction.execute(&sql, &params_refs[..]).await {
                 let db_err: DbError = e.into();
                 tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
-                histogram!(
-                    "db_transaction_duration_seconds",
-                    "method" => "execute_transaction",
-                    "status" => "error"
-                )
-                .record(txn_start.elapsed().as_secs_f64());
-                counter!(
-                    "db_transactions_total",
-                    "method" => "execute_transaction",
-                    "status" => "error"
-                )
-                .increment(1);
                 return Err(db_err);
             }
         }
 
         transaction.commit().await?;
-
-        histogram!(
-            "db_transaction_duration_seconds",
-            "method" => "execute_transaction",
-            "status" => "success"
-        )
-        .record(txn_start.elapsed().as_secs_f64());
-        counter!(
-            "db_transactions_total",
-            "method" => "execute_transaction",
-            "status" => "success"
-        )
-        .increment(1);
-
         Ok(())
     }
 
@@ -192,7 +216,7 @@ impl DbPool {
         // Execute all operations and collect affected row counts
         let mut affected_rows = Vec::with_capacity(operations.len());
         for op in operations {
-            let (sql, params) = build_operation_sql(op);
+            let (sql, params) = build_operation_sql(&op);
             let params_refs: Vec<&(dyn ToSql + Sync)> =
                 params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
@@ -307,8 +331,18 @@ impl DbPool {
     }
 }
 
+/// Check whether a `DbError` is a PostgreSQL deadlock (SQLSTATE 40P01).
+fn is_deadlock(err: &DbError) -> bool {
+    match err {
+        DbError::PostgresError(e) => e
+            .as_db_error()
+            .is_some_and(|db| *db.code() == SqlState::T_R_DEADLOCK_DETECTED),
+        _ => false,
+    }
+}
+
 /// Build SQL and parameters from a DbOperation.
-fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
+fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
     match op {
         DbOperation::Upsert {
             table,
@@ -318,28 +352,28 @@ fn build_operation_sql(op: DbOperation) -> (String, Vec<SqlParam>) {
             update_columns,
             update_condition,
         } => build_upsert_sql(
-            &table,
-            &columns,
-            &values,
-            &conflict_columns,
-            &update_columns,
+            table,
+            columns,
+            values,
+            conflict_columns,
+            update_columns,
             update_condition.as_deref(),
         ),
         DbOperation::Insert {
             table,
             columns,
             values,
-        } => build_insert_sql(&table, &columns, &values),
+        } => build_insert_sql(table, columns, values),
         DbOperation::Update {
             table,
             set_columns,
             where_clause,
-        } => build_update_sql(&table, &set_columns, &where_clause),
+        } => build_update_sql(table, set_columns, where_clause),
         DbOperation::Delete {
             table,
             where_clause,
         } => build_delete_sql(&table, &where_clause),
-        DbOperation::RawSql { query, params } => (query, convert_values_to_params(&params)),
+        DbOperation::RawSql { query, params, .. } => (query, convert_values_to_params(&params)),
     }
 }
 
@@ -423,20 +457,6 @@ fn extract_db_value_from_row(
 
     let col_name = col.name();
     let col_type = col.type_();
-
-    // Handle NULL values first
-    let _is_null: bool = row
-        .try_get::<_, Option<bool>>(col_name)
-        .map(|v| v.is_none())
-        .unwrap_or(false)
-        || row
-            .try_get::<_, Option<i64>>(col_name)
-            .map(|v| v.is_none())
-            .unwrap_or(false)
-        || row
-            .try_get::<_, Option<String>>(col_name)
-            .map(|v| v.is_none())
-            .unwrap_or(false);
 
     match *col_type {
         Type::BOOL => Ok(try_extract_column::<bool>(row, col_name)
@@ -771,6 +791,119 @@ fn build_delete_sql(table: &str, where_clause: &WhereClause) -> (String, Vec<Sql
     (sql, builder.finish())
 }
 
+// ─── Deterministic lock ordering ────────────────────────────────────────────
+
+/// Sort operations by (table, row-identity bytes) so that every transaction
+/// acquires row locks in the same deterministic order, preventing deadlocks
+/// when concurrent transactions touch overlapping rows.
+fn sort_operations_for_lock_ordering(ops: &mut [DbOperation]) {
+    ops.sort_by_cached_key(operation_sort_key);
+}
+
+/// Extract a comparable sort key from a DbOperation.
+///
+/// For Upserts, the key is (table, conflict-column values) since those
+/// identify the locked row. For Inserts the full value tuple is used.
+/// For Update/Delete the WHERE clause values are used. RawSql sorts last.
+fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
+    match op {
+        DbOperation::Upsert {
+            table,
+            columns,
+            values,
+            conflict_columns,
+            ..
+        } => {
+            let mut key = table.as_bytes().to_vec();
+            key.push(0); // separator
+            for conflict_col in conflict_columns {
+                if let Some(idx) = columns.iter().position(|c| c == conflict_col) {
+                    if let Some(val) = values.get(idx) {
+                        append_db_value_bytes(val, &mut key);
+                    }
+                }
+            }
+            (0, key)
+        }
+        DbOperation::Insert { table, values, .. } => {
+            let mut key = table.as_bytes().to_vec();
+            key.push(0);
+            for val in values {
+                append_db_value_bytes(val, &mut key);
+            }
+            (1, key)
+        }
+        DbOperation::Update {
+            table,
+            where_clause,
+            ..
+        } => {
+            let mut key = table.as_bytes().to_vec();
+            key.push(0);
+            append_where_clause_bytes(where_clause, &mut key);
+            (2, key)
+        }
+        DbOperation::Delete {
+            table,
+            where_clause,
+        } => {
+            let mut key = table.as_bytes().to_vec();
+            key.push(0);
+            append_where_clause_bytes(where_clause, &mut key);
+            (3, key)
+        }
+        DbOperation::RawSql { query, .. } => (4, query.as_bytes().to_vec()),
+    }
+}
+
+/// Append a deterministic byte representation of a DbValue for sorting.
+fn append_db_value_bytes(val: &DbValue, out: &mut Vec<u8>) {
+    match val {
+        DbValue::Null => out.push(0),
+        DbValue::Bool(v) => out.push(if *v { 1 } else { 0 }),
+        DbValue::Int64(v) => out.extend_from_slice(&v.to_be_bytes()),
+        DbValue::Int32(v) => out.extend_from_slice(&v.to_be_bytes()),
+        DbValue::Int2(v) => out.extend_from_slice(&v.to_be_bytes()),
+        DbValue::Uint64(v) => out.extend_from_slice(&v.to_be_bytes()),
+        DbValue::Float64(v) => out.extend_from_slice(&v.to_be_bytes()),
+        DbValue::Text(v) | DbValue::VarChar(v) | DbValue::Numeric(v) => {
+            out.extend_from_slice(v.as_bytes());
+        }
+        DbValue::Bytes(v) => out.extend_from_slice(v),
+        DbValue::Address(v) => out.extend_from_slice(v),
+        DbValue::Bytes32(v) => out.extend_from_slice(v),
+        DbValue::Timestamp(v) => out.extend_from_slice(&v.to_be_bytes()),
+        DbValue::Json(v) | DbValue::JsonB(v) => {
+            out.extend_from_slice(v.to_string().as_bytes());
+        }
+    }
+    out.push(0xFF); // separator between values
+}
+
+/// Append bytes from a WHERE clause for sort key generation.
+fn append_where_clause_bytes(wc: &WhereClause, out: &mut Vec<u8>) {
+    match wc {
+        WhereClause::Eq(col, val) => {
+            out.extend_from_slice(col.as_bytes());
+            out.push(0);
+            append_db_value_bytes(val, out);
+        }
+        WhereClause::And(pairs) => {
+            for (col, val) in pairs {
+                out.extend_from_slice(col.as_bytes());
+                out.push(0);
+                append_db_value_bytes(val, out);
+            }
+        }
+        WhereClause::Raw { condition, params } => {
+            out.extend_from_slice(condition.as_bytes());
+            for p in params {
+                append_db_value_bytes(p, out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,5 +1004,92 @@ mod tests {
             DbValue::Int2(v) => assert_eq!(v, -128),
             other => panic!("Expected DbValue::Int2(-128), got {:?}", other),
         }
+    }
+
+    // ─── Lock ordering tests ────────────────────────────────────────
+
+    fn upsert_user(chain_id: i64, address: [u8; 20]) -> DbOperation {
+        DbOperation::Upsert {
+            table: "users".to_string(),
+            columns: vec![
+                "chain_id".to_string(),
+                "address".to_string(),
+                "first_seen".to_string(),
+                "last_seen".to_string(),
+            ],
+            values: vec![
+                DbValue::Int64(chain_id),
+                DbValue::Address(address),
+                DbValue::Timestamp(1000),
+                DbValue::Timestamp(1000),
+            ],
+            conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
+            update_columns: vec!["last_seen".to_string()],
+            update_condition: None,
+        }
+    }
+
+    fn insert_transfer(block: i64, log_idx: i64) -> DbOperation {
+        DbOperation::Insert {
+            table: "transfers".to_string(),
+            columns: vec!["block_number".to_string(), "log_index".to_string()],
+            values: vec![DbValue::Int64(block), DbValue::Int64(log_idx)],
+        }
+    }
+
+    #[test]
+    fn sort_upserts_by_address_deterministically() {
+        let addr_a = [0x00; 20];
+        let addr_b = [0xFF; 20];
+
+        // Reverse order: B before A
+        let mut ops = vec![upsert_user(1, addr_b), upsert_user(1, addr_a)];
+
+        sort_operations_for_lock_ordering(&mut ops);
+
+        // After sort: A before B (0x00 < 0xFF)
+        match &ops[0] {
+            DbOperation::Upsert { values, .. } => match &values[1] {
+                DbValue::Address(a) => assert_eq!(*a, addr_a),
+                other => panic!("Expected Address, got {:?}", other),
+            },
+            other => panic!("Expected Upsert, got {:?}", other),
+        }
+        match &ops[1] {
+            DbOperation::Upsert { values, .. } => match &values[1] {
+                DbValue::Address(a) => assert_eq!(*a, addr_b),
+                other => panic!("Expected Address, got {:?}", other),
+            },
+            other => panic!("Expected Upsert, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sort_groups_by_table_then_key() {
+        let addr = [0x01; 20];
+
+        let mut ops = vec![
+            insert_transfer(100, 0),
+            upsert_user(1, addr),
+            insert_transfer(100, 1),
+        ];
+
+        sort_operations_for_lock_ordering(&mut ops);
+
+        // Upserts (type 0) sort before Inserts (type 1),
+        // and within inserts, "transfers" sorts by values.
+        assert!(matches!(&ops[0], DbOperation::Upsert { table, .. } if table == "users"));
+        assert!(matches!(&ops[1], DbOperation::Insert { table, .. } if table == "transfers"));
+        assert!(matches!(&ops[2], DbOperation::Insert { table, .. } if table == "transfers"));
+    }
+
+    #[test]
+    fn sort_is_stable_for_identical_keys() {
+        let addr = [0x42; 20];
+        let mut ops = vec![upsert_user(1, addr), upsert_user(1, addr)];
+
+        // Should not panic or reorder arbitrarily
+        sort_operations_for_lock_ordering(&mut ops);
+        assert_eq!(ops.len(), 2);
     }
 }

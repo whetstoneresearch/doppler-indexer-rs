@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{
     ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, UInt32Array,
@@ -134,7 +135,7 @@ pub(crate) async fn process_completed_range(
         );
     }
 
-    // Send logs to decoder before processing (decoder will receive them for live decoding)
+    // Send logs to decoder before processing (decoder will receive them for decoding).
     if let Some(tx) = decoder_tx {
         let _ = tx
             .send(DecoderMessage::LogsReady {
@@ -145,18 +146,29 @@ pub(crate) async fn process_completed_range(
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })
             .await;
-    }
 
-    process_range(
-        &range,
-        logs,
-        log_fields,
-        schema,
-        output_dir,
-        storage_manager,
-        chain_name,
-    )
-    .await
+        process_range(
+            &range,
+            &logs,
+            log_fields,
+            schema,
+            output_dir,
+            storage_manager,
+            chain_name,
+        )
+        .await
+    } else {
+        process_range(
+            &range,
+            &logs,
+            log_fields,
+            schema,
+            output_dir,
+            storage_manager,
+            chain_name,
+        )
+        .await
+    }
 }
 
 pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {
@@ -178,7 +190,7 @@ pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 
 
 pub(crate) async fn process_range(
     range: &BlockRange,
-    logs: Vec<LogData>,
+    logs: &[LogData],
     log_fields: &Option<Vec<LogField>>,
     schema: &Arc<Schema>,
     output_dir: &Path,
@@ -192,20 +204,22 @@ pub(crate) async fn process_range(
         range.end - 1
     );
 
+    let write_start = Instant::now();
+    let log_count = logs.len();
     match log_fields {
         Some(fields) => {
-            let records: Vec<MinimalLogRecord> = logs
-                .into_iter()
-                .map(|l| MinimalLogRecord {
+            let mut records: Vec<MinimalLogRecord> = Vec::with_capacity(log_count);
+            for l in logs {
+                records.push(MinimalLogRecord {
                     block_number: l.block_number,
                     block_timestamp: l.block_timestamp,
                     transaction_hash: l.transaction_hash.0,
                     log_index: l.log_index,
                     address: l.address,
-                    topics: l.topics,
-                    data: l.data,
-                })
-                .collect();
+                    topics: l.topics.clone(),
+                    data: l.data.clone(),
+                });
+            }
             let output_path = output_dir.join(range.file_name("logs"));
             write_minimal_logs_to_parquet_async(
                 records,
@@ -216,24 +230,32 @@ pub(crate) async fn process_range(
             .await?;
         }
         None => {
-            let records: Vec<FullLogRecord> = logs
-                .into_iter()
-                .map(|l| FullLogRecord {
+            let mut records: Vec<FullLogRecord> = Vec::with_capacity(log_count);
+            for l in logs {
+                records.push(FullLogRecord {
                     block_number: l.block_number,
                     block_timestamp: l.block_timestamp,
                     transaction_hash: l.transaction_hash.0,
                     log_index: l.log_index,
                     address: l.address,
-                    topics: l.topics,
-                    data: l.data,
-                })
-                .collect();
+                    topics: l.topics.clone(),
+                    data: l.data.clone(),
+                });
+            }
             let output_path = output_dir.join(range.file_name("logs"));
             write_full_logs_to_parquet_async(records, schema.clone(), output_path).await?;
         }
     }
 
     let output_path = output_dir.join(range.file_name("logs"));
+
+    crate::metrics::record_parquet_write(
+        chain_name,
+        "logs",
+        write_start.elapsed().as_secs_f64(),
+        &output_path,
+    );
+
     tracing::info!("Wrote logs to {}", output_path.display());
 
     // Upload to S3 if configured
@@ -446,7 +468,7 @@ pub(crate) fn write_parquet(
     output_path: &Path,
 ) -> Result<(), LogCollectionError> {
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 

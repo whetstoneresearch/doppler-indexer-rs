@@ -12,7 +12,7 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 
 use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 
@@ -36,11 +36,16 @@ impl TransformationHandler for V3CreateHandler {
         vec![
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
     fn reorg_tables(&self) -> Vec<&'static str> {
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        false
     }
 
     async fn handle(
@@ -54,12 +59,15 @@ impl TransformationHandler for V3CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
-            let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
+            else {
+                continue;
+            };
 
             let pool_call = ctx
-                .calls_for_address(pool_or_hook)
-                .find(|call| call.function_name == "once")
+                .current_or_historical_once_call_for_address("DopplerV3Pool", pool_or_hook)
+                .await?
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(pool_or_hook)
@@ -177,7 +185,6 @@ impl EventHandler for V3CreateHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
             ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             ("DopplerV3Pool".to_string(), "once".to_string()),
         ]
     }
@@ -201,11 +208,16 @@ impl TransformationHandler for LockableV3CreateHandler {
         vec![
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
     fn reorg_tables(&self) -> Vec<&'static str> {
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        true
     }
 
     async fn handle(
@@ -219,12 +231,15 @@ impl TransformationHandler for LockableV3CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let pool_or_hook = event.extract_address("poolOrHook")?;
 
-            let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
+            else {
+                continue;
+            };
 
             let pool_call = ctx
-                .calls_for_address(pool_or_hook)
-                .find(|call| call.function_name == "once")
+                .current_or_historical_once_call_for_address("DopplerLockableV3Pool", pool_or_hook)
+                .await?
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(pool_or_hook)
@@ -340,19 +355,19 @@ impl EventHandler for LockableV3CreateHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
             ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             ("DopplerLockableV3Pool".to_string(), "once".to_string()),
         ]
     }
 }
 
-pub fn register_handlers(registry: &mut TransformationRegistry, metadata_cache: Arc<PoolMetadataCache>) {
+pub fn register_handlers(
+    registry: &mut TransformationRegistry,
+    metadata_cache: Arc<PoolMetadataCache>,
+) {
     registry.register_event_handler(V3CreateHandler {
         metadata_cache: metadata_cache.clone(),
     });
-    registry.register_event_handler(LockableV3CreateHandler {
-        metadata_cache,
-    });
+    registry.register_event_handler(LockableV3CreateHandler { metadata_cache });
 }
 
 #[cfg(test)]
@@ -361,10 +376,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::rpc::UnifiedRpcClient;
     use crate::transformations::context::TransformationContext;
     use crate::transformations::historical::HistoricalDataReader;
     use crate::transformations::util::pool_metadata::PoolMetadataCache;
-    use crate::rpc::UnifiedRpcClient;
 
     fn make_empty_ctx() -> TransformationContext {
         let historical = Arc::new(

@@ -20,6 +20,9 @@ use crate::transformations::event::metrics::v4_hook_extract::{
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 const SOURCE: &str = "DopplerHookInitializer";
 
@@ -27,6 +30,7 @@ const SOURCE: &str = "DopplerHookInitializer";
 
 pub struct DhookSwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -46,6 +50,7 @@ impl TransformationHandler for DhookSwapMetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
 
@@ -69,14 +74,37 @@ impl TransformationHandler for DhookSwapMetricsHandler {
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            self.name(),
+            SOURCE,
         )
         .await?;
 
-        Ok(process_swaps(&swaps, &self.metadata_cache, ctx.chain_id))
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+        let mut ops = process_swaps(
+            &swaps,
+            &self.metadata_cache,
+            ctx.chain_id,
+            self.name(),
+            SOURCE,
+            Some(&usd_ctx),
+            self.version(),
+        );
+        ops.extend(price_ops);
+        Ok(ops)
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -94,10 +122,13 @@ impl EventHandler for DhookSwapMetricsHandler {
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {
-        vec![(SOURCE.to_string(), "getSlot0".to_string())]
+        vec![
+            (SOURCE.to_string(), "getSlot0".to_string()),
+            chainlink_latest_answer_dependency(),
+        ]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["DopplerHookCreateHandler"]
     }
 }
@@ -143,7 +174,7 @@ impl EventHandler for DhookLiquidityMetricsHandler {
         )]
     }
 
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["DopplerHookCreateHandler"]
     }
 }
@@ -154,9 +185,11 @@ pub fn register_handlers(
     registry: &mut TransformationRegistry,
     chain_id: u64,
     cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
 ) {
     registry.register_event_handler(DhookSwapMetricsHandler {
         metadata_cache: cache,
+        oracle_cache,
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),

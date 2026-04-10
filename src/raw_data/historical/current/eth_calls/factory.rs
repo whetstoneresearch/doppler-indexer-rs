@@ -80,36 +80,44 @@ pub(super) async fn handle_factory_message(
                             output_dir: &state.base_output_dir,
                             existing_files: &state.existing_files,
                             rpc_batch_size: state.rpc_batch_size,
+                            repair: state.repair,
                             decoder_tx,
                             chain_name,
                             storage_manager,
                             s3_manifest: &state.s3_manifest,
                         };
 
-                        let new_skipped = if let Some(multicall_addr) = state.multicall3_address {
-                            process_event_triggers_multicall(
-                                triggers,
-                                &state.event_call_configs,
-                                &state.factory_addresses,
-                                &ctx,
-                                multicall_addr,
-                                buf_range_start,
-                                buf_range_end,
-                                &state.contracts,
-                            )
-                            .await?
-                        } else {
-                            process_event_triggers(
-                                triggers,
-                                &state.event_call_configs,
-                                &state.factory_addresses,
-                                &ctx,
-                                buf_range_start,
-                                buf_range_end,
-                                &state.contracts,
-                            )
-                            .await?
-                        };
+                        let (new_skipped, mut pending_writes) =
+                            if let Some(multicall_addr) = state.multicall3_address {
+                                process_event_triggers_multicall(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    &ctx,
+                                    multicall_addr,
+                                    buf_range_start,
+                                    buf_range_end,
+                                    &state.contracts,
+                                    false,
+                                )
+                                .await?
+                            } else {
+                                process_event_triggers(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    &ctx,
+                                    buf_range_start,
+                                    buf_range_end,
+                                    &state.contracts,
+                                    false,
+                                )
+                                .await?
+                            };
+                        while let Some(result) = pending_writes.join_next().await {
+                            result
+                                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+                        }
 
                         if !new_skipped.is_empty() {
                             still_skipped.push((new_skipped, buf_range_start, buf_range_end));
@@ -161,6 +169,7 @@ pub(super) async fn handle_factory_message(
                             output_dir: &state.base_output_dir,
                             existing_files: &state.existing_files,
                             rpc_batch_size: state.rpc_batch_size,
+                            repair: state.repair,
                             decoder_tx,
                             chain_name,
                             storage_manager,
@@ -294,7 +303,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use alloy::primitives::{Address, U256};
     use crate::raw_data::historical::eth_calls::{
         BlockInfo, EthCallCatchupState, FrequencyState, OnceCallConfig,
     };
@@ -304,6 +312,7 @@ mod tests {
         AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
         FactoryEventConfigOrArray, FactoryParameterLocation,
     };
+    use alloy::primitives::{Address, U256};
 
     fn dummy_client() -> Arc<UnifiedRpcClient> {
         Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
@@ -363,6 +372,7 @@ mod tests {
             has_factory_calls: false,
             has_factory_once_calls: true,
             has_event_triggered_calls: false,
+            repair: false,
             max_params: 0,
             factory_max_params: 0,
             existing_files: HashSet::new(),
@@ -388,9 +398,13 @@ mod tests {
 
         // Pre-populate: regular processing done, block data available
         state.range_regular_done.insert(0);
-        state
-            .range_data
-            .insert(0, vec![BlockInfo { block_number: 0, timestamp: 100 }]);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
         state.range_factory_data.insert(
             0,
             FactoryAddressData {

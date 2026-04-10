@@ -152,7 +152,7 @@ pub async fn collect_factories(
     // =========================================================================
     let needs_migration = factory_collection_names
         .iter()
-        .any(|c| contract_indexes.get(c).map_or(true, |idx| idx.is_empty()));
+        .any(|c| contract_indexes.get(c).is_none_or(|idx| idx.is_empty()));
 
     if needs_migration {
         tracing::info!(
@@ -182,13 +182,16 @@ pub async fn collect_factories(
                     log_range.end - 1
                 );
                 let file_exists = existing_files.contains(&rel_path)
-                    || s3_manifest
-                        .as_ref()
-                        .is_some_and(|m| m.has_factories(collection, log_range.start, log_range.end - 1));
+                    || s3_manifest.as_ref().is_some_and(|m| {
+                        m.has_factories(collection, log_range.start, log_range.end - 1)
+                    });
                 if !file_exists {
                     return false;
                 }
-                let index = contract_indexes.get(collection).cloned().unwrap_or_default();
+                let index = contract_indexes
+                    .get(collection)
+                    .cloned()
+                    .unwrap_or_default();
                 !index.contains_key(&rk)
             });
 
@@ -289,7 +292,7 @@ pub async fn collect_factories(
     };
     let mut catchup_count = 0;
 
-    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(4);
+    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8);
     let matchers = Arc::new(matchers);
     let existing_files = Arc::new(existing_files);
     let output_dir = Arc::new(output_dir);
@@ -302,8 +305,9 @@ pub async fn collect_factories(
 
     {
         let semaphore = Arc::new(Semaphore::new(factory_concurrency));
-        let mut join_set: JoinSet<Result<Option<(u64, u64, FactoryAddressData)>, FactoryCollectionError>> =
-            JoinSet::new();
+        let mut join_set: JoinSet<
+            Result<Option<(u64, u64, FactoryAddressData)>, FactoryCollectionError>,
+        > = JoinSet::new();
 
         for log_range in &log_ranges {
             let rk = range_key(log_range.start, log_range.end - 1);
@@ -325,12 +329,13 @@ pub async fn collect_factories(
                 }
 
                 // File exists — check contract index for missing contracts
-                let expected_for_range = build_expected_factory_contracts_for_range(
-                    &chain.contracts,
-                    log_range.end,
-                );
+                let expected_for_range =
+                    build_expected_factory_contracts_for_range(&chain.contracts, log_range.end);
                 if let Some(expected) = expected_for_range.get(collection) {
-                    let index = contract_indexes.get(collection).cloned().unwrap_or_default();
+                    let index = contract_indexes
+                        .get(collection)
+                        .cloned()
+                        .unwrap_or_default();
                     get_missing_contracts(&index, &rk, expected).is_empty()
                 } else {
                     true
@@ -555,15 +560,14 @@ pub async fn collect_factories(
             }
             if wrote_any {
                 let dir = output_dir.join(collection);
-                write_contract_index(&dir, index)
-                    .map_err(|e| FactoryCollectionError::Io(e))?;
+                write_contract_index(&dir, index).map_err(FactoryCollectionError::Io)?;
 
                 // Upload contract index to S3
                 if let Some(ref sm) = storage_manager.as_ref() {
                     let index_path = dir.join("contract_index.json");
-                    upload_sidecar_to_s3(sm, &index_path)
-                        .await
-                        .map_err(|e| FactoryCollectionError::Io(std::io::Error::other(e.to_string())))?;
+                    upload_sidecar_to_s3(sm, &index_path).await.map_err(|e| {
+                        FactoryCollectionError::Io(std::io::Error::other(e.to_string()))
+                    })?;
                 }
             }
         }

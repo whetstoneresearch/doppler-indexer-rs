@@ -22,6 +22,8 @@ use crate::storage::paths::{decoded_base_dir, scan_parquet_ranges};
 
 /// Index mapping (source_name, event_or_function_name) to available parquet file ranges.
 type FileIndex = HashMap<(String, String), Vec<(u64, u64, PathBuf)>>;
+/// Cache key for historical call lookups by source/function/address up to a block.
+type CallCacheKey = (String, String, [u8; 20], u64);
 
 /// Reader for historical decoded data stored in parquet files.
 pub struct HistoricalDataReader {
@@ -30,6 +32,8 @@ pub struct HistoricalDataReader {
     decoded_base: PathBuf,
     /// Cache of available file ranges per (source, event/function)
     file_index: RwLock<FileIndex>,
+    /// Cache of latest historical call lookups by (source, function, address, to_block)
+    call_cache: RwLock<HashMap<CallCacheKey, DecodedCall>>,
 }
 
 impl HistoricalDataReader {
@@ -41,6 +45,7 @@ impl HistoricalDataReader {
             chain_name: chain_name.to_string(),
             decoded_base,
             file_index: RwLock::new(HashMap::new()),
+            call_cache: RwLock::new(HashMap::new()),
         };
 
         // Build initial index if directory exists
@@ -99,8 +104,18 @@ impl HistoricalDataReader {
                 }
                 let name = name_entry.file_name().to_string_lossy().to_string();
 
-                // Find parquet files and extract ranges (already sorted by start)
-                let files = scan_parquet_ranges(&name_entry.path())?;
+                // Find parquet files and extract ranges (already sorted by start).
+                // Event-triggered decoded calls are stored under an `on_events/`
+                // subdirectory, so mirror the catchup loader's first-match
+                // semantics and fall back to indexing that location when the
+                // top-level function directory has no parquet files.
+                let mut files = scan_parquet_ranges(&name_entry.path())?;
+                if files.is_empty() {
+                    let on_events_dir = name_entry.path().join("on_events");
+                    if on_events_dir.is_dir() {
+                        files = scan_parquet_ranges(&on_events_dir)?;
+                    }
+                }
 
                 let key = (source_name.clone(), name);
                 index.insert(key, files);
@@ -191,6 +206,68 @@ impl HistoricalDataReader {
         }
 
         Ok(results)
+    }
+
+    /// Get the latest call for a source/function/address up to `to_block`, cached in-memory.
+    pub async fn get_cached_call_for_address(
+        &self,
+        source: &str,
+        function_name: &str,
+        contract_address: [u8; 20],
+        to_block: u64,
+    ) -> Result<Option<DecodedCall>, TransformationError> {
+        let cache_key = (
+            source.to_string(),
+            function_name.to_string(),
+            contract_address,
+            to_block,
+        );
+
+        if let Some(cached) = self.call_cache.read().unwrap().get(&cache_key).cloned() {
+            return Ok(Some(cached));
+        }
+
+        // Freshly-decoded parquet files appear while the engine is running, so
+        // refresh the file index on cache miss before querying historical data.
+        self.rebuild_index()?;
+
+        let latest = self
+            .query_calls(HistoricalCallQuery {
+                source: Some(source.to_string()),
+                function_name: Some(function_name.to_string()),
+                contract_address: Some(contract_address),
+                from_block: 0,
+                to_block,
+                limit: None,
+            })
+            .await?
+            .into_iter()
+            .max_by_key(|call| {
+                (
+                    call.block_number,
+                    call.trigger_log_index.unwrap_or(u32::MAX),
+                )
+            });
+
+        if let Some(ref latest_call) = latest {
+            self.call_cache
+                .write()
+                .unwrap()
+                .insert(cache_key, latest_call.clone());
+        }
+
+        Ok(latest)
+    }
+
+    /// Invalidate cached historical call lookups for a given source/function.
+    /// Needed when decoded parquet files are rewritten or backfilled in place.
+    pub fn invalidate_call_cache(&self, source: &str, function_name: &str) {
+        self.call_cache
+            .write()
+            .unwrap()
+            .retain(|(cached_source, cached_function, _, _), _| {
+                !(cached_source == source && cached_function == function_name)
+            });
     }
 
     /// Read all events from a specific parquet file (no filtering).
@@ -440,7 +517,12 @@ fn batch_to_calls(
         .transpose()?;
 
     // Get result columns (exclude standard + log_index)
-    let standard_cols = ["block_number", "block_timestamp", "contract_address", "log_index"];
+    let standard_cols = [
+        "block_number",
+        "block_timestamp",
+        "contract_address",
+        "log_index",
+    ];
     let schema = batch.schema();
     let result_columns: Vec<_> = schema
         .fields()
@@ -755,10 +837,12 @@ fn extract_value_from_array(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::RwLock;
 
     use arrow::array::{ArrayRef, FixedSizeBinaryArray, UInt32Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use tempfile::TempDir;
 
     use super::{batch_to_events, HistoricalDataReader};
     use crate::types::decoded::DecodedValue;
@@ -776,6 +860,33 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].3, 0);
         assert_eq!(files[0].4, 9999);
+    }
+
+    #[test]
+    fn rebuild_index_falls_back_to_on_events_when_function_dir_is_empty() {
+        let temp = TempDir::new().unwrap();
+        let calls_dir = temp
+            .path()
+            .join("eth_calls")
+            .join("Hook")
+            .join("getSlot0")
+            .join("on_events");
+        std::fs::create_dir_all(&calls_dir).unwrap();
+        std::fs::write(calls_dir.join("100-199.parquet"), []).unwrap();
+
+        let reader = HistoricalDataReader {
+            chain_name: "test".to_string(),
+            decoded_base: temp.path().to_path_buf(),
+            file_index: RwLock::new(HashMap::new()),
+            call_cache: RwLock::new(HashMap::new()),
+        };
+
+        reader.rebuild_index().unwrap();
+
+        let index = reader.file_index.read().unwrap();
+        let files = reader.find_files_for_range(&index, Some("Hook"), Some("getSlot0"), 150, 151);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].2, calls_dir.join("100-199.parquet"));
     }
 
     #[test]

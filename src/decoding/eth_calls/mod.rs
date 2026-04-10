@@ -23,6 +23,7 @@ use super::current;
 use super::types::EthCallDecoderOutputs;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
+use crate::types::shared::repair::RepairScope;
 
 pub async fn decode_eth_calls(
     chain: &ChainConfig,
@@ -32,6 +33,8 @@ pub async fn decode_eth_calls(
     eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
     decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
+    repair: bool,
+    repair_scope: Option<RepairScope>,
 ) -> Result<(), EthCallDecodingError> {
     let output_base = crate::storage::paths::decoded_eth_calls_dir(&chain.name);
     std::fs::create_dir_all(&output_base)?;
@@ -93,6 +96,8 @@ pub async fn decode_eth_calls(
                 &event_configs,
                 raw_data_config,
                 None,
+                repair,
+                repair_scope.clone(),
             )
             .await?;
 
@@ -129,6 +134,7 @@ pub async fn decode_eth_calls(
         &configs,
         raw_data_config,
         &outputs,
+        repair,
     )
     .await?;
 

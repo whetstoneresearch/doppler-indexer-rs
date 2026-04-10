@@ -273,6 +273,26 @@ pub(crate) async fn process_logs(
     let factory_matchers = matchers.factory_matchers;
     let build_transform = outputs.transform_tx.is_some();
 
+    // Build topic0 index for O(1) matcher lookup instead of O(matchers) linear scan per log.
+    // This is the key optimization for catchup with many configured events.
+    let mut regular_by_topic: HashMap<[u8; 32], Vec<&EventMatcher>> = HashMap::new();
+    for matcher in regular_matchers {
+        regular_by_topic
+            .entry(matcher.event.topic0)
+            .or_default()
+            .push(matcher);
+    }
+
+    let mut factory_by_topic: HashMap<[u8; 32], Vec<(&str, &EventMatcher)>> = HashMap::new();
+    for (collection_name, matchers) in factory_matchers {
+        for matcher in matchers {
+            factory_by_topic
+                .entry(matcher.event.topic0)
+                .or_default()
+                .push((collection_name.as_str(), matcher));
+        }
+    }
+
     // Group decoded logs by (contract_name, event_name) — for parquet storage
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
         HashMap::new();
@@ -287,58 +307,52 @@ pub(crate) async fn process_logs(
         }
         let topic0 = log.topics[0];
 
-        // Try regular matchers
-        for matcher in regular_matchers {
-            // Skip if block is before contract's start_block
-            if let Some(sb) = matcher.start_block {
-                if log.block_number < sb {
+        // Regular matchers via topic0 index
+        if let Some(matchers) = regular_by_topic.get(&topic0) {
+            for matcher in matchers {
+                if let Some(sb) = matcher.start_block {
+                    if log.block_number < sb {
+                        continue;
+                    }
+                }
+                if !matcher.addresses.contains(&log.address) {
                     continue;
                 }
-            }
-            if !matcher.addresses.contains(&log.address) {
-                continue;
-            }
-            if topic0 != matcher.event.topic0 {
-                continue;
-            }
 
-            if let Some(decoded) = decode_log(log, &matcher.event)? {
-                if build_transform {
-                    let transform_event = convert_to_transform_event(
-                        &decoded,
-                        &matcher.event,
-                        &matcher.name,
-                        &matcher.event_name,
-                    );
+                if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    if build_transform {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            &matcher.name,
+                            &matcher.event_name,
+                        );
+                        let key = (matcher.name.clone(), matcher.event_name.clone());
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
+                    }
+
                     let key = (matcher.name.clone(), matcher.event_name.clone());
-                    transform_events_by_type
+                    decoded_by_event
                         .entry(key)
-                        .or_default()
-                        .push(transform_event);
+                        .or_insert_with(|| (Vec::new(), &matcher.event))
+                        .0
+                        .push(decoded);
                 }
-
-                let key = (matcher.name.clone(), matcher.event_name.clone());
-                decoded_by_event
-                    .entry(key)
-                    .or_insert_with(|| (Vec::new(), &matcher.event))
-                    .0
-                    .push(decoded);
             }
         }
 
-        // Try factory matchers
-        for (collection_name, matchers) in factory_matchers {
-            let addrs = match factory_addresses.get(collection_name) {
-                Some(addrs) => addrs,
-                None => continue,
-            };
+        // Factory matchers via topic0 index
+        if let Some(entries) = factory_by_topic.get(&topic0) {
+            for (collection_name, matcher) in entries {
+                let addrs = match factory_addresses.get(*collection_name) {
+                    Some(addrs) => addrs,
+                    None => continue,
+                };
 
-            if !addrs.contains(&log.address) {
-                continue;
-            }
-
-            for matcher in matchers {
-                if topic0 != matcher.event.topic0 {
+                if !addrs.contains(&log.address) {
                     continue;
                 }
 
@@ -350,14 +364,14 @@ pub(crate) async fn process_logs(
                             collection_name,
                             &matcher.event_name,
                         );
-                        let key = (collection_name.clone(), matcher.event_name.clone());
+                        let key = (collection_name.to_string(), matcher.event_name.clone());
                         transform_events_by_type
                             .entry(key)
                             .or_default()
                             .push(transform_event);
                     }
 
-                    let key = (collection_name.clone(), matcher.event_name.clone());
+                    let key = (collection_name.to_string(), matcher.event_name.clone());
                     decoded_by_event
                         .entry(key)
                         .or_insert_with(|| (Vec::new(), &matcher.event))
@@ -505,8 +519,22 @@ fn decode_log(
     let indexed_params = event.indexed_params();
     let data_params = event.data_params();
 
-    // Collect decoded values per param (may be nested for tuples)
-    let mut param_values: Vec<DecodedValue> = Vec::new();
+    // Preserve original ABI parameter order. Indexed params are decoded from
+    // topics while non-indexed params come from data, but flattening expects
+    // values aligned with event.params, not grouped by storage location.
+    let mut param_values: Vec<Option<DecodedValue>> = vec![None; event.params.len()];
+    let indexed_positions: Vec<usize> = event
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, param)| param.indexed.then_some(idx))
+        .collect();
+    let data_positions: Vec<usize> = event
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, param)| (!param.indexed).then_some(idx))
+        .collect();
 
     // Decode indexed params from topics (topics[1..])
     for (i, param) in indexed_params.iter().enumerate() {
@@ -520,13 +548,13 @@ fn decode_log(
         // Check if this is an indexed tuple - store as hash
         if param.tuple_fields.is_some() {
             if let Some(TupleFieldInfo::Tuple(_)) = &param.tuple_fields {
-                param_values.push(DecodedValue::Bytes32(*topic));
+                param_values[indexed_positions[i]] = Some(DecodedValue::Bytes32(*topic));
                 continue;
             }
         }
 
         let value = decode_topic(topic, &param.param_type)?;
-        param_values.push(value);
+        param_values[indexed_positions[i]] = Some(value);
     }
 
     // Decode non-indexed params from data
@@ -538,10 +566,14 @@ fn decode_log(
 
         match tuple_type.abi_decode(&log.data) {
             Ok(DynSolValue::Tuple(values)) => {
-                for (value, param) in values.iter().zip(data_params.iter()) {
+                for ((value, param), param_idx) in values
+                    .iter()
+                    .zip(data_params.iter())
+                    .zip(data_positions.iter())
+                {
                     let decoded =
                         convert_dyn_sol_value_with_tuple_info(value, &param.tuple_fields)?;
-                    param_values.push(decoded);
+                    param_values[*param_idx] = Some(decoded);
                 }
             }
             Ok(_) => return Ok(None),
@@ -551,6 +583,19 @@ fn decode_log(
             }
         }
     }
+
+    let param_values: Vec<DecodedValue> = match param_values.into_iter().collect() {
+        Some(values) => values,
+        None => {
+            tracing::debug!(
+                "Decoded param count/order mismatch for event {} at block {} log_index {}",
+                event.name,
+                log.block_number,
+                log.log_index
+            );
+            return Ok(None);
+        }
+    };
 
     // Flatten param_values to match flattened_fields order
     // Returns None if any tuple field is missing (C1 fix: avoid silent data loss)
@@ -858,7 +903,7 @@ fn write_decoded_logs_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -1281,4 +1326,81 @@ pub(crate) fn delete_decoded_logs_for_blocks(
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::dyn_abi::DynSolValue;
+    use alloy::primitives::{Address, B256, U256};
+
+    use super::decode_log;
+    use crate::decoding::event_parsing::ParsedEvent;
+    use crate::raw_data::historical::receipts::LogData;
+    use crate::types::decoded::DecodedValue;
+
+    fn encode_address_topic(address: [u8; 20]) -> [u8; 32] {
+        let mut topic = [0u8; 32];
+        topic[12..].copy_from_slice(&address);
+        topic
+    }
+
+    fn encode_int_topic(value: i32) -> [u8; 32] {
+        alloy::primitives::I256::try_from(value)
+            .expect("valid i32")
+            .to_be_bytes::<32>()
+    }
+
+    #[test]
+    fn decode_log_keeps_interleaved_indexed_params_in_signature_order() {
+        let parsed = ParsedEvent::from_signature(
+            "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)",
+        )
+        .unwrap();
+
+        let sender = [0x11u8; 20];
+        let owner = [0x22u8; 20];
+        let amount = 1234u128;
+        let amount0 = U256::from(5678u64);
+        let amount1 = U256::from(9012u64);
+
+        let log = LogData {
+            block_number: 1,
+            block_timestamp: 2,
+            transaction_hash: B256::ZERO,
+            log_index: 3,
+            address: [0x33u8; 20],
+            topics: vec![
+                parsed.topic0,
+                encode_address_topic(owner),
+                encode_int_topic(-120),
+                encode_int_topic(240),
+            ],
+            data: DynSolValue::Tuple(vec![
+                DynSolValue::Address(Address::from_slice(&sender)),
+                DynSolValue::Uint(U256::from(amount), 128),
+                DynSolValue::Uint(amount0, 256),
+                DynSolValue::Uint(amount1, 256),
+            ])
+            .abi_encode_params(),
+        };
+
+        let decoded = decode_log(&log, &parsed).unwrap().unwrap();
+
+        assert!(matches!(
+            decoded.decoded_values.first(),
+            Some(DecodedValue::Address(value)) if *value == sender
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(1),
+            Some(DecodedValue::Address(value)) if *value == owner
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(2),
+            Some(DecodedValue::Int64(value)) if *value == -120
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(3),
+            Some(DecodedValue::Int64(value)) if *value == 240
+        ));
+    }
 }

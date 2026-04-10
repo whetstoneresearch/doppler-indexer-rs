@@ -15,7 +15,7 @@ use crate::transformations::util::db::pool::{
     insert_pool, BeneficiariesData, Beneficiary, PoolData,
 };
 use crate::transformations::util::db::token::{insert_token, TokenData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
@@ -37,11 +37,16 @@ impl TransformationHandler for DopplerHookCreateHandler {
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
             "migrations/tables/dhook_pool_configs.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
     fn reorg_tables(&self) -> Vec<&'static str> {
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        false
     }
 
     async fn handle(
@@ -54,12 +59,18 @@ impl TransformationHandler for DopplerHookCreateHandler {
             let asset = event.extract_address("asset")?;
             let numeraire = event.extract_address("numeraire")?;
 
-            let (asset_metadata, numeraire_metadata) =
-                get_metadata(&asset, &numeraire, event, ctx)?;
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
+            else {
+                continue;
+            };
 
             let get_state_call = ctx
                 .calls_of_type("DopplerHookInitializer", "getState")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call at block {} tx index {}",
@@ -150,7 +161,10 @@ impl TransformationHandler for DopplerHookCreateHandler {
 
             let beneficiaries: Option<BeneficiariesData> = ctx
                 .calls_of_type("DopplerHookInitializer", "getBeneficiaries")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
                     DecodedValue::Array(elements) => elements
@@ -224,7 +238,6 @@ impl EventHandler for DopplerHookCreateHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
             ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             ("DopplerHookInitializer".to_string(), "getState".to_string()),
             (
                 "DopplerHookInitializer".to_string(),

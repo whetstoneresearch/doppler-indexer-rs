@@ -128,6 +128,7 @@ pub async fn collect_factories(
 
         match message {
             LogMessage::Logs(logs) => {
+                let logs = Arc::try_unwrap(logs).unwrap_or_else(|arc| (*arc).clone());
                 for log in logs {
                     let range_start = (log.block_number / range_size) * range_size;
                     range_data.entry(range_start).or_default().push(log);
@@ -233,7 +234,8 @@ pub async fn collect_factories(
                         if let Err(e) = write_contract_index(&dir, &index) {
                             tracing::error!(
                                 "Failed to write contract index for {}: {}",
-                                collection, e
+                                collection,
+                                e
                             );
                         }
 
@@ -243,7 +245,8 @@ pub async fn collect_factories(
                             if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
                                 tracing::warn!(
                                     "Failed to upload contract index for {} to S3: {}",
-                                    collection, e
+                                    collection,
+                                    e
                                 );
                             }
                         }

@@ -298,39 +298,43 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ---
 
-## Phase 5: Migration Pool Handler
+## Phase 5: Migration Pool Handler ✅
+
+**Status**: Complete
 
 **Goal**: Handle swaps and liquidity on graduated (migrated) V4 pools.
 
-### Tasks
-1. Create `src/transformations/event/migration_pool/` module
-2. Implement `migration_pool/metrics.rs` — MigrationPoolMetricsHandler
-3. Register in `event/mod.rs`
+**Delivered**:
+- `src/transformations/event/migration_pool/mod.rs`
+- `src/transformations/event/migration_pool/create.rs` — MigrationPoolCreateHandler
+- `src/transformations/event/migration_pool/metrics.rs` — MigrationPoolSwapMetricsHandler, MigrationPoolLiquidityMetricsHandler
+- `src/transformations/util/db/pool.rs` — `MigrationPoolData` + `insert_migration_pool()`
+- All 3 handlers registered in `event/mod.rs`
 
-### Handler specifics
-- Swap source: `UniswapV4PoolManager` — Swap event has sqrtPriceX96/tick/liquidity directly
-- Liquidity source: `UniswapV4MigratorHook` — ModifyLiquidity (tuple format)
-- **Must filter PoolManager Swaps**: PoolManager emits Swap for ALL V4 pools. Use in-memory `RwLock<HashSet<Vec<u8>>>` of migration pool IDs. Rebuild on init from `pools WHERE migrated_from IS NOT NULL`.
-- Also scan for Migrate events in current context to add newly graduated pools inline
-- call_dependencies: none (all data in events)
+**Key design decisions**:
+- **Create handler required**: no existing handler inserted migration pool rows into `pools`. `MigrationPoolCreateHandler` handles `UniswapV4Migrator.Migrate`, queries the original Doppler pool via `migration_pool = poolId`, and inserts a new row with `migrated_from` set. This enables `PoolMetadataCache` to work normally for migration pools.
+- **Swap filtering**: `MigrationPoolSwapMetricsHandler` holds `RwLock<HashSet<Vec<u8>>>` of migration pool IDs. Seeded at init from `pools WHERE migrated_from IS NOT NULL`. Inline scan of `Migrate` events in the current context handles same-range Migrate+Swap edge cases.
+- **Liquidity**: `MigrationPoolLiquidityMetricsHandler` triggers on `UniswapV4MigratorHook.ModifyLiquidity` (tuple format). No filter needed — MigratorHook only handles migration pools. Uses `extract_tuple_modify_liquidity()`.
+- **Dependencies**: both metrics handlers depend on `MigrationPoolCreateHandler` so the pool row and metadata exist before metrics handlers run.
+- **Chains**: 5 chains have Migrator + MigratorHook (base, baseSepolia, mainnet, unichain, sepolia). ink and monad have PoolManager but no migration infrastructure — handlers simply find no events on those chains.
 
 ---
 
-## Phase 6: USD Pricing & Rolling Metrics
+## Phase 6: USD Pricing & Rolling Metrics ✅
+
+**Status**: Complete
 
 **Goal**: Add USD-denominated values to snapshots and rolling metrics to pool_state.
 
-### Tasks
-1. Read ChainlinkEthOracle latestAnswer from transformation context (calls_of_type)
-2. Read reference pool prices from `prices` table (written by existing PriceHandler)
-3. Resolve quote token → USD price (WETH via ETH/USD, USDC/USDT directly, others via reference pools)
-4. Add volume_usd to pool_snapshots
-5. Add rolling aggregation queries for pool_state: volume_24h_usd, price_change_1h, price_change_24h, swap_count_24h
-
-### Design notes
-- Price resolution: for each swap, look up quote token USD price. If quote is WETH, multiply by latest ETH/USD. If quote is USDC/USDT, use 1.0. If quote is another token, chain through reference pool prices.
-- Rolling metrics: query pool_snapshots for the relevant time window. This can be done as part of pool_state upsert or as a separate periodic handler.
-- Leave architecture open for future price graph traversal.
+### Implementation
+- **New module**: `src/transformations/util/usd_price.rs` — `OraclePriceCache` (shared, DB-backed) + `UsdPriceContext` (per-invocation)
+- **Migration**: `pool_snapshots_add_volume_usd.sql` adds nullable `volume_usd` column
+- **USD resolution**: WETH via ChainlinkEthOracle `latestAnswer` (8 decimals), USDC/USDT at $1, EURC via prices table (EURC/USDC from PriceHandler)
+- **Volume**: Single-side (quote-side only), standard DeFi convention
+- **Rolling metrics**: `DbOperation::RawSql` UPDATE with backward-looking LATERAL subqueries on `pool_snapshots`, executed in-transaction after snapshot inserts
+- **Price change**: Backward-looking — compares current `price_close` to last known `price_close` at or before the 1h/24h mark
+- **Oracle persistence**: ETH/USD written to `prices` table (source = "chainlink"). `OraclePriceCache` shared across all 8 swap handlers, seeded from DB on startup
+- **All 8 swap handlers** updated with shared `Arc<OraclePriceCache>`, new `process_swaps()` signature
 
 ---
 

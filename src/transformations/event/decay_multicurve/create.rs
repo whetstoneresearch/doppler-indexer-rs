@@ -13,7 +13,7 @@ use crate::transformations::util::db::pool::{
 };
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
@@ -35,6 +35,7 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
             "migrations/tables/v4_pool_configs.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -42,6 +43,10 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
         // tokens and pools have block_number for rollback
         // v4_pool_configs is immutable config without block_number
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        false
     }
 
     async fn handle(
@@ -59,21 +64,18 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                 TransformationError::TypeConversion("numeraire is not an address".to_string())
             })?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
-
-            let asset_metadata;
-            let numeraire_metadata;
-            match metadata_result {
-                Ok(r) => {
-                    asset_metadata = r.0;
-                    numeraire_metadata = r.1;
-                }
-                Err(e) => return Err(e),
-            }
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
+            else {
+                continue;
+            };
 
             let get_state_call = ctx
                 .calls_of_type("DecayMulticurveInitializer", "getState")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call for asset {} at block {} tx {}",
@@ -83,9 +85,9 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                     ))
                 })?;
 
-            let num_to_sell = ctx
-                .calls_of_type("DERC20", "once")
-                .find(|call| call.contract_address == asset)
+            let asset_once_call = ctx
+                .current_or_historical_once_call_for_address("DERC20", asset)
+                .await?
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getAssetData call for asset {} at block {} tx {}",
@@ -93,8 +95,9 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
                         event.block_number,
                         B256::from(event.transaction_hash)
                     ))
-                })?
-                .get("getAssetData.numTokensToSell")?;
+                })?;
+
+            let num_to_sell = asset_once_call.get("getAssetData.numTokensToSell")?;
 
             let pool_key = {
                 let field_err = |field: &str, expected: &str| {
@@ -175,7 +178,10 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
 
             let get_positions_call = ctx
                 .calls_of_type("DecayMulticurveInitializer", "getPositions")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getPositions call for asset {} at block {} tx {}",
@@ -323,7 +329,10 @@ impl TransformationHandler for V4DecayMulticurveCreateHandler {
 
             let beneficiaries: Option<BeneficiariesData> = ctx
                 .calls_of_type("DecayMulticurveInitializer", "getBeneficiaries")
-                .find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
                     DecodedValue::Array(elements) => elements
@@ -391,7 +400,6 @@ impl EventHandler for V4DecayMulticurveCreateHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
             ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             (
                 "DecayMulticurveInitializer".to_string(),
                 "getState".to_string(),

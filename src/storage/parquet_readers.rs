@@ -13,7 +13,9 @@ use arrow::array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, ListArray, StringArray, UInt32Array,
     UInt64Array,
 };
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
 use thiserror::Error;
 
 use crate::decoding::{EthCallResult, EventCallResult};
@@ -180,6 +182,41 @@ pub fn read_raw_logs_from_parquet(path: &Path) -> Result<Vec<LogData>, ParquetRe
     }
 
     Ok(logs)
+}
+
+/// Read projected raw log batches for event-triggered eth_call audit.
+///
+/// Only reads the columns needed to identify and reconstruct triggering events:
+/// `block_number`, `block_timestamp`, `log_index`, `address`, `topics`, and `data`.
+pub fn read_event_trigger_log_batches_from_parquet(
+    path: &Path,
+) -> Result<Vec<RecordBatch>, ParquetReadError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let arrow_schema = builder.schema().clone();
+
+    let needed = [
+        "block_number",
+        "block_timestamp",
+        "log_index",
+        "address",
+        "topics",
+        "data",
+    ];
+    let root_indices: Vec<usize> = needed
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+    let reader = builder.with_projection(mask).build()?;
+
+    let mut batches = Vec::new();
+    for batch_result in reader {
+        batches.push(batch_result?);
+    }
+
+    Ok(batches)
 }
 
 /// Read factory addresses from a parquet file, returning a set of raw 20-byte addresses.

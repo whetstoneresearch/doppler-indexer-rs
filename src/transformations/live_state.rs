@@ -23,6 +23,17 @@ pub(crate) struct PendingEventData {
     pub required_handlers: Vec<String>,
 }
 
+/// A pending handler/range entry that timed out during finalization.
+#[derive(Debug, Clone)]
+pub(crate) struct TimedOutPendingHandler {
+    pub handler_key: String,
+    pub source_name: String,
+    pub event_name: String,
+    pub required_calls: Vec<(String, String)>,
+    pub required_handlers: Vec<String>,
+    pub timed_out_after_secs: u64,
+}
+
 /// Default timeout for stuck pending events (5 minutes).
 pub(crate) const PENDING_EVENT_TIMEOUT_SECS: u64 = 300;
 
@@ -130,33 +141,47 @@ impl LiveProcessingState {
         range_key: (u64, u64),
         expect_logs: bool,
         expect_eth_calls: bool,
-    ) -> (bool, Vec<String>) {
+    ) -> (bool, Vec<TimedOutPendingHandler>) {
         let completion = self.completion.get(&range_key).copied().unwrap_or_default();
+        let streams_ready = completion.is_ready(expect_logs, expect_eth_calls);
 
         // Check for timed-out pending events
         let timeout = Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
         let now = Instant::now();
-        let mut timed_out: Vec<String> = Vec::new();
+        let mut timed_out: HashMap<String, TimedOutPendingHandler> = HashMap::new();
 
-        for (handler_key, pending_list) in &self.pending_events {
-            for pending in pending_list {
-                if (pending.range_start, pending.range_end) == range_key {
-                    let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
-                    if let Some(&first_seen) = self.pending_event_timestamps.get(&timestamp_key) {
-                        if now.duration_since(first_seen) >= timeout {
-                            tracing::error!(
-                                "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
-                                 Force-finalizing range to unblock progress.",
-                                now.duration_since(first_seen),
-                                handler_key,
-                                pending.range_start,
-                                pending.range_end,
-                                pending.source_name,
-                                pending.event_name,
-                                pending.required_calls,
-                                pending.required_handlers
-                            );
-                            timed_out.push(handler_key.clone());
+        if streams_ready {
+            for (handler_key, pending_list) in &self.pending_events {
+                for pending in pending_list {
+                    if (pending.range_start, pending.range_end) == range_key {
+                        let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
+                        if let Some(&first_seen) = self.pending_event_timestamps.get(&timestamp_key)
+                        {
+                            let elapsed = now.duration_since(first_seen);
+                            if elapsed >= timeout {
+                                tracing::error!(
+                                    "Pending event TIMED OUT after {:?}: handler={} range={}-{} event={}/{} waiting_for_calls={:?} waiting_for_handlers={:?}. \
+                                     Force-finalizing range to unblock progress.",
+                                    elapsed,
+                                    handler_key,
+                                    pending.range_start,
+                                    pending.range_end,
+                                    pending.source_name,
+                                    pending.event_name,
+                                    pending.required_calls,
+                                    pending.required_handlers
+                                );
+                                timed_out.entry(handler_key.clone()).or_insert_with(|| {
+                                    TimedOutPendingHandler {
+                                        handler_key: handler_key.clone(),
+                                        source_name: pending.source_name.clone(),
+                                        event_name: pending.event_name.clone(),
+                                        required_calls: pending.required_calls.clone(),
+                                        required_handlers: pending.required_handlers.clone(),
+                                        timed_out_after_secs: elapsed.as_secs(),
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -164,12 +189,17 @@ impl LiveProcessingState {
         }
 
         // Remove timed-out pending events
-        for handler_key in &timed_out {
-            if let Some(pending_list) = self.pending_events.get_mut(handler_key) {
+        for timed_out_handler in timed_out.values() {
+            if let Some(pending_list) = self.pending_events.get_mut(&timed_out_handler.handler_key)
+            {
                 pending_list
                     .retain(|pending| (pending.range_start, pending.range_end) != range_key);
             }
-            let timestamp_key = (range_key.0, range_key.1, handler_key.clone());
+            let timestamp_key = (
+                range_key.0,
+                range_key.1,
+                timed_out_handler.handler_key.clone(),
+            );
             self.pending_event_timestamps.remove(&timestamp_key);
         }
         self.pending_events.retain(|_, v| !v.is_empty());
@@ -180,7 +210,7 @@ impl LiveProcessingState {
                 .any(|pending| (pending.range_start, pending.range_end) == range_key)
         });
 
-        if has_pending && completion.logs_complete && completion.eth_calls_complete {
+        if has_pending && streams_ready {
             for (handler_key, pending_list) in &self.pending_events {
                 for pending in pending_list {
                     if (pending.range_start, pending.range_end) == range_key {
@@ -201,7 +231,7 @@ impl LiveProcessingState {
         }
 
         let ready = !has_pending && completion.is_ready(expect_logs, expect_eth_calls);
-        (ready, timed_out)
+        (ready, timed_out.into_values().collect())
     }
 
     /// Mark a range as finalized. Returns false if already finalized.
@@ -518,6 +548,45 @@ mod tests {
             !should_persist_success(&state, "price_v1", range_key, true, true),
             "must not persist while pending entries remain, even with logs_complete"
         );
+    }
+
+    #[test]
+    fn pending_events_do_not_timeout_until_expected_streams_complete() {
+        let range_key = (100u64, 200u64);
+        let mut state = LiveProcessingState::default();
+        state.pending_events.insert(
+            "handler_v1".to_string(),
+            vec![make_pending(
+                range_key,
+                vec![("Pool".into(), "slot0".into())],
+                vec![],
+            )],
+        );
+        state.pending_event_timestamps.insert(
+            (range_key.0, range_key.1, "handler_v1".to_string()),
+            Instant::now() - Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS + 1),
+        );
+        state
+            .completion
+            .entry(range_key)
+            .or_default()
+            .mark(RangeCompleteKind::Logs);
+
+        let (ready, timed_out) = state.check_finalization_readiness(range_key, true, true);
+        assert!(!ready);
+        assert!(
+            timed_out.is_empty(),
+            "pending events should not time out before eth_call completion"
+        );
+
+        state
+            .completion
+            .entry(range_key)
+            .or_default()
+            .mark(RangeCompleteKind::EthCalls);
+        let (_, timed_out) = state.check_finalization_readiness(range_key, true, true);
+        assert_eq!(timed_out.len(), 1);
+        assert_eq!(timed_out[0].handler_key, "handler_v1");
     }
 
     #[test]

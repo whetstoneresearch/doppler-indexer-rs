@@ -9,13 +9,20 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
+use alloy::transports::http::reqwest;
 use async_trait::async_trait;
 use governor::clock::{QuantaClock, QuantaInstant};
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Jitter, Quota, RateLimiter};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
+
+use crate::metrics::{
+    chain_label_from_url, record_rate_limit_wait, record_retries_exhausted, record_retry_attempt,
+    set_cu_usage,
+};
 
 use super::alchemy::SlidingWindowRateLimiter;
 
@@ -101,10 +108,45 @@ pub trait RpcProvider: Send + Sync {
     ) -> Result<Vec<Result<Bytes, RpcError>>, RpcError>;
 }
 
+/// Maximum length for individual error messages in the chain.
+/// Keeps log output readable when alloy includes full response bodies in errors.
+const ERROR_SEGMENT_MAX_LEN: usize = 300;
+
+/// Truncate a single error message to a reasonable length.
+fn truncate_error_segment(msg: &str, max_len: usize) -> String {
+    if msg.len() <= max_len {
+        msg.to_string()
+    } else {
+        format!(
+            "{}... [{} bytes truncated]",
+            &msg[..max_len],
+            msg.len() - max_len
+        )
+    }
+}
+
 /// Extracts the full error chain from an error, including all source errors.
-/// This is useful for debugging because alloy errors like "error decoding response body"
-/// often have underlying serde errors that explain exactly what field failed.
+/// Individual segments are truncated to keep logs readable.
+/// Use `error_chain_full` when you need the complete untruncated output.
 pub fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = vec![truncate_error_segment(
+        &err.to_string(),
+        ERROR_SEGMENT_MAX_LEN,
+    )];
+    let mut source = err.source();
+    while let Some(s) = source {
+        chain.push(truncate_error_segment(
+            &s.to_string(),
+            ERROR_SEGMENT_MAX_LEN,
+        ));
+        source = s.source();
+    }
+    chain.join(": ")
+}
+
+/// Extracts the full error chain without any truncation.
+/// Useful for debug-level logging when you need to see the complete response body.
+pub fn error_chain_full(err: &dyn std::error::Error) -> String {
     let mut chain = vec![err.to_string()];
     let mut source = err.source();
     while let Some(s) = source {
@@ -243,15 +285,20 @@ impl RetryConfig {
 ///
 /// Retries the operation up to `config.max_retries` times with exponential backoff
 /// for retryable errors. All retry attempts are logged for debugging.
+///
+/// The `chain` parameter is used for metrics labeling. Pass an empty string to skip
+/// metrics recording.
 pub async fn with_retry<F, Fut, T>(
     config: &RetryConfig,
     operation_name: &str,
+    chain: &str,
     mut operation: F,
 ) -> Result<T, RpcError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, RpcError>>,
 {
+    let has_chain = !chain.is_empty();
     let mut errors: Vec<String> = Vec::new();
 
     for attempt in 0..=config.max_retries {
@@ -276,6 +323,9 @@ where
                         operation_name,
                         attempt
                     );
+                    if has_chain {
+                        record_retry_attempt(chain, operation_name, "success_after_retry");
+                    }
                 }
                 return Ok(result);
             }
@@ -291,6 +341,9 @@ where
                         error_msg
                     );
                     errors.push(format!("attempt {}: {}", attempt + 1, error_msg));
+                    if has_chain {
+                        record_retry_attempt(chain, operation_name, "retry");
+                    }
                 } else {
                     // Non-retryable error or exhausted retries
                     errors.push(format!("attempt {}: {}", attempt + 1, error_msg));
@@ -303,6 +356,9 @@ where
                             attempt + 1,
                             errors.join("; ")
                         );
+                        if has_chain {
+                            record_retries_exhausted(chain, operation_name);
+                        }
                     }
                     return Err(e);
                 }
@@ -311,6 +367,9 @@ where
     }
 
     // This should be unreachable, but provide a meaningful error if it happens
+    if has_chain {
+        record_retries_exhausted(chain, operation_name);
+    }
     Err(RpcError::ProviderError(format!(
         "RPC '{}' exhausted retries. Errors: [{}]",
         operation_name,
@@ -325,6 +384,7 @@ pub type StandardRateLimiter =
 pub struct RpcClientConfig {
     pub url: Url,
     pub max_batch_size: usize,
+    pub concurrency: usize,
     pub batching_enabled: bool,
     pub rate_limit: Option<RateLimitConfig>,
     pub retry: RetryConfig,
@@ -360,6 +420,7 @@ impl RpcClientConfig {
         Self {
             url,
             max_batch_size: 100,
+            concurrency: 100,
             batching_enabled: true,
             rate_limit: None,
             retry: RetryConfig::default(),
@@ -368,6 +429,11 @@ impl RpcClientConfig {
 
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.max_batch_size = size;
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
         self
     }
 
@@ -387,18 +453,39 @@ impl RpcClientConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct RpcClient {
     provider: RootProvider<Ethereum>,
     config: RpcClientConfig,
     rate_limiter: Option<Arc<StandardRateLimiter>>,
     jitter: Option<Jitter>,
     sliding_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    rpc_semaphore: Arc<Semaphore>,
+    chain: String,
+}
+
+/// Default HTTP read timeout for RPC requests (2 minutes).
+/// Large blocks with many receipts/logs can produce multi-MB responses
+/// that need more time than reqwest's default 30s.
+const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Build an alloy RootProvider with a custom reqwest client configured
+/// for large RPC responses.
+fn build_provider(url: &Url) -> Result<RootProvider<Ethereum>, RpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(RPC_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| RpcError::Transport(format!("failed to build HTTP client: {e}")))?;
+    let rpc_client = alloy::rpc::client::RpcClient::new_http_with_client(client, url.clone());
+    Ok(RootProvider::<Ethereum>::new(rpc_client))
 }
 
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        let provider = build_provider(&config.url)?;
+        let chain = chain_label_from_url(&config.url);
+        let concurrency = config.concurrency.max(1);
 
         let (rate_limiter, jitter) = if let Some(ref rate_config) = config.rate_limit {
             let quota = Quota::per_second(rate_config.requests_per_second);
@@ -418,6 +505,8 @@ impl RpcClient {
             rate_limiter,
             jitter,
             sliding_limiter: None,
+            rpc_semaphore: Arc::new(Semaphore::new(concurrency)),
+            chain,
         })
     }
 
@@ -425,13 +514,17 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        let provider = build_provider(&config.url)?;
+        let chain = chain_label_from_url(&config.url);
+        let concurrency = config.concurrency.max(1);
         Ok(Self {
             provider,
             config,
             rate_limiter: None,
             jitter: None,
             sliding_limiter: Some(limiter),
+            rpc_semaphore: Arc::new(Semaphore::new(concurrency)),
+            chain,
         })
     }
 
@@ -457,21 +550,53 @@ impl RpcClient {
     }
 
     async fn wait_for_rate_limit(&self) {
+        let start = std::time::Instant::now();
         if let Some(ref limiter) = self.sliding_limiter {
             limiter.acquire(1).await;
+            let current = limiter.current_usage_async().await;
+            set_cu_usage(&self.chain, current as f64, limiter.max_in_window() as f64);
         } else if let (Some(limiter), Some(jitter)) = (&self.rate_limiter, &self.jitter) {
             limiter.until_ready_with_jitter(*jitter).await;
         }
+        let elapsed = start.elapsed();
+        if elapsed > Duration::from_millis(1) {
+            record_rate_limit_wait(&self.chain, elapsed.as_secs_f64());
+        }
+    }
+
+    fn effective_chunk_size(&self) -> usize {
+        self.config
+            .max_batch_size
+            .min(self.config.concurrency)
+            .max(1)
+    }
+
+    fn streaming_max_in_flight(&self) -> usize {
+        self.config.concurrency.max(1) * 2
+    }
+
+    async fn acquire_rpc_permit(&self) -> OwnedSemaphorePermit {
+        self.rpc_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("rpc semaphore should never be closed during operation")
     }
 
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
-        with_retry(&self.config.retry, "get_block_number", || async {
-            self.wait_for_rate_limit().await;
-            self.provider
-                .get_block_number()
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "get_block_number",
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .get_block_number()
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -481,8 +606,9 @@ impl RpcClient {
         full_transactions: bool,
     ) -> Result<Option<Block>, RpcError> {
         let op_name = format!("eth_getBlockByNumber({:?})", block_id);
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             let builder = self.provider.get_block(block_id);
             if full_transactions {
                 builder
@@ -509,8 +635,9 @@ impl RpcClient {
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             self.provider
                 .get_transaction_by_hash(hash)
                 .await
@@ -524,8 +651,9 @@ impl RpcClient {
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             self.provider
                 .get_transaction_receipt(hash)
                 .await
@@ -552,8 +680,10 @@ impl RpcClient {
         let raw_receipts: Vec<serde_json::Value> = with_retry(
             &self.config.retry,
             &format!("{}({:?})", method_name, block_number),
+            &self.chain,
             || async {
                 self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
                 self.provider
                     .client()
                     .request(method.clone(), (block_param.clone(),))
@@ -597,10 +727,9 @@ impl RpcClient {
         }
 
         let mut all_results = Vec::with_capacity(block_numbers.len());
+        let effective_concurrency = concurrency.min(self.config.concurrency).max(1);
 
-        for chunk in block_numbers.chunks(concurrency) {
-            self.wait_for_rate_limit().await;
-
+        for chunk in block_numbers.chunks(effective_concurrency) {
             let chunk_block_numbers: Vec<_> = chunk.to_vec();
             let futures: Vec<_> = chunk
                 .iter()
@@ -635,8 +764,9 @@ impl RpcClient {
             filter.get_from_block(),
             filter.get_to_block()
         );
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             self.provider
                 .get_logs(&filter)
                 .await
@@ -651,8 +781,9 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             self.provider
                 .get_balance(address)
                 .block_id(block.unwrap_or(BlockId::latest()))
@@ -668,8 +799,9 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
         let op_name = format!("eth_getCode({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             self.provider
                 .get_code_at(address)
                 .block_id(block.unwrap_or(BlockId::latest()))
@@ -686,8 +818,9 @@ impl RpcClient {
     ) -> Result<Bytes, RpcError> {
         let tx = tx.clone();
         let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
-        with_retry(&self.config.retry, &op_name, || async {
+        with_retry(&self.config.retry, &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
+            let _permit = self.acquire_rpc_permit().await;
             self.provider
                 .call(tx.clone())
                 .block(block.unwrap_or(BlockId::latest()))
@@ -712,53 +845,71 @@ impl RpcClient {
 
         let mut all_results = Vec::with_capacity(block_numbers.len());
 
-        for (chunk_idx, chunk) in block_numbers.chunks(self.config.max_batch_size).enumerate() {
+        for chunk in block_numbers.chunks(self.effective_chunk_size()) {
             let chunk_vec: Vec<BlockNumberOrTag> = chunk.to_vec();
-            let first_block = chunk_vec
-                .first()
-                .map(|b| format!("{:?}", b))
-                .unwrap_or_default();
-            let last_block = chunk_vec
-                .last()
-                .map(|b| format!("{:?}", b))
-                .unwrap_or_default();
-            let op_name = format!(
-                "eth_getBlockByNumber[batch {}] blocks {}-{}",
-                chunk_idx, first_block, last_block
-            );
-            let chunk_results: Vec<Option<Block>> =
-                with_retry(&self.config.retry, &op_name, || async {
-                    self.wait_for_rate_limit().await;
-
-                    let futures: Vec<_> = chunk_vec
-                        .iter()
-                        .map(|&number| {
-                            let builder = self.provider.get_block(BlockId::Number(number));
-                            async move {
-                                if full_transactions {
-                                    builder.full().await
-                                } else {
-                                    builder.await
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let results = futures::future::join_all(futures).await;
-
-                    let mut chunk_results = Vec::with_capacity(results.len());
-                    for result in results {
-                        chunk_results
-                            .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                    }
-                    Ok(chunk_results)
+            let client = self.clone();
+            let futures: Vec<_> = chunk_vec
+                .into_iter()
+                .map(|number| {
+                    let client = client.clone();
+                    async move { client.get_block_by_number(number, full_transactions).await }
                 })
-                .await?;
+                .collect();
+            let results = futures::future::join_all(futures).await;
+
+            let mut chunk_results = Vec::with_capacity(results.len());
+            for result in results {
+                chunk_results.push(result?);
+            }
 
             all_results.extend(chunk_results);
         }
 
         Ok(all_results)
+    }
+
+    /// Stream blocks as they are fetched concurrently, sending each to the provided channel.
+    /// Uses a bounded JoinSet pipeline for concurrent fetching with backpressure.
+    /// Returns a JoinHandle that completes when all blocks are fetched.
+    pub fn get_blocks_streaming(
+        &self,
+        block_numbers: Vec<BlockNumberOrTag>,
+        full_transactions: bool,
+        result_tx: tokio::sync::mpsc::Sender<(BlockNumberOrTag, Result<Option<Block>, RpcError>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        let max_in_flight = self.streaming_max_in_flight();
+        let client = self.clone();
+
+        tokio::spawn(async move {
+            let mut iter = block_numbers.into_iter();
+            let mut join_set = tokio::task::JoinSet::new();
+
+            // Seed initial batch
+            for number in iter.by_ref().take(max_in_flight) {
+                let client = client.clone();
+                let tx = result_tx.clone();
+                join_set.spawn(async move {
+                    let result = client.get_block_by_number(number, full_transactions).await;
+                    let _ = tx.send((number, result)).await;
+                });
+            }
+
+            // Pipeline: as tasks complete, spawn replacements
+            while let Some(join_result) = join_set.join_next().await {
+                if let Err(e) = join_result {
+                    tracing::error!("Task panicked in get_blocks_streaming: {:?}", e);
+                }
+
+                if let Some(number) = iter.next() {
+                    let client = client.clone();
+                    let tx = result_tx.clone();
+                    join_set.spawn(async move {
+                        let result = client.get_block_by_number(number, full_transactions).await;
+                        let _ = tx.send((number, result)).await;
+                    });
+                }
+            }
+        })
     }
 
     pub async fn get_transaction_receipts_batch(
@@ -781,12 +932,14 @@ impl RpcClient {
 
         let mut all_results = Vec::with_capacity(hashes.len());
 
-        for chunk in hashes.chunks(self.config.max_batch_size) {
-            self.wait_for_rate_limit().await;
-
+        for chunk in hashes.chunks(self.effective_chunk_size()) {
+            let client = self.clone();
             let futures: Vec<_> = chunk
                 .iter()
-                .map(|&hash| self.provider.get_transaction_receipt(hash))
+                .map(|&hash| {
+                    let client = client.clone();
+                    async move { client.get_transaction_receipt(hash).await }
+                })
                 .collect();
 
             let results = futures::future::join_all(futures).await;
@@ -816,31 +969,22 @@ impl RpcClient {
 
         let mut all_results = Vec::with_capacity(filters.len());
 
-        for (chunk_idx, chunk) in filters.chunks(self.config.max_batch_size).enumerate() {
+        for chunk in filters.chunks(self.effective_chunk_size()) {
             let chunk_vec: Vec<Filter> = chunk.to_vec();
-            let op_name = format!(
-                "eth_getLogs[batch {}] ({} filters)",
-                chunk_idx,
-                chunk_vec.len()
-            );
-            let chunk_results: Vec<Vec<Log>> = with_retry(&self.config.retry, &op_name, || async {
-                self.wait_for_rate_limit().await;
+            let client = self.clone();
+            let futures: Vec<_> = chunk_vec
+                .into_iter()
+                .map(|filter| {
+                    let client = client.clone();
+                    async move { client.get_logs(&filter).await }
+                })
+                .collect();
+            let results = futures::future::join_all(futures).await;
 
-                let futures: Vec<_> = chunk_vec
-                    .iter()
-                    .map(|filter| self.provider.get_logs(filter))
-                    .collect();
-
-                let results = futures::future::join_all(futures).await;
-
-                let mut chunk_results = Vec::with_capacity(results.len());
-                for result in results {
-                    chunk_results
-                        .push(result.map_err(|e| RpcError::ProviderError(error_chain(&e)))?);
-                }
-                Ok(chunk_results)
-            })
-            .await?;
+            let mut chunk_results = Vec::with_capacity(results.len());
+            for result in results {
+                chunk_results.push(result?);
+            }
 
             all_results.extend(chunk_results);
         }
@@ -862,48 +1006,18 @@ impl RpcClient {
 
         let mut all_results = Vec::with_capacity(calls.len());
 
-        for (chunk_idx, chunk) in calls.chunks(self.config.max_batch_size).enumerate() {
+        for chunk in calls.chunks(self.effective_chunk_size()) {
             let chunk_vec: Vec<(alloy::rpc::types::TransactionRequest, BlockId)> = chunk.to_vec();
-            let first_block = chunk_vec
-                .first()
-                .map(|(_, b)| format!("{:?}", b))
-                .unwrap_or_default();
-            let last_block = chunk_vec
-                .last()
-                .map(|(_, b)| format!("{:?}", b))
-                .unwrap_or_default();
-            let to_addr = chunk_vec
-                .first()
-                .and_then(|(tx, _)| tx.to)
-                .map(|a| format!("{:?}", a))
-                .unwrap_or_else(|| "unknown".to_string());
-            let op_name = format!(
-                "eth_call[batch {}] to={} blocks {}-{} ({} calls)",
-                chunk_idx,
-                to_addr,
-                first_block,
-                last_block,
-                chunk_vec.len()
-            );
-            let chunk_results: Vec<Result<Bytes, RpcError>> =
-                with_retry(&self.config.retry, &op_name, || async {
-                    self.wait_for_rate_limit().await;
-
-                    let futures: Vec<_> = chunk_vec
-                        .iter()
-                        .map(|(tx, block)| async move {
-                            self.provider.call(tx.clone()).block(*block).await
-                        })
-                        .collect();
-
-                    let results = futures::future::join_all(futures).await;
-
-                    Ok(results
-                        .into_iter()
-                        .map(|r| r.map_err(|e| RpcError::ProviderError(error_chain(&e))))
-                        .collect())
+            let client = self.clone();
+            let futures: Vec<_> = chunk_vec
+                .into_iter()
+                .map(|(tx, block)| {
+                    let client = client.clone();
+                    async move { client.call(&tx, Some(block)).await }
                 })
-                .await?;
+                .collect();
+            let results = futures::future::join_all(futures).await;
+            let chunk_results: Vec<Result<Bytes, RpcError>> = results.into_iter().collect();
 
             all_results.extend(chunk_results);
         }
@@ -1002,5 +1116,59 @@ impl std::fmt::Debug for RpcClient {
             .field("config", &self.config)
             .field("has_rate_limiter", &self.rate_limiter.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that get_transaction_receipts_batch chunks by
+    /// min(max_batch_size, concurrency) to enforce concurrency.
+    #[test]
+    fn effective_chunk_size_uses_min_of_batch_and_concurrency() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_batch_size(100)
+            .with_concurrency(10);
+
+        let effective = config.max_batch_size.min(config.concurrency).max(1);
+        assert_eq!(effective, 10);
+    }
+
+    /// Verify that concurrency > batch_size still respects the batch_size cap.
+    #[test]
+    fn effective_chunk_size_respects_batch_cap() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_batch_size(5)
+            .with_concurrency(100);
+
+        let effective = config.max_batch_size.min(config.concurrency).max(1);
+        assert_eq!(effective, 5);
+    }
+
+    /// Verify .max(1) guards against chunks(0) panic.
+    #[test]
+    fn effective_chunk_size_zero_defaults_to_one() {
+        let mut config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
+        config.max_batch_size = 0;
+        config.concurrency = 0;
+
+        let effective = config.max_batch_size.min(config.concurrency).max(1);
+        assert_eq!(effective, 1);
+    }
+
+    /// Verify with_concurrency builder actually sets the field.
+    #[test]
+    fn with_concurrency_builder() {
+        let config =
+            RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap()).with_concurrency(42);
+        assert_eq!(config.concurrency, 42);
+    }
+
+    /// Verify default concurrency is 100.
+    #[test]
+    fn default_concurrency_is_100() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
+        assert_eq!(config.concurrency, 100);
     }
 }

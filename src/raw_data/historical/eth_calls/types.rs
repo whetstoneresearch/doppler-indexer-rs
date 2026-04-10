@@ -97,6 +97,7 @@ pub struct EthCallContext<'a> {
     pub output_dir: &'a Path,
     pub existing_files: &'a HashSet<String>,
     pub rpc_batch_size: usize,
+    pub repair: bool,
     pub decoder_tx: &'a Option<Sender<DecoderMessage>>,
     pub chain_name: &'a str,
     pub storage_manager: Option<&'a Arc<StorageManager>>,
@@ -119,6 +120,8 @@ pub struct ContractProcessingInfo {
     pub patch_fn_names: Vec<String>,
     pub output_path: PathBuf,
     pub has_existing_file: bool,
+    /// Pre-read parquet state (batches for merge, avoids re-reading the file).
+    pub parquet_state: Option<super::parquet_io::OnceParquetState>,
 }
 
 /// Info needed to process a factory collection's once-calls through the
@@ -132,6 +135,8 @@ pub struct FactoryContractProcessingInfo {
     pub output_path: PathBuf,
     pub has_existing_file: bool,
     pub once_configs: Vec<OnceCallConfig>,
+    /// Pre-read parquet state (batches for merge, avoids re-reading the file).
+    pub parquet_state: Option<super::parquet_io::OnceParquetState>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +251,7 @@ pub struct EthCallCatchupState {
     pub has_factory_calls: bool,
     pub has_factory_once_calls: bool,
     pub has_event_triggered_calls: bool,
+    pub repair: bool,
     // Derived constants
     pub max_params: usize,
     pub factory_max_params: usize,

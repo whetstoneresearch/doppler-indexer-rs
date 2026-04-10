@@ -13,7 +13,10 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// Atomically write a RecordBatch to a Snappy-compressed parquet file.
+/// Atomically write a RecordBatch to a Snappy-compressed parquet file with `sync_all()`.
+///
+/// Use for data that must survive power loss (e.g., live compaction where the
+/// source bincode files are deleted after writing).
 ///
 /// 1. Creates parent directories if needed.
 /// 2. Writes to a temporary file (`.tmp.{random}` suffix) in the same directory.
@@ -21,6 +24,27 @@ use parquet::file::properties::WriterProperties;
 /// 4. Atomically renames temp file to the final path.
 /// 5. Removes the temp file on any error.
 pub fn atomic_write_parquet(batch: &RecordBatch, output_path: &Path) -> Result<(), std::io::Error> {
+    atomic_write_parquet_inner(batch, output_path, true)
+}
+
+/// Atomically write a RecordBatch to a Snappy-compressed parquet file without `sync_all()`.
+///
+/// Use for rebuildable data (historical collection, decoding) where the data can
+/// be re-fetched from RPC if lost in a crash. Skips fsync for better throughput.
+///
+/// Still uses temp-file + flush + rename for atomicity (prevents corrupt partial writes).
+pub fn atomic_write_parquet_fast(
+    batch: &RecordBatch,
+    output_path: &Path,
+) -> Result<(), std::io::Error> {
+    atomic_write_parquet_inner(batch, output_path, false)
+}
+
+fn atomic_write_parquet_inner(
+    batch: &RecordBatch,
+    output_path: &Path,
+    durable: bool,
+) -> Result<(), std::io::Error> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -33,7 +57,7 @@ pub fn atomic_write_parquet(batch: &RecordBatch, output_path: &Path) -> Result<(
     );
     let temp_path = output_path.with_file_name(temp_name);
 
-    match write_and_sync(batch, &temp_path) {
+    match write_parquet_to_file(batch, &temp_path, durable) {
         Ok(()) => {
             fs::rename(&temp_path, output_path)?;
             Ok(())
@@ -45,20 +69,26 @@ pub fn atomic_write_parquet(batch: &RecordBatch, output_path: &Path) -> Result<(
     }
 }
 
-fn write_and_sync(batch: &RecordBatch, path: &Path) -> Result<(), std::io::Error> {
+fn write_parquet_to_file(
+    batch: &RecordBatch,
+    path: &Path,
+    durable: bool,
+) -> Result<(), std::io::Error> {
     let file = fs::File::create(path)?;
     let props = WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
         .build();
 
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
-        .map_err(std::io::Error::other)?;
+    let mut writer =
+        ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(std::io::Error::other)?;
     writer.write(batch).map_err(std::io::Error::other)?;
 
     // into_inner() writes the footer and returns the underlying File,
     // letting us sync before the atomic rename.
     let file = writer.into_inner().map_err(std::io::Error::other)?;
-    file.sync_all()?;
+    if durable {
+        file.sync_all()?;
+    }
 
     Ok(())
 }

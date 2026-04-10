@@ -5,9 +5,7 @@ use std::path::Path;
 
 use tokio::sync::mpsc::Sender;
 
-use super::column_index::{
-    read_decoded_column_index, read_decoded_parquet_function_names, write_decoded_column_index,
-};
+use super::column_index::{read_decoded_column_index, write_decoded_column_index};
 use super::decode::decode_value;
 use super::parquet_io::{
     merge_decoded_once_calls, write_decoded_calls_to_parquet, write_decoded_event_calls_to_parquet,
@@ -174,6 +172,7 @@ pub async fn process_once_calls(
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     return_index_info: bool,
+    #[allow(unused_variables)] force_overwrite: bool,
 ) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
     // Get start_block from first config (all configs for a contract share the same start_block)
     let start_block = configs.first().and_then(|c| c.start_block);
@@ -337,7 +336,7 @@ pub async fn process_once_calls(
     let output_path = output_dir.join(&file_name);
 
     // Check if we need to merge with existing decoded data
-    if output_path.exists() {
+    if output_path.exists() && !force_overwrite {
         tracing::info!(
             "Merging new decoded columns into existing file {}",
             output_path.display()
@@ -347,10 +346,8 @@ pub async fn process_once_calls(
         write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
     }
 
-    // Read actual columns from written file
-    let actual_cols: Vec<String> = read_decoded_parquet_function_names(&output_path)
-        .into_iter()
-        .collect();
+    // Derive column names from configs instead of re-reading the file we just wrote
+    let actual_cols: Vec<String> = configs.iter().map(|c| c.function_name.clone()).collect();
 
     if decoded_records.is_empty() {
         tracing::debug!(

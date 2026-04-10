@@ -243,6 +243,40 @@ The S3 storage system is composed of several modules in `src/storage/`:
 | `data_loader.rs` | `DataLoader` for on-demand S3 download with local caching |
 | `error.rs` | `StorageError` enum (Io, ObjectStore, NotFound, Config, Serialization, Cache, Manifest) |
 
+### Contract Index Tracking
+
+The storage system maintains per-directory `contract_index.json` files to track which factory-discovered contracts were included in each processed range. This enables reprocessing when configuration changes add new contracts.
+
+**Types** (`src/storage/contract_index.rs`):
+```rust
+pub type ContractIndex = HashMap<String, HashMap<String, Vec<String>>>
+// range_key -> source_name -> [contract_addresses]
+
+pub type ExpectedContracts = HashMap<String, Vec<String>>
+// source_name -> [contract_addresses]
+```
+
+**Key functions**:
+- `range_key(start, end)` - generates range key string
+- `build_expected_factory_contracts(contracts)` - computes expected contracts from config
+- `get_missing_contracts(index, range_key, expected)` - finds contracts not yet in index
+- `update_contract_index(index, range_key, contracts)` - adds contracts to index
+- `read_contract_index(dir)` / `write_contract_index(dir, index)` - atomic file I/O
+- `detect_contracts_in_log_parquet(path, address_maps)` - scans parquet for contract presence
+
+**Migration helpers**: When the contract index is first introduced, existing data is migrated from the factory layer to downstream indices (eth_calls, decoded logs) without requiring a full reprocess.
+
+### Atomic Parquet Writes
+
+All parquet file writes use `atomic_write_parquet()` (`src/storage/parquet_writer.rs`):
+
+1. Write to a temporary file (`.tmp` suffix)
+2. Apply Snappy compression
+3. Call `sync_all()` to ensure data is flushed to disk
+4. Atomic `rename()` to final path
+
+This prevents corrupt parquet files from partial writes or crashes. Parquet files have their metadata footer written last, so a partial write produces an unreadable file. The atomic rename guarantees readers always see a complete file.
+
 ### DataLoader
 
 The `DataLoader` provides transparent on-demand fetching from S3. When a file is needed locally but missing, it downloads from S3 and writes it to the local filesystem atomically (via tmp file + rename). This is used by catchup collectors to fetch data that may have been produced by another service.

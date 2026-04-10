@@ -216,7 +216,7 @@ RPC settings are configured per-chain in the config file under the `rpc` section
 | Config Field | Default | Description |
 |-------------|---------|-------------|
 | `rpc.concurrency` | 100 | Max concurrent in-flight RPC requests |
-| `rpc.compute_units_per_second` | 7500 | Alchemy compute units per second |
+| `rpc.requests_per_second` | 7500 | Generic rate-limit units per second. For standard providers this is requests/sec; for Alchemy-like providers it is CU/sec |
 | `rpc.batch_size` | 100 | Max number of requests per JSON-RPC batch |
 
 These values can also be set via `rpc_batch_size` in the `raw_data_collection` section as a fallback for batch size.
@@ -273,7 +273,7 @@ All clients can share a rate limiter for account-level rate limiting across bloc
       "start_block": "17000000",
       "rpc": {
         "concurrency": 100,
-        "compute_units_per_second": 7500,
+        "requests_per_second": 7500,
         "batch_size": 100
       }
     }

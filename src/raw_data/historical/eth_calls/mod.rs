@@ -2,6 +2,7 @@ pub(crate) mod config;
 pub(crate) mod event_triggers;
 pub(crate) mod factory;
 pub(crate) mod frequency;
+pub(crate) mod helpers;
 pub(crate) mod multicall;
 pub(crate) mod once_calls;
 pub(crate) mod parquet_io;
