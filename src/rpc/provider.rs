@@ -299,6 +299,7 @@ where
     Fut: Future<Output = Result<T, RpcError>>,
 {
     let has_chain = !chain.is_empty();
+    let chain_tag = if has_chain { chain } else { "unknown" };
     let mut errors: Vec<String> = Vec::new();
 
     for attempt in 0..=config.max_retries {
@@ -306,7 +307,8 @@ where
         if attempt > 0 {
             let delay = config.delay_for_attempt(attempt);
             tracing::warn!(
-                "RPC retry {}/{} for '{}' in {:?}",
+                "[{}] RPC retry {}/{} for '{}' in {:?}",
+                chain_tag,
                 attempt,
                 config.max_retries,
                 operation_name,
@@ -319,7 +321,8 @@ where
             Ok(result) => {
                 if attempt > 0 {
                     tracing::info!(
-                        "RPC '{}' succeeded after {} retries",
+                        "[{}] RPC '{}' succeeded after {} retries",
+                        chain_tag,
                         operation_name,
                         attempt
                     );
@@ -334,7 +337,8 @@ where
 
                 if e.is_retryable() && attempt < config.max_retries {
                     tracing::warn!(
-                        "RPC '{}' failed (attempt {}/{}): {}",
+                        "[{}] RPC '{}' failed (attempt {}/{}): {}",
+                        chain_tag,
                         operation_name,
                         attempt + 1,
                         config.max_retries + 1,
@@ -351,7 +355,8 @@ where
                     if errors.len() > 1 {
                         // Multiple attempts failed - log the full error history
                         tracing::error!(
-                            "RPC '{}' failed after {} attempts. Error history: [{}]",
+                            "[{}] RPC '{}' failed after {} attempts. Error history: [{}]",
+                            chain_tag,
                             operation_name,
                             attempt + 1,
                             errors.join("; ")
@@ -371,7 +376,8 @@ where
         record_retries_exhausted(chain, operation_name);
     }
     Err(RpcError::ProviderError(format!(
-        "RPC '{}' exhausted retries. Errors: [{}]",
+        "[{}] RPC '{}' exhausted retries. Errors: [{}]",
+        chain_tag,
         operation_name,
         errors.join("; ")
     )))
@@ -702,7 +708,8 @@ impl RpcClient {
                     Ok(receipt) => Some(receipt),
                     Err(e) => {
                         tracing::debug!(
-                            "Skipping receipt {} in block {:?}: {}",
+                            "[{}] Skipping receipt {} in block {:?}: {}",
+                            self.chain,
                             i,
                             block_number,
                             e
@@ -744,7 +751,8 @@ impl RpcClient {
                     Err(e) => {
                         let failed_block = chunk_block_numbers.get(i);
                         tracing::error!(
-                            "get_block_receipts failed for block {:?}: {}",
+                            "[{}] get_block_receipts failed for block {:?}: {}",
+                            self.chain,
                             failed_block,
                             e
                         );
@@ -879,6 +887,7 @@ impl RpcClient {
     ) -> tokio::task::JoinHandle<()> {
         let max_in_flight = self.streaming_max_in_flight();
         let client = self.clone();
+        let chain = self.chain.clone();
 
         tokio::spawn(async move {
             let mut iter = block_numbers.into_iter();
@@ -897,7 +906,11 @@ impl RpcClient {
             // Pipeline: as tasks complete, spawn replacements
             while let Some(join_result) = join_set.join_next().await {
                 if let Err(e) = join_result {
-                    tracing::error!("Task panicked in get_blocks_streaming: {:?}", e);
+                    tracing::error!(
+                        "[{}] Task panicked in get_blocks_streaming: {:?}",
+                        chain,
+                        e
+                    );
                 }
 
                 if let Some(number) = iter.next() {
@@ -922,7 +935,12 @@ impl RpcClient {
                 match self.get_transaction_receipt(hash).await {
                     Ok(receipt) => results.push(receipt),
                     Err(e) => {
-                        tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                        tracing::debug!(
+                            "[{}] Skipping receipt for tx {:?}: {}",
+                            self.chain,
+                            hash,
+                            e
+                        );
                         results.push(None);
                     }
                 }
@@ -948,7 +966,12 @@ impl RpcClient {
                 match result {
                     Ok(receipt) => all_results.push(receipt),
                     Err(e) => {
-                        tracing::debug!("Skipping receipt for tx {:?}: {}", chunk[i], e);
+                        tracing::debug!(
+                            "[{}] Skipping receipt for tx {:?}: {}",
+                            self.chain,
+                            chunk[i],
+                            e
+                        );
                         all_results.push(None);
                     }
                 }

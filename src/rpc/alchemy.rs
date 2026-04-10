@@ -491,6 +491,7 @@ impl AlchemyClient {
 
         let num_requests = requests.len();
         let executor = self.create_concurrent_executor(cost_per_request);
+        let chain = executor.chain.clone();
         let make_request = Arc::new(make_request);
         let mut join_set = JoinSet::new();
         let mut requests_iter = requests.into_iter().enumerate().peekable();
@@ -516,7 +517,11 @@ impl AlchemyClient {
             match result {
                 Ok((idx, value)) => indexed_results.push((idx, value)),
                 Err(e) => {
-                    tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
+                    tracing::error!(
+                        "[{}] Task panicked in execute_concurrent_ordered: {:?}",
+                        chain,
+                        e
+                    );
                     had_panic = true;
                 }
             }
@@ -526,7 +531,8 @@ impl AlchemyClient {
                 && indexed_results.len() < num_requests
             {
                 tracing::debug!(
-                    "Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    "[{}] Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    chain,
                     indexed_results.len(),
                     num_requests,
                     indexed_results.len() as f64 / num_requests as f64 * 100.0,
@@ -578,6 +584,7 @@ impl AlchemyClient {
         use tokio::task::JoinSet;
 
         let executor = self.create_concurrent_executor(cost_per_request);
+        let chain = executor.chain.clone();
         let make_request = Arc::new(make_request);
 
         tokio::spawn(async move {
@@ -601,7 +608,7 @@ impl AlchemyClient {
             // Wait for tasks to complete, spawning replacements to keep the pipeline full
             while let Some(result) = join_set.join_next().await {
                 if let Err(e) = result {
-                    tracing::error!("Task panicked in execute_streaming: {:?}", e);
+                    tracing::error!("[{}] Task panicked in execute_streaming: {:?}", chain, e);
                 }
 
                 // Spawn replacements
@@ -1087,6 +1094,8 @@ impl AlchemyClient {
         hashes: Vec<B256>,
     ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
         let provider = self.inner.provider().clone();
+        let per_request_chain = self.chain_label();
+        let fallback_chain = per_request_chain.clone();
 
         // This method swallows errors and returns None for failed receipts,
         // so we use execute_batch_with_metrics (no error unwrapping)
@@ -1096,23 +1105,34 @@ impl AlchemyClient {
             ComputeUnitCost::GET_TRANSACTION_RECEIPT.cost(),
             move |hash| {
                 let provider = provider.clone();
+                let chain = per_request_chain.clone();
                 async move {
                     match provider.get_transaction_receipt(hash).await {
                         Ok(receipt) => receipt,
                         Err(e) => {
-                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            tracing::debug!(
+                                "[{}] Skipping receipt for tx {:?}: {}",
+                                chain,
+                                hash,
+                                e
+                            );
                             None
                         }
                     }
                 }
             },
-            |hashes| async move {
+            move |hashes| async move {
                 let mut results = Vec::with_capacity(hashes.len());
                 for hash in hashes {
                     match self.get_transaction_receipt(hash).await {
                         Ok(receipt) => results.push(receipt),
                         Err(e) => {
-                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            tracing::debug!(
+                                "[{}] Skipping receipt for tx {:?}: {}",
+                                fallback_chain,
+                                hash,
+                                e
+                            );
                             results.push(None);
                         }
                     }
