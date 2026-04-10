@@ -71,6 +71,7 @@ pub async fn decode_eth_calls_live(
                             config,
                             transform_tx,
                             retry_transform_after_decode,
+                            &state.chain_name,
                         )
                         .await?;
                     } else {
@@ -82,6 +83,8 @@ pub async fn decode_eth_calls_live(
                             config,
                             output_base,
                             transform_tx,
+                            chain_name,
+                            "historical",
                         )
                         .await?;
                     }
@@ -111,6 +114,7 @@ pub async fn decode_eth_calls_live(
                             &configs,
                             transform_tx,
                             retry_transform_after_decode,
+                            &state.chain_name,
                         )
                         .await?;
                     } else {
@@ -125,6 +129,8 @@ pub async fn decode_eth_calls_live(
                             transform_tx,
                             false,
                             false,
+                            chain_name,
+                            "historical",
                         )
                         .await?;
                     }
@@ -154,6 +160,7 @@ pub async fn decode_eth_calls_live(
                             config,
                             transform_tx,
                             retry_transform_after_decode,
+                            &state.chain_name,
                         )
                         .await?;
                     } else {
@@ -165,6 +172,8 @@ pub async fn decode_eth_calls_live(
                             config,
                             output_base,
                             transform_tx,
+                            chain_name,
+                            "historical",
                         )
                         .await?;
                     }
@@ -207,6 +216,7 @@ pub async fn decode_eth_calls_live(
                     &contract_name,
                     once_configs,
                     transform_tx,
+                    chain_name,
                 )
                 .await?;
             }
@@ -222,6 +232,7 @@ pub async fn decode_eth_calls_live(
                         event_configs,
                         raw_data_config,
                         transform_tx,
+                        chain_name,
                         repair,
                         None,
                     )

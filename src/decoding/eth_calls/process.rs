@@ -28,6 +28,8 @@ pub async fn process_regular_calls(
     config: &CallDecodeConfig,
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    chain_name: &str,
+    mode: &str,
 ) -> Result<(), EthCallDecodingError> {
     // Skip if entire range is before contract's start_block
     if let Some(sb) = config.start_block {
@@ -36,6 +38,7 @@ pub async fn process_regular_calls(
         }
     }
 
+    let decode_start = std::time::Instant::now();
     let mut decoded_records = Vec::new();
     let mut decode_failures = 0u64;
     let mut non_empty_count = 0u64;
@@ -96,6 +99,16 @@ pub async fn process_regular_calls(
         );
     }
 
+    // Record eth_call decode metrics
+    let successes = decoded_records.len() as u64;
+    crate::metrics::decoding::record_eth_call_decode_metrics(
+        chain_name,
+        mode,
+        successes,
+        decode_failures,
+        decode_start.elapsed(),
+    );
+
     // Send to transformation channel FIRST (before parquet I/O)
     // to unblock the transformation engine while parquet writes happen.
     if let Some(tx) = transform_tx {
@@ -129,6 +142,7 @@ pub async fn process_regular_calls(
     }
 
     // Write decoded data
+    let parquet_write_start = std::time::Instant::now();
     let output_dir = output_base
         .join(&config.contract_name)
         .join(&config.function_name);
@@ -138,6 +152,11 @@ pub async fn process_regular_calls(
     let output_path = output_dir.join(&file_name);
 
     write_decoded_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
+    crate::metrics::decoding::record_parquet_write_duration(
+        chain_name,
+        "eth_calls",
+        parquet_write_start.elapsed(),
+    );
 
     if decoded_records.is_empty() {
         tracing::debug!(
@@ -173,6 +192,8 @@ pub async fn process_once_calls(
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     return_index_info: bool,
     #[allow(unused_variables)] force_overwrite: bool,
+    chain_name: &str,
+    mode: &str,
 ) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
     // Get start_block from first config (all configs for a contract share the same start_block)
     let start_block = configs.first().and_then(|c| c.start_block);
@@ -184,6 +205,7 @@ pub async fn process_once_calls(
         }
     }
 
+    let decode_start = std::time::Instant::now();
     let mut decoded_records = Vec::new();
     // Track decode failures per function: fn_name -> (successes, failures)
     let mut decode_stats: HashMap<String, (u64, u64)> = HashMap::new();
@@ -262,6 +284,17 @@ pub async fn process_once_calls(
         }
     }
 
+    // Record eth_call decode metrics (aggregate across all functions)
+    let total_successes: u64 = decode_stats.values().map(|(s, _)| s).sum();
+    let total_failures: u64 = decode_stats.values().map(|(_, f)| f).sum();
+    crate::metrics::decoding::record_eth_call_decode_metrics(
+        chain_name,
+        mode,
+        total_successes,
+        total_failures,
+        decode_start.elapsed(),
+    );
+
     // Send to transformation channel FIRST (before parquet I/O)
     // to unblock the transformation engine while parquet writes happen.
     if let Some(tx) = transform_tx {
@@ -329,6 +362,7 @@ pub async fn process_once_calls(
     }
 
     // Write decoded data
+    let parquet_write_start = std::time::Instant::now();
     let output_dir = output_base.join(contract_name).join("once");
     std::fs::create_dir_all(&output_dir)?;
 
@@ -345,6 +379,11 @@ pub async fn process_once_calls(
     } else {
         write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
     }
+    crate::metrics::decoding::record_parquet_write_duration(
+        chain_name,
+        "eth_calls",
+        parquet_write_start.elapsed(),
+    );
 
     // Derive column names from configs instead of re-reading the file we just wrote
     let actual_cols: Vec<String> = configs.iter().map(|c| c.function_name.clone()).collect();
@@ -395,6 +434,8 @@ pub async fn process_event_calls(
     config: &EventCallDecodeConfig,
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    chain_name: &str,
+    mode: &str,
 ) -> Result<(), EthCallDecodingError> {
     // Skip if entire range is before contract's start_block
     if let Some(sb) = config.start_block {
@@ -403,6 +444,7 @@ pub async fn process_event_calls(
         }
     }
 
+    let decode_start = std::time::Instant::now();
     let mut decoded_records = Vec::new();
     let mut decode_failures = 0u64;
     let mut non_empty_count = 0u64;
@@ -483,6 +525,16 @@ pub async fn process_event_calls(
         );
     }
 
+    // Record eth_call decode metrics
+    let successes = decoded_records.len() as u64;
+    crate::metrics::decoding::record_eth_call_decode_metrics(
+        chain_name,
+        mode,
+        successes,
+        decode_failures,
+        decode_start.elapsed(),
+    );
+
     // Send to transformation channel FIRST (before parquet I/O)
     // to unblock the transformation engine while parquet writes happen.
     if let Some(tx) = transform_tx {
@@ -519,6 +571,7 @@ pub async fn process_event_calls(
     }
 
     // Write decoded data to on_events/ subdirectory
+    let parquet_write_start = std::time::Instant::now();
     let output_dir = output_base
         .join(&config.contract_name)
         .join(&config.function_name)
@@ -530,6 +583,11 @@ pub async fn process_event_calls(
 
     // Always write file (even if empty) for catchup idempotency
     write_decoded_event_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
+    crate::metrics::decoding::record_parquet_write_duration(
+        chain_name,
+        "eth_calls",
+        parquet_write_start.elapsed(),
+    );
 
     if decoded_records.is_empty() {
         tracing::debug!(

@@ -190,12 +190,15 @@ pub async fn catchup_decode_logs(
 
     let recollect_tx = recollect_tx.cloned();
 
+    let chain_name_arc = Arc::new(chain.name.clone());
+
     for (range_start, range_end, file_path, missing_regular, missing_factory) in files_to_process {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let factory_addresses = factory_addresses.clone();
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
         let recollect_tx = recollect_tx.clone();
+        let chain_name = chain_name_arc.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -280,6 +283,8 @@ pub async fn catchup_decode_logs(
                 &output_base,
                 &outputs,
                 None, // contract index writes are done serially after drain (Fix 3)
+                &chain_name,
+                "catchup",
             )
             .await
             .map(|_| Some((range_start, range_end)))

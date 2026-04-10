@@ -144,6 +144,7 @@ pub async fn catchup_decode_eth_calls(
     event_configs: &[EventCallDecodeConfig],
     raw_data_config: &RawDataCollectionConfig,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
+    chain_name: &str,
     repair: bool,
     repair_scope: Option<RepairScope>,
 ) -> Result<(), EthCallDecodingError> {
@@ -640,11 +641,14 @@ pub async fn catchup_decode_eth_calls(
     let transform_tx = transform_tx.cloned();
     let mut join_set = JoinSet::new();
 
+    let chain_name_arc = Arc::new(chain_name.to_string());
+
     for item in work_items {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let output_base = output_base.clone();
         let transform_tx = transform_tx.clone();
         let completed = completed.clone();
+        let chain_name = chain_name_arc.clone();
 
         join_set.spawn(async move {
             let _permit = permit; // Hold permit until task completes
@@ -668,6 +672,8 @@ pub async fn catchup_decode_eth_calls(
                         &config,
                         &output_base,
                         transform_tx.as_ref(),
+                        &chain_name,
+                        "catchup",
                     )
                     .await?;
                     Ok(None)
@@ -695,8 +701,10 @@ pub async fn catchup_decode_eth_calls(
                         &config_refs,
                         &output_base,
                         transform_tx.as_ref(),
-                        true,
+                        true, // return_index_info: batch update after all tasks complete
                         true, // force_overwrite: catchup always overwrites to handle row additions
+                        &chain_name,
+                        "catchup",
                     )
                     .await
                 }
@@ -744,6 +752,8 @@ pub async fn catchup_decode_eth_calls(
                         &config,
                         &output_base,
                         transform_tx.as_ref(),
+                        &chain_name,
+                        "catchup",
                     )
                     .await?;
                     Ok(None)
@@ -955,6 +965,8 @@ mod tests {
             &config,
             &decoded_dir,
             None,
+            "test",
+            "catchup",
         )
         .await
         .unwrap();
@@ -974,6 +986,7 @@ mod tests {
             std::slice::from_ref(&config),
             &raw_config(),
             None,
+            "test",
             false,
             None,
         )
@@ -989,6 +1002,7 @@ mod tests {
             std::slice::from_ref(&config),
             &raw_config(),
             None,
+            "test",
             true,
             None,
         )
@@ -1050,6 +1064,8 @@ mod tests {
             &config,
             &decoded_dir,
             None,
+            "test",
+            "catchup",
         )
         .await
         .unwrap();
@@ -1070,6 +1086,7 @@ mod tests {
             std::slice::from_ref(&config),
             &raw_config(),
             None,
+            "test",
             true,
             None,
         )

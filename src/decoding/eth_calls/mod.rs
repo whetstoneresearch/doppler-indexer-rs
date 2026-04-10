@@ -96,6 +96,7 @@ pub async fn decode_eth_calls(
                 &event_configs,
                 raw_data_config,
                 None,
+                &chain.name,
                 repair,
                 repair_scope.clone(),
             )
