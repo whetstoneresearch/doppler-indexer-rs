@@ -528,7 +528,7 @@ impl AlchemyClient {
             }
 
             if log_interval > 0
-                && indexed_results.len() % log_interval == 0
+                && indexed_results.len().is_multiple_of(log_interval)
                 && indexed_results.len() < num_requests
             {
                 tracing::debug!(

@@ -24,8 +24,8 @@ use tracing_subscriber::EnvFilter;
 use db::DbPool;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use live::{
-    CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig,
-    LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
+    CompactionService, LiveCollector, LiveCollectorConfig, LiveEthCallCollector, LiveMessage,
+    LiveModeConfig, LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
 };
 use raw_data::historical::catchup::blocks::collect_blocks;
 use raw_data::historical::factories::{
@@ -1028,7 +1028,7 @@ impl FullPipelineContext {
                     let sm_for_current = sm.clone();
                     raw_data::historical::catchup::receipts::collect_receipts(
                         &chain,
-                        &*receipts_client,
+                        &receipts_client,
                         &cfg,
                         &log_tx,
                         &factory_log_tx,
@@ -1900,17 +1900,17 @@ async fn spawn_live_mode(
     );
 
     // Start live collector
-    let collector = LiveCollector::new(
-        chain.clone(),
-        http_client.clone(),
-        live_config.clone(),
-        Some(progress_tracker.clone()),
+    let collector = LiveCollector::new(LiveCollectorConfig {
+        chain: chain.clone(),
+        http_client: http_client.clone(),
+        config: live_config.clone(),
+        progress_tracker: Some(progress_tracker.clone()),
         factory_matchers,
         eth_call_collector,
-        db_pool.clone(),
-        live_expectations,
-        live_channels.transform_retry_tx.clone(),
-    );
+        db_pool: db_pool.clone(),
+        expectations: live_expectations,
+        transform_retry_tx: live_channels.transform_retry_tx.clone(),
+    });
     tasks.spawn(async move {
         collector
             .run(

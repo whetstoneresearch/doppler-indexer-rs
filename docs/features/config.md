@@ -47,7 +47,7 @@ The following environment variables control indexer behavior:
 | `DB_POOL_SIZE` | 16 | PostgreSQL connection pool size |
 | `RUST_LOG` | info | Log level filter (standard tracing crate) |
 
-RPC tuning parameters (`concurrency`, `compute_units_per_second`, `batch_size`) are configured per-chain via the `rpc` config object rather than environment variables. See [Chain RPC Configuration](#chain-rpc-configuration) below.
+RPC tuning parameters (`concurrency`, `requests_per_second`, `batch_size`) are configured per-chain via the `rpc` config object rather than environment variables. See [Chain RPC Configuration](#chain-rpc-configuration) below.
 
 ## Main Configuration
 
@@ -127,7 +127,7 @@ The optional `rpc` object on each chain configures RPC client behavior:
     "rpc_url_env_var": "BASE_RPC_URL",
     "rpc": {
         "concurrency": 100,
-        "compute_units_per_second": 7500,
+        "requests_per_second": 7500,
         "batch_size": 100
     }
 }
@@ -136,7 +136,8 @@ The optional `rpc` object on each chain configures RPC client behavior:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `concurrency` | number | No | 100 | Maximum concurrent in-flight RPC requests |
-| `compute_units_per_second` | number | No | 7500 | Compute units per second rate limit (matches Alchemy Scale tier) |
+| `requests_per_second` | number | No | 7500 | Generic rate-limit units per second. For standard providers this is requests/sec; for Alchemy-like providers it is CU/sec |
+| `compute_units_per_second` | number | No | - | Legacy alias for `requests_per_second`; kept for backward compatibility |
 | `batch_size` | number | No | 100 | Maximum batch size for JSON-RPC batch requests. Falls back to `raw_data_collection.rpc_batch_size` if not set. |
 
 ### Raw Data Collection

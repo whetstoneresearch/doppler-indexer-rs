@@ -24,6 +24,9 @@ use crate::transformations::event::metrics::swap_data::{
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 // --- Shared extraction functions ---
 
@@ -61,7 +64,7 @@ fn extract_v3_liquidity(
             TransformationError::TypeConversion(format!(
                 "Mint amount {} overflows I256 (pool {}, block {})",
                 amount,
-                hex::encode(&event.contract_address),
+                hex::encode(event.contract_address),
                 event.block_number,
             ))
         })?;
@@ -81,7 +84,7 @@ fn extract_v3_liquidity(
             TransformationError::TypeConversion(format!(
                 "Burn amount {} overflows I256 (pool {}, block {})",
                 amount,
-                hex::encode(&event.contract_address),
+                hex::encode(event.contract_address),
                 event.block_number,
             ))
         })?;
@@ -102,6 +105,7 @@ fn extract_v3_liquidity(
 
 pub struct V3SwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -121,6 +125,7 @@ impl TransformationHandler for V3SwapMetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
 
@@ -149,17 +154,32 @@ impl TransformationHandler for V3SwapMetricsHandler {
         )
         .await?;
 
-        Ok(process_swaps(
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+        let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
             ctx.chain_id,
             self.name(),
             "DopplerV3Pool",
-        ))
+            Some(&usd_ctx),
+            self.version(),
+        );
+        ops.extend(price_ops);
+        Ok(ops)
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -178,6 +198,10 @@ impl EventHandler for V3SwapMetricsHandler {
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["V3CreateHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 }
 
@@ -237,6 +261,7 @@ impl EventHandler for V3LiquidityMetricsHandler {
 
 pub struct LockableV3SwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -256,6 +281,7 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
 
@@ -284,17 +310,32 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
         )
         .await?;
 
-        Ok(process_swaps(
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+        let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
             ctx.chain_id,
             self.name(),
             "DopplerLockableV3Pool",
-        ))
+            Some(&usd_ctx),
+            self.version(),
+        );
+        ops.extend(price_ops);
+        Ok(ops)
     }
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -313,6 +354,10 @@ impl EventHandler for LockableV3SwapMetricsHandler {
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec!["LockableV3CreateHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 }
 
@@ -374,16 +419,19 @@ pub fn register_handlers(
     registry: &mut TransformationRegistry,
     chain_id: u64,
     cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
 ) {
     // Swap metrics: pool_state + pool_snapshots (single-trigger, captures snapshots)
     registry.register_event_handler(V3SwapMetricsHandler {
         metadata_cache: cache.clone(),
+        oracle_cache: Arc::clone(&oracle_cache),
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
     });
     registry.register_event_handler(LockableV3SwapMetricsHandler {
         metadata_cache: cache,
+        oracle_cache: Arc::clone(&oracle_cache),
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
@@ -444,6 +492,7 @@ mod tests {
         let cache = Arc::new(PoolMetadataCache::new());
         let handler = V3SwapMetricsHandler {
             metadata_cache: cache.clone(),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
             decimals_init: Once::new(),
             chain_id: 8453,
             db_pool: OnceLock::new(),
@@ -489,6 +538,7 @@ mod tests {
         let t1 = tokio::spawn(async move {
             let handler = V3SwapMetricsHandler {
                 metadata_cache: cache1,
+                oracle_cache: Arc::new(OraclePriceCache::new()),
                 decimals_init: Once::new(),
                 chain_id: 8453,
                 db_pool: OnceLock::new(),
@@ -500,6 +550,7 @@ mod tests {
         let t2 = tokio::spawn(async move {
             let handler = V3SwapMetricsHandler {
                 metadata_cache: cache2,
+                oracle_cache: Arc::new(OraclePriceCache::new()),
                 decimals_init: Once::new(),
                 chain_id: 8453,
                 db_pool: OnceLock::new(),
@@ -517,5 +568,30 @@ mod tests {
             cache.get(&pool_id).is_some(),
             "pool entry should still be in cache after concurrent handle() calls"
         );
+    }
+
+    #[test]
+    fn test_swap_handlers_declare_chainlink_dependency() {
+        let v3_handler = V3SwapMetricsHandler {
+            metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
+            decimals_init: Once::new(),
+            chain_id: 8453,
+            db_pool: OnceLock::new(),
+        };
+        assert!(v3_handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
+
+        let lockable_handler = LockableV3SwapMetricsHandler {
+            metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
+            decimals_init: Once::new(),
+            chain_id: 8453,
+            db_pool: OnceLock::new(),
+        };
+        assert!(lockable_handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
     }
 }

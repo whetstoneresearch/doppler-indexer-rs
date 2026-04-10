@@ -53,6 +53,19 @@ pub enum CollectorError {
     ReorgCleanupFailed(Vec<u64>),
 }
 
+/// Configuration for creating a `LiveCollector`.
+pub struct LiveCollectorConfig {
+    pub chain: Arc<ChainConfig>,
+    pub http_client: Arc<UnifiedRpcClient>,
+    pub config: LiveModeConfig,
+    pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    pub factory_matchers: Arc<Vec<FactoryMatcher>>,
+    pub eth_call_collector: Option<LiveEthCallCollector>,
+    pub db_pool: Option<Arc<DbPool>>,
+    pub expectations: LivePipelineExpectations,
+    pub transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
+}
+
 /// Collects live blocks from WebSocket and processes them.
 pub struct LiveCollector {
     chain: Arc<ChainConfig>,
@@ -82,18 +95,19 @@ pub struct LiveCollector {
 
 impl LiveCollector {
     /// Create a new LiveCollector.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chain: Arc<ChainConfig>,
-        http_client: Arc<UnifiedRpcClient>,
-        config: LiveModeConfig,
-        progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
-        factory_matchers: Arc<Vec<FactoryMatcher>>,
-        eth_call_collector: Option<LiveEthCallCollector>,
-        db_pool: Option<Arc<DbPool>>,
-        expectations: LivePipelineExpectations,
-        transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
-    ) -> Self {
+    pub fn new(cfg: LiveCollectorConfig) -> Self {
+        let LiveCollectorConfig {
+            chain,
+            http_client,
+            config,
+            progress_tracker,
+            factory_matchers,
+            eth_call_collector,
+            db_pool,
+            expectations,
+            transform_retry_tx,
+        } = cfg;
+
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
 
@@ -475,7 +489,7 @@ impl LiveCollector {
                 .send(DecoderMessage::LogsReady {
                     range_start: block_number,
                     range_end: block_number + 1, // Exclusive end for single block
-                    logs: log_data,
+                    logs: std::sync::Arc::new(log_data),
                     live_mode: true, // Live mode: write to bincode
                     has_factory_matchers: !self.factory_matchers.is_empty(),
                 })
@@ -753,19 +767,22 @@ impl LiveCollector {
         &self,
         block_number: u64,
     ) -> Result<(Vec<LiveReceipt>, Vec<LiveLog>), CollectorError> {
-        let method_name = self
-            .chain
-            .block_receipts_method
-            .as_ref()
-            .map(|m| m.as_str())
-            .unwrap_or("eth_getBlockReceipts");
-
-        let receipts = self
-            .http_client
-            .get_block_receipts(method_name, BlockNumberOrTag::Number(block_number))
-            .await?;
-
         let block = self.storage.read_block(block_number)?;
+        let receipts = match self.chain.block_receipts_method.as_ref() {
+            Some(method) => {
+                self.http_client
+                    .get_block_receipts(method.as_str(), BlockNumberOrTag::Number(block_number))
+                    .await?
+            }
+            None if block.tx_hashes.is_empty() => Vec::new(),
+            None => {
+                let tx_hashes: Vec<B256> =
+                    block.tx_hashes.iter().copied().map(B256::from).collect();
+                self.http_client
+                    .get_transaction_receipts_batch(tx_hashes)
+                    .await?
+            }
+        };
 
         let mut live_receipts = Vec::new();
         let mut all_logs = Vec::new();
@@ -1164,7 +1181,7 @@ impl LiveCollector {
             .send(DecoderMessage::LogsReady {
                 range_start: block_number,
                 range_end: block_number + 1,
-                logs: log_data,
+                logs: std::sync::Arc::new(log_data),
                 live_mode: true,
                 has_factory_matchers: !self.factory_matchers.is_empty(),
             })
