@@ -933,7 +933,7 @@ mod tests {
 
         let events = batch_to_events(batch, "v3", "Swap").unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].contract_address, [0x22u8; 20]);
+        assert_eq!(events[0].contract_address, ChainAddress::Evm([0x22u8; 20]));
         assert_eq!(events[0].params.len(), 1);
         assert!(matches!(
             events[0].params.get("amount0"),
