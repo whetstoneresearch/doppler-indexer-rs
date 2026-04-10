@@ -137,7 +137,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
             let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
             events
                 .iter()
-                .filter_map(|e| hook_pool_map.get(&e.contract_address).copied())
+                .filter_map(|e| hook_pool_map.get(e.evm_address_ref()).copied())
                 .filter(|id| seen.insert(*id))
                 .map(|id| id.to_vec())
                 .collect()
@@ -344,7 +344,7 @@ impl V4BaseMetricsHandler {
             let map = self.hook_pool_map.read().unwrap();
             events
                 .iter()
-                .any(|e| !map.contains_key(&e.contract_address))
+                .any(|e| !map.contains_key(e.evm_address_ref()))
         };
 
         if !missing {
@@ -383,8 +383,8 @@ impl V4BaseMetricsHandler {
 
         let still_missing: Vec<_> = events
             .iter()
-            .filter(|e| !map.contains_key(&e.contract_address))
-            .map(|e| hex::encode(e.contract_address))
+            .filter(|e| !map.contains_key(e.evm_address_ref()))
+            .map(|e| hex::encode(e.evm_address()))
             .collect();
         if !still_missing.is_empty() {
             tracing::warn!(
@@ -544,11 +544,11 @@ impl V4BaseMetricsHandler {
         // Group events by pool_id.
         let mut pool_events: HashMap<[u8; 32], Vec<&DecodedEvent>> = HashMap::new();
         for event in events {
-            match hook_pool_map.get(&event.contract_address) {
+            match hook_pool_map.get(event.evm_address_ref()) {
                 Some(&pool_id) => pool_events.entry(pool_id).or_default().push(event),
                 None => tracing::warn!(
                     "V4BaseMetricsHandler: no pool_id for hook {} at block {}, skipping",
-                    hex::encode(event.contract_address),
+                    hex::encode(event.evm_address()),
                     event.block_number,
                 ),
             }
@@ -559,7 +559,7 @@ impl V4BaseMetricsHandler {
         let mut new_cumulative: HashMap<[u8; 32], (U256, U256)> = HashMap::new();
 
         for (pool_id, mut pool_evts) in pool_events {
-            pool_evts.sort_by_key(|e| (e.block_number, e.log_index));
+            pool_evts.sort_by_key(|e| (e.block_number, e.log_index()));
 
             let (mut prev_proceeds, mut prev_tokens) = prev_state
                 .get(&pool_id)
@@ -653,10 +653,10 @@ impl V4BaseMetricsHandler {
 
                 swaps.push(SwapInput {
                     pool_id: pool_id.to_vec(),
-                    transaction_hash: event.transaction_hash,
+                    transaction_hash: event.evm_tx_hash(),
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    log_index: event.log_index,
+                    log_index: event.log_index(),
                     amount0,
                     amount1,
                     sqrt_price_x96,
@@ -851,9 +851,9 @@ mod tests {
         DecodedEvent {
             block_number,
             block_timestamp: block_number * 12,
-            transaction_hash: [0u8; 32],
-            log_index,
-            contract_address: hook_addr,
+            transaction_id: crate::types::chain::TxId::Evm([0u8; 32]),
+            position: crate::types::chain::LogPosition::Evm { log_index },
+            contract_address: crate::types::chain::ChainAddress::Evm(hook_addr),
             source_name: SOURCE.to_string(),
             event_name: "Swap".to_string(),
             event_signature: "Swap(int24,uint256,uint256)".to_string(),

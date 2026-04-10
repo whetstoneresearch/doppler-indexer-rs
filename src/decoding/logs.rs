@@ -25,6 +25,7 @@ use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
     RangeCompleteMessage,
 };
+use crate::types::chain::{ChainAddress, LogPosition, TxId};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{
     resolve_factory_config, AddressOrAddresses, Contracts, FactoryCollections,
@@ -1067,9 +1068,11 @@ fn convert_to_transform_event(
     TransformDecodedEvent {
         block_number: record.block_number,
         block_timestamp: record.block_timestamp,
-        transaction_hash: record.transaction_hash,
-        log_index: record.log_index,
-        contract_address: record.contract_address,
+        transaction_id: TxId::Evm(record.transaction_hash),
+        position: LogPosition::Evm {
+            log_index: record.log_index,
+        },
+        contract_address: ChainAddress::Evm(record.contract_address),
         source_name: source_name.to_string(),
         event_name: event_name.to_string(),
         event_signature: parsed_event.signature.clone(),

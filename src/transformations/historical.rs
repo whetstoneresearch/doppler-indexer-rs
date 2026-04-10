@@ -19,11 +19,12 @@ use super::context::{
 };
 use super::error::TransformationError;
 use crate::storage::paths::{decoded_base_dir, scan_parquet_ranges};
+use crate::types::chain::{ChainAddress, LogPosition, TxId};
 
 /// Index mapping (source_name, event_or_function_name) to available parquet file ranges.
 type FileIndex = HashMap<(String, String), Vec<(u64, u64, PathBuf)>>;
 /// Cache key for historical call lookups by source/function/address up to a block.
-type CallCacheKey = (String, String, [u8; 20], u64);
+type CallCacheKey = (String, String, ChainAddress, u64);
 
 /// Reader for historical decoded data stored in parquet files.
 pub struct HistoricalDataReader {
@@ -216,6 +217,7 @@ impl HistoricalDataReader {
         contract_address: [u8; 20],
         to_block: u64,
     ) -> Result<Option<DecodedCall>, TransformationError> {
+        let contract_address = ChainAddress::Evm(contract_address);
         let cache_key = (
             source.to_string(),
             function_name.to_string(),
@@ -245,7 +247,9 @@ impl HistoricalDataReader {
             .max_by_key(|call| {
                 (
                     call.block_number,
-                    call.trigger_log_index.unwrap_or(u32::MAX),
+                    call.trigger_position
+                        .map(|position| position.ordinal())
+                        .unwrap_or(u64::MAX),
                 )
             });
 
@@ -449,7 +453,7 @@ fn batch_to_events(
     let block_timestamps = get_u64_column(&batch, "block_timestamp")?;
     let tx_hashes = get_bytes32_column(&batch, "transaction_hash")?;
     let log_indices = get_u32_column(&batch, "log_index")?;
-    let addresses = get_address_column(&batch, "contract_address")?;
+    let addresses = get_chain_address_column(&batch, "contract_address")?;
 
     // Get parameter columns (everything except standard columns)
     let standard_cols = [
@@ -481,8 +485,10 @@ fn batch_to_events(
         events.push(DecodedEvent {
             block_number: block_numbers[row],
             block_timestamp: block_timestamps[row],
-            transaction_hash: tx_hashes[row],
-            log_index: log_indices[row],
+            transaction_id: TxId::Evm(tx_hashes[row]),
+            position: LogPosition::Evm {
+                log_index: log_indices[row],
+            },
             contract_address: addresses[row],
             source_name: source_name.to_string(),
             event_name: event_name.to_string(),
@@ -508,7 +514,7 @@ fn batch_to_calls(
     // Extract standard columns
     let block_numbers = get_u64_column(&batch, "block_number")?;
     let block_timestamps = get_u64_column(&batch, "block_timestamp")?;
-    let addresses = get_address_column(&batch, "contract_address")?;
+    let addresses = get_chain_address_column(&batch, "contract_address")?;
 
     // Extract log_index if present (event-triggered calls have this column)
     let log_indices = batch
@@ -554,7 +560,9 @@ fn batch_to_calls(
             contract_address: addresses[row],
             source_name: source_name.to_string(),
             function_name: function_name.to_string(),
-            trigger_log_index: log_indices.as_ref().map(|indices| indices[row]),
+            trigger_position: log_indices.as_ref().map(|indices| LogPosition::Evm {
+                log_index: indices[row],
+            }),
             result,
             is_reverted: false,
             revert_reason: None,
@@ -612,10 +620,10 @@ fn get_bytes32_column(
     Ok(result)
 }
 
-fn get_address_column(
+fn get_chain_address_column(
     batch: &RecordBatch,
     name: &str,
-) -> Result<Vec<[u8; 20]>, TransformationError> {
+) -> Result<Vec<ChainAddress>, TransformationError> {
     let col = batch
         .column_by_name(name)
         .ok_or_else(|| TransformationError::MissingColumn(name.to_string()))?;
@@ -628,10 +636,18 @@ fn get_address_column(
 
     let mut result = Vec::with_capacity(arr.len());
     for i in 0..arr.len() {
-        let bytes: [u8; 20] = arr.value(i).try_into().map_err(|_| {
-            TransformationError::TypeConversion(format!("{} value is not 20 bytes", name))
-        })?;
-        result.push(bytes);
+        let bytes = arr.value(i);
+        let address = match bytes.len() {
+            20 => ChainAddress::Evm(bytes.try_into().unwrap()),
+            32 => ChainAddress::Solana(bytes.try_into().unwrap()),
+            size => {
+                return Err(TransformationError::TypeConversion(format!(
+                    "{} value has unexpected address size {}",
+                    name, size
+                )))
+            }
+        };
+        result.push(address);
     }
     Ok(result)
 }

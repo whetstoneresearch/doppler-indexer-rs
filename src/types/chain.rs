@@ -21,35 +21,64 @@ pub enum ChainAddress {
 impl ChainAddress {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            ChainAddress::Evm(a) => a,
-            ChainAddress::Solana(p) => p,
+            Self::Evm(address) => address,
+            Self::Solana(pubkey) => pubkey,
         }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.as_bytes()
     }
 
     pub fn len(&self) -> usize {
         match self {
-            ChainAddress::Evm(_) => 20,
-            ChainAddress::Solana(_) => 32,
+            Self::Evm(_) => 20,
+            Self::Solana(_) => 32,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        false // addresses are never empty
+        false
     }
 
     pub fn to_hex(&self) -> String {
         match self {
-            ChainAddress::Evm(a) => format!("0x{}", hex::encode(a)),
-            ChainAddress::Solana(p) => hex::encode(p),
+            Self::Evm(address) => format!("0x{}", hex::encode(address)),
+            Self::Solana(pubkey) => hex::encode(pubkey),
         }
+    }
+
+    pub fn as_evm(&self) -> Option<[u8; 20]> {
+        match self {
+            Self::Evm(address) => Some(*address),
+            Self::Solana(_) => None,
+        }
+    }
+
+    pub fn as_evm_ref(&self) -> Option<&[u8; 20]> {
+        match self {
+            Self::Evm(address) => Some(address),
+            Self::Solana(_) => None,
+        }
+    }
+
+    pub fn as_solana(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Solana(pubkey) => Some(*pubkey),
+            Self::Evm(_) => None,
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
     }
 }
 
 impl std::fmt::Display for ChainAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChainAddress::Evm(_) => write!(f, "{}", self.to_hex()),
-            ChainAddress::Solana(pubkey) => write!(f, "{}", encode_base58(pubkey)),
+            Self::Evm(_) => write!(f, "{}", self.to_hex()),
+            Self::Solana(pubkey) => write!(f, "{}", encode_base58(pubkey)),
         }
     }
 }
@@ -88,6 +117,12 @@ fn encode_base58(bytes: &[u8]) -> String {
     output
 }
 
+impl AsRef<[u8]> for ChainAddress {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 /// A transaction identifier, sized for the source chain.
 /// Clone but NOT Copy — at 65 bytes for the Solana variant, implicit copies
 /// in hot loops are invisible overhead.
@@ -100,8 +135,29 @@ pub enum TxId {
 impl TxId {
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            TxId::Evm(h) => h,
-            TxId::Solana(s) => s,
+            Self::Evm(hash) => hash,
+            Self::Solana(signature) => signature,
+        }
+    }
+
+    pub fn as_evm(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Evm(hash) => Some(*hash),
+            Self::Solana(_) => None,
+        }
+    }
+
+    pub fn as_evm_ref(&self) -> Option<&[u8; 32]> {
+        match self {
+            Self::Evm(hash) => Some(hash),
+            Self::Solana(_) => None,
+        }
+    }
+
+    pub fn as_solana(&self) -> Option<[u8; 64]> {
+        match self {
+            Self::Solana(signature) => Some(*signature),
+            Self::Evm(_) => None,
         }
     }
 }
@@ -123,8 +179,8 @@ impl LogPosition {
     /// instruction/inner-instruction structure.
     pub fn sort_key(&self) -> (u64, u64) {
         match self {
-            LogPosition::Evm { log_index } => (*log_index as u64, 0),
-            LogPosition::Solana {
+            Self::Evm { log_index } => (*log_index as u64, 0),
+            Self::Solana {
                 instruction_index,
                 inner_instruction_index,
             } => (
@@ -140,14 +196,25 @@ impl LogPosition {
     /// Lossless packed ordinal for BIGINT-backed database columns.
     pub fn packed_ordinal_i64(&self) -> i64 {
         match self {
-            LogPosition::Evm { log_index } => i64::from(*log_index),
-            LogPosition::Solana { .. } => {
+            Self::Evm { log_index } => i64::from(*log_index),
+            Self::Solana { .. } => {
                 let (instruction_index, inner_slot) = self.sort_key();
                 let instruction_index =
                     i64::try_from(instruction_index).expect("u16 instruction index fits in i64");
                 let inner_slot = i64::try_from(inner_slot).expect("inner sort slot fits in i64");
                 instruction_index * SOLANA_PACKED_ORDINAL_STRIDE + inner_slot
             }
+        }
+    }
+
+    pub fn ordinal(&self) -> u64 {
+        u64::try_from(self.packed_ordinal_i64()).expect("log position ordinal is non-negative")
+    }
+
+    pub fn evm_log_index(&self) -> Option<u32> {
+        match self {
+            Self::Evm { log_index } => Some(*log_index),
+            Self::Solana { .. } => None,
         }
     }
 }

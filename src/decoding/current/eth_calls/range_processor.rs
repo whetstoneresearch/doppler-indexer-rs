@@ -10,6 +10,7 @@ use crate::transformations::{
     DecodedCall as TransformDecodedCall, DecodedCallsMessage, RangeCompleteKind,
     RangeCompleteMessage,
 };
+use crate::types::chain::ChainAddress;
 
 /// Handle a live-mode `EthCallsReady` message for regular calls: decode results,
 /// persist to bincode, and optionally forward to the transformation engine.
@@ -34,10 +35,10 @@ pub(super) async fn handle_regular_calls_live(
                 transform_calls.push(TransformDecodedCall {
                     block_number: result.block_number,
                     block_timestamp: result.block_timestamp,
-                    contract_address: result.contract_address,
+                    contract_address: ChainAddress::Evm(result.contract_address),
                     source_name: contract_name.to_string(),
                     function_name: function_name.to_string(),
-                    trigger_log_index: None,
+                    trigger_position: None,
                     result: build_result_map(&decoded, &config.output_type, function_name),
                     is_reverted: false,
                     revert_reason: None,

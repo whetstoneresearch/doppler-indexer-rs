@@ -20,6 +20,7 @@ use super::types::{
 };
 use crate::decoding::types::{EthCallResult, EventCallResult, OnceCallResult};
 use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
+use crate::types::chain::{ChainAddress, LogPosition};
 
 pub async fn process_regular_calls(
     results: &[EthCallResult],
@@ -288,10 +289,10 @@ pub async fn process_once_calls(
                 TransformDecodedCall {
                     block_number: record.block_number,
                     block_timestamp: record.block_timestamp,
-                    contract_address: record.contract_address,
+                    contract_address: ChainAddress::Evm(record.contract_address),
                     source_name: contract_name.to_string(),
                     function_name: "once".to_string(),
-                    trigger_log_index: None,
+                    trigger_position: None,
                     result: merged_result,
                     is_reverted: false,
                     revert_reason: None,
@@ -422,10 +423,12 @@ pub async fn process_event_calls(
             reverted_calls.push(TransformDecodedCall {
                 block_number: result.block_number,
                 block_timestamp: result.block_timestamp,
-                contract_address: result.target_address,
+                contract_address: ChainAddress::Evm(result.target_address),
                 source_name: config.contract_name.clone(),
                 function_name: config.function_name.clone(),
-                trigger_log_index: Some(result.log_index),
+                trigger_position: Some(LogPosition::Evm {
+                    log_index: result.log_index,
+                }),
                 result: HashMap::new(),
                 is_reverted: true,
                 revert_reason: result.revert_reason.clone(),

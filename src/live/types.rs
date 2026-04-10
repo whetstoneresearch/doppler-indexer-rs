@@ -310,6 +310,7 @@ pub enum LiveDbValue {
     VarChar(String),
     Bytes(Vec<u8>),
     Address([u8; 20]),
+    Pubkey([u8; 32]),
     Bytes32([u8; 32]),
     Numeric(String),
     Timestamp(i64),

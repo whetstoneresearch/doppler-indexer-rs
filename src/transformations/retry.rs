@@ -27,6 +27,7 @@ use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
 use crate::rpc::UnifiedRpcClient;
+use crate::types::chain::{ChainAddress, LogPosition, TxId};
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::eth_call::EvmType;
 
@@ -59,7 +60,7 @@ struct RetryPayload {
     handler: Arc<dyn super::traits::TransformationHandler>,
     handler_events: Arc<Vec<DecodedEvent>>,
     handler_calls: Arc<Vec<DecodedCall>>,
-    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    tx_addresses: HashMap<TxId, TransactionAddresses>,
 }
 
 pub(crate) fn resolve_retry_missing_handlers(
@@ -368,10 +369,10 @@ impl RetryProcessor {
                     calls.push(DecodedCall {
                         block_number: call.block_number,
                         block_timestamp: call.block_timestamp,
-                        contract_address: call.contract_address,
+                        contract_address: ChainAddress::Evm(call.contract_address),
                         source_name: source_name.clone(),
                         function_name: "once".to_string(),
-                        trigger_log_index: None,
+                        trigger_position: None,
                         result: merged_result,
                         is_reverted: false,
                         revert_reason: None,
@@ -966,9 +967,11 @@ fn live_log_to_decoded_event(
     DecodedEvent {
         block_number: log.block_number,
         block_timestamp: log.block_timestamp,
-        transaction_hash: log.transaction_hash,
-        log_index: log.log_index,
-        contract_address: log.contract_address,
+        transaction_id: TxId::Evm(log.transaction_hash),
+        position: LogPosition::Evm {
+            log_index: log.log_index,
+        },
+        contract_address: ChainAddress::Evm(log.contract_address),
         source_name: source_name.to_string(),
         event_name: event_name.to_string(),
         event_signature: parsed_event.signature.clone(),
@@ -985,10 +988,10 @@ fn live_call_to_decoded_call(
     DecodedCall {
         block_number: call.block_number,
         block_timestamp: call.block_timestamp,
-        contract_address: call.contract_address,
+        contract_address: ChainAddress::Evm(call.contract_address),
         source_name: source_name.to_string(),
         function_name: function_name.to_string(),
-        trigger_log_index: None,
+        trigger_position: None,
         result: build_result_map(&call.decoded_value, output_type, function_name),
         is_reverted: false,
         revert_reason: None,
@@ -1004,10 +1007,12 @@ fn live_event_call_to_decoded_call(
     DecodedCall {
         block_number: call.block_number,
         block_timestamp: call.block_timestamp,
-        contract_address: call.target_address,
+        contract_address: ChainAddress::Evm(call.target_address),
         source_name: source_name.to_string(),
         function_name: function_name.to_string(),
-        trigger_log_index: Some(call.log_index),
+        trigger_position: Some(LogPosition::Evm {
+            log_index: call.log_index,
+        }),
         result: build_result_map(&call.decoded_value, output_type, function_name),
         is_reverted: false,
         revert_reason: None,
@@ -1017,16 +1022,16 @@ fn live_event_call_to_decoded_call(
 fn read_live_receipt_addresses(
     chain_name: &str,
     block_number: u64,
-) -> Result<HashMap<[u8; 32], TransactionAddresses>, TransformationError> {
+) -> Result<HashMap<TxId, TransactionAddresses>, TransformationError> {
     let storage = LiveStorage::new(chain_name);
     let mut tx_addresses = HashMap::new();
 
     for receipt in storage.read_receipts(block_number)? {
         tx_addresses.insert(
-            receipt.transaction_hash,
+            TxId::Evm(receipt.transaction_hash),
             TransactionAddresses {
-                from_address: receipt.from,
-                to_address: receipt.to,
+                from_address: ChainAddress::Evm(receipt.from),
+                to_address: receipt.to.map(ChainAddress::Evm),
             },
         );
     }
@@ -1111,10 +1116,10 @@ mod tests {
         let calls = vec![DecodedCall {
             block_number: 100,
             block_timestamp: 1200,
-            contract_address: [0; 20],
+            contract_address: ChainAddress::Evm([0; 20]),
             source_name: "Pool".to_string(),
             function_name: "slot0".to_string(),
-            trigger_log_index: None,
+            trigger_position: None,
             result: HashMap::from([("result".to_string(), DecodedValue::Uint64(1))]),
             is_reverted: false,
             revert_reason: None,
