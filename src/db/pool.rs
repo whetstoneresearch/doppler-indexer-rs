@@ -373,7 +373,9 @@ fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
             table,
             where_clause,
         } => build_delete_sql(&table, &where_clause),
-        DbOperation::RawSql { query, params, .. } => (query, convert_values_to_params(&params)),
+        DbOperation::RawSql { query, params, .. } => {
+            (query.clone(), convert_values_to_params(params))
+        }
     }
 }
 
