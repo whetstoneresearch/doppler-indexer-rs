@@ -1,5 +1,6 @@
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use rand::Rng;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
@@ -59,12 +60,16 @@ impl DbPool {
             match self.try_execute_transaction(&operations).await {
                 Ok(()) => return Ok(()),
                 Err(e) if is_deadlock(&e) && attempt < DEADLOCK_MAX_RETRIES => {
-                    let delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    let base_delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    let jitter_range = base_delay_ms / 5; // ±20%
+                    let jitter_offset = rand::rng().random_range(0..=(jitter_range * 2));
+                    let delay_ms = base_delay_ms - jitter_range + jitter_offset;
                     tracing::warn!(
-                        "Deadlock detected (attempt {}/{}), retrying in {}ms",
+                        "Deadlock detected (attempt {}/{}), retrying in {}ms (base={}ms)",
                         attempt + 1,
                         DEADLOCK_MAX_RETRIES + 1,
                         delay_ms,
+                        base_delay_ms,
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }

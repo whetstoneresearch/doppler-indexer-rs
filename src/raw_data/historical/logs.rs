@@ -136,14 +136,12 @@ pub(crate) async fn process_completed_range(
     }
 
     // Send logs to decoder before processing (decoder will receive them for decoding).
-    // Wrap in Arc so we can share without cloning when process_range also needs ownership.
     if let Some(tx) = decoder_tx {
-        let logs = std::sync::Arc::new(logs);
         let _ = tx
             .send(DecoderMessage::LogsReady {
                 range_start,
                 range_end,
-                logs: std::sync::Arc::clone(&logs),
+                logs: logs.clone(),
                 live_mode: false,            // Historical mode: write to parquet
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })
@@ -151,7 +149,7 @@ pub(crate) async fn process_completed_range(
 
         process_range(
             &range,
-            logs.as_ref(),
+            &logs,
             log_fields,
             schema,
             output_dir,
