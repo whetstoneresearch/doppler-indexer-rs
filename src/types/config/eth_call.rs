@@ -3,6 +3,7 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use arrow::datatypes::{DataType, Field};
 use serde::de::{self, Visitor};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -27,11 +28,14 @@ pub enum EventFieldLocation {
 
 impl EventFieldLocation {
     /// Convert back to the canonical string representation.
-    pub fn as_str_repr(&self) -> String {
+    ///
+    /// Returns `Cow::Borrowed` for the `Address` variant (zero-alloc) and
+    /// `Cow::Owned` for indexed variants that require formatting.
+    pub fn as_str_repr(&self) -> Cow<'static, str> {
         match self {
-            Self::Address => "address".to_string(),
-            Self::Topic(idx) => format!("topics[{}]", idx),
-            Self::Data(idx) => format!("data[{}]", idx),
+            Self::Address => Cow::Borrowed("address"),
+            Self::Topic(idx) => Cow::Owned(format!("topics[{}]", idx)),
+            Self::Data(idx) => Cow::Owned(format!("data[{}]", idx)),
         }
     }
 }

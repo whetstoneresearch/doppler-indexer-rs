@@ -46,6 +46,9 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::tick_math::tick_to_sqrt_price_x96;
+use crate::transformations::util::usd_price::{
+    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 const SOURCE: &str = "DopplerV4Hook";
 
@@ -53,6 +56,7 @@ const SOURCE: &str = "DopplerV4Hook";
 
 pub struct V4BaseMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -86,6 +90,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
         vec![
             "migrations/tables/pool_state.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
             "migrations/tables/v4_base_proceeds_state.sql",
         ]
     }
@@ -193,13 +198,24 @@ impl TransformationHandler for V4BaseMetricsHandler {
             return Ok(Vec::new());
         }
 
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
         let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
             self.chain_id,
             self.name(),
             SOURCE,
+            Some(&usd_ctx),
+            self.version(),
         );
+        ops.extend(price_ops);
 
         // Durably checkpoint the new cumulative totals.
         for (pool_id, (total_proceeds, total_tokens_sold)) in &new_cumulative {
@@ -241,6 +257,9 @@ impl TransformationHandler for V4BaseMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
         self.metadata_cache
             .load_into(db_pool, self.chain_id)
             .await?;
@@ -289,6 +308,10 @@ impl TransformationHandler for V4BaseMetricsHandler {
 impl EventHandler for V4BaseMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(SOURCE, "Swap(int24,uint256,uint256)")]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
@@ -750,9 +773,11 @@ pub fn register_handlers(
     registry: &mut TransformationRegistry,
     chain_id: u64,
     cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
 ) {
     registry.register_event_handler(V4BaseMetricsHandler {
         metadata_cache: cache,
+        oracle_cache,
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
@@ -803,6 +828,7 @@ mod tests {
     fn make_handler(chain_id: u64) -> V4BaseMetricsHandler {
         V4BaseMetricsHandler {
             metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
             decimals_init: Once::new(),
             chain_id,
             db_pool: OnceLock::new(),
@@ -1048,6 +1074,14 @@ mod tests {
             }
             _ => panic!("expected Upsert"),
         }
+    }
+
+    #[test]
+    fn test_handler_declares_chainlink_dependency() {
+        let handler = make_handler(8453);
+        assert!(handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
     }
 
     // ── commit hooks / gate / reorg ───────────────────────────────────────────

@@ -230,7 +230,7 @@ src/
       "block_receipts_method": "eth_getBlockReceipts",
       "rpc": {
         "concurrency": 100,
-        "compute_units_per_second": 7500,
+        "requests_per_second": 7500,
         "batch_size": 1000
       }
     }

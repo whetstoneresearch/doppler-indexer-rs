@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use super::defaults::storage as defaults;
+
 /// Top-level storage configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct StorageConfig {
@@ -41,7 +43,7 @@ pub struct S3Config {
 }
 
 fn default_region() -> String {
-    "us-east-1".to_string()
+    defaults::REGION.to_string()
 }
 
 /// Local cache configuration.
@@ -73,15 +75,18 @@ impl Default for CacheConfig {
 }
 
 fn default_max_size_gb() -> u64 {
-    100
+    defaults::MAX_SIZE_GB
 }
 
 fn default_pinned_prefixes() -> Vec<String> {
-    vec!["factories".to_string(), "decoded".to_string()]
+    defaults::PINNED_PREFIXES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn default_eviction_threshold() -> f64 {
-    0.8
+    defaults::EVICTION_THRESHOLD
 }
 
 /// Synchronization configuration for S3.
@@ -119,17 +124,17 @@ impl Default for SyncConfig {
 }
 
 fn default_marker_freshness_ranges() -> u64 {
-    10
+    defaults::MARKER_FRESHNESS_RANGES
 }
 
 fn default_manifest_refresh_secs() -> u64 {
-    60
+    defaults::MANIFEST_REFRESH_SECS
 }
 
 fn default_retry_interval_secs() -> u64 {
-    30
+    defaults::RETRY_INTERVAL_SECS
 }
 
 fn default_max_retries() -> u32 {
-    10
+    defaults::MAX_RETRIES
 }

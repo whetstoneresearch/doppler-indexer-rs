@@ -25,8 +25,8 @@ use cli::IndexerMode;
 use db::DbPool;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use live::{
-    CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig,
-    LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
+    CompactionService, LiveCollector, LiveCollectorConfig, LiveEthCallCollector, LiveMessage,
+    LiveModeConfig, LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
 };
 use raw_data::historical::factories::{
     build_factory_matchers, FactoryAddressData, FactoryMessage, RecollectRequest,
@@ -1329,17 +1329,17 @@ async fn spawn_live_mode(
     );
 
     // Start live collector
-    let collector = LiveCollector::new(
-        chain.clone(),
-        http_client.clone(),
-        live_config.clone(),
-        Some(progress_tracker.clone()),
+    let collector = LiveCollector::new(LiveCollectorConfig {
+        chain: chain.clone(),
+        http_client: http_client.clone(),
+        config: live_config.clone(),
+        progress_tracker: Some(progress_tracker.clone()),
         factory_matchers,
         eth_call_collector,
-        db_pool.clone(),
-        live_expectations,
-        live_channels.transform_retry_tx.clone(),
-    );
+        db_pool: db_pool.clone(),
+        expectations: live_expectations,
+        transform_retry_tx: live_channels.transform_retry_tx.clone(),
+    });
     tasks.spawn(async move {
         collector
             .run(

@@ -137,11 +137,12 @@ pub(crate) async fn process_completed_range(
 
     // Send logs to decoder before processing (decoder will receive them for decoding).
     if let Some(tx) = decoder_tx {
+        let logs_for_decoder = std::sync::Arc::new(logs.clone());
         let _ = tx
             .send(DecoderMessage::LogsReady {
                 range_start,
                 range_end,
-                logs: logs.clone(),
+                logs: logs_for_decoder,
                 live_mode: false,            // Historical mode: write to parquet
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })

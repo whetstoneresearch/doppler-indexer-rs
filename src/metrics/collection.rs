@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use metrics::{counter, describe_counter, describe_histogram, histogram};
+use metrics::{describe_counter, describe_histogram, histogram};
 
 /// Register metric descriptions for block/receipt/log/eth_call collection
 /// (call once at startup).

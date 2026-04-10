@@ -17,6 +17,49 @@ use crate::rpc::UnifiedRpcClient;
 use crate::storage::StorageManager;
 use crate::types::config::chain::ChainConfig;
 
+async fn maybe_emit_range_complete(
+    range_start: u64,
+    range_end: u64,
+    decoder_tx: &Option<Sender<DecoderMessage>>,
+    state: &EthCallCatchupState,
+    local_state: &mut CollectorState,
+) {
+    if local_state.emitted_complete_ranges.contains(&range_start) {
+        return;
+    }
+
+    let regular_done = state.range_regular_done.contains(&range_start);
+    let factory_done = (!state.has_factory_calls && !state.has_factory_once_calls)
+        || state.range_factory_done.contains(&range_start);
+    let event_done = !state.has_event_triggered_calls
+        || local_state.completed_event_ranges.contains(&range_start);
+
+    if !(regular_done && factory_done && event_done) {
+        return;
+    }
+
+    if let Some(tx) = decoder_tx {
+        if let Err(e) = tx
+            .send(DecoderMessage::EthCallsBlockComplete {
+                range_start,
+                range_end,
+                retry_transform_after_decode: false,
+            })
+            .await
+        {
+            tracing::warn!(
+                "Failed to send eth_call range completion for blocks {}-{}: {}",
+                range_start,
+                range_end - 1,
+                e
+            );
+            return;
+        }
+    }
+
+    local_state.emitted_complete_ranges.insert(range_start);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_eth_calls(
     chain: &ChainConfig,
@@ -44,7 +87,8 @@ pub async fn collect_eth_calls(
     loop {
         if local_state.block_rx_closed {
             // Check if we should still wait for factory or event trigger data
-            let waiting_for_factory = state.has_factory_calls && factory_rx.is_some();
+            let waiting_for_factory =
+                (state.has_factory_calls || state.has_factory_once_calls) && factory_rx.is_some();
             let waiting_for_events =
                 state.has_event_triggered_calls && !local_state.event_trigger_rx_closed;
 
@@ -60,6 +104,13 @@ pub async fn collect_eth_calls(
                         None => std::future::pending().await,
                     }
                 } => {
+                    let completed_range = factory_result.as_ref().and_then(|msg| match msg {
+                        FactoryMessage::RangeComplete {
+                            range_start,
+                            range_end,
+                        } => Some((*range_start, *range_end)),
+                        _ => None,
+                    });
                     handle_factory_message(
                         factory_result,
                         &mut state,
@@ -70,6 +121,17 @@ pub async fn collect_eth_calls(
                         storage_manager.as_ref(),
                     )
                     .await?;
+
+                    if let Some((range_start, range_end)) = completed_range {
+                        maybe_emit_range_complete(
+                            range_start,
+                            range_end,
+                            &decoder_tx,
+                            &state,
+                            &mut local_state,
+                        )
+                        .await;
+                    }
                 }
 
                 event_result = async {
@@ -78,6 +140,13 @@ pub async fn collect_eth_calls(
                         None => std::future::pending().await,
                     }
                 } => {
+                    let completed_range = event_result.as_ref().and_then(|msg| match msg {
+                        EventTriggerMessage::RangeComplete {
+                            range_start,
+                            range_end,
+                        } => Some((*range_start, *range_end)),
+                        _ => None,
+                    });
                     handle_event_trigger_message(
                         event_result,
                         &mut state,
@@ -88,6 +157,18 @@ pub async fn collect_eth_calls(
                         storage_manager.as_ref(),
                     )
                     .await?;
+
+                    if let Some((range_start, range_end)) = completed_range {
+                        local_state.completed_event_ranges.insert(range_start);
+                        maybe_emit_range_complete(
+                            range_start,
+                            range_end,
+                            &decoder_tx,
+                            &state,
+                            &mut local_state,
+                        )
+                        .await;
+                    }
                 }
             }
             continue;
@@ -122,6 +203,14 @@ pub async fn collect_eth_calls(
                                     storage_manager.as_ref(),
                                 )
                                 .await?;
+                                maybe_emit_range_complete(
+                                    range_start,
+                                    range_start + state.range_size,
+                                    &decoder_tx,
+                                    &state,
+                                    &mut local_state,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -137,6 +226,13 @@ pub async fn collect_eth_calls(
                     None => std::future::pending().await,
                 }
             } => {
+                let completed_range = factory_result.as_ref().and_then(|msg| match msg {
+                    FactoryMessage::RangeComplete {
+                        range_start,
+                        range_end,
+                    } => Some((*range_start, *range_end)),
+                    _ => None,
+                });
                 handle_factory_message(
                     factory_result,
                     &mut state,
@@ -147,6 +243,17 @@ pub async fn collect_eth_calls(
                     storage_manager.as_ref(),
                 )
                 .await?;
+
+                if let Some((range_start, range_end)) = completed_range {
+                    maybe_emit_range_complete(
+                        range_start,
+                        range_end,
+                        &decoder_tx,
+                        &state,
+                        &mut local_state,
+                    )
+                    .await;
+                }
             }
 
             event_result = async {
@@ -155,6 +262,13 @@ pub async fn collect_eth_calls(
                     None => std::future::pending().await,
                 }
             } => {
+                let completed_range = event_result.as_ref().and_then(|msg| match msg {
+                    EventTriggerMessage::RangeComplete {
+                        range_start,
+                        range_end,
+                    } => Some((*range_start, *range_end)),
+                    _ => None,
+                });
                 handle_event_trigger_message(
                     event_result,
                     &mut state,
@@ -165,6 +279,18 @@ pub async fn collect_eth_calls(
                     storage_manager.as_ref(),
                 )
                 .await?;
+
+                if let Some((range_start, range_end)) = completed_range {
+                    local_state.completed_event_ranges.insert(range_start);
+                    maybe_emit_range_complete(
+                        range_start,
+                        range_end,
+                        &decoder_tx,
+                        &state,
+                        &mut local_state,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -175,6 +301,11 @@ pub async fn collect_eth_calls(
     let remaining_ranges: Vec<(u64, Vec<BlockInfo>)> =
         std::mem::take(&mut state.range_data).into_iter().collect();
     for (range_start, blocks) in remaining_ranges {
+        let max_block = blocks
+            .iter()
+            .map(|b| b.block_number)
+            .max()
+            .unwrap_or(range_start);
         process_incomplete_range(
             range_start,
             blocks,
@@ -185,6 +316,14 @@ pub async fn collect_eth_calls(
             storage_manager.as_ref(),
         )
         .await?;
+        maybe_emit_range_complete(
+            range_start,
+            max_block + 1,
+            &decoder_tx,
+            &state,
+            &mut local_state,
+        )
+        .await;
     }
 
     // Signal decoder that all ranges are complete

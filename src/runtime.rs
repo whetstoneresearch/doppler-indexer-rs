@@ -138,24 +138,24 @@ pub fn build_rpc_client(
     batch_size: usize,
 ) -> anyhow::Result<(Arc<SlidingWindowRateLimiter>, Arc<UnifiedRpcClient>)> {
     let concurrency = rpc_config.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
-    let cu_per_second = rpc_config
-        .compute_units_per_second
+    let units_per_second = rpc_config
+        .units_per_second()
         .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
-    let rate_limiter = Arc::new(SlidingWindowRateLimiter::new(cu_per_second));
+    let rate_limiter = Arc::new(SlidingWindowRateLimiter::new(units_per_second));
 
     let client = UnifiedRpcClient::from_url_with_options(
         rpc_url,
-        cu_per_second,
+        units_per_second,
         concurrency,
         batch_size,
         Some(rate_limiter.clone()),
     )?;
 
     tracing::info!(
-        "RPC config: concurrency={}, cu_per_second={}, batch_size={}",
+        "RPC config: concurrency={}, units_per_second={}, batch_size={}",
         concurrency,
-        cu_per_second,
+        units_per_second,
         batch_size
     );
 
@@ -170,13 +170,13 @@ pub fn build_rpc_client_with_limiter(
     shared_limiter: Arc<SlidingWindowRateLimiter>,
 ) -> anyhow::Result<UnifiedRpcClient> {
     let concurrency = rpc_config.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
-    let cu_per_second = rpc_config
-        .compute_units_per_second
+    let units_per_second = rpc_config
+        .units_per_second()
         .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
     UnifiedRpcClient::from_url_with_options(
         rpc_url,
-        cu_per_second,
+        units_per_second,
         concurrency,
         batch_size,
         Some(shared_limiter),
@@ -347,16 +347,16 @@ impl ChainRuntime {
 
         // Resolve RPC parameters before building client
         let concurrency = chain.rpc.concurrency.unwrap_or(rpc_defaults::CONCURRENCY);
-        let cu_per_second = chain
+        let units_per_second = chain
             .rpc
-            .compute_units_per_second
+            .units_per_second()
             .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
 
         // Build RPC client, reusing shared rate limiter if provided
         let (rate_limiter, http_client) = if let Some(limiter) = shared_rate_limiter {
             let client = UnifiedRpcClient::from_url_with_options(
                 &rpc_url,
-                cu_per_second,
+                units_per_second,
                 concurrency,
                 rpc_batch_size,
                 Some(limiter.clone()),
@@ -588,7 +588,7 @@ impl FullPipelineContext {
                     let sm_for_current = sm.clone();
                     crate::raw_data::historical::catchup::receipts::collect_receipts(
                         &chain,
-                        &*receipts_client,
+                        &receipts_client,
                         &cfg,
                         &log_tx,
                         &factory_log_tx,

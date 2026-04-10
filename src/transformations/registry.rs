@@ -765,6 +765,7 @@ mod tests {
     use crate::transformations::context::TransformationContext;
     use crate::transformations::error::TransformationError;
     use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+    use crate::transformations::util::usd_price::chainlink_latest_answer_dependency;
     use async_trait::async_trait;
 
     /// A mock event handler for testing call dependency validation.
@@ -1366,5 +1367,39 @@ mod tests {
                 "DopplerHookCreateHandler".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn usd_swap_handlers_all_declare_chainlink_dependency() {
+        let registry = build_registry(1);
+        let expected_handlers: HashSet<&'static str> = HashSet::from([
+            "V3SwapMetricsHandler",
+            "LockableV3SwapMetricsHandler",
+            "MulticurveSwapMetricsHandler",
+            "DecayMulticurveSwapMetricsHandler",
+            "ScheduledMulticurveSwapMetricsHandler",
+            "DhookSwapMetricsHandler",
+            "V4BaseMetricsHandler",
+            "MigrationPoolSwapMetricsHandler",
+        ]);
+        let chainlink_dep = chainlink_latest_answer_dependency();
+        let mut seen = HashSet::new();
+
+        for handler_info in registry.unique_event_handlers() {
+            let name = handler_info.handler.name();
+            if expected_handlers.contains(name) {
+                assert!(
+                    handler_info
+                        .handler
+                        .call_dependencies()
+                        .contains(&chainlink_dep),
+                    "{} must declare Chainlink latestAnswer as a call dependency",
+                    name
+                );
+                seen.insert(name);
+            }
+        }
+
+        assert_eq!(seen, expected_handlers);
     }
 }

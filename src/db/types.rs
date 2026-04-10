@@ -90,8 +90,24 @@ pub enum DbOperation {
         table: String,
         where_clause: WhereClause,
     },
-    /// Raw SQL for complex operations (use sparingly)
-    RawSql { query: String, params: Vec<DbValue> },
+    /// Raw SQL for complex operations (use sparingly).
+    ///
+    /// `snapshot` is optional metadata for live-mode rollback. When present,
+    /// the executor snapshots the targeted row before executing the SQL and can
+    /// later restore it during reorg handling.
+    RawSql {
+        query: String,
+        params: Vec<DbValue>,
+        snapshot: Option<DbSnapshot>,
+    },
+}
+
+/// Snapshot metadata for row-modifying operations that cannot be expressed as a
+/// standard Upsert.
+#[derive(Debug, Clone)]
+pub struct DbSnapshot {
+    pub table: String,
+    pub key_columns: Vec<(String, DbValue)>,
 }
 
 /// WHERE clause for UPDATE and DELETE operations.
