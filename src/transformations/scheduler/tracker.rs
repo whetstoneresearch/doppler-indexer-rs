@@ -123,7 +123,10 @@ impl CompletionTracker {
     /// The `starts` must be sorted ascending. This enables contiguous watermark
     /// tracking for handlers with `contiguous_handler_dependencies`.
     pub(crate) fn with_available_starts(starts: Vec<u64>) -> Self {
-        debug_assert!(starts.windows(2).all(|w| w[0] < w[1]), "starts must be sorted");
+        debug_assert!(
+            starts.windows(2).all(|w| w[0] < w[1]),
+            "starts must be sorted"
+        );
         Self {
             state: RwLock::new(HandlerRangeState {
                 completed: HashMap::new(),
@@ -498,7 +501,7 @@ impl CompletionTracker {
             let contiguous = self.contiguous.read().await;
             for dep in contiguous_deps {
                 let watermark = contiguous.watermarks.get(dep).copied().flatten();
-                if !watermark.is_some_and(|w| w >= range_start) {
+                if watermark.is_none_or(|w| w < range_start) {
                     return DepState::Waiting;
                 }
             }
@@ -509,7 +512,10 @@ impl CompletionTracker {
             let call_deps = self.call_dep_ranges.read().await;
             for (source, function) in call_dep_keys {
                 let key = (source.clone(), function.clone());
-                if !call_deps.get(&key).is_some_and(|r| r.contains(&range_start)) {
+                if !call_deps
+                    .get(&key)
+                    .is_some_and(|r| r.contains(&range_start))
+                {
                     return DepState::Waiting;
                 }
             }
@@ -541,10 +547,16 @@ impl CompletionTracker {
             {
                 DepState::Ready => return Ok(()),
                 DepState::DepFailed { dep_name } => {
-                    return Err(DepWaitError::DepFailed { dep_name, range_start })
+                    return Err(DepWaitError::DepFailed {
+                        dep_name,
+                        range_start,
+                    })
                 }
                 DepState::DepBlocked { dep_name } => {
-                    return Err(DepWaitError::DepBlocked { dep_name, range_start })
+                    return Err(DepWaitError::DepBlocked {
+                        dep_name,
+                        range_start,
+                    })
                 }
                 DepState::Waiting => notified.await,
             }
@@ -919,7 +931,9 @@ mod tests {
 
     #[tokio::test]
     async fn wait_ready_extended_contiguous_dep_gates() {
-        let tracker = Arc::new(CompletionTracker::with_available_starts(vec![100, 200, 300]));
+        let tracker = Arc::new(CompletionTracker::with_available_starts(vec![
+            100, 200, 300,
+        ]));
         // A has completed 100 only; contiguous watermark = 100.
         tracker.seed_completed("A", [100]).await;
 
@@ -931,7 +945,10 @@ mod tests {
                 .unwrap();
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!handle.is_finished(), "should wait for A's watermark to reach 200");
+        assert!(
+            !handle.is_finished(),
+            "should wait for A's watermark to reach 200"
+        );
 
         // Complete A:200 → watermark advances to 200 → waiter unblocks.
         tracker.mark_completed("A", 200).await;
@@ -959,7 +976,9 @@ mod tests {
         // Register the call-dep range (range_end differs from log's range_end — only range_start matters).
         let mut ranges = HashSet::new();
         ranges.insert((100u64, 250u64)); // Different range_end than log's (100, 200)
-        tracker.register_call_dep_ranges("src", "func", ranges).await;
+        tracker
+            .register_call_dep_ranges("src", "func", ranges)
+            .await;
 
         tokio::time::timeout(Duration::from_millis(100), handle)
             .await
@@ -969,7 +988,9 @@ mod tests {
 
     #[tokio::test]
     async fn wait_ready_extended_combined_gating() {
-        let tracker = Arc::new(CompletionTracker::with_available_starts(vec![100, 200, 300]));
+        let tracker = Arc::new(CompletionTracker::with_available_starts(vec![
+            100, 200, 300,
+        ]));
         // Need: handler dep B completed for range 200, contiguous dep A >= 200,
         // call dep (src, func) available for range_start 200.
         tracker.seed_completed("A", [100]).await;
@@ -978,12 +999,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let call_deps = vec![("src".to_string(), "func".to_string())];
             tracker2
-                .wait_ready_extended(
-                    &names(&["B"]),
-                    &names(&["A"]),
-                    &call_deps,
-                    200,
-                )
+                .wait_ready_extended(&names(&["B"]), &names(&["A"]), &call_deps, 200)
                 .await
                 .unwrap();
         });
@@ -993,7 +1009,10 @@ mod tests {
         // Satisfy handler dep B.
         tracker.mark_completed("B", 200).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!handle.is_finished(), "still waiting on contiguous + call dep");
+        assert!(
+            !handle.is_finished(),
+            "still waiting on contiguous + call dep"
+        );
 
         // Satisfy contiguous dep A.
         tracker.mark_completed("A", 200).await;
@@ -1003,7 +1022,9 @@ mod tests {
         // Satisfy call dep (call-dep file has different range_end — only range_start matters).
         let mut ranges = HashSet::new();
         ranges.insert((200u64, 400u64));
-        tracker.register_call_dep_ranges("src", "func", ranges).await;
+        tracker
+            .register_call_dep_ranges("src", "func", ranges)
+            .await;
         tokio::time::timeout(Duration::from_millis(100), handle)
             .await
             .expect("waiter should resolve after all deps satisfied")
@@ -1014,12 +1035,12 @@ mod tests {
     async fn probe_extended_reports_failed_dep() {
         let tracker = CompletionTracker::with_available_starts(vec![100, 200]);
         tracker.mark_failed("A", 100).await;
-        let state = tracker
-            .probe_extended(&names(&["A"]), &[], &[], 100)
-            .await;
+        let state = tracker.probe_extended(&names(&["A"]), &[], &[], 100).await;
         assert_eq!(
             state,
-            DepState::DepFailed { dep_name: "A".to_string() }
+            DepState::DepFailed {
+                dep_name: "A".to_string()
+            }
         );
     }
 

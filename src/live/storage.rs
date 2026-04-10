@@ -122,15 +122,20 @@ pub struct LiveStorage {
 
 impl LiveStorage {
     /// Create a new LiveStorage for the given chain.
+    ///
+    /// On construction, removes any orphaned `.lock` files left by a
+    /// previous process crash (file locks are process-scoped).
     pub fn new(chain_name: &str) -> Self {
         let base_dir = PathBuf::from(format!("data/{}/live", chain_name));
         let durable_writes = std::env::var("DOPPLER_DURABLE_WRITES")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
-        Self {
+        let storage = Self {
             base_dir,
             durable_writes,
-        }
+        };
+        storage.cleanup_orphaned_locks();
+        storage
     }
 
     /// Create a new LiveStorage with a custom base directory.
@@ -146,6 +151,41 @@ impl LiveStorage {
     #[allow(dead_code)]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+
+    /// Remove orphaned `.lock` files from the status directory.
+    ///
+    /// File locks are process-scoped and released on exit, so any `.lock`
+    /// files present at startup are orphans from a previous crash.
+    pub fn cleanup_orphaned_locks(&self) {
+        let status_dir = self.base_dir.join("status");
+        if !status_dir.exists() {
+            return;
+        }
+
+        let entries = match fs::read_dir(&status_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut count = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("lock") {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!("Failed to remove orphaned lock file {:?}: {}", path, e);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            tracing::info!(
+                count,
+                "Cleaned up orphaned lock files from status directory"
+            );
+        }
     }
 
     /// Ensure all subdirectories exist and clean up leftover .tmp files.

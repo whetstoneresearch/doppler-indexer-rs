@@ -1017,8 +1017,14 @@ mod tests {
                 .unwrap()
         };
 
-        assert!(matches!(get("S", 100).status, OutcomeStatus::Blocked { .. }));
-        assert!(matches!(get("S", 101).status, OutcomeStatus::Blocked { .. }));
+        assert!(matches!(
+            get("S", 100).status,
+            OutcomeStatus::Blocked { .. }
+        ));
+        assert!(matches!(
+            get("S", 101).status,
+            OutcomeStatus::Blocked { .. }
+        ));
         assert_eq!(
             get("D", 100).status,
             OutcomeStatus::DepCascadeBlocked {

@@ -108,7 +108,7 @@ fn spawn_fallback_flush(
     join_set.spawn(async move {
         let block_infos: Vec<BlockInfo> = blocks_to_fetch.into_iter().map(|(_, bi)| bi).collect();
         let refs: Vec<&BlockInfo> = block_infos.iter().collect();
-        let result = fetch_tx_receipts_batched(&refs, &*client_clone, &rf).await;
+        let result = fetch_tx_receipts_batched(&refs, &client_clone, &rf).await;
         ReceiptFetchResult::FallbackBatch {
             blocks: blocks_with_ranges,
             result,
@@ -479,7 +479,7 @@ pub async fn collect_receipts(
                                 let block_refs: Vec<&BlockInfo> = vec![&block_info];
                                 let result = fetch_block_receipts_bounded(
                                     &block_refs,
-                                    &*client,
+                                    &client,
                                     &receipt_fields,
                                     &method_str,
                                     1, // single-block fetch
@@ -856,7 +856,7 @@ pub async fn collect_receipts(
                     let pr = process_range(
                         &range,
                         blocks,
-                        &*client,
+                        &client,
                         receipt_fields,
                         &schema,
                         &output_dir,
@@ -932,7 +932,7 @@ pub async fn collect_receipts(
 
         let block_infos: Vec<BlockInfo> = blocks_to_fetch.into_iter().map(|(_, bi)| bi).collect();
         let refs: Vec<&BlockInfo> = block_infos.iter().collect();
-        let result = fetch_tx_receipts_batched(&refs, &*client, receipt_fields).await?;
+        let result = fetch_tx_receipts_batched(&refs, &client, receipt_fields).await?;
 
         // Partition records by range
         let mut minimal_by_range: HashMap<u64, Vec<_>> = HashMap::new();
@@ -1035,7 +1035,7 @@ pub async fn collect_receipts(
 
             let result = fetch_receipts_for_blocks(
                 &block_refs,
-                &*client,
+                &client,
                 receipt_fields,
                 chain.block_receipts_method.as_ref().map(|m| m.as_str()),
                 receipt_fetch_concurrency,

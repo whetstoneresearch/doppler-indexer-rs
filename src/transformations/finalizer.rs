@@ -377,6 +377,7 @@ impl RangeFinalizer {
                         DbValue::Text(error_message),
                         DbValue::JsonB(debug_context),
                     ],
+                    snapshot: None,
                 }
             })
             .collect();
@@ -386,8 +387,8 @@ impl RangeFinalizer {
     }
 
     /// Check if this range requires eth_call completion signal before finalization.
-    fn range_requires_eth_call_completion(&self, range_key: (u64, u64)) -> bool {
-        self.expect_eth_call_completion && range_key.1.saturating_sub(range_key.0) == 1
+    fn range_requires_eth_call_completion(&self, _range_key: (u64, u64)) -> bool {
+        self.expect_eth_call_completion
     }
 
     // ─── Reorg Cleanup ─────────────────────────────────────────────────
@@ -660,8 +661,8 @@ pub(crate) fn dedupe_restore_snapshots(
 /// where `uncovered_blocks` is the subset of `orphaned` that have no snapshot
 /// coverage for that table.  Tables where all orphaned blocks are covered are
 /// omitted entirely.
-pub(crate) fn compute_fallback_deletes<'a>(
-    tables_to_clean: &HashSet<&'a str>,
+pub(crate) fn compute_fallback_deletes(
+    tables_to_clean: &HashSet<&str>,
     tables_covered: &HashMap<String, HashSet<u64>>,
     orphaned: &[u64],
 ) -> Vec<(String, Vec<u64>)> {

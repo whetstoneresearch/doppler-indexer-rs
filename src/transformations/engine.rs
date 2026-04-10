@@ -34,8 +34,8 @@ use super::scheduler::dag::{
     DagScheduler, OutcomeStatus, WorkItem, WorkItemOutcome, WorkItemRunResult,
 };
 use super::scheduler::loader::{
-    read_receipt_addresses, CallDepScanner, CatchupLoader, CatchupPayload,
-    run_call_dep_scanner_loop,
+    read_receipt_addresses, run_call_dep_scanner_loop, CallDepScanner, CatchupLoader,
+    CatchupPayload,
 };
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
@@ -414,7 +414,7 @@ impl TransformationEngine {
                         continue;
                     }
 
-                    if !path.extension().is_some_and(|ext| ext == "parquet") {
+                    if path.extension().is_none_or(|ext| ext != "parquet") {
                         continue;
                     }
 
@@ -2811,7 +2811,11 @@ mod tests {
         ));
 
         let mut complete_index = HashMap::new();
-        update_contract_index(&mut complete_index, &range_key(100, 199), &expected_for_source);
+        update_contract_index(
+            &mut complete_index,
+            &range_key(100, 199),
+            &expected_for_source,
+        );
         write_contract_index(dir.path(), &complete_index).unwrap();
         assert!(call_dependency_contract_index_complete(
             dir.path(),
