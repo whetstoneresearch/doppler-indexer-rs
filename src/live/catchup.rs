@@ -516,7 +516,7 @@ impl LiveCatchupService {
                 .send(DecoderMessage::LogsReady {
                     range_start: block_number,
                     range_end: block_number + 1,
-                    logs: log_data,
+                    logs: std::sync::Arc::new(log_data),
                     live_mode: true,
                     has_factory_matchers: !factory_addresses.addresses_by_collection.is_empty(),
                 })

@@ -361,7 +361,7 @@ pub(crate) fn write_parquet(
     output_path: &Path,
 ) -> Result<(), BlockCollectionError> {
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 

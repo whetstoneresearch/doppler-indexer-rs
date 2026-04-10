@@ -577,8 +577,9 @@ async fn write_factory_parquet_files(
 
             if force_rewrite
                 || (!existing_files.contains(&rel_path)
-                    && !s3_manifest
-                        .is_some_and(|m| m.has_factories(collection_name, range_start, range_end - 1)))
+                    && !s3_manifest.is_some_and(|m| {
+                        m.has_factories(collection_name, range_start, range_end - 1)
+                    }))
             {
                 let sub_dir = output_dir.join(collection_name);
                 tokio::fs::create_dir_all(&sub_dir).await?;
@@ -699,7 +700,7 @@ fn write_factory_records_to_parquet(
     ];
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -927,7 +928,7 @@ fn write_empty_factory_parquet(output_path: &Path) -> Result<(), FactoryCollecti
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
 
-    crate::storage::atomic_write_parquet(&batch, output_path)?;
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 

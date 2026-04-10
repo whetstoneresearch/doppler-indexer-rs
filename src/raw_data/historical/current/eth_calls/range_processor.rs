@@ -44,6 +44,7 @@ pub(super) async fn process_complete_range(
         output_dir: &state.base_output_dir,
         existing_files: &state.existing_files,
         rpc_batch_size: state.rpc_batch_size,
+        repair: state.repair,
         decoder_tx,
         chain_name: &chain.name,
         storage_manager,
@@ -201,6 +202,7 @@ pub(super) async fn process_incomplete_range(
         output_dir: &state.base_output_dir,
         existing_files: &state.existing_files,
         rpc_batch_size: state.rpc_batch_size,
+        repair: state.repair,
         decoder_tx,
         chain_name: &chain.name,
         storage_manager,
@@ -333,8 +335,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use alloy::primitives::{Address, U256};
-    use crate::raw_data::historical::eth_calls::{BlockInfo, OnceCallConfig, FrequencyState};
+    use crate::raw_data::historical::eth_calls::{BlockInfo, FrequencyState, OnceCallConfig};
     use crate::raw_data::historical::factories::FactoryAddressData;
     use crate::rpc::UnifiedRpcClient;
     use crate::types::config::chain::ChainConfig;
@@ -342,6 +343,7 @@ mod tests {
         AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
         FactoryEventConfigOrArray, FactoryParameterLocation,
     };
+    use alloy::primitives::{Address, U256};
 
     fn test_chain() -> ChainConfig {
         ChainConfig {
@@ -418,6 +420,7 @@ mod tests {
             has_factory_calls: false,
             has_factory_once_calls: true,
             has_event_triggered_calls: false,
+            repair: false,
             max_params: 0,
             factory_max_params: 0,
             existing_files: HashSet::new(),
@@ -443,9 +446,13 @@ mod tests {
         let mut state = factory_once_only_state(tmp.path());
 
         // Pre-populate range_data with one block
-        state
-            .range_data
-            .insert(0, vec![BlockInfo { block_number: 0, timestamp: 100 }]);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
         // Do NOT insert range_factory_data — factory hasn't arrived yet
 
         process_complete_range(0, &mut state, &client, &chain, &None, None)
@@ -480,7 +487,10 @@ mod tests {
             },
         );
 
-        let blocks = vec![BlockInfo { block_number: 0, timestamp: 100 }];
+        let blocks = vec![BlockInfo {
+            block_number: 0,
+            timestamp: 100,
+        }];
 
         process_incomplete_range(0, blocks, &mut state, &client, &chain, &None, None)
             .await

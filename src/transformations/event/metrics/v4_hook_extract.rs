@@ -26,9 +26,12 @@ pub fn extract_v4_hook_swaps(
 ) -> Result<Vec<SwapInput>, TransformationError> {
     // Build a lookup map once so each swap event can find its matching getSlot0 result
     // in O(1) rather than re-scanning the full call list for every event (O(n²)).
-    let slot0_by_log_index: HashMap<u32, _> = ctx
+    let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
         .calls_of_type(call_source, "getSlot0")
-        .filter_map(|call| call.trigger_log_index.map(|idx| (idx, call)))
+        .filter_map(|call| {
+            call.trigger_log_index
+                .map(|idx| ((call.block_number, idx), call))
+        })
         .collect();
 
     let mut swaps = Vec::new();
@@ -36,7 +39,10 @@ pub fn extract_v4_hook_swaps(
     for event in ctx.events_of_type(event_source, "Swap") {
         let pool_id = event.extract_bytes32("poolId")?;
 
-        let Some(slot0) = slot0_by_log_index.get(&event.log_index).copied() else {
+        let Some(slot0) = slot0_by_event_key
+            .get(&(event.block_number, event.log_index))
+            .copied()
+        else {
             return Err(TransformationError::MissingData(format!(
                 "No getSlot0 call for swap at block {} log_index {} (source: {})",
                 event.block_number, event.log_index, call_source
@@ -58,6 +64,7 @@ pub fn extract_v4_hook_swaps(
 
         swaps.push(SwapInput {
             pool_id: pool_id.to_vec(),
+            transaction_hash: event.transaction_hash,
             block_number: event.block_number,
             block_timestamp: event.block_timestamp,
             log_index: event.log_index,
@@ -139,11 +146,15 @@ mod tests {
     use alloy_primitives::{I256, U256};
 
     use crate::rpc::UnifiedRpcClient;
-    use crate::transformations::context::{DecodedCall, DecodedEvent, DecodedValue, TransformationContext};
+    use crate::transformations::context::{
+        DecodedCall, DecodedEvent, DecodedValue, TransformationContext,
+    };
     use crate::transformations::historical::HistoricalDataReader;
     use crate::types::uniswap::v4::PoolKey;
 
-    use super::{extract_flat_modify_liquidity, extract_tuple_modify_liquidity, extract_v4_hook_swaps};
+    use super::{
+        extract_flat_modify_liquidity, extract_tuple_modify_liquidity, extract_v4_hook_swaps,
+    };
 
     const SOURCE: &str = "UniswapV4MulticurveInitializerHook";
 
@@ -172,12 +183,22 @@ mod tests {
     }
 
     fn swap_event(log_index: u32, pool_id: [u8; 32], amount0: i128, amount1: i128) -> DecodedEvent {
+        swap_event_at_block(100, log_index, pool_id, amount0, amount1)
+    }
+
+    fn swap_event_at_block(
+        block_number: u64,
+        log_index: u32,
+        pool_id: [u8; 32],
+        amount0: i128,
+        amount1: i128,
+    ) -> DecodedEvent {
         let mut params = HashMap::new();
         params.insert("poolId".to_string(), DecodedValue::Bytes32(pool_id));
         params.insert("amount0".to_string(), DecodedValue::Int128(amount0));
         params.insert("amount1".to_string(), DecodedValue::Int128(amount1));
         DecodedEvent {
-            block_number: 100,
+            block_number,
             block_timestamp: 1000,
             transaction_hash: [0u8; 32],
             log_index,
@@ -189,12 +210,30 @@ mod tests {
         }
     }
 
-    fn slot0_call(trigger_log_index: u32, sqrt_price_x96: U256, tick: i32, is_reverted: bool) -> DecodedCall {
+    fn slot0_call(
+        trigger_log_index: u32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        is_reverted: bool,
+    ) -> DecodedCall {
+        slot0_call_at_block(100, trigger_log_index, sqrt_price_x96, tick, is_reverted)
+    }
+
+    fn slot0_call_at_block(
+        block_number: u64,
+        trigger_log_index: u32,
+        sqrt_price_x96: U256,
+        tick: i32,
+        is_reverted: bool,
+    ) -> DecodedCall {
         let mut result = HashMap::new();
-        result.insert("sqrtPriceX96".to_string(), DecodedValue::Uint256(sqrt_price_x96));
+        result.insert(
+            "sqrtPriceX96".to_string(),
+            DecodedValue::Uint256(sqrt_price_x96),
+        );
         result.insert("tick".to_string(), DecodedValue::Int32(tick));
         DecodedCall {
-            block_number: 100,
+            block_number,
             block_timestamp: 1000,
             contract_address: [0u8; 20],
             source_name: SOURCE.to_string(),
@@ -219,7 +258,10 @@ mod tests {
         let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE);
         assert!(result.is_err(), "missing getSlot0 should return Err");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("getSlot0"), "error should mention getSlot0: {err}");
+        assert!(
+            err.contains("getSlot0"),
+            "error should mention getSlot0: {err}"
+        );
     }
 
     #[test]
@@ -230,7 +272,10 @@ mod tests {
             vec![slot0_call(0, q96(), 0, true)],
         );
         let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE).unwrap();
-        assert!(result.is_empty(), "reverted slot0 should produce no SwapInput");
+        assert!(
+            result.is_empty(),
+            "reverted slot0 should produce no SwapInput"
+        );
     }
 
     #[test]
@@ -259,14 +304,45 @@ mod tests {
         let pool_a = [1u8; 32];
         let pool_b = [2u8; 32];
         let ctx = make_test_ctx(
-            vec![swap_event(0, pool_a, 100, -100), swap_event(1, pool_b, 200, -200)],
-            vec![slot0_call(0, q96(), 10, false), slot0_call(1, q96(), 20, false)],
+            vec![
+                swap_event(0, pool_a, 100, -100),
+                swap_event(1, pool_b, 200, -200),
+            ],
+            vec![
+                slot0_call(0, q96(), 10, false),
+                slot0_call(1, q96(), 20, false),
+            ],
         );
         let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].pool_id, pool_a.to_vec());
         assert_eq!(result[0].tick, 10);
         assert_eq!(result[1].pool_id, pool_b.to_vec());
+        assert_eq!(result[1].tick, 20);
+    }
+
+    #[test]
+    fn test_swap_duplicate_log_index_across_blocks_matches_on_block_and_log_index() {
+        let pool_a = [1u8; 32];
+        let pool_b = [2u8; 32];
+        let ctx = make_test_ctx(
+            vec![
+                swap_event_at_block(100, 0, pool_a, 100, -100),
+                swap_event_at_block(101, 0, pool_b, 200, -200),
+            ],
+            vec![
+                slot0_call_at_block(100, 0, q96(), 10, false),
+                slot0_call_at_block(101, 0, q96(), 20, false),
+            ],
+        );
+
+        let result = extract_v4_hook_swaps(&ctx, SOURCE, SOURCE).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].pool_id, pool_a.to_vec());
+        assert_eq!(result[0].block_number, 100);
+        assert_eq!(result[0].tick, 10);
+        assert_eq!(result[1].pool_id, pool_b.to_vec());
+        assert_eq!(result[1].block_number, 101);
         assert_eq!(result[1].tick, 20);
     }
 
@@ -281,10 +357,19 @@ mod tests {
         let tick_spacing = 60i32;
 
         let mut params = HashMap::new();
-        params.insert("key.currency0".to_string(), DecodedValue::Address(currency0));
-        params.insert("key.currency1".to_string(), DecodedValue::Address(currency1));
+        params.insert(
+            "key.currency0".to_string(),
+            DecodedValue::Address(currency0),
+        );
+        params.insert(
+            "key.currency1".to_string(),
+            DecodedValue::Address(currency1),
+        );
         params.insert("key.fee".to_string(), DecodedValue::Uint32(fee));
-        params.insert("key.tickSpacing".to_string(), DecodedValue::Int32(tick_spacing));
+        params.insert(
+            "key.tickSpacing".to_string(),
+            DecodedValue::Int32(tick_spacing),
+        );
         params.insert("key.hooks".to_string(), DecodedValue::Address(hooks));
         params.insert("params.tickLower".to_string(), DecodedValue::Int32(-100));
         params.insert("params.tickUpper".to_string(), DecodedValue::Int32(100));
@@ -351,7 +436,8 @@ mod tests {
             contract_address: [0u8; 20],
             source_name: "DecayMulticurveHook".to_string(),
             event_name: "ModifyLiquidity".to_string(),
-            event_signature: "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)".to_string(),
+            event_signature: "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
+                .to_string(),
             params,
         };
 

@@ -206,6 +206,7 @@ pub(super) async fn handle_once_file_backfilled(
             output_base,
             transform_tx,
             false,
+            false,
             chain_name,
             "historical",
         )

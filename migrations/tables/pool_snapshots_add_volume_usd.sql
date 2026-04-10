@@ -1,0 +1,1 @@
+ALTER TABLE pool_snapshots ADD COLUMN IF NOT EXISTS volume_usd NUMERIC;

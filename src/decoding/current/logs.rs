@@ -128,7 +128,7 @@ pub async fn decode_logs_live(
                     // For live mode, range_start == range_end (single block)
                     // Use the full accumulated factory addresses
                     process_logs_live(
-                        &logs,
+                        logs.as_slice(),
                         range_start,
                         matchers,
                         &accumulated_factory_addresses,
@@ -140,10 +140,10 @@ pub async fn decode_logs_live(
                 } else {
                     // Historical mode: write to parquet
                     // Build per-range expected contracts so the contract index gets an entry
-                    let expected_for_range = contracts
-                        .map(|c| build_expected_factory_contracts_for_range(c, range_end));
+                    let expected_for_range =
+                        contracts.map(|c| build_expected_factory_contracts_for_range(c, range_end));
                     process_logs(
-                        &logs,
+                        logs.as_slice(),
                         range_start,
                         range_end,
                         matchers,

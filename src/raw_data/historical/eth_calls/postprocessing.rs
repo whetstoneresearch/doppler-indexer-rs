@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
+use metrics::counter;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
@@ -89,14 +91,27 @@ pub(crate) async fn finalize_regular_results(
     // 1. Parquet write via async wrapper
     let max_params = params.max_params;
     let results = params.results;
-    #[cfg(feature = "bench")]
-    let write_start = std::time::Instant::now();
+    let write_start = Instant::now();
     write_results_to_parquet_async(results, output_path.clone(), max_params).await?;
+    let write_elapsed = write_start.elapsed();
+
+    // Record eth_call collection metrics
+    counter!(
+        "collection_eth_calls_total",
+        "chain" => params.chain_name.to_string()
+    )
+    .increment(result_count as u64);
+
+    crate::metrics::record_parquet_write(
+        params.chain_name,
+        "eth_calls",
+        write_elapsed.as_secs_f64(),
+        &output_path,
+    );
 
     // 2. Bench recording
     #[cfg(feature = "bench")]
     {
-        let write_time = write_start.elapsed();
         if let Some((bench_label, rpc_time, process_time)) = params.bench {
             crate::bench::record(
                 &bench_label,
@@ -105,7 +120,7 @@ pub(crate) async fn finalize_regular_results(
                 result_count,
                 rpc_time,
                 process_time,
-                write_time,
+                write_elapsed,
             );
         }
     }
@@ -228,14 +243,27 @@ pub(crate) async fn finalize_regular_results_deferred(
 
     let handle = tokio::spawn(async move {
         // 1. Parquet write
-        #[cfg(feature = "bench")]
-        let write_start = std::time::Instant::now();
+        let write_start = Instant::now();
         write_results_to_parquet_async(results, output_path.clone(), max_params).await?;
+        let write_elapsed = write_start.elapsed();
+
+        // Record eth_call collection metrics
+        counter!(
+            "collection_eth_calls_total",
+            "chain" => chain_name.clone()
+        )
+        .increment(result_count as u64);
+
+        crate::metrics::record_parquet_write(
+            &chain_name,
+            "eth_calls",
+            write_elapsed.as_secs_f64(),
+            &output_path,
+        );
 
         // 2. Bench recording
         #[cfg(feature = "bench")]
         {
-            let write_time = write_start.elapsed();
             if let Some((bench_label, rpc_time, process_time)) = bench {
                 crate::bench::record(
                     &bench_label,
@@ -244,7 +272,7 @@ pub(crate) async fn finalize_regular_results_deferred(
                     result_count,
                     rpc_time,
                     process_time,
-                    write_time,
+                    write_elapsed,
                 );
             }
         }

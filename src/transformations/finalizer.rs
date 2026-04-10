@@ -6,11 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
+use metrics::histogram;
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::error::TransformationError;
-use super::live_state::LiveProcessingState;
+use super::live_state::{LiveProcessingState, TimedOutPendingHandler};
 use super::registry::TransformationRegistry;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
 use crate::live::{LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, StorageError};
@@ -120,21 +123,32 @@ impl RangeFinalizer {
         };
 
         if !timed_out_handlers.is_empty() {
+            let timed_out_keys: Vec<String> = timed_out_handlers
+                .iter()
+                .map(|handler| handler.handler_key.clone())
+                .collect();
             tracing::warn!(
                 "Removed {} timed-out pending event handlers for range {:?}: {:?}",
                 timed_out_handlers.len(),
                 range_key,
-                timed_out_handlers
+                timed_out_keys
             );
+
+            self.record_retry_backlog_entries(range_key, &timed_out_handlers, "timed_out")
+                .await?;
 
             // Persist timed-out handlers as failures so they remain retryable
             let is_single_block = range_key.1 - range_key.0 == 1;
             if is_single_block {
                 let storage = LiveStorage::new(&self.chain_name);
                 if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
-                    for key in &timed_out_handlers {
-                        status.failed_handlers.insert(key.clone());
-                        status.completed_handlers.remove(key);
+                    for timed_out_handler in &timed_out_handlers {
+                        status
+                            .failed_handlers
+                            .insert(timed_out_handler.handler_key.clone());
+                        status
+                            .completed_handlers
+                            .remove(&timed_out_handler.handler_key);
                     }
                     status.transformed = false;
                 }) {
@@ -151,8 +165,11 @@ impl RangeFinalizer {
             // Update in-memory state: mark failed, remove from completed
             {
                 let mut state = live_state.lock().await;
-                for key in &timed_out_handlers {
-                    if let Some(name) = self.registry.handler_name_for_key(key) {
+                for timed_out_handler in &timed_out_handlers {
+                    if let Some(name) = self
+                        .registry
+                        .handler_name_for_key(&timed_out_handler.handler_key)
+                    {
                         state
                             .failed_handlers
                             .entry(range_key)
@@ -185,6 +202,7 @@ impl RangeFinalizer {
         range_end: u64,
         live_state: &Mutex<LiveProcessingState>,
     ) -> Result<(), TransformationError> {
+        let finalize_start = Instant::now();
         let range_key = (range_start, range_end);
 
         // Prevent double finalization
@@ -293,12 +311,84 @@ impl RangeFinalizer {
             }
         }
 
+        histogram!(
+            "transformation_range_finalization_duration_seconds",
+            "chain" => self.chain_name.clone(),
+        )
+        .record(finalize_start.elapsed().as_secs_f64());
+
+        Ok(())
+    }
+
+    async fn record_retry_backlog_entries(
+        &self,
+        range_key: (u64, u64),
+        timed_out_handlers: &[TimedOutPendingHandler],
+        failure_reason: &str,
+    ) -> Result<(), TransformationError> {
+        if timed_out_handlers.is_empty() {
+            return Ok(());
+        }
+
+        let operations: Vec<DbOperation> = timed_out_handlers
+            .iter()
+            .map(|handler| {
+                let error_message = format!(
+                    "Timed out after {}s waiting on call deps {:?} and handler deps {:?} while processing {}/{}",
+                    handler.timed_out_after_secs,
+                    handler.required_calls,
+                    handler.required_handlers,
+                    handler.source_name,
+                    handler.event_name,
+                );
+                let debug_context = json!({
+                    "source_name": handler.source_name,
+                    "event_name": handler.event_name,
+                    "required_calls": handler.required_calls,
+                    "required_handlers": handler.required_handlers,
+                    "timed_out_after_secs": handler.timed_out_after_secs,
+                });
+
+                DbOperation::RawSql {
+                    query: "INSERT INTO _handler_retry_backlog (
+                                chain_id,
+                                handler_key,
+                                range_start,
+                                range_end,
+                                failure_reason,
+                                error_message,
+                                debug_context
+                            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                            ON CONFLICT (chain_id, handler_key, range_start)
+                            DO UPDATE SET
+                                range_end = EXCLUDED.range_end,
+                                failure_reason = EXCLUDED.failure_reason,
+                                error_message = EXCLUDED.error_message,
+                                debug_context = EXCLUDED.debug_context,
+                                last_failed_at = NOW(),
+                                failure_count = _handler_retry_backlog.failure_count + 1"
+                        .to_string(),
+                    params: vec![
+                        DbValue::Int64(self.chain_id as i64),
+                        DbValue::Text(handler.handler_key.clone()),
+                        DbValue::Int64(range_key.0 as i64),
+                        DbValue::Int64(range_key.1 as i64),
+                        DbValue::Text(failure_reason.to_string()),
+                        DbValue::Text(error_message),
+                        DbValue::JsonB(debug_context),
+                    ],
+                    snapshot: None,
+                }
+            })
+            .collect();
+
+        self.db_pool.execute_transaction(operations).await?;
         Ok(())
     }
 
     /// Check if this range requires eth_call completion signal before finalization.
-    fn range_requires_eth_call_completion(&self, range_key: (u64, u64)) -> bool {
-        self.expect_eth_call_completion && range_key.1.saturating_sub(range_key.0) == 1
+    fn range_requires_eth_call_completion(&self, _range_key: (u64, u64)) -> bool {
+        self.expect_eth_call_completion
     }
 
     // ─── Reorg Cleanup ─────────────────────────────────────────────────
@@ -571,8 +661,8 @@ pub(crate) fn dedupe_restore_snapshots(
 /// where `uncovered_blocks` is the subset of `orphaned` that have no snapshot
 /// coverage for that table.  Tables where all orphaned blocks are covered are
 /// omitted entirely.
-pub(crate) fn compute_fallback_deletes<'a>(
-    tables_to_clean: &HashSet<&'a str>,
+pub(crate) fn compute_fallback_deletes(
+    tables_to_clean: &HashSet<&str>,
     tables_covered: &HashMap<String, HashSet<u64>>,
     orphaned: &[u64],
 ) -> Vec<(String, Vec<u64>)> {
@@ -679,7 +769,11 @@ mod tests {
         let mut tables_covered: HashMap<String, HashSet<u64>> = HashMap::new();
         let deduped = dedupe_restore_snapshots(per_block, &mut tables_covered);
 
-        assert_eq!(deduped.len(), 2, "two distinct pool rows should both be kept");
+        assert_eq!(
+            deduped.len(),
+            2,
+            "two distinct pool rows should both be kept"
+        );
     }
 
     /// Snapshots for different tables (same key) remain separate.
@@ -720,7 +814,6 @@ mod tests {
             "expected the DELETE snapshot (previous_row = None) from block 100"
         );
     }
-
 
     /// Fix C test: when block 100 has a snapshot but block 101 does not,
     /// the fallback DELETE should target only block 101.

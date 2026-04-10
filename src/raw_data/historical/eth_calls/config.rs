@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::Bytes;
 
+use super::helpers::parse_function_name;
 use super::types::{
     CallConfig, EncodedParam, EthCallCollectionError, OnceCallConfig, ParamCombinations,
 };
@@ -91,12 +92,7 @@ pub fn build_call_configs(
                 };
 
                 let selector = compute_function_selector(&call.function);
-                let function_name = call
-                    .function
-                    .split('(')
-                    .next()
-                    .unwrap_or(&call.function)
-                    .to_string();
+                let function_name = parse_function_name(&call.function);
 
                 let param_combinations = generate_param_combinations(&call.params)?;
 
@@ -144,12 +140,7 @@ pub fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<Onc
             for call in calls {
                 if call.frequency.is_once() {
                     let selector = compute_function_selector(&call.function);
-                    let function_name = call
-                        .function
-                        .split('(')
-                        .next()
-                        .unwrap_or(&call.function)
-                        .to_string();
+                    let function_name = parse_function_name(&call.function);
 
                     // Check if call has self-address params (requires dynamic encoding per address)
                     let (preencoded_calldata, params) = if call.has_self_address_param() {
@@ -233,12 +224,7 @@ pub fn build_factory_once_call_configs(
         for call in call_configs {
             if call.frequency.is_once() {
                 let selector = compute_function_selector(&call.function);
-                let function_name = call
-                    .function
-                    .split('(')
-                    .next()
-                    .unwrap_or(&call.function)
-                    .to_string();
+                let function_name = parse_function_name(&call.function);
 
                 // Resolve target override if specified (resolves to first address only for factory calls)
                 let target_addresses = call.target.as_ref().and_then(|t| {

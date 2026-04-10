@@ -15,10 +15,10 @@ use tokio::task::JoinSet;
 use super::dag::WorkItem;
 use crate::db::DbPool;
 use crate::rpc::UnifiedRpcClient;
-use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses, TransformationContext};
+use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use crate::transformations::engine::HandlerKind;
 use crate::transformations::error::TransformationError;
-use crate::transformations::executor::inject_source_version;
+use crate::transformations::executor::{run_handler_task, DbExecMode};
 use crate::transformations::finalizer::RangeFinalizer;
 use crate::transformations::historical::HistoricalDataReader;
 use crate::transformations::retry::{filter_calls_by_start_block, filter_events_by_start_block};
@@ -63,11 +63,7 @@ where
                 tracing::debug!("Reading decoded data from {}", file_path.display());
                 match read_fn(reader, &file_path, &src, &name) {
                     Ok(items) => {
-                        tracing::debug!(
-                            "Read {} items from {}",
-                            items.len(),
-                            file_path.display()
-                        );
+                        tracing::debug!("Read {} items from {}", items.len(), file_path.display());
                         Ok(items)
                     }
                     Err(e) => {
@@ -77,10 +73,7 @@ where
                                 if io.kind() == std::io::ErrorKind::NotFound
                         );
                         if is_not_found {
-                            tracing::debug!(
-                                "File not found, skipping: {}",
-                                file_path.display()
-                            );
+                            tracing::debug!("File not found, skipping: {}", file_path.display());
                             Ok(Vec::new())
                         } else {
                             tracing::warn!(
@@ -130,7 +123,9 @@ pub(crate) async fn read_receipt_addresses(
     .unwrap_or_else(|e| {
         tracing::error!(
             "read_receipt_addresses panicked for range {}-{}: {}",
-            range_start, range_end, e
+            range_start,
+            range_end,
+            e
         );
         HashMap::new()
     })
@@ -358,50 +353,22 @@ impl CatchupLoader {
             HandlerKind::Call => HashMap::new(),
         };
 
-        let ctx = TransformationContext::new(
+        run_handler_task(
+            payload.handler,
+            Arc::new(events),
+            Arc::new(calls),
+            tx_addresses,
             self.chain_name.clone(),
             self.chain_id,
             range_start,
             range_end,
-            Arc::new(events),
-            Arc::new(calls),
-            tx_addresses,
             self.historical_reader.clone(),
             self.rpc_client.clone(),
             self.contracts.clone(),
-        );
-
-        let ops = payload.handler.handle(&ctx).await?;
-
-        if !ops.is_empty() {
-            let ops = inject_source_version(ops, payload.handler_name, payload.handler_version);
-            match self.db_pool.execute_transaction(ops).await {
-                Ok(()) => {
-                    payload
-                        .handler
-                        .on_commit_success((range_start, range_end))
-                        .await?;
-                }
-                Err(e) => {
-                    if let Err(cb_err) = payload
-                        .handler
-                        .on_commit_failure((range_start, range_end))
-                        .await
-                    {
-                        tracing::warn!(
-                            "on_commit_failure callback failed for {} range {}-{}: {}",
-                            handler_key, range_start, range_end, cb_err
-                        );
-                    }
-                    return Err(TransformationError::DatabaseError(e));
-                }
-            }
-        } else {
-            payload
-                .handler
-                .on_commit_success((range_start, range_end))
-                .await?;
-        }
+            self.db_pool.clone(),
+            &DbExecMode::Direct,
+        )
+        .await?;
 
         self.finalizer
             .record_completed_range_for_handler(handler_key, range_start, range_end)
@@ -463,9 +430,185 @@ impl CatchupLoader {
     }
 }
 
+// ─── CallDepScanner ────────────────────────────────────────────────────────
+
+use std::collections::HashSet;
+
+use crate::storage::contract_index::build_expected_factory_contracts_for_range;
+use crate::transformations::engine::call_dependency_contract_index_complete;
+use crate::transformations::scheduler::tracker::CompletionTracker;
+
+/// Standalone call-dependency file scanner.
+///
+/// Periodically scans the decoded-calls directory for each unique `(source,
+/// function)` pair to discover which parquet ranges are available on disk.
+/// Registers newly-found ranges with the [`CompletionTracker`] so that
+/// `wait_ready_extended` can unblock items whose call deps have arrived.
+pub(crate) struct CallDepScanner {
+    decoded_calls_dir: PathBuf,
+    raw_eth_calls_dir: PathBuf,
+    contracts: Arc<Contracts>,
+    /// Unique `(source, function)` pairs to scan for.
+    call_dep_pairs: Vec<(String, String)>,
+}
+
+impl CallDepScanner {
+    pub(crate) fn new(
+        decoded_calls_dir: PathBuf,
+        raw_eth_calls_dir: PathBuf,
+        contracts: Arc<Contracts>,
+        call_dep_pairs: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            decoded_calls_dir,
+            raw_eth_calls_dir,
+            contracts,
+            call_dep_pairs,
+        }
+    }
+
+    /// Scan all `(source, function)` pairs and return available ranges.
+    pub(crate) async fn scan_all(&self) -> HashMap<(String, String), HashSet<(u64, u64)>> {
+        let mut results = HashMap::new();
+        for (source, function) in &self.call_dep_pairs {
+            match self.scan_one(source, function).await {
+                Ok(ranges) => {
+                    if !ranges.is_empty() {
+                        results.insert((source.clone(), function.clone()), ranges);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Call-dep scan failed for {}/{}: {}", source, function, e);
+                }
+            }
+        }
+        results
+    }
+
+    /// Scan one `(source, function)` pair for available decoded call parquet files.
+    ///
+    /// This is the same logic as `TransformationEngine::scan_available_call_dependency_ranges`
+    /// but extracted to avoid borrowing `&self` across a spawn boundary.
+    async fn scan_one(
+        &self,
+        source: &str,
+        function_name: &str,
+    ) -> Result<HashSet<(u64, u64)>, std::io::Error> {
+        let source = source.to_string();
+        let function_name = function_name.to_string();
+        let decoded_base = self.decoded_calls_dir.join(&source).join(&function_name);
+        let raw_base = self.raw_eth_calls_dir.join(&source).join(&function_name);
+        let contracts = self.contracts.clone();
+
+        tokio::task::spawn_blocking(move || {
+            fn scan_recursive(
+                dir: &Path,
+                decoded_base: &Path,
+                raw_base: &Path,
+                source: &str,
+                function_name: &str,
+                contracts: &Contracts,
+                ranges: &mut HashSet<(u64, u64)>,
+            ) -> std::io::Result<()> {
+                if !dir.exists() {
+                    return Ok(());
+                }
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        scan_recursive(
+                            &path,
+                            decoded_base,
+                            raw_base,
+                            source,
+                            function_name,
+                            contracts,
+                            ranges,
+                        )?;
+                        continue;
+                    }
+                    if path.extension().is_none_or(|ext| ext != "parquet") {
+                        continue;
+                    }
+                    let Some((range_start, range_end_inclusive)) =
+                        crate::storage::paths::parse_range_from_filename(&path)
+                    else {
+                        continue;
+                    };
+                    let range_end = range_end_inclusive + 1;
+                    let expected = build_expected_factory_contracts_for_range(contracts, range_end);
+                    let parent_dir = path.parent().unwrap_or(decoded_base);
+                    let relative_parent = parent_dir
+                        .strip_prefix(decoded_base)
+                        .ok()
+                        .filter(|rel| !rel.as_os_str().is_empty());
+                    let raw_index_dir = match relative_parent {
+                        Some(rel) => raw_base.join(rel),
+                        None => raw_base.to_path_buf(),
+                    };
+                    if !call_dependency_contract_index_complete(
+                        &raw_index_dir,
+                        source,
+                        range_start,
+                        range_end,
+                        &expected,
+                    ) {
+                        continue;
+                    }
+                    ranges.insert((range_start, range_end));
+                }
+                Ok(())
+            }
+
+            let mut ranges = HashSet::new();
+            if !decoded_base.exists() {
+                return Ok(ranges);
+            }
+            scan_recursive(
+                &decoded_base,
+                &decoded_base,
+                &raw_base,
+                &source,
+                &function_name,
+                contracts.as_ref(),
+                &mut ranges,
+            )?;
+            Ok(ranges)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+    }
+}
+
+/// Background scanner loop that periodically discovers call-dep files and
+/// registers them with the tracker.
+///
+/// The loop runs until the `cancel` watch receives `true`, or the task is
+/// aborted. Callers typically abort the returned `JoinHandle` when catchup
+/// finishes.
+pub(crate) async fn run_call_dep_scanner_loop(
+    scanner: CallDepScanner,
+    tracker: Arc<CompletionTracker>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let results = scanner.scan_all().await;
+        for ((source, func), ranges) in results {
+            tracker
+                .register_call_dep_ranges(&source, &func, ranges)
+                .await;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+            _ = cancel.changed() => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem};
+    use super::super::dag::{DagScheduler, OutcomeStatus, WorkItem, WorkItemRunResult};
     use super::super::tracker::CompletionTracker;
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -501,35 +644,39 @@ mod tests {
 
         fn runner(
             self: &Arc<Self>,
-        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        ) -> impl Fn(WorkItem) -> std::pin::Pin<Box<dyn Future<Output = WorkItemRunResult> + Send>>
                + Send
                + Sync
                + Clone
-               + 'static
-        {
+               + 'static {
             let rec = self.clone();
             move |item: WorkItem| {
                 let rec = rec.clone();
                 Box::pin(async move {
                     let key = (item.handler_name.clone(), item.range_start);
-                    rec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "start"));
+                    rec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "start",
+                    ));
 
                     if rec.hold_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(rec.hold_ms)).await;
                     }
 
-                    rec.events
-                        .lock()
-                        .await
-                        .push((item.handler_name.clone(), item.range_start, "end"));
+                    rec.events.lock().await.push((
+                        item.handler_name.clone(),
+                        item.range_start,
+                        "end",
+                    ));
 
                     if rec.fail_on.contains(&key) {
-                        Err(format!("test-forced failure at {}:{}", key.0, key.1))
+                        WorkItemRunResult::Failed(format!(
+                            "test-forced failure at {}:{}",
+                            key.0, key.1
+                        ))
                     } else {
-                        Ok(())
+                        WorkItemRunResult::Succeeded
                     }
                 })
             }
@@ -542,6 +689,9 @@ mod tests {
             range_start,
             range_end: range_start + 1000,
             dep_names: deps.iter().map(|s| s.to_string()).collect(),
+            contiguous_dep_names: Vec::new(),
+            call_dep_keys: Vec::new(),
+            sequential: false,
             payload: Box::new(()),
         }
     }
@@ -613,11 +763,7 @@ mod tests {
                     continue;
                 }
 
-                items.push(item(
-                    name,
-                    range_start,
-                    handler_deps,
-                ));
+                items.push(item(name, range_start, handler_deps));
             }
         }
 
@@ -638,9 +784,9 @@ mod tests {
 
         // Handlers in topological order: A first, then B (depends on A), then C.
         let handlers: Vec<(&str, &[&str], bool)> = vec![
-            ("A", &[], true),        // has call_deps
-            ("B", &["A"], false),    // depends on A, no call_deps
-            ("C", &[], false),       // independent
+            ("A", &[], true),     // has call_deps
+            ("B", &["A"], false), // depends on A, no call_deps
+            ("C", &[], false),    // independent
         ];
         let ranges: Vec<(u64, u64)> = vec![(100, 1100), (101, 1101), (102, 1102)];
         let completed: HashMap<String, HashSet<u64>> = HashMap::new();

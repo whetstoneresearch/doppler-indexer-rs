@@ -31,6 +31,8 @@ pub struct SnapshotData {
     pub volume0: String,
     pub volume1: String,
     pub swap_count: i32,
+    /// USD-converted quote-side volume. None when no USD price data is available.
+    pub volume_usd: Option<String>,
 }
 
 /// Data for a liquidity_deltas row.
@@ -107,6 +109,7 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
             "volume0".into(),
             "volume1".into(),
             "swap_count".into(),
+            "volume_usd".into(),
         ],
         values: vec![
             DbValue::Int64(data.chain_id as i64),
@@ -121,6 +124,10 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
             DbValue::Numeric(data.volume0.clone()),
             DbValue::Numeric(data.volume1.clone()),
             DbValue::Int32(data.swap_count),
+            data.volume_usd
+                .as_ref()
+                .map(|v| DbValue::Numeric(v.clone()))
+                .unwrap_or(DbValue::Null),
         ],
         conflict_columns: vec!["chain_id".into(), "pool_id".into(), "block_number".into()],
         update_columns: vec![
@@ -133,6 +140,7 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
             "volume0".into(),
             "volume1".into(),
             "swap_count".into(),
+            "volume_usd".into(),
         ],
         update_condition: None,
     }

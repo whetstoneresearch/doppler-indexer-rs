@@ -109,20 +109,14 @@ pub trait TransformationHandler: Send + Sync + 'static {
     /// Called after the ops returned by `handle()` committed successfully.
     /// Lets handlers promote any in-flight optimistic state.
     #[allow(unused_variables)]
-    async fn on_commit_success(
-        &self,
-        range: (u64, u64),
-    ) -> Result<(), TransformationError> {
+    async fn on_commit_success(&self, range: (u64, u64)) -> Result<(), TransformationError> {
         Ok(())
     }
 
     /// Called after the ops returned by `handle()` failed to commit.
     /// Lets handlers revert optimistic state and mark the range for retry.
     #[allow(unused_variables)]
-    async fn on_commit_failure(
-        &self,
-        range: (u64, u64),
-    ) -> Result<(), TransformationError> {
+    async fn on_commit_failure(&self, range: (u64, u64)) -> Result<(), TransformationError> {
         Ok(())
     }
 }
@@ -179,6 +173,19 @@ pub trait EventHandler: TransformationHandler {
     /// Handler names (via `TransformationHandler::name()`) that must complete
     /// before this handler can execute for a given block range.
     fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    /// Handler names that must be completed contiguously through the current
+    /// range before this handler can execute in catchup mode.
+    ///
+    /// Use this for dependencies whose outputs can be referenced by later
+    /// ranges, such as pool-create handlers that populate metadata consumed by
+    /// swap/liquidity handlers in subsequent ranges.
+    ///
+    /// Live/retry processing currently treats these the same as
+    /// `handler_dependencies()`, since those paths operate on a single range.
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec![]
     }
 }

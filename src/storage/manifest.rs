@@ -6,11 +6,13 @@
 //! - S3Manifest: Aggregated view of all available data ranges
 //! - ManifestManager: Handles manifest refresh and caching
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use serde::de::Deserializer;
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use super::s3::S3Backend;
@@ -19,32 +21,44 @@ use crate::types::config::storage::SyncConfig;
 
 /// A sorted, deduplicated set of `(start, end)` block ranges.
 ///
-/// Serializes transparently as `Vec<(u64, u64)>` for backward compatibility
-/// with existing S3 manifest JSON.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RangeSet(Vec<(u64, u64)>);
+/// Backed by a `BTreeSet` for O(log n) lookup and insertion with
+/// automatic ordering. Serializes as `Vec<(u64, u64)>` for backward
+/// compatibility with existing S3 manifest JSON.
+#[derive(Debug, Clone, Default)]
+pub struct RangeSet(BTreeSet<(u64, u64)>);
+
+impl Serialize for RangeSet {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let vec: Vec<&(u64, u64)> = self.0.iter().collect();
+        vec.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RangeSet {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let vec = Vec::<(u64, u64)>::deserialize(deserializer)?;
+        Ok(RangeSet(vec.into_iter().collect()))
+    }
+}
 
 impl RangeSet {
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self(BTreeSet::new())
     }
 
-    /// Check if a specific `(start, end)` range exists in the set.
+    /// Check if a specific `(start, end)` range exists in the set — O(log n).
     pub fn has(&self, start: u64, end: u64) -> bool {
-        self.0.iter().any(|(s, e)| *s == start && *e == end)
+        self.0.contains(&(start, end))
     }
 
-    /// Add a range. Duplicates are ignored and the set stays sorted by start.
+    /// Add a range — O(log n). Duplicates are ignored; order is maintained
+    /// by the BTreeSet.
     pub fn add(&mut self, start: u64, end: u64) {
-        if !self.has(start, end) {
-            self.0.push((start, end));
-            self.0.sort_by_key(|(s, _)| *s);
-        }
+        self.0.insert((start, end));
     }
 
-    /// Iterate over all ranges.
-    pub fn iter(&self) -> impl Iterator<Item = &(u64, u64)> {
+    /// Iterate over all ranges in sorted order.
+    pub fn iter(&self) -> std::collections::btree_set::Iter<'_, (u64, u64)> {
         self.0.iter()
     }
 
@@ -61,7 +75,7 @@ impl RangeSet {
 
 impl<'a> IntoIterator for &'a RangeSet {
     type Item = &'a (u64, u64);
-    type IntoIter = std::slice::Iter<'a, (u64, u64)>;
+    type IntoIter = std::collections::btree_set::Iter<'a, (u64, u64)>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()

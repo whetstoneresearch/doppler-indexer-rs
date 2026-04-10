@@ -15,12 +15,12 @@ use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
     read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
-use crate::types::config::contract::Contracts;
 use crate::storage::decoded_index::scan_existing_decoded_files;
 use crate::storage::factory_data::load_factory_addresses_by_range;
 use crate::storage::parquet_readers::read_raw_logs_from_parquet;
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::contract::Contracts;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 /// Catchup phase: decode existing raw log files
@@ -35,7 +35,7 @@ pub async fn catchup_decode_logs(
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
-    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(4);
+    let concurrency = raw_data_config.decoding_concurrency.unwrap_or(8);
 
     // Scan existing decoded files
     let existing_decoded = Arc::new(scan_existing_decoded_files(output_base));
@@ -90,13 +90,16 @@ pub async fn catchup_decode_logs(
     );
 
     // Pre-load contract indexes for each factory collection
-    let factory_collection_names: HashSet<String> =
-        factory_matchers.keys().cloned().collect();
+    let factory_collection_names: HashSet<String> = factory_matchers.keys().cloned().collect();
     let mut contract_indexes: HashMap<String, ContractIndex> = HashMap::new();
     for collection in &factory_collection_names {
         // Each factory collection's decoded logs use the same output_base/{collection}/{event}/ layout
         // We load one index per (collection, event) pair
-        for matchers in factory_matchers.get(collection).iter().flat_map(|v| v.iter()) {
+        for matchers in factory_matchers
+            .get(collection)
+            .iter()
+            .flat_map(|v| v.iter())
+        {
             let dir = output_base.join(collection).join(&matchers.event_name);
             let idx = {
                 let dir_clone = dir.clone();
@@ -170,7 +173,10 @@ pub async fn catchup_decode_logs(
                 let key = (collection.clone(), matcher.event_name.clone());
                 live_indexes.entry(key).or_insert_with(|| {
                     let index_key = format!("{}/{}", collection, matcher.event_name);
-                    contract_indexes.get(&index_key).cloned().unwrap_or_default()
+                    contract_indexes
+                        .get(&index_key)
+                        .cloned()
+                        .unwrap_or_default()
                 });
             }
         }
@@ -203,9 +209,15 @@ pub async fn catchup_decode_logs(
                 range_end - 1
             );
 
-            // Read raw logs from parquet
+            // Read raw logs from parquet — use spawn_blocking to avoid starving
+            // the tokio runtime with synchronous file I/O + decompression
             let file_path_for_read = file_path.clone();
-            let logs = match read_raw_logs_from_parquet(&file_path_for_read) {
+            let logs = match tokio::task::spawn_blocking(move || {
+                read_raw_logs_from_parquet(&file_path_for_read)
+            })
+            .await
+            .expect("parquet read task panicked")
+            {
                 Ok(logs) => logs,
                 Err(e) => {
                     tracing::warn!(
