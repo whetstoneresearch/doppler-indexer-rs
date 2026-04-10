@@ -417,6 +417,7 @@ mod tests {
                 pool_type: "v3".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
+                total_supply: None,
             },
         );
         cache
