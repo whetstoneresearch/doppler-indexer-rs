@@ -254,29 +254,34 @@ UPDATE pool_state SET
   price_change_24h = sub.pc_24h
 FROM (
   SELECT
-    COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
-    COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h,
+    agg.vol_24h,
+    agg.swaps_24h,
     CASE WHEN h1h.price_close IS NOT NULL AND h1h.price_close != 0
-         THEN ($3::numeric - h1h.price_close) / h1h.price_close
+         THEN ($3::text::numeric - h1h.price_close) / h1h.price_close
     END AS pc_1h,
     CASE WHEN h24h.price_close IS NOT NULL AND h24h.price_close != 0
-         THEN ($3::numeric - h24h.price_close) / h24h.price_close
+         THEN ($3::text::numeric - h24h.price_close) / h24h.price_close
     END AS pc_24h
-  FROM pool_snapshots s
+  FROM (
+    SELECT
+      COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
+      COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h
+    FROM pool_snapshots s
+    WHERE s.chain_id = $1 AND s.pool_id = $2
+      AND s.block_timestamp > ($4::bigint - 86400)
+  ) agg
   LEFT JOIN LATERAL (
     SELECT price_close FROM pool_snapshots
     WHERE chain_id = $1 AND pool_id = $2
-      AND block_timestamp <= ($4 - 3600)
+      AND block_timestamp <= ($4::bigint - 3600)
     ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
   ) h1h ON true
   LEFT JOIN LATERAL (
     SELECT price_close FROM pool_snapshots
     WHERE chain_id = $1 AND pool_id = $2
-      AND block_timestamp <= ($4 - 86400)
+      AND block_timestamp <= ($4::bigint - 86400)
     ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
   ) h24h ON true
-  WHERE s.chain_id = $1 AND s.pool_id = $2
-    AND s.block_timestamp > ($4 - 86400)
 ) sub
 WHERE pool_state.chain_id = $1
   AND pool_state.pool_id = $2
@@ -383,11 +388,7 @@ pub async fn refresh_cache_if_needed(
         .collect();
 
     if !still_missing.is_empty() {
-        let sample: Vec<String> = still_missing
-            .iter()
-            .take(10)
-            .map(hex::encode)
-            .collect();
+        let sample: Vec<String> = still_missing.iter().take(10).map(hex::encode).collect();
         tracing::warn!(
             handler = handler_name,
             source = source_name,
@@ -553,6 +554,12 @@ mod tests {
             } => {
                 assert!(query.contains("volume_24h_usd"));
                 assert!(query.contains("price_change_1h"));
+                assert!(query.contains("agg.vol_24h"));
+                assert!(query.contains(
+                    "FROM (\n    SELECT\n      COALESCE(SUM(s.volume_usd), 0) AS vol_24h"
+                ));
+                assert!(query.contains("$3::text::numeric"));
+                assert!(query.contains("$4::bigint - 86400"));
                 assert!(query.contains("pool_state.block_number = $5"));
                 assert_eq!(params.len(), 7);
                 let snapshot = snapshot
