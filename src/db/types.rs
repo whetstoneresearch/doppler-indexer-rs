@@ -12,8 +12,8 @@ pub enum DbValue {
     Int64(i64),
     /// Signed 32-bit integer
     Int32(i32),
-    /// Unsigned 8-bit integer (stored as SMALLINT/INT2)
-    Int2(u8),
+    /// Signed 16-bit integer (stored as SMALLINT/INT2)
+    Int2(i16),
     /// Unsigned 64-bit integer (stored as BIGINT)
     Uint64(u64),
     /// Text (unlimited length)
@@ -34,6 +34,8 @@ pub enum DbValue {
     Json(JsonValue),
     /// JSONB value (binary JSON, more efficient for querying)
     JsonB(JsonValue),
+    /// Double-precision floating point (FLOAT8)
+    Float64(f64),
 }
 
 impl DbValue {
@@ -68,6 +70,8 @@ pub enum DbOperation {
         conflict_columns: Vec<String>,
         /// Columns to update on conflict
         update_columns: Vec<String>,
+        /// Optional WHERE clause on the DO UPDATE (e.g. "EXCLUDED.block_number >= pool_state.block_number")
+        update_condition: Option<String>,
     },
     /// Simple INSERT
     Insert {
@@ -86,8 +90,24 @@ pub enum DbOperation {
         table: String,
         where_clause: WhereClause,
     },
-    /// Raw SQL for complex operations (use sparingly)
-    RawSql { query: String, params: Vec<DbValue> },
+    /// Raw SQL for complex operations (use sparingly).
+    ///
+    /// `snapshot` is optional metadata for live-mode rollback. When present,
+    /// the executor snapshots the targeted row before executing the SQL and can
+    /// later restore it during reorg handling.
+    RawSql {
+        query: String,
+        params: Vec<DbValue>,
+        snapshot: Option<DbSnapshot>,
+    },
+}
+
+/// Snapshot metadata for row-modifying operations that cannot be expressed as a
+/// standard Upsert.
+#[derive(Debug, Clone)]
+pub struct DbSnapshot {
+    pub table: String,
+    pub key_columns: Vec<(String, DbValue)>,
 }
 
 /// WHERE clause for UPDATE and DELETE operations.

@@ -53,6 +53,8 @@ pub(super) async fn handle_once_calls_live(
                                 &config.output_type,
                                 &config.function_name,
                             ),
+                            is_reverted: false,
+                            revert_reason: None,
                         };
                         transform_calls_by_fn
                             .entry(config.function_name.clone())
@@ -187,6 +189,7 @@ pub(super) async fn handle_once_file_backfilled(
             &configs_ref,
             output_base,
             transform_tx,
+            false,
             false,
         )
         .await?;

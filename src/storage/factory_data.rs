@@ -138,14 +138,21 @@ pub async fn load_factory_addresses_by_collection(
     for (collection_name, file_paths) in files_to_process {
         for file_path in file_paths {
             match data_loader.ensure_local(&file_path).await {
-                Ok(true) => {
-                    if let Ok(addresses) = read_factory_addresses_from_parquet(&file_path) {
+                Ok(true) => match read_factory_addresses_from_parquet(&file_path) {
+                    Ok(addresses) => {
                         result
                             .entry(collection_name.clone())
                             .or_default()
                             .extend(addresses.into_iter().map(Address::from));
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read factory addresses from {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                    }
+                },
                 Ok(false) => {
                     tracing::debug!(
                         "Factory file {} not available locally or in S3",

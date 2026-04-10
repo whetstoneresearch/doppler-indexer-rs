@@ -39,10 +39,8 @@ fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
             DynSolType::Tuple(field_types)
         }
         EvmType::UnnamedTuple(fields) => {
-            let field_types: Vec<DynSolType> = fields
-                .iter()
-                .map(|ty| evm_type_to_dyn_sol_type(ty))
-                .collect();
+            let field_types: Vec<DynSolType> =
+                fields.iter().map(evm_type_to_dyn_sol_type).collect();
             DynSolType::Tuple(field_types)
         }
         EvmType::Array(inner) => DynSolType::Array(Box::new(evm_type_to_dyn_sol_type(inner))),
@@ -57,7 +55,7 @@ pub fn decode_value(
     let sol_type = evm_type_to_dyn_sol_type(output_type);
 
     let decoded = sol_type
-        .abi_decode(raw)
+        .abi_decode_params(raw)
         .map_err(|e| EthCallDecodingError::Decode(e.to_string()))?;
 
     convert_dyn_sol_value(&decoded, output_type)

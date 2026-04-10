@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -10,8 +10,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 
 use super::types::{CallResult, EthCallCollectionError, OnceCallResult};
 use crate::storage::paths::scan_nested_parquet_files_2;
@@ -20,11 +18,17 @@ pub(crate) fn scan_existing_parquet_files(dir: &Path) -> HashSet<String> {
     scan_nested_parquet_files_2(dir)
 }
 
+pub(crate) async fn scan_existing_parquet_files_async(dir: PathBuf) -> HashSet<String> {
+    tokio::task::spawn_blocking(move || scan_existing_parquet_files(&dir))
+        .await
+        .unwrap_or_default()
+}
+
 pub(crate) fn build_schema(num_params: usize) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
         Field::new("value", DataType::Binary, false),
     ];
 
@@ -73,16 +77,7 @@ pub(crate) fn write_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -90,7 +85,7 @@ pub(crate) fn build_once_schema(function_names: &[String]) -> Arc<Schema> {
     let mut fields = vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_timestamp", DataType::UInt64, false),
-        Field::new("address", DataType::FixedSizeBinary(20), false),
+        Field::new("contract_address", DataType::FixedSizeBinary(20), false),
     ];
 
     for fn_name in function_names {
@@ -141,11 +136,8 @@ pub(crate) fn write_once_column_index(
         index_path.display(),
         index.len()
     );
-    let content = serde_json::to_string_pretty(index).map_err(|e| {
-        std::io::Error::other(
-            format!("JSON serialize error: {}", e),
-        )
-    })?;
+    let content = serde_json::to_string_pretty(index)
+        .map_err(|e| std::io::Error::other(format!("JSON serialize error: {}", e)))?;
     std::fs::write(&index_path, content)?;
     Ok(())
 }
@@ -169,6 +161,53 @@ pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String
         }
     }
 
+    let index = build_once_column_index_from_parquet(once_dir);
+
+    // Write the newly built index
+    if !index.is_empty() {
+        if let Err(e) = write_once_column_index(once_dir, &index) {
+            tracing::warn!(
+                "Failed to write column index to {}: {}",
+                once_dir.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Built and saved column index for {}: {} files tracked",
+                once_dir.display(),
+                index.len()
+            );
+        }
+    }
+
+    index
+}
+
+/// Force a rebuild of a raw once-column index by scanning parquet files,
+/// ignoring any existing sidecar file.
+pub(crate) fn rebuild_once_column_index(once_dir: &Path) -> HashMap<String, Vec<String>> {
+    let index = build_once_column_index_from_parquet(once_dir);
+
+    if once_dir.exists() {
+        if let Err(e) = write_once_column_index(once_dir, &index) {
+            tracing::warn!(
+                "Failed to rewrite column index to {}: {}",
+                once_dir.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "Rebuilt column index for {}: {} files tracked",
+                once_dir.display(),
+                index.len()
+            );
+        }
+    }
+
+    index
+}
+
+fn build_once_column_index_from_parquet(once_dir: &Path) -> HashMap<String, Vec<String>> {
     // Index doesn't exist or couldn't be loaded - build from parquet files
     if !once_dir.exists() {
         return HashMap::new();
@@ -207,24 +246,122 @@ pub(crate) fn load_or_build_once_column_index(once_dir: &Path) -> HashMap<String
         }
     }
 
-    // Write the newly built index
-    if !index.is_empty() {
-        if let Err(e) = write_once_column_index(once_dir, &index) {
-            tracing::warn!(
-                "Failed to write column index to {}: {}",
-                once_dir.display(),
-                e
-            );
-        } else {
-            tracing::info!(
-                "Built and saved column index for {}: {} files tracked",
-                once_dir.display(),
-                index.len()
-            );
-        }
+    index
+}
+
+/// All state extracted from a single read of a once-call parquet file.
+///
+/// Eliminates redundant file opens by reading once and extracting all
+/// validation info (schema, null positions, row count) plus the full
+/// record batches in a single pass.
+pub(crate) struct OnceParquetState {
+    /// Function names extracted from schema (stripped `_result` suffix).
+    pub column_names: HashSet<String>,
+    /// Total row count across all batches.
+    pub row_count: u64,
+    /// Per-column null entries: fn_name -> set of addresses with null values.
+    pub null_entries: HashMap<String, HashSet<[u8; 20]>>,
+    /// The full record batches (use `.take()` when ownership is needed for merge).
+    pub batches: Option<Vec<RecordBatch>>,
+}
+
+/// Read a once-call parquet file once, extracting all state needed for
+/// validation and processing in a single pass.
+pub(crate) fn read_once_parquet_state(
+    path: &Path,
+) -> Result<OnceParquetState, EthCallCollectionError> {
+    let batches = read_existing_once_parquet(path)?;
+
+    // Empty parquet files can yield zero Arrow batches even though the parquet
+    // metadata still contains the full once-call schema.
+    let column_names = if let Some(first) = batches.first() {
+        extract_column_names_from_schema(&first.schema())
+    } else {
+        read_parquet_column_names(path)
+    };
+
+    // Compute row count
+    let row_count = batches.iter().map(|b| b.num_rows() as u64).sum();
+
+    // Extract null entries from batches
+    let null_entries = extract_null_entries_from_batches(&batches);
+
+    Ok(OnceParquetState {
+        column_names,
+        row_count,
+        null_entries,
+        batches: Some(batches),
+    })
+}
+
+pub(crate) async fn read_once_parquet_state_async(
+    path: PathBuf,
+) -> Result<OnceParquetState, EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || read_once_parquet_state(&path))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+/// Extract function names from a schema by stripping the `_result` suffix.
+fn extract_column_names_from_schema(schema: &Schema) -> HashSet<String> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| f.name().strip_suffix("_result").map(|s| s.to_string()))
+        .collect()
+}
+
+/// Extract per-address null entries from already-read batches.
+fn extract_null_entries_from_batches(
+    batches: &[RecordBatch],
+) -> HashMap<String, HashSet<[u8; 20]>> {
+    if batches.is_empty() {
+        return HashMap::new();
+    }
+    let schema = batches[0].schema();
+    let result_fn_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .filter_map(|f| f.name().strip_suffix("_result").map(|s| s.to_string()))
+        .collect();
+    if result_fn_names.is_empty() {
+        return HashMap::new();
     }
 
-    index
+    let mut null_entries: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
+    for batch in batches {
+        let address_col = match batch.column_by_name("contract_address") {
+            Some(col) => col,
+            None => continue,
+        };
+        let address_arr = match address_col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for fn_name in &result_fn_names {
+            let col_name = format!("{}_result", fn_name);
+            let col = match batch.column_by_name(&col_name) {
+                Some(c) => c,
+                None => continue,
+            };
+            if col.null_count() == 0 {
+                continue;
+            }
+            for i in 0..batch.num_rows() {
+                if col.is_null(i) {
+                    let addr_bytes: [u8; 20] = match address_arr.value(i).try_into() {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    null_entries
+                        .entry(fn_name.clone())
+                        .or_default()
+                        .insert(addr_bytes);
+                }
+            }
+        }
+    }
+    null_entries
 }
 
 /// Read column names from a parquet file's schema (for fallback when index is missing).
@@ -259,6 +396,7 @@ pub(crate) fn read_parquet_column_names(path: &Path) -> HashSet<String> {
 /// Find per-address null entries in `_result` columns.
 /// Returns a map of function_name -> set of addresses that have null values for that function.
 /// Used to identify which specific (address, column) pairs need re-fetching.
+#[allow(dead_code)]
 pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]>> {
     let batches = match read_existing_once_parquet(path) {
         Ok(b) => b,
@@ -279,7 +417,7 @@ pub(crate) fn find_null_entries(path: &Path) -> HashMap<String, HashSet<[u8; 20]
 
     let mut null_entries: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
     for batch in &batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -343,7 +481,7 @@ pub(crate) fn extract_addresses_from_once_parquet(
     let mut addresses = HashMap::new();
 
     for batch in batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -386,7 +524,7 @@ pub(crate) fn extract_existing_results_from_parquet(
     let mut results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = HashMap::new();
 
     for batch in batches {
-        let address_col = match batch.column_by_name("address") {
+        let address_col = match batch.column_by_name("contract_address") {
             Some(col) => col,
             None => continue,
         };
@@ -451,12 +589,12 @@ pub(crate) fn merge_once_columns(
 
     let num_rows = existing.num_rows();
     let address_col = existing
-        .column_by_name("address")
-        .expect("existing once parquet must have address column");
+        .column_by_name("contract_address")
+        .expect("existing once parquet must have contract_address column");
     let address_arr = address_col
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .expect("address column must be FixedSizeBinary(20)");
+        .expect("contract_address column must be FixedSizeBinary(20)");
 
     tracing::debug!(
         "Existing data has {} rows, {} columns",
@@ -606,15 +744,124 @@ pub(crate) fn write_once_results_to_parquet(
     }
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sync helper: write a RecordBatch directly to a parquet file
+// ---------------------------------------------------------------------------
+
+pub(crate) fn write_record_batch_to_parquet(
+    batch: &RecordBatch,
+    output_path: &Path,
+) -> Result<(), EthCallCollectionError> {
+    crate::storage::atomic_write_parquet_fast(batch, output_path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Async wrappers: offload blocking file I/O to spawn_blocking
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn write_results_to_parquet_async(
+    results: Vec<CallResult>,
+    output_path: PathBuf,
+    num_params: usize,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_results_to_parquet(&results, &output_path, num_params)
+    })
+    .await
+    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_once_results_to_parquet_async(
+    results: Vec<OnceCallResult>,
+    output_path: PathBuf,
+    function_names: Vec<String>,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || {
+        write_once_results_to_parquet(&results, &output_path, &function_names)
+    })
+    .await
+    .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn write_record_batch_to_parquet_async(
+    batch: RecordBatch,
+    output_path: PathBuf,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || write_record_batch_to_parquet(&batch, &output_path))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_parquet_column_names_async(path: PathBuf) -> HashSet<String> {
+    tokio::task::spawn_blocking(move || read_parquet_column_names(&path))
+        .await
+        .unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_parquet_row_count_async(path: PathBuf) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        use parquet::file::reader::FileReader;
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        parquet::file::reader::SerializedFileReader::new(file)
+            .map(|r| {
+                let meta = r.metadata();
+                (0..meta.num_row_groups())
+                    .map(|i| meta.row_group(i).num_rows() as u64)
+                    .sum()
+            })
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_existing_once_parquet_async(
+    path: PathBuf,
+) -> Result<Vec<RecordBatch>, EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || read_existing_once_parquet(&path))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+pub(crate) async fn load_or_build_once_column_index_async(
+    once_dir: PathBuf,
+) -> HashMap<String, Vec<String>> {
+    tokio::task::spawn_blocking(move || load_or_build_once_column_index(&once_dir))
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn read_once_column_index_async(
+    once_dir: PathBuf,
+) -> HashMap<String, Vec<String>> {
+    tokio::task::spawn_blocking(move || read_once_column_index(&once_dir))
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn write_once_column_index_async(
+    once_dir: PathBuf,
+    index: HashMap<String, Vec<String>>,
+) -> Result<(), EthCallCollectionError> {
+    tokio::task::spawn_blocking(move || write_once_column_index(&once_dir, &index))
+        .await
+        .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))?
+}
+
+#[allow(dead_code)]
+pub(crate) async fn find_null_entries_async(path: PathBuf) -> HashMap<String, HashSet<[u8; 20]>> {
+    tokio::task::spawn_blocking(move || find_null_entries(&path))
+        .await
+        .unwrap_or_default()
 }

@@ -9,8 +9,13 @@ use std::fs::File;
 use std::path::Path;
 
 use alloy::primitives::Address;
-use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, ListArray, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, ListArray, StringArray, UInt32Array,
+    UInt64Array,
+};
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ProjectionMask;
 use thiserror::Error;
 
 use crate::decoding::{EthCallResult, EventCallResult};
@@ -179,11 +184,44 @@ pub fn read_raw_logs_from_parquet(path: &Path) -> Result<Vec<LogData>, ParquetRe
     Ok(logs)
 }
 
+/// Read projected raw log batches for event-triggered eth_call audit.
+///
+/// Only reads the columns needed to identify and reconstruct triggering events:
+/// `block_number`, `block_timestamp`, `log_index`, `address`, `topics`, and `data`.
+pub fn read_event_trigger_log_batches_from_parquet(
+    path: &Path,
+) -> Result<Vec<RecordBatch>, ParquetReadError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let arrow_schema = builder.schema().clone();
+
+    let needed = [
+        "block_number",
+        "block_timestamp",
+        "log_index",
+        "address",
+        "topics",
+        "data",
+    ];
+    let root_indices: Vec<usize> = needed
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+    let reader = builder.with_projection(mask).build()?;
+
+    let mut batches = Vec::new();
+    for batch_result in reader {
+        batches.push(batch_result?);
+    }
+
+    Ok(batches)
+}
+
 /// Read factory addresses from a parquet file, returning a set of raw 20-byte addresses.
 ///
 /// Reads the `factory_address` column from a factory parquet file.
-/// Parquet read errors are logged as warnings and result in an empty set (not a hard error),
-/// matching the original behavior.
 pub fn read_factory_addresses_from_parquet(
     path: &Path,
 ) -> Result<HashSet<[u8; 20]>, ParquetReadError> {
@@ -192,21 +230,11 @@ pub fn read_factory_addresses_from_parquet(
         Ok(builder) => match builder.build() {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to build parquet reader for {}: {}",
-                    path.display(),
-                    e
-                );
-                return Ok(HashSet::new());
+                return Err(ParquetReadError::Parquet(e));
             }
         },
         Err(e) => {
-            tracing::warn!(
-                "Failed to create parquet reader for {}: {}",
-                path.display(),
-                e
-            );
-            return Ok(HashSet::new());
+            return Err(ParquetReadError::Parquet(e));
         }
     };
 
@@ -326,7 +354,7 @@ pub fn read_factory_addresses_with_blocks(
 
 /// Read regular eth_call results from a parquet file.
 ///
-/// Reads `block_number`, `block_timestamp`, `address`, and `value` columns.
+/// Reads `block_number`, `block_timestamp`, `contract_address`, and `value` columns.
 pub fn read_regular_calls_from_parquet(
     path: &Path,
 ) -> Result<Vec<EthCallResult>, ParquetReadError> {
@@ -342,7 +370,7 @@ pub fn read_regular_calls_from_parquet(
 
         let block_number_idx = schema.index_of("block_number").ok();
         let block_timestamp_idx = schema.index_of("block_timestamp").ok();
-        let address_idx = schema.index_of("address").ok();
+        let address_idx = schema.index_of("contract_address").ok();
         let value_idx = schema.index_of("value").ok();
 
         for row in 0..batch.num_rows() {
@@ -428,6 +456,8 @@ pub fn read_event_calls_from_parquet(
         let log_index_idx = schema.index_of("log_index").ok();
         let address_idx = schema.index_of("target_address").ok();
         let value_idx = schema.index_of("value").ok();
+        let is_reverted_idx = schema.index_of("is_reverted").ok();
+        let revert_reason_idx = schema.index_of("revert_reason").ok();
 
         for row in 0..batch.num_rows() {
             let block_number = block_number_idx
@@ -489,12 +519,38 @@ pub fn read_event_calls_from_parquet(
                 })
                 .unwrap_or_default();
 
+            let is_reverted = is_reverted_idx
+                .and_then(|i| {
+                    batch
+                        .column(i)
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .map(|a| a.value(row))
+                })
+                .unwrap_or(false);
+
+            let revert_reason = revert_reason_idx.and_then(|i| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .and_then(|a| {
+                        if a.is_null(row) {
+                            None
+                        } else {
+                            Some(a.value(row).to_string())
+                        }
+                    })
+            });
+
             results.push(EventCallResult {
                 block_number,
                 block_timestamp,
                 log_index,
                 target_address,
                 value,
+                is_reverted,
+                revert_reason,
             });
         }
     }

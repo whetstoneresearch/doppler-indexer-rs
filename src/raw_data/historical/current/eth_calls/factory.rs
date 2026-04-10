@@ -5,12 +5,13 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::eth_calls::{
-    process_factory_once_calls, process_factory_once_calls_multicall, process_factory_range,
-    process_factory_range_multicall, BlockRange, EthCallCatchupState, EthCallCollectionError,
-    EthCallContext,
+    process_event_triggers, process_event_triggers_multicall, process_factory_once_calls,
+    process_factory_once_calls_multicall, process_factory_range, process_factory_range_multicall,
+    BlockRange, EthCallCatchupState, EthCallCollectionError, EthCallContext,
 };
 use crate::raw_data::historical::factories::{FactoryAddressData, FactoryMessage};
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::build_expected_factory_contracts_for_range;
 use crate::storage::StorageManager;
 
 /// Handle a single `FactoryMessage` received from the factory channel.
@@ -42,6 +43,93 @@ pub(super) async fn handle_factory_message(
                 }
             }
 
+            // Check if any buffered triggers can now proceed
+            if !state.factory_skipped_triggers.is_empty() {
+                let mut still_skipped = Vec::new();
+                let buffered = std::mem::take(&mut state.factory_skipped_triggers);
+
+                for (skipped_triggers, buf_range_start, buf_range_end) in buffered {
+                    // Check if any of the triggers' factory collections are now known
+                    let has_new_addresses = skipped_triggers.iter().any(|st| {
+                        let key = (st.trigger.source_name.clone(), st.trigger.event_signature);
+                        state
+                            .event_call_configs
+                            .get(&key)
+                            .map(|configs| {
+                                configs.iter().any(|c| {
+                                    c.is_factory
+                                        && state.factory_addresses.contains_key(&c.contract_name)
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+
+                    if has_new_addresses {
+                        let triggers: Vec<_> = skipped_triggers
+                            .iter()
+                            .map(|st| st.trigger.clone())
+                            .collect();
+
+                        tracing::info!(
+                            "Replaying {} previously-skipped triggers for range {}-{} after factory addresses arrived",
+                            triggers.len(), buf_range_start, buf_range_end
+                        );
+
+                        let ctx = EthCallContext {
+                            client,
+                            output_dir: &state.base_output_dir,
+                            existing_files: &state.existing_files,
+                            rpc_batch_size: state.rpc_batch_size,
+                            repair: state.repair,
+                            decoder_tx,
+                            chain_name,
+                            storage_manager,
+                            s3_manifest: &state.s3_manifest,
+                        };
+
+                        let (new_skipped, mut pending_writes) =
+                            if let Some(multicall_addr) = state.multicall3_address {
+                                process_event_triggers_multicall(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    &ctx,
+                                    multicall_addr,
+                                    buf_range_start,
+                                    buf_range_end,
+                                    &state.contracts,
+                                    false,
+                                )
+                                .await?
+                            } else {
+                                process_event_triggers(
+                                    triggers,
+                                    &state.event_call_configs,
+                                    &state.factory_addresses,
+                                    &ctx,
+                                    buf_range_start,
+                                    buf_range_end,
+                                    &state.contracts,
+                                    false,
+                                )
+                                .await?
+                            };
+                        while let Some(result) = pending_writes.join_next().await {
+                            result
+                                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+                        }
+
+                        if !new_skipped.is_empty() {
+                            still_skipped.push((new_skipped, buf_range_start, buf_range_end));
+                        }
+                    } else {
+                        still_skipped.push((skipped_triggers, buf_range_start, buf_range_end));
+                    }
+                }
+
+                state.factory_skipped_triggers = still_skipped;
+            }
+
             // Merge into existing range_factory_data
             let existing = state
                 .range_factory_data
@@ -64,7 +152,9 @@ pub(super) async fn handle_factory_message(
             range_end,
         }) => {
             if state.range_regular_done.contains(&range_start) {
-                if state.has_factory_calls && !state.range_factory_done.contains(&range_start) {
+                if (state.has_factory_calls || state.has_factory_once_calls)
+                    && !state.range_factory_done.contains(&range_start)
+                {
                     let range = BlockRange {
                         start: range_start,
                         end: range_end,
@@ -79,39 +169,50 @@ pub(super) async fn handle_factory_message(
                             output_dir: &state.base_output_dir,
                             existing_files: &state.existing_files,
                             rpc_batch_size: state.rpc_batch_size,
+                            repair: state.repair,
                             decoder_tx,
                             chain_name,
                             storage_manager,
                             s3_manifest: &state.s3_manifest,
                         };
 
-                        if let Some(multicall_addr) = state.multicall3_address {
-                            process_factory_range_multicall(
-                                &range,
-                                blocks,
-                                &ctx,
-                                factory_data,
-                                &state.factory_call_configs,
-                                state.factory_max_params,
-                                &mut state.frequency_state,
-                                multicall_addr,
-                            )
-                            .await?;
-                        } else {
-                            process_factory_range(
-                                &range,
-                                blocks,
-                                &ctx,
-                                factory_data,
-                                &state.factory_call_configs,
-                                state.factory_max_params,
-                                &mut state.frequency_state,
-                            )
-                            .await?;
+                        if state.has_factory_calls {
+                            if let Some(multicall_addr) = state.multicall3_address {
+                                process_factory_range_multicall(
+                                    &range,
+                                    blocks,
+                                    &ctx,
+                                    factory_data,
+                                    &state.factory_call_configs,
+                                    state.factory_max_params,
+                                    &mut state.frequency_state,
+                                    multicall_addr,
+                                    None,
+                                    &state.contracts,
+                                )
+                                .await?;
+                            } else {
+                                process_factory_range(
+                                    &range,
+                                    blocks,
+                                    &ctx,
+                                    factory_data,
+                                    &state.factory_call_configs,
+                                    state.factory_max_params,
+                                    &mut state.frequency_state,
+                                    None,
+                                    &state.contracts,
+                                )
+                                .await?;
+                            }
                         }
 
                         if state.has_factory_once_calls {
                             let empty_index = HashMap::new();
+                            let expected_once = build_expected_factory_contracts_for_range(
+                                &state.contracts,
+                                range.end,
+                            );
                             if let Some(multicall_addr) = state.multicall3_address {
                                 process_factory_once_calls_multicall(
                                     &range,
@@ -120,6 +221,7 @@ pub(super) async fn handle_factory_message(
                                     &state.factory_once_configs,
                                     &empty_index,
                                     multicall_addr,
+                                    Some(&expected_once),
                                 )
                                 .await?;
                             } else {
@@ -129,16 +231,44 @@ pub(super) async fn handle_factory_message(
                                     factory_data,
                                     &state.factory_once_configs,
                                     &empty_index,
+                                    Some(&expected_once),
                                 )
                                 .await?;
                             }
                         }
                     }
                     state.range_factory_done.insert(range_start);
+
+                    // Factory address discovery is complete for this range.
+                    // Any buffered triggers for this range whose emitters still aren't
+                    // in factory_addresses are legitimately not factory instances — drop them.
+                    if !state.factory_skipped_triggers.is_empty() {
+                        let before: usize = state
+                            .factory_skipped_triggers
+                            .iter()
+                            .map(|(t, _, _)| t.len())
+                            .sum();
+                        state
+                            .factory_skipped_triggers
+                            .retain(|(_, buf_start, _)| *buf_start != range_start);
+                        let after: usize = state
+                            .factory_skipped_triggers
+                            .iter()
+                            .map(|(t, _, _)| t.len())
+                            .sum();
+                        let dropped = before - after;
+                        if dropped > 0 {
+                            tracing::debug!(
+                                "Dropped {} buffered triggers for range {} — factory discovery complete, addresses not found",
+                                dropped, range_start
+                            );
+                        }
+                    }
                 }
 
                 if state.range_regular_done.contains(&range_start)
-                    && (!state.has_factory_calls || state.range_factory_done.contains(&range_start))
+                    && ((!state.has_factory_calls && !state.has_factory_once_calls)
+                        || state.range_factory_done.contains(&range_start))
                 {
                     state.range_data.remove(&range_start);
                     state.range_factory_data.remove(&range_start);
@@ -146,9 +276,191 @@ pub(super) async fn handle_factory_message(
             }
         }
         Some(FactoryMessage::AllComplete) | None => {
+            if !state.factory_skipped_triggers.is_empty() {
+                let total: usize = state
+                    .factory_skipped_triggers
+                    .iter()
+                    .map(|(t, _, _)| t.len())
+                    .sum();
+                tracing::error!(
+                    "BUG: {} buffered triggers remain after all factory ranges complete. \
+                     These should have been drained by RangeComplete.",
+                    total
+                );
+            }
             tracing::debug!("eth_calls: factory channel closed");
             *factory_rx = None;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    use crate::raw_data::historical::eth_calls::{
+        BlockInfo, EthCallCatchupState, FrequencyState, OnceCallConfig,
+    };
+    use crate::raw_data::historical::factories::FactoryAddressData;
+    use crate::rpc::UnifiedRpcClient;
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+        FactoryEventConfigOrArray, FactoryParameterLocation,
+    };
+    use alloy::primitives::{Address, U256};
+
+    fn dummy_client() -> Arc<UnifiedRpcClient> {
+        Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap())
+    }
+
+    fn test_contracts() -> HashMap<String, ContractConfig> {
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "TestFactory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::new([0xaa; 20])),
+                start_block: Some(U256::from(0)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "Created(address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![0]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+        contracts
+    }
+
+    fn factory_once_only_state(base_dir: &Path) -> EthCallCatchupState {
+        let mut factory_once_configs = HashMap::new();
+        factory_once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        EthCallCatchupState {
+            base_output_dir: base_dir.to_path_buf(),
+            range_size: 100,
+            rpc_batch_size: 10,
+            multicall3_address: None,
+            call_configs: vec![],
+            factory_call_configs: HashMap::new(),
+            event_call_configs: HashMap::new(),
+            once_configs: HashMap::new(),
+            factory_once_configs,
+            has_regular_calls: false,
+            has_once_calls: false,
+            has_factory_calls: false,
+            has_factory_once_calls: true,
+            has_event_triggered_calls: false,
+            repair: false,
+            max_params: 0,
+            factory_max_params: 0,
+            existing_files: HashSet::new(),
+            s3_manifest: None,
+            factory_addresses: HashMap::new(),
+            frequency_state: FrequencyState {
+                last_call_times: HashMap::new(),
+            },
+            range_data: HashMap::new(),
+            range_factory_data: HashMap::new(),
+            range_regular_done: HashSet::new(),
+            range_factory_done: HashSet::new(),
+            factory_skipped_triggers: vec![],
+            contracts: test_contracts(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_factory_rangecomplete_runs_factory_once_without_factory_calls() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let mut state = factory_once_only_state(tmp.path());
+
+        // Pre-populate: regular processing done, block data available
+        state.range_regular_done.insert(0);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
+        state.range_factory_data.insert(
+            0,
+            FactoryAddressData {
+                range_start: 0,
+                range_end: 100,
+                addresses_by_block: HashMap::new(),
+            },
+        );
+
+        let mut factory_rx = None;
+
+        handle_factory_message(
+            Some(FactoryMessage::RangeComplete {
+                range_start: 0,
+                range_end: 100,
+            }),
+            &mut state,
+            &client,
+            &mut factory_rx,
+            &None,
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Factory processing marked done
+        assert!(
+            state.range_factory_done.contains(&0),
+            "range_factory_done must be set"
+        );
+        // Both regular and factory done -> range data cleaned up
+        assert!(
+            !state.range_data.contains_key(&0),
+            "range_data should be cleaned up"
+        );
+
+        // Verify empty parquet was written (BlockRange { start: 0, end: 100 } -> 0-99.parquet)
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "empty parquet must be written via late-arrival factory-once path"
+        );
+
+        // Verify sidecars
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must be written"
+        );
+        assert!(
+            tmp.path()
+                .join("test_collection/once/contract_index.json")
+                .exists(),
+            "contract_index.json must be written when expected_contracts is non-empty"
+        );
+    }
 }

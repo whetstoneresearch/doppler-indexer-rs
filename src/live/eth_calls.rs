@@ -577,6 +577,7 @@ impl LiveEthCallCollector {
         let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
         // Group calls by (contract_name, function_name) for decoder messages
+        #[allow(clippy::type_complexity)]
         let mut grouped_calls: HashMap<
             (String, String),
             Vec<(Address, u32, Bytes, &EventTriggeredCallConfig)>,
@@ -694,6 +695,8 @@ impl LiveEthCallCollector {
                         log_index: *log_index,
                         target_address: target_address.0 .0,
                         value: result_bytes,
+                        is_reverted: false,
+                        revert_reason: None,
                     });
                 }
             }
@@ -823,7 +826,6 @@ mod tests {
             ws_url_env_var: None,
             start_block: None,
             contracts: HashMap::new(),
-            tokens: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),
             rpc: Default::default(),

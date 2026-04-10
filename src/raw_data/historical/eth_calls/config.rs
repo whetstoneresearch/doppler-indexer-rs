@@ -1,4 +1,4 @@
-//! Config builders for eth_call collection: build_call_configs, build_token_call_configs,
+//! Config builders for eth_call collection: build_call_configs,
 //! build_once_call_configs, build_factory_once_call_configs, compute_function_selector.
 
 use std::collections::HashMap;
@@ -6,16 +6,18 @@ use std::collections::HashMap;
 use alloy::dyn_abi::DynSolValue;
 use alloy::primitives::Bytes;
 
-use super::types::{CallConfig, EthCallCollectionError, OnceCallConfig, TokenCallConfig};
+use super::helpers::parse_function_name;
+use super::types::{
+    CallConfig, EncodedParam, EthCallCollectionError, OnceCallConfig, ParamCombinations,
+};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{
-    encode_call_with_params, EthCallConfig, EvmType, ParamConfig, ParamError, ParamValue,
+    encode_call_with_params, EthCallConfig, ParamConfig, ParamError,
 };
-use crate::types::config::tokens::{AddressOrPoolId, PoolType, Tokens};
 
 pub(crate) fn generate_param_combinations(
     params: &[ParamConfig],
-) -> Result<Vec<Vec<(EvmType, ParamValue, Vec<u8>)>>, ParamError> {
+) -> Result<ParamCombinations, ParamError> {
     if params.is_empty() {
         return Ok(vec![vec![]]);
     }
@@ -90,12 +92,7 @@ pub fn build_call_configs(
                 };
 
                 let selector = compute_function_selector(&call.function);
-                let function_name = call
-                    .function
-                    .split('(')
-                    .next()
-                    .unwrap_or(&call.function)
-                    .to_string();
+                let function_name = parse_function_name(&call.function);
 
                 let param_combinations = generate_param_combinations(&call.params)?;
 
@@ -103,14 +100,16 @@ pub fn build_call_configs(
                     for param_combo in &param_combinations {
                         let dyn_values: Vec<DynSolValue> = param_combo
                             .iter()
-                            .map(|(param_type, value, _)| param_type.parse_value(value))
+                            .map(|(param_type, value, _): &EncodedParam| {
+                                param_type.parse_value(value)
+                            })
                             .collect::<Result<_, _>>()?;
 
                         let encoded_calldata = encode_call_with_params(selector, &dyn_values);
 
                         let param_values: Vec<Vec<u8>> = param_combo
                             .iter()
-                            .map(|(_, _, encoded)| encoded.clone())
+                            .map(|(_, _, encoded): &EncodedParam| encoded.clone())
                             .collect();
 
                         configs.push(CallConfig {
@@ -131,100 +130,6 @@ pub fn build_call_configs(
     Ok(configs)
 }
 
-/// Build call configs from token pool configurations
-pub(crate) fn build_token_call_configs(
-    tokens: &Tokens,
-    contracts: &Contracts,
-) -> Result<Vec<TokenCallConfig>, EthCallCollectionError> {
-    let mut configs = Vec::new();
-
-    // Look up UniswapV4StateView address from contracts config
-    let state_view_address = contracts
-        .get("UniswapV4StateView")
-        .and_then(|c| match &c.address {
-            AddressOrAddresses::Single(addr) => Some(*addr),
-            AddressOrAddresses::Multiple(addrs) => addrs.first().copied(),
-        });
-
-    for (token_name, token_config) in tokens {
-        if let Some(pool) = &token_config.pool {
-            if let Some(calls) = &pool.calls {
-                for call in calls {
-                    // Skip once and on_events calls for now
-                    if call.frequency.is_once() || call.frequency.is_on_events() {
-                        continue;
-                    }
-
-                    let selector = compute_function_selector(&call.function);
-                    let function_name = call
-                        .function
-                        .split('(')
-                        .next()
-                        .unwrap_or(&call.function)
-                        .to_string();
-
-                    let (target_address, encoded_calldata) = match pool.pool_type {
-                        PoolType::V2 | PoolType::V3 => {
-                            // Target the pool address directly
-                            let addr = match &pool.address {
-                                AddressOrPoolId::Address(a) => *a,
-                                AddressOrPoolId::PoolId(_) => {
-                                    tracing::warn!(
-                                        "V2/V3 pool {} has PoolId instead of Address, skipping",
-                                        token_name
-                                    );
-                                    continue;
-                                }
-                            };
-                            let calldata = Bytes::copy_from_slice(&selector);
-                            (addr, calldata)
-                        }
-                        PoolType::V4 => {
-                            // Target StateView with pool ID as parameter
-                            let state_view = match state_view_address {
-                                Some(addr) => addr,
-                                None => {
-                                    tracing::warn!(
-                                        "No UniswapV4StateView configured, skipping V4 pool calls for {}",
-                                        token_name
-                                    );
-                                    continue;
-                                }
-                            };
-                            let pool_id_bytes = match &pool.address {
-                                AddressOrPoolId::PoolId(id) => *id,
-                                AddressOrPoolId::Address(_) => {
-                                    tracing::warn!(
-                                        "V4 pool {} has Address instead of PoolId, skipping",
-                                        token_name
-                                    );
-                                    continue;
-                                }
-                            };
-                            // Encode call: selector + abi-encoded pool_id (bytes32)
-                            let pool_id_value = DynSolValue::FixedBytes(pool_id_bytes, 32);
-                            let calldata = encode_call_with_params(selector, &[pool_id_value]);
-                            (state_view, calldata)
-                        }
-                    };
-
-                    configs.push(TokenCallConfig {
-                        token_name: token_name.clone(),
-                        pool_type: pool.pool_type.clone(),
-                        target_address,
-                        function_name,
-                        encoded_calldata,
-                        frequency: call.frequency.clone(),
-                        output_type: call.output_type.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(configs)
-}
-
 pub fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<OnceCallConfig>> {
     let mut configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
 
@@ -235,12 +140,7 @@ pub fn build_once_call_configs(contracts: &Contracts) -> HashMap<String, Vec<Onc
             for call in calls {
                 if call.frequency.is_once() {
                     let selector = compute_function_selector(&call.function);
-                    let function_name = call
-                        .function
-                        .split('(')
-                        .next()
-                        .unwrap_or(&call.function)
-                        .to_string();
+                    let function_name = parse_function_name(&call.function);
 
                     // Check if call has self-address params (requires dynamic encoding per address)
                     let (preencoded_calldata, params) = if call.has_self_address_param() {
@@ -324,12 +224,7 @@ pub fn build_factory_once_call_configs(
         for call in call_configs {
             if call.frequency.is_once() {
                 let selector = compute_function_selector(&call.function);
-                let function_name = call
-                    .function
-                    .split('(')
-                    .next()
-                    .unwrap_or(&call.function)
-                    .to_string();
+                let function_name = parse_function_name(&call.function);
 
                 // Resolve target override if specified (resolves to first address only for factory calls)
                 let target_addresses = call.target.as_ref().and_then(|t| {

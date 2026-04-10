@@ -25,6 +25,7 @@ pub fn insert_pool_config(data: &PoolConfigData, ctx: &TransformationContext) ->
         table: "v4_pool_configs".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "hook_address".to_string()],
         update_columns: vec![],
+        update_condition: None,
         columns: vec![
             "chain_id".to_string(),
             "pool_id".to_string(),

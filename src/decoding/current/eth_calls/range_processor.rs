@@ -39,6 +39,8 @@ pub(super) async fn handle_regular_calls_live(
                     function_name: function_name.to_string(),
                     trigger_log_index: None,
                     result: build_result_map(&decoded, &config.output_type, function_name),
+                    is_reverted: false,
+                    revert_reason: None,
                 });
 
                 decoded_calls.push(LiveDecodedCall {
@@ -106,16 +108,26 @@ pub(super) async fn handle_block_complete(
     complete_tx: Option<&Sender<RangeCompleteMessage>>,
     transform_retry_tx: Option<&Sender<TransformRetryRequest>>,
 ) {
-    if let Ok(mut status) = live_storage.read_status(range_start) {
-        status.eth_calls_decoded = true;
-        if let Err(e) = live_storage.write_status(range_start, &status) {
-            tracing::warn!(
-                "Failed to update block status after eth_call block completion: {}",
-                e
-            );
-        } else {
-            tracing::debug!("Block {} eth_calls decoded", range_start);
+    if range_end.saturating_sub(range_start) == 1 {
+        match live_storage.update_status_atomic(range_start, |status| {
+            status.eth_calls_decoded = true;
+        }) {
+            Ok(()) => {
+                tracing::debug!("Block {} eth_calls decoded", range_start);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to update block status after eth_call block completion: {}",
+                    e
+                );
+            }
         }
+    } else {
+        tracing::debug!(
+            "Eth_call range {}-{} decoded",
+            range_start,
+            range_end.saturating_sub(1)
+        );
     }
 
     if !retry_transform_after_decode {

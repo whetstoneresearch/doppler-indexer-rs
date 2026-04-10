@@ -51,7 +51,7 @@ pub struct PoolData {
     pub migration_type: String,
     pub lock_duration: Option<u32>,
     pub beneficiaries: Option<BeneficiariesData>,
-    pub pool_key: PoolKey,
+    pub pool_key: Option<PoolKey>,
     pub starting_time: u64,
     pub ending_time: u64,
 }
@@ -61,6 +61,7 @@ pub fn insert_pool(data: &PoolData, ctx: &TransformationContext) -> DbOperation 
         table: "pools".to_string(),
         conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
         update_columns: vec![],
+        update_condition: None,
         columns: vec![
             "chain_id".to_string(),
             "block_number".to_string(),
@@ -120,9 +121,97 @@ pub fn insert_pool(data: &PoolData, ctx: &TransformationContext) -> DbOperation 
                 Some(beneficiaries_data) => DbValue::jsonb(beneficiaries_data),
                 None => DbValue::Null,
             },
-            DbValue::jsonb(&data.pool_key),
+            match &data.pool_key {
+                Some(pk) => DbValue::jsonb(pk),
+                None => DbValue::Null,
+            },
             DbValue::Timestamp(data.starting_time as i64),
             DbValue::Timestamp(data.ending_time as i64),
+        ],
+    }
+}
+
+/// Domain data for inserting a migration pool record into the database.
+///
+/// Migration pools are graduated Doppler V4 pools that now trade as standard
+/// UniswapV4 pools. Their metadata (tokens, fee, integrator) is inherited from
+/// the original Doppler pool.
+pub struct MigrationPoolData<'a> {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    /// The new migration pool's bytes32 pool ID.
+    pub pool_id: &'a [u8; 32],
+    pub base_token: [u8; 20],
+    pub quote_token: [u8; 20],
+    pub is_token_0: bool,
+    pub integrator: [u8; 20],
+    pub initializer: [u8; 20],
+    pub fee: u32,
+    /// The original Doppler V4 pool's bytes32 address stored in `pools.address`.
+    pub migrated_from: &'a [u8],
+}
+
+/// Insert a migration pool row into the `pools` table.
+///
+/// Uses ON CONFLICT DO NOTHING so reprocessing is idempotent.
+pub fn insert_migration_pool(
+    data: &MigrationPoolData<'_>,
+    ctx: &crate::transformations::TransformationContext,
+) -> DbOperation {
+    DbOperation::Upsert {
+        table: "pools".to_string(),
+        conflict_columns: vec!["chain_id".to_string(), "address".to_string()],
+        update_columns: vec![],
+        update_condition: None,
+        columns: vec![
+            "chain_id".to_string(),
+            "block_number".to_string(),
+            "created_at".to_string(),
+            "address".to_string(),
+            "base_token".to_string(),
+            "quote_token".to_string(),
+            "is_token_0".to_string(),
+            "type".to_string(),
+            "integrator".to_string(),
+            "initializer".to_string(),
+            "fee".to_string(),
+            "min_threshold".to_string(),
+            "max_threshold".to_string(),
+            "migrator".to_string(),
+            "migrated_at".to_string(),
+            "migration_pool".to_string(),
+            "migrated_from".to_string(),
+            "migration_type".to_string(),
+            "lock_duration".to_string(),
+            "beneficiaries".to_string(),
+            "pool_key".to_string(),
+            "starting_time".to_string(),
+            "ending_time".to_string(),
+        ],
+        values: vec![
+            DbValue::Int64(ctx.chain_id as i64),
+            DbValue::Uint64(data.block_number),
+            DbValue::Timestamp(data.block_timestamp as i64),
+            DbValue::Bytes32(*data.pool_id),
+            DbValue::Address(data.base_token),
+            DbValue::Address(data.quote_token),
+            DbValue::Bool(data.is_token_0),
+            DbValue::VarChar("migration_v4".to_string()),
+            DbValue::Address(data.integrator),
+            DbValue::Address(data.initializer),
+            DbValue::Int32(data.fee as i32),
+            DbValue::Null, // min_threshold
+            DbValue::Null, // max_threshold
+            DbValue::Null, // migrator
+            DbValue::Null, // migrated_at
+            DbValue::Null, // migration_pool
+            DbValue::Bytes(data.migrated_from.to_vec()),
+            DbValue::VarChar("v4".to_string()), // migration_type
+            DbValue::Null,                      // lock_duration
+            DbValue::Null,                      // beneficiaries
+            DbValue::Null,                      // pool_key
+            DbValue::Timestamp(data.block_timestamp as i64), // starting_time = migration time
+            DbValue::Timestamp(data.block_timestamp as i64), // ending_time = migration time
         ],
     }
 }

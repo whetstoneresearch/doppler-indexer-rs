@@ -86,6 +86,39 @@ pub trait TransformationHandler: Send + Sync + 'static {
     fn reorg_tables(&self) -> Vec<&'static str> {
         vec![]
     }
+
+    /// Whether this handler must process block ranges sequentially (one at a time, in order).
+    ///
+    /// When true, the catchup engine limits concurrency to 1 for this handler, relying on
+    /// Tokio's FIFO semaphore to guarantee ranges execute in ascending block order.
+    ///
+    /// Required for handlers that maintain cumulative in-memory state that depends on
+    /// block ordering (e.g., tracking running totals across block ranges).
+    fn requires_sequential(&self) -> bool {
+        false
+    }
+
+    /// Called after the finalizer has rolled back DB rows for orphaned blocks.
+    /// Handlers that cache stateful DB-derived values in memory should invalidate
+    /// or reload the affected entries here. Default is a no-op.
+    #[allow(unused_variables)]
+    async fn on_reorg(&self, orphaned: &[u64]) -> Result<(), TransformationError> {
+        Ok(())
+    }
+
+    /// Called after the ops returned by `handle()` committed successfully.
+    /// Lets handlers promote any in-flight optimistic state.
+    #[allow(unused_variables)]
+    async fn on_commit_success(&self, range: (u64, u64)) -> Result<(), TransformationError> {
+        Ok(())
+    }
+
+    /// Called after the ops returned by `handle()` failed to commit.
+    /// Lets handlers revert optimistic state and mark the range for retry.
+    #[allow(unused_variables)]
+    async fn on_commit_failure(&self, range: (u64, u64)) -> Result<(), TransformationError> {
+        Ok(())
+    }
 }
 
 /// Trigger for event-based handlers.
@@ -134,6 +167,25 @@ pub trait EventHandler: TransformationHandler {
     /// Returns (source_name, function_name) pairs that must be available
     /// in decoded parquet files before this handler can process a range.
     fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![]
+    }
+
+    /// Handler names (via `TransformationHandler::name()`) that must complete
+    /// before this handler can execute for a given block range.
+    fn handler_dependencies(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    /// Handler names that must be completed contiguously through the current
+    /// range before this handler can execute in catchup mode.
+    ///
+    /// Use this for dependencies whose outputs can be referenced by later
+    /// ranges, such as pool-create handlers that populate metadata consumed by
+    /// swap/liquidity handlers in subsequent ranges.
+    ///
+    /// Live/retry processing currently treats these the same as
+    /// `handler_dependencies()`, since those paths operate on a single range.
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
         vec![]
     }
 }

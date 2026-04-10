@@ -8,7 +8,7 @@
 //! 5. Cleans up live storage
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -179,81 +176,93 @@ impl CompactionService {
             return;
         }
 
+        // Phase 1 (no locks): gather block list and read status files from storage
         let blocks = match self.storage.list_blocks() {
             Ok(b) => b,
             Err(_) => return,
         };
 
         let now = Instant::now();
-        let mut pending_retries = Vec::new();
-        let mut seen_blocks = HashSet::new();
-        let mut stuck_blocks = self.stuck_blocks.lock().await;
+        let seen_blocks: HashSet<u64> = blocks.iter().copied().collect();
 
+        // Collect blocks that are transform-ready but not yet transformed,
+        // along with their failed handlers from the status file.
+        let mut candidates: Vec<(u64, HashSet<String>)> = Vec::new();
         for block_number in blocks {
-            seen_blocks.insert(block_number);
-
             let status = match self.storage.read_status(block_number) {
                 Ok(s) => s,
-                Err(_) => {
-                    stuck_blocks.remove(&block_number);
-                    continue;
-                }
+                Err(_) => continue,
             };
 
             if status.transformed || !status.transform_inputs_ready_with(&self.expectations) {
-                stuck_blocks.remove(&block_number);
                 continue;
             }
 
-            let progress = self.progress_tracker.lock().await;
-            if progress.is_block_complete(block_number) {
-                stuck_blocks.remove(&block_number);
-                continue;
-            }
-
-            // Combine handlers that are pending in the progress tracker with
-            // handlers that explicitly failed (stored in status file)
-            let mut missing_handlers = progress.get_pending_handlers(block_number);
-            drop(progress);
-
-            // Include failed handlers from status file - these need retry
-            missing_handlers.extend(status.failed_handlers.iter().cloned());
-
-            if missing_handlers.is_empty() {
-                stuck_blocks.remove(&block_number);
-                continue;
-            }
-
-            let first_seen = stuck_blocks.entry(block_number).or_insert(now);
-            if now.duration_since(*first_seen) >= self.retry_grace_period {
-                pending_retries.push((block_number, missing_handlers));
-            }
-        }
-
-        stuck_blocks.retain(|block_number, _| seen_blocks.contains(block_number));
-
-        // Only remove from stuck_blocks on successful send. If try_send fails
-        // (channel full), the block keeps its original grace timer so it doesn't
-        // restart the grace period on the next cycle.
-        for (block_number, missing_handlers) in pending_retries {
-            match retry_tx.try_send(TransformRetryRequest {
+            candidates.push((
                 block_number,
-                missing_handlers: Some(missing_handlers),
-            }) {
-                Ok(()) => {
-                    stuck_blocks.remove(&block_number);
-                    tracing::info!(
-                        "Requested transformation retry for stuck block {}",
-                        block_number
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!("Retry channel full for block {}: {}", block_number, e);
-                }
-            }
+                status.failed_handlers.iter().cloned().collect(),
+            ));
         }
 
-        drop(stuck_blocks);
+        // Phase 2a (progress_tracker lock only): collect complete blocks and pending handlers
+        let mut blocks_with_missing: Vec<(u64, HashSet<String>)> = Vec::new();
+        {
+            let progress = self.progress_tracker.lock().await;
+            for (block_number, mut failed_handlers) in candidates {
+                if progress.is_block_complete(block_number) {
+                    continue;
+                }
+
+                // Combine handlers pending in the progress tracker with
+                // handlers that explicitly failed (stored in status file)
+                let mut missing_handlers = progress.get_pending_handlers(block_number);
+                missing_handlers.extend(failed_handlers.drain());
+
+                if !missing_handlers.is_empty() {
+                    blocks_with_missing.push((block_number, missing_handlers));
+                }
+            }
+        } // progress_tracker lock dropped
+
+        // Phase 2b (stuck_blocks lock only): update stuck state and build retry list
+        let mut pending_retries = Vec::new();
+        {
+            let mut stuck_blocks = self.stuck_blocks.lock().await;
+
+            for (block_number, missing_handlers) in blocks_with_missing {
+                let first_seen = stuck_blocks.entry(block_number).or_insert(now);
+                if now.duration_since(*first_seen) >= self.retry_grace_period {
+                    pending_retries.push((block_number, missing_handlers));
+                }
+            }
+
+            stuck_blocks.retain(|block_number, _| seen_blocks.contains(block_number));
+
+            // Only remove from stuck_blocks on successful send. If try_send fails
+            // (channel full), the block keeps its original grace timer so it doesn't
+            // restart the grace period on the next cycle.
+            for (block_number, missing_handlers) in pending_retries {
+                match retry_tx.try_send(TransformRetryRequest {
+                    block_number,
+                    missing_handlers: Some(missing_handlers),
+                }) {
+                    Ok(()) => {
+                        stuck_blocks.remove(&block_number);
+                        tracing::info!(
+                            "Requested transformation retry for stuck block {}",
+                            block_number
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Retry channel full for block {}: {}",
+                            block_number,
+                            e
+                        );
+                    }
+                }
+            }
+        } // stuck_blocks lock dropped
     }
 
     /// Find ranges that are ready for compaction.
@@ -537,12 +546,8 @@ impl CompactionService {
     fn write_factories_parquet(
         &self,
         records: &[(u64, u64, [u8; 20])],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_timestamp", DataType::UInt64, false),
@@ -559,24 +564,15 @@ impl CompactionService {
             addresses.append_value(addr)?;
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
                 Arc::new(addresses.finish()) as ArrayRef,
             ],
-        )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        Ok(())
+        )
     }
 
     /// Get path for eth_calls parquet file.
@@ -591,12 +587,8 @@ impl CompactionService {
     fn write_eth_calls_parquet(
         &self,
         calls: &[super::types::LiveEthCall],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_timestamp", DataType::UInt64, false),
@@ -622,8 +614,9 @@ impl CompactionService {
             results.append_value(&call.result);
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
@@ -634,14 +627,6 @@ impl CompactionService {
             ],
         )?;
 
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
         tracing::debug!("Wrote {} eth_calls to {}", calls.len(), path.display());
 
         Ok(())
@@ -651,12 +636,8 @@ impl CompactionService {
     fn write_blocks_parquet(
         &self,
         blocks: &[super::types::LiveBlock],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_hash", DataType::Binary, false),
@@ -676,37 +657,24 @@ impl CompactionService {
             timestamps.append_value(block.timestamp);
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(block_hashes.finish()) as ArrayRef,
                 Arc::new(parent_hashes.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
             ],
-        )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        Ok(())
+        )
     }
 
     /// Write logs to parquet file.
     fn write_logs_parquet(
         &self,
         logs: &[(u64, u64, super::types::LiveLog)],
-        path: &PathBuf,
+        path: &Path,
     ) -> Result<(), CompactionError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("block_number", DataType::UInt64, false),
             Field::new("block_timestamp", DataType::UInt64, false),
@@ -766,8 +734,9 @@ impl CompactionService {
             datas.append_value(&log.data);
         }
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        write_compaction_parquet(
+            path,
+            schema,
             vec![
                 Arc::new(block_numbers.finish()) as ArrayRef,
                 Arc::new(timestamps.finish()) as ArrayRef,
@@ -781,17 +750,7 @@ impl CompactionService {
                 Arc::new(topic3s.finish()) as ArrayRef,
                 Arc::new(datas.finish()) as ArrayRef,
             ],
-        )?;
-
-        let file = std::fs::File::create(path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        Ok(())
+        )
     }
 
     /// Migrate progress entries from _live_progress to _handler_progress.
@@ -942,6 +901,19 @@ impl CompactionService {
 
         Ok(())
     }
+}
+
+/// Write a RecordBatch to a Snappy-compressed parquet file.
+///
+/// Creates parent directories if needed.
+fn write_compaction_parquet(
+    path: &std::path::Path,
+    schema: Arc<Schema>,
+    columns: Vec<ArrayRef>,
+) -> Result<(), CompactionError> {
+    let batch = RecordBatch::try_new(schema, columns)?;
+    crate::storage::atomic_write_parquet(&batch, path)?;
+    Ok(())
 }
 
 impl std::fmt::Debug for CompactionService {

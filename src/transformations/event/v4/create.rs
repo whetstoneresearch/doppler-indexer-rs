@@ -11,7 +11,8 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
+use crate::transformations::util::migration::resolve_migration_type;
 
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
 
@@ -32,6 +33,7 @@ impl TransformationHandler for V4CreateHandler {
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
             "migrations/tables/v4_pool_configs.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -39,6 +41,10 @@ impl TransformationHandler for V4CreateHandler {
         // tokens and pools have block_number for rollback
         // v4_pool_configs is immutable config without block_number
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        false
     }
 
     async fn handle(
@@ -52,20 +58,15 @@ impl TransformationHandler for V4CreateHandler {
             let numeraire = event.extract_address("numeraire")?;
             let hook = event.extract_address("poolOrHook")?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
-
-            let asset_metadata;
-            let numeraire_metadata;
-            match metadata_result {
-                Ok(r) => {
-                    asset_metadata = r.0;
-                    numeraire_metadata = r.1;
-                }
-                Err(e) => return Err(e),
-            }
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
+            else {
+                continue;
+            };
 
             let hook_call = ctx
-                .calls_for_address(hook).find(|call| call.function_name == "once")
+                .current_or_historical_once_call_for_address("DopplerV4Hook", hook)
+                .await?
                 .ok_or_else(|| {
                     let available_calls: Vec<_> = ctx
                         .calls_for_address(hook)
@@ -169,24 +170,7 @@ impl TransformationHandler for V4CreateHandler {
                 ctx,
             ));
 
-            let migration_type = ctx
-                .match_contract_address(
-                    asset_metadata.migrator.into(),
-                    &[
-                        "UniswapV4Migrator",
-                        "UniswapV2Migrator",
-                        "NimCustomV2Migrator",
-                        "UniswapV3Migrator",
-                        "NimCustomV3Migrator",
-                    ],
-                )
-                .map(|contract_name| match contract_name {
-                    "UniswapV4Migrator" => "v4",
-                    "UniswapV2Migrator" | "NimCustomV2Migrator" => "v2",
-                    "UniswapV3Migrator" | "NimCustomV3Migrator" => "v3",
-                    _ => "unknown",
-                })
-                .unwrap_or("unknown");
+            let migration_type = resolve_migration_type(ctx, asset_metadata.migrator.into());
 
             ops.push(insert_pool(
                 &PoolData {
@@ -208,7 +192,7 @@ impl TransformationHandler for V4CreateHandler {
                     migration_type: migration_type.to_string(),
                     lock_duration: None,
                     beneficiaries: None,
-                    pool_key,
+                    pool_key: Some(pool_key),
                     starting_time: pool_config.starting_time,
                     ending_time: pool_config.ending_time,
                 },
@@ -236,7 +220,6 @@ impl EventHandler for V4CreateHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
             ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             ("DopplerV4Hook".to_string(), "once".to_string()),
         ]
     }

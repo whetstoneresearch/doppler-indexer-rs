@@ -11,6 +11,10 @@ use crate::raw_data::historical::eth_calls::{
 };
 use crate::raw_data::historical::receipts::EventTriggerMessage;
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::{
+    build_expected_factory_contracts_for_range, range_key, read_contract_index,
+    update_contract_index, write_contract_index,
+};
 use crate::storage::StorageManager;
 
 /// Handle a single `EventTriggerMessage` received from the event trigger channel.
@@ -48,33 +52,52 @@ pub(super) async fn handle_event_trigger_message(
                     output_dir: &state.base_output_dir,
                     existing_files: &state.existing_files,
                     rpc_batch_size: state.rpc_batch_size,
+                    repair: state.repair,
                     decoder_tx,
                     chain_name,
                     storage_manager,
                     s3_manifest: &state.s3_manifest,
                 };
 
-                if let Some(multicall_addr) = state.multicall3_address {
-                    process_event_triggers_multicall(
-                        triggers,
-                        &state.event_call_configs,
-                        &state.factory_addresses,
-                        &ctx,
-                        multicall_addr,
-                        range_start,
-                        inclusive_end,
-                    )
-                    .await?;
-                } else {
-                    process_event_triggers(
-                        triggers,
-                        &state.event_call_configs,
-                        &state.factory_addresses,
-                        &ctx,
-                        range_start,
-                        inclusive_end,
-                    )
-                    .await?;
+                let (skipped, mut pending_writes) =
+                    if let Some(multicall_addr) = state.multicall3_address {
+                        process_event_triggers_multicall(
+                            triggers,
+                            &state.event_call_configs,
+                            &state.factory_addresses,
+                            &ctx,
+                            multicall_addr,
+                            range_start,
+                            inclusive_end,
+                            &state.contracts,
+                            false,
+                        )
+                        .await?
+                    } else {
+                        process_event_triggers(
+                            triggers,
+                            &state.event_call_configs,
+                            &state.factory_addresses,
+                            &ctx,
+                            range_start,
+                            inclusive_end,
+                            &state.contracts,
+                            false,
+                        )
+                        .await?
+                    };
+                while let Some(result) = pending_writes.join_next().await {
+                    result.map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+                }
+
+                if !skipped.is_empty() {
+                    tracing::info!(
+                        "Buffered {} triggers skipped due to missing factory addresses for range {}-{}",
+                        skipped.len(), range_start, inclusive_end
+                    );
+                    state
+                        .factory_skipped_triggers
+                        .push((skipped, range_start, inclusive_end));
                 }
             } else {
                 local_state.pending_event_triggers.clear();
@@ -102,16 +125,17 @@ pub(super) async fn handle_event_trigger_message(
                 let output_path = sub_dir.join(&file_name);
                 // Only write if file doesn't exist (don't overwrite if we already wrote results)
                 if !output_path.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&sub_dir) {
+                    if let Err(e) = tokio::fs::create_dir_all(&sub_dir).await {
                         tracing::warn!("Failed to create dir for empty event file: {}", e);
                         continue;
                     }
                     if let Err(e) =
-                        crate::raw_data::historical::eth_calls::write_event_call_results_to_parquet(
-                            &[],
-                            &output_path,
+                        crate::raw_data::historical::eth_calls::event_triggers::write_event_call_results_to_parquet_async(
+                            vec![],
+                            output_path.clone(),
                             0,
                         )
+                        .await
                     {
                         tracing::warn!("Failed to write empty event file: {}", e);
                     } else {
@@ -119,6 +143,21 @@ pub(super) async fn handle_event_trigger_message(
                             "Wrote empty event-triggered eth_call file to {} (no matching events)",
                             output_path.display()
                         );
+                        let expected_for_range = build_expected_factory_contracts_for_range(
+                            &state.contracts,
+                            inclusive_end + 1,
+                        );
+                        if let Some(expected) = expected_for_range.get(&contract_name) {
+                            let rk = range_key(range_start, inclusive_end);
+                            let mut ci = read_contract_index(&sub_dir);
+                            update_contract_index(&mut ci, &rk, expected);
+                            if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                                tracing::warn!(
+                                    "Failed to write contract index (empty on_events current): {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                 }
             }

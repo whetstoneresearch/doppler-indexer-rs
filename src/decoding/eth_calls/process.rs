@@ -5,9 +5,7 @@ use std::path::Path;
 
 use tokio::sync::mpsc::Sender;
 
-use super::column_index::{
-    read_decoded_column_index, read_decoded_parquet_function_names, write_decoded_column_index,
-};
+use super::column_index::{read_decoded_column_index, write_decoded_column_index};
 use super::decode::decode_value;
 use super::parquet_io::{
     merge_decoded_once_calls, write_decoded_calls_to_parquet, write_decoded_event_calls_to_parquet,
@@ -98,35 +96,8 @@ pub async fn process_regular_calls(
         );
     }
 
-    // Write decoded data
-    let output_dir = output_base
-        .join(&config.contract_name)
-        .join(&config.function_name);
-    std::fs::create_dir_all(&output_dir)?;
-
-    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-    let output_path = output_dir.join(&file_name);
-
-    write_decoded_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
-
-    if decoded_records.is_empty() {
-        tracing::debug!(
-            "Wrote 0 decoded {}.{} results to {}",
-            config.contract_name,
-            config.function_name,
-            output_path.display()
-        );
-    } else {
-        tracing::info!(
-            "Wrote {} decoded {}.{} results to {}",
-            decoded_records.len(),
-            config.contract_name,
-            config.function_name,
-            output_path.display()
-        );
-    }
-
-    // Send to transformation channel if enabled
+    // Send to transformation channel FIRST (before parquet I/O)
+    // to unblock the transformation engine while parquet writes happen.
     if let Some(tx) = transform_tx {
         let transform_calls: Vec<TransformDecodedCall> = decoded_records
             .iter()
@@ -157,6 +128,34 @@ pub async fn process_regular_calls(
         }
     }
 
+    // Write decoded data
+    let output_dir = output_base
+        .join(&config.contract_name)
+        .join(&config.function_name);
+    std::fs::create_dir_all(&output_dir)?;
+
+    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+    let output_path = output_dir.join(&file_name);
+
+    write_decoded_calls_to_parquet(&decoded_records, &config.output_type, &output_path)?;
+
+    if decoded_records.is_empty() {
+        tracing::debug!(
+            "Wrote 0 decoded {}.{} results to {}",
+            config.contract_name,
+            config.function_name,
+            output_path.display()
+        );
+    } else {
+        tracing::info!(
+            "Wrote {} decoded {}.{} results to {}",
+            decoded_records.len(),
+            config.contract_name,
+            config.function_name,
+            output_path.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -173,6 +172,7 @@ pub async fn process_once_calls(
     output_base: &Path,
     transform_tx: Option<&Sender<DecodedCallsMessage>>,
     return_index_info: bool,
+    #[allow(unused_variables)] force_overwrite: bool,
 ) -> Result<Option<OnceCallsResult>, EthCallDecodingError> {
     // Get start_block from first config (all configs for a contract share the same start_block)
     let start_block = configs.first().and_then(|c| c.start_block);
@@ -262,56 +262,8 @@ pub async fn process_once_calls(
         }
     }
 
-    // Write decoded data
-    let output_dir = output_base.join(contract_name).join("once");
-    std::fs::create_dir_all(&output_dir)?;
-
-    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
-    let output_path = output_dir.join(&file_name);
-
-    // Check if we need to merge with existing decoded data
-    if output_path.exists() {
-        tracing::info!(
-            "Merging new decoded columns into existing file {}",
-            output_path.display()
-        );
-        merge_decoded_once_calls(&output_path, &decoded_records, configs)?;
-    } else {
-        write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
-    }
-
-    // Read actual columns from written file
-    let actual_cols: Vec<String> = read_decoded_parquet_function_names(&output_path)
-        .into_iter()
-        .collect();
-
-    if decoded_records.is_empty() {
-        tracing::debug!(
-            "Wrote 0 decoded {}/once results to {} ({} columns: {:?})",
-            contract_name,
-            output_path.display(),
-            actual_cols.len(),
-            actual_cols
-        );
-    } else {
-        tracing::info!(
-            "Wrote {} decoded {}/once results to {} ({} columns: {:?})",
-            decoded_records.len(),
-            contract_name,
-            output_path.display(),
-            actual_cols.len(),
-            actual_cols
-        );
-    }
-
-    // If not returning index info, update column index directly (live mode)
-    if !return_index_info {
-        let mut index = read_decoded_column_index(&output_dir);
-        index.insert(file_name.clone(), actual_cols.clone());
-        write_decoded_column_index(&output_dir, &index)?;
-    }
-
-    // Send to transformation channel if enabled
+    // Send to transformation channel FIRST (before parquet I/O)
+    // to unblock the transformation engine while parquet writes happen.
     if let Some(tx) = transform_tx {
         // For "once" calls, we consolidate ALL functions per address into a single DecodedCall
         // with function_name = "once" and ALL results merged. This matches:
@@ -341,6 +293,8 @@ pub async fn process_once_calls(
                     function_name: "once".to_string(),
                     trigger_log_index: None,
                     result: merged_result,
+                    is_reverted: false,
+                    revert_reason: None,
                 }
             })
             .filter(|call| !call.result.is_empty())
@@ -372,6 +326,53 @@ pub async fn process_once_calls(
                 range_end
             );
         }
+    }
+
+    // Write decoded data
+    let output_dir = output_base.join(contract_name).join("once");
+    std::fs::create_dir_all(&output_dir)?;
+
+    let file_name = format!("{}-{}.parquet", range_start, range_end - 1);
+    let output_path = output_dir.join(&file_name);
+
+    // Check if we need to merge with existing decoded data
+    if output_path.exists() && !force_overwrite {
+        tracing::info!(
+            "Merging new decoded columns into existing file {}",
+            output_path.display()
+        );
+        merge_decoded_once_calls(&output_path, &decoded_records, configs)?;
+    } else {
+        write_decoded_once_calls_to_parquet(&decoded_records, configs, &output_path)?;
+    }
+
+    // Derive column names from configs instead of re-reading the file we just wrote
+    let actual_cols: Vec<String> = configs.iter().map(|c| c.function_name.clone()).collect();
+
+    if decoded_records.is_empty() {
+        tracing::debug!(
+            "Wrote 0 decoded {}/once results to {} ({} columns: {:?})",
+            contract_name,
+            output_path.display(),
+            actual_cols.len(),
+            actual_cols
+        );
+    } else {
+        tracing::info!(
+            "Wrote {} decoded {}/once results to {} ({} columns: {:?})",
+            decoded_records.len(),
+            contract_name,
+            output_path.display(),
+            actual_cols.len(),
+            actual_cols
+        );
+    }
+
+    // If not returning index info, update column index directly (live mode)
+    if !return_index_info {
+        let mut index = read_decoded_column_index(&output_dir);
+        index.insert(file_name.clone(), actual_cols.clone());
+        write_decoded_column_index(&output_dir, &index)?;
     }
 
     // Return index info for batch updating (catchup mode)
@@ -406,6 +407,8 @@ pub async fn process_event_calls(
     let mut decode_failures = 0u64;
     let mut non_empty_count = 0u64;
 
+    let mut reverted_calls: Vec<TransformDecodedCall> = Vec::new();
+
     for result in results {
         // Skip if block is before contract's start_block
         if let Some(sb) = config.start_block {
@@ -413,6 +416,23 @@ pub async fn process_event_calls(
                 continue;
             }
         }
+
+        // Handle reverted results: skip decode, create transform call with empty result
+        if result.is_reverted {
+            reverted_calls.push(TransformDecodedCall {
+                block_number: result.block_number,
+                block_timestamp: result.block_timestamp,
+                contract_address: result.target_address,
+                source_name: config.contract_name.clone(),
+                function_name: config.function_name.clone(),
+                trigger_log_index: Some(result.log_index),
+                result: HashMap::new(),
+                is_reverted: true,
+                revert_reason: result.revert_reason.clone(),
+            });
+            continue;
+        }
+
         if result.value.is_empty() {
             continue;
         }
@@ -463,6 +483,41 @@ pub async fn process_event_calls(
         );
     }
 
+    // Send to transformation channel FIRST (before parquet I/O)
+    // to unblock the transformation engine while parquet writes happen.
+    if let Some(tx) = transform_tx {
+        let mut transform_calls: Vec<TransformDecodedCall> = decoded_records
+            .iter()
+            .map(|r| {
+                convert_event_call_to_transform_call(
+                    r,
+                    &config.contract_name,
+                    &config.function_name,
+                    &config.output_type,
+                )
+            })
+            .collect();
+
+        // Include reverted calls so the engine can unblock pending events
+        transform_calls.extend(reverted_calls);
+
+        if !transform_calls.is_empty() {
+            let msg = DecodedCallsMessage {
+                range_start,
+                range_end,
+                source_name: config.contract_name.clone(),
+                function_name: config.function_name.clone(),
+                calls: transform_calls,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(
+                    "Failed to send decoded event calls to transformation channel: {}",
+                    e
+                );
+            }
+        }
+    }
+
     // Write decoded data to on_events/ subdirectory
     let output_dir = output_base
         .join(&config.contract_name)
@@ -491,37 +546,6 @@ pub async fn process_event_calls(
             config.function_name,
             output_path.display()
         );
-    }
-
-    // Send to transformation channel if enabled
-    if let Some(tx) = transform_tx {
-        let transform_calls: Vec<TransformDecodedCall> = decoded_records
-            .iter()
-            .map(|r| {
-                convert_event_call_to_transform_call(
-                    r,
-                    &config.contract_name,
-                    &config.function_name,
-                    &config.output_type,
-                )
-            })
-            .collect();
-
-        if !transform_calls.is_empty() {
-            let msg = DecodedCallsMessage {
-                range_start,
-                range_end,
-                source_name: config.contract_name.clone(),
-                function_name: config.function_name.clone(),
-                calls: transform_calls,
-            };
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(
-                    "Failed to send decoded event calls to transformation channel: {}",
-                    e
-                );
-            }
-        }
     }
 
     Ok(())

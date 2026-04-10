@@ -3,8 +3,9 @@ use std::path::Path;
 
 use crate::types::config::eth_call::EthCallConfig;
 use crate::types::config::generic::SingleOrMultiple;
-use crate::types::config::loader::{load_config_from_path, ConfigLoadError};
+use crate::types::config::loader::load_config_from_path;
 use alloy_primitives::{keccak256, Address, U256};
+use serde::de;
 use serde::Deserialize;
 
 /// Configuration for an event to decode
@@ -107,7 +108,7 @@ pub struct FactoryEventConfig {
     pub topics_signature: String,
     #[serde(default)]
     pub data_signature: Option<String>,
-    pub factory_parameters: String,
+    pub factory_parameters: FactoryParameterLocation,
 }
 
 /// Factory event config: single event or multiple events
@@ -117,6 +118,54 @@ pub type FactoryEventConfigOrArray = SingleOrMultiple<FactoryEventConfig>;
 pub enum FactoryParameterLocation {
     Topic(usize),
     Data(Vec<usize>),
+}
+
+impl std::fmt::Display for FactoryParameterLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Topic(idx) => write!(f, "topics[{}]", idx),
+            Self::Data(indices) => {
+                write!(f, "data")?;
+                for idx in indices {
+                    write!(f, "[{}]", idx)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FactoryParameterLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let param = s.trim();
+
+        if param.starts_with("topics[") {
+            let idx_str = param
+                .strip_prefix("topics[")
+                .and_then(|s| s.strip_suffix(']'))
+                .ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "Invalid factory_parameters format: {} (expected \"topics[N]\")",
+                        param
+                    ))
+                })?;
+            let idx = idx_str.parse::<usize>().map_err(|_| {
+                de::Error::custom(format!(
+                    "Invalid topic index in factory_parameters: {}",
+                    idx_str
+                ))
+            })?;
+            Ok(FactoryParameterLocation::Topic(idx))
+        } else if param.starts_with("data[") {
+            Ok(FactoryParameterLocation::Data(parse_bracket_indices(param)))
+        } else {
+            Ok(FactoryParameterLocation::Data(vec![0]))
+        }
+    }
 }
 
 fn parse_bracket_indices(param: &str) -> Vec<usize> {
@@ -171,21 +220,12 @@ impl FactoryEventConfig {
         keccak256(full_sig.as_bytes()).0
     }
 
+    /// Returns the parsed factory parameter location.
+    ///
+    /// The parsing now happens at deserialization time, so this just returns a clone
+    /// of the already-parsed field for backward compatibility with existing callers.
     pub fn parse_factory_parameter(&self) -> FactoryParameterLocation {
-        let param = self.factory_parameters.trim();
-
-        if param.starts_with("topics[") {
-            let idx_str = param
-                .strip_prefix("topics[")
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or("0");
-            let idx = idx_str.parse::<usize>().unwrap_or(0);
-            FactoryParameterLocation::Topic(idx)
-        } else if param.starts_with("data[") {
-            FactoryParameterLocation::Data(parse_bracket_indices(param))
-        } else {
-            FactoryParameterLocation::Data(vec![0])
-        }
+        self.factory_parameters.clone()
     }
 }
 
@@ -201,25 +241,135 @@ pub type Contracts = HashMap<String, ContractConfig>;
 /// Load contracts from a path (file or directory).
 ///
 /// Uses the generic config loader with duplicate key detection.
-/// Panics on error for backwards compatibility with existing code.
 pub fn load_contracts_from_path(base_dir: &Path, path: &str) -> anyhow::Result<Contracts> {
     load_config_from_path::<Contracts>(base_dir, path)
-        .map_err(|e| panic_on_load_error("contracts", e))
+        .map_err(|e| anyhow::anyhow!("Failed to load contracts: {}", e))
 }
 
 /// Load factory collections from a path (file or directory).
 ///
 /// Uses the generic config loader with duplicate key detection.
-/// Panics on error for backwards compatibility with existing code.
 pub fn load_factory_collections_from_path(
     base_dir: &Path,
     path: &str,
 ) -> anyhow::Result<FactoryCollections> {
     load_config_from_path::<FactoryCollections>(base_dir, path)
-        .map_err(|e| panic_on_load_error("factory collections", e))
+        .map_err(|e| anyhow::anyhow!("Failed to load factory collections: {}", e))
 }
 
-/// Helper to panic with a formatted error message (for backwards compatibility).
-fn panic_on_load_error(config_type: &str, error: ConfigLoadError) -> anyhow::Error {
-    panic!("Failed to load {}: {}", config_type, error)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_load_contracts_nonexistent_path_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let result = load_contracts_from_path(dir.path(), "nonexistent.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_contracts_invalid_json_returns_err() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("contracts.json"), "not valid json").unwrap();
+        let result = load_contracts_from_path(dir.path(), "contracts.json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_contracts_valid_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "UniswapV3Factory": {
+                "address": "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+            }
+        }"#;
+        fs::write(dir.path().join("contracts.json"), json).unwrap();
+        let result = load_contracts_from_path(dir.path(), "contracts.json");
+        assert!(result.is_ok());
+        let contracts = result.unwrap();
+        assert!(contracts.contains_key("UniswapV3Factory"));
+    }
+
+    #[test]
+    fn test_factory_parameter_location_deserialize_topic() {
+        let json = r#""topics[1]""#;
+        let loc: FactoryParameterLocation = serde_json::from_str(json).unwrap();
+        match loc {
+            FactoryParameterLocation::Topic(idx) => assert_eq!(idx, 1),
+            _ => panic!("Expected Topic variant"),
+        }
+    }
+
+    #[test]
+    fn test_factory_parameter_location_deserialize_data_single() {
+        let json = r#""data[0]""#;
+        let loc: FactoryParameterLocation = serde_json::from_str(json).unwrap();
+        match loc {
+            FactoryParameterLocation::Data(indices) => assert_eq!(indices, vec![0]),
+            _ => panic!("Expected Data variant"),
+        }
+    }
+
+    #[test]
+    fn test_factory_parameter_location_deserialize_data_nested() {
+        let json = r#""data[5][4]""#;
+        let loc: FactoryParameterLocation = serde_json::from_str(json).unwrap();
+        match loc {
+            FactoryParameterLocation::Data(indices) => assert_eq!(indices, vec![5, 4]),
+            _ => panic!("Expected Data variant"),
+        }
+    }
+
+    #[test]
+    fn test_factory_parameter_location_deserialize_data_deep() {
+        let json = r#""data[0][1][2]""#;
+        let loc: FactoryParameterLocation = serde_json::from_str(json).unwrap();
+        match loc {
+            FactoryParameterLocation::Data(indices) => assert_eq!(indices, vec![0, 1, 2]),
+            _ => panic!("Expected Data variant"),
+        }
+    }
+
+    #[test]
+    fn test_factory_parameter_location_deserialize_fallback() {
+        let json = r#""unknown_format""#;
+        let loc: FactoryParameterLocation = serde_json::from_str(json).unwrap();
+        match loc {
+            FactoryParameterLocation::Data(indices) => assert_eq!(indices, vec![0]),
+            _ => panic!("Expected Data variant with default"),
+        }
+    }
+
+    #[test]
+    fn test_factory_event_config_deserialization() {
+        let json = r#"{
+            "name": "PoolCreated",
+            "topics_signature": "address,address",
+            "data_signature": "uint24,int24,address",
+            "factory_parameters": "topics[1]"
+        }"#;
+        let config: FactoryEventConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "PoolCreated");
+        match &config.factory_parameters {
+            FactoryParameterLocation::Topic(idx) => assert_eq!(*idx, 1),
+            _ => panic!("Expected Topic variant"),
+        }
+        // parse_factory_parameter should return the same thing
+        match config.parse_factory_parameter() {
+            FactoryParameterLocation::Topic(idx) => assert_eq!(idx, 1),
+            _ => panic!("Expected Topic variant"),
+        }
+    }
+
+    #[test]
+    fn test_factory_parameter_location_display() {
+        let topic = FactoryParameterLocation::Topic(2);
+        assert_eq!(topic.to_string(), "topics[2]");
+
+        let data = FactoryParameterLocation::Data(vec![5, 4]);
+        assert_eq!(data.to_string(), "data[5][4]");
+    }
 }

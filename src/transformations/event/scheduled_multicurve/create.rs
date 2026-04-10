@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use alloy::dyn_abi::DynSolValue;
-use alloy_primitives::{b256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::TransformationContext;
@@ -9,10 +9,13 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 
-use crate::transformations::util::db::pool::{insert_pool, BeneficiariesData, Beneficiary, PoolData};
+use crate::transformations::util::db::pool::{
+    insert_pool, BeneficiariesData, Beneficiary, PoolData,
+};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
-use crate::transformations::util::metadata::get_metadata;
+use crate::transformations::util::metadata::get_metadata_or_skip;
+use crate::transformations::util::migration::resolve_migration_type;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
 
@@ -33,6 +36,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
             "migrations/tables/tokens.sql",
             "migrations/tables/pools.sql",
             "migrations/tables/v4_pool_configs.sql",
+            "migrations/tables/skipped_addresses.sql",
         ]
     }
 
@@ -40,6 +44,10 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
         // tokens and pools have block_number for rollback
         // v4_pool_configs is immutable config without block_number
         vec!["tokens", "pools"]
+    }
+
+    fn requires_sequential(&self) -> bool {
+        false
     }
 
     async fn handle(
@@ -57,20 +65,18 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 TransformationError::TypeConversion("numeraire is not an address".to_string())
             })?;
 
-            let metadata_result = get_metadata(&asset, &numeraire, event, ctx);
-
-            let asset_metadata;
-            let numeraire_metadata;
-            match metadata_result {
-                Ok(r) => {
-                    asset_metadata = r.0;
-                    numeraire_metadata = r.1;
-                }
-                Err(e) => return Err(e),
-            }
+            let Some((asset_metadata, numeraire_metadata)) =
+                get_metadata_or_skip(&asset, &numeraire, event, ctx, &mut ops).await?
+            else {
+                continue;
+            };
 
             let get_state_call = ctx
-                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getState").find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getState")
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call for asset {} at block {} tx {}",
@@ -80,8 +86,9 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     ))
                 })?;
 
-            let num_to_sell = ctx
-                .calls_of_type("DERC20", "once").find(|call| call.contract_address == asset)
+            let asset_once_call = ctx
+                .current_or_historical_once_call_for_address("DERC20", asset)
+                .await?
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getAssetData call for asset {} at block {} tx {}",
@@ -89,8 +96,9 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         event.block_number,
                         B256::from(event.transaction_hash)
                     ))
-                })?
-                .get("getAssetData.numTokensToSell")?;
+                })?;
+
+            let num_to_sell = asset_once_call.get("getAssetData.numTokensToSell")?;
 
             let pool_key = {
                 let field_err = |field: &str, expected: &str| {
@@ -146,14 +154,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
             };
 
             let pool_id = pool_key.pool_id();
-
-            // The hook address in pool_key.hooks is the pool manager, not the actual hook.
-            // Find the real hook by looking for the contract that emitted a specific event in this tx.
-            const HOOK_EVENT_TOPIC0: B256 =
-                b256!("db675a606e5aa8f039e93c54673258dc875053bdaa5dbb96de1670bfdece53b3");
-            let hook: [u8; 20] = ctx
-                .find_log_emitter(event.transaction_hash, HOOK_EVENT_TOPIC0)
-                .await?;
+            let hook: [u8; 20] = pool_key.hooks.into();
 
             let starting_time_result = ctx
                 .eth_call(
@@ -162,7 +163,20 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     vec![DynSolValue::FixedBytes(pool_id, 32)],
                     event.block_number,
                 )
-                .await?;
+                .await
+                .map_err(|e| {
+                    TransformationError::RpcError(format!(
+                        "startingTimeOf reverted: hook={} pool_id={} asset={} numeraire={} \
+                         block={} tx={}: {}",
+                        pool_key.hooks,
+                        pool_id,
+                        Address::from(asset),
+                        Address::from(numeraire),
+                        event.block_number,
+                        B256::from(event.transaction_hash),
+                        e,
+                    ))
+                })?;
 
             let starting_time =
                 starting_time_result
@@ -199,7 +213,11 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 })?;
 
             let get_positions_call = ctx
-                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getPositions").find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getPositions")
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getPositions call for asset {} at block {} tx {}",
@@ -354,7 +372,11 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 .calls_of_type(
                     "UniswapV4ScheduledMulticurveInitializer",
                     "getBeneficiaries",
-                ).find(|call| call.trigger_log_index.unwrap() == event.log_index)
+                )
+                .find(|call| {
+                    call.block_number == event.block_number
+                        && call.trigger_log_index == Some(event.log_index)
+                })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
                     DecodedValue::Array(elements) => elements
@@ -372,24 +394,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     _ => Vec::new(),
                 });
 
-            let migration_type = ctx
-                .match_contract_address(
-                    asset_metadata.migrator.into(),
-                    &[
-                        "UniswapV4Migrator",
-                        "UniswapV2Migrator",
-                        "NimCustomV2Migrator",
-                        "UniswapV3Migrator",
-                        "NimCustomV3Migrator",
-                    ],
-                )
-                .map(|contract_name| match contract_name {
-                    "UniswapV4Migrator" => "v4",
-                    "UniswapV2Migrator" | "NimCustomV2Migrator" => "v2",
-                    "UniswapV3Migrator" | "NimCustomV3Migrator" => "v3",
-                    _ => "unknown",
-                })
-                .unwrap_or("unknown");
+            let migration_type = resolve_migration_type(ctx, asset_metadata.migrator.into());
 
             ops.push(insert_pool(
                 &PoolData {
@@ -411,7 +416,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     migration_type: migration_type.to_string(),
                     lock_duration: None,
                     beneficiaries,
-                    pool_key,
+                    pool_key: Some(pool_key),
                     starting_time: pool_config.starting_time,
                     ending_time: pool_config.ending_time,
                 },
@@ -439,7 +444,6 @@ impl EventHandler for V4ScheduledMulticurveCreateHandler {
     fn call_dependencies(&self) -> Vec<(String, String)> {
         vec![
             ("DERC20".to_string(), "once".to_string()),
-            ("Numeraires".to_string(), "once".to_string()),
             (
                 "UniswapV4ScheduledMulticurveInitializer".to_string(),
                 "getState".to_string(),

@@ -53,6 +53,19 @@ pub enum CollectorError {
     ReorgCleanupFailed(Vec<u64>),
 }
 
+/// Configuration for creating a `LiveCollector`.
+pub struct LiveCollectorConfig {
+    pub chain: Arc<ChainConfig>,
+    pub http_client: Arc<UnifiedRpcClient>,
+    pub config: LiveModeConfig,
+    pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    pub factory_matchers: Arc<Vec<FactoryMatcher>>,
+    pub eth_call_collector: Option<LiveEthCallCollector>,
+    pub db_pool: Option<Arc<DbPool>>,
+    pub expectations: LivePipelineExpectations,
+    pub transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
+}
+
 /// Collects live blocks from WebSocket and processes them.
 pub struct LiveCollector {
     chain: Arc<ChainConfig>,
@@ -68,6 +81,8 @@ pub struct LiveCollector {
     expected_start_block: Option<u64>,
     /// Factory matchers for extracting new contract addresses from factory events.
     factory_matchers: Arc<Vec<FactoryMatcher>>,
+    /// Pre-built index mapping topic0 -> indices into `factory_matchers` for O(n) extraction.
+    factory_topic_index: HashMap<[u8; 32], Vec<usize>>,
     /// Optional eth_call collector for live mode.
     eth_call_collector: Option<LiveEthCallCollector>,
     /// Database pool for status file reconstruction during catchup.
@@ -80,18 +95,19 @@ pub struct LiveCollector {
 
 impl LiveCollector {
     /// Create a new LiveCollector.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chain: Arc<ChainConfig>,
-        http_client: Arc<UnifiedRpcClient>,
-        config: LiveModeConfig,
-        progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
-        factory_matchers: Arc<Vec<FactoryMatcher>>,
-        eth_call_collector: Option<LiveEthCallCollector>,
-        db_pool: Option<Arc<DbPool>>,
-        expectations: LivePipelineExpectations,
-        transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
-    ) -> Self {
+    pub fn new(cfg: LiveCollectorConfig) -> Self {
+        let LiveCollectorConfig {
+            chain,
+            http_client,
+            config,
+            progress_tracker,
+            factory_matchers,
+            eth_call_collector,
+            db_pool,
+            expectations,
+            transform_retry_tx,
+        } = cfg;
+
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
 
@@ -141,6 +157,15 @@ impl LiveCollector {
             tracing::info!("Live collector initialized with eth_call collector");
         }
 
+        // Pre-build topic0 -> matcher index map for O(n) factory extraction
+        let mut factory_topic_index: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+        for (idx, matcher) in factory_matchers.iter().enumerate() {
+            factory_topic_index
+                .entry(matcher.event_topic0)
+                .or_default()
+                .push(idx);
+        }
+
         Self {
             chain,
             http_client,
@@ -151,6 +176,7 @@ impl LiveCollector {
             progress_tracker,
             expected_start_block,
             factory_matchers,
+            factory_topic_index,
             eth_call_collector,
             db_pool,
             expectations,
@@ -360,9 +386,9 @@ impl LiveCollector {
         self.storage.write_block(&updated_block)?;
 
         // Update status
-        let mut status = self.storage.read_status(block_number)?;
-        status.block_fetched = true;
-        self.storage.write_status(block_number, &status)?;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.block_fetched = true;
+        })?;
 
         tracing::info!(
             "Block {} collected: {} txs",
@@ -401,12 +427,12 @@ impl LiveCollector {
         }
 
         // Update status
-        let mut status = self.storage.read_status(block_number)?;
-        status.receipts_collected = true;
-        status.logs_collected = true;
-        // Factory extraction is always done at this point (even if no factories found)
-        status.factories_extracted = true;
-        self.storage.write_status(block_number, &status)?;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.receipts_collected = true;
+            status.logs_collected = true;
+            // Factory extraction is always done at this point (even if no factories found)
+            status.factories_extracted = true;
+        })?;
 
         // Send to live message channel
         live_tx
@@ -463,7 +489,7 @@ impl LiveCollector {
                 .send(DecoderMessage::LogsReady {
                     range_start: block_number,
                     range_end: block_number + 1, // Exclusive end for single block
-                    logs: log_data,
+                    logs: std::sync::Arc::new(log_data),
                     live_mode: true, // Live mode: write to bincode
                     has_factory_matchers: !self.factory_matchers.is_empty(),
                 })
@@ -479,9 +505,9 @@ impl LiveCollector {
 
         // If no log decoder is configured, mark logs as decoded
         if log_decoder_tx.is_none() {
-            let mut status = self.storage.read_status(block_number)?;
-            status.logs_decoded = true;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.logs_decoded = true;
+            })?;
         }
 
         // Collect eth_calls if configured
@@ -533,10 +559,10 @@ impl LiveCollector {
             }
         } else {
             // No eth_call collector configured - mark as collected and decoded
-            let mut status = self.storage.read_status(block_number)?;
-            status.eth_calls_collected = true;
-            status.eth_calls_decoded = true;
-            self.storage.write_status(block_number, &status)?;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.eth_calls_collected = true;
+                status.eth_calls_decoded = true;
+            })?;
         };
 
         // If no handlers are registered, mark transformed=true
@@ -566,6 +592,16 @@ impl LiveCollector {
             event.orphaned,
             event.depth
         );
+
+        if event.is_deep {
+            tracing::error!(
+                "DEEP REORG detected at block {}: reorg goes beyond retention window. \
+                 Orphaning all {} tracked blocks as best-effort cleanup. \
+                 Manual verification may be needed.",
+                event._new_block_number,
+                event.orphaned.len()
+            );
+        }
 
         // Delete orphaned blocks from storage (including decoded data)
         // Only clear progress for blocks that were successfully deleted
@@ -731,18 +767,22 @@ impl LiveCollector {
         &self,
         block_number: u64,
     ) -> Result<(Vec<LiveReceipt>, Vec<LiveLog>), CollectorError> {
-        let method_name = self
-            .chain
-            .block_receipts_method
-            .as_deref()
-            .unwrap_or("eth_getBlockReceipts");
-
-        let receipts = self
-            .http_client
-            .get_block_receipts(method_name, BlockNumberOrTag::Number(block_number))
-            .await?;
-
         let block = self.storage.read_block(block_number)?;
+        let receipts = match self.chain.block_receipts_method.as_ref() {
+            Some(method) => {
+                self.http_client
+                    .get_block_receipts(method.as_str(), BlockNumberOrTag::Number(block_number))
+                    .await?
+            }
+            None if block.tx_hashes.is_empty() => Vec::new(),
+            None => {
+                let tx_hashes: Vec<B256> =
+                    block.tx_hashes.iter().copied().map(B256::from).collect();
+                self.http_client
+                    .get_transaction_receipts_batch(tx_hashes)
+                    .await?
+            }
+        };
 
         let mut live_receipts = Vec::new();
         let mut all_logs = Vec::new();
@@ -781,6 +821,8 @@ impl LiveCollector {
     }
 
     /// Extract factory addresses from logs using configured matchers.
+    ///
+    /// Uses a pre-built topic0 index for O(n) lookup instead of O(n*m) nested iteration.
     fn extract_factory_addresses(
         &self,
         logs: &[LiveLog],
@@ -793,22 +835,29 @@ impl LiveCollector {
         }
 
         for log in logs {
-            for matcher in self.factory_matchers.iter() {
+            // Skip logs with no topics
+            if log.topics.is_empty() {
+                continue;
+            }
+
+            // Look up matchers by topic0
+            let Some(matcher_indices) = self.factory_topic_index.get(&log.topics[0]) else {
+                continue;
+            };
+
+            for &idx in matcher_indices {
+                let matcher = &self.factory_matchers[idx];
+
                 // Check if log address matches factory contract
                 if log.address != matcher.factory_contract_address {
                     continue;
                 }
 
-                // Check if topic0 matches the event signature
-                if log.topics.is_empty() || log.topics[0] != matcher.event_topic0 {
-                    continue;
-                }
-
                 // Extract address based on parameter location
                 let extracted_address = match &matcher.param_location {
-                    FactoryParameterLocation::Topic(idx) => {
-                        if *idx < log.topics.len() {
-                            let topic = &log.topics[*idx];
+                    FactoryParameterLocation::Topic(topic_idx) => {
+                        if *topic_idx < log.topics.len() {
+                            let topic = &log.topics[*topic_idx];
                             let mut addr = [0u8; 20];
                             addr.copy_from_slice(&topic[12..32]);
                             Some(addr)
@@ -908,19 +957,20 @@ impl LiveCollector {
         self.storage.delete_snapshots(block_number)?;
         self.clear_persisted_progress(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.block_fetched = false;
-        status.receipts_collected = false;
-        status.logs_collected = false;
-        status.factories_extracted = false;
-        status.eth_calls_collected = false;
-        status.logs_decoded = false;
-        status.eth_calls_decoded = false;
-        status.transformed = false;
-        status.completed_handlers.clear();
-        status.failed_handlers.clear();
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.block_fetched = false;
+            status.receipts_collected = false;
+            status.logs_collected = false;
+            status.factories_extracted = false;
+            status.eth_calls_collected = false;
+            status.logs_decoded = false;
+            status.eth_calls_decoded = false;
+            status.transformed = false;
+            status.completed_handlers.clear();
+            status.failed_handlers.clear();
+            status.apply_expectations(expectations);
+        })?;
 
         Ok(())
     }
@@ -936,18 +986,19 @@ impl LiveCollector {
         self.storage.delete_snapshots(block_number)?;
         self.clear_persisted_progress(block_number).await?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.receipts_collected = false;
-        status.logs_collected = false;
-        status.factories_extracted = false;
-        status.eth_calls_collected = false;
-        status.logs_decoded = false;
-        status.eth_calls_decoded = false;
-        status.transformed = false;
-        status.completed_handlers.clear();
-        status.failed_handlers.clear();
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.receipts_collected = false;
+            status.logs_collected = false;
+            status.factories_extracted = false;
+            status.eth_calls_collected = false;
+            status.logs_decoded = false;
+            status.eth_calls_decoded = false;
+            status.transformed = false;
+            status.completed_handlers.clear();
+            status.failed_handlers.clear();
+            status.apply_expectations(expectations);
+        })?;
 
         Ok(())
     }
@@ -957,13 +1008,14 @@ impl LiveCollector {
         self.storage.delete_all_decoded_calls(block_number)?;
         self.storage.delete_snapshots(block_number)?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.eth_calls_collected = false;
-        status.eth_calls_decoded = false;
-        status.transformed = false;
-        status.failed_handlers.clear();
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.eth_calls_collected = false;
+            status.eth_calls_decoded = false;
+            status.transformed = false;
+            status.failed_handlers.clear();
+            status.apply_expectations(expectations);
+        })?;
 
         Ok(())
     }
@@ -1008,11 +1060,12 @@ impl LiveCollector {
 
         self.storage.write_block(&full_block)?;
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.collected = true;
-        status.block_fetched = true;
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.collected = true;
+            status.block_fetched = true;
+            status.apply_expectations(expectations);
+        })?;
 
         self.resume_from_receipts_and_logs(block_number, log_decoder_tx, eth_call_decoder_tx)
             .await
@@ -1040,12 +1093,13 @@ impl LiveCollector {
                 .write_factories(block_number, &factory_addresses)?;
         }
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.receipts_collected = true;
-        status.logs_collected = true;
-        status.factories_extracted = true;
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.receipts_collected = true;
+            status.logs_collected = true;
+            status.factories_extracted = true;
+            status.apply_expectations(expectations);
+        })?;
 
         self.dispatch_logs_for_block(
             block_number,
@@ -1057,10 +1111,11 @@ impl LiveCollector {
         .await?;
 
         if log_decoder_tx.is_none() {
-            let mut status = self.storage.read_status(block_number)?;
-            status.logs_decoded = true;
-            status.apply_expectations(&self.expectations);
-            self.storage.write_status(block_number, &status)?;
+            let expectations = &self.expectations;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.logs_decoded = true;
+                status.apply_expectations(expectations);
+            })?;
         }
 
         // retry_transform_after_decode=false: logs were re-dispatched through the
@@ -1126,7 +1181,7 @@ impl LiveCollector {
             .send(DecoderMessage::LogsReady {
                 range_start: block_number,
                 range_end: block_number + 1,
-                logs: log_data,
+                logs: std::sync::Arc::new(log_data),
                 live_mode: true,
                 has_factory_matchers: !self.factory_matchers.is_empty(),
             })
@@ -1146,21 +1201,28 @@ impl LiveCollector {
             self.reset_eth_call_state(block_number).await?;
         }
 
-        let mut status = self.storage.read_status(block_number)?;
-        status.eth_calls_collected = true;
-
-        if !batch.calls.is_empty() {
+        // Write data before updating status to preserve invariant:
+        // data exists before status says it's collected.
+        let empty_batch = batch.calls.is_empty();
+        if !empty_batch {
             self.storage.write_eth_calls(block_number, &batch.calls)?;
-        } else {
-            status.eth_calls_decoded = true;
         }
 
-        if eth_call_decoder_tx.is_none() {
-            status.eth_calls_decoded = true;
-        }
+        let no_decoder = eth_call_decoder_tx.is_none();
+        let expectations = &self.expectations;
+        self.storage.update_status_atomic(block_number, |status| {
+            status.eth_calls_collected = true;
 
-        status.apply_expectations(&self.expectations);
-        self.storage.write_status(block_number, &status)?;
+            if empty_batch {
+                status.eth_calls_decoded = true;
+            }
+
+            if no_decoder {
+                status.eth_calls_decoded = true;
+            }
+
+            status.apply_expectations(expectations);
+        })?;
 
         if let Some(ref mut eth_collector) = self.eth_call_collector {
             eth_collector.apply_collected_batch(&batch);
@@ -1252,11 +1314,12 @@ impl LiveCollector {
                 }
             }
         } else {
-            let mut status = self.storage.read_status(block_number)?;
-            status.eth_calls_collected = true;
-            status.eth_calls_decoded = true;
-            status.apply_expectations(&self.expectations);
-            self.storage.write_status(block_number, &status)?;
+            let expectations = &self.expectations;
+            self.storage.update_status_atomic(block_number, |status| {
+                status.eth_calls_collected = true;
+                status.eth_calls_decoded = true;
+                status.apply_expectations(expectations);
+            })?;
 
             if retry_transform_after_decode {
                 self.queue_transform_retry(block_number, None).await;
@@ -1592,7 +1655,6 @@ mod tests {
             ws_url_env_var: None,
             start_block: None,
             contracts: HashMap::new(),
-            tokens: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),
             rpc: Default::default(),
@@ -1614,6 +1676,7 @@ mod tests {
             progress_tracker: None,
             expected_start_block: None,
             factory_matchers: Arc::new(vec![]),
+            factory_topic_index: HashMap::new(),
             eth_call_collector: None,
             db_pool: None,
             expectations: LivePipelineExpectations {

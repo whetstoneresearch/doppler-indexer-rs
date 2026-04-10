@@ -1,22 +1,89 @@
 {
+    "rpc_rate_limits": {
+        "alchemy": {
+            "units_per_second": 7500
+        }
+    },
     "chains": [
         {
             "name": "base",
             "chain_id": 8453,
             "rpc_url_env_var": "BASE_RPC_URL",
-            "ws_url_env_var": "BASE_WS_URL",            
+            "ws_url_env_var": "BASE_WS_URL",
             "start_block": 26602741,
             "contracts": "contracts/base",
-            "tokens": "tokens/base.json",
-            "block_receipts_method": "eth_getBlockReceipts"
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
+        },
+        {
+            "name": "mainnet",
+            "chain_id": 1,
+            "rpc_url_env_var": "MAINNET_RPC_URL",
+            "ws_url_env_var": "MAINNET_WS_URL",
+            "start_block": 21781000,
+            "contracts": "contracts/mainnet",
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
+        },
+        {
+            "name": "unichain",
+            "chain_id": 130,
+            "rpc_url_env_var": "UNICHAIN_RPC_URL",
+            "ws_url_env_var": "UNICHAIN_WS_URL",
+            "start_block": 8536880,
+            "contracts": "contracts/unichain",
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
+        },
+        {
+            "name": "ink",
+            "chain_id": 57073,
+            "rpc_url_env_var": "INK_RPC_URL",
+            "ws_url_env_var": "INK_WS_URL",
+            "start_block": 9508011,
+            "contracts": "contracts/ink",
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
+        },
+        {
+            "name": "monad",
+            "chain_id": 143,
+            "rpc_url_env_var": "MONAD_RPC_URL",
+            "ws_url_env_var": "MONAD_WS_URL",
+            "start_block": 34746370,
+            "contracts": "contracts/monad",
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "requests_per_second": 50, "concurrency": 15 }
+        },
+        {
+            "name": "sepolia",
+            "chain_id": 11155111,
+            "rpc_url_env_var": "SEPOLIA_RPC_URL",
+            "ws_url_env_var": "SEPOLIA_WS_URL",
+            "start_block": 10134362,
+            "contracts": "contracts/sepolia",
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
+        },
+        {
+            "name": "baseSepolia",
+            "chain_id": 84532,
+            "rpc_url_env_var": "BASE_SEPOLIA_RPC_URL",
+            "ws_url_env_var": "BASE_SEPOLIA_WS_URL",
+            "start_block": 28109000,
+            "contracts": "contracts/baseSepolia",
+            "block_receipts_method": "eth_getBlockReceipts",
+            "rpc": { "rate_limit_group": "alchemy" }
         }
     ],
     "raw_data_collection": {
         "channel_capacity": 5000,
         "factory_channel_capacity": 5000,
-        "block_receipt_concurrency": 100,
+        "block_receipt_concurrency": 50,
         "parquet_block_range": 10000,
         "rpc_batch_size": 1000,
+        "event_call_concurrency": 12,
+        "decoding_concurrency": 16,
         "fields": {
             "block_fields": [
                 "number",
@@ -43,13 +110,17 @@
         },
         "contract_logs_only": false        
     },
+    "metrics": {
+        "addr": "0.0.0.0:9090"
+    },
     "transformations": {
         "database_url_env_var": "DATABASE_URL",
+        "db_pool_size": 48,
         "mode": {
             "batch_for_catchup": true,
             "catchup_batch_size": 10000
         },
-        "handler_concurrency": 4,
+        "handler_concurrency": 48,
         "max_batch_size": 1000
     }
 }

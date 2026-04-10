@@ -1,21 +1,42 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy::primitives::B256;
 use alloy::rpc::types::BlockNumberOrTag;
 use arrow::datatypes::Schema;
+use metrics::{counter, histogram};
 use tokio::sync::mpsc::{self, Sender};
 
 use crate::raw_data::historical::blocks::{
-    build_block_schema, process_single_block_full, write_full_blocks_to_parquet,
-    write_minimal_blocks_to_parquet, BlockCollectionError, FullBlockRecord, MinimalBlockRecord,
+    build_block_schema, process_single_block_full, write_full_blocks_to_parquet_async,
+    write_minimal_blocks_to_parquet_async, BlockCollectionError, FullBlockRecord,
+    MinimalBlockRecord,
 };
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::paths::{parse_range_from_filename, raw_blocks_dir, scan_parquet_filenames};
 use crate::storage::{upload_parquet_to_s3, BlockRange, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::{BlockField, RawDataCollectionConfig};
+
+/// Holds owned data for a deferred parquet write, allowing the next range's
+/// RPC fetch to proceed while the previous range's I/O completes in the background.
+enum PendingBlockWrite {
+    Minimal {
+        records: Vec<MinimalBlockRecord>,
+        schema: Arc<Schema>,
+        fields: Vec<BlockField>,
+        output_path: PathBuf,
+        chain_name: String,
+    },
+    Full {
+        records: Vec<FullBlockRecord>,
+        schema: Arc<Schema>,
+        output_path: PathBuf,
+        chain_name: String,
+    },
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_blocks(
@@ -29,7 +50,7 @@ pub async fn collect_blocks(
     catch_up_only: bool,
 ) -> Result<(), BlockCollectionError> {
     let output_dir = raw_blocks_dir(&chain.name);
-    std::fs::create_dir_all(&output_dir)?;
+    tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let start_block = chain.start_block.map(|u| u.to::<u64>()).unwrap_or(0);
@@ -46,7 +67,10 @@ pub async fn collect_blocks(
     // In catch-up-only mode, only fill gaps within existing data — don't extend
     // to chain head. The upper bound is the highest block in existing files.
     let effective_head = if catch_up_only {
-        let existing = scan_existing_parquet_files(&output_dir);
+        let dir = output_dir.clone();
+        let existing = tokio::task::spawn_blocking(move || scan_existing_parquet_files(&dir))
+            .await
+            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
         let max_existing = highest_block_from_files(&existing, s3_manifest);
         match max_existing {
             Some(max) => {
@@ -67,13 +91,19 @@ pub async fn collect_blocks(
         chain_head
     };
 
-    let ranges = compute_ranges_to_fetch(
-        start_block,
-        effective_head,
-        range_size,
-        &output_dir,
-        s3_manifest,
-    );
+    let dir = output_dir.clone();
+    let s3_manifest_owned = s3_manifest.cloned();
+    let ranges = tokio::task::spawn_blocking(move || {
+        compute_ranges_to_fetch(
+            start_block,
+            effective_head,
+            range_size,
+            &dir,
+            s3_manifest_owned.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| BlockCollectionError::JoinError(e.to_string()))?;
 
     if ranges.is_empty() {
         tracing::info!(
@@ -94,10 +124,33 @@ pub async fn collect_blocks(
     let block_fields = &raw_data_config.fields.block_fields;
     let schema = build_block_schema(block_fields);
 
+    // Pipeline: overlap parquet writes with the next range's RPC fetch.
+    // While range N+1 is being fetched, range N's parquet write runs in the background.
+    let mut pending_write_handle: Option<
+        tokio::task::JoinHandle<Result<(), BlockCollectionError>>,
+    > = None;
+    let mut pending_s3_info: Option<(PathBuf, u64, u64)> = None;
+
     for range in ranges {
+        // Drain the previous range's write before starting a new one.
+        if let Some(handle) = pending_write_handle.take() {
+            handle
+                .await
+                .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+
+            // Upload the now-written file to S3 if configured.
+            if let (Some(ref sm), Some((ref path, s3_start, s3_end))) =
+                (&storage_manager, &pending_s3_info)
+            {
+                upload_parquet_to_s3(sm, path, &chain.name, "raw/blocks", *s3_start, *s3_end)
+                    .await
+                    .map_err(|e| BlockCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
+        }
+
         tracing::info!("Fetching blocks {}-{}", range.start, range.end - 1);
 
-        let record_count = collect_blocks_streaming(
+        let (record_count, pending_write) = collect_blocks_streaming(
             client,
             &range,
             block_fields,
@@ -105,28 +158,30 @@ pub async fn collect_blocks(
             &output_dir,
             &tx_sender,
             &eth_call_sender,
+            &chain.name,
         )
         .await?;
 
         let output_path = output_dir.join(range.file_name("blocks"));
         tracing::info!("Wrote {} blocks to {}", record_count, output_path.display());
 
-        // Upload to S3 if configured
-        if let Some(ref sm) = storage_manager {
-            upload_parquet_to_s3(
-                sm,
-                &output_path,
-                &chain.name,
-                "raw/blocks",
-                range.start,
-                range.end - 1,
-            )
+        // Spawn background write and record S3 metadata for the next drain.
+        pending_s3_info = Some((output_path, range.start, range.end - 1));
+        pending_write_handle = Some(tokio::spawn(execute_block_write(pending_write)));
+    }
+
+    // Drain the final pending write.
+    if let Some(handle) = pending_write_handle.take() {
+        handle
             .await
-            .map_err(|e| {
-                BlockCollectionError::Io(std::io::Error::other(
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+
+        if let (Some(ref sm), Some((ref path, s3_start, s3_end))) =
+            (&storage_manager, &pending_s3_info)
+        {
+            upload_parquet_to_s3(sm, path, &chain.name, "raw/blocks", *s3_start, *s3_end)
+                .await
+                .map_err(|e| BlockCollectionError::Io(std::io::Error::other(e.to_string())))?;
         }
     }
 
@@ -134,7 +189,8 @@ pub async fn collect_blocks(
 }
 
 /// Streaming block collection: fetches blocks concurrently and forwards to downstream
-/// collectors immediately as each block arrives. Buffers records for ordered parquet writing.
+/// collectors immediately as each block arrives. Buffers records and returns a
+/// `PendingBlockWrite` so the caller can overlap the parquet I/O with the next fetch.
 async fn collect_blocks_streaming(
     client: &UnifiedRpcClient,
     range: &BlockRange,
@@ -143,7 +199,9 @@ async fn collect_blocks_streaming(
     output_dir: &Path,
     tx_sender: &Option<Sender<(u64, u64, Vec<B256>)>>,
     eth_call_sender: &Option<Sender<(u64, u64)>>,
-) -> Result<usize, BlockCollectionError> {
+    chain_name: &str,
+) -> Result<(usize, PendingBlockWrite), BlockCollectionError> {
+    let range_start_time = Instant::now();
     let block_numbers: Vec<BlockNumberOrTag> = (range.start..range.end)
         .map(BlockNumberOrTag::Number)
         .collect();
@@ -245,22 +303,39 @@ async fn collect_blocks_streaming(
                 );
             }
 
-            // Write to parquet
-            let schema_clone = schema.clone();
-            let fields_vec = fields.to_vec();
-            let output_path = output_dir.join(range.file_name("blocks"));
-            tokio::task::spawn_blocking(move || {
-                write_minimal_blocks_to_parquet(
-                    &all_records,
-                    &schema_clone,
-                    &fields_vec,
-                    &output_path,
-                )
-            })
-            .await
-            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+            // Record collection metrics
+            counter!(
+                "collection_blocks_processed_total",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .increment(count as u64);
 
-            Ok(count)
+            for record in &all_records {
+                histogram!(
+                    "collection_block_transactions",
+                    "chain" => chain_name.to_string()
+                )
+                .record(record.transaction_count as f64);
+            }
+
+            histogram!(
+                "collection_block_processing_duration_seconds",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .record(range_start_time.elapsed().as_secs_f64());
+
+            // Return data for deferred parquet write
+            let pending = PendingBlockWrite::Minimal {
+                records: all_records,
+                schema: schema.clone(),
+                fields: fields.to_vec(),
+                output_path: output_dir.join(range.file_name("blocks")),
+                chain_name: chain_name.to_string(),
+            };
+
+            Ok((count, pending))
         }
         None => {
             let mut records_map: BTreeMap<u64, FullBlockRecord> = BTreeMap::new();
@@ -330,18 +405,79 @@ async fn collect_blocks_streaming(
             let all_records: Vec<FullBlockRecord> = records_map.into_values().collect();
             let count = all_records.len();
 
-            // Write to parquet
-            let schema_clone = schema.clone();
-            let output_path = output_dir.join(range.file_name("blocks"));
-            tokio::task::spawn_blocking(move || {
-                write_full_blocks_to_parquet(&all_records, &schema_clone, &output_path)
-            })
-            .await
-            .map_err(|e| BlockCollectionError::JoinError(e.to_string()))??;
+            // Record collection metrics
+            counter!(
+                "collection_blocks_processed_total",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .increment(count as u64);
 
-            Ok(count)
+            for record in &all_records {
+                histogram!(
+                    "collection_block_transactions",
+                    "chain" => chain_name.to_string()
+                )
+                .record(record.transaction_count as f64);
+            }
+
+            histogram!(
+                "collection_block_processing_duration_seconds",
+                "chain" => chain_name.to_string(),
+                "mode" => "historical"
+            )
+            .record(range_start_time.elapsed().as_secs_f64());
+
+            // Return data for deferred parquet write
+            let pending = PendingBlockWrite::Full {
+                records: all_records,
+                schema: schema.clone(),
+                output_path: output_dir.join(range.file_name("blocks")),
+                chain_name: chain_name.to_string(),
+            };
+
+            Ok((count, pending))
         }
     }
+}
+
+/// Execute a deferred parquet write using async wrappers (which internally
+/// use `spawn_blocking`).
+async fn execute_block_write(write: PendingBlockWrite) -> Result<(), BlockCollectionError> {
+    let write_start = Instant::now();
+    match write {
+        PendingBlockWrite::Minimal {
+            records,
+            schema,
+            fields,
+            output_path,
+            chain_name,
+        } => {
+            write_minimal_blocks_to_parquet_async(records, schema, fields, output_path.clone())
+                .await?;
+            crate::metrics::record_parquet_write(
+                &chain_name,
+                "blocks",
+                write_start.elapsed().as_secs_f64(),
+                &output_path,
+            );
+        }
+        PendingBlockWrite::Full {
+            records,
+            schema,
+            output_path,
+            chain_name,
+        } => {
+            write_full_blocks_to_parquet_async(records, schema, output_path.clone()).await?;
+            crate::metrics::record_parquet_write(
+                &chain_name,
+                "blocks",
+                write_start.elapsed().as_secs_f64(),
+                &output_path,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn compute_ranges_to_fetch(
@@ -375,7 +511,7 @@ fn compute_ranges_to_fetch(
             }
             // Skip if range exists in S3 manifest
             if let Some(manifest) = s3_manifest {
-                if manifest.has_raw_blocks(range.start, range.end - 1) {
+                if manifest.raw_blocks.has(range.start, range.end - 1) {
                     tracing::debug!(
                         "Skipping blocks range {}-{}: exists in S3 manifest",
                         range.start,

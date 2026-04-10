@@ -1,0 +1,2563 @@
+//! Once-call execution: process_once_calls_regular, process_once_calls_multicall,
+//! process_factory_once_calls, process_factory_once_calls_multicall.
+
+use std::collections::{HashMap, HashSet};
+
+use alloy::primitives::Address;
+use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
+
+use super::event_triggers::encode_once_call_params;
+use super::helpers::{
+    check_factory_once_file_state, check_regular_once_file_state, extract_fn_names,
+    update_column_index, write_empty_once_file,
+};
+// Re-imported for test accessibility via `super::unique_factory_address_count`
+#[cfg(test)]
+use super::helpers::unique_factory_address_count;
+use super::multicall::{
+    execute_multicalls_generic, BlockMulticall, FactoryOnceSlotMeta, MulticallSlotGeneric,
+    OnceCallMeta,
+};
+use super::parquet_io::{
+    extract_addresses_from_once_parquet, extract_existing_results_from_parquet, merge_once_columns,
+    write_once_results_to_parquet_async, write_record_batch_to_parquet_async,
+};
+use super::types::{
+    AddressResults, BlockInfo, BlockRange, CollectionResults, ContractProcessingInfo,
+    EthCallCollectionError, EthCallContext, FactoryContractProcessingInfo, OnceCallConfig,
+    OnceCallResult,
+};
+use crate::decoding::{DecoderMessage, OnceCallResult as DecoderOnceCallResult};
+use crate::raw_data::historical::factories::FactoryAddressData;
+use crate::storage::contract_index::{
+    range_key, read_contract_index, update_contract_index as update_ci, write_contract_index,
+    ExpectedContracts,
+};
+use crate::storage::upload_parquet_to_s3;
+use crate::types::config::contract::{AddressOrAddresses, Contracts};
+
+pub(crate) async fn process_once_calls_regular(
+    range: &BlockRange,
+    blocks: &[BlockInfo],
+    ctx: &EthCallContext<'_>,
+    once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    contracts: &Contracts,
+) -> Result<(), EthCallCollectionError> {
+    let first_block = match blocks.first() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    for (contract_name, call_configs) in once_configs {
+        if call_configs.is_empty() {
+            continue;
+        }
+
+        let file_name = range.file_name("");
+        let rel_path = format!("{}/once/{}", contract_name, file_name);
+        let sub_dir = ctx.output_dir.join(contract_name).join("once");
+        let output_path = sub_dir.join(&file_name);
+
+        let all_fn_names = extract_fn_names(call_configs);
+
+        // Check parquet file state: returns None if file is already complete
+        let file_state = check_regular_once_file_state(
+            &rel_path,
+            &file_name,
+            &sub_dir,
+            &output_path,
+            &all_fn_names,
+            ctx.existing_files,
+            contract_name,
+            range.start,
+            range.end,
+        )
+        .await?;
+        let file_state = match file_state {
+            Some(s) => s,
+            None => continue,
+        };
+        let missing_fn_names = file_state.missing_fn_names;
+        let has_existing_file = file_state.has_existing_file;
+        let null_entries = file_state.null_entries;
+        let mut parquet_state = file_state.parquet_state;
+
+        // Filter call configs to only missing functions
+        let configs_to_call: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        // Configs for partially-null columns (only need to call specific addresses)
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
+            .collect();
+
+        let contract = match contracts.get(contract_name) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let default_addresses = match &contract.address {
+            AddressOrAddresses::Single(addr) => vec![*addr],
+            AddressOrAddresses::Multiple(addrs) => addrs.clone(),
+        };
+
+        let block_id = BlockId::Number(BlockNumberOrTag::Number(first_block.block_number));
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, String)> = Vec::new();
+
+        // Missing columns: call ALL addresses
+        for call_config in &configs_to_call {
+            // Skip if first_block is before contract's start_block
+            if let Some(sb) = call_config.start_block {
+                if first_block.block_number < sb {
+                    continue;
+                }
+            }
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
+
+            for address in addresses {
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
+                let tx = TransactionRequest::default()
+                    .to(*address)
+                    .input(calldata.into());
+                pending_calls.push((tx, block_id, *address, call_config.function_name.clone()));
+            }
+        }
+
+        // Partially-null columns: call only addresses with null values
+        for call_config in &configs_to_patch {
+            // Skip if first_block is before contract's start_block
+            if let Some(sb) = call_config.start_block {
+                if first_block.block_number < sb {
+                    continue;
+                }
+            }
+            let null_addrs = &null_entries[&call_config.function_name];
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
+
+            for address in addresses {
+                if !null_addrs.contains(&address.0 .0) {
+                    continue;
+                }
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
+                let tx = TransactionRequest::default()
+                    .to(*address)
+                    .input(calldata.into());
+                pending_calls.push((tx, block_id, *address, call_config.function_name.clone()));
+            }
+        }
+
+        if pending_calls.is_empty() {
+            continue;
+        }
+
+        let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+            .iter()
+            .map(|(tx, bid, _, _)| (tx.clone(), *bid))
+            .collect();
+
+        let batch_results = ctx.client.call_batch(batch_calls).await?;
+
+        let mut results_by_address: HashMap<Address, HashMap<String, Vec<u8>>> = HashMap::new();
+
+        for (i, result) in batch_results.into_iter().enumerate() {
+            let (tx, _, address, function_name) = &pending_calls[i];
+
+            let function_results = results_by_address.entry(*address).or_default();
+
+            match result {
+                Ok(bytes) => {
+                    function_results.insert(function_name.clone(), bytes.to_vec());
+                }
+                Err(e) => {
+                    let calldata = tx
+                        .input
+                        .input
+                        .as_ref()
+                        .map(|b| format!("0x{}", hex::encode(b)))
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        "once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
+                        contract_name,
+                        function_name,
+                        first_block.block_number,
+                        address,
+                        calldata,
+                        e
+                    );
+                    // Skip reverted calls - don't insert empty results
+                }
+            }
+        }
+
+        tokio::fs::create_dir_all(&sub_dir).await?;
+
+        let decoder_once_results: Option<Vec<DecoderOnceCallResult>> = if ctx.decoder_tx.is_some() {
+            Some(
+                results_by_address
+                    .iter()
+                    .map(|(addr, function_results)| DecoderOnceCallResult {
+                        block_number: first_block.block_number,
+                        block_timestamp: first_block.timestamp,
+                        contract_address: addr.0 .0,
+                        results: function_results.clone(),
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        if has_existing_file {
+            // Merge new columns into existing parquet
+            let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
+                .into_iter()
+                .map(|(addr, fns)| (addr.0 .0, fns))
+                .collect();
+
+            // Reuse batches from the single-read state instead of re-reading the file
+            let existing_batches = parquet_state
+                .as_mut()
+                .and_then(|s| s.batches.take())
+                .unwrap_or_default();
+            if !existing_batches.is_empty() {
+                // Combine missing + patch function names for merge
+                let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+                let all_new_fn_names: Vec<String> = missing_fn_names
+                    .iter()
+                    .chain(patch_fn_names.iter())
+                    .cloned()
+                    .collect();
+                let merged =
+                    merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+
+                write_record_batch_to_parquet_async(merged, output_path.clone()).await?;
+
+                tracing::info!(
+                    "Merged {} new + {} patched once columns into {} for {}",
+                    missing_fn_names.len(),
+                    patch_fn_names.len(),
+                    output_path.display(),
+                    contract_name
+                );
+            }
+        } else {
+            // Write new file with all results - collect all unique addresses from pending_calls
+            let all_addresses: Vec<Address> = pending_calls
+                .iter()
+                .map(|(_, _, addr, _)| *addr)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let results: Vec<OnceCallResult> = all_addresses
+                .iter()
+                .filter_map(|addr| {
+                    results_by_address
+                        .remove(addr)
+                        .map(|function_results| OnceCallResult {
+                            block_number: first_block.block_number,
+                            block_timestamp: first_block.timestamp,
+                            contract_address: addr.0 .0,
+                            function_results,
+                        })
+                })
+                .collect();
+
+            if !results.is_empty() {
+                let output_path = sub_dir.join(&file_name);
+
+                tracing::info!(
+                    "Writing {} once eth_call results to {}",
+                    results.len(),
+                    output_path.display()
+                );
+
+                write_once_results_to_parquet_async(results, output_path, all_fn_names.clone())
+                    .await?;
+            }
+        }
+
+        // Upload to S3 if configured
+        if let Some(sm) = ctx.storage_manager {
+            let data_type = format!("raw/eth_calls/{}/once", contract_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                ctx.chain_name,
+                &data_type,
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
+        // Update the column index — use all_fn_names directly instead of
+        // re-reading the file we just wrote.
+        update_column_index(&sub_dir, &file_name, &all_fn_names).await?;
+        tracing::info!(
+            "Updated column index for {}: {} now has {} columns: {:?}",
+            contract_name,
+            file_name,
+            all_fn_names.len(),
+            all_fn_names
+        );
+
+        if let Some(tx) = ctx.decoder_tx {
+            if let Some(results) = decoder_once_results {
+                let _ = tx
+                    .send(DecoderMessage::OnceCallsReady {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: contract_name.clone(),
+                        results,
+                        live_mode: false,
+                        retry_transform_after_decode: false,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn process_factory_once_calls(
+    range: &BlockRange,
+    ctx: &EthCallContext<'_>,
+    factory_data: &FactoryAddressData,
+    once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
+    expected_contracts: Option<&HashMap<String, ExpectedContracts>>,
+) -> Result<(), EthCallCollectionError> {
+    for (collection_name, call_configs) in once_configs {
+        if call_configs.is_empty() {
+            continue;
+        }
+
+        let file_name = range.file_name("");
+        let rel_path = format!("{}/once/{}", collection_name, file_name);
+        let sub_dir = ctx.output_dir.join(collection_name).join("once");
+        let output_path = sub_dir.join(&file_name);
+
+        let all_fn_names = extract_fn_names(call_configs);
+
+        // Check parquet file state: returns None if file is already complete
+        let file_state = check_factory_once_file_state(
+            &rel_path,
+            &file_name,
+            &sub_dir,
+            &output_path,
+            &all_fn_names,
+            ctx.existing_files,
+            column_indexes,
+            collection_name,
+            range,
+            factory_data,
+            expected_contracts,
+            ctx.repair,
+        )
+        .await?;
+        let file_state = match file_state {
+            Some(s) => s,
+            None => continue,
+        };
+        let missing_fn_names = file_state.missing_fn_names;
+        let has_existing_file = file_state.has_existing_file;
+        let null_entries = file_state.null_entries;
+        let mut parquet_state = file_state.parquet_state;
+
+        let configs_to_call: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        // Configs for partially-null columns (only need to call specific addresses)
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
+            .collect();
+
+        let mut address_discovery: HashMap<Address, (u64, u64)> = HashMap::new();
+
+        for (block_num, addrs) in &factory_data.addresses_by_block {
+            for (timestamp, addr, coll_name) in addrs {
+                if coll_name == collection_name {
+                    address_discovery
+                        .entry(*addr)
+                        .or_insert((*block_num, *timestamp));
+                }
+            }
+        }
+
+        // Write empty file when no factory addresses discovered (no data for this range)
+        if address_discovery.is_empty() && !has_existing_file {
+            write_empty_once_file(&sub_dir, &output_path, &file_name, &all_fn_names).await?;
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_ci(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index (empty range) for {}: {}",
+                        collection_name,
+                        e
+                    );
+                }
+            }
+            if let Some(tx) = ctx.decoder_tx {
+                let _ = tx
+                    .send(DecoderMessage::OnceFileBackfilled {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: collection_name.clone(),
+                    })
+                    .await;
+            }
+            continue;
+        }
+
+        // C. Reuse batches from parquet_state to identify absent addresses
+        let existing_addr_set = if let Some(ref state) = parquet_state {
+            if let Some(ref batches) = state.batches {
+                extract_addresses_from_once_parquet(batches)
+                    .into_keys()
+                    .collect()
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+
+        let absent_addresses: Vec<(&Address, &(u64, u64))> = address_discovery
+            .iter()
+            .filter(|(addr, _)| !existing_addr_set.contains(&addr.0 .0))
+            .collect();
+
+        let mut pending_calls: Vec<(TransactionRequest, BlockId, Address, u64, u64, String)> =
+            Vec::new();
+
+        // Missing columns: call ALL discovered addresses
+        for (discovered_address, (block_number, timestamp)) in &address_discovery {
+            let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
+
+            for call_config in &configs_to_call {
+                let target_address = call_config
+                    .target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *discovered_address,
+                    )?
+                };
+                let tx = TransactionRequest::default()
+                    .to(target_address)
+                    .input(calldata.into());
+                pending_calls.push((
+                    tx,
+                    block_id,
+                    *discovered_address,
+                    *block_number,
+                    *timestamp,
+                    call_config.function_name.clone(),
+                ));
+            }
+        }
+
+        // Partially-null columns: call only addresses with null values
+        for (discovered_address, (block_number, timestamp)) in &address_discovery {
+            let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
+
+            for call_config in &configs_to_patch {
+                let null_addrs = &null_entries[&call_config.function_name];
+                if !null_addrs.contains(&discovered_address.0 .0) {
+                    continue;
+                }
+                let target_address = call_config
+                    .target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *discovered_address,
+                    )?
+                };
+                let tx = TransactionRequest::default()
+                    .to(target_address)
+                    .input(calldata.into());
+                pending_calls.push((
+                    tx,
+                    block_id,
+                    *discovered_address,
+                    *block_number,
+                    *timestamp,
+                    call_config.function_name.clone(),
+                ));
+            }
+        }
+
+        // D. Absent addresses: call existing functions for addresses not yet in the parquet
+        if !absent_addresses.is_empty() {
+            let already_covered_by_global: HashSet<&str> = configs_to_call
+                .iter()
+                .map(|c| c.function_name.as_str())
+                .collect();
+
+            for (addr, (block_number, timestamp)) in &absent_addresses {
+                let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_number));
+
+                for call_config in call_configs.iter() {
+                    if already_covered_by_global.contains(call_config.function_name.as_str()) {
+                        continue;
+                    }
+                    let target_address = call_config
+                        .target_addresses
+                        .as_ref()
+                        .and_then(|addrs| addrs.first().copied())
+                        .unwrap_or(**addr);
+
+                    let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                        preencoded.clone()
+                    } else {
+                        encode_once_call_params(
+                            call_config.function_selector,
+                            &call_config.params,
+                            **addr,
+                        )?
+                    };
+                    let tx = TransactionRequest::default()
+                        .to(target_address)
+                        .input(calldata.into());
+                    pending_calls.push((
+                        tx,
+                        block_id,
+                        **addr,
+                        *block_number,
+                        *timestamp,
+                        call_config.function_name.clone(),
+                    ));
+                }
+            }
+        }
+
+        // H. No-op optimization: if contract-index gate fell through but no calls needed,
+        // just write the missing contract_index.json and skip the parquet rewrite.
+        if pending_calls.is_empty() && has_existing_file {
+            if !ctx.repair {
+                continue;
+            }
+            // Rewrite empty parquet with full schema when columns are missing
+            if !missing_fn_names.is_empty() && existing_addr_set.is_empty() {
+                write_empty_once_file(&sub_dir, &output_path, &file_name, &all_fn_names).await?;
+                tracing::info!(
+                    "Factory once {} blocks {}-{}: rewrote empty parquet with {} columns",
+                    collection_name,
+                    range.start,
+                    range.end - 1,
+                    all_fn_names.len()
+                );
+            }
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_ci(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index for {}: {}",
+                        collection_name,
+                        e
+                    );
+                } else {
+                    tracing::info!(
+                        "Factory once {} blocks {}-{}: wrote missing contract index (no parquet changes needed)",
+                        collection_name, range.start, range.end - 1
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Skip only if no pending calls AND no existing file to backfill
+        if pending_calls.is_empty() && !has_existing_file {
+            continue;
+        }
+
+        // Execute batch calls only if there are pending calls
+        let results_by_address: AddressResults = if !pending_calls.is_empty() {
+            let batch_calls: Vec<(TransactionRequest, BlockId)> = pending_calls
+                .iter()
+                .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
+                .collect();
+
+            let batch_results = ctx.client.call_batch(batch_calls).await?;
+
+            let mut results_map: AddressResults = HashMap::new();
+
+            for (i, result) in batch_results.into_iter().enumerate() {
+                let (tx, _, address, block_number, timestamp, function_name) = &pending_calls[i];
+
+                let entry = results_map
+                    .entry(*address)
+                    .or_insert_with(|| (*block_number, *timestamp, HashMap::new()));
+
+                match result {
+                    Ok(bytes) => {
+                        entry.2.insert(function_name.clone(), bytes.to_vec());
+                    }
+                    Err(e) => {
+                        let calldata = tx
+                            .input
+                            .input
+                            .as_ref()
+                            .map(|b| format!("0x{}", hex::encode(b)))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                                "factory once eth_call failed for {}.{} at block {} (address {}, calldata {}): {}",
+                                collection_name,
+                                function_name,
+                                block_number,
+                                address,
+                                calldata,
+                                e
+                            );
+                        entry.2.insert(function_name.clone(), Vec::new());
+                    }
+                }
+            }
+            results_map
+        } else {
+            HashMap::new()
+        };
+
+        tokio::fs::create_dir_all(&sub_dir).await?;
+
+        if has_existing_file {
+            // E. Reuse batches from single-read parquet state
+            let existing_batches = parquet_state
+                .as_mut()
+                .and_then(|s| s.batches.take())
+                .unwrap_or_default();
+            let existing_is_empty =
+                existing_batches.is_empty() || existing_batches.iter().all(|b| b.num_rows() == 0);
+
+            // If existing file is empty/incomplete and we have new results,
+            // do a full rewrite combining existing + new data.
+            let has_new_addrs = !results_by_address.is_empty();
+            if (existing_is_empty || has_new_addrs) && has_new_addrs {
+                let mut combined: Vec<OnceCallResult> = results_by_address
+                    .into_iter()
+                    .map(
+                        |(address, (block_number, timestamp, function_results))| OnceCallResult {
+                            block_number,
+                            block_timestamp: timestamp,
+                            contract_address: address.0 .0,
+                            function_results,
+                        },
+                    )
+                    .collect();
+                let new_addrs: HashSet<[u8; 20]> =
+                    combined.iter().map(|r| r.contract_address).collect();
+
+                if !existing_is_empty {
+                    let existing_data = extract_addresses_from_once_parquet(&existing_batches);
+                    let existing_results = extract_existing_results_from_parquet(
+                        &existing_batches,
+                        &all_fn_names
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                    for (addr_bytes, (block_num, timestamp)) in existing_data {
+                        if new_addrs.contains(&addr_bytes) {
+                            continue;
+                        }
+                        let fn_results = existing_results
+                            .get(&addr_bytes)
+                            .cloned()
+                            .unwrap_or_default();
+                        combined.push(OnceCallResult {
+                            block_number: block_num,
+                            block_timestamp: timestamp,
+                            contract_address: addr_bytes,
+                            function_results: fn_results,
+                        });
+                    }
+                }
+
+                tracing::info!(
+                    "Writing {} factory once results ({} new + {} existing) to {} for {}",
+                    combined.len(),
+                    new_addrs.len(),
+                    combined.len() - new_addrs.len(),
+                    output_path.display(),
+                    collection_name
+                );
+
+                write_once_results_to_parquet_async(
+                    combined,
+                    output_path.clone(),
+                    all_fn_names.clone(),
+                )
+                .await?;
+            } else {
+                // Merge new columns into existing parquet
+                let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> =
+                    results_by_address
+                        .into_iter()
+                        .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
+                        .collect();
+
+                if !existing_is_empty {
+                    // Check which addresses already have data for the missing functions
+                    let existing_results =
+                        extract_existing_results_from_parquet(&existing_batches, &missing_fn_names);
+
+                    // Find addresses in existing parquet that need backfill
+                    let existing_addresses = extract_addresses_from_once_parquet(&existing_batches);
+
+                    // Build list of (address, block, functions_to_call) for backfill
+                    // Only call functions that don't already have data
+                    let mut backfill_calls: Vec<(TransactionRequest, BlockId, [u8; 20], String)> =
+                        Vec::new();
+
+                    for (addr_bytes, (block_num, _timestamp)) in &existing_addresses {
+                        // Skip addresses that are in current batch (already have new results)
+                        if new_results.contains_key(addr_bytes) {
+                            continue;
+                        }
+
+                        let discovered_address = Address::from_slice(addr_bytes);
+                        let block_id = BlockId::Number(BlockNumberOrTag::Number(*block_num));
+
+                        // Check which functions this address already has data for
+                        let existing_fns = existing_results.get(addr_bytes);
+
+                        for call_config in &configs_to_call {
+                            // Skip if this address already has data for this function
+                            if let Some(fns) = existing_fns {
+                                if fns.contains_key(&call_config.function_name) {
+                                    continue;
+                                }
+                            }
+
+                            let target_address = call_config
+                                .target_addresses
+                                .as_ref()
+                                .and_then(|addrs| addrs.first().copied())
+                                .unwrap_or(discovered_address);
+
+                            let calldata =
+                                if let Some(preencoded) = &call_config.preencoded_calldata {
+                                    preencoded.clone()
+                                } else {
+                                    encode_once_call_params(
+                                        call_config.function_selector,
+                                        &call_config.params,
+                                        discovered_address,
+                                    )?
+                                };
+                            let tx = TransactionRequest::default()
+                                .to(target_address)
+                                .input(calldata.into());
+                            backfill_calls.push((
+                                tx,
+                                block_id,
+                                *addr_bytes,
+                                call_config.function_name.clone(),
+                            ));
+                        }
+                    }
+
+                    // Merge existing results into new_results (preserve what we already have)
+                    for (addr_bytes, fns) in existing_results {
+                        let entry = new_results.entry(addr_bytes).or_default();
+                        for (fn_name, data) in fns {
+                            entry.entry(fn_name).or_insert(data);
+                        }
+                    }
+
+                    // Make backfill calls for addresses/functions that don't have data
+                    if !backfill_calls.is_empty() {
+                        tracing::info!(
+                        "Backfilling {} calls for factory once columns (addresses missing data)",
+                        backfill_calls.len()
+                    );
+
+                        let batch_calls: Vec<(TransactionRequest, BlockId)> = backfill_calls
+                            .iter()
+                            .map(|(tx, bid, _, _)| (tx.clone(), *bid))
+                            .collect();
+
+                        let batch_results = ctx.client.call_batch(batch_calls).await?;
+
+                        for (i, result) in batch_results.into_iter().enumerate() {
+                            let (_, _, addr_bytes, function_name) = &backfill_calls[i];
+                            let entry = new_results.entry(*addr_bytes).or_default();
+                            match result {
+                                Ok(bytes) => {
+                                    entry.insert(function_name.clone(), bytes.to_vec());
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Backfill factory once eth_call failed for {}.{}: {}",
+                                        collection_name,
+                                        function_name,
+                                        e
+                                    );
+                                    entry.insert(function_name.clone(), Vec::new());
+                                }
+                            }
+                        }
+                    }
+
+                    // Combine missing + patch function names for merge
+                    let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+                    let all_new_fn_names: Vec<String> = missing_fn_names
+                        .iter()
+                        .chain(patch_fn_names.iter())
+                        .cloned()
+                        .collect();
+                    let merged =
+                        merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+
+                    write_record_batch_to_parquet_async(merged, output_path.clone()).await?;
+
+                    tracing::info!(
+                        "Merged {} new + {} patched factory once columns into {} for {}",
+                        missing_fn_names.len(),
+                        patch_fn_names.len(),
+                        output_path.display(),
+                        collection_name
+                    );
+                }
+            } // close else { for existing_is_empty check
+        } else {
+            let results: Vec<OnceCallResult> = results_by_address
+                .into_iter()
+                .map(
+                    |(address, (block_number, timestamp, function_results))| OnceCallResult {
+                        block_number,
+                        block_timestamp: timestamp,
+                        contract_address: address.0 .0,
+                        function_results,
+                    },
+                )
+                .collect();
+
+            if !results.is_empty() {
+                tracing::info!(
+                    "Writing {} factory once eth_call results to {}",
+                    results.len(),
+                    output_path.display()
+                );
+
+                write_once_results_to_parquet_async(
+                    results,
+                    output_path.clone(),
+                    all_fn_names.clone(),
+                )
+                .await?;
+            }
+        }
+
+        // Upload to S3 if configured
+        if let Some(sm) = ctx.storage_manager {
+            let data_type = format!("raw/eth_calls/{}/once", collection_name);
+            upload_parquet_to_s3(
+                sm,
+                &output_path,
+                ctx.chain_name,
+                &data_type,
+                range.start,
+                range.end - 1,
+            )
+            .await
+            .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+        }
+
+        // Update the column index — use all_fn_names directly instead of
+        // re-reading the file we just wrote.
+        update_column_index(&sub_dir, &file_name, &all_fn_names).await?;
+        tracing::info!(
+            "Updated column index for factory {}: {} now has {} columns: {:?}",
+            collection_name,
+            file_name,
+            all_fn_names.len(),
+            all_fn_names
+        );
+
+        // F. Write contract index after parquet write
+        if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+            let rk = range_key(range.start, range.end - 1);
+            let mut ci = read_contract_index(&sub_dir);
+            update_ci(&mut ci, &rk, expected);
+            if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                tracing::warn!(
+                    "Failed to write once contract index for {}: {}",
+                    collection_name,
+                    e
+                );
+            }
+        }
+
+        // Notify decoder that this file was updated so it can decode new columns
+        if let Some(tx) = ctx.decoder_tx {
+            let _ = tx
+                .send(DecoderMessage::OnceFileBackfilled {
+                    range_start: range.start,
+                    range_end: range.end,
+                    contract_name: collection_name.clone(),
+                })
+                .await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Process regular once calls using Multicall3 aggregate3
+pub(crate) async fn process_once_calls_multicall(
+    range: &BlockRange,
+    blocks: &[BlockInfo],
+    ctx: &EthCallContext<'_>,
+    once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    contracts: &Contracts,
+    multicall3_address: Address,
+) -> Result<(), EthCallCollectionError> {
+    let first_block = match blocks.first() {
+        Some(b) => b,
+        None => return Ok(()),
+    };
+
+    let mut all_slots: Vec<MulticallSlotGeneric<OnceCallMeta>> = Vec::new();
+    let mut contracts_to_process: Vec<ContractProcessingInfo> = Vec::new();
+
+    for (contract_name, call_configs) in once_configs {
+        if call_configs.is_empty() {
+            continue;
+        }
+
+        let file_name = range.file_name("");
+        let rel_path = format!("{}/once/{}", contract_name, file_name);
+        let sub_dir = ctx.output_dir.join(contract_name).join("once");
+        let output_path = sub_dir.join(&file_name);
+
+        let all_fn_names = extract_fn_names(call_configs);
+
+        // Check parquet file state: returns None if file is already complete
+        let file_state = check_regular_once_file_state(
+            &rel_path,
+            &file_name,
+            &sub_dir,
+            &output_path,
+            &all_fn_names,
+            ctx.existing_files,
+            contract_name,
+            range.start,
+            range.end,
+        )
+        .await?;
+        let file_state = match file_state {
+            Some(s) => s,
+            None => continue,
+        };
+        let missing_fn_names = file_state.missing_fn_names;
+        let has_existing_file = file_state.has_existing_file;
+        let null_entries = file_state.null_entries;
+        let parquet_state = file_state.parquet_state;
+
+        let configs_to_call: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
+            .collect();
+
+        let contract = match contracts.get(contract_name) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Skip if first_block is before contract's start_block
+        if let Some(sb) = contract.start_block {
+            let start_block = sb.to::<u64>();
+            if first_block.block_number < start_block {
+                tracing::debug!(
+                    "Skipping once calls for {} at block {} (before start_block {})",
+                    contract_name,
+                    first_block.block_number,
+                    start_block
+                );
+                continue;
+            }
+        }
+
+        let default_addresses = match &contract.address {
+            AddressOrAddresses::Single(addr) => vec![*addr],
+            AddressOrAddresses::Multiple(addrs) => addrs.clone(),
+        };
+
+        // Missing columns: slots for ALL addresses
+        for call_config in &configs_to_call {
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
+
+            for address in addresses {
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
+
+                all_slots.push(MulticallSlotGeneric {
+                    block_number: first_block.block_number,
+                    block_timestamp: first_block.timestamp,
+                    target_address: *address,
+                    encoded_calldata: calldata,
+                    metadata: OnceCallMeta {
+                        contract_name: contract_name.clone(),
+                        function_name: call_config.function_name.clone(),
+                        contract_address: *address,
+                    },
+                });
+            }
+        }
+
+        // Partially-null columns: slots only for addresses with null values
+        for call_config in &configs_to_patch {
+            let null_addrs = &null_entries[&call_config.function_name];
+            let addresses = call_config
+                .target_addresses
+                .as_ref()
+                .unwrap_or(&default_addresses);
+
+            for address in addresses {
+                if !null_addrs.contains(&address.0 .0) {
+                    continue;
+                }
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *address,
+                    )?
+                };
+
+                all_slots.push(MulticallSlotGeneric {
+                    block_number: first_block.block_number,
+                    block_timestamp: first_block.timestamp,
+                    target_address: *address,
+                    encoded_calldata: calldata,
+                    metadata: OnceCallMeta {
+                        contract_name: contract_name.clone(),
+                        function_name: call_config.function_name.clone(),
+                        contract_address: *address,
+                    },
+                });
+            }
+        }
+
+        let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+        contracts_to_process.push(ContractProcessingInfo {
+            name: contract_name.clone(),
+            all_fn_names,
+            missing_fn_names,
+            patch_fn_names,
+            output_path,
+            has_existing_file,
+            parquet_state,
+        });
+    }
+
+    if all_slots.is_empty() {
+        return Ok(());
+    }
+
+    // Build one multicall for all slots (they're all at the same block)
+    let block_multicalls = vec![BlockMulticall {
+        block_number: first_block.block_number,
+        block_id: BlockId::Number(BlockNumberOrTag::Number(first_block.block_number)),
+        slots: all_slots,
+    }];
+
+    tracing::info!(
+        "Executing multicall with {} once calls at block {}",
+        block_multicalls[0].slots.len(),
+        first_block.block_number
+    );
+
+    // Execute multicall
+    let results = execute_multicalls_generic(
+        ctx.client,
+        multicall3_address,
+        block_multicalls,
+        ctx.chain_name,
+    )
+    .await?;
+
+    // Group results by contract_name -> address -> function_name -> value
+    let mut results_by_contract: HashMap<String, HashMap<Address, HashMap<String, Vec<u8>>>> =
+        HashMap::new();
+
+    for (meta, return_data, _success) in results {
+        results_by_contract
+            .entry(meta.contract_name.clone())
+            .or_default()
+            .entry(meta.contract_address)
+            .or_default()
+            .insert(meta.function_name, return_data);
+    }
+
+    // Write parquet for each contract
+    for ContractProcessingInfo {
+        name: contract_name,
+        all_fn_names,
+        missing_fn_names,
+        patch_fn_names,
+        output_path,
+        has_existing_file,
+        mut parquet_state,
+    } in contracts_to_process
+    {
+        let sub_dir = output_path.parent().unwrap();
+        tokio::fs::create_dir_all(sub_dir).await?;
+
+        if let Some(results_by_address) = results_by_contract.remove(&contract_name) {
+            let decoder_once_results: Option<Vec<DecoderOnceCallResult>> =
+                if ctx.decoder_tx.is_some() {
+                    Some(
+                        results_by_address
+                            .iter()
+                            .map(|(addr, function_results)| DecoderOnceCallResult {
+                                block_number: first_block.block_number,
+                                block_timestamp: first_block.timestamp,
+                                contract_address: addr.0 .0,
+                                results: function_results.clone(),
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+
+            if has_existing_file {
+                let new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> = results_by_address
+                    .into_iter()
+                    .map(|(addr, fns)| (addr.0 .0, fns))
+                    .collect();
+
+                // Reuse batches from single-read parquet state
+                let existing_batches = parquet_state
+                    .as_mut()
+                    .and_then(|s| s.batches.take())
+                    .unwrap_or_default();
+                if !existing_batches.is_empty() {
+                    // Combine missing + patch function names for merge
+                    let all_new_fn_names: Vec<String> = missing_fn_names
+                        .iter()
+                        .chain(patch_fn_names.iter())
+                        .cloned()
+                        .collect();
+                    let merged =
+                        merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+
+                    write_record_batch_to_parquet_async(merged, output_path.clone()).await?;
+
+                    tracing::info!(
+                        "Merged {} new + {} patched multicall once columns into {} for {}",
+                        missing_fn_names.len(),
+                        patch_fn_names.len(),
+                        output_path.display(),
+                        contract_name
+                    );
+                }
+            } else {
+                let results: Vec<OnceCallResult> = results_by_address
+                    .into_iter()
+                    .map(|(address, function_results)| OnceCallResult {
+                        block_number: first_block.block_number,
+                        block_timestamp: first_block.timestamp,
+                        contract_address: address.0 .0,
+                        function_results,
+                    })
+                    .collect();
+
+                if !results.is_empty() {
+                    tracing::info!(
+                        "Writing {} multicall once eth_call results to {}",
+                        results.len(),
+                        output_path.display()
+                    );
+
+                    write_once_results_to_parquet_async(
+                        results,
+                        output_path.clone(),
+                        all_fn_names.clone(),
+                    )
+                    .await?;
+                }
+            }
+
+            // Upload to S3 if configured
+            if let Some(sm) = ctx.storage_manager {
+                let data_type = format!("raw/eth_calls/{}/once", contract_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path,
+                    ctx.chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
+
+            // Update column index — use all_fn_names directly instead of
+            // re-reading the file we just wrote.
+            let file_name = output_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            update_column_index(sub_dir, &file_name, &all_fn_names).await?;
+
+            if let Some(tx) = ctx.decoder_tx {
+                if let Some(results) = decoder_once_results {
+                    let _ = tx
+                        .send(DecoderMessage::OnceCallsReady {
+                            range_start: range.start,
+                            range_end: range.end,
+                            contract_name: contract_name.clone(),
+                            results,
+                            live_mode: false,
+                            retry_transform_after_decode: false,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Process factory once calls using Multicall3 aggregate3
+pub(crate) async fn process_factory_once_calls_multicall(
+    range: &BlockRange,
+    ctx: &EthCallContext<'_>,
+    factory_data: &FactoryAddressData,
+    once_configs: &HashMap<String, Vec<OnceCallConfig>>,
+    column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
+    multicall3_address: Address,
+    expected_contracts: Option<&HashMap<String, ExpectedContracts>>,
+) -> Result<(), EthCallCollectionError> {
+    // Collect all calls across all collections into one multicall
+    let mut all_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> = Vec::new();
+    let mut collections_to_process: Vec<FactoryContractProcessingInfo> = Vec::new();
+
+    for (collection_name, call_configs) in once_configs {
+        if call_configs.is_empty() {
+            continue;
+        }
+
+        let file_name = range.file_name("");
+        let rel_path = format!("{}/once/{}", collection_name, file_name);
+        let sub_dir = ctx.output_dir.join(collection_name).join("once");
+        let output_path = sub_dir.join(&file_name);
+
+        let all_fn_names = extract_fn_names(call_configs);
+
+        // Check parquet file state: returns None if file is already complete
+        let file_state = check_factory_once_file_state(
+            &rel_path,
+            &file_name,
+            &sub_dir,
+            &output_path,
+            &all_fn_names,
+            ctx.existing_files,
+            column_indexes,
+            collection_name,
+            range,
+            factory_data,
+            expected_contracts,
+            ctx.repair,
+        )
+        .await?;
+        let file_state = match file_state {
+            Some(s) => s,
+            None => continue,
+        };
+        let missing_fn_names = file_state.missing_fn_names;
+        let has_existing_file = file_state.has_existing_file;
+        let null_entries = file_state.null_entries;
+        let parquet_state = file_state.parquet_state;
+
+        let configs_to_call: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| missing_fn_names.contains(&c.function_name))
+            .collect();
+
+        let configs_to_patch: Vec<&OnceCallConfig> = call_configs
+            .iter()
+            .filter(|c| null_entries.contains_key(&c.function_name))
+            .collect();
+
+        // Build address discovery map
+        let mut address_discovery: HashMap<Address, (u64, u64)> = HashMap::new();
+        for (block_num, addrs) in &factory_data.addresses_by_block {
+            for (timestamp, addr, coll_name) in addrs {
+                if coll_name == collection_name {
+                    address_discovery
+                        .entry(*addr)
+                        .or_insert((*block_num, *timestamp));
+                }
+            }
+        }
+
+        // Write empty file when no factory addresses discovered (no data for this range)
+        if address_discovery.is_empty() && !has_existing_file {
+            write_empty_once_file(&sub_dir, &output_path, &file_name, &all_fn_names).await?;
+            // G. Write contract index in empty-file branch
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_ci(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index (empty range) for {}: {}",
+                        collection_name,
+                        e
+                    );
+                }
+            }
+            continue;
+        }
+
+        // C. Reuse batches from parquet_state to identify absent addresses
+        let existing_addr_set: HashSet<[u8; 20]> = if let Some(ref state) = parquet_state {
+            if let Some(ref batches) = state.batches {
+                extract_addresses_from_once_parquet(batches)
+                    .into_keys()
+                    .collect()
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
+
+        let absent_addresses: Vec<(&Address, &(u64, u64))> = address_discovery
+            .iter()
+            .filter(|(addr, _)| !existing_addr_set.contains(&addr.0 .0))
+            .collect();
+
+        // Rewrite empty parquet with full schema when columns are missing and file is empty
+        if address_discovery.is_empty()
+            && has_existing_file
+            && !missing_fn_names.is_empty()
+            && existing_addr_set.is_empty()
+        {
+            if !ctx.repair {
+                continue;
+            }
+            write_empty_once_file(&sub_dir, &output_path, &file_name, &all_fn_names).await?;
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(&sub_dir);
+                update_ci(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(&sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index for {}: {}",
+                        collection_name,
+                        e
+                    );
+                }
+            }
+            tracing::info!(
+                "Factory once multicall {} blocks {}-{}: rewrote empty parquet with {} columns",
+                collection_name,
+                range.start,
+                range.end - 1,
+                all_fn_names.len()
+            );
+            continue;
+        }
+
+        // Missing columns: slots for ALL discovered addresses
+        for call_config in &configs_to_call {
+            for (discovered_address, (block_num, timestamp)) in &address_discovery {
+                let target_address = call_config
+                    .target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *discovered_address,
+                    )?
+                };
+
+                all_slots.push(MulticallSlotGeneric {
+                    block_number: *block_num,
+                    block_timestamp: *timestamp,
+                    target_address,
+                    encoded_calldata: calldata,
+                    metadata: FactoryOnceSlotMeta {
+                        collection_name: collection_name.clone(),
+                        function_name: call_config.function_name.clone(),
+                        address: *discovered_address,
+                        block_number: *block_num,
+                        block_timestamp: *timestamp,
+                    },
+                });
+            }
+        }
+
+        // Partially-null columns: slots only for addresses with null values
+        for call_config in &configs_to_patch {
+            let null_addrs = &null_entries[&call_config.function_name];
+            for (discovered_address, (block_num, timestamp)) in &address_discovery {
+                if !null_addrs.contains(&discovered_address.0 .0) {
+                    continue;
+                }
+                let target_address = call_config
+                    .target_addresses
+                    .as_ref()
+                    .and_then(|addrs| addrs.first().copied())
+                    .unwrap_or(*discovered_address);
+
+                let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                    preencoded.clone()
+                } else {
+                    encode_once_call_params(
+                        call_config.function_selector,
+                        &call_config.params,
+                        *discovered_address,
+                    )?
+                };
+
+                all_slots.push(MulticallSlotGeneric {
+                    block_number: *block_num,
+                    block_timestamp: *timestamp,
+                    target_address,
+                    encoded_calldata: calldata,
+                    metadata: FactoryOnceSlotMeta {
+                        collection_name: collection_name.clone(),
+                        function_name: call_config.function_name.clone(),
+                        address: *discovered_address,
+                        block_number: *block_num,
+                        block_timestamp: *timestamp,
+                    },
+                });
+            }
+        }
+
+        // D. Absent addresses: add slots for existing functions for addresses not yet in the parquet
+        if !absent_addresses.is_empty() {
+            let already_covered_by_global: HashSet<&str> = configs_to_call
+                .iter()
+                .map(|c| c.function_name.as_str())
+                .collect();
+
+            for (addr, (block_num, timestamp)) in &absent_addresses {
+                for call_config in call_configs.iter() {
+                    if already_covered_by_global.contains(call_config.function_name.as_str()) {
+                        continue;
+                    }
+                    let target_address = call_config
+                        .target_addresses
+                        .as_ref()
+                        .and_then(|addrs| addrs.first().copied())
+                        .unwrap_or(**addr);
+
+                    let calldata = if let Some(preencoded) = &call_config.preencoded_calldata {
+                        preencoded.clone()
+                    } else {
+                        encode_once_call_params(
+                            call_config.function_selector,
+                            &call_config.params,
+                            **addr,
+                        )?
+                    };
+
+                    all_slots.push(MulticallSlotGeneric {
+                        block_number: *block_num,
+                        block_timestamp: *timestamp,
+                        target_address,
+                        encoded_calldata: calldata,
+                        metadata: FactoryOnceSlotMeta {
+                            collection_name: collection_name.clone(),
+                            function_name: call_config.function_name.clone(),
+                            address: **addr,
+                            block_number: *block_num,
+                            block_timestamp: *timestamp,
+                        },
+                    });
+                }
+            }
+        }
+
+        // Clone configs for use in backfill phase
+        let configs_for_backfill: Vec<OnceCallConfig> =
+            configs_to_call.iter().map(|c| (*c).clone()).collect();
+
+        let patch_fn_names: Vec<String> = null_entries.keys().cloned().collect();
+
+        // Always add to collections_to_process - even with empty address_discovery,
+        // existing files may need backfill for missing columns
+        collections_to_process.push(FactoryContractProcessingInfo {
+            name: collection_name.clone(),
+            all_fn_names,
+            missing_fn_names,
+            patch_fn_names,
+            output_path,
+            has_existing_file,
+            once_configs: configs_for_backfill,
+            parquet_state,
+        });
+    }
+
+    // Skip multicall execution only if there are no slots AND no collections need backfill
+    let any_need_backfill = collections_to_process
+        .iter()
+        .any(|info| info.has_existing_file);
+    if all_slots.is_empty() && !any_need_backfill {
+        return Ok(());
+    }
+
+    // Group results by collection_name -> address -> (block_num, timestamp, function_results)
+    let mut results_by_collection: CollectionResults = HashMap::new();
+
+    // Execute multicalls only if there are slots to process
+    if !all_slots.is_empty() {
+        // Group slots by block for multicall batching
+        let mut slots_by_block: HashMap<u64, Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>> =
+            HashMap::new();
+        for slot in all_slots {
+            slots_by_block
+                .entry(slot.block_number)
+                .or_default()
+                .push(slot);
+        }
+
+        let mut block_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> = Vec::new();
+        for (block_number, slots) in slots_by_block {
+            block_multicalls.push(BlockMulticall {
+                block_number,
+                block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
+                slots,
+            });
+        }
+
+        tracing::info!(
+            "Executing {} multicalls for factory once calls in blocks {}-{}",
+            block_multicalls.len(),
+            range.start,
+            range.end - 1
+        );
+
+        // Execute multicalls
+        let results = execute_multicalls_generic(
+            ctx.client,
+            multicall3_address,
+            block_multicalls,
+            ctx.chain_name,
+        )
+        .await?;
+
+        for (meta, return_data, _success) in results {
+            let entry = results_by_collection
+                .entry(meta.collection_name.clone())
+                .or_default()
+                .entry(meta.address)
+                .or_insert((meta.block_number, meta.block_timestamp, HashMap::new()));
+            entry.2.insert(meta.function_name, return_data);
+        }
+    }
+
+    // Write parquet for each collection
+    for FactoryContractProcessingInfo {
+        name: collection_name,
+        all_fn_names,
+        missing_fn_names,
+        patch_fn_names,
+        output_path,
+        has_existing_file,
+        once_configs: configs_to_call,
+        mut parquet_state,
+    } in collections_to_process
+    {
+        let sub_dir = output_path.parent().unwrap();
+        tokio::fs::create_dir_all(sub_dir).await?;
+
+        // Get results for this collection (may be None if no new addresses discovered)
+        let results_by_address = results_by_collection.remove(&collection_name);
+
+        // H. No-op optimization: if contract-index gate fell through but no slots were
+        // queued for this collection and the parquet already exists, just write the
+        // missing contract_index.json and skip the parquet rewrite.
+        let has_results = results_by_address.as_ref().is_some_and(|r| !r.is_empty());
+        if !has_results
+            && has_existing_file
+            && missing_fn_names.is_empty()
+            && patch_fn_names.is_empty()
+        {
+            if !ctx.repair {
+                continue;
+            }
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(&collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(sub_dir);
+                update_ci(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index for {}: {}",
+                        collection_name,
+                        e
+                    );
+                } else {
+                    tracing::info!(
+                        "Factory once multicall {} blocks {}-{}: wrote missing contract index (no parquet changes needed)",
+                        collection_name, range.start, range.end - 1
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Process if we have results OR if existing file needs backfill
+        if results_by_address.is_some() || has_existing_file {
+            let results_by_address = results_by_address.unwrap_or_default();
+
+            if has_existing_file {
+                // Reuse batches from single-read parquet state
+                let existing_batches = parquet_state
+                    .as_mut()
+                    .and_then(|s| s.batches.take())
+                    .unwrap_or_default();
+                let existing_is_empty = existing_batches.is_empty()
+                    || existing_batches.iter().all(|b| b.num_rows() == 0);
+
+                // If existing file is empty/incomplete and we have new results,
+                // do a full rewrite combining existing + new data.
+                let has_new_addrs = !results_by_address.is_empty();
+                if (existing_is_empty || has_new_addrs) && has_new_addrs {
+                    // Build combined results: new addresses + existing addresses
+                    let mut combined: Vec<OnceCallResult> = results_by_address
+                        .into_iter()
+                        .map(|(address, (block_number, timestamp, function_results))| {
+                            OnceCallResult {
+                                block_number,
+                                block_timestamp: timestamp,
+                                contract_address: address.0 .0,
+                                function_results,
+                            }
+                        })
+                        .collect();
+                    let new_addrs: HashSet<[u8; 20]> =
+                        combined.iter().map(|r| r.contract_address).collect();
+
+                    // Preserve existing rows that aren't being replaced
+                    if !existing_is_empty {
+                        let existing_data = extract_addresses_from_once_parquet(&existing_batches);
+                        let existing_results = extract_existing_results_from_parquet(
+                            &existing_batches,
+                            &all_fn_names
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>(),
+                        );
+                        for (addr_bytes, (block_num, timestamp)) in existing_data {
+                            if new_addrs.contains(&addr_bytes) {
+                                continue; // new data takes precedence
+                            }
+                            let fn_results = existing_results
+                                .get(&addr_bytes)
+                                .cloned()
+                                .unwrap_or_default();
+                            combined.push(OnceCallResult {
+                                block_number: block_num,
+                                block_timestamp: timestamp,
+                                contract_address: addr_bytes,
+                                function_results: fn_results,
+                            });
+                        }
+                    }
+
+                    tracing::info!(
+                        "Writing {} multicall factory once results ({} new + {} existing) to {} for {}",
+                        combined.len(),
+                        new_addrs.len(),
+                        combined.len() - new_addrs.len(),
+                        output_path.display(),
+                        collection_name
+                    );
+
+                    write_once_results_to_parquet_async(
+                        combined,
+                        output_path.clone(),
+                        all_fn_names.clone(),
+                    )
+                    .await?;
+                } else {
+                    let mut new_results: HashMap<[u8; 20], HashMap<String, Vec<u8>>> =
+                        results_by_address
+                            .into_iter()
+                            .map(|(addr, (_, _, fns))| (addr.0 .0, fns))
+                            .collect();
+
+                    if !existing_is_empty {
+                        // Check which addresses already have data for the missing functions
+                        let existing_results = extract_existing_results_from_parquet(
+                            &existing_batches,
+                            &missing_fn_names,
+                        );
+
+                        // Find addresses in existing parquet
+                        let existing_addresses =
+                            extract_addresses_from_once_parquet(&existing_batches);
+
+                        // Build backfill slots only for addresses/functions that don't have data
+                        let mut backfill_slots: Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>> =
+                            Vec::new();
+
+                        if !configs_to_call.is_empty() {
+                            for (addr_bytes, (block_num, timestamp)) in &existing_addresses {
+                                // Skip addresses that are in current batch (already have new results)
+                                if new_results.contains_key(addr_bytes) {
+                                    continue;
+                                }
+
+                                let discovered_address = Address::from_slice(addr_bytes);
+
+                                // Check which functions this address already has data for
+                                let existing_fns = existing_results.get(addr_bytes);
+
+                                for call_config in &configs_to_call {
+                                    // Skip if this address already has data for this function
+                                    if let Some(fns) = existing_fns {
+                                        if fns.contains_key(&call_config.function_name) {
+                                            continue;
+                                        }
+                                    }
+
+                                    let target_address = call_config
+                                        .target_addresses
+                                        .as_ref()
+                                        .and_then(|addrs| addrs.first().copied())
+                                        .unwrap_or(discovered_address);
+
+                                    let calldata = if let Some(preencoded) =
+                                        &call_config.preencoded_calldata
+                                    {
+                                        preencoded.clone()
+                                    } else {
+                                        encode_once_call_params(
+                                            call_config.function_selector,
+                                            &call_config.params,
+                                            discovered_address,
+                                        )?
+                                    };
+
+                                    backfill_slots.push(MulticallSlotGeneric {
+                                        block_number: *block_num,
+                                        block_timestamp: *timestamp,
+                                        target_address,
+                                        encoded_calldata: calldata,
+                                        metadata: FactoryOnceSlotMeta {
+                                            collection_name: collection_name.clone(),
+                                            function_name: call_config.function_name.clone(),
+                                            address: discovered_address,
+                                            block_number: *block_num,
+                                            block_timestamp: *timestamp,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+
+                        // Merge existing results into new_results (preserve what we already have)
+                        for (addr_bytes, fns) in existing_results {
+                            let entry = new_results.entry(addr_bytes).or_default();
+                            for (fn_name, data) in fns {
+                                entry.entry(fn_name).or_insert(data);
+                            }
+                        }
+
+                        // Execute backfill multicalls for addresses/functions that don't have data
+                        if !backfill_slots.is_empty() {
+                            tracing::info!(
+                            "Backfilling {} multicall slots for factory once columns (addresses missing data)",
+                            backfill_slots.len()
+                        );
+
+                            // Group by block for multicall
+                            let mut slots_by_block: HashMap<
+                                u64,
+                                Vec<MulticallSlotGeneric<FactoryOnceSlotMeta>>,
+                            > = HashMap::new();
+                            for slot in backfill_slots {
+                                slots_by_block
+                                    .entry(slot.block_number)
+                                    .or_default()
+                                    .push(slot);
+                            }
+
+                            let backfill_multicalls: Vec<BlockMulticall<FactoryOnceSlotMeta>> =
+                                slots_by_block
+                                    .into_iter()
+                                    .map(|(block_number, slots)| BlockMulticall {
+                                        block_number,
+                                        block_id: BlockId::Number(BlockNumberOrTag::Number(
+                                            block_number,
+                                        )),
+                                        slots,
+                                    })
+                                    .collect();
+
+                            let backfill_results = execute_multicalls_generic(
+                                ctx.client,
+                                multicall3_address,
+                                backfill_multicalls,
+                                ctx.chain_name,
+                            )
+                            .await?;
+
+                            for (meta, return_data, _success) in backfill_results {
+                                let addr_bytes: [u8; 20] = meta.address.0 .0;
+                                let entry = new_results.entry(addr_bytes).or_default();
+                                entry.insert(meta.function_name, return_data);
+                            }
+                        }
+
+                        // Combine missing + patch function names for merge
+                        let all_new_fn_names: Vec<String> = missing_fn_names
+                            .iter()
+                            .chain(patch_fn_names.iter())
+                            .cloned()
+                            .collect();
+                        let merged =
+                            merge_once_columns(&existing_batches, &new_results, &all_new_fn_names)?;
+
+                        write_record_batch_to_parquet_async(merged, output_path.clone()).await?;
+
+                        tracing::info!(
+                        "Merged {} new + {} patched multicall factory once columns into {} for {}",
+                        missing_fn_names.len(),
+                        patch_fn_names.len(),
+                        output_path.display(),
+                        collection_name
+                    );
+                    }
+                } // close else { for existing_is_empty check
+            } else {
+                let results: Vec<OnceCallResult> = results_by_address
+                    .into_iter()
+                    .map(
+                        |(address, (block_number, timestamp, function_results))| OnceCallResult {
+                            block_number,
+                            block_timestamp: timestamp,
+                            contract_address: address.0 .0,
+                            function_results,
+                        },
+                    )
+                    .collect();
+
+                if !results.is_empty() {
+                    tracing::info!(
+                        "Writing {} multicall factory once eth_call results to {}",
+                        results.len(),
+                        output_path.display()
+                    );
+
+                    write_once_results_to_parquet_async(
+                        results,
+                        output_path.clone(),
+                        all_fn_names.clone(),
+                    )
+                    .await?;
+                }
+            }
+
+            // Upload to S3 if configured
+            if let Some(sm) = ctx.storage_manager {
+                let data_type = format!("raw/eth_calls/{}/once", collection_name);
+                upload_parquet_to_s3(
+                    sm,
+                    &output_path,
+                    ctx.chain_name,
+                    &data_type,
+                    range.start,
+                    range.end - 1,
+                )
+                .await
+                .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
+            }
+
+            // Update column index — use all_fn_names directly instead of
+            // re-reading the file we just wrote.
+            let file_name = output_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            update_column_index(sub_dir, &file_name, &all_fn_names).await?;
+
+            // F. Write contract index after parquet write
+            if let Some(expected) = expected_contracts.and_then(|m| m.get(&collection_name)) {
+                let rk = range_key(range.start, range.end - 1);
+                let mut ci = read_contract_index(sub_dir);
+                update_ci(&mut ci, &rk, expected);
+                if let Err(e) = write_contract_index(sub_dir, &ci) {
+                    tracing::warn!(
+                        "Failed to write once contract index for {}: {}",
+                        collection_name,
+                        e
+                    );
+                }
+            }
+
+            if let Some(tx) = ctx.decoder_tx {
+                let _ = tx
+                    .send(DecoderMessage::OnceFileBackfilled {
+                        range_start: range.start,
+                        range_end: range.end,
+                        contract_name: collection_name.clone(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use crate::raw_data::historical::eth_calls::{
+        extract_addresses_from_once_parquet, read_existing_once_parquet, read_once_parquet_state,
+        read_parquet_column_names, write_once_results_to_parquet, EthCallContext, OnceCallConfig,
+    };
+    use crate::raw_data::historical::factories::FactoryAddressData;
+    use crate::rpc::UnifiedRpcClient;
+    use crate::storage::contract_index::{
+        build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
+        read_contract_index, update_contract_index, write_contract_index, ExpectedContracts,
+    };
+    use crate::storage::BlockRange;
+
+    /// When no contract_index.json exists, `read_contract_index` returns an empty
+    /// index and `get_missing_contracts` reports everything as missing. The skip
+    /// gate must NOT be taken.
+    #[test]
+    fn test_factory_once_skip_requires_contract_index_completeness() {
+        let dir = TempDir::new().unwrap();
+
+        // No contract_index.json written to dir.
+
+        let mut expected = ExpectedContracts::new();
+        expected.insert(
+            "ContractX".to_string(),
+            vec!["0xaaa".to_string(), "0xbbb".to_string()],
+        );
+        expected.insert("ContractY".to_string(), vec!["0xccc".to_string()]);
+
+        let index = read_contract_index(dir.path());
+        assert!(
+            index.is_empty(),
+            "index should be empty when file is absent"
+        );
+
+        let rk = range_key(0, 999);
+        let missing = get_missing_contracts(&index, &rk, &expected);
+
+        assert!(
+            !missing.is_empty(),
+            "missing must be non-empty when contract index is absent — skip should NOT be taken"
+        );
+        // Every expected entry should be reported missing.
+        assert!(missing.contains_key("ContractX"));
+        assert!(missing.contains_key("ContractY"));
+    }
+
+    /// When the contract_index.json contains all expected contracts and addresses
+    /// for the range, `get_missing_contracts` returns an empty map. The skip gate
+    /// IS taken.
+    #[test]
+    fn test_factory_once_skip_allowed_when_contract_index_complete() {
+        let dir = TempDir::new().unwrap();
+
+        let mut expected = ExpectedContracts::new();
+        expected.insert(
+            "ContractX".to_string(),
+            vec!["0xaaa".to_string(), "0xbbb".to_string()],
+        );
+        expected.insert("ContractY".to_string(), vec!["0xccc".to_string()]);
+
+        // Write a fully-populated contract index.
+        let mut index = read_contract_index(dir.path());
+        let rk = range_key(0, 999);
+        update_contract_index(&mut index, &rk, &expected);
+        write_contract_index(dir.path(), &index).unwrap();
+
+        // Re-read from disk to confirm roundtrip fidelity.
+        let index = read_contract_index(dir.path());
+        let missing = get_missing_contracts(&index, &rk, &expected);
+
+        assert!(
+            missing.is_empty(),
+            "missing must be empty when contract index is complete — skip IS taken"
+        );
+    }
+
+    /// When the contract_index.json only has partial data (one contract missing
+    /// entirely, another missing an address), `get_missing_contracts` reports the
+    /// gaps. The skip gate must NOT be taken.
+    #[test]
+    fn test_factory_once_contract_index_partial_not_complete() {
+        let dir = TempDir::new().unwrap();
+
+        let mut expected = ExpectedContracts::new();
+        expected.insert(
+            "ContractX".to_string(),
+            vec!["0xaaa".to_string(), "0xbbb".to_string()],
+        );
+        expected.insert("ContractY".to_string(), vec!["0xccc".to_string()]);
+
+        // Write a partial index: only ContractX with one of its two addresses.
+        let rk = range_key(0, 999);
+        let mut partial = ExpectedContracts::new();
+        partial.insert("ContractX".to_string(), vec!["0xaaa".to_string()]);
+
+        let mut index = read_contract_index(dir.path());
+        update_contract_index(&mut index, &rk, &partial);
+        write_contract_index(dir.path(), &index).unwrap();
+
+        // Re-read from disk.
+        let index = read_contract_index(dir.path());
+        let missing = get_missing_contracts(&index, &rk, &expected);
+
+        assert!(
+            !missing.is_empty(),
+            "missing must be non-empty when contract index is partial — skip should NOT be taken"
+        );
+        // ContractY is entirely absent.
+        assert!(
+            missing.contains_key("ContractY"),
+            "ContractY should be reported as missing"
+        );
+        // ContractX is present but missing address 0xbbb.
+        let missing_x = missing
+            .get("ContractX")
+            .expect("ContractX should have missing addresses");
+        assert!(
+            missing_x.contains(&"0xbbb".to_string()),
+            "0xbbb should be reported as missing for ContractX"
+        );
+        assert!(
+            !missing_x.contains(&"0xaaa".to_string()),
+            "0xaaa should NOT be reported as missing for ContractX"
+        );
+    }
+
+    /// P1 regression: when an existing once parquet has zero rows, all newly
+    /// discovered factory addresses must be treated as absent so they get
+    /// backfilled for existing functions.
+    #[test]
+    fn test_empty_parquet_absent_addresses_filter() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.parquet");
+
+        // Write an empty parquet with schema [A, B] but 0 rows.
+        write_once_results_to_parquet(&[], &path, &["getA".to_string(), "getB".to_string()])
+            .unwrap();
+
+        // Read back and extract addresses — should be empty.
+        let batches = read_existing_once_parquet(&path).unwrap();
+        let existing_addr_set: HashSet<[u8; 20]> = extract_addresses_from_once_parquet(&batches)
+            .into_keys()
+            .collect();
+        assert!(
+            existing_addr_set.is_empty(),
+            "empty parquet must yield empty address set"
+        );
+
+        // The fixed filter: `!existing_addr_set.contains(&addr)` must return true
+        // for any address, meaning all addresses are "absent" and eligible for backfill.
+        let test_addr: [u8; 20] = [0xaa; 20];
+        assert!(
+            !existing_addr_set.contains(&test_addr),
+            "any address must be treated as absent when parquet is empty"
+        );
+    }
+
+    /// P2 regression: when an empty once parquet exists with stale schema and a
+    /// new function column is added, rewriting the parquet with the full schema
+    /// must converge — the new column appears in the schema and no rows are lost.
+    #[test]
+    fn test_empty_parquet_schema_rewrite_converges() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.parquet");
+
+        // Step 1: write empty parquet with columns [A].
+        write_once_results_to_parquet(&[], &path, &["getA".to_string()]).unwrap();
+
+        let cols = read_parquet_column_names(&path);
+        assert!(cols.contains("getA"), "initial schema must contain getA");
+        assert!(
+            !cols.contains("getB"),
+            "initial schema must NOT contain getB"
+        );
+
+        // Step 2: rewrite with full schema [A, B] (the P2 fix).
+        write_once_results_to_parquet(&[], &path, &["getA".to_string(), "getB".to_string()])
+            .unwrap();
+
+        let cols = read_parquet_column_names(&path);
+        assert!(cols.contains("getA"), "rewritten schema must contain getA");
+        assert!(cols.contains("getB"), "rewritten schema must contain getB");
+
+        // Step 3: verify no spurious rows were created.
+        let batches = read_existing_once_parquet(&path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(addrs.is_empty(), "rewritten empty parquet must have 0 rows");
+
+        // Step 4: a subsequent read_parquet_column_names returns full schema,
+        // so the missing-column check would now pass — no infinite loop.
+        let final_cols = read_parquet_column_names(&path);
+        let all_fn_names = vec!["getA".to_string(), "getB".to_string()];
+        let missing: Vec<&String> = all_fn_names
+            .iter()
+            .filter(|f| !final_cols.contains(*f))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "no columns should be missing after rewrite — loop must converge"
+        );
+    }
+
+    #[test]
+    fn test_empty_parquet_state_preserves_schema_columns() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.parquet");
+
+        write_once_results_to_parquet(&[], &path, &["getA".to_string(), "getB".to_string()])
+            .unwrap();
+
+        let state = read_once_parquet_state(&path).unwrap();
+
+        assert_eq!(state.row_count, 0, "empty parquet must have zero rows");
+        assert!(
+            state.column_names.contains("getA"),
+            "empty parquet metadata must preserve getA"
+        );
+        assert!(
+            state.column_names.contains("getB"),
+            "empty parquet metadata must preserve getB"
+        );
+    }
+
+    #[test]
+    fn test_unique_factory_address_count_dedupes_repeated_addresses() {
+        use alloy_primitives::Address;
+
+        let repeated = Address::new([0xaa; 20]);
+        let other = Address::new([0xbb; 20]);
+        let mut addresses_by_block = HashMap::new();
+        addresses_by_block.insert(
+            100,
+            vec![
+                (1, repeated, "Numeraires".to_string()),
+                (2, repeated, "Numeraires".to_string()),
+                (3, other, "Numeraires".to_string()),
+                (4, Address::new([0xcc; 20]), "OtherCollection".to_string()),
+            ],
+        );
+        let factory_data = FactoryAddressData {
+            range_start: 100,
+            range_end: 200,
+            addresses_by_block,
+        };
+
+        assert_eq!(
+            super::unique_factory_address_count(&factory_data, "Numeraires"),
+            2,
+            "row completeness should be based on unique discovered addresses"
+        );
+    }
+
+    /// P3 regression: `build_expected_factory_contracts_for_range` must return
+    /// correct collection→contract→addresses mapping from a Contracts config
+    /// that has factory entries, so that the live/current path can write
+    /// contract_index.json.
+    #[test]
+    fn test_build_expected_factory_contracts_for_range() {
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+        use alloy_primitives::{Address, U256};
+
+        let addr_a = Address::new([0xaa; 20]);
+        let addr_b = Address::new([0xbb; 20]);
+
+        let mut contracts = std::collections::HashMap::new();
+
+        // Contract with factory → collection "v3_pools", start_block 100.
+        contracts.insert(
+            "UniswapV3Factory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Multiple(vec![addr_a, addr_b]),
+                start_block: Some(U256::from(100)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "v3_pools".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "PoolCreated".to_string(),
+                        topics_signature: "PoolCreated(address,address,uint24,int24,address)"
+                            .to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![4]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        // range_end > start_block → included
+        let result = build_expected_factory_contracts_for_range(&contracts, 200);
+        assert!(
+            result.contains_key("v3_pools"),
+            "collection must be present"
+        );
+        let expected = &result["v3_pools"];
+        assert!(
+            expected.contains_key("UniswapV3Factory"),
+            "contract must be present"
+        );
+        let addrs = &expected["UniswapV3Factory"];
+        assert_eq!(addrs.len(), 2, "both addresses must be listed");
+
+        // range_end <= start_block → excluded
+        let result = build_expected_factory_contracts_for_range(&contracts, 100);
+        assert!(
+            result.is_empty(),
+            "contract with start_block >= range_end must be excluded"
+        );
+    }
+
+    /// Calling `process_factory_once_calls` with empty factory data (no addresses
+    /// discovered) must still write the empty-range outputs: a parquet file with
+    /// the function schema, a column_index.json, and a contract_index.json.
+    #[tokio::test]
+    async fn test_factory_once_empty_range_writes_outputs() {
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+        use alloy_primitives::{Address, U256};
+
+        let tmp = TempDir::new().unwrap();
+        let dummy_client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+        let existing_files: HashSet<String> = HashSet::new();
+        let decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>> = None;
+        let s3_manifest: Option<crate::storage::S3Manifest> = None;
+
+        let ctx = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            repair: false,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        let factory_data = FactoryAddressData {
+            range_start: 0,
+            range_end: 100,
+            addresses_by_block: HashMap::new(),
+        };
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
+        // Build expected contracts using the same ContractConfig pattern as
+        // test_build_expected_factory_contracts_for_range.
+        let addr_a = Address::new([0xaa; 20]);
+        let addr_b = Address::new([0xbb; 20]);
+
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "UniswapV3Factory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Multiple(vec![addr_a, addr_b]),
+                start_block: Some(U256::from(100)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "PoolCreated".to_string(),
+                        topics_signature: "PoolCreated(address,address,uint24,int24,address)"
+                            .to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![4]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        // range_end must be > start_block for the contract to be included.
+        let expected = build_expected_factory_contracts_for_range(&contracts, 101);
+        let range = BlockRange { start: 0, end: 100 };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        // 1. Parquet file exists (range 0..100 → file "0-99.parquet")
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "parquet file must exist after empty-range write"
+        );
+
+        // 2. Column names include our function
+        let col_names = read_parquet_column_names(&parquet_path);
+        assert!(
+            col_names.contains("testFn"),
+            "parquet schema must contain 'testFn'"
+        );
+
+        // 3. No rows (empty factory data → 0 addresses)
+        let batches = read_existing_once_parquet(&parquet_path).unwrap();
+        let addrs = extract_addresses_from_once_parquet(&batches);
+        assert!(
+            addrs.is_empty(),
+            "empty factory data must produce 0-row parquet"
+        );
+
+        // 4. Column index sidecar exists
+        assert!(
+            tmp.path()
+                .join("test_collection/once/column_index.json")
+                .exists(),
+            "column_index.json must exist after empty-range write"
+        );
+
+        // 5. Contract index sidecar exists
+        assert!(
+            tmp.path()
+                .join("test_collection/once/contract_index.json")
+                .exists(),
+            "contract_index.json must exist after empty-range write"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_factory_once_existing_file_contract_index_repair_is_repair_only() {
+        use crate::types::config::contract::{
+            AddressOrAddresses, ContractConfig, FactoryConfig, FactoryEventConfig,
+            FactoryEventConfigOrArray, FactoryParameterLocation,
+        };
+        use alloy_primitives::{Address, U256};
+
+        let tmp = TempDir::new().unwrap();
+        let dummy_client = Arc::new(UnifiedRpcClient::from_url("http://127.0.0.1:8545").unwrap());
+        let range = BlockRange { start: 0, end: 100 };
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        std::fs::create_dir_all(parquet_path.parent().unwrap()).unwrap();
+        write_once_results_to_parquet(&[], &parquet_path, &["testFn".to_string()]).unwrap();
+
+        let mut existing_files: HashSet<String> = HashSet::new();
+        existing_files.insert("test_collection/once/0-99.parquet".to_string());
+        let decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>> = None;
+        let s3_manifest: Option<crate::storage::S3Manifest> = None;
+
+        let factory_data = FactoryAddressData {
+            range_start: 0,
+            range_end: 100,
+            addresses_by_block: HashMap::new(),
+        };
+
+        let mut once_configs: HashMap<String, Vec<OnceCallConfig>> = HashMap::new();
+        once_configs.insert(
+            "test_collection".to_string(),
+            vec![OnceCallConfig {
+                function_name: "testFn".to_string(),
+                function_selector: [0u8; 4],
+                preencoded_calldata: None,
+                params: vec![],
+                target_addresses: None,
+                start_block: None,
+            }],
+        );
+
+        let column_indexes: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+        let mut contracts = HashMap::new();
+        contracts.insert(
+            "TestFactory".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::new([0xaa; 20])),
+                start_block: Some(U256::from(0)),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "test_collection".to_string(),
+                    factory_events: FactoryEventConfigOrArray::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "Created(address)".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Data(vec![0]),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+        let expected = build_expected_factory_contracts_for_range(&contracts, range.end);
+
+        let ctx_no_repair = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            repair: false,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx_no_repair,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        let contract_index_path = tmp.path().join("test_collection/once/contract_index.json");
+        assert!(
+            !contract_index_path.exists(),
+            "normal catchup should not backfill legacy contract indexes"
+        );
+
+        let ctx_repair = EthCallContext {
+            client: &dummy_client,
+            output_dir: tmp.path(),
+            existing_files: &existing_files,
+            rpc_batch_size: 10,
+            repair: true,
+            decoder_tx: &decoder_tx,
+            chain_name: "test",
+            storage_manager: None,
+            s3_manifest: &s3_manifest,
+        };
+
+        super::process_factory_once_calls(
+            &range,
+            &ctx_repair,
+            &factory_data,
+            &once_configs,
+            &column_indexes,
+            Some(&expected),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            contract_index_path.exists(),
+            "repair mode should backfill legacy contract indexes"
+        );
+    }
+}

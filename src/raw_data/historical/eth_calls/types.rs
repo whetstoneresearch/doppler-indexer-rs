@@ -1,19 +1,23 @@
 //! Types for eth_call collection: error types, config structs, result structs, and state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy::primitives::Address;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
 
 use crate::decoding::DecoderMessage;
+use crate::raw_data::historical::eth_calls::event_triggers::SkippedFactoryTrigger;
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::rpc::{RpcError, UnifiedRpcClient};
 use crate::storage::{S3Manifest, StorageManager};
-use crate::types::config::eth_call::{EthCallConfig, EvmType, Frequency, ParamConfig, ParamError};
-use crate::types::config::tokens::PoolType;
+use crate::types::config::contract::Contracts;
+use crate::types::config::eth_call::{
+    EthCallConfig, EvmType, Frequency, ParamConfig, ParamError, ParamValue,
+};
 use alloy::primitives::Bytes;
 
 #[derive(Debug, Error)]
@@ -43,6 +47,43 @@ pub enum EthCallCollectionError {
     EventParamExtraction(String),
 }
 
+/// A collection of spawned write-task handles that aborts all remaining
+/// tasks when dropped. Prevents silent detached writes on error paths.
+pub(crate) struct AbortOnDropHandles {
+    handles: VecDeque<JoinHandle<Result<(), EthCallCollectionError>>>,
+}
+
+impl AbortOnDropHandles {
+    pub fn new() -> Self {
+        Self {
+            handles: VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, handle: JoinHandle<Result<(), EthCallCollectionError>>) {
+        self.handles.push_back(handle);
+    }
+
+    /// Await all handles front-to-back. On error, remaining handles stay in
+    /// `self` and are aborted by `Drop`.
+    pub async fn drain_all(&mut self) -> Result<(), EthCallCollectionError> {
+        while let Some(handle) = self.handles.pop_front() {
+            handle
+                .await
+                .map_err(|e| EthCallCollectionError::JoinError(e.to_string()))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AbortOnDropHandles {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 pub use crate::storage::BlockRange;
 
 /// Shared context for eth_call processing functions.
@@ -50,11 +91,13 @@ pub use crate::storage::BlockRange;
 /// Bundles the RPC client, output paths, and chain info that are threaded
 /// through every `process_*` function in the execution and event_triggers
 /// modules.
+#[allow(dead_code)]
 pub struct EthCallContext<'a> {
     pub client: &'a UnifiedRpcClient,
     pub output_dir: &'a Path,
     pub existing_files: &'a HashSet<String>,
     pub rpc_batch_size: usize,
+    pub repair: bool,
     pub decoder_tx: &'a Option<Sender<DecoderMessage>>,
     pub chain_name: &'a str,
     pub storage_manager: Option<&'a Arc<StorageManager>>,
@@ -77,6 +120,8 @@ pub struct ContractProcessingInfo {
     pub patch_fn_names: Vec<String>,
     pub output_path: PathBuf,
     pub has_existing_file: bool,
+    /// Pre-read parquet state (batches for merge, avoids re-reading the file).
+    pub parquet_state: Option<super::parquet_io::OnceParquetState>,
 }
 
 /// Info needed to process a factory collection's once-calls through the
@@ -90,6 +135,8 @@ pub struct FactoryContractProcessingInfo {
     pub output_path: PathBuf,
     pub has_existing_file: bool,
     pub once_configs: Vec<OnceCallConfig>,
+    /// Pre-read parquet state (batches for merge, avoids re-reading the file).
+    pub parquet_state: Option<super::parquet_io::OnceParquetState>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,10 +211,18 @@ pub struct EventCallResult {
     pub target_address: [u8; 20],
     pub value_bytes: Vec<u8>,
     pub param_values: Vec<Vec<u8>>,
+    pub is_reverted: bool,
+    pub revert_reason: Option<String>,
 }
 
 /// Key for grouping event-triggered calls: (source_name, event_signature_hash)
 pub type EventCallKey = (String, [u8; 32]);
+
+/// A single encoded parameter: (evm_type, param_value, abi-encoded bytes).
+pub type EncodedParam = (EvmType, ParamValue, Vec<u8>);
+
+/// All parameter combinations for an eth_call configuration.
+pub type ParamCombinations = Vec<Vec<EncodedParam>>;
 
 #[derive(Debug)]
 pub struct CallResult {
@@ -188,7 +243,6 @@ pub struct EthCallCatchupState {
     pub call_configs: Vec<CallConfig>,
     pub factory_call_configs: HashMap<String, Vec<EthCallConfig>>,
     pub event_call_configs: HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
-    pub token_call_configs: Vec<TokenCallConfig>,
     pub once_configs: HashMap<String, Vec<OnceCallConfig>>,
     pub factory_once_configs: HashMap<String, Vec<OnceCallConfig>>,
     // Feature flags
@@ -197,7 +251,7 @@ pub struct EthCallCatchupState {
     pub has_factory_calls: bool,
     pub has_factory_once_calls: bool,
     pub has_event_triggered_calls: bool,
-    pub has_token_calls: bool,
+    pub repair: bool,
     // Derived constants
     pub max_params: usize,
     pub factory_max_params: usize,
@@ -211,24 +265,9 @@ pub struct EthCallCatchupState {
     pub range_factory_data: HashMap<u64, FactoryAddressData>,
     pub range_regular_done: HashSet<u64>,
     pub range_factory_done: HashSet<u64>,
-}
-
-/// Configuration for a token pool call
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TokenCallConfig {
-    /// Token name (used for output directory naming as {token_name}_pool)
-    pub token_name: String,
-    /// Pool type (v2, v3, v4)
-    pub pool_type: PoolType,
-    /// Target address for the call (pool address for v2/v3, StateView for v4)
-    pub target_address: Address,
-    /// Function name (e.g., "slot0")
-    pub function_name: String,
-    /// Encoded calldata including selector and any params
-    pub encoded_calldata: Bytes,
-    /// Call frequency
-    pub frequency: Frequency,
-    /// Output type for decoding
-    pub output_type: EvmType,
+    /// Buffered triggers skipped because factory addresses weren't known yet.
+    /// Each entry: (skipped_triggers, range_start, range_end_inclusive)
+    pub factory_skipped_triggers: Vec<(Vec<SkippedFactoryTrigger>, u64, u64)>,
+    /// Contracts config, used to build per-range expected factory contracts for contract index tracking.
+    pub contracts: Contracts,
 }

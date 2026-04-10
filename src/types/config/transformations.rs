@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use super::defaults::{database, transformations as defaults};
+use super::defaults::{database, db_pool, transformations as defaults};
 
 /// Configuration for the transformation system.
 ///
@@ -26,6 +26,10 @@ pub struct TransformationConfig {
     /// Maximum operations per transaction batch.
     #[serde(default = "default_batch_size")]
     pub max_batch_size: usize,
+
+    /// Maximum number of connections in the database pool.
+    #[serde(default = "default_db_pool_size")]
+    pub db_pool_size: usize,
 }
 
 /// Execution mode configuration.
@@ -60,6 +64,10 @@ fn default_catchup_batch_size() -> usize {
     defaults::CATCHUP_BATCH_SIZE
 }
 
+fn default_db_pool_size() -> usize {
+    db_pool::MAX_SIZE
+}
+
 impl Default for TransformationConfig {
     fn default() -> Self {
         Self {
@@ -67,6 +75,7 @@ impl Default for TransformationConfig {
             mode: TransformationModeConfig::default(),
             handler_concurrency: default_handler_concurrency(),
             max_batch_size: default_batch_size(),
+            db_pool_size: default_db_pool_size(),
         }
     }
 }

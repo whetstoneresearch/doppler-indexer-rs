@@ -10,7 +10,9 @@ pub struct RawDataCollectionConfig {
     pub channel_capacity: Option<usize>,
     /// Capacity for factory-related channels. Default: 1000
     pub factory_channel_capacity: Option<usize>,
-    /// Number of blocks to fetch receipts for concurrently when using block_receipts_method.
+    /// Number of concurrent receipt fetch tasks.
+    /// In block-receipt mode each task fetches one block; in fallback mode each
+    /// task fetches one tx-receipt micro-batch.
     /// Higher values improve throughput but use more memory and compute units.
     /// Default: 10
     pub block_receipt_concurrency: Option<usize>,
@@ -22,6 +24,10 @@ pub struct RawDataCollectionConfig {
     /// Higher values improve throughput during catchup but use more memory.
     /// Default: 4
     pub factory_concurrency: Option<usize>,
+    /// Number of concurrent log ranges to process for event-triggered eth_call catchup.
+    /// Higher values improve throughput during catchup but use more RPC bandwidth.
+    /// Default: 4
+    pub event_call_concurrency: Option<usize>,
     /// Enable WebSocket live mode after catchup completes.
     /// Requires ws_url_env_var to be set in chain config.
     pub live_mode: Option<bool>,

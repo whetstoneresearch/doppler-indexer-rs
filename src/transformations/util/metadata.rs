@@ -1,12 +1,21 @@
 use alloy_primitives::{Address, B256};
 
+use crate::db::DbOperation;
+use crate::transformations::util::db::skipped_addresses::{
+    insert_skipped_address, SkippedAddressData,
+};
 use crate::transformations::util::sanitize::is_precompile_address;
 
 use crate::transformations::{DecodedEvent, TransformationContext, TransformationError};
 use crate::types::shared::metadata::{AssetTokenMetadata, TokenMetadata};
 use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
-pub fn get_metadata(
+fn should_block_for_missing_metadata(msg: &str) -> bool {
+    msg.starts_with("No DERC20 'once' call found")
+        || msg.starts_with("No Numeraires 'once' call found")
+}
+
+pub async fn get_metadata(
     asset: &[u8; 20],
     numeraire: &[u8; 20],
     event: &DecodedEvent,
@@ -23,7 +32,8 @@ pub fn get_metadata(
     }
 
     let asset_metadata = ctx
-        .calls_of_type("DERC20", "once").find(|call| call.contract_address == *asset)
+        .current_or_historical_once_call_for_address("DERC20", *asset)
+        .await?
         .ok_or_else(|| {
             let available_calls: Vec<_> = ctx
                 .calls_for_address(*asset)
@@ -143,7 +153,9 @@ pub fn get_metadata(
             decimals: 18,
         }
     } else {
-        let call = ctx.calls_of_type("Numeraires", "once").find(|call| call.contract_address == *numeraire)
+        let call = ctx
+            .current_or_historical_once_call_for_address("Numeraires", *numeraire)
+            .await?
             .ok_or_else(|| {
                 let available_calls: Vec<_> = ctx.calls_for_address(*numeraire)
                     .map(|c| format!("{}:{}", c.source_name, c.function_name))
@@ -201,4 +213,72 @@ pub fn get_metadata(
     };
 
     Ok((asset_metadata, numeraire_metadata))
+}
+
+pub async fn get_metadata_or_skip(
+    asset: &[u8; 20],
+    numeraire: &[u8; 20],
+    event: &DecodedEvent,
+    ctx: &TransformationContext,
+    ops: &mut Vec<DbOperation>,
+) -> Result<Option<(AssetTokenMetadata, TokenMetadata)>, TransformationError> {
+    match get_metadata(asset, numeraire, event, ctx).await {
+        Ok(m) => Ok(Some(m)),
+        Err(TransformationError::MissingData(msg)) if should_block_for_missing_metadata(&msg) => {
+            tracing::info!(
+                asset = %Address::from(asset),
+                numeraire = %Address::from(numeraire),
+                block = event.block_number,
+                "Deferring create event until metadata is available: {}",
+                msg
+            );
+            Err(TransformationError::TransientBlocked(msg))
+        }
+        Err(
+            TransformationError::MissingData(msg)
+            | TransformationError::IncludesPrecompileError(msg),
+        ) => {
+            tracing::warn!(
+                asset = %Address::from(asset),
+                numeraire = %Address::from(numeraire),
+                block = event.block_number,
+                "Skipping create event (non-contract or missing metadata): {}",
+                msg
+            );
+            ops.push(insert_skipped_address(
+                &SkippedAddressData {
+                    block_number: event.block_number,
+                    tx_hash: &event.transaction_hash,
+                    asset_address: asset,
+                    numeraire_address: numeraire,
+                    reason: &msg,
+                },
+                ctx,
+            ));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_block_for_missing_metadata;
+
+    #[test]
+    fn once_call_misses_are_retryable() {
+        assert!(should_block_for_missing_metadata(
+            "No DERC20 'once' call found for asset 0x0 at block 1 tx 0x0. Available calls: []"
+        ));
+        assert!(should_block_for_missing_metadata(
+            "No Numeraires 'once' call found for numeraire 0x0 at block 1 tx 0x0. Available calls: []"
+        ));
+    }
+
+    #[test]
+    fn malformed_metadata_stays_terminal() {
+        assert!(!should_block_for_missing_metadata(
+            "asset 0x0 missing field 'symbol' at block 1 tx 0x0. Available fields: []"
+        ));
+    }
 }

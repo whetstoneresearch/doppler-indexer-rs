@@ -33,6 +33,7 @@ pub async fn decode_eth_calls_live(
     configs: &EthCallDecodeConfigs<'_>,
     raw_data_config: &RawDataCollectionConfig,
     outputs: &EthCallDecoderOutputs<'_>,
+    repair: bool,
 ) -> Result<(), EthCallDecodingError> {
     let regular_configs = configs.regular;
     let once_configs = configs.once;
@@ -122,6 +123,7 @@ pub async fn decode_eth_calls_live(
                             &configs,
                             output_base,
                             transform_tx,
+                            false,
                             false,
                         )
                         .await?;
@@ -220,6 +222,8 @@ pub async fn decode_eth_calls_live(
                         event_configs,
                         raw_data_config,
                         transform_tx,
+                        repair,
+                        None,
                     )
                     .await?;
                 }
@@ -244,7 +248,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::decode_eth_calls_live;
-    use crate::decoding::eth_calls::{CallDecodeConfig, EthCallDecodeConfigs, EventCallDecodeConfig};
+    use crate::decoding::eth_calls::{
+        CallDecodeConfig, EthCallDecodeConfigs, EventCallDecodeConfig,
+    };
     use crate::decoding::types::EthCallDecoderOutputs;
     use crate::decoding::{DecoderMessage, EthCallResult, EventCallResult, OnceCallResult};
     use crate::live::{LiveBlockStatus, LiveStorage, TransformRetryRequest};
@@ -269,6 +275,7 @@ mod tests {
             block_receipt_concurrency: None,
             decoding_concurrency: None,
             factory_concurrency: None,
+            event_call_concurrency: None,
             live_mode: None,
             reorg_depth: None,
             compaction_interval_secs: None,
@@ -332,6 +339,7 @@ mod tests {
                 &configs,
                 &raw_data_config(),
                 &outputs,
+                false,
             )
             .await
         })
@@ -361,6 +369,7 @@ mod tests {
                 &configs,
                 &raw_data_config(),
                 &outputs,
+                false,
             )
             .await
         });
@@ -408,6 +417,7 @@ mod tests {
                 &configs,
                 &raw_data_config(),
                 &outputs,
+                false,
             )
             .await
         });
@@ -612,6 +622,8 @@ mod tests {
                     log_index: 7,
                     target_address: [3u8; 20],
                     value: encode_uint256(7),
+                    is_reverted: false,
+                    revert_reason: None,
                 }],
                 live_mode: true,
                 retry_transform_after_decode: true,

@@ -64,6 +64,7 @@ pub mod historical;
 mod live_state;
 pub mod registry;
 mod retry;
+pub(crate) mod scheduler;
 pub mod traits;
 pub mod util;
 
@@ -73,4 +74,4 @@ pub use engine::{
     RangeCompleteMessage, ReorgMessage, TransformationEngine, TransformationEngineConfig,
 };
 pub use error::TransformationError;
-pub use registry::build_registry;
+pub use registry::{build_registry, build_registry_for_chain};

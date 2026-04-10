@@ -126,6 +126,7 @@ impl DecodedValue {
             DecodedValue::Uint32(v) => (*v).try_into().ok(),
             DecodedValue::Uint256(v) => v.try_into().ok(),
             DecodedValue::Uint128(v) => (*v).try_into().ok(),
+            DecodedValue::String(s) => s.trim().parse().ok(),
             _ => None,
         }
     }

@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,8 +10,6 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -21,6 +18,9 @@ use super::types::{BuiltMatchers, DecoderMessage, LogDecoderOutputs, LogMatcherC
 use crate::live::{LiveDecodedLog, LiveStorage};
 use crate::raw_data::historical::factories::RecollectRequest;
 use crate::raw_data::historical::receipts::LogData;
+use crate::storage::contract_index::{
+    range_key, read_contract_index, update_contract_index, write_contract_index, ExpectedContracts,
+};
 use crate::transformations::{
     DecodedEvent as TransformDecodedEvent, DecodedEventsMessage, RangeCompleteKind,
     RangeCompleteMessage,
@@ -171,6 +171,7 @@ pub async fn decode_logs(
         &output_base,
         &chain.name,
         &log_outputs,
+        Some(&chain.contracts),
     )
     .await?;
 
@@ -266,11 +267,37 @@ pub(crate) async fn process_logs(
     factory_addresses: &HashMap<String, HashSet<[u8; 20]>>,
     output_base: &Path,
     outputs: &LogDecoderOutputs<'_>,
+    expected_by_collection: Option<&HashMap<String, ExpectedContracts>>,
 ) -> Result<(), LogDecodingError> {
     let regular_matchers = matchers.regular_matchers;
     let factory_matchers = matchers.factory_matchers;
-    // Group decoded logs by (contract_name, event_name)
+    let build_transform = outputs.transform_tx.is_some();
+
+    // Build topic0 index for O(1) matcher lookup instead of O(matchers) linear scan per log.
+    // This is the key optimization for catchup with many configured events.
+    let mut regular_by_topic: HashMap<[u8; 32], Vec<&EventMatcher>> = HashMap::new();
+    for matcher in regular_matchers {
+        regular_by_topic
+            .entry(matcher.event.topic0)
+            .or_default()
+            .push(matcher);
+    }
+
+    let mut factory_by_topic: HashMap<[u8; 32], Vec<(&str, &EventMatcher)>> = HashMap::new();
+    for (collection_name, matchers) in factory_matchers {
+        for matcher in matchers {
+            factory_by_topic
+                .entry(matcher.event.topic0)
+                .or_default()
+                .push((collection_name.as_str(), matcher));
+        }
+    }
+
+    // Group decoded logs by (contract_name, event_name) — for parquet storage
     let mut decoded_by_event: HashMap<(String, String), (Vec<DecodedLogRecord>, &ParsedEvent)> =
+        HashMap::new();
+    // Also build transform events in the same pass when the channel is present
+    let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
         HashMap::new();
 
     for log in logs {
@@ -280,49 +307,71 @@ pub(crate) async fn process_logs(
         }
         let topic0 = log.topics[0];
 
-        // Try regular matchers
-        for matcher in regular_matchers {
-            // Skip if block is before contract's start_block
-            if let Some(sb) = matcher.start_block {
-                if log.block_number < sb {
-                    continue;
-                }
-            }
-            if !matcher.addresses.contains(&log.address) {
-                continue;
-            }
-            if topic0 != matcher.event.topic0 {
-                continue;
-            }
-
-            if let Some(decoded) = decode_log(log, &matcher.event)? {
-                let key = (matcher.name.clone(), matcher.event_name.clone());
-                decoded_by_event
-                    .entry(key)
-                    .or_insert_with(|| (Vec::new(), &matcher.event))
-                    .0
-                    .push(decoded);
-            }
-        }
-
-        // Try factory matchers
-        for (collection_name, matchers) in factory_matchers {
-            let addrs = match factory_addresses.get(collection_name) {
-                Some(addrs) => addrs,
-                None => continue,
-            };
-
-            if !addrs.contains(&log.address) {
-                continue;
-            }
-
+        // Regular matchers via topic0 index
+        if let Some(matchers) = regular_by_topic.get(&topic0) {
             for matcher in matchers {
-                if topic0 != matcher.event.topic0 {
+                if let Some(sb) = matcher.start_block {
+                    if log.block_number < sb {
+                        continue;
+                    }
+                }
+                if !matcher.addresses.contains(&log.address) {
                     continue;
                 }
 
                 if let Some(decoded) = decode_log(log, &matcher.event)? {
-                    let key = (collection_name.clone(), matcher.event_name.clone());
+                    if build_transform {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            &matcher.name,
+                            &matcher.event_name,
+                        );
+                        let key = (matcher.name.clone(), matcher.event_name.clone());
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
+                    }
+
+                    let key = (matcher.name.clone(), matcher.event_name.clone());
+                    decoded_by_event
+                        .entry(key)
+                        .or_insert_with(|| (Vec::new(), &matcher.event))
+                        .0
+                        .push(decoded);
+                }
+            }
+        }
+
+        // Factory matchers via topic0 index
+        if let Some(entries) = factory_by_topic.get(&topic0) {
+            for (collection_name, matcher) in entries {
+                let addrs = match factory_addresses.get(*collection_name) {
+                    Some(addrs) => addrs,
+                    None => continue,
+                };
+
+                if !addrs.contains(&log.address) {
+                    continue;
+                }
+
+                if let Some(decoded) = decode_log(log, &matcher.event)? {
+                    if build_transform {
+                        let transform_event = convert_to_transform_event(
+                            &decoded,
+                            &matcher.event,
+                            collection_name,
+                            &matcher.event_name,
+                        );
+                        let key = (collection_name.to_string(), matcher.event_name.clone());
+                        transform_events_by_type
+                            .entry(key)
+                            .or_default()
+                            .push(transform_event);
+                    }
+
+                    let key = (collection_name.to_string(), matcher.event_name.clone());
                     decoded_by_event
                         .entry(key)
                         .or_insert_with(|| (Vec::new(), &matcher.event))
@@ -342,6 +391,41 @@ pub(crate) async fn process_logs(
         total_decoded,
         decoded_by_event.len()
     );
+
+    // Send transform events to the transformation channel FIRST (before parquet I/O)
+    // to unblock the transformation engine while parquet writes happen.
+    if let Some(tx) = outputs.transform_tx {
+        for ((source_name, event_name), events) in transform_events_by_type {
+            if events.is_empty() {
+                continue;
+            }
+            let msg = DecodedEventsMessage {
+                range_start,
+                range_end,
+                source_name,
+                event_name,
+                events,
+            };
+            if let Err(e) = tx.send(msg).await {
+                tracing::warn!(
+                    "Failed to send decoded events to transformation channel: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Signal that all events for this range have been sent
+    if let Some(tx) = outputs.complete_tx {
+        let msg = RangeCompleteMessage {
+            range_start,
+            range_end,
+            kind: RangeCompleteKind::Logs,
+        };
+        if let Err(e) = tx.send(msg).await {
+            tracing::warn!("Failed to send range complete: {}", e);
+        }
+    }
 
     // Write decoded data to parquet files
     for ((contract_name, event_name), (records, parsed_event)) in decoded_by_event {
@@ -400,112 +484,26 @@ pub(crate) async fn process_logs(
         }
     }
 
-    // Send to transformation channel if enabled
-    if let Some(tx) = outputs.transform_tx {
-        // Re-decode and send to transformation engine (we need to iterate again to build the transform messages)
-        // Group decoded logs by (contract_name, event_name) for sending
-        let mut transform_events_by_type: HashMap<(String, String), Vec<TransformDecodedEvent>> =
-            HashMap::new();
+    // Update contract index for factory collections so that catchup can skip
+    // ranges already processed with the current set of contracts/addresses.
+    if let Some(expected_map) = expected_by_collection {
+        let rk = range_key(range_start, range_end - 1);
 
-        for log in logs {
-            if log.topics.is_empty() {
-                continue;
-            }
-            let topic0 = log.topics[0];
-
-            // Try regular matchers
-            for matcher in regular_matchers {
-                // Skip if block is before contract's start_block
-                if let Some(sb) = matcher.start_block {
-                    if log.block_number < sb {
-                        continue;
-                    }
-                }
-                if !matcher.addresses.contains(&log.address) {
-                    continue;
-                }
-                if topic0 != matcher.event.topic0 {
-                    continue;
-                }
-
-                if let Some(decoded) = decode_log(log, &matcher.event)? {
-                    let transform_event = convert_to_transform_event(
-                        &decoded,
-                        &matcher.event,
-                        &matcher.name,
-                        &matcher.event_name,
-                    );
-                    let key = (matcher.name.clone(), matcher.event_name.clone());
-                    transform_events_by_type
-                        .entry(key)
-                        .or_default()
-                        .push(transform_event);
-                }
-            }
-
-            // Try factory matchers
-            for (collection_name, matchers) in factory_matchers {
-                let addrs = match factory_addresses.get(collection_name) {
-                    Some(addrs) => addrs,
-                    None => continue,
-                };
-
-                if !addrs.contains(&log.address) {
-                    continue;
-                }
-
-                for matcher in matchers {
-                    if topic0 != matcher.event.topic0 {
-                        continue;
-                    }
-
-                    if let Some(decoded) = decode_log(log, &matcher.event)? {
-                        let transform_event = convert_to_transform_event(
-                            &decoded,
-                            &matcher.event,
-                            collection_name,
-                            &matcher.event_name,
-                        );
-                        let key = (collection_name.clone(), matcher.event_name.clone());
-                        transform_events_by_type
-                            .entry(key)
-                            .or_default()
-                            .push(transform_event);
-                    }
-                }
+        // Collect unique (collection, event_name) pairs from factory matchers
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+        for (collection, matchers) in factory_matchers {
+            for matcher in matchers {
+                seen_pairs.insert((collection.clone(), matcher.event_name.clone()));
             }
         }
 
-        // Send each event type as a message
-        for ((source_name, event_name), events) in transform_events_by_type {
-            if events.is_empty() {
-                continue;
+        for (collection, event_name) in seen_pairs {
+            if let Some(expected) = expected_map.get(&collection) {
+                let dir = output_base.join(&collection).join(&event_name);
+                let mut index = read_contract_index(&dir);
+                update_contract_index(&mut index, &rk, expected);
+                write_contract_index(&dir, &index)?;
             }
-            let msg = DecodedEventsMessage {
-                range_start,
-                range_end,
-                source_name,
-                event_name,
-                events,
-            };
-            if let Err(e) = tx.send(msg).await {
-                tracing::warn!(
-                    "Failed to send decoded events to transformation channel: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    // Signal that all events for this range have been sent
-    if let Some(tx) = outputs.complete_tx {
-        let msg = RangeCompleteMessage {
-            range_start,
-            range_end,
-            kind: RangeCompleteKind::Logs,
-        };
-        if let Err(e) = tx.send(msg).await {
-            tracing::warn!("Failed to send range complete: {}", e);
         }
     }
 
@@ -521,8 +519,22 @@ fn decode_log(
     let indexed_params = event.indexed_params();
     let data_params = event.data_params();
 
-    // Collect decoded values per param (may be nested for tuples)
-    let mut param_values: Vec<DecodedValue> = Vec::new();
+    // Preserve original ABI parameter order. Indexed params are decoded from
+    // topics while non-indexed params come from data, but flattening expects
+    // values aligned with event.params, not grouped by storage location.
+    let mut param_values: Vec<Option<DecodedValue>> = vec![None; event.params.len()];
+    let indexed_positions: Vec<usize> = event
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, param)| param.indexed.then_some(idx))
+        .collect();
+    let data_positions: Vec<usize> = event
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, param)| (!param.indexed).then_some(idx))
+        .collect();
 
     // Decode indexed params from topics (topics[1..])
     for (i, param) in indexed_params.iter().enumerate() {
@@ -536,13 +548,13 @@ fn decode_log(
         // Check if this is an indexed tuple - store as hash
         if param.tuple_fields.is_some() {
             if let Some(TupleFieldInfo::Tuple(_)) = &param.tuple_fields {
-                param_values.push(DecodedValue::Bytes32(*topic));
+                param_values[indexed_positions[i]] = Some(DecodedValue::Bytes32(*topic));
                 continue;
             }
         }
 
         let value = decode_topic(topic, &param.param_type)?;
-        param_values.push(value);
+        param_values[indexed_positions[i]] = Some(value);
     }
 
     // Decode non-indexed params from data
@@ -554,10 +566,14 @@ fn decode_log(
 
         match tuple_type.abi_decode(&log.data) {
             Ok(DynSolValue::Tuple(values)) => {
-                for (value, param) in values.iter().zip(data_params.iter()) {
+                for ((value, param), param_idx) in values
+                    .iter()
+                    .zip(data_params.iter())
+                    .zip(data_positions.iter())
+                {
                     let decoded =
                         convert_dyn_sol_value_with_tuple_info(value, &param.tuple_fields)?;
-                    param_values.push(decoded);
+                    param_values[*param_idx] = Some(decoded);
                 }
             }
             Ok(_) => return Ok(None),
@@ -567,6 +583,19 @@ fn decode_log(
             }
         }
     }
+
+    let param_values: Vec<DecodedValue> = match param_values.into_iter().collect() {
+        Some(values) => values,
+        None => {
+            tracing::debug!(
+                "Decoded param count/order mismatch for event {} at block {} log_index {}",
+                event.name,
+                log.block_number,
+                log.log_index
+            );
+            return Ok(None);
+        }
+    };
 
     // Flatten param_values to match flattened_fields order
     // Returns None if any tuple field is missing (C1 fix: avoid silent data loss)
@@ -874,16 +903,7 @@ fn write_decoded_logs_to_parquet(
 
     // Write to parquet
     let batch = RecordBatch::try_new(schema.clone(), arrays)?;
-
-    let file = File::create(output_path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-    writer.write(&batch)?;
-    writer.close()?;
-
+    crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
     Ok(())
 }
 
@@ -898,12 +918,15 @@ fn build_flattened_field_array(
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(20).finish()))
             } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match r.decoded_values.get(field_idx) {
-                        Some(DecodedValue::Address(addr)) => addr.as_slice(),
-                        _ => &[0u8; 20][..],
-                    }
-                }))?;
+                let values: Vec<Option<&[u8]>> = records
+                    .iter()
+                    .map(|r| match r.decoded_values.get(field_idx) {
+                        Some(DecodedValue::Address(addr)) => Some(addr.as_slice()),
+                        _ => None,
+                    })
+                    .collect();
+                let arr =
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 20)?;
                 Ok(Arc::new(arr))
             }
         }
@@ -989,12 +1012,15 @@ fn build_flattened_field_array(
             if records.is_empty() {
                 Ok(Arc::new(FixedSizeBinaryBuilder::new(32).finish()))
             } else {
-                let arr = FixedSizeBinaryArray::try_from_iter(records.iter().map(|r| {
-                    match r.decoded_values.get(field_idx) {
-                        Some(DecodedValue::Bytes32(b)) => b.as_slice(),
-                        _ => &[0u8; 32][..],
-                    }
-                }))?;
+                let values: Vec<Option<&[u8]>> = records
+                    .iter()
+                    .map(|r| match r.decoded_values.get(field_idx) {
+                        Some(DecodedValue::Bytes32(b)) => Some(b.as_slice()),
+                        _ => None,
+                    })
+                    .collect();
+                let arr =
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), 32)?;
                 Ok(Arc::new(arr))
             }
         }
@@ -1263,18 +1289,15 @@ pub(crate) async fn process_logs_live(
     }
 
     // Update block status to mark log decoding complete
-    if let Ok(mut status) = storage.read_status(block_number) {
+    match storage.update_status_atomic(block_number, |status| {
         status.logs_decoded = true;
-        if let Err(e) = storage.write_status(block_number, &status) {
-            tracing::warn!("Failed to update block status after log decoding: {}", e);
-        } else {
+    }) {
+        Ok(()) => {
             tracing::info!("Block {} logs decoded", block_number);
         }
-    } else {
-        tracing::warn!(
-            "Block {} status file not found for log decode completion",
-            block_number
-        );
+        Err(e) => {
+            tracing::warn!("Failed to update block status after log decoding: {}", e);
+        }
     }
 
     // Signal that all events for this block have been sent
@@ -1303,4 +1326,81 @@ pub(crate) fn delete_decoded_logs_for_blocks(
             .map_err(|e| LogDecodingError::Io(std::io::Error::other(e.to_string())))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::dyn_abi::DynSolValue;
+    use alloy::primitives::{Address, B256, U256};
+
+    use super::decode_log;
+    use crate::decoding::event_parsing::ParsedEvent;
+    use crate::raw_data::historical::receipts::LogData;
+    use crate::types::decoded::DecodedValue;
+
+    fn encode_address_topic(address: [u8; 20]) -> [u8; 32] {
+        let mut topic = [0u8; 32];
+        topic[12..].copy_from_slice(&address);
+        topic
+    }
+
+    fn encode_int_topic(value: i32) -> [u8; 32] {
+        alloy::primitives::I256::try_from(value)
+            .expect("valid i32")
+            .to_be_bytes::<32>()
+    }
+
+    #[test]
+    fn decode_log_keeps_interleaved_indexed_params_in_signature_order() {
+        let parsed = ParsedEvent::from_signature(
+            "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)",
+        )
+        .unwrap();
+
+        let sender = [0x11u8; 20];
+        let owner = [0x22u8; 20];
+        let amount = 1234u128;
+        let amount0 = U256::from(5678u64);
+        let amount1 = U256::from(9012u64);
+
+        let log = LogData {
+            block_number: 1,
+            block_timestamp: 2,
+            transaction_hash: B256::ZERO,
+            log_index: 3,
+            address: [0x33u8; 20],
+            topics: vec![
+                parsed.topic0,
+                encode_address_topic(owner),
+                encode_int_topic(-120),
+                encode_int_topic(240),
+            ],
+            data: DynSolValue::Tuple(vec![
+                DynSolValue::Address(Address::from_slice(&sender)),
+                DynSolValue::Uint(U256::from(amount), 128),
+                DynSolValue::Uint(amount0, 256),
+                DynSolValue::Uint(amount1, 256),
+            ])
+            .abi_encode_params(),
+        };
+
+        let decoded = decode_log(&log, &parsed).unwrap().unwrap();
+
+        assert!(matches!(
+            decoded.decoded_values.first(),
+            Some(DecodedValue::Address(value)) if *value == sender
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(1),
+            Some(DecodedValue::Address(value)) if *value == owner
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(2),
+            Some(DecodedValue::Int64(value)) if *value == -120
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(3),
+            Some(DecodedValue::Int64(value)) if *value == 240
+        ));
+    }
 }

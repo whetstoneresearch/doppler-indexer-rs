@@ -55,6 +55,7 @@ impl TransformationHandler for DERC20TransferHandler {
             ops.push(upsert_user(&to_address, &event.block_timestamp, ctx));
             ops.push(insert_transfer(
                 event.block_number,
+                event.log_index,
                 event.block_timestamp,
                 &event.contract_address,
                 &from_address,

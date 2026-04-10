@@ -12,8 +12,12 @@ pub mod database {
 
 /// Transformation system defaults
 pub mod transformations {
-    /// Default number of concurrent handler executions
-    pub const HANDLER_CONCURRENCY: usize = 4;
+    /// Default number of concurrent handler executions.
+    ///
+    /// Catchup work items are heavily I/O-bound (parquet reads + DB transactions),
+    /// so concurrency must be well above the target CPU core count. At ~80% I/O
+    /// duty cycle, 32 concurrent tasks yields ~6 cores of CPU utilization.
+    pub const HANDLER_CONCURRENCY: usize = 32;
 
     /// Default maximum operations per transaction batch
     pub const BATCH_SIZE: usize = 1000;
@@ -65,11 +69,42 @@ pub mod rpc {
     pub const ALCHEMY_CU_PER_SECOND: u32 = 7500;
 }
 
+/// Storage and S3 defaults
+pub mod storage {
+    /// Default AWS region for S3-compatible storage
+    pub const REGION: &str = "us-east-1";
+
+    /// Default maximum cache size in gigabytes
+    pub const MAX_SIZE_GB: u64 = 100;
+
+    /// Default eviction threshold as a fraction of max_size_gb
+    pub const EVICTION_THRESHOLD: f64 = 0.8;
+
+    /// Default number of recent ranges to check markers directly
+    pub const MARKER_FRESHNESS_RANGES: u64 = 10;
+
+    /// Default manifest refresh interval in seconds
+    pub const MANIFEST_REFRESH_SECS: u64 = 60;
+
+    /// Default retry interval for failed uploads in seconds
+    pub const RETRY_INTERVAL_SECS: u64 = 30;
+
+    /// Default maximum number of retry attempts
+    pub const MAX_RETRIES: u32 = 10;
+
+    /// Default prefixes that are pinned (never evicted from cache)
+    pub const PINNED_PREFIXES: &[&str] = &["factories", "decoded"];
+}
+
 /// Database pool defaults
 #[allow(dead_code)]
 pub mod db_pool {
-    /// Default maximum pool size
-    pub const MAX_SIZE: usize = 16;
+    /// Default maximum pool size.
+    ///
+    /// Must be at least as large as `transformations::HANDLER_CONCURRENCY` to
+    /// avoid connection starvation during catchup, where each concurrent handler
+    /// needs a DB connection for its transaction.
+    pub const MAX_SIZE: usize = 32;
 }
 
 #[cfg(test)]
@@ -83,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_transformation_defaults() {
-        assert_eq!(transformations::HANDLER_CONCURRENCY, 4);
+        assert_eq!(transformations::HANDLER_CONCURRENCY, 32);
         assert_eq!(transformations::BATCH_SIZE, 1000);
         assert!(transformations::BATCH_FOR_CATCHUP);
         assert_eq!(transformations::CATCHUP_BATCH_SIZE, 10000);
@@ -110,6 +145,18 @@ mod tests {
 
     #[test]
     fn test_db_pool_defaults() {
-        assert_eq!(db_pool::MAX_SIZE, 16);
+        assert_eq!(db_pool::MAX_SIZE, 32);
+    }
+
+    #[test]
+    fn test_storage_defaults() {
+        assert_eq!(storage::REGION, "us-east-1");
+        assert_eq!(storage::MAX_SIZE_GB, 100);
+        assert!((storage::EVICTION_THRESHOLD - 0.8).abs() < f64::EPSILON);
+        assert_eq!(storage::MARKER_FRESHNESS_RANGES, 10);
+        assert_eq!(storage::MANIFEST_REFRESH_SECS, 60);
+        assert_eq!(storage::RETRY_INTERVAL_SECS, 30);
+        assert_eq!(storage::MAX_RETRIES, 10);
+        assert_eq!(storage::PINNED_PREFIXES, &["factories", "decoded"]);
     }
 }
