@@ -356,6 +356,7 @@ impl AlchemyClient {
     ) -> Result<Self, RpcError> {
         let rpc_config = RpcClientConfig::new(config.url.clone())
             .with_batch_size(config.max_batch_size)
+            .with_concurrency(config.rpc_concurrency)
             .with_batching(config.batching_enabled);
 
         let inner = Arc::new(RpcClient::new(rpc_config)?);
@@ -1298,6 +1299,7 @@ impl std::fmt::Debug for AlchemyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use url::Url;
 
     /// Test that an entry exactly at the window boundary is considered expired.
     ///
@@ -1411,5 +1413,19 @@ mod tests {
             usage_after, usage,
             "Usage should be the same before and after cleanup"
         );
+    }
+
+    #[test]
+    fn test_inner_rpc_client_inherits_configured_concurrency() {
+        let config = AlchemyConfig::new(
+            Url::parse("https://eth-mainnet.g.alchemy.com/v2/test").unwrap(),
+            7500,
+        )
+        .with_rpc_concurrency(17);
+
+        let client = AlchemyClient::new(config).unwrap();
+
+        assert_eq!(client.config().rpc_concurrency, 17);
+        assert_eq!(client.inner().config().concurrency, 17);
     }
 }
