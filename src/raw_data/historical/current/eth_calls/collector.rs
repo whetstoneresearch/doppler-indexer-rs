@@ -191,9 +191,12 @@ pub async fn collect_eth_calls(
                             let received_blocks: HashSet<u64> =
                                 blocks.iter().map(|b| b.block_number).collect();
 
-                            if expected_blocks.is_subset(&received_blocks)
-                                && !state.range_regular_done.contains(&range_start)
-                            {
+                            let range_complete = expected_blocks.is_subset(&received_blocks);
+                            let needs_processing = !state.range_regular_done.contains(&range_start)
+                                || ((state.has_factory_calls || state.has_factory_once_calls)
+                                    && !state.range_factory_done.contains(&range_start));
+
+                            if range_complete && needs_processing {
                                 process_complete_range(
                                     range_start,
                                     &mut state,
