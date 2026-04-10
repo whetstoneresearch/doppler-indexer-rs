@@ -911,6 +911,7 @@ mod tests {
                 pool_type: "v4".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
+                total_supply: None,
             },
         );
     }

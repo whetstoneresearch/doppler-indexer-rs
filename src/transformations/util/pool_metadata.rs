@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use deadpool_postgres::Pool;
 
 use crate::db::DbPool;
@@ -28,6 +28,11 @@ pub struct PoolMetadata {
     pub pool_type: String,
     pub base_decimals: u8,
     pub quote_decimals: u8,
+    /// Total supply of the base token, resolved lazily via LEFT JOIN on `tokens`.
+    /// `None` means the tokens row had not been committed when the cache was last
+    /// (re-)loaded, or the token row had a NULL total_supply. Downstream consumers
+    /// (e.g. market-cap computation) propagate the missing value.
+    pub total_supply: Option<U256>,
 }
 
 /// Thread-safe cache of pool metadata keyed by pool_id bytes.
@@ -61,10 +66,13 @@ impl PoolMetadataCache {
 
         let rows = client
             .query(
-                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type \
+                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type, \
+                        t.total_supply::text AS total_supply_text \
                  FROM pools p \
                  JOIN active_versions av \
                    ON p.source = av.source AND p.source_version = av.active_version \
+                 LEFT JOIN tokens t \
+                   ON t.chain_id = p.chain_id AND t.address = p.base_token \
                  WHERE p.chain_id = $1",
                 &[&(chain_id as i64)],
             )
@@ -79,6 +87,7 @@ impl PoolMetadataCache {
             let quote_token_bytes: Vec<u8> = row.get("quote_token");
             let is_token_0: bool = row.get("is_token_0");
             let pool_type: String = row.get("type");
+            let total_supply = parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
 
             if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
                 continue;
@@ -102,6 +111,7 @@ impl PoolMetadataCache {
                     pool_type,
                     base_decimals,
                     quote_decimals,
+                    total_supply,
                 },
             );
         }
@@ -193,10 +203,13 @@ impl PoolMetadataCache {
 
         let rows = client
             .query(
-                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type \
+                "SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type, \
+                        t.total_supply::text AS total_supply_text \
                  FROM pools p \
                  JOIN active_versions av \
                    ON p.source = av.source AND p.source_version = av.active_version \
+                 LEFT JOIN tokens t \
+                   ON t.chain_id = p.chain_id AND t.address = p.base_token \
                  WHERE p.chain_id = $1",
                 &[&(chain_id as i64)],
             )
@@ -208,7 +221,16 @@ impl PoolMetadataCache {
 
         for row in &rows {
             let pool_id: Vec<u8> = row.get("address");
-            if inner.contains_key(&pool_id) {
+            let total_supply = parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
+
+            // If the pool is already cached but had no total_supply at load time,
+            // backfill it opportunistically from the refreshed row. This closes
+            // the bootstrap gap where the create handler populated the cache
+            // before the tokens row was committed.
+            if let Some(existing) = inner.get_mut(&pool_id) {
+                if existing.total_supply.is_none() && total_supply.is_some() {
+                    existing.total_supply = total_supply;
+                }
                 continue;
             }
 
@@ -236,6 +258,7 @@ impl PoolMetadataCache {
                     pool_type,
                     base_decimals: 18,
                     quote_decimals: 18,
+                    total_supply,
                 },
             );
             new_count += 1;
@@ -288,6 +311,25 @@ const KNOWN_QUOTE_TOKENS: &[QuoteTokenConfig] = &[
         decimals: 6,
     },
 ];
+
+/// Parse a NUMERIC-as-text representation of `tokens.total_supply` into a U256.
+///
+/// Postgres NUMERIC can exceed rust_decimal's ~28-digit range, so the caller
+/// passes the column through `::text` to preserve full precision. The string
+/// is an integer with an optional trailing `.0` or similar when cast from
+/// NUMERIC — we tolerate that by stripping any fractional part.
+fn parse_total_supply(text: Option<String>) -> Option<U256> {
+    let raw = text?;
+    let trimmed = raw.trim();
+    // NUMERIC::text may emit an integer without a decimal point for integral
+    // values, or "1000.00" style for non-integral. total_supply is always an
+    // integer value in token base units, so we truncate any fractional part.
+    let integer_part = trimmed.split('.').next()?;
+    if integer_part.is_empty() || integer_part == "-" {
+        return None;
+    }
+    U256::from_str_radix(integer_part, 10).ok()
+}
 
 /// Resolve decimals for a known quote token address by checking against
 /// the contract configuration. Returns None if the address is not a known
