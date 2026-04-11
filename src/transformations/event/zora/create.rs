@@ -9,6 +9,7 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
+use crate::transformations::util::sanitize::strip_nul_bytes;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
 
 const SOURCE: &str = "ZoraFactory";
@@ -123,9 +124,9 @@ impl ZoraCreateHandler {
             let payout_recipient = event.extract_address("payoutRecipient")?;
             let platform_referrer = event.extract_address("platformReferrer")?;
             let currency = event.extract_address("currency")?;
-            let uri = event.extract_string("uri")?;
-            let name = event.extract_string("name")?;
-            let symbol = event.extract_string("symbol")?;
+            let uri = strip_nul_bytes(event.extract_string("uri")?);
+            let name = strip_nul_bytes(event.extract_string("name")?);
+            let symbol = strip_nul_bytes(event.extract_string("symbol")?);
             let coin = event.extract_address("coin")?;
 
             let pool_key = PoolKey {
@@ -157,11 +158,11 @@ impl ZoraCreateHandler {
                     integrator: non_zero_address(platform_referrer).as_ref(),
                     token_address: &coin,
                     pool: Some(&PoolAddressOrPoolId::PoolId(pool_id)),
-                    name,
-                    symbol,
+                    name: name.as_ref(),
+                    symbol: symbol.as_ref(),
                     decimals: 18,
                     total_supply: None,
-                    token_uri: Some(uri),
+                    token_uri: Some(uri.as_ref()),
                     is_derc20: false,
                     is_creator_coin: kind.is_creator_coin(),
                     is_content_coin: kind.is_content_coin(),
