@@ -889,11 +889,7 @@ impl RpcClient {
             // Pipeline: as tasks complete, spawn replacements
             while let Some(join_result) = join_set.join_next().await {
                 if let Err(e) = join_result {
-                    tracing::error!(
-                        "[{}] Task panicked in get_blocks_streaming: {:?}",
-                        chain,
-                        e
-                    );
+                    tracing::error!("[{}] Task panicked in get_blocks_streaming: {:?}", chain, e);
                 }
 
                 if let Some(number) = iter.next() {
