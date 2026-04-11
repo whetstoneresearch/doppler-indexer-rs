@@ -9,7 +9,6 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
-use alloy::transports::http::reqwest;
 use async_trait::async_trait;
 use governor::clock::{QuantaClock, QuantaInstant};
 use governor::middleware::NoOpMiddleware;
@@ -470,26 +469,10 @@ pub struct RpcClient {
     chain: String,
 }
 
-/// Default HTTP read timeout for RPC requests (2 minutes).
-/// Large blocks with many receipts/logs can produce multi-MB responses
-/// that need more time than reqwest's default 30s.
-const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Build an alloy RootProvider with a custom reqwest client configured
-/// for large RPC responses.
-fn build_provider(url: &Url) -> Result<RootProvider<Ethereum>, RpcError> {
-    let client = reqwest::Client::builder()
-        .timeout(RPC_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| RpcError::Transport(format!("failed to build HTTP client: {e}")))?;
-    let rpc_client = alloy::rpc::client::RpcClient::new_http_with_client(client, url.clone());
-    Ok(RootProvider::<Ethereum>::new(rpc_client))
-}
-
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = build_provider(&config.url)?;
+        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
         let chain = chain_label_from_url(&config.url);
         let concurrency = config.concurrency.max(1);
 
@@ -520,7 +503,7 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = build_provider(&config.url)?;
+        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
         let chain = chain_label_from_url(&config.url);
         let concurrency = config.concurrency.max(1);
         Ok(Self {
