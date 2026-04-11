@@ -31,6 +31,9 @@ use crate::transformations::event::metrics::swap_data::{
     process_liquidity_deltas, process_swaps, refresh_cache_if_needed, SwapInput,
 };
 use crate::transformations::event::metrics::v4_hook_extract::extract_tuple_modify_liquidity;
+use crate::transformations::event::migration_pool::create::{
+    MIGRATION_POOL_CREATE_HANDLER_NAME, MIGRATION_POOL_CREATE_HANDLER_VERSION,
+};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
@@ -68,10 +71,15 @@ impl MigrationPoolSwapMetricsHandler {
             .query(
                 "SELECT p.address \
                  FROM pools p \
-                 JOIN active_versions av \
-                   ON p.source = av.source AND p.source_version = av.active_version \
-                 WHERE p.chain_id = $1 AND p.migrated_from IS NOT NULL",
-                &[&(self.chain_id as i64)],
+                 WHERE p.chain_id = $1 \
+                   AND p.migrated_from IS NOT NULL \
+                   AND p.source = $2 \
+                   AND p.source_version = $3",
+                &[
+                    &(self.chain_id as i64),
+                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
+                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
+                ],
             )
             .await?;
 
@@ -107,7 +115,9 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
     fn migration_paths(&self) -> Vec<&'static str> {
         vec![
             "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_state_add_tvl.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
             "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
@@ -207,10 +217,15 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
             .query(
                 "SELECT p.address \
                  FROM pools p \
-                 JOIN active_versions av \
-                   ON p.source = av.source AND p.source_version = av.active_version \
-                 WHERE p.chain_id = $1 AND p.migrated_from IS NOT NULL",
-                &[&(self.chain_id as i64)],
+                 WHERE p.chain_id = $1 \
+                   AND p.migrated_from IS NOT NULL \
+                   AND p.source = $2 \
+                   AND p.source_version = $3",
+                &[
+                    &(self.chain_id as i64),
+                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
+                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
+                ],
             )
             .await?;
 

@@ -23,8 +23,15 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::db::pool::{insert_migration_pool, MigrationPoolData};
+use crate::transformations::util::pool_metadata::VersionedSource;
 
 const MIGRATOR_SOURCE: &str = "UniswapV4Migrator";
+pub const MIGRATION_POOL_CREATE_HANDLER_NAME: &str = "MigrationPoolCreateHandler";
+pub const MIGRATION_POOL_CREATE_HANDLER_VERSION: u32 = 1;
+pub const MIGRATION_POOL_CREATE_HANDLER_SCOPE: VersionedSource = VersionedSource::new(
+    MIGRATION_POOL_CREATE_HANDLER_NAME,
+    MIGRATION_POOL_CREATE_HANDLER_VERSION,
+);
 
 pub struct MigrationPoolCreateHandler {
     db_pool: OnceLock<Pool>,
@@ -33,11 +40,11 @@ pub struct MigrationPoolCreateHandler {
 #[async_trait]
 impl TransformationHandler for MigrationPoolCreateHandler {
     fn name(&self) -> &'static str {
-        "MigrationPoolCreateHandler"
+        MIGRATION_POOL_CREATE_HANDLER_NAME
     }
 
     fn version(&self) -> u32 {
-        1
+        MIGRATION_POOL_CREATE_HANDLER_VERSION
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {

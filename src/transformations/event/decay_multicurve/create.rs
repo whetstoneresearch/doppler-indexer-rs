@@ -15,19 +15,27 @@ use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
 use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
+use crate::transformations::util::pool_metadata::VersionedSource;
 use crate::types::decoded::DecodedValue;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
+
+pub const V4_DECAY_MULTICURVE_CREATE_HANDLER_NAME: &str = "V4DecayMulticurveCreateHandler";
+pub const V4_DECAY_MULTICURVE_CREATE_HANDLER_VERSION: u32 = 1;
+pub const V4_DECAY_MULTICURVE_CREATE_HANDLER_SCOPE: VersionedSource = VersionedSource::new(
+    V4_DECAY_MULTICURVE_CREATE_HANDLER_NAME,
+    V4_DECAY_MULTICURVE_CREATE_HANDLER_VERSION,
+);
 
 pub struct V4DecayMulticurveCreateHandler;
 
 #[async_trait]
 impl TransformationHandler for V4DecayMulticurveCreateHandler {
     fn name(&self) -> &'static str {
-        "V4DecayMulticurveCreateHandler"
+        V4_DECAY_MULTICURVE_CREATE_HANDLER_NAME
     }
 
     fn version(&self) -> u32 {
-        1
+        V4_DECAY_MULTICURVE_CREATE_HANDLER_VERSION
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {
