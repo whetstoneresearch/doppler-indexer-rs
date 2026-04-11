@@ -20,6 +20,11 @@ use deadpool_postgres::Pool;
 use crate::db::{DbOperation, DbPool};
 use crate::transformations::context::{FieldExtractor, TransformationContext};
 use crate::transformations::error::TransformationError;
+use crate::transformations::event::decay_multicurve::create::V4_DECAY_MULTICURVE_CREATE_HANDLER_SCOPE;
+use crate::transformations::event::dhook::create::DOPPLER_HOOK_CREATE_HANDLER_SCOPE;
+use crate::transformations::event::multicurve::create::V4_MULTICURVE_CREATE_HANDLER_SCOPE;
+use crate::transformations::event::scheduled_multicurve::create::V4_SCHEDULED_MULTICURVE_CREATE_HANDLER_SCOPE;
+use crate::transformations::event::v4::create::V4_CREATE_HANDLER_SCOPE;
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::db::pool::{insert_migration_pool, MigrationPoolData};
@@ -32,6 +37,14 @@ pub const MIGRATION_POOL_CREATE_HANDLER_SCOPE: VersionedSource = VersionedSource
     MIGRATION_POOL_CREATE_HANDLER_NAME,
     MIGRATION_POOL_CREATE_HANDLER_VERSION,
 );
+
+const ORIGINAL_POOL_SCOPES: &[VersionedSource] = &[
+    V4_CREATE_HANDLER_SCOPE,
+    V4_MULTICURVE_CREATE_HANDLER_SCOPE,
+    V4_SCHEDULED_MULTICURVE_CREATE_HANDLER_SCOPE,
+    V4_DECAY_MULTICURVE_CREATE_HANDLER_SCOPE,
+    DOPPLER_HOOK_CREATE_HANDLER_SCOPE,
+];
 
 pub struct MigrationPoolCreateHandler {
     db_pool: OnceLock<Pool>,
@@ -64,6 +77,7 @@ impl TransformationHandler for MigrationPoolCreateHandler {
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
         let mut ops = Vec::new();
+        let (original_pool_sources, original_pool_versions) = original_pool_scope_params();
 
         for event in ctx.events_of_type(MIGRATOR_SOURCE, "Migrate") {
             let pool_id = event.extract_bytes32("poolId")?;
@@ -77,13 +91,22 @@ impl TransformationHandler for MigrationPoolCreateHandler {
 
             let rows = client
                 .query(
-                    "SELECT address, base_token, quote_token, is_token_0, fee, \
-                     integrator, initializer \
-                     FROM pools \
-                     WHERE chain_id = $1 AND migration_pool = $2 \
-                     ORDER BY source_version DESC \
+                    "WITH original_pool_scope AS ( \
+                        SELECT * FROM unnest($3::text[], $4::int4[]) AS scope(source, source_version) \
+                     ) \
+                     SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.fee, \
+                            p.integrator, p.initializer \
+                     FROM pools p \
+                     JOIN original_pool_scope ops \
+                       ON p.source = ops.source AND p.source_version = ops.source_version \
+                     WHERE p.chain_id = $1 AND p.migration_pool = $2 \
                      LIMIT 1",
-                    &[&(ctx.chain_id as i64), &pool_id.to_vec()],
+                    &[
+                        &(ctx.chain_id as i64),
+                        &pool_id.to_vec(),
+                        &original_pool_sources,
+                        &original_pool_versions,
+                    ],
                 )
                 .await?;
 
@@ -177,4 +200,17 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
     registry.register_event_handler(MigrationPoolCreateHandler {
         db_pool: OnceLock::new(),
     });
+}
+
+fn original_pool_scope_params() -> (Vec<String>, Vec<i32>) {
+    (
+        ORIGINAL_POOL_SCOPES
+            .iter()
+            .map(|scope| scope.source.to_string())
+            .collect(),
+        ORIGINAL_POOL_SCOPES
+            .iter()
+            .map(|scope| scope.version as i32)
+            .collect(),
+    )
 }
