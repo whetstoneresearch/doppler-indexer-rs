@@ -4,7 +4,7 @@
 //! share the same Swap event format and need getSlot0 call results for sqrtPriceX96/tick.
 //! ModifyLiquidity comes in two formats: tuple (multicurve, dhook) and flat (decay, scheduled).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use alloy_primitives::U256;
 
@@ -13,6 +13,7 @@ use crate::transformations::error::TransformationError;
 use crate::types::uniswap::v4::PoolKey;
 
 use super::swap_data::{LiquidityInput, SwapInput};
+use super::tvl::TvlTarget;
 
 /// Extract swap inputs from V4 hook Swap events, matching each with its getSlot0 call result.
 ///
@@ -77,6 +78,62 @@ pub fn extract_v4_hook_swaps(
     }
 
     Ok(swaps)
+}
+
+/// Extract TVL targets from V4 hook Swap events, deduplicated by (pool_id, block_number).
+///
+/// Uses the same getSlot0 matching as [`extract_v4_hook_swaps`] but produces
+/// [`TvlTarget`]s instead of [`SwapInput`]s. For each (pool, block), keeps the
+/// last swap's tick/sqrtPriceX96 (end-of-block state).
+pub fn extract_v4_hook_tvl_targets(
+    ctx: &TransformationContext,
+    event_source: &str,
+    call_source: &str,
+) -> Result<Vec<TvlTarget>, TransformationError> {
+    let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
+        .calls_of_type(call_source, "getSlot0")
+        .filter_map(|call| {
+            call.trigger_log_index
+                .map(|idx| ((call.block_number, idx), call))
+        })
+        .collect();
+
+    let mut by_pool_block: BTreeMap<(Vec<u8>, u64), TvlTarget> = BTreeMap::new();
+
+    for event in ctx.events_of_type(event_source, "Swap") {
+        let pool_id = event.extract_bytes32("poolId")?;
+
+        let Some(slot0) = slot0_by_event_key
+            .get(&(event.block_number, event.log_index))
+            .copied()
+        else {
+            return Err(TransformationError::MissingData(format!(
+                "No getSlot0 call for TVL target at block {} log_index {} (source: {})",
+                event.block_number, event.log_index, call_source
+            )));
+        };
+
+        if slot0.is_reverted {
+            continue;
+        }
+
+        let sqrt_price_x96 = slot0.extract_uint256("sqrtPriceX96")?;
+        let tick = slot0.extract_i32_flexible("tick")?;
+
+        let key = (pool_id.to_vec(), event.block_number);
+        by_pool_block.insert(
+            key,
+            TvlTarget {
+                pool_id: pool_id.to_vec(),
+                block_number: event.block_number,
+                block_timestamp: event.block_timestamp,
+                tick,
+                sqrt_price_x96,
+            },
+        );
+    }
+
+    Ok(by_pool_block.into_values().collect())
 }
 
 /// Extract liquidity deltas from tuple-format ModifyLiquidity events (multicurve, dhook).

@@ -18,7 +18,7 @@
 //! no filtering is needed. Pool ID is computed from the tuple PoolKey via keccak256,
 //! matching the same approach used by V4 hook liquidity handlers.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Once, OnceLock, RwLock};
 
 use async_trait::async_trait;
@@ -29,6 +29,9 @@ use crate::transformations::context::{FieldExtractor, TransformationContext};
 use crate::transformations::error::TransformationError;
 use crate::transformations::event::metrics::swap_data::{
     process_liquidity_deltas, process_swaps, refresh_cache_if_needed, SwapInput,
+};
+use crate::transformations::event::metrics::tvl::{
+    process_tvl, TvlHandlerConfig, TvlTarget,
 };
 use crate::transformations::event::metrics::v4_hook_extract::extract_tuple_modify_liquidity;
 use crate::transformations::event::migration_pool::create::{
@@ -307,6 +310,212 @@ impl EventHandler for MigrationPoolLiquidityMetricsHandler {
     }
 }
 
+// ─── TVL handler ──────────────────────────────────────────────────────────────
+
+pub struct MigrationPoolTvlMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
+    chain_id: u64,
+    db_pool: OnceLock<Pool>,
+    tvl_config: TvlHandlerConfig,
+    /// bytes32 pool IDs of known migration pools (same filter as swap handler).
+    migration_pool_ids: RwLock<HashSet<Vec<u8>>>,
+}
+
+impl MigrationPoolTvlMetricsHandler {
+    async fn refresh_migration_pool_ids(&self) -> Result<(), TransformationError> {
+        let Some(pool) = self.db_pool.get() else {
+            return Ok(());
+        };
+        let client = pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT p.address \
+                 FROM pools p \
+                 WHERE p.chain_id = $1 \
+                   AND p.migrated_from IS NOT NULL \
+                   AND p.source = $2 \
+                   AND p.source_version = $3",
+                &[
+                    &(self.chain_id as i64),
+                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
+                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
+                ],
+            )
+            .await?;
+
+        let mut ids = self.migration_pool_ids.write().unwrap();
+        let before = ids.len();
+        for row in &rows {
+            let address: Vec<u8> = row.get("address");
+            ids.insert(address);
+        }
+        let added = ids.len() - before;
+        if added > 0 {
+            tracing::info!(
+                added,
+                total = ids.len(),
+                chain_id = self.chain_id,
+                "TVL handler refreshed migration pool ID set"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TransformationHandler for MigrationPoolTvlMetricsHandler {
+    fn name(&self) -> &'static str {
+        "MigrationPoolTvlMetricsHandler"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![
+            "migrations/tables/pool_state_add_tvl.sql",
+            "migrations/tables/pool_state_add_active_liquidity_usd.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
+            "migrations/tables/pool_snapshots_add_active_liquidity_usd.sql",
+        ]
+    }
+
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec!["pool_state", "pool_snapshots"]
+    }
+
+    async fn handle(
+        &self,
+        ctx: &TransformationContext,
+    ) -> Result<Vec<DbOperation>, TransformationError> {
+        self.refresh_migration_pool_ids().await?;
+
+        // Extract PoolManager Swap events, filtering to known migration pool IDs,
+        // deduplicated by (pool_id, block_number).
+        let mut by_pool_block: BTreeMap<(Vec<u8>, u64), TvlTarget> = BTreeMap::new();
+        for event in ctx.events_of_type(POOL_MANAGER_SOURCE, "Swap") {
+            let pool_id = event.extract_bytes32("id")?;
+
+            let known = {
+                let ids = self.migration_pool_ids.read().unwrap();
+                ids.contains(pool_id.as_slice())
+            };
+            if !known {
+                continue;
+            }
+
+            let sqrt_price_x96 = event.extract_uint256("sqrtPriceX96")?;
+            let tick = event.extract_i32_flexible("tick")?;
+
+            let key = (pool_id.to_vec(), event.block_number);
+            by_pool_block.insert(
+                key,
+                TvlTarget {
+                    pool_id: pool_id.to_vec(),
+                    block_number: event.block_number,
+                    block_timestamp: event.block_timestamp,
+                    tick,
+                    sqrt_price_x96,
+                },
+            );
+        }
+
+        let targets: Vec<TvlTarget> = by_pool_block.into_values().collect();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        refresh_cache_if_needed(
+            targets.iter().map(|t| &t.pool_id),
+            &self.metadata_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+            self.name(),
+            POOL_MANAGER_SOURCE,
+        )
+        .await?;
+
+        let Some(pool) = self.db_pool.get() else {
+            return Ok(Vec::new());
+        };
+
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+
+        let mut ops =
+            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
+                .await?;
+        ops.extend(price_ops);
+        Ok(ops)
+    }
+
+    async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
+        self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
+        self.metadata_cache
+            .load_into(db_pool, self.chain_id)
+            .await?;
+
+        let client = db_pool.inner().get().await?;
+        let rows = client
+            .query(
+                "SELECT p.address \
+                 FROM pools p \
+                 WHERE p.chain_id = $1 \
+                   AND p.migrated_from IS NOT NULL \
+                   AND p.source = $2 \
+                   AND p.source_version = $3",
+                &[
+                    &(self.chain_id as i64),
+                    &MIGRATION_POOL_CREATE_HANDLER_NAME,
+                    &(MIGRATION_POOL_CREATE_HANDLER_VERSION as i32),
+                ],
+            )
+            .await?;
+
+        let mut ids = self.migration_pool_ids.write().unwrap();
+        for row in &rows {
+            let address: Vec<u8> = row.get("address");
+            ids.insert(address);
+        }
+
+        tracing::info!(
+            count = ids.len(),
+            chain_id = self.chain_id,
+            "MigrationPoolTvlMetricsHandler initialized"
+        );
+        Ok(())
+    }
+}
+
+impl EventHandler for MigrationPoolTvlMetricsHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![EventTrigger::new(
+            POOL_MANAGER_SOURCE,
+            "Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)",
+        )]
+    }
+
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["MigrationPoolCreateHandler", "MigrationPoolLiquidityMetricsHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
+    }
+}
+
 // ─── Registration ──────────────────────────────────────────────────────────────
 
 pub fn register_handlers(
@@ -316,12 +525,25 @@ pub fn register_handlers(
     oracle_cache: Arc<OraclePriceCache>,
 ) {
     registry.register_event_handler(MigrationPoolSwapMetricsHandler {
-        metadata_cache: cache,
-        oracle_cache,
+        metadata_cache: cache.clone(),
+        oracle_cache: Arc::clone(&oracle_cache),
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
         migration_pool_ids: RwLock::new(HashSet::new()),
     });
     registry.register_event_handler(MigrationPoolLiquidityMetricsHandler { chain_id });
+    registry.register_event_handler(MigrationPoolTvlMetricsHandler {
+        metadata_cache: cache,
+        oracle_cache,
+        chain_id,
+        db_pool: OnceLock::new(),
+        tvl_config: TvlHandlerConfig {
+            liquidity_source: "MigrationPoolLiquidityMetricsHandler",
+            liquidity_source_version: 1,
+            swap_source: "MigrationPoolSwapMetricsHandler",
+            swap_source_version: 1,
+        },
+        migration_pool_ids: RwLock::new(HashSet::new()),
+    });
 }

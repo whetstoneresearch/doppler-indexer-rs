@@ -15,13 +15,17 @@
 //! See `docs/designs/pool-metrics/metrics_implementation_phases.md` (Phase 7)
 //! for the architectural context.
 
+use std::collections::BTreeMap;
+use std::str::FromStr;
+
 use alloy_primitives::U256;
 use bigdecimal::BigDecimal;
 use deadpool_postgres::Pool;
 
 use crate::db::{DbOperation, DbSnapshot, DbValue};
 use crate::transformations::error::TransformationError;
-use crate::transformations::util::pool_metadata::PoolMetadata;
+use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
+use crate::transformations::util::price::sqrt_price_x96_to_price;
 use crate::transformations::util::tick_math::get_amounts_for_position;
 use crate::transformations::util::usd_price::{u256_to_decimal_adjusted, UsdPriceContext};
 
@@ -604,13 +608,188 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
     }
 }
 
+// ─── Shared TVL handler processing ─────────────────────────────────
+
+/// A single (pool, block) TVL computation target extracted from swap events.
+#[derive(Debug, Clone)]
+pub struct TvlTarget {
+    pub pool_id: Vec<u8>,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub tick: i32,
+    pub sqrt_price_x96: U256,
+}
+
+/// Handler source identities for reading `liquidity_deltas` and writing to
+/// the swap handler's `pool_snapshots`/`pool_state` rows.
+#[derive(Debug, Clone)]
+pub struct TvlHandlerConfig {
+    /// Source name of the liquidity handler whose `liquidity_deltas` rows to query.
+    pub liquidity_source: &'static str,
+    /// Source version of the liquidity handler.
+    pub liquidity_source_version: u32,
+    /// Source name of the swap handler whose rows to update with TVL columns.
+    pub swap_source: &'static str,
+    /// Source version of the swap handler.
+    pub swap_source_version: u32,
+}
+
+/// Intermediate result cached during the snapshot pass to avoid re-querying
+/// the tick map for the state update.
+struct TvlComputeResult {
+    active_liquidity: BigDecimal,
+    amount0: BigDecimal,
+    amount1: BigDecimal,
+    tvl_usd: Option<BigDecimal>,
+    market_cap_usd: Option<BigDecimal>,
+    active_liquidity_usd: Option<BigDecimal>,
+    bootstrap_seed: TvlBootstrapSeed,
+    total_supply: Option<U256>,
+}
+
+/// Core TVL processing: for each target, query the tick map from
+/// `liquidity_deltas`, compute token amounts and USD values, and produce
+/// `pool_snapshots` + `pool_state` update operations targeting the swap
+/// handler's rows.
+///
+/// Targets should be deduplicated by `(pool_id, block_number)` before calling,
+/// keeping the last swap's `tick`/`sqrt_price_x96` per block (the TVL snapshot
+/// reflects end-of-block state).
+pub async fn process_tvl(
+    targets: &[TvlTarget],
+    config: &TvlHandlerConfig,
+    metadata_cache: &PoolMetadataCache,
+    db: &Pool,
+    chain_id: u64,
+    usd_ctx: &UsdPriceContext,
+) -> Result<Vec<DbOperation>, TransformationError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ops = Vec::new();
+    // Track the latest block per pool and its compute result for state updates.
+    let mut latest_per_pool: BTreeMap<Vec<u8>, (&TvlTarget, TvlComputeResult)> = BTreeMap::new();
+
+    for target in targets {
+        let Some(meta) = metadata_cache.get(&target.pool_id) else {
+            continue;
+        };
+
+        let positions = query_tick_map(
+            db,
+            chain_id,
+            &target.pool_id,
+            target.block_number,
+            config.liquidity_source,
+            config.liquidity_source_version,
+        )
+        .await?;
+
+        if positions.is_empty() {
+            continue;
+        }
+
+        let price_close = match sqrt_price_x96_to_price(
+            &target.sqrt_price_x96,
+            meta.base_decimals,
+            meta.quote_decimals,
+            meta.is_token_0,
+        ) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let (total0, total1) = compute_position_amounts(&positions, target.sqrt_price_x96)?;
+        let (active0, active1) =
+            compute_active_position_amounts(&positions, target.tick, target.sqrt_price_x96)?;
+
+        let active_liquidity: u128 = positions
+            .iter()
+            .filter(|p| p.tick_lower <= target.tick && target.tick < p.tick_upper)
+            .map(|p| p.liquidity)
+            .fold(0u128, |acc, l| acc.saturating_add(l));
+        let active_liquidity_dec =
+            BigDecimal::from_str(&active_liquidity.to_string()).unwrap_or_default();
+
+        let amount0 = BigDecimal::from_str(&total0.to_string()).unwrap_or_default();
+        let amount1 = BigDecimal::from_str(&total1.to_string()).unwrap_or_default();
+
+        let tvl_usd = compute_tvl_usd(&total0, &total1, &meta, &price_close, usd_ctx);
+        let market_cap_usd = compute_market_cap_usd(&meta, &price_close, usd_ctx);
+        let active_liquidity_usd =
+            compute_tvl_usd(&active0, &active1, &meta, &price_close, usd_ctx);
+
+        let bootstrap_seed = TvlBootstrapSeed {
+            tick: target.tick,
+            sqrt_price_x96: target.sqrt_price_x96,
+            price: price_close,
+        };
+
+        ops.push(build_snapshot_tvl_update(
+            chain_id,
+            &target.pool_id,
+            target.block_number,
+            target.block_timestamp,
+            &active_liquidity_dec,
+            &amount0,
+            &amount1,
+            tvl_usd.as_ref(),
+            market_cap_usd.as_ref(),
+            active_liquidity_usd.as_ref(),
+            Some(&bootstrap_seed),
+            config.swap_source,
+            config.swap_source_version,
+        ));
+
+        let result = TvlComputeResult {
+            active_liquidity: active_liquidity_dec,
+            amount0,
+            amount1,
+            tvl_usd,
+            market_cap_usd,
+            active_liquidity_usd,
+            bootstrap_seed,
+            total_supply: meta.total_supply.clone(),
+        };
+
+        let update_latest = latest_per_pool
+            .get(&target.pool_id)
+            .map_or(true, |(prev, _)| target.block_number >= prev.block_number);
+        if update_latest {
+            latest_per_pool.insert(target.pool_id.clone(), (target, result));
+        }
+    }
+
+    // Emit pool_state updates for the latest block per pool.
+    for (pool_id, (target, result)) in &latest_per_pool {
+        ops.push(build_state_tvl_update(
+            chain_id,
+            pool_id,
+            target.block_number,
+            target.block_timestamp,
+            &result.active_liquidity,
+            &result.amount0,
+            &result.amount1,
+            result.tvl_usd.as_ref(),
+            result.market_cap_usd.as_ref(),
+            result.active_liquidity_usd.as_ref(),
+            result.total_supply.as_ref(),
+            Some(&result.bootstrap_seed),
+            config.swap_source,
+            config.swap_source_version,
+        ));
+    }
+
+    Ok(ops)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transformations::util::tick_math::tick_to_sqrt_price_x96;
-    use std::str::FromStr;
 
     fn bd(s: &str) -> BigDecimal {
         BigDecimal::from_str(s).unwrap()

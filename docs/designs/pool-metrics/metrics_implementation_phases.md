@@ -345,24 +345,40 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ---
 
-## Phase 7: TVL + Active Liquidity USD
+## Phase 7: TVL + Active Liquidity USD (Complete)
 
-**Goal**: Compute TVL plus USD active-liquidity pricing from in-memory tick maps and update `pool_snapshots` + `pool_state`.
+**Goal**: Compute TVL plus USD active-liquidity pricing from tick maps and update `pool_snapshots` + `pool_state`.
 
-### Tasks
-1. Implement tick map store: `RwLock<HashMap<pool_id, BTreeMap<(tick_lower, tick_upper), i128>>>`
-2. Rebuild on startup from liquidity_deltas table (one GROUP BY query)
-3. Sequential pass: process liquidity_deltas in order, update tick maps, compute TVL per block
-4. TVL formula: iterate tick map positions, compute token amounts based on position vs current tick
-5. Compute active-liquidity token amounts for positions currently in range, then convert that subset to `active_liquidity_usd`
-6. Add `amount0`, `amount1`, `tvl_usd`, `market_cap_usd`, and `active_liquidity_usd` columns to `pool_state` and `pool_snapshots`
-7. Market cap = token price × total supply (total_supply from tokens table)
+### Implementation
 
-### Design notes
-- This pass is sequential by nature (tick maps are cumulative state)
-- USD active-liquidity pricing is part of the same Phase 7 pass as TVL, not a separate later phase
-- Could be a separate handler or a background task
-- Consider materialized views for protocol-wide TVL aggregation
+**Stateless design**: Each TVL handler re-queries `liquidity_deltas` per target block via `query_tick_map()` instead of maintaining in-memory tick map state. This trades a small amount of extra DB work for simpler correctness — no in-memory caches to invalidate on reorg, no checkpoint table. Parallel ordering with respect to swap and liquidity handlers is provided by `contiguous_handler_dependencies`.
+
+**Shared compute module** (`src/transformations/event/metrics/tvl.rs`):
+- `query_tick_map()` — stateless `liquidity_deltas` re-aggregation scoped by `(source, source_version)`
+- `compute_position_amounts()` / `compute_active_position_amounts()` — full-pool and in-range token amounts
+- `compute_tvl_usd()` / `compute_market_cap_usd()` — USD conversions via `UsdPriceContext`
+- `build_snapshot_tvl_update()` / `build_state_tvl_update()` — `RawSql` upserts with LP-only bootstrap
+- `process_tvl()` — shared core that all 7 TVL handlers delegate to
+
+**TVL handlers** (one per pool type, targeting the sibling swap handler's rows via `target_source`):
+
+| Handler | Trigger | Pool ID | Liquidity source | Swap source (target) |
+|---|---|---|---|---|
+| V3TvlMetricsHandler | DopplerV3Pool.Swap | contract_address | V3LiquidityMetricsHandler | V3SwapMetricsHandler |
+| LockableV3TvlMetricsHandler | DopplerLockableV3Pool.Swap | contract_address | LockableV3LiquidityMetricsHandler | LockableV3SwapMetricsHandler |
+| MulticurveTvlMetricsHandler | V4 hook Swap + getSlot0 | poolId (bytes32) | MulticurveLiquidityMetricsHandler | MulticurveSwapMetricsHandler |
+| DecayMulticurveTvlMetricsHandler | V4 hook Swap + getSlot0 | poolId (bytes32) | DecayMulticurveLiquidityMetricsHandler | DecayMulticurveSwapMetricsHandler |
+| ScheduledMulticurveTvlMetricsHandler | V4 hook Swap + getSlot0 | poolId (bytes32) | ScheduledMulticurveLiquidityMetricsHandler | ScheduledMulticurveSwapMetricsHandler |
+| DhookTvlMetricsHandler | V4 hook Swap + getSlot0 | poolId (bytes32) | DhookLiquidityMetricsHandler | DhookSwapMetricsHandler |
+| MigrationPoolTvlMetricsHandler | PoolManager.Swap | id (bytes32) | MigrationPoolLiquidityMetricsHandler | MigrationPoolSwapMetricsHandler |
+
+**Columns added** via migrations:
+- `pool_state`: `amount0`, `amount1`, `tvl_usd`, `market_cap_usd`, `total_supply`, `active_liquidity_usd`
+- `pool_snapshots`: `amount0`, `amount1`, `tvl_usd`, `market_cap_usd`, `active_liquidity_usd`
+
+**Row ownership (Option A)**: TVL handlers update the swap handler's rows via `target_source`/`target_source_version` passed at registration. The TVL handler's own `name()`/`version()` tracks scheduler progress independently. Re-backfilling TVL = bump TVL handler version; re-backfilling swaps = bump both.
+
+**No V4 base TVL handler**: DopplerV4Hook has no `ModifyLiquidity` events, so there's no tick map to query.
 
 ---
 
@@ -378,7 +394,9 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 - **Quote token decimals**: hardcoded lookup (WETH=18, USDC=6, USDT=6, EURC=6), extracted to shared util
 - **Indexed poolKey in Swap**: keccak hash of PoolKey = pool_id, so topics[2] = topics[3]
 - **getSlot0 on_event calls**: configured on hook contracts with `target: UniswapV4StateView`; `source_name` on decoded calls = hook contract name (not target)
-- **TVL deferred**: liquidity_deltas written in parallel, TVL plus `active_liquidity_usd` computed in a separate sequential pass (Phase 7)
+- **TVL stateless re-query**: instead of in-memory tick map state, each TVL handler re-queries `liquidity_deltas` per target block. Simpler correctness (no reorg invalidation), at the cost of one GROUP BY query per (pool, block) per range. `contiguous_handler_dependencies` on the liquidity handler ensures deltas from prior ranges are committed before querying
+- **TVL target_source ownership (Option A)**: TVL handlers update the swap handler's rows (not their own), keeping a single row per (pool, block) in `pool_snapshots`/`pool_state`. TVL handler version is independent for scheduler progress tracking
+- **Migration pool TVL filter**: replicates the swap handler's `RwLock<HashSet>` ID filter rather than relying on empty tick maps, to avoid unnecessary DB queries for non-migration PoolManager.Swap events
 - **V4 hook swap/liquidity split**: same rationale as V3 — avoids multi-trigger snapshot capture issues
 - **V4 hook metadata caches**: each pool type gets its own `Arc<PoolMetadataCache>`, not shared with create handlers (create handlers don't use the cache)
 - **Shared V4 extraction functions**: `metrics/v4_hook_extract.rs` avoids duplication across 4 handler files
