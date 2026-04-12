@@ -11,6 +11,9 @@ mod storage;
 mod transformations;
 mod types;
 
+#[cfg(feature = "solana")]
+mod solana;
+
 use std::env;
 use std::future::Future;
 use std::path::{Path, PathBuf};
