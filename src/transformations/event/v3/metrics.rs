@@ -9,6 +9,7 @@
 //! single primary trigger, avoiding duplicate live executions and snapshot
 //! capture issues with multi-trigger handlers.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Once, OnceLock};
 
 use alloy_primitives::I256;
@@ -20,6 +21,9 @@ use crate::transformations::context::{FieldExtractor, TransformationContext};
 use crate::transformations::error::TransformationError;
 use crate::transformations::event::metrics::swap_data::{
     process_liquidity_deltas, process_swaps, refresh_cache_if_needed, LiquidityInput, SwapInput,
+};
+use crate::transformations::event::metrics::tvl::{
+    process_tvl, TvlHandlerConfig, TvlTarget,
 };
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
@@ -124,7 +128,9 @@ impl TransformationHandler for V3SwapMetricsHandler {
     fn migration_paths(&self) -> Vec<&'static str> {
         vec![
             "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_state_add_tvl.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
             "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
@@ -280,7 +286,9 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
     fn migration_paths(&self) -> Vec<&'static str> {
         vec![
             "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_state_add_tvl.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
             "migrations/tables/pool_snapshots_add_volume_usd.sql",
         ]
     }
@@ -413,6 +421,239 @@ impl EventHandler for LockableV3LiquidityMetricsHandler {
     }
 }
 
+// --- V3 TVL target extraction ---
+
+/// Extract TVL targets from V3 Swap events, deduplicated by (pool_id, block_number).
+/// For each (pool, block), keeps the last swap's tick/sqrtPriceX96 (end-of-block state).
+fn extract_v3_tvl_targets(
+    ctx: &TransformationContext,
+    source: &str,
+) -> Result<Vec<TvlTarget>, TransformationError> {
+    let mut by_pool_block: BTreeMap<(Vec<u8>, u64), TvlTarget> = BTreeMap::new();
+    for event in ctx.events_of_type(source, "Swap") {
+        let pool_id = event.contract_address.to_vec();
+        let block_number = event.block_number;
+        let sqrt_price_x96 = event.extract_uint256("sqrtPriceX96")?;
+        let tick = event.extract_i32_flexible("tick")?;
+        let target = TvlTarget {
+            pool_id: pool_id.clone(),
+            block_number,
+            block_timestamp: event.block_timestamp,
+            tick,
+            sqrt_price_x96,
+        };
+        // Later events (higher log_index) overwrite earlier ones for the same (pool, block).
+        by_pool_block.insert((pool_id, block_number), target);
+    }
+    Ok(by_pool_block.into_values().collect())
+}
+
+// --- V3TvlMetricsHandler ---
+
+pub struct V3TvlMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
+    chain_id: u64,
+    db_pool: OnceLock<Pool>,
+    tvl_config: TvlHandlerConfig,
+}
+
+#[async_trait]
+impl TransformationHandler for V3TvlMetricsHandler {
+    fn name(&self) -> &'static str {
+        "V3TvlMetricsHandler"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![
+            "migrations/tables/pool_state_add_tvl.sql",
+            "migrations/tables/pool_state_add_active_liquidity_usd.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
+            "migrations/tables/pool_snapshots_add_active_liquidity_usd.sql",
+        ]
+    }
+
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec!["pool_state", "pool_snapshots"]
+    }
+
+    async fn handle(
+        &self,
+        ctx: &TransformationContext,
+    ) -> Result<Vec<DbOperation>, TransformationError> {
+        let targets = extract_v3_tvl_targets(ctx, "DopplerV3Pool")?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        refresh_cache_if_needed(
+            targets.iter().map(|t| &t.pool_id),
+            &self.metadata_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+            self.name(),
+            "DopplerV3Pool",
+        )
+        .await?;
+
+        let Some(pool) = self.db_pool.get() else {
+            return Ok(Vec::new());
+        };
+
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+
+        let mut ops =
+            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
+                .await?;
+        ops.extend(price_ops);
+        Ok(ops)
+    }
+
+    async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
+        self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
+        self.metadata_cache
+            .load_into(db_pool, self.chain_id)
+            .await?;
+        tracing::info!("V3TvlMetricsHandler initialized");
+        Ok(())
+    }
+}
+
+impl EventHandler for V3TvlMetricsHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![EventTrigger::new(
+            "DopplerV3Pool",
+            "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        )]
+    }
+
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["V3CreateHandler", "V3LiquidityMetricsHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
+    }
+}
+
+// --- LockableV3TvlMetricsHandler ---
+
+pub struct LockableV3TvlMetricsHandler {
+    metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
+    chain_id: u64,
+    db_pool: OnceLock<Pool>,
+    tvl_config: TvlHandlerConfig,
+}
+
+#[async_trait]
+impl TransformationHandler for LockableV3TvlMetricsHandler {
+    fn name(&self) -> &'static str {
+        "LockableV3TvlMetricsHandler"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn migration_paths(&self) -> Vec<&'static str> {
+        vec![
+            "migrations/tables/pool_state_add_tvl.sql",
+            "migrations/tables/pool_state_add_active_liquidity_usd.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
+            "migrations/tables/pool_snapshots_add_active_liquidity_usd.sql",
+        ]
+    }
+
+    fn reorg_tables(&self) -> Vec<&'static str> {
+        vec!["pool_state", "pool_snapshots"]
+    }
+
+    async fn handle(
+        &self,
+        ctx: &TransformationContext,
+    ) -> Result<Vec<DbOperation>, TransformationError> {
+        let targets = extract_v3_tvl_targets(ctx, "DopplerLockableV3Pool")?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        refresh_cache_if_needed(
+            targets.iter().map(|t| &t.pool_id),
+            &self.metadata_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+            self.name(),
+            "DopplerLockableV3Pool",
+        )
+        .await?;
+
+        let Some(pool) = self.db_pool.get() else {
+            return Ok(Vec::new());
+        };
+
+        let (usd_ctx, price_ops) = build_usd_price_context(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+        )
+        .await;
+
+        let mut ops =
+            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
+                .await?;
+        ops.extend(price_ops);
+        Ok(ops)
+    }
+
+    async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
+        self.db_pool.set(db_pool.inner().clone()).ok();
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
+            .await?;
+        self.metadata_cache
+            .load_into(db_pool, self.chain_id)
+            .await?;
+        tracing::info!("LockableV3TvlMetricsHandler initialized");
+        Ok(())
+    }
+}
+
+impl EventHandler for LockableV3TvlMetricsHandler {
+    fn triggers(&self) -> Vec<EventTrigger> {
+        vec![EventTrigger::new(
+            "DopplerLockableV3Pool",
+            "Swap(address,address,int256,int256,uint160,uint128,int24)",
+        )]
+    }
+
+    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+        vec!["LockableV3CreateHandler", "LockableV3LiquidityMetricsHandler"]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
+    }
+}
+
 // --- Registration ---
 
 pub fn register_handlers(
@@ -430,7 +671,7 @@ pub fn register_handlers(
         db_pool: OnceLock::new(),
     });
     registry.register_event_handler(LockableV3SwapMetricsHandler {
-        metadata_cache: cache,
+        metadata_cache: cache.clone(),
         oracle_cache: Arc::clone(&oracle_cache),
         decimals_init: Once::new(),
         chain_id,
@@ -440,6 +681,32 @@ pub fn register_handlers(
     // Liquidity metrics: liquidity_deltas (insert-only, no snapshot concerns)
     registry.register_event_handler(V3LiquidityMetricsHandler { chain_id });
     registry.register_event_handler(LockableV3LiquidityMetricsHandler { chain_id });
+
+    // TVL metrics: amount0/1, tvl_usd, market_cap_usd, active_liquidity_usd
+    registry.register_event_handler(V3TvlMetricsHandler {
+        metadata_cache: cache.clone(),
+        oracle_cache: Arc::clone(&oracle_cache),
+        chain_id,
+        db_pool: OnceLock::new(),
+        tvl_config: TvlHandlerConfig {
+            liquidity_source: "V3LiquidityMetricsHandler",
+            liquidity_source_version: 1,
+            swap_source: "V3SwapMetricsHandler",
+            swap_source_version: 1,
+        },
+    });
+    registry.register_event_handler(LockableV3TvlMetricsHandler {
+        metadata_cache: cache,
+        oracle_cache,
+        chain_id,
+        db_pool: OnceLock::new(),
+        tvl_config: TvlHandlerConfig {
+            liquidity_source: "LockableV3LiquidityMetricsHandler",
+            liquidity_source_version: 1,
+            swap_source: "LockableV3SwapMetricsHandler",
+            swap_source_version: 1,
+        },
+    });
 }
 
 #[cfg(test)]
@@ -527,6 +794,7 @@ mod tests {
                 pool_type: "v3".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
+                total_supply: None,
             },
         );
 

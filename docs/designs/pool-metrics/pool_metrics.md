@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS pool_state (
     price_change_1h  NUMERIC,               -- (phase 3+)
     price_change_24h NUMERIC,               -- (phase 3+)
     swap_count_24h   INTEGER,               -- (phase 3+)
+    amount0          NUMERIC,               -- total token0 held by pool (phase 7)
+    amount1          NUMERIC,               -- total token1 held by pool (phase 7)
+    tvl_usd          NUMERIC,               -- total pool TVL in USD (phase 7)
+    market_cap_usd   NUMERIC,               -- base token market cap in USD (phase 7)
+    active_liquidity_usd NUMERIC,           -- USD value of in-range liquidity only (phase 7)
+    total_supply     NUMERIC,               -- base token total supply (phase 7)
     source           VARCHAR(255) NOT NULL,
     source_version   INT NOT NULL,
     UNIQUE (chain_id, pool_id, source, source_version)
@@ -30,6 +36,8 @@ CREATE INDEX IF NOT EXISTS idx_pool_state_reorg ON pool_state (chain_id, block_n
 ```
 
 **Upsert semantics**: `ON CONFLICT DO UPDATE SET ... WHERE EXCLUDED.block_number > pool_state.block_number`. Writes from stale blocks (e.g., retried historical ranges) are silently dropped. This conditional update is the basis for correct reorg snapshot capture — see [Reorg Invariants](#reorg-invariants).
+
+**Phase 7 TVL writes**: the TVL handler UPDATEs the Phase 7 columns (`amount0`, `amount1`, `tvl_usd`, `active_liquidity_usd`, `market_cap_usd`, `total_supply`) via `DbOperation::RawSql`, gated on `pool_state.block_number = $block_number` to avoid overwriting a newer range's state with stale TVL. The WHERE clause also matches the swap handler's `source` / `source_version` (passed as params) since the TVL handler owns a different handler name but needs to enrich rows written by the swap handler.
 
 ### pool_snapshots — one row per (chain, pool, block) with swap activity
 
@@ -47,6 +55,11 @@ CREATE TABLE IF NOT EXISTS pool_snapshots (
     volume0          NUMERIC NOT NULL DEFAULT 0,   -- sum of |amount0| across all swaps
     volume1          NUMERIC NOT NULL DEFAULT 0,   -- sum of |amount1| across all swaps
     swap_count       INT NOT NULL DEFAULT 0,
+    amount0          NUMERIC,               -- total token0 held by pool (phase 7)
+    amount1          NUMERIC,               -- total token1 held by pool (phase 7)
+    tvl_usd          NUMERIC,               -- total pool TVL in USD (phase 7)
+    market_cap_usd   NUMERIC,               -- base token market cap in USD (phase 7)
+    active_liquidity_usd NUMERIC,           -- USD value of in-range liquidity only (phase 7)
     source           VARCHAR(255) NOT NULL,
     source_version   INT NOT NULL,
     UNIQUE (chain_id, pool_id, block_number, source, source_version)
@@ -56,7 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_time ON pool_snapshots (pool_id, block_
 CREATE INDEX IF NOT EXISTS idx_snapshots_reorg ON pool_snapshots (chain_id, block_number);
 ```
 
-**Upsert semantics**: `ON CONFLICT DO UPDATE SET ...` (unconditional — updates all columns). Idempotent across retries for the same block.
+**Upsert semantics**: `ON CONFLICT DO UPDATE SET ...` (unconditional — updates all columns). Idempotent across retries for the same block. Swap handlers write the OHLC, volume, and volume_usd columns (phases 2–6). The TVL handler (phase 7) populates the TVL columns via a follow-up `DbOperation::RawSql` UPDATE targeting `source = <swap handler name>` in the WHERE clause; TVL writes are explicitly isolated from the idempotent swap upsert.
 
 ### liquidity_deltas — append-only recovery log for Mint/Burn events
 
@@ -138,10 +151,13 @@ def compute_price(sqrt_price_x96: int, decimals0: int, decimals1: int) -> Decima
     return adjusted_price
 ```
 
-### 2. Active Liquidity
+### 2. Active Liquidity (raw L)
 
 Just the `liquidity` value from the pool's slot0/state. Your handler grabs this
-directly from the event or call result — no math needed.
+directly from the event or call result — no math needed. Stored as-is in the
+`active_liquidity` column. **Not a dollar amount** — it's the Uniswap v3
+liquidity parameter `L`, useful for price-impact math but meaningless without
+context. Use `active_liquidity_usd` (§3b) for dollar-valued liquidity.
 
 ### 3. TVL (Token Amounts)
 
@@ -207,7 +223,53 @@ def compute_tvl(
     return amount0, amount1
 ```
 
-### 4. TVL in USD
+### 3b. Active Liquidity Token Amounts
+
+Same walk as §3, but only positions whose range straddles the current tick
+(Uniswap v3 convention: `tick_lower ≤ current_tick < tick_upper`). These
+positions are the subset that can absorb a swap at the current price — their
+token amounts represent "liquidity available right now". Non-straddling
+positions still hold tokens (and contribute to total TVL) but those tokens are
+not price-accessible until price moves into their range.
+
+```python
+def compute_active_liquidity_amounts(
+    tick_map: dict[tuple[int, int], int],
+    current_tick: int,
+    sqrt_price_x96: int,
+    decimals0: int,
+    decimals1: int,
+) -> tuple[Decimal, Decimal]:
+    """
+    Returns (amount0, amount1) in human-readable units, restricted to
+    positions straddling current_tick. Only the "straddles current tick"
+    branch from compute_tvl is reachable here; the other two branches
+    are skipped by the filter.
+    """
+    Q96 = 2 ** 96
+    total_amount0_raw = Decimal(0)
+    total_amount1_raw = Decimal(0)
+    sqrt_current = Decimal(sqrt_price_x96) / Decimal(Q96)
+
+    for (tick_lower, tick_upper), liquidity in tick_map.items():
+        if liquidity <= 0:
+            continue
+        # Filter: only straddling positions
+        if tick_lower > current_tick or tick_upper <= current_tick:
+            continue
+
+        L = Decimal(liquidity)
+        sqrt_lower = Decimal(math.sqrt(1.0001 ** tick_lower))
+        sqrt_upper = Decimal(math.sqrt(1.0001 ** tick_upper))
+        total_amount0_raw += L * (1 / sqrt_current - 1 / sqrt_upper)
+        total_amount1_raw += L * (sqrt_current - sqrt_lower)
+
+    amount0 = total_amount0_raw / Decimal(10 ** decimals0)
+    amount1 = total_amount1_raw / Decimal(10 ** decimals1)
+    return amount0, amount1
+```
+
+### 4. TVL in USD (shared conversion for both TVL and active liquidity)
 
 ```python
 def compute_tvl_usd(
@@ -222,6 +284,11 @@ def compute_tvl_usd(
       - If token1 is a stablecoin: price1_usd = 1.0, price0_usd = pool price
       - If neither is stable: chain through a reference pool
         e.g., TOKEN/WETH pool price * WETH/USDC pool price
+
+    The same function is applied twice per block:
+      - Once with (amount0_total, amount1_total) from compute_tvl → tvl_usd
+      - Once with (amount0_active, amount1_active) from
+        compute_active_liquidity_amounts → active_liquidity_usd
     """
     return amount0 * price0_usd + amount1 * price1_usd
 ```
@@ -397,6 +464,14 @@ The V4 base Swap event has no `poolId` field. The handler maps `event.contract_a
 
 V4 base Swap events do not emit liquidity, and Doppler auction "active liquidity" isn't directly analogous to a v3 pool's. The handler writes `active_liquidity = 0` for V4 base snapshots.
 
+### active_liquidity_usd
+
+`active_liquidity_usd` is in scope for the same Phase 7 pass as TVL. It is not a
+separate future metric. The computation uses only positions currently in range at
+the pool's current tick, converts those in-range token amounts to USD with the
+same pricing context used for `tvl_usd`, and stores the result on both
+`pool_snapshots` and `pool_state`.
+
 ---
 
 ## Handler Flow
@@ -449,8 +524,15 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
         acc = accumulators[pool_id]
         meta = get_pool_meta(pool_id)
 
-        # compute TVL from in-memory tick map
+        # compute total TVL token amounts from in-memory tick map
         amount0, amount1 = compute_tvl(
+            tick_maps.get(pool_id, {}),
+            acc.tick, acc.sqrt_price_x96,
+            meta.decimals0, meta.decimals1,
+        )
+
+        # compute USD value of in-range liquidity only
+        active_amount0, active_amount1 = compute_active_position_amounts(
             tick_maps.get(pool_id, {}),
             acc.tick, acc.sqrt_price_x96,
             meta.decimals0, meta.decimals1,
@@ -459,6 +541,9 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
         # resolve USD prices (protocol-specific)
         price0_usd, price1_usd = resolve_usd_prices(pool_id, acc.price_close)
         tvl_usd = compute_tvl_usd(amount0, amount1, price0_usd, price1_usd)
+        active_liquidity_usd = compute_tvl_usd(
+            active_amount0, active_amount1, price0_usd, price1_usd
+        )
 
         # market cap
         market_cap = compute_market_cap(price0_usd, meta.total_supply, meta.decimals0)
@@ -480,6 +565,7 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
             pool_id, block_number, block_timestamp,
             acc.price_open, acc.price_close, acc.price_high, acc.price_low,
             acc.active_liquidity, amount0, amount1, tvl_usd, market_cap,
+            active_liquidity_usd,
             acc.volume0, acc.volume1, volume_usd, acc.swap_count,
         ))
 
@@ -489,7 +575,7 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
             block_number, block_timestamp,
             acc.tick, acc.sqrt_price_x96,
             acc.price_close, acc.active_liquidity,
-            amount0, amount1, tvl_usd,
+            amount0, amount1, tvl_usd, active_liquidity_usd,
             meta.total_supply, market_cap,
             volume_24h, price_change_1h, price_change_24h,
             acc.swap_count,  # this is just this block, accumulate differently for 24h
@@ -530,6 +616,7 @@ def rebuild_tick_maps():
 ```sql
 -- Top pools by market cap, page 2
 SELECT pool_id, price, market_cap_usd, active_liquidity,
+       active_liquidity_usd,
        tvl_usd, volume_24h_usd, price_change_24h
 FROM pool_state
 ORDER BY market_cap_usd DESC NULLS LAST
@@ -564,6 +651,7 @@ SELECT
     sum(volume_usd) AS volume,
     (array_agg(market_cap_usd ORDER BY block_number DESC))[1] AS market_cap,
     (array_agg(active_liquidity ORDER BY block_number DESC))[1] AS active_liquidity,
+    (array_agg(active_liquidity_usd ORDER BY block_number DESC))[1] AS active_liquidity_usd,
     (array_agg(tvl_usd ORDER BY block_number DESC))[1] AS tvl
 FROM pool_snapshots
 WHERE pool_id = $1
@@ -572,19 +660,21 @@ GROUP BY date_trunc('hour', block_timestamp)
 ORDER BY hour;
 ```
 
-### TVL history for a pool
+### TVL and active liquidity history for a pool
 
 ```sql
-SELECT block_timestamp, tvl_usd
+SELECT block_timestamp, tvl_usd, active_liquidity_usd
 FROM pool_snapshots
 WHERE pool_id = $1
   AND block_timestamp > now() - INTERVAL '7 days'
 ORDER BY block_number;
 ```
 
-### Protocol-wide TVL (sum across all pools)
+### Protocol-wide TVL and active liquidity (sum across all pools)
 
 ```sql
-SELECT COALESCE(SUM(tvl_usd), 0) AS protocol_tvl
+SELECT
+    COALESCE(SUM(tvl_usd), 0) AS protocol_tvl,
+    COALESCE(SUM(active_liquidity_usd), 0) AS protocol_active_liquidity
 FROM pool_state;
 ```

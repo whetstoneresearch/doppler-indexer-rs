@@ -1,9 +1,11 @@
-//! Tick math utilities ported from Uniswap v3's TickMath.sol.
+//! Tick math utilities ported from Uniswap v3's TickMath.sol and LiquidityAmounts.sol.
 //!
-//! Provides precise conversion between ticks and sqrtPriceX96 values
-//! using the same algorithm as the on-chain contracts.
+//! Provides precise conversion between ticks and sqrtPriceX96 values, and
+//! computes token amounts for a position given its tick range, current
+//! sqrt price, and liquidity. All algorithms mirror the on-chain contracts.
 
 use alloy_primitives::U256;
+use bigdecimal::num_bigint::{BigInt, Sign};
 
 use crate::transformations::error::TransformationError;
 
@@ -86,6 +88,139 @@ pub fn tick_to_sqrt_price_x96(tick: i32) -> Result<U256, TransformationError> {
         U256::ZERO
     };
     Ok((ratio >> 32) + shift)
+}
+
+// ─── Position amount math (LiquidityAmounts.sol port) ───────────────
+
+fn u256_to_bigint(x: &U256) -> BigInt {
+    BigInt::parse_bytes(x.to_string().as_bytes(), 10).expect("U256 stringifies to a valid decimal")
+}
+
+fn bigint_to_u256(x: &BigInt) -> Result<U256, TransformationError> {
+    if x.sign() == Sign::Minus {
+        return Err(TransformationError::TypeConversion(format!(
+            "cannot convert negative BigInt to U256: {}",
+            x
+        )));
+    }
+    U256::from_str_radix(&x.to_str_radix(10), 10).map_err(|e| {
+        TransformationError::TypeConversion(format!("BigInt exceeds U256 range: {}", e))
+    })
+}
+
+/// Computes the amount of token0 in a position between two sqrtPriceX96 bounds.
+///
+/// Ports Uniswap v3 `LiquidityAmounts.getAmount0ForLiquidity` (equivalent to
+/// `SqrtPriceMath.getAmount0Delta(sqrtA, sqrtB, L, false)`).
+///
+/// Formula: `L * 2^96 * (sqrtB - sqrtA) / sqrtA / sqrtB`, computed via `BigInt`
+/// to avoid intermediate overflow.
+///
+/// The arguments are reordered internally to satisfy `sqrtA <= sqrtB`.
+/// Returns `Err` if either sqrt price is zero.
+pub fn get_amount0_delta(
+    sqrt_lower_x96: U256,
+    sqrt_upper_x96: U256,
+    liquidity: u128,
+) -> Result<U256, TransformationError> {
+    let (a, b) = if sqrt_lower_x96 > sqrt_upper_x96 {
+        (sqrt_upper_x96, sqrt_lower_x96)
+    } else {
+        (sqrt_lower_x96, sqrt_upper_x96)
+    };
+    if a.is_zero() || b.is_zero() {
+        return Err(TransformationError::TypeConversion(
+            "sqrtPriceX96 cannot be zero in get_amount0_delta".to_string(),
+        ));
+    }
+    if liquidity == 0 || a == b {
+        return Ok(U256::ZERO);
+    }
+
+    let a_bi = u256_to_bigint(&a);
+    let b_bi = u256_to_bigint(&b);
+    let l_bi = BigInt::from(liquidity);
+    let q96 = BigInt::from(1u64) << 96;
+
+    let numerator = &l_bi * &q96 * (&b_bi - &a_bi);
+    let denominator = &a_bi * &b_bi;
+    let result = numerator / denominator; // integer truncation, matches Solidity
+    bigint_to_u256(&result)
+}
+
+/// Computes the amount of token1 in a position between two sqrtPriceX96 bounds.
+///
+/// Ports Uniswap v3 `LiquidityAmounts.getAmount1ForLiquidity` (equivalent to
+/// `SqrtPriceMath.getAmount1Delta(sqrtA, sqrtB, L, false)`).
+///
+/// Formula: `L * (sqrtB - sqrtA) / 2^96`, computed via `BigInt`.
+///
+/// The arguments are reordered internally to satisfy `sqrtA <= sqrtB`.
+pub fn get_amount1_delta(
+    sqrt_lower_x96: U256,
+    sqrt_upper_x96: U256,
+    liquidity: u128,
+) -> Result<U256, TransformationError> {
+    let (a, b) = if sqrt_lower_x96 > sqrt_upper_x96 {
+        (sqrt_upper_x96, sqrt_lower_x96)
+    } else {
+        (sqrt_lower_x96, sqrt_upper_x96)
+    };
+    if liquidity == 0 || a == b {
+        return Ok(U256::ZERO);
+    }
+
+    let a_bi = u256_to_bigint(&a);
+    let b_bi = u256_to_bigint(&b);
+    let l_bi = BigInt::from(liquidity);
+    let q96 = BigInt::from(1u64) << 96;
+
+    let result = (&l_bi * (&b_bi - &a_bi)) / &q96;
+    bigint_to_u256(&result)
+}
+
+/// Computes the `(amount0, amount1)` in raw token units for a position with
+/// the given tick range, current sqrt price, and liquidity.
+///
+/// Dispatches based on where the current price sits relative to the position:
+/// - `current <= sqrt_lower`: position is above current → all `token0`
+/// - `current >= sqrt_upper`: position is below current → all `token1`
+/// - otherwise (straddling): both tokens present
+///
+/// Returns `Err` if `tick_lower >= tick_upper` or either tick is out of range.
+pub fn get_amounts_for_position(
+    tick_lower: i32,
+    tick_upper: i32,
+    current_sqrt_price_x96: U256,
+    liquidity: u128,
+) -> Result<(U256, U256), TransformationError> {
+    if tick_lower >= tick_upper {
+        return Err(TransformationError::TypeConversion(format!(
+            "tick_lower ({}) must be strictly less than tick_upper ({})",
+            tick_lower, tick_upper
+        )));
+    }
+    if liquidity == 0 {
+        return Ok((U256::ZERO, U256::ZERO));
+    }
+
+    let sqrt_lower = tick_to_sqrt_price_x96(tick_lower)?;
+    let sqrt_upper = tick_to_sqrt_price_x96(tick_upper)?;
+
+    if current_sqrt_price_x96 <= sqrt_lower {
+        // Current price is at or below the lower bound — position holds only token0.
+        let amount0 = get_amount0_delta(sqrt_lower, sqrt_upper, liquidity)?;
+        Ok((amount0, U256::ZERO))
+    } else if current_sqrt_price_x96 >= sqrt_upper {
+        // Current price is at or above the upper bound — position holds only token1.
+        let amount1 = get_amount1_delta(sqrt_lower, sqrt_upper, liquidity)?;
+        Ok((U256::ZERO, amount1))
+    } else {
+        // Current price straddles the position — split across both tokens.
+        let amount0 = get_amount0_delta(current_sqrt_price_x96, sqrt_upper, liquidity)?;
+        let amount1 = get_amount1_delta(sqrt_lower, current_sqrt_price_x96, liquidity)?;
+        Ok((amount0, amount1))
+    }
 }
 
 /// Convert a sqrtPriceX96 value to the greatest tick whose sqrt ratio does not
@@ -185,6 +320,134 @@ mod tests {
     fn test_tick_too_high() {
         assert!(tick_to_sqrt_price_x96(MAX_TICK + 1).is_err());
     }
+
+    // ─── Position amount math tests ─────────────────────────────────
+
+    #[test]
+    fn test_position_zero_liquidity() {
+        let (a0, a1) = get_amounts_for_position(-60, 60, U256::from(1u64) << 96, 0).unwrap();
+        assert_eq!(a0, U256::ZERO);
+        assert_eq!(a1, U256::ZERO);
+    }
+
+    #[test]
+    fn test_position_invalid_tick_order() {
+        let result = get_amounts_for_position(100, 100, U256::from(1u64) << 96, 1_000);
+        assert!(result.is_err());
+        let result = get_amounts_for_position(200, 100, U256::from(1u64) << 96, 1_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_position_entirely_above_current_is_all_token0() {
+        // Current at tick 0 (sqrt = 2^96). Position (60, 120) is strictly above.
+        let current = U256::from(1u64) << 96;
+        let (a0, a1) =
+            get_amounts_for_position(60, 120, current, 1_000_000_000_000_000_000).unwrap();
+        assert!(
+            a0 > U256::ZERO,
+            "amount0 should be non-zero for above-tick position"
+        );
+        assert_eq!(
+            a1,
+            U256::ZERO,
+            "amount1 must be zero for above-tick position"
+        );
+    }
+
+    #[test]
+    fn test_position_entirely_below_current_is_all_token1() {
+        // Current at tick 0. Position (-120, -60) is strictly below.
+        let current = U256::from(1u64) << 96;
+        let (a0, a1) =
+            get_amounts_for_position(-120, -60, current, 1_000_000_000_000_000_000).unwrap();
+        assert_eq!(
+            a0,
+            U256::ZERO,
+            "amount0 must be zero for below-tick position"
+        );
+        assert!(
+            a1 > U256::ZERO,
+            "amount1 should be non-zero for below-tick position"
+        );
+    }
+
+    #[test]
+    fn test_position_straddling_has_both_tokens() {
+        // Current at tick 0, position (-60, 60) straddles it.
+        let current = U256::from(1u64) << 96;
+        let l = 1_000_000_000_000_000_000u128; // 1e18
+        let (a0, a1) = get_amounts_for_position(-60, 60, current, l).unwrap();
+        assert!(a0 > U256::ZERO);
+        assert!(a1 > U256::ZERO);
+        // Symmetric around tick 0 at current=tick 0 ⇒ amount0 and amount1 are within 1% of each other.
+        let diff = if a0 > a1 { a0 - a1 } else { a1 - a0 };
+        let tolerance = a0 / U256::from(100u64);
+        assert!(
+            diff <= tolerance,
+            "expected a0≈a1 for symmetric straddling position, got a0={} a1={}",
+            a0,
+            a1
+        );
+    }
+
+    #[test]
+    fn test_position_current_at_tick_lower_is_all_token0() {
+        // Current sqrt price exactly equals sqrt_lower ⇒ handled by the "<= lower" branch.
+        let sqrt_lower = tick_to_sqrt_price_x96(-60).unwrap();
+        let (a0, a1) =
+            get_amounts_for_position(-60, 60, sqrt_lower, 1_000_000_000_000_000_000).unwrap();
+        assert!(a0 > U256::ZERO);
+        assert_eq!(a1, U256::ZERO);
+    }
+
+    #[test]
+    fn test_position_current_at_tick_upper_is_all_token1() {
+        let sqrt_upper = tick_to_sqrt_price_x96(60).unwrap();
+        let (a0, a1) =
+            get_amounts_for_position(-60, 60, sqrt_upper, 1_000_000_000_000_000_000).unwrap();
+        assert_eq!(a0, U256::ZERO);
+        assert!(a1 > U256::ZERO);
+    }
+
+    #[test]
+    fn test_amount0_delta_symmetric_bounds_gives_zero() {
+        // sqrt_lower == sqrt_upper → no width, zero amount
+        let q96 = U256::from(1u64) << 96;
+        let amount = get_amount0_delta(q96, q96, 1_000_000).unwrap();
+        assert_eq!(amount, U256::ZERO);
+    }
+
+    #[test]
+    fn test_amount1_delta_symmetric_bounds_gives_zero() {
+        let q96 = U256::from(1u64) << 96;
+        let amount = get_amount1_delta(q96, q96, 1_000_000).unwrap();
+        assert_eq!(amount, U256::ZERO);
+    }
+
+    #[test]
+    fn test_amount_delta_argument_order_independent() {
+        // get_amount0_delta should sort its inputs, so swapping args gives same result.
+        let sqrt_a = tick_to_sqrt_price_x96(-60).unwrap();
+        let sqrt_b = tick_to_sqrt_price_x96(60).unwrap();
+        let l = 1_000_000_000_000u128;
+        let a_forward = get_amount0_delta(sqrt_a, sqrt_b, l).unwrap();
+        let a_reverse = get_amount0_delta(sqrt_b, sqrt_a, l).unwrap();
+        assert_eq!(a_forward, a_reverse);
+
+        let b_forward = get_amount1_delta(sqrt_a, sqrt_b, l).unwrap();
+        let b_reverse = get_amount1_delta(sqrt_b, sqrt_a, l).unwrap();
+        assert_eq!(b_forward, b_reverse);
+    }
+
+    #[test]
+    fn test_amount0_delta_zero_sqrt_price_errors() {
+        let q96 = U256::from(1u64) << 96;
+        assert!(get_amount0_delta(U256::ZERO, q96, 1_000).is_err());
+        assert!(get_amount0_delta(q96, U256::ZERO, 1_000).is_err());
+    }
+
+    // ─── sqrt_price_x96_to_tick tests ─────────────────────────────────
 
     #[test]
     fn test_sqrt_price_to_tick_zero() {

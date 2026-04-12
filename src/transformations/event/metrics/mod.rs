@@ -5,4 +5,5 @@
 
 pub mod accumulator;
 pub mod swap_data;
+pub mod tvl;
 pub mod v4_hook_extract;
