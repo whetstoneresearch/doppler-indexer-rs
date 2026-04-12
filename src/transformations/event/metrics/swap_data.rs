@@ -274,17 +274,20 @@ FROM (
     SELECT price_close FROM pool_snapshots
     WHERE chain_id = $1 AND pool_id = $2
       AND block_timestamp <= ($4::bigint - 3600)
+      AND source = $6 AND source_version = $7
     ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
   ) h1h ON true
   LEFT JOIN LATERAL (
     SELECT price_close FROM pool_snapshots
     WHERE chain_id = $1 AND pool_id = $2
       AND block_timestamp <= ($4::bigint - 86400)
+      AND source = $6 AND source_version = $7
     ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
   ) h24h ON true
   WHERE s.chain_id = $1 AND s.pool_id = $2
     AND s.block_timestamp > ($4 - 86400)
     AND s.block_timestamp <= $4
+    AND s.source = $6 AND s.source_version = $7
 ) sub
 WHERE pool_state.chain_id = $1
   AND pool_state.pool_id = $2

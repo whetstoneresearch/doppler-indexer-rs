@@ -79,11 +79,11 @@ pub async fn query_tick_map(
              GROUP BY tick_lower, tick_upper \
              HAVING SUM(liquidity_delta) > 0",
             &[
-                &(chain_id as i64),
+                &i64::try_from(chain_id).expect("chain_id fits i64"),
                 &pool_id,
-                &(target_block as i64),
+                &i64::try_from(target_block).expect("block_number fits i64"),
                 &liquidity_source,
-                &(liquidity_source_version as i32),
+                &i32::try_from(liquidity_source_version).expect("source_version fits i32"),
             ],
         )
         .await
@@ -363,10 +363,10 @@ DO UPDATE SET
     DbOperation::RawSql {
         query: query.to_string(),
         params: vec![
-            DbValue::Int64(chain_id as i64),
+            DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
             DbValue::Bytes(pool_id.to_vec()),
-            DbValue::Int64(block_number as i64),
-            DbValue::Int64(block_timestamp as i64),
+            DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
+            DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64")),
             DbValue::Numeric(active_liquidity.to_string()),
             DbValue::Numeric(amount0.to_string()),
             DbValue::Numeric(amount1.to_string()),
@@ -374,17 +374,17 @@ DO UPDATE SET
             optional_decimal_value(market_cap_usd),
             optional_decimal_value(active_liquidity_usd),
             DbValue::VarChar(target_source.to_string()),
-            DbValue::Int32(target_source_version as i32),
+            DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
             optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_snapshots".to_string(),
             key_columns: vec![
-                ("chain_id".to_string(), DbValue::Int64(chain_id as i64)),
+                ("chain_id".to_string(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
                 ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
                 (
                     "block_number".to_string(),
-                    DbValue::Int64(block_number as i64),
+                    DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
                 ),
                 (
                     "source".to_string(),
@@ -392,7 +392,7 @@ DO UPDATE SET
                 ),
                 (
                     "source_version".to_string(),
-                    DbValue::Int32(target_source_version as i32),
+                    DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
                 ),
             ],
         }),
@@ -529,6 +529,8 @@ CROSS JOIN LATERAL (
     WHERE chain_id = $1
       AND pool_id = $2
       AND block_timestamp <= ($4 - 3600)
+      AND source = $12
+      AND source_version = $13
     ORDER BY block_timestamp DESC, block_number DESC
     LIMIT 1
   ) h1h ON true
@@ -538,6 +540,8 @@ CROSS JOIN LATERAL (
     WHERE chain_id = $1
       AND pool_id = $2
       AND block_timestamp <= ($4 - 86400)
+      AND source = $12
+      AND source_version = $13
     ORDER BY block_timestamp DESC, block_number DESC
     LIMIT 1
   ) h24h ON true
@@ -545,6 +549,8 @@ CROSS JOIN LATERAL (
     AND s.pool_id = $2
     AND s.block_timestamp > ($4 - 86400)
     AND s.block_timestamp <= $4
+    AND s.source = $12
+    AND s.source_version = $13
 ) AS rolling
 ON CONFLICT (chain_id, pool_id, source, source_version)
 DO UPDATE SET
@@ -570,10 +576,10 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
     DbOperation::RawSql {
         query: query.to_string(),
         params: vec![
-            DbValue::Int64(chain_id as i64),
+            DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
             DbValue::Bytes(pool_id.to_vec()),
-            DbValue::Int64(block_number as i64),
-            DbValue::Int64(block_timestamp as i64),
+            DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
+            DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64")),
             DbValue::Numeric(active_liquidity.to_string()),
             DbValue::Numeric(amount0.to_string()),
             DbValue::Numeric(amount1.to_string()),
@@ -582,7 +588,7 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
             optional_decimal_value(active_liquidity_usd),
             optional_u256_value(total_supply),
             DbValue::VarChar(target_source.to_string()),
-            DbValue::Int32(target_source_version as i32),
+            DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
             optional_i32_value(bootstrap_seed.map(|seed| seed.tick)),
             match bootstrap_seed {
                 Some(seed) => DbValue::Numeric(seed.sqrt_price_x96.to_string()),
@@ -593,7 +599,7 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
         snapshot: Some(DbSnapshot {
             table: "pool_state".to_string(),
             key_columns: vec![
-                ("chain_id".to_string(), DbValue::Int64(chain_id as i64)),
+                ("chain_id".to_string(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
                 ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
                 (
                     "source".to_string(),
@@ -601,7 +607,7 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
                 ),
                 (
                     "source_version".to_string(),
-                    DbValue::Int32(target_source_version as i32),
+                    DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
                 ),
             ],
         }),
@@ -673,6 +679,10 @@ pub async fn process_tvl(
 
     for target in targets {
         let Some(meta) = metadata_cache.get(&target.pool_id) else {
+            tracing::debug!(
+                pool_id = %hex::encode(&target.pool_id),
+                "TVL: skipping pool, metadata not found in cache"
+            );
             continue;
         };
 
@@ -687,6 +697,11 @@ pub async fn process_tvl(
         .await?;
 
         if positions.is_empty() {
+            tracing::debug!(
+                pool_id = %hex::encode(&target.pool_id),
+                block_number = target.block_number,
+                "TVL: skipping pool, no liquidity positions at block"
+            );
             continue;
         }
 
@@ -697,7 +712,13 @@ pub async fn process_tvl(
             meta.is_token_0,
         ) {
             Some(p) => p,
-            None => continue,
+            None => {
+                tracing::warn!(
+                    pool_id = %hex::encode(&target.pool_id),
+                    "TVL: skipping pool, sqrt_price_x96_to_price returned None"
+                );
+                continue;
+            }
         };
 
         let (total0, total1) = compute_position_amounts(&positions, target.sqrt_price_x96)?;
@@ -710,10 +731,10 @@ pub async fn process_tvl(
             .map(|p| p.liquidity)
             .fold(0u128, |acc, l| acc.saturating_add(l));
         let active_liquidity_dec =
-            BigDecimal::from_str(&active_liquidity.to_string()).unwrap_or_default();
+            BigDecimal::from_str(&active_liquidity.to_string()).expect("u128::to_string is valid decimal");
 
-        let amount0 = BigDecimal::from_str(&total0.to_string()).unwrap_or_default();
-        let amount1 = BigDecimal::from_str(&total1.to_string()).unwrap_or_default();
+        let amount0 = BigDecimal::from_str(&total0.to_string()).expect("U256::to_string is valid decimal");
+        let amount1 = BigDecimal::from_str(&total1.to_string()).expect("U256::to_string is valid decimal");
 
         let tvl_usd = compute_tvl_usd(&total0, &total1, &meta, &price_close, usd_ctx);
         let market_cap_usd = compute_market_cap_usd(&meta, &price_close, usd_ctx);
