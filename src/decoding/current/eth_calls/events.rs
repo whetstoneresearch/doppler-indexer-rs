@@ -8,6 +8,7 @@ use crate::decoding::eth_calls::EthCallDecodingError;
 use crate::decoding::eth_calls::{build_result_map, decode_value, EventCallDecodeConfig};
 use crate::live::{LiveDecodedEventCall, LiveStorage};
 use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
+use crate::types::chain::{ChainAddress, LogPosition};
 
 /// Handle a live-mode `EventCallsReady` message: decode results, persist to bincode,
 /// and optionally forward to the transformation engine.
@@ -32,10 +33,12 @@ pub(super) async fn handle_event_calls_live(
             transform_calls.push(TransformDecodedCall {
                 block_number: result.block_number,
                 block_timestamp: result.block_timestamp,
-                contract_address: result.target_address,
+                contract_address: ChainAddress::Evm(result.target_address),
                 source_name: contract_name.to_string(),
                 function_name: function_name.to_string(),
-                trigger_log_index: Some(result.log_index),
+                trigger_position: Some(LogPosition::Evm {
+                    log_index: result.log_index,
+                }),
                 result: HashMap::new(),
                 is_reverted: true,
                 revert_reason: result.revert_reason.clone(),
@@ -48,10 +51,12 @@ pub(super) async fn handle_event_calls_live(
                 transform_calls.push(TransformDecodedCall {
                     block_number: result.block_number,
                     block_timestamp: result.block_timestamp,
-                    contract_address: result.target_address,
+                    contract_address: ChainAddress::Evm(result.target_address),
                     source_name: contract_name.to_string(),
                     function_name: function_name.to_string(),
-                    trigger_log_index: Some(result.log_index),
+                    trigger_position: Some(LogPosition::Evm {
+                        log_index: result.log_index,
+                    }),
                     result: build_result_map(&decoded, &config.output_type, function_name),
                     is_reverted: false,
                     revert_reason: None,

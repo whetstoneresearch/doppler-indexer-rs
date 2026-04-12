@@ -76,7 +76,7 @@ impl TransformationHandler for V4CreateHandler {
                         "No 'once' call found for hook {} at block {} tx {}. Available calls: {:?}",
                         Address::from(hook),
                         event.block_number,
-                        B256::from(event.transaction_hash),
+                        B256::from(event.evm_tx_hash()),
                         available_calls
                     ))
                 })?;
@@ -109,8 +109,8 @@ impl TransformationHandler for V4CreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
-                    creator_address: ctx.tx_from(&event.transaction_hash),
+                    tx_hash: event.evm_tx_hash_ref(),
+                    creator_address: ctx.tx_from_evm(&event.transaction_id),
                     integrator: Some(&asset_metadata.integrator.into()),
                     token_address: &asset,
                     pool: Some(&PoolAddressOrPoolId::PoolId(pool_id.0)),
@@ -132,7 +132,7 @@ impl TransformationHandler for V4CreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
+                    tx_hash: event.evm_tx_hash_ref(),
                     creator_address: None,
                     integrator: None,
                     token_address: &numeraire,

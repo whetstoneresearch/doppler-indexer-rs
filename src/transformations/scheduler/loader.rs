@@ -23,6 +23,7 @@ use crate::transformations::finalizer::RangeFinalizer;
 use crate::transformations::historical::HistoricalDataReader;
 use crate::transformations::retry::{filter_calls_by_start_block, filter_events_by_start_block};
 use crate::transformations::traits::TransformationHandler;
+use crate::types::chain::{ChainAddress, TxId};
 use crate::types::config::contract::Contracts;
 
 // ─── Free functions ──────────────────────────────────────────────────────────
@@ -114,7 +115,7 @@ pub(crate) async fn read_receipt_addresses(
     raw_receipts_dir: &Path,
     range_start: u64,
     range_end: u64,
-) -> HashMap<[u8; 32], TransactionAddresses> {
+) -> HashMap<TxId, TransactionAddresses> {
     let raw_receipts_dir = raw_receipts_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         read_receipt_addresses_sync(&raw_receipts_dir, range_start, range_end)
@@ -135,7 +136,7 @@ fn read_receipt_addresses_sync(
     raw_receipts_dir: &Path,
     range_start: u64,
     range_end: u64,
-) -> HashMap<[u8; 32], TransactionAddresses> {
+) -> HashMap<TxId, TransactionAddresses> {
     use arrow::array::{Array, FixedSizeBinaryArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -239,14 +240,15 @@ fn read_receipt_addresses_sync(
                 if col.is_null(row) {
                     None
                 } else {
-                    col.value(row).try_into().ok()
+                    let address: [u8; 20] = col.value(row).try_into().ok()?;
+                    Some(ChainAddress::Evm(address))
                 }
             });
 
             addresses.insert(
-                tx_hash,
+                TxId::Evm(tx_hash),
                 TransactionAddresses {
-                    from_address,
+                    from_address: ChainAddress::Evm(from_address),
                     to_address,
                 },
             );

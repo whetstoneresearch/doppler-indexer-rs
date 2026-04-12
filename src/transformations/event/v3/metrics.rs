@@ -35,10 +35,10 @@ fn extract_v3_swaps(
     for event in ctx.events_of_type(source, "Swap") {
         swaps.push(SwapInput {
             pool_id: event.contract_address.to_vec(),
-            transaction_hash: event.transaction_hash,
+            transaction_hash: event.evm_tx_hash(),
             block_number: event.block_number,
             block_timestamp: event.block_timestamp,
-            log_index: event.log_index,
+            log_index: event.log_index(),
             amount0: event.extract_int256("amount0")?,
             amount1: event.extract_int256("amount1")?,
             sqrt_price_x96: event.extract_uint256("sqrtPriceX96")?,
@@ -68,7 +68,7 @@ fn extract_v3_liquidity(
         deltas.push(LiquidityInput {
             pool_id: event.contract_address.to_vec(),
             block_number: event.block_number,
-            log_index: event.log_index,
+            log_index: event.log_index(),
             tick_lower: event.extract_i32_flexible("tickLower")?,
             tick_upper: event.extract_i32_flexible("tickUpper")?,
             liquidity_delta: delta,
@@ -88,7 +88,7 @@ fn extract_v3_liquidity(
         deltas.push(LiquidityInput {
             pool_id: event.contract_address.to_vec(),
             block_number: event.block_number,
-            log_index: event.log_index,
+            log_index: event.log_index(),
             tick_lower: event.extract_i32_flexible("tickLower")?,
             tick_upper: event.extract_i32_flexible("tickUpper")?,
             liquidity_delta: -delta,

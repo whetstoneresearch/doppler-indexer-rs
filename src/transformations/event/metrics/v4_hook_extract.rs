@@ -29,7 +29,7 @@ pub fn extract_v4_hook_swaps(
     let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
         .calls_of_type(call_source, "getSlot0")
         .filter_map(|call| {
-            call.trigger_log_index
+            call.trigger_log_index()
                 .map(|idx| ((call.block_number, idx), call))
         })
         .collect();
@@ -40,12 +40,14 @@ pub fn extract_v4_hook_swaps(
         let pool_id = event.extract_bytes32("poolId")?;
 
         let Some(slot0) = slot0_by_event_key
-            .get(&(event.block_number, event.log_index))
+            .get(&(event.block_number, event.log_index()))
             .copied()
         else {
             return Err(TransformationError::MissingData(format!(
                 "No getSlot0 call for swap at block {} log_index {} (source: {})",
-                event.block_number, event.log_index, call_source
+                event.block_number,
+                event.log_index(),
+                call_source
             )));
         };
 
@@ -54,7 +56,7 @@ pub fn extract_v4_hook_swaps(
                 "getSlot0 reverted for pool {} at block {} log_index {}, skipping",
                 hex::encode(pool_id),
                 event.block_number,
-                event.log_index
+                event.log_index()
             );
             continue;
         }
@@ -64,10 +66,10 @@ pub fn extract_v4_hook_swaps(
 
         swaps.push(SwapInput {
             pool_id: pool_id.to_vec(),
-            transaction_hash: event.transaction_hash,
+            transaction_hash: event.evm_tx_hash(),
             block_number: event.block_number,
             block_timestamp: event.block_timestamp,
-            log_index: event.log_index,
+            log_index: event.log_index(),
             amount0: event.extract_int256("amount0")?,
             amount1: event.extract_int256("amount1")?,
             sqrt_price_x96,
@@ -102,7 +104,7 @@ pub fn extract_tuple_modify_liquidity(
         deltas.push(LiquidityInput {
             pool_id: pool_id.0.to_vec(),
             block_number: event.block_number,
-            log_index: event.log_index,
+            log_index: event.log_index(),
             tick_lower: event.extract_i32_flexible("params.tickLower")?,
             tick_upper: event.extract_i32_flexible("params.tickUpper")?,
             liquidity_delta: event.extract_int256("params.liquidityDelta")?,
@@ -128,7 +130,7 @@ pub fn extract_flat_modify_liquidity(
         deltas.push(LiquidityInput {
             pool_id: pool_id.to_vec(),
             block_number: event.block_number,
-            log_index: event.log_index,
+            log_index: event.log_index(),
             tick_lower: event.extract_i32_flexible("tickLower")?,
             tick_upper: event.extract_i32_flexible("tickUpper")?,
             liquidity_delta: event.extract_int256("liquidityDelta")?,
@@ -150,6 +152,7 @@ mod tests {
         DecodedCall, DecodedEvent, DecodedValue, TransformationContext,
     };
     use crate::transformations::historical::HistoricalDataReader;
+    use crate::types::chain::{ChainAddress, LogPosition, TxId};
     use crate::types::uniswap::v4::PoolKey;
 
     use super::{
@@ -201,9 +204,9 @@ mod tests {
         DecodedEvent {
             block_number,
             block_timestamp: 1000,
-            transaction_hash: [0u8; 32],
-            log_index,
-            contract_address: [0u8; 20],
+            transaction_id: TxId::Evm([0u8; 32]),
+            position: LogPosition::Evm { log_index },
+            contract_address: ChainAddress::Evm([0u8; 20]),
             source_name: SOURCE.to_string(),
             event_name: "Swap".to_string(),
             event_signature: "Swap(address,(address,address,uint24,int24,address),bytes32,(bool,int256,uint160),int128,int128,bytes)".to_string(),
@@ -236,10 +239,10 @@ mod tests {
         DecodedCall {
             block_number,
             block_timestamp: 1000,
-            contract_address: [0u8; 20],
+            contract_address: ChainAddress::Evm([0u8; 20]),
             source_name: SOURCE.to_string(),
             function_name: "getSlot0".to_string(),
-            trigger_log_index: Some(trigger_log_index),
+            trigger_position: Some(LogPosition::Evm { log_index: trigger_log_index }),
             result,
             is_reverted,
             revert_reason: None,
@@ -382,9 +385,9 @@ mod tests {
         let event = DecodedEvent {
             block_number: 100,
             block_timestamp: 1000,
-            transaction_hash: [0u8; 32],
-            log_index: 5,
-            contract_address: [0u8; 20],
+            transaction_id: TxId::Evm([0u8; 32]),
+            position: LogPosition::Evm { log_index: 5 },
+            contract_address: ChainAddress::Evm([0u8; 20]),
             source_name: SOURCE.to_string(),
             event_name: "ModifyLiquidity".to_string(),
             event_signature: "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))".to_string(),
@@ -432,9 +435,9 @@ mod tests {
         let event = DecodedEvent {
             block_number: 101,
             block_timestamp: 1010,
-            transaction_hash: [0u8; 32],
-            log_index: 7,
-            contract_address: [0u8; 20],
+            transaction_id: TxId::Evm([0u8; 32]),
+            position: LogPosition::Evm { log_index: 7 },
+            contract_address: ChainAddress::Evm([0u8; 20]),
             source_name: "DecayMulticurveHook".to_string(),
             event_name: "ModifyLiquidity".to_string(),
             event_signature: "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"

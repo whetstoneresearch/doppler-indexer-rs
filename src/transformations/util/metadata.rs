@@ -21,6 +21,8 @@ pub async fn get_metadata(
     event: &DecodedEvent,
     ctx: &TransformationContext,
 ) -> Result<(AssetTokenMetadata, TokenMetadata), TransformationError> {
+    let tx_hash = event.evm_tx_hash();
+
     if is_precompile_address(asset.into()) {
         return Err(TransformationError::IncludesPrecompileError(
             "asset address is a precompile".to_string(),
@@ -43,7 +45,7 @@ pub async fn get_metadata(
                 "No DERC20 'once' call found for asset {} at block {} tx {}. Available calls: {:?}",
                 Address::from(asset),
                 event.block_number,
-                B256::from(event.transaction_hash),
+                B256::from(tx_hash),
                 available_calls
             ))
         })?;
@@ -58,7 +60,7 @@ pub async fn get_metadata(
                 expected,
                 call.result.get(field),
                 event.block_number,
-                B256::from(event.transaction_hash)
+                B256::from(tx_hash)
             ))
         };
         let missing_err = |field: &str| {
@@ -67,7 +69,7 @@ pub async fn get_metadata(
                 Address::from(asset),
                 field,
                 event.block_number,
-                B256::from(event.transaction_hash),
+                B256::from(tx_hash),
                 call.result.keys().collect::<Vec<_>>()
             ))
         };
@@ -162,7 +164,7 @@ pub async fn get_metadata(
                     .collect();
                 TransformationError::MissingData(format!(
                     "No Numeraires 'once' call found for numeraire {} at block {} tx {}. Available calls: {:?}",
-                    Address::from(numeraire), event.block_number, B256::from(event.transaction_hash), available_calls
+                    Address::from(numeraire), event.block_number, B256::from(tx_hash), available_calls
                 ))
             })?;
 
@@ -174,7 +176,7 @@ pub async fn get_metadata(
                 expected,
                 call.result.get(field),
                 event.block_number,
-                B256::from(event.transaction_hash)
+                B256::from(tx_hash)
             ))
         };
         let missing_err = |field: &str| {
@@ -183,7 +185,7 @@ pub async fn get_metadata(
                 Address::from(numeraire),
                 field,
                 event.block_number,
-                B256::from(event.transaction_hash),
+                B256::from(tx_hash),
                 call.result.keys().collect::<Vec<_>>()
             ))
         };
@@ -248,7 +250,7 @@ pub async fn get_metadata_or_skip(
             ops.push(insert_skipped_address(
                 &SkippedAddressData {
                     block_number: event.block_number,
-                    tx_hash: &event.transaction_hash,
+                    tx_hash: event.evm_tx_hash_ref(),
                     asset_address: asset,
                     numeraire_address: numeraire,
                     reason: &msg,

@@ -69,12 +69,13 @@ impl TransformationHandler for DopplerHookCreateHandler {
                 .calls_of_type("DopplerHookInitializer", "getState")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index == Some(event.log_index)
+                        && call.trigger_log_index() == Some(event.log_index())
                 })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call at block {} tx index {}",
-                        event.block_number, event.log_index
+                        event.block_number,
+                        event.log_index()
                     ))
                 })?;
 
@@ -103,8 +104,8 @@ impl TransformationHandler for DopplerHookCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
-                    creator_address: ctx.tx_from(&event.transaction_hash),
+                    tx_hash: event.evm_tx_hash_ref(),
+                    creator_address: ctx.tx_from_evm(&event.transaction_id),
                     integrator: Some(&asset_metadata.integrator.into()),
                     token_address: &asset,
                     pool: Some(&PoolAddressOrPoolId::PoolId(pool_id.0)),
@@ -126,7 +127,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
+                    tx_hash: event.evm_tx_hash_ref(),
                     creator_address: None,
                     integrator: None,
                     token_address: &numeraire,
@@ -163,7 +164,7 @@ impl TransformationHandler for DopplerHookCreateHandler {
                 .calls_of_type("DopplerHookInitializer", "getBeneficiaries")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index == Some(event.log_index)
+                        && call.trigger_log_index() == Some(event.log_index())
                 })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {

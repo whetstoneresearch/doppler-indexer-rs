@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::types::{DecodedCallRecord, DecodedEventCallRecord};
 use crate::transformations::DecodedCall as TransformDecodedCall;
+use crate::types::chain::{ChainAddress, LogPosition};
 use crate::types::config::eth_call::EvmType;
 use crate::types::decoded::DecodedValue;
 
@@ -84,10 +85,10 @@ pub(super) fn convert_to_transform_call(
     TransformDecodedCall {
         block_number: record.block_number,
         block_timestamp: record.block_timestamp,
-        contract_address: record.contract_address,
+        contract_address: ChainAddress::Evm(record.contract_address),
         source_name: source_name.to_string(),
         function_name: function_name.to_string(),
-        trigger_log_index: None,
+        trigger_position: None,
         result: build_result_map(&record.decoded_value, output_type, function_name),
         is_reverted: false,
         revert_reason: None,
@@ -104,10 +105,12 @@ pub(super) fn convert_event_call_to_transform_call(
     TransformDecodedCall {
         block_number: record.block_number,
         block_timestamp: record.block_timestamp,
-        contract_address: record.target_address,
+        contract_address: ChainAddress::Evm(record.target_address),
         source_name: source_name.to_string(),
         function_name: function_name.to_string(),
-        trigger_log_index: Some(record.log_index),
+        trigger_position: Some(LogPosition::Evm {
+            log_index: record.log_index,
+        }),
         result: build_result_map(&record.decoded_value, output_type, function_name),
         is_reverted: false,
         revert_reason: None,

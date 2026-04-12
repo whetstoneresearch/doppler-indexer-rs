@@ -75,14 +75,14 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getState")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index == Some(event.log_index)
+                        && call.trigger_log_index() == Some(event.log_index())
                 })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getState call for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     ))
                 })?;
 
@@ -94,7 +94,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         "No getAssetData call for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     ))
                 })?;
 
@@ -105,13 +105,13 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     TransformationError::TypeConversion(format!(
                         "UniswapV4ScheduledMulticurveInitializer getState for {} field '{}': expected {} but got {:?} at block {} tx {}",
                         Address::from(asset), field, expected, get_state_call.result.get(field),
-                        event.block_number, B256::from(event.transaction_hash)
+                        event.block_number, B256::from(event.evm_tx_hash())
                     ))
                 };
                 let missing_err = |field: &str| {
                     TransformationError::MissingData(format!(
                         "UniswapV4ScheduledMulticurveInitializer getState for {} missing field '{}' at block {} tx {}. Available fields: {:?}",
-                        Address::from(asset), field, event.block_number, B256::from(event.transaction_hash),
+                        Address::from(asset), field, event.block_number, B256::from(event.evm_tx_hash()),
                         get_state_call.result.keys().collect::<Vec<_>>()
                     ))
                 };
@@ -173,7 +173,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         Address::from(asset),
                         Address::from(numeraire),
                         event.block_number,
-                        B256::from(event.transaction_hash),
+                        B256::from(event.evm_tx_hash()),
                         e,
                     ))
                 })?;
@@ -187,7 +187,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                             "startingTimeOf did not return uint256 for pool {} at block {} tx {}",
                             pool_id,
                             event.block_number,
-                            B256::from(event.transaction_hash)
+                            B256::from(event.evm_tx_hash())
                         ))
                     })?;
 
@@ -199,7 +199,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         "No farTick in getState for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     ))
                 })?
                 .as_i32()
@@ -208,7 +208,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         "farTick is not an i32 in getState for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     ))
                 })?;
 
@@ -216,14 +216,14 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 .calls_of_type("UniswapV4ScheduledMulticurveInitializer", "getPositions")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index == Some(event.log_index)
+                        && call.trigger_log_index() == Some(event.log_index())
                 })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
                         "No getPositions call for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     ))
                 })?;
 
@@ -235,7 +235,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         "No getPositions result for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     ))
                 })?;
 
@@ -248,13 +248,13 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                             .and_then(|v| v.as_i32())
                             .ok_or_else(|| TransformationError::TypeConversion(format!(
                                 "position tickLower missing or not i32 for asset {} at block {} tx {}",
-                                Address::from(asset), event.block_number, B256::from(event.transaction_hash)
+                                Address::from(asset), event.block_number, B256::from(event.evm_tx_hash())
                             )))?;
                         let tick_upper = elem.get_field("tickUpper")
                             .and_then(|v| v.as_i32())
                             .ok_or_else(|| TransformationError::TypeConversion(format!(
                                 "position tickUpper missing or not i32 for asset {} at block {} tx {}",
-                                Address::from(asset), event.block_number, B256::from(event.transaction_hash)
+                                Address::from(asset), event.block_number, B256::from(event.evm_tx_hash())
                             )))?;
                         min_lower = min_lower.min(tick_lower);
                         max_upper = max_upper.max(tick_upper);
@@ -266,7 +266,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                         "getPositions is not a non-empty array for asset {} at block {} tx {}",
                         Address::from(asset),
                         event.block_number,
-                        B256::from(event.transaction_hash)
+                        B256::from(event.evm_tx_hash())
                     )))
                 }
             };
@@ -284,14 +284,14 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                     .as_uint256()
                     .ok_or_else(|| TransformationError::TypeConversion(format!(
                         "numTokensToSell is not uint256 in getAssetData for asset {} at block {} tx {}",
-                        Address::from(asset), event.block_number, B256::from(event.transaction_hash)
+                        Address::from(asset), event.block_number, B256::from(event.evm_tx_hash())
                     )))?,
                 min_proceeds: U256::ZERO,
                 max_proceeds: U256::ZERO,
                 starting_time: starting_time.try_into().map_err(|_| {
                     TransformationError::TypeConversion(format!(
                         "startingTimeOf overflows u64 for pool {} at block {} tx {}",
-                        B256::from(pool_id), event.block_number, B256::from(event.transaction_hash)
+                        B256::from(pool_id), event.block_number, B256::from(event.evm_tx_hash())
                     ))
                 })?,
                 ending_time: 0,
@@ -307,8 +307,8 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
-                    creator_address: ctx.tx_from(&event.transaction_hash),
+                    tx_hash: event.evm_tx_hash_ref(),
+                    creator_address: ctx.tx_from_evm(&event.transaction_id),
                     integrator: Some(&asset_metadata.integrator.into()),
                     token_address: &asset,
                     pool: Some(&PoolAddressOrPoolId::PoolId(pool_id.0)),
@@ -330,7 +330,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
+                    tx_hash: event.evm_tx_hash_ref(),
                     creator_address: None,
                     integrator: None,
                     token_address: &numeraire,
@@ -375,7 +375,7 @@ impl TransformationHandler for V4ScheduledMulticurveCreateHandler {
                 )
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index == Some(event.log_index)
+                        && call.trigger_log_index() == Some(event.log_index())
                 })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {

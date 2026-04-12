@@ -43,6 +43,7 @@ use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
     read_contract_index, ExpectedContracts,
 };
+use crate::types::chain::TxId;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 
 /// Message containing decoded events for a block range.
@@ -1242,7 +1243,7 @@ impl TransformationEngine {
         &self,
         range_start: u64,
         range_end: u64,
-    ) -> HashMap<[u8; 32], TransactionAddresses> {
+    ) -> HashMap<TxId, TransactionAddresses> {
         read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await
     }
 
@@ -2005,7 +2006,7 @@ impl TransformationEngine {
         for call in calls {
             let chain_id = self.chain_id as i64;
             let block_number = call.block_number as i64;
-            let log_index = call.trigger_log_index.map(i64::from);
+            let log_index = call.trigger_log_index().map(i64::from);
             let source_name = &call.source_name;
             let function_name = &call.function_name;
             let target_address = call.contract_address.as_slice();
@@ -2482,7 +2483,7 @@ impl TransformationEngine {
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
         account_states: Arc<Vec<DecodedAccountState>>,
-        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+        tx_addresses: HashMap<TxId, TransactionAddresses>,
         range_start: u64,
         range_end: u64,
         snapshot_chain: Option<String>,

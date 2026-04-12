@@ -21,6 +21,7 @@ use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
 use crate::live::{LiveDbValue, LiveStorage, LiveUpsertSnapshot};
 use crate::metrics::HandlerMetricsGuard;
 use crate::rpc::UnifiedRpcClient;
+use crate::types::chain::TxId;
 use crate::types::config::contract::Contracts;
 
 /// Outcome of a successful handler execution.
@@ -45,7 +46,7 @@ pub(crate) struct HandlerTask {
     pub events: Arc<Vec<DecodedEvent>>,
     pub calls: Arc<Vec<DecodedCall>>,
     pub account_states: Arc<Vec<DecodedAccountState>>,
-    pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    pub tx_addresses: HashMap<TxId, TransactionAddresses>,
 }
 
 /// Opaque payload carried inside a process-range [`WorkItem`].
@@ -60,7 +61,7 @@ pub(crate) struct ProcessRangePayload {
     pub events: Arc<Vec<DecodedEvent>>,
     pub calls: Arc<Vec<DecodedCall>>,
     pub account_states: Arc<Vec<DecodedAccountState>>,
-    pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    pub tx_addresses: HashMap<TxId, TransactionAddresses>,
     /// `Some(chain_name)` → snapshot-capture mode (live); `None` → direct (historical).
     pub snapshot_chain: Option<String>,
 }
@@ -186,7 +187,7 @@ pub(crate) async fn run_handler_task(
     events: Arc<Vec<DecodedEvent>>,
     calls: Arc<Vec<DecodedCall>>,
     account_states: Arc<Vec<DecodedAccountState>>,
-    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    tx_addresses: HashMap<TxId, TransactionAddresses>,
     chain_name: String,
     chain_id: u64,
     range_start: u64,

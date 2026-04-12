@@ -11,7 +11,7 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use super::error::TransformationError;
 use super::historical::HistoricalDataReader;
 use crate::rpc::UnifiedRpcClient;
-use crate::types::chain::ChainAddress;
+use crate::types::chain::{ChainAddress, LogPosition, TxId};
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 
 pub use crate::types::decoded::DecodedValue;
@@ -76,12 +76,6 @@ pub trait FieldExtractor {
     }
 
     impl_field_extractor!(extract_address, as_address, [u8; 20], "an address");
-    impl_field_extractor!(
-        extract_chain_address,
-        as_chain_address,
-        ChainAddress,
-        "a chain address"
-    );
     impl_field_extractor!(extract_pubkey, as_pubkey, [u8; 32], "a pubkey");
     impl_field_extractor!(extract_uint256, as_uint256, U256, "a uint256");
     impl_field_extractor!(extract_int256, as_int256, I256, "an int256");
@@ -94,6 +88,18 @@ pub trait FieldExtractor {
     impl_field_extractor!(extract_string, as_string, &str, "a string");
     impl_field_extractor!(extract_bytes32, as_bytes32, [u8; 32], "bytes32");
     impl_field_extractor!(extract_bytes, as_bytes, &[u8], "bytes");
+
+    /// Extract either an EVM address or Solana pubkey as a chain-aware address.
+    fn extract_chain_address(&self, name: &str) -> Result<ChainAddress, TransformationError> {
+        let val = self.get_field(name)?;
+        val.as_chain_address().ok_or_else(|| {
+            TransformationError::TypeConversion(format!(
+                "'{}' is not an address or pubkey in {}",
+                name,
+                self.context_info()
+            ))
+        })
+    }
 
     /// Extract a u64 field with flexible parsing (handles i64, u64, or numeric strings).
     /// This is useful for timestamp fields that may come from different encoding formats.
@@ -150,9 +156,9 @@ pub trait FieldExtractor {
 pub struct DecodedEvent {
     pub block_number: u64,
     pub block_timestamp: u64,
-    pub transaction_hash: [u8; 32],
-    pub log_index: u32,
-    pub contract_address: [u8; 20],
+    pub transaction_id: TxId,
+    pub position: LogPosition,
+    pub contract_address: ChainAddress,
     /// Contract or collection name from config
     pub source_name: String,
     /// Event name (e.g., "Swap", "Transfer")
@@ -177,6 +183,41 @@ impl DecodedEvent {
     pub fn try_get(&self, name: &str) -> Option<&DecodedValue> {
         self.params.get(name)
     }
+
+    /// EVM convenience accessor.
+    pub fn evm_address(&self) -> [u8; 20] {
+        self.contract_address
+            .as_evm()
+            .expect("evm_address() called on non-EVM event")
+    }
+
+    /// EVM convenience accessor.
+    pub fn evm_address_ref(&self) -> &[u8; 20] {
+        self.contract_address
+            .as_evm_ref()
+            .expect("evm_address_ref() called on non-EVM event")
+    }
+
+    /// EVM convenience accessor.
+    pub fn log_index(&self) -> u32 {
+        self.position
+            .evm_log_index()
+            .expect("log_index() called on non-EVM event")
+    }
+
+    /// EVM convenience accessor.
+    pub fn evm_tx_hash(&self) -> [u8; 32] {
+        self.transaction_id
+            .as_evm()
+            .expect("evm_tx_hash() called on non-EVM event")
+    }
+
+    /// EVM convenience accessor.
+    pub fn evm_tx_hash_ref(&self) -> &[u8; 32] {
+        self.transaction_id
+            .as_evm_ref()
+            .expect("evm_tx_hash_ref() called on non-EVM event")
+    }
 }
 
 impl FieldExtractor for DecodedEvent {
@@ -187,7 +228,10 @@ impl FieldExtractor for DecodedEvent {
     fn context_info(&self) -> String {
         format!(
             "event {}:{} at block {} log_index {}",
-            self.source_name, self.event_name, self.block_number, self.log_index
+            self.source_name,
+            self.event_name,
+            self.block_number,
+            self.position.ordinal()
         )
     }
 }
@@ -198,13 +242,13 @@ impl FieldExtractor for DecodedEvent {
 pub struct DecodedCall {
     pub block_number: u64,
     pub block_timestamp: u64,
-    pub contract_address: [u8; 20],
+    pub contract_address: ChainAddress,
     /// Contract or collection name from config
     pub source_name: String,
     /// Function name (e.g., "slot0", "balanceOf")
     pub function_name: String,
     /// For event-triggered calls, the log index of the triggering event
-    pub trigger_log_index: Option<u32>,
+    pub trigger_position: Option<LogPosition>,
     /// Decoded return value(s) keyed by field name.
     /// For single return values, the key is the function name or "result".
     /// For tuples, uses field names from the output type.
@@ -227,6 +271,29 @@ impl DecodedCall {
     /// Try to get a result field by name.
     pub fn try_get(&self, name: &str) -> Option<&DecodedValue> {
         self.result.get(name)
+    }
+
+    /// EVM convenience accessor.
+    pub fn evm_address(&self) -> [u8; 20] {
+        self.contract_address
+            .as_evm()
+            .expect("evm_address() called on non-EVM call")
+    }
+
+    /// EVM convenience accessor.
+    pub fn evm_address_ref(&self) -> &[u8; 20] {
+        self.contract_address
+            .as_evm_ref()
+            .expect("evm_address_ref() called on non-EVM call")
+    }
+
+    /// EVM convenience accessor.
+    pub fn trigger_log_index(&self) -> Option<u32> {
+        self.trigger_position.map(|position| {
+            position
+                .evm_log_index()
+                .expect("trigger_log_index() called on non-EVM call")
+        })
     }
 }
 
@@ -295,7 +362,7 @@ pub struct HistoricalEventQuery {
     /// Filter by event name
     pub event_name: Option<String>,
     /// Filter by contract address
-    pub contract_address: Option<[u8; 20]>,
+    pub contract_address: Option<ChainAddress>,
     /// Start block (inclusive)
     pub from_block: u64,
     /// End block (exclusive) - cannot exceed current blockrange_end
@@ -312,7 +379,7 @@ pub struct HistoricalCallQuery {
     /// Filter by function name
     pub function_name: Option<String>,
     /// Filter by contract address
-    pub contract_address: Option<[u8; 20]>,
+    pub contract_address: Option<ChainAddress>,
     /// Start block (inclusive)
     pub from_block: u64,
     /// End block (exclusive)
@@ -339,8 +406,8 @@ pub struct EthCallRequest {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TransactionAddresses {
-    pub from_address: [u8; 20],
-    pub to_address: Option<[u8; 20]>,
+    pub from_address: ChainAddress,
+    pub to_address: Option<ChainAddress>,
 }
 
 /// Context provided to transformation handlers.
@@ -367,7 +434,7 @@ pub struct TransformationContext {
 
     // ===== Transaction Address Data =====
     /// Transaction hash -> from/to addresses from receipt data
-    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    tx_addresses: HashMap<TxId, TransactionAddresses>,
 
     // ===== Services =====
     /// Historical data reader for querying parquet files
@@ -391,7 +458,7 @@ impl TransformationContext {
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
         account_states: Arc<Vec<DecodedAccountState>>,
-        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+        tx_addresses: HashMap<TxId, TransactionAddresses>,
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
         contracts: Arc<Contracts>,
@@ -436,6 +503,14 @@ impl TransformationContext {
         &self,
         address: [u8; 20],
     ) -> impl Iterator<Item = &DecodedEvent> + '_ {
+        self.events_for_chain_address(ChainAddress::Evm(address))
+    }
+
+    /// Get all events for a specific chain address in the current range.
+    pub fn events_for_chain_address(
+        &self,
+        address: ChainAddress,
+    ) -> impl Iterator<Item = &DecodedEvent> + '_ {
         self.events.iter().filter(move |e| {
             if e.contract_address != address {
                 return false;
@@ -466,6 +541,14 @@ impl TransformationContext {
     /// Get all calls for a specific contract address in the current range.
     /// Filters out calls before the contract's start_block if configured.
     pub fn calls_for_address(&self, address: [u8; 20]) -> impl Iterator<Item = &DecodedCall> + '_ {
+        self.calls_for_chain_address(ChainAddress::Evm(address))
+    }
+
+    /// Get all calls for a specific chain address in the current range.
+    pub fn calls_for_chain_address(
+        &self,
+        address: ChainAddress,
+    ) -> impl Iterator<Item = &DecodedCall> + '_ {
         self.calls.iter().filter(move |c| {
             if c.contract_address != address {
                 return false;
@@ -516,7 +599,7 @@ impl TransformationContext {
             .find(|c| {
                 c.source_name == source
                     && c.function_name == function_name
-                    && c.contract_address == address
+                    && c.contract_address == ChainAddress::Evm(address)
                     && start_block.is_none_or(|sb| c.block_number >= sb)
             })
             .cloned()
@@ -593,15 +676,35 @@ impl TransformationContext {
     // ===== Transaction Address Lookup =====
 
     /// Look up the from_address for a transaction by its hash.
-    pub fn tx_from(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
-        self.tx_addresses.get(tx_hash).map(|a| &a.from_address)
+    pub fn tx_from(&self, tx_id: &TxId) -> Option<&ChainAddress> {
+        self.tx_addresses.get(tx_id).map(|a| &a.from_address)
     }
 
     /// Look up the to_address for a transaction by its hash.
-    pub fn tx_to(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
+    pub fn tx_to(&self, tx_id: &TxId) -> Option<&ChainAddress> {
         self.tx_addresses
-            .get(tx_hash)
+            .get(tx_id)
             .and_then(|a| a.to_address.as_ref())
+    }
+
+    /// Look up the EVM from_address for a transaction.
+    pub fn tx_from_evm(&self, tx_id: &TxId) -> Option<&[u8; 20]> {
+        self.tx_from(tx_id).and_then(ChainAddress::as_evm_ref)
+    }
+
+    /// Look up the EVM to_address for a transaction.
+    pub fn tx_to_evm(&self, tx_id: &TxId) -> Option<&[u8; 20]> {
+        self.tx_to(tx_id).and_then(ChainAddress::as_evm_ref)
+    }
+
+    /// Look up the EVM from_address for a raw transaction hash.
+    pub fn tx_from_evm_hash(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
+        self.tx_from_evm(&TxId::Evm(*tx_hash))
+    }
+
+    /// Look up the EVM to_address for a raw transaction hash.
+    pub fn tx_to_evm_hash(&self, tx_hash: &[u8; 32]) -> Option<&[u8; 20]> {
+        self.tx_to_evm(&TxId::Evm(*tx_hash))
     }
 
     // ===== Historical Data Access =====
@@ -835,9 +938,9 @@ mod tests {
         DecodedEvent {
             block_number: 100,
             block_timestamp: 1234567890,
-            transaction_hash: [0u8; 32],
-            log_index: 0,
-            contract_address: [1u8; 20],
+            transaction_id: TxId::Evm([0u8; 32]),
+            position: LogPosition::Evm { log_index: 0 },
+            contract_address: ChainAddress::Evm([1u8; 20]),
             source_name: "TestContract".to_string(),
             event_name: "TestEvent".to_string(),
             event_signature: "TestEvent(address,uint256)".to_string(),
@@ -849,10 +952,10 @@ mod tests {
         DecodedCall {
             block_number: 100,
             block_timestamp: 1234567890,
-            contract_address: [1u8; 20],
+            contract_address: ChainAddress::Evm([1u8; 20]),
             source_name: "TestContract".to_string(),
             function_name: "testFunction".to_string(),
-            trigger_log_index: None,
+            trigger_position: None,
             result,
             is_reverted: false,
             revert_reason: None,

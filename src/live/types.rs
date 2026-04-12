@@ -316,6 +316,7 @@ pub enum LiveDbValue {
     Json(String),  // JSON stored as string for bincode
     JsonB(String), // JSONB stored as string for bincode
     Float64(f64),
+    // Appended to preserve bincode compatibility for persisted snapshot files.
     Pubkey([u8; 32]),
 }
 

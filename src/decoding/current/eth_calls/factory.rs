@@ -14,6 +14,7 @@ use crate::decoding::eth_calls::{
 };
 use crate::live::{LiveDecodedOnceCall, LiveStorage};
 use crate::transformations::{DecodedCall as TransformDecodedCall, DecodedCallsMessage};
+use crate::types::chain::ChainAddress;
 use crate::types::decoded::DecodedValue;
 
 /// Handle a live-mode `OnceCallsReady` message: decode results, persist to bincode,
@@ -44,10 +45,10 @@ pub(super) async fn handle_once_calls_live(
                         let transform_call = TransformDecodedCall {
                             block_number: result.block_number,
                             block_timestamp: result.block_timestamp,
-                            contract_address: result.contract_address,
+                            contract_address: ChainAddress::Evm(result.contract_address),
                             source_name: contract_name.to_string(),
                             function_name: config.function_name.clone(),
-                            trigger_log_index: None,
+                            trigger_position: None,
                             result: build_result_map(
                                 &decoded,
                                 &config.output_type,
