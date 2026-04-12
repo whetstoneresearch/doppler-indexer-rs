@@ -383,11 +383,7 @@ pub async fn refresh_cache_if_needed(
         .collect();
 
     if !still_missing.is_empty() {
-        let sample: Vec<String> = still_missing
-            .iter()
-            .take(10)
-            .map(hex::encode)
-            .collect();
+        let sample: Vec<String> = still_missing.iter().take(10).map(hex::encode).collect();
         tracing::warn!(
             handler = handler_name,
             source = source_name,

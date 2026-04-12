@@ -2,7 +2,8 @@
 //!
 //! Rebuilds per-pool tick maps on demand from the `liquidity_deltas` table,
 //! computes token amounts via Uniswap v3 position math, and produces
-//! `DbOperation::RawSql` UPDATE ops for `pool_snapshots` + `pool_state`.
+//! `DbOperation::RawSql` materializing upserts for `pool_snapshots` +
+//! `pool_state`.
 //!
 //! Stateless by design: each `handle()` invocation re-queries
 //! `liquidity_deltas` per target block. This trades a small amount of extra
@@ -190,19 +191,35 @@ pub fn compute_market_cap_usd(
     usd_ctx.quote_decimal_amount_to_usd(&value_in_quote, &meta.quote_token)
 }
 
-// ─── UPDATE op builders ─────────────────────────────────────────────
+// ─── TVL row builders ───────────────────────────────────────────────
 
-/// Build a `DbOperation::RawSql` UPDATE that populates TVL columns on a
+fn optional_decimal_value(value: Option<&BigDecimal>) -> DbValue {
+    match value {
+        Some(v) => DbValue::Numeric(v.to_string()),
+        None => DbValue::Null,
+    }
+}
+
+fn optional_u256_value(value: Option<&U256>) -> DbValue {
+    match value {
+        Some(v) => DbValue::Numeric(v.to_string()),
+        None => DbValue::Null,
+    }
+}
+
+/// Build a `DbOperation::RawSql` upsert that populates TVL columns on a
 /// `pool_snapshots` row owned by the given `target_source` handler.
 ///
-/// Targets a single `(chain_id, pool_id, block_number, source, source_version)`
-/// row. Includes a [`DbSnapshot`] so the executor can record the pre-update
-/// column values and roll them back on reorg. Mirrors the pattern used by
-/// Phase 6's `build_rolling_metrics_update` in `swap_data.rs`.
+/// If the per-block snapshot row already exists (the swap path wrote it first),
+/// this updates only TVL-related columns. Otherwise it materializes a new
+/// LP-only block row by carrying forward the latest known `price_close` into
+/// OHLC and initializing swap volumes/counts to zero.
 pub fn build_snapshot_tvl_update(
     chain_id: u64,
     pool_id: &[u8],
     block_number: u64,
+    block_timestamp: u64,
+    active_liquidity: &BigDecimal,
     amount0: &BigDecimal,
     amount1: &BigDecimal,
     tvl_usd: Option<&BigDecimal>,
@@ -210,36 +227,81 @@ pub fn build_snapshot_tvl_update(
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
-    let query = "UPDATE pool_snapshots SET \
-                   amount0 = $1, \
-                   amount1 = $2, \
-                   tvl_usd = $3, \
-                   market_cap_usd = $4 \
-                 WHERE chain_id = $5 \
-                   AND pool_id = $6 \
-                   AND block_number = $7 \
-                   AND source = $8 \
-                   AND source_version = $9";
-
-    let tvl_param = match tvl_usd {
-        Some(v) => DbValue::Numeric(v.to_string()),
-        None => DbValue::Null,
-    };
-    let mcap_param = match market_cap_usd {
-        Some(v) => DbValue::Numeric(v.to_string()),
-        None => DbValue::Null,
-    };
+    let query = r#"
+INSERT INTO pool_snapshots (
+  chain_id,
+  pool_id,
+  block_number,
+  block_timestamp,
+  price_open,
+  price_close,
+  price_high,
+  price_low,
+  active_liquidity,
+  volume0,
+  volume1,
+  swap_count,
+  volume_usd,
+  amount0,
+  amount1,
+  tvl_usd,
+  market_cap_usd,
+  source,
+  source_version
+)
+SELECT
+  $1,
+  $2,
+  $3,
+  $4,
+  prev.price_close,
+  prev.price_close,
+  prev.price_close,
+  prev.price_close,
+  $5,
+  0::numeric,
+  0::numeric,
+  0,
+  NULL::numeric,
+  $6,
+  $7,
+  $8,
+  $9,
+  $10,
+  $11
+FROM LATERAL (
+  SELECT price_close
+  FROM pool_snapshots
+  WHERE chain_id = $1
+    AND pool_id = $2
+    AND block_number <= $3
+    AND source = $10
+    AND source_version = $11
+  ORDER BY block_number DESC
+  LIMIT 1
+) AS prev
+ON CONFLICT (chain_id, pool_id, block_number, source, source_version)
+DO UPDATE SET
+  block_timestamp = EXCLUDED.block_timestamp,
+  active_liquidity = EXCLUDED.active_liquidity,
+  amount0 = EXCLUDED.amount0,
+  amount1 = EXCLUDED.amount1,
+  tvl_usd = EXCLUDED.tvl_usd,
+  market_cap_usd = EXCLUDED.market_cap_usd
+"#;
 
     DbOperation::RawSql {
         query: query.to_string(),
         params: vec![
-            DbValue::Numeric(amount0.to_string()),
-            DbValue::Numeric(amount1.to_string()),
-            tvl_param,
-            mcap_param,
             DbValue::Int64(chain_id as i64),
             DbValue::Bytes(pool_id.to_vec()),
             DbValue::Int64(block_number as i64),
+            DbValue::Int64(block_timestamp as i64),
+            DbValue::Numeric(active_liquidity.to_string()),
+            DbValue::Numeric(amount0.to_string()),
+            DbValue::Numeric(amount1.to_string()),
+            optional_decimal_value(tvl_usd),
+            optional_decimal_value(market_cap_usd),
             DbValue::VarChar(target_source.to_string()),
             DbValue::Int32(target_source_version as i32),
         ],
@@ -265,17 +327,21 @@ pub fn build_snapshot_tvl_update(
     }
 }
 
-/// Build a `DbOperation::RawSql` UPDATE that populates TVL columns on the
+/// Build a `DbOperation::RawSql` upsert that populates TVL columns on the
 /// `pool_state` row owned by the given `target_source` handler.
 ///
-/// Gated on `pool_state.block_number = $block_number` so a parallel later
-/// range that already advanced pool_state past our target block is not
-/// overwritten with stale TVL. Also updates `total_supply` for dashboard
-/// convenience when available.
+/// If the latest `pool_state` row is at or before `block_number`, this advances
+/// that row to the new block while carrying forward price/tick fields and the
+/// rolling 24h metrics. If a swap path already wrote the target block, the
+/// conflict update fills in TVL columns in place. If `pool_state` has already
+/// advanced past `block_number`, the `SELECT` yields no row and the statement is
+/// intentionally a no-op rather than overwriting newer state.
 pub fn build_state_tvl_update(
     chain_id: u64,
     pool_id: &[u8],
     block_number: u64,
+    block_timestamp: u64,
+    active_liquidity: &BigDecimal,
     amount0: &BigDecimal,
     amount1: &BigDecimal,
     tvl_usd: Option<&BigDecimal>,
@@ -284,42 +350,87 @@ pub fn build_state_tvl_update(
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
-    let query = "UPDATE pool_state SET \
-                   amount0 = $1, \
-                   amount1 = $2, \
-                   tvl_usd = $3, \
-                   market_cap_usd = $4, \
-                   total_supply = $5 \
-                 WHERE chain_id = $6 \
-                   AND pool_id = $7 \
-                   AND block_number = $8 \
-                   AND source = $9 \
-                   AND source_version = $10";
-
-    let tvl_param = match tvl_usd {
-        Some(v) => DbValue::Numeric(v.to_string()),
-        None => DbValue::Null,
-    };
-    let mcap_param = match market_cap_usd {
-        Some(v) => DbValue::Numeric(v.to_string()),
-        None => DbValue::Null,
-    };
-    let supply_param = match total_supply {
-        Some(v) => DbValue::Numeric(v.to_string()),
-        None => DbValue::Null,
-    };
+    let query = r#"
+INSERT INTO pool_state (
+  chain_id,
+  pool_id,
+  block_number,
+  block_timestamp,
+  tick,
+  sqrt_price_x96,
+  price,
+  active_liquidity,
+  volume_24h_usd,
+  price_change_1h,
+  price_change_24h,
+  swap_count_24h,
+  amount0,
+  amount1,
+  tvl_usd,
+  market_cap_usd,
+  total_supply,
+  source,
+  source_version
+)
+SELECT
+  $1,
+  $2,
+  $3,
+  $4,
+  prev.tick,
+  prev.sqrt_price_x96,
+  prev.price,
+  $5,
+  prev.volume_24h_usd,
+  prev.price_change_1h,
+  prev.price_change_24h,
+  prev.swap_count_24h,
+  $6,
+  $7,
+  $8,
+  $9,
+  $10,
+  $11,
+  $12
+FROM pool_state AS prev
+WHERE prev.chain_id = $1
+  AND prev.pool_id = $2
+  AND prev.source = $11
+  AND prev.source_version = $12
+  AND prev.block_number <= $3
+ON CONFLICT (chain_id, pool_id, source, source_version)
+DO UPDATE SET
+  block_number = EXCLUDED.block_number,
+  block_timestamp = EXCLUDED.block_timestamp,
+  tick = EXCLUDED.tick,
+  sqrt_price_x96 = EXCLUDED.sqrt_price_x96,
+  price = EXCLUDED.price,
+  active_liquidity = EXCLUDED.active_liquidity,
+  volume_24h_usd = EXCLUDED.volume_24h_usd,
+  price_change_1h = EXCLUDED.price_change_1h,
+  price_change_24h = EXCLUDED.price_change_24h,
+  swap_count_24h = EXCLUDED.swap_count_24h,
+  amount0 = EXCLUDED.amount0,
+  amount1 = EXCLUDED.amount1,
+  tvl_usd = EXCLUDED.tvl_usd,
+  market_cap_usd = EXCLUDED.market_cap_usd,
+  total_supply = EXCLUDED.total_supply
+WHERE EXCLUDED.block_number >= pool_state.block_number
+"#;
 
     DbOperation::RawSql {
         query: query.to_string(),
         params: vec![
-            DbValue::Numeric(amount0.to_string()),
-            DbValue::Numeric(amount1.to_string()),
-            tvl_param,
-            mcap_param,
-            supply_param,
             DbValue::Int64(chain_id as i64),
             DbValue::Bytes(pool_id.to_vec()),
             DbValue::Int64(block_number as i64),
+            DbValue::Int64(block_timestamp as i64),
+            DbValue::Numeric(active_liquidity.to_string()),
+            DbValue::Numeric(amount0.to_string()),
+            DbValue::Numeric(amount1.to_string()),
+            optional_decimal_value(tvl_usd),
+            optional_decimal_value(market_cap_usd),
+            optional_u256_value(total_supply),
             DbValue::VarChar(target_source.to_string()),
             DbValue::Int32(target_source_version as i32),
         ],
@@ -501,14 +612,7 @@ mod tests {
     fn test_compute_tvl_usd_zero_amounts() {
         let meta = sample_meta(true, None);
         let usd_ctx = sample_usd_ctx(Some("2000"));
-        let tvl = compute_tvl_usd(
-            &U256::ZERO,
-            &U256::ZERO,
-            &meta,
-            &bd("2"),
-            &usd_ctx,
-        )
-        .unwrap();
+        let tvl = compute_tvl_usd(&U256::ZERO, &U256::ZERO, &meta, &bd("2"), &usd_ctx).unwrap();
         assert_eq!(tvl, bd("0"));
     }
 
@@ -582,6 +686,8 @@ mod tests {
             8453,
             &[0xAAu8; 20],
             1000,
+            1_700_000_000,
+            &bd("9.75"),
             &bd("1.5"),
             &bd("2.25"),
             Some(&bd("5000")),
@@ -595,26 +701,20 @@ mod tests {
                 params,
                 snapshot,
             } => {
-                assert!(query.contains("UPDATE pool_snapshots"));
-                assert!(query.contains("amount0 = $1"));
-                assert!(query.contains("amount1 = $2"));
-                assert!(query.contains("tvl_usd = $3"));
-                assert!(query.contains("market_cap_usd = $4"));
-                assert!(query.contains("WHERE chain_id = $5"));
-                assert!(query.contains("AND pool_id = $6"));
-                assert!(query.contains("AND block_number = $7"));
-                assert!(query.contains("AND source = $8"));
-                assert!(query.contains("AND source_version = $9"));
-                assert_eq!(params.len(), 9);
+                assert!(query.contains("INSERT INTO pool_snapshots"));
+                assert!(query.contains("prev.price_close"));
+                assert!(query.contains(
+                    "ON CONFLICT (chain_id, pool_id, block_number, source, source_version)"
+                ));
+                assert!(query.contains("active_liquidity = EXCLUDED.active_liquidity"));
+                assert!(query.contains("source = $10"));
+                assert!(query.contains("source_version = $11"));
+                assert_eq!(params.len(), 11);
 
                 let snap = snapshot.expect("snapshot should be present");
                 assert_eq!(snap.table, "pool_snapshots");
                 assert_eq!(snap.key_columns.len(), 5);
-                let keys: Vec<&str> = snap
-                    .key_columns
-                    .iter()
-                    .map(|(k, _)| k.as_str())
-                    .collect();
+                let keys: Vec<&str> = snap.key_columns.iter().map(|(k, _)| k.as_str()).collect();
                 assert_eq!(
                     keys,
                     vec![
@@ -636,6 +736,8 @@ mod tests {
             8453,
             &[0xAAu8; 20],
             1000,
+            1_700_000_000,
+            &bd("9.75"),
             &bd("1.5"),
             &bd("2.25"),
             None,
@@ -645,8 +747,9 @@ mod tests {
         );
         match op {
             DbOperation::RawSql { params, .. } => {
-                assert!(matches!(params[2], DbValue::Null));
-                assert!(matches!(params[3], DbValue::Null));
+                // params[7] = tvl_usd, [8] = market_cap_usd
+                assert!(matches!(params[7], DbValue::Null));
+                assert!(matches!(params[8], DbValue::Null));
             }
             _ => panic!("expected RawSql"),
         }
@@ -661,6 +764,8 @@ mod tests {
             8453,
             &[0xAAu8; 20],
             1000,
+            1_700_000_000,
+            &bd("9.75"),
             &bd("1.5"),
             &bd("2.25"),
             Some(&bd("5000")),
@@ -675,22 +780,21 @@ mod tests {
                 params,
                 snapshot,
             } => {
-                assert!(query.contains("UPDATE pool_state"));
-                assert!(query.contains("total_supply = $5"));
-                assert!(query.contains("AND block_number = $8"));
-                assert!(query.contains("AND source = $9"));
-                assert!(query.contains("AND source_version = $10"));
-                assert_eq!(params.len(), 10);
+                assert!(query.contains("INSERT INTO pool_state"));
+                assert!(query.contains("prev.volume_24h_usd"));
+                assert!(query.contains("ON CONFLICT (chain_id, pool_id, source, source_version)"));
+                assert!(query.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
+                assert!(query.contains("prev.block_number <= $3"));
+                assert_eq!(params.len(), 12);
 
                 let snap = snapshot.expect("snapshot should be present");
                 assert_eq!(snap.table, "pool_state");
                 assert_eq!(snap.key_columns.len(), 4);
-                let keys: Vec<&str> = snap
-                    .key_columns
-                    .iter()
-                    .map(|(k, _)| k.as_str())
-                    .collect();
-                assert_eq!(keys, vec!["chain_id", "pool_id", "source", "source_version"]);
+                let keys: Vec<&str> = snap.key_columns.iter().map(|(k, _)| k.as_str()).collect();
+                assert_eq!(
+                    keys,
+                    vec!["chain_id", "pool_id", "source", "source_version"]
+                );
             }
             _ => panic!("expected RawSql"),
         }
@@ -702,6 +806,8 @@ mod tests {
             8453,
             &[0xAAu8; 20],
             1000,
+            1_700_000_000,
+            &bd("9.75"),
             &bd("1.5"),
             &bd("2.25"),
             None,
@@ -712,10 +818,10 @@ mod tests {
         );
         match op {
             DbOperation::RawSql { params, .. } => {
-                // params[2] = tvl_usd, [3] = market_cap_usd, [4] = total_supply
-                assert!(matches!(params[2], DbValue::Null));
-                assert!(matches!(params[3], DbValue::Null));
-                assert!(matches!(params[4], DbValue::Null));
+                // params[7] = tvl_usd, [8] = market_cap_usd, [9] = total_supply
+                assert!(matches!(params[7], DbValue::Null));
+                assert!(matches!(params[8], DbValue::Null));
+                assert!(matches!(params[9], DbValue::Null));
             }
             _ => panic!("expected RawSql"),
         }

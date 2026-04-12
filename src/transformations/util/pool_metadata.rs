@@ -87,7 +87,8 @@ impl PoolMetadataCache {
             let quote_token_bytes: Vec<u8> = row.get("quote_token");
             let is_token_0: bool = row.get("is_token_0");
             let pool_type: String = row.get("type");
-            let total_supply = parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
+            let total_supply =
+                parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
 
             if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
                 continue;
@@ -221,7 +222,8 @@ impl PoolMetadataCache {
 
         for row in &rows {
             let pool_id: Vec<u8> = row.get("address");
-            let total_supply = parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
+            let total_supply =
+                parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
 
             // If the pool is already cached but had no total_supply at load time,
             // backfill it opportunistically from the refreshed row. This closes
