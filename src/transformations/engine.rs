@@ -2484,8 +2484,6 @@ impl TransformationEngine {
         calls: Arc<Vec<DecodedCall>>,
         account_states: Arc<Vec<DecodedAccountState>>,
         tx_addresses: HashMap<TxId, TransactionAddresses>,
-        account_states: Arc<Vec<DecodedAccountState>>,
-        tx_addresses: HashMap<TxId, TransactionAddresses>,
         range_start: u64,
         range_end: u64,
         snapshot_chain: Option<String>,
