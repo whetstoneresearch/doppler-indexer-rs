@@ -144,6 +144,38 @@ pub fn compute_position_amounts(
     Ok((total0, total1))
 }
 
+/// Compute `(amount0, amount1)` contributed by positions currently in range
+/// at `current_tick`, i.e. those whose range satisfies
+/// `tick_lower <= current_tick < tick_upper`. Matches Uniswap v3's convention
+/// for which positions earn fees at the current price — the upper bound is
+/// exclusive so a position being crossed is not double-counted with the
+/// adjacent tick's active set.
+///
+/// Feed the result through [`compute_tvl_usd`] to obtain `active_liquidity_usd`.
+/// Pass `current_tick` from the swap accumulator (`BlockAccumulator::last_tick`)
+/// and the same `current_sqrt_price_x96` used for full-pool TVL.
+pub fn compute_active_position_amounts(
+    positions: &[TickMapPosition],
+    current_tick: i32,
+    current_sqrt_price_x96: U256,
+) -> Result<(U256, U256), TransformationError> {
+    let mut total0 = U256::ZERO;
+    let mut total1 = U256::ZERO;
+    for pos in positions {
+        if pos.tick_lower <= current_tick && current_tick < pos.tick_upper {
+            let (a0, a1) = get_amounts_for_position(
+                pos.tick_lower,
+                pos.tick_upper,
+                current_sqrt_price_x96,
+                pos.liquidity,
+            )?;
+            total0 = total0.saturating_add(a0);
+            total1 = total1.saturating_add(a1);
+        }
+    }
+    Ok((total0, total1))
+}
+
 /// Compute `tvl_usd` from raw token amounts + pool metadata + current price +
 /// USD pricing context.
 ///
@@ -224,6 +256,7 @@ pub fn build_snapshot_tvl_update(
     amount1: &BigDecimal,
     tvl_usd: Option<&BigDecimal>,
     market_cap_usd: Option<&BigDecimal>,
+    active_liquidity_usd: Option<&BigDecimal>,
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
@@ -246,6 +279,7 @@ INSERT INTO pool_snapshots (
   amount1,
   tvl_usd,
   market_cap_usd,
+  active_liquidity_usd,
   source,
   source_version
 )
@@ -268,15 +302,16 @@ SELECT
   $8,
   $9,
   $10,
-  $11
+  $11,
+  $12
 FROM LATERAL (
   SELECT price_close
   FROM pool_snapshots
   WHERE chain_id = $1
     AND pool_id = $2
     AND block_number <= $3
-    AND source = $10
-    AND source_version = $11
+    AND source = $11
+    AND source_version = $12
   ORDER BY block_number DESC
   LIMIT 1
 ) AS prev
@@ -287,7 +322,8 @@ DO UPDATE SET
   amount0 = EXCLUDED.amount0,
   amount1 = EXCLUDED.amount1,
   tvl_usd = EXCLUDED.tvl_usd,
-  market_cap_usd = EXCLUDED.market_cap_usd
+  market_cap_usd = EXCLUDED.market_cap_usd,
+  active_liquidity_usd = EXCLUDED.active_liquidity_usd
 "#;
 
     DbOperation::RawSql {
@@ -302,6 +338,7 @@ DO UPDATE SET
             DbValue::Numeric(amount1.to_string()),
             optional_decimal_value(tvl_usd),
             optional_decimal_value(market_cap_usd),
+            optional_decimal_value(active_liquidity_usd),
             DbValue::VarChar(target_source.to_string()),
             DbValue::Int32(target_source_version as i32),
         ],
@@ -346,6 +383,7 @@ pub fn build_state_tvl_update(
     amount1: &BigDecimal,
     tvl_usd: Option<&BigDecimal>,
     market_cap_usd: Option<&BigDecimal>,
+    active_liquidity_usd: Option<&BigDecimal>,
     total_supply: Option<&U256>,
     target_source: &str,
     target_source_version: u32,
@@ -368,6 +406,7 @@ INSERT INTO pool_state (
   amount1,
   tvl_usd,
   market_cap_usd,
+  active_liquidity_usd,
   total_supply,
   source,
   source_version
@@ -391,12 +430,13 @@ SELECT
   $9,
   $10,
   $11,
-  $12
+  $12,
+  $13
 FROM pool_state AS prev
 WHERE prev.chain_id = $1
   AND prev.pool_id = $2
-  AND prev.source = $11
-  AND prev.source_version = $12
+  AND prev.source = $12
+  AND prev.source_version = $13
   AND prev.block_number <= $3
 ON CONFLICT (chain_id, pool_id, source, source_version)
 DO UPDATE SET
@@ -414,6 +454,7 @@ DO UPDATE SET
   amount1 = EXCLUDED.amount1,
   tvl_usd = EXCLUDED.tvl_usd,
   market_cap_usd = EXCLUDED.market_cap_usd,
+  active_liquidity_usd = EXCLUDED.active_liquidity_usd,
   total_supply = EXCLUDED.total_supply
 WHERE EXCLUDED.block_number >= pool_state.block_number
 "#;
@@ -430,6 +471,7 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
             DbValue::Numeric(amount1.to_string()),
             optional_decimal_value(tvl_usd),
             optional_decimal_value(market_cap_usd),
+            optional_decimal_value(active_liquidity_usd),
             optional_u256_value(total_supply),
             DbValue::VarChar(target_source.to_string()),
             DbValue::Int32(target_source_version as i32),
@@ -678,6 +720,94 @@ mod tests {
         assert!(mcap.is_none());
     }
 
+    // ─── compute_active_position_amounts ───
+
+    #[test]
+    fn test_compute_active_position_amounts_empty() {
+        let (a0, a1) = compute_active_position_amounts(&[], 0, q96()).unwrap();
+        assert_eq!(a0, U256::ZERO);
+        assert_eq!(a1, U256::ZERO);
+    }
+
+    #[test]
+    fn test_compute_active_position_amounts_filters_out_of_range() {
+        // Straddling (in-range) + out-of-range-above + out-of-range-below.
+        let positions = vec![
+            TickMapPosition {
+                tick_lower: -60,
+                tick_upper: 60,
+                liquidity: 1_000_000_000_000_000_000u128,
+            },
+            TickMapPosition {
+                tick_lower: 120,
+                tick_upper: 180,
+                liquidity: 5_000_000_000_000_000_000u128,
+            },
+            TickMapPosition {
+                tick_lower: -180,
+                tick_upper: -120,
+                liquidity: 7_000_000_000_000_000_000u128,
+            },
+        ];
+        let (active0, active1) = compute_active_position_amounts(&positions, 0, q96()).unwrap();
+
+        // Should match computing over just the in-range position alone.
+        let in_range_only = vec![positions[0].clone()];
+        let (expected0, expected1) = compute_position_amounts(&in_range_only, q96()).unwrap();
+        assert_eq!(active0, expected0);
+        assert_eq!(active1, expected1);
+    }
+
+    #[test]
+    fn test_compute_active_position_amounts_boundary_lower_inclusive() {
+        // Position (0, 60) at current_tick = 0 → lower bound inclusive, so included.
+        let positions = vec![TickMapPosition {
+            tick_lower: 0,
+            tick_upper: 60,
+            liquidity: 1_000_000_000_000_000_000u128,
+        }];
+        let (a0, a1) = compute_active_position_amounts(&positions, 0, q96()).unwrap();
+        // At current_tick = 0 == tick_lower, all liquidity sits in token0.
+        assert!(a0 > U256::ZERO);
+        assert_eq!(a1, U256::ZERO);
+    }
+
+    #[test]
+    fn test_compute_active_position_amounts_boundary_upper_exclusive() {
+        // Position (-60, 0) at current_tick = 0 → upper bound exclusive, so skipped.
+        let positions = vec![TickMapPosition {
+            tick_lower: -60,
+            tick_upper: 0,
+            liquidity: 1_000_000_000_000_000_000u128,
+        }];
+        let (a0, a1) = compute_active_position_amounts(&positions, 0, q96()).unwrap();
+        assert_eq!(a0, U256::ZERO);
+        assert_eq!(a1, U256::ZERO);
+    }
+
+    #[test]
+    fn test_compute_active_liquidity_usd_end_to_end() {
+        // Same shape as test_compute_tvl_usd_base_token0_weth_quote, but the
+        // amounts come from the filtered compute and then flow through
+        // compute_tvl_usd for the USD conversion.
+        //
+        // In-range position contributes base_raw = 1e18, quote_raw = 0.5e18.
+        // Out-of-range position is ignored. price_close = 2, eth_usd = 2000.
+        // → tvl_in_quote = 1 * 2 + 0.5 = 2.5, usd = 5000.
+        //
+        // We construct amounts directly rather than going through
+        // get_amounts_for_position, since the filtering behavior is already
+        // covered by the tests above; this test pins the USD wiring.
+        let base_raw = U256::from(1_000_000_000_000_000_000u128);
+        let quote_raw = U256::from(500_000_000_000_000_000u128);
+        let meta = sample_meta(true, None);
+        let price_close = bd("2");
+        let usd_ctx = sample_usd_ctx(Some("2000"));
+        let active_usd =
+            compute_tvl_usd(&base_raw, &quote_raw, &meta, &price_close, &usd_ctx).unwrap();
+        assert_eq!(active_usd, bd("5000"));
+    }
+
     // ─── build_snapshot_tvl_update ───
 
     #[test]
@@ -692,6 +822,7 @@ mod tests {
             &bd("2.25"),
             Some(&bd("5000")),
             Some(&bd("4000000000000")),
+            Some(&bd("3200")),
             "V3SwapMetricsHandler",
             1,
         );
@@ -707,9 +838,14 @@ mod tests {
                     "ON CONFLICT (chain_id, pool_id, block_number, source, source_version)"
                 ));
                 assert!(query.contains("active_liquidity = EXCLUDED.active_liquidity"));
-                assert!(query.contains("source = $10"));
-                assert!(query.contains("source_version = $11"));
-                assert_eq!(params.len(), 11);
+                assert!(query.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
+                assert!(query.contains("source = $11"));
+                assert!(query.contains("source_version = $12"));
+                assert_eq!(params.len(), 12);
+                match &params[9] {
+                    DbValue::Numeric(s) => assert_eq!(s, "3200"),
+                    other => panic!("expected Numeric for active_liquidity_usd, got {:?}", other),
+                }
 
                 let snap = snapshot.expect("snapshot should be present");
                 assert_eq!(snap.table, "pool_snapshots");
@@ -742,14 +878,16 @@ mod tests {
             &bd("2.25"),
             None,
             None,
+            None,
             "V3SwapMetricsHandler",
             1,
         );
         match op {
             DbOperation::RawSql { params, .. } => {
-                // params[7] = tvl_usd, [8] = market_cap_usd
+                // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd
                 assert!(matches!(params[7], DbValue::Null));
                 assert!(matches!(params[8], DbValue::Null));
+                assert!(matches!(params[9], DbValue::Null));
             }
             _ => panic!("expected RawSql"),
         }
@@ -770,6 +908,7 @@ mod tests {
             &bd("2.25"),
             Some(&bd("5000")),
             Some(&bd("4000000000000")),
+            Some(&bd("3200")),
             Some(&supply),
             "V3SwapMetricsHandler",
             1,
@@ -783,9 +922,14 @@ mod tests {
                 assert!(query.contains("INSERT INTO pool_state"));
                 assert!(query.contains("prev.volume_24h_usd"));
                 assert!(query.contains("ON CONFLICT (chain_id, pool_id, source, source_version)"));
+                assert!(query.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
                 assert!(query.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
                 assert!(query.contains("prev.block_number <= $3"));
-                assert_eq!(params.len(), 12);
+                assert_eq!(params.len(), 13);
+                match &params[9] {
+                    DbValue::Numeric(s) => assert_eq!(s, "3200"),
+                    other => panic!("expected Numeric for active_liquidity_usd, got {:?}", other),
+                }
 
                 let snap = snapshot.expect("snapshot should be present");
                 assert_eq!(snap.table, "pool_state");
@@ -813,15 +957,18 @@ mod tests {
             None,
             None,
             None,
+            None,
             "V3SwapMetricsHandler",
             1,
         );
         match op {
             DbOperation::RawSql { params, .. } => {
-                // params[7] = tvl_usd, [8] = market_cap_usd, [9] = total_supply
+                // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd,
+                // [10] = total_supply
                 assert!(matches!(params[7], DbValue::Null));
                 assert!(matches!(params[8], DbValue::Null));
                 assert!(matches!(params[9], DbValue::Null));
+                assert!(matches!(params[10], DbValue::Null));
             }
             _ => panic!("expected RawSql"),
         }
