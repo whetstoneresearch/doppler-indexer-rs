@@ -393,6 +393,10 @@ pub struct RpcClientConfig {
     pub batching_enabled: bool,
     pub rate_limit: Option<RateLimitConfig>,
     pub retry: RetryConfig,
+    /// When true, build the underlying reqwest Client with HTTP/2 prior knowledge
+    /// (no HTTP/1.1 fallback), BDP-based adaptive flow-control, and idle keep-alive
+    /// tuned for multiplexed JSON-RPC traffic.
+    pub force_http2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +433,7 @@ impl RpcClientConfig {
             batching_enabled: true,
             rate_limit: None,
             retry: RetryConfig::default(),
+            force_http2: false,
         }
     }
 
@@ -456,6 +461,39 @@ impl RpcClientConfig {
         self.retry = config;
         self
     }
+
+    pub fn with_force_http2(mut self, force: bool) -> Self {
+        self.force_http2 = force;
+        self
+    }
+}
+
+/// Build the underlying alloy `RootProvider` for an RPC endpoint.
+///
+/// When `force_http2` is true, the provider is backed by a custom `reqwest::Client`
+/// with HTTP/2 prior knowledge (no HTTP/1.1 fallback), BDP-based adaptive window
+/// sizing, and idle keep-alive — suited for high-throughput multiplexed RPC.
+/// When false, alloy's default HTTP provider is used, which still negotiates h2
+/// opportunistically via ALPN on HTTPS endpoints.
+fn build_provider(url: Url, force_http2: bool) -> Result<RootProvider<Ethereum>, RpcError> {
+    if !force_http2 {
+        return Ok(RootProvider::<Ethereum>::new_http(url));
+    }
+
+    let http_client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .build()
+        .map_err(|e| {
+            RpcError::Transport(format!("failed to build reqwest HTTP/2 client: {}", e))
+        })?;
+
+    let rpc_client = alloy::rpc::client::RpcClient::new_http_with_client(http_client, url);
+    Ok(RootProvider::<Ethereum>::new(rpc_client))
 }
 
 #[derive(Clone)]
@@ -472,7 +510,7 @@ pub struct RpcClient {
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        let provider = build_provider(config.url.clone(), config.force_http2)?;
         let chain = chain_label_from_url(&config.url);
         let concurrency = config.concurrency.max(1);
 
@@ -503,7 +541,7 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = RootProvider::<Ethereum>::new_http(config.url.clone());
+        let provider = build_provider(config.url.clone(), config.force_http2)?;
         let chain = chain_label_from_url(&config.url);
         let concurrency = config.concurrency.max(1);
         Ok(Self {
@@ -1172,5 +1210,52 @@ mod tests {
     fn default_concurrency_is_100() {
         let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
         assert_eq!(config.concurrency, 100);
+    }
+
+    /// Verify force_http2 defaults to false.
+    #[test]
+    fn default_force_http2_is_false() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
+        assert!(!config.force_http2);
+    }
+
+    /// Verify with_force_http2 builder sets the flag.
+    #[test]
+    fn with_force_http2_builder() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_force_http2(true);
+        assert!(config.force_http2);
+    }
+
+    /// Verify that building the reqwest HTTP/2 client actually succeeds.
+    ///
+    /// This exercises the reqwest feature set (http2 + rustls-tls) and the
+    /// `http2_prior_knowledge` + adaptive-window + keep-alive knobs we configure.
+    #[test]
+    fn build_provider_with_http2_succeeds() {
+        let url = Url::parse("http://localhost:8545").unwrap();
+        let provider = build_provider(url, true);
+        assert!(
+            provider.is_ok(),
+            "HTTP/2 provider construction should not fail: {:?}",
+            provider.err()
+        );
+    }
+
+    /// Verify build_provider with http2 disabled returns a default alloy provider.
+    #[test]
+    fn build_provider_without_http2_succeeds() {
+        let url = Url::parse("http://localhost:8545").unwrap();
+        let provider = build_provider(url, false);
+        assert!(provider.is_ok());
+    }
+
+    /// Verify that RpcClient::new propagates force_http2 through to provider build.
+    #[test]
+    fn rpc_client_new_with_force_http2() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_force_http2(true);
+        let client = RpcClient::new(config);
+        assert!(client.is_ok());
     }
 }

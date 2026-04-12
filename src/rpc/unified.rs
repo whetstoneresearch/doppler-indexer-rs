@@ -58,12 +58,16 @@ impl UnifiedRpcClient {
     /// * `rpc_concurrency` - Max concurrent in-flight RPC requests
     /// * `max_batch_size` - Maximum number of requests per JSON-RPC batch
     /// * `shared_limiter` - Optional shared rate limiter for account-level rate limiting
+    /// * `force_http2` - When true, build the HTTP transport with HTTP/2 prior knowledge
+    ///   (no HTTP/1.1 fallback) and H2 tuning (adaptive window, keep-alive). Applies to
+    ///   both Standard and Alchemy clients.
     pub fn from_url_with_options(
         url: &str,
         compute_units_per_second: u32,
         rpc_concurrency: usize,
         max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        force_http2: bool,
     ) -> Result<Self, RpcError> {
         if url.contains("alchemy") {
             Ok(Self::Alchemy(AlchemyClient::from_url_with_options(
@@ -72,13 +76,15 @@ impl UnifiedRpcClient {
                 rpc_concurrency,
                 max_batch_size,
                 shared_limiter,
+                force_http2,
             )?))
         } else {
             let parsed_url =
                 url::Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
             let config = RpcClientConfig::new(parsed_url)
                 .with_batch_size(max_batch_size)
-                .with_concurrency(rpc_concurrency);
+                .with_concurrency(rpc_concurrency)
+                .with_force_http2(force_http2);
             let client = if let Some(limiter) = shared_limiter {
                 RpcClient::new_with_shared_limiter(config, limiter)?
             } else {
@@ -347,5 +353,57 @@ impl std::fmt::Debug for UnifiedRpcClient {
                 .field(client)
                 .finish(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Building a Standard (non-Alchemy) client with force_http2=true should
+    /// succeed and select the Standard variant.
+    #[test]
+    fn from_url_with_options_standard_http2() {
+        let client = UnifiedRpcClient::from_url_with_options(
+            "https://eth.drpc.org",
+            7500,
+            100,
+            100,
+            None,
+            true,
+        )
+        .expect("should build standard HTTP/2 client");
+        assert!(matches!(client, UnifiedRpcClient::Standard(_)));
+    }
+
+    /// Building an Alchemy client with force_http2=true should succeed and
+    /// select the Alchemy variant.
+    #[test]
+    fn from_url_with_options_alchemy_http2() {
+        let client = UnifiedRpcClient::from_url_with_options(
+            "https://eth-mainnet.g.alchemy.com/v2/test",
+            7500,
+            100,
+            100,
+            None,
+            true,
+        )
+        .expect("should build Alchemy HTTP/2 client");
+        assert!(matches!(client, UnifiedRpcClient::Alchemy(_)));
+    }
+
+    /// Default force_http2=false path still builds a usable Standard client.
+    #[test]
+    fn from_url_with_options_standard_no_http2() {
+        let client = UnifiedRpcClient::from_url_with_options(
+            "https://eth.drpc.org",
+            7500,
+            100,
+            100,
+            None,
+            false,
+        )
+        .expect("should build standard client with default transport");
+        assert!(matches!(client, UnifiedRpcClient::Standard(_)));
     }
 }
