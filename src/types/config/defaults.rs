@@ -80,6 +80,20 @@ pub mod db_pool {
     pub const MAX_SIZE: usize = 32;
 }
 
+#[cfg(feature = "solana")]
+pub mod solana_rpc {
+    /// Default requests per second for Solana RPC endpoints.
+    /// Conservative for public RPC; paid providers typically allow 50-100+.
+    pub const REQUESTS_PER_SECOND: u32 = 25;
+
+    /// Default max concurrent in-flight RPC requests.
+    /// Lower than EVM (100) because Solana getBlock responses are ~1-5 MB.
+    pub const CONCURRENCY: usize = 10;
+
+    /// Default max concurrent requests for batch operations.
+    pub const BATCH_CONCURRENCY: usize = 5;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

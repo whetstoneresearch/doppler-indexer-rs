@@ -6,7 +6,11 @@ edition = "2021"
 [features]
 default = []
 bench = []
-solana = []
+solana = [
+    "dep:solana-client",
+    "dep:solana-sdk",
+    "dep:solana-transaction-status",
+]
 
 [dependencies]
 alloy-primitives = { version = "1.5.2", features = ["serde"] }
@@ -53,3 +57,8 @@ object_store = { version = "0.11", features = ["aws"] }
 
 # File locking
 fs2 = "0.4"
+
+# Solana (Phase 4+)
+solana-client = { version = "~2.3", optional = true }
+solana-sdk = { version = "~2.3", optional = true }
+solana-transaction-status = { version = "~2.3", optional = true }
