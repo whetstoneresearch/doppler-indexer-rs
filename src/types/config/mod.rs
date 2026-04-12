@@ -7,5 +7,7 @@ pub mod indexer;
 pub mod loader;
 pub mod metrics;
 pub mod raw_data;
+#[cfg(feature = "solana")]
+pub mod solana;
 pub mod storage;
 pub mod transformations;

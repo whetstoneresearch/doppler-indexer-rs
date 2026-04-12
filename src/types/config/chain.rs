@@ -8,6 +8,10 @@ use crate::types::config::contract::{
     load_contracts_from_path, load_factory_collections_from_path, Contracts, FactoryCollections,
 };
 use crate::types::config::generic::InlineOrPath;
+#[cfg(feature = "solana")]
+use crate::types::config::solana::{
+    load_solana_programs_from_path, SolanaCommitment, SolanaPrograms,
+};
 
 /// RPC method to use for fetching block receipts.
 ///
@@ -88,6 +92,15 @@ pub struct ChainConfigRaw {
     /// RPC client configuration (rate limiting, concurrency).
     #[serde(default)]
     pub rpc: RpcConfig,
+    /// Solana program configuration. Inline or file/directory path.
+    /// Resolved into `ChainConfig.solana_programs`.
+    #[cfg(feature = "solana")]
+    #[serde(default)]
+    pub programs: Option<InlineOrPath<SolanaPrograms>>,
+    /// Solana commitment level. Defaults to `confirmed` when absent.
+    #[cfg(feature = "solana")]
+    #[serde(default)]
+    pub commitment: Option<SolanaCommitment>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +117,12 @@ pub struct ChainConfig {
     pub factory_collections: FactoryCollections,
     /// RPC client configuration (rate limiting, concurrency).
     pub rpc: RpcConfig,
+    /// Resolved Solana program map. Empty when no `programs` was set.
+    #[cfg(feature = "solana")]
+    pub solana_programs: SolanaPrograms,
+    /// Resolved Solana commitment level. Defaults to `Confirmed`.
+    #[cfg(feature = "solana")]
+    pub commitment: SolanaCommitment,
 }
 
 pub fn resolve_chain_config(
@@ -126,6 +145,20 @@ pub fn resolve_chain_config(
         None => FactoryCollections::new(),
     };
 
+    #[cfg(feature = "solana")]
+    let solana_programs = match raw_config.programs {
+        Some(InlineOrPath::Inline(programs)) => programs,
+        Some(InlineOrPath::Path(p)) => {
+            load_solana_programs_from_path(base_dir, &p).map_err(|e| {
+                anyhow::anyhow!("Failed to load Solana programs from path {}: {}", p, e)
+            })?
+        }
+        None => SolanaPrograms::new(),
+    };
+
+    #[cfg(feature = "solana")]
+    let commitment = raw_config.commitment.unwrap_or_default();
+
     Ok(ChainConfig {
         name: raw_config.name,
         chain_id: raw_config.chain_id,
@@ -137,6 +170,10 @@ pub fn resolve_chain_config(
         block_receipts_method: raw_config.block_receipts_method,
         factory_collections,
         rpc: raw_config.rpc,
+        #[cfg(feature = "solana")]
+        solana_programs,
+        #[cfg(feature = "solana")]
+        commitment,
     })
 }
 
@@ -192,6 +229,10 @@ mod tests {
             block_receipts_method: None,
             factory_collections: None,
             rpc: RpcConfig::default(),
+            #[cfg(feature = "solana")]
+            programs: None,
+            #[cfg(feature = "solana")]
+            commitment: None,
         };
         let result = resolve_chain_config(raw, Path::new("/tmp"));
         assert!(result.is_err());
@@ -210,6 +251,10 @@ mod tests {
             block_receipts_method: Some(BlockReceiptsMethod::EthGetBlockReceipts),
             factory_collections: None,
             rpc: RpcConfig::default(),
+            #[cfg(feature = "solana")]
+            programs: None,
+            #[cfg(feature = "solana")]
+            commitment: None,
         };
         let result = resolve_chain_config(raw, Path::new("/tmp"));
         assert!(result.is_ok());
@@ -260,5 +305,129 @@ mod tests {
 
         let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
         assert_eq!(raw.chain_type, ChainType::Solana);
+    }
+
+    #[cfg(feature = "solana")]
+    mod solana_tests {
+        use super::*;
+        use crate::types::config::solana::SolanaCommitment;
+
+        #[test]
+        fn chain_config_raw_solana_with_inline_programs_deserializes() {
+            let json = r#"{
+                "name": "solana-mainnet",
+                "chain_id": 101,
+                "chain_type": "solana",
+                "rpc_url_env_var": "SOLANA_RPC_URL",
+                "contracts": {},
+                "commitment": "finalized",
+                "programs": {
+                    "whirlpool": {
+                        "program_id": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+                        "events": [{ "name": "Traded" }]
+                    }
+                }
+            }"#;
+
+            let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
+            assert_eq!(raw.chain_type, ChainType::Solana);
+            assert_eq!(raw.commitment, Some(SolanaCommitment::Finalized));
+            let programs = raw.programs.expect("programs present");
+            match programs {
+                InlineOrPath::Inline(map) => {
+                    assert_eq!(map.len(), 1);
+                    assert!(map.contains_key("whirlpool"));
+                }
+                InlineOrPath::Path(_) => panic!("expected inline programs"),
+            }
+        }
+
+        #[test]
+        fn chain_config_raw_solana_fields_default_to_none() {
+            let json = r#"{
+                "name": "test",
+                "chain_id": 1,
+                "rpc_url_env_var": "RPC_URL",
+                "contracts": {}
+            }"#;
+
+            let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
+            assert!(raw.programs.is_none());
+            assert!(raw.commitment.is_none());
+        }
+
+        #[test]
+        fn resolve_chain_config_solana_programs_inline() {
+            let json = r#"{
+                "name": "solana",
+                "chain_id": 101,
+                "chain_type": "solana",
+                "rpc_url_env_var": "SOLANA_RPC_URL",
+                "contracts": {},
+                "commitment": "processed",
+                "programs": {
+                    "whirlpool": {
+                        "program_id": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+                    }
+                }
+            }"#;
+
+            let raw: ChainConfigRaw = serde_json::from_str(json).unwrap();
+            let resolved = resolve_chain_config(raw, Path::new("/tmp")).unwrap();
+            assert_eq!(resolved.chain_type, ChainType::Solana);
+            assert_eq!(resolved.commitment, SolanaCommitment::Processed);
+            assert_eq!(resolved.solana_programs.len(), 1);
+            let program = resolved
+                .solana_programs
+                .get("whirlpool")
+                .expect("whirlpool present");
+            assert_eq!(
+                program.program_id,
+                "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+            );
+        }
+
+        #[test]
+        fn resolve_chain_config_solana_programs_missing_path_returns_err() {
+            let raw = ChainConfigRaw {
+                name: "solana".to_string(),
+                chain_id: 101,
+                chain_type: ChainType::Solana,
+                rpc_url_env_var: "SOLANA_RPC_URL".to_string(),
+                ws_url_env_var: None,
+                start_block: None,
+                contracts: InlineOrPath::Inline(Contracts::new()),
+                block_receipts_method: None,
+                factory_collections: None,
+                rpc: RpcConfig::default(),
+                programs: Some(InlineOrPath::Path("nonexistent/programs.json".to_string())),
+                commitment: None,
+            };
+            let result = resolve_chain_config(raw, Path::new("/tmp"));
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("Failed to load Solana programs from path"));
+        }
+
+        #[test]
+        fn resolve_chain_config_solana_commitment_defaults_to_confirmed() {
+            let raw = ChainConfigRaw {
+                name: "solana".to_string(),
+                chain_id: 101,
+                chain_type: ChainType::Solana,
+                rpc_url_env_var: "SOLANA_RPC_URL".to_string(),
+                ws_url_env_var: None,
+                start_block: None,
+                contracts: InlineOrPath::Inline(Contracts::new()),
+                block_receipts_method: None,
+                factory_collections: None,
+                rpc: RpcConfig::default(),
+                programs: None,
+                commitment: None,
+            };
+            let resolved = resolve_chain_config(raw, Path::new("/tmp")).unwrap();
+            assert_eq!(resolved.commitment, SolanaCommitment::Confirmed);
+            assert!(resolved.solana_programs.is_empty());
+        }
     }
 }
