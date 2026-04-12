@@ -58,6 +58,18 @@ pub struct RpcConfig {
     /// Mutually exclusive with `requests_per_second` and `compute_units_per_second`.
     #[serde(default)]
     pub rate_limit_group: Option<String>,
+    /// Opt in to HTTP/2 for the RPC transport.
+    ///
+    /// When true, the underlying reqwest client is built with HTTP/2 prior knowledge
+    /// (no HTTP/1.1 fallback), BDP-based adaptive window sizing, and idle keep-alive.
+    /// This is best for HTTPS endpoints that support h2 (e.g., Alchemy, Infura, QuickNode)
+    /// and want maximum stream multiplexing for concurrent JSON-RPC calls.
+    ///
+    /// When false or unset, the default transport is used (alloy's `RootProvider::new_http`),
+    /// which still negotiates h2 opportunistically via ALPN on HTTPS endpoints but also
+    /// allows HTTP/1.1 fallback.
+    #[serde(default)]
+    pub http2: Option<bool>,
 }
 
 impl RpcConfig {
@@ -67,6 +79,11 @@ impl RpcConfig {
 
     pub fn has_explicit_rate_limit(&self) -> bool {
         self.requests_per_second.is_some() || self.compute_units_per_second.is_some()
+    }
+
+    /// Returns the resolved HTTP/2 opt-in flag. Defaults to false when unset.
+    pub fn http2_enabled(&self) -> bool {
+        self.http2.unwrap_or(false)
     }
 }
 
@@ -222,8 +239,40 @@ mod tests {
             compute_units_per_second: Some(7500),
             batch_size: None,
             rate_limit_group: None,
+            http2: None,
         };
 
         assert_eq!(rpc.units_per_second(), Some(25));
+    }
+
+    #[test]
+    fn test_rpc_config_http2_default_is_false() {
+        let rpc = RpcConfig::default();
+        assert_eq!(rpc.http2, None);
+        assert!(!rpc.http2_enabled());
+    }
+
+    #[test]
+    fn test_rpc_config_http2_deserializes_from_json() {
+        let json = r#"{"concurrency": 100, "requests_per_second": 7500, "http2": true}"#;
+        let rpc: RpcConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(rpc.http2, Some(true));
+        assert!(rpc.http2_enabled());
+    }
+
+    #[test]
+    fn test_rpc_config_http2_false_deserializes() {
+        let json = r#"{"http2": false}"#;
+        let rpc: RpcConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(rpc.http2, Some(false));
+        assert!(!rpc.http2_enabled());
+    }
+
+    #[test]
+    fn test_rpc_config_http2_absent_defaults_to_none() {
+        let json = r#"{"concurrency": 50}"#;
+        let rpc: RpcConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(rpc.http2, None);
+        assert!(!rpc.http2_enabled());
     }
 }

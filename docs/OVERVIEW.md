@@ -230,7 +230,8 @@ src/
       "rpc": {
         "concurrency": 100,
         "requests_per_second": 7500,
-        "batch_size": 1000
+        "batch_size": 1000,
+        "http2": true
       }
     }
   ],

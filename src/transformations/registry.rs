@@ -1383,6 +1383,7 @@ mod tests {
             "DhookSwapMetricsHandler",
             "V4BaseMetricsHandler",
             "MigrationPoolSwapMetricsHandler",
+            "ZoraSwapMetricsHandler",
         ]);
         let chainlink_dep = chainlink_latest_answer_dependency();
         let mut seen = HashSet::new();

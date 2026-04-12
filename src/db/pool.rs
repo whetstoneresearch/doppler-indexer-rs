@@ -1,5 +1,8 @@
+use std::time::Instant;
+
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use metrics::{counter, histogram};
 use rand::Rng;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
@@ -48,6 +51,13 @@ impl DbPool {
         &self.pool
     }
 
+    /// Return a reference to the underlying deadpool pool.
+    ///
+    /// Used by the metrics sampler to call `.status()` for pool gauge updates.
+    pub fn pool_ref(&self) -> &Pool {
+        &self.pool
+    }
+
     pub async fn execute_transaction(&self, operations: Vec<DbOperation>) -> Result<(), DbError> {
         if operations.is_empty() {
             return Ok(());
@@ -56,12 +66,36 @@ impl DbPool {
         let mut operations = operations;
         sort_operations_for_lock_ordering(&mut operations);
 
+        let op_count = operations.len();
+        let txn_start = Instant::now();
+
+
+        counter!(
+            "db_transaction_operations_total",
+            "method" => "execute_transaction"
+        )
+        .increment(op_count as u64);
+
         for attempt in 0..=DEADLOCK_MAX_RETRIES {
             match self.try_execute_transaction(&operations).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction",
+                        "status" => "success"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction",
+                        "status" => "success"
+                    )
+                    .increment(1);
+                    return Ok(());
+                }
                 Err(e) if is_deadlock(&e) && attempt < DEADLOCK_MAX_RETRIES => {
                     let base_delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
-                    let jitter_range = base_delay_ms / 5; // ±20%
+                    let jitter_range = base_delay_ms / 5;
                     let jitter_offset = rand::rng().random_range(0..=(jitter_range * 2));
                     let delay_ms = base_delay_ms - jitter_range + jitter_offset;
                     tracing::warn!(
@@ -73,7 +107,21 @@ impl DbPool {
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction",
+                        "status" => "error"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction",
+                        "status" => "error"
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
             }
         }
 
@@ -81,7 +129,20 @@ impl DbPool {
     }
 
     async fn try_execute_transaction(&self, operations: &[DbOperation]) -> Result<(), DbError> {
-        let mut client = self.pool.get().await?;
+        let acquire_start = Instant::now();
+        let mut client = match self.pool.get().await {
+            Ok(c) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                c
+            }
+            Err(e) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                return Err(e.into());
+            }
+        };
+
         let transaction = client.transaction().await?;
 
         for op in operations {
@@ -114,8 +175,36 @@ impl DbPool {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let mut client = self.pool.get().await?;
+        let op_count = operations.len();
+
+        let acquire_start = Instant::now();
+        let mut client = match self.pool.get().await {
+            Ok(c) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                c
+            }
+            Err(e) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                counter!(
+                    "db_transactions_total",
+                    "method" => "execute_transaction_with_snapshot_reads",
+                    "status" => "error"
+                )
+                .increment(1);
+                return Err(e.into());
+            }
+        };
+
+        let txn_start = Instant::now();
         let transaction = client.transaction().await?;
+
+        counter!(
+            "db_transaction_operations_total",
+            "method" => "execute_transaction_with_snapshot_reads"
+        )
+        .increment(op_count as u64);
 
         // Run snapshot queries inside the transaction (sees state before our modifications)
         let mut snapshot_results = Vec::new();
@@ -136,12 +225,38 @@ impl DbPool {
                 Err(e) => {
                     let db_err: DbError = e.into();
                     tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction_with_snapshot_reads",
+                        "status" => "error"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction_with_snapshot_reads",
+                        "status" => "error"
+                    )
+                    .increment(1);
                     return Err(db_err);
                 }
             }
         }
 
         transaction.commit().await?;
+
+        histogram!(
+            "db_transaction_duration_seconds",
+            "method" => "execute_transaction_with_snapshot_reads",
+            "status" => "success"
+        )
+        .record(txn_start.elapsed().as_secs_f64());
+        counter!(
+            "db_transactions_total",
+            "method" => "execute_transaction_with_snapshot_reads",
+            "status" => "success"
+        )
+        .increment(1);
+
         Ok((snapshot_results, affected_rows))
     }
 
@@ -161,9 +276,36 @@ impl DbPool {
         query: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<tokio_postgres::Row>, DbError> {
-        let client = self.pool.get().await?;
-        let rows = client.query(query, params).await?;
-        Ok(rows)
+        let acquire_start = Instant::now();
+        let client = match self.pool.get().await {
+            Ok(c) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                c
+            }
+            Err(e) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                counter!("db_queries_total", "status" => "error").increment(1);
+                return Err(e.into());
+            }
+        };
+
+        let query_start = Instant::now();
+        match client.query(query, params).await {
+            Ok(rows) => {
+                histogram!("db_query_duration_seconds")
+                    .record(query_start.elapsed().as_secs_f64());
+                counter!("db_queries_total", "status" => "success").increment(1);
+                Ok(rows)
+            }
+            Err(e) => {
+                histogram!("db_query_duration_seconds")
+                    .record(query_start.elapsed().as_secs_f64());
+                counter!("db_queries_total", "status" => "error").increment(1);
+                Err(e.into())
+            }
+        }
     }
 
     /// Query a single row by key columns.

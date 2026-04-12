@@ -223,6 +223,36 @@ pub fn get_amounts_for_position(
     }
 }
 
+/// Convert a sqrtPriceX96 value to the greatest tick whose sqrt ratio does not
+/// exceed the input.
+///
+/// This mirrors Uniswap's `getTickAtSqrtRatio` contract behavior closely
+/// enough for transformation use cases, while staying simple and exact by
+/// binary-searching the monotonic tick→sqrt mapping.
+pub fn sqrt_price_x96_to_tick(sqrt_price_x96: &U256) -> Result<i32, TransformationError> {
+    if *sqrt_price_x96 < MIN_SQRT_RATIO || *sqrt_price_x96 > MAX_SQRT_RATIO {
+        return Err(TransformationError::TypeConversion(format!(
+            "sqrtPriceX96 {} out of range [{}, {}]",
+            sqrt_price_x96, MIN_SQRT_RATIO, MAX_SQRT_RATIO
+        )));
+    }
+
+    let mut lo = MIN_TICK;
+    let mut hi = MAX_TICK;
+
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        let mid_sqrt = tick_to_sqrt_price_x96(mid)?;
+        if mid_sqrt <= *sqrt_price_x96 {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    Ok(lo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +445,30 @@ mod tests {
         let q96 = U256::from(1u64) << 96;
         assert!(get_amount0_delta(U256::ZERO, q96, 1_000).is_err());
         assert!(get_amount0_delta(q96, U256::ZERO, 1_000).is_err());
+    }
+
+    // ─── sqrt_price_x96_to_tick tests ─────────────────────────────────
+
+    #[test]
+    fn test_sqrt_price_to_tick_zero() {
+        let sqrt = tick_to_sqrt_price_x96(0).unwrap();
+        assert_eq!(sqrt_price_x96_to_tick(&sqrt).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_sqrt_price_to_tick_positive() {
+        let sqrt = tick_to_sqrt_price_x96(12345).unwrap();
+        assert_eq!(sqrt_price_x96_to_tick(&sqrt).unwrap(), 12345);
+    }
+
+    #[test]
+    fn test_sqrt_price_to_tick_negative() {
+        let sqrt = tick_to_sqrt_price_x96(-54321).unwrap();
+        assert_eq!(sqrt_price_x96_to_tick(&sqrt).unwrap(), -54321);
+    }
+
+    #[test]
+    fn test_sqrt_price_to_tick_out_of_range() {
+        assert!(sqrt_price_x96_to_tick(&U256::ZERO).is_err());
     }
 }

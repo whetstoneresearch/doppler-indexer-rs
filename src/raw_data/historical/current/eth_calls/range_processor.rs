@@ -51,50 +51,58 @@ pub(super) async fn process_complete_range(
         s3_manifest: &state.s3_manifest,
     };
 
-    if state.has_regular_calls {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_range_multicall(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.call_configs,
-                state.max_params,
-                &mut state.frequency_state,
-                multicall_addr,
-                None,
-            )
-            .await?;
-        } else {
-            process_range(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.call_configs,
-                state.max_params,
-                &mut state.frequency_state,
-                None,
-            )
-            .await?;
-        }
-    }
-
-    if state.has_once_calls {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_once_calls_multicall(
-                &range,
-                blocks,
-                &ctx,
-                &state.once_configs,
-                &chain.contracts,
-                multicall_addr,
-            )
-            .await?;
-        } else {
-            process_once_calls_regular(&range, blocks, &ctx, &state.once_configs, &chain.contracts)
+    if !state.range_regular_done.contains(&range_start) {
+        if state.has_regular_calls {
+            if let Some(multicall_addr) = state.multicall3_address {
+                process_range_multicall(
+                    &range,
+                    blocks.clone(),
+                    &ctx,
+                    &state.call_configs,
+                    state.max_params,
+                    &mut state.frequency_state,
+                    multicall_addr,
+                    None,
+                )
                 .await?;
+            } else {
+                process_range(
+                    &range,
+                    blocks.clone(),
+                    &ctx,
+                    &state.call_configs,
+                    state.max_params,
+                    &mut state.frequency_state,
+                    None,
+                )
+                .await?;
+            }
         }
+
+        if state.has_once_calls {
+            if let Some(multicall_addr) = state.multicall3_address {
+                process_once_calls_multicall(
+                    &range,
+                    blocks,
+                    &ctx,
+                    &state.once_configs,
+                    &chain.contracts,
+                    multicall_addr,
+                )
+                .await?;
+            } else {
+                process_once_calls_regular(
+                    &range,
+                    blocks,
+                    &ctx,
+                    &state.once_configs,
+                    &chain.contracts,
+                )
+                .await?;
+            }
+        }
+        state.range_regular_done.insert(range_start);
     }
-    state.range_regular_done.insert(range_start);
 
     if let Some(factory_data) = state.range_factory_data.get(&range_start) {
         if state.has_factory_calls && !state.range_factory_done.contains(&range_start) {
@@ -468,6 +476,54 @@ mod tests {
         );
         // Factory not done yet
         assert!(!state.range_factory_done.contains(&0));
+    }
+
+    #[tokio::test]
+    async fn test_complete_range_processes_factory_work_after_catchup_marked_regular_done() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let chain = test_chain();
+        let mut state = factory_once_only_state(tmp.path());
+
+        state.range_regular_done.insert(0);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
+        state.range_factory_data.insert(
+            0,
+            FactoryAddressData {
+                range_start: 0,
+                range_end: 100,
+                addresses_by_block: HashMap::new(),
+            },
+        );
+
+        process_complete_range(0, &mut state, &client, &chain, &None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            state.range_factory_done.contains(&0),
+            "factory work should run even when regular work was already completed during catchup"
+        );
+        assert!(
+            !state.range_data.contains_key(&0),
+            "range_data should be cleaned up after factory work completes"
+        );
+        assert!(
+            !state.range_factory_data.contains_key(&0),
+            "range_factory_data should be cleaned up after factory work completes"
+        );
+
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "factory once output must be written during the follow-up current-phase pass"
+        );
     }
 
     #[tokio::test]

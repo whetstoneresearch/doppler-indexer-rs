@@ -11,6 +11,7 @@ pub mod multicurve;
 pub mod scheduled_multicurve;
 pub mod v3;
 pub mod v4;
+pub mod zora;
 
 use std::sync::Arc;
 
@@ -44,6 +45,8 @@ fn register_handlers_inner(
     scheduled_multicurve::create::register_handlers(registry);
     decay_multicurve::create::register_handlers(registry);
     dhook::create::register_handlers(registry);
+    zora::create::register_handlers(registry);
+    zora::transfer::register_handlers(registry);
 
     // Shared oracle price cache across all swap metrics handlers.
     // ETH/USD and EURC/USD prices are shared so a single oracle reading
@@ -104,6 +107,9 @@ fn register_handlers_inner(
         v4::create::V4_CREATE_HANDLER_SCOPE,
     ]));
     v4::metrics::register_handlers(registry, chain_id, v4_base_cache, Arc::clone(&oracle_cache));
+
+    let zora_cache = Arc::new(PoolMetadataCache::new());
+    zora::metrics::register_handlers(registry, chain_id, zora_cache, Arc::clone(&oracle_cache));
 
     // Register migration pool handlers as a group only on chains with a V4
     // migrator. The swap handler depends on MigrationPoolCreateHandler, so

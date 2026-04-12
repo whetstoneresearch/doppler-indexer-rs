@@ -279,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
             .context("Invalid metrics.addr in config")?;
         metrics::init_metrics_server(addr);
         metrics::describe_rpc_metrics();
+        metrics::describe_db_metrics();
         metrics::describe_transformation_metrics();
         metrics::describe_collection_metrics();
     }
@@ -457,6 +458,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Spawn pool metrics sampler if we have a shared pool
+    if let Some(ref pool) = shared_db_pool {
+        tokio::spawn(metrics::sample_pool_stats(
+            Arc::clone(pool),
+            std::time::Duration::from_secs(5),
+        ));
+    }
 
     let mut chain_tasks: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
 

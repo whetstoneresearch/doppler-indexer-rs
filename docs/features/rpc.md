@@ -401,6 +401,7 @@ RPC parameters are configured per-chain in the `rpc` block of the chain config:
 | `rpc.concurrency` | 100 | Max concurrent in-flight RPC requests |
 | `rpc.requests_per_second` | 7500 | Generic rate-limit units per second. For standard providers this is requests/sec; for Alchemy-like providers it is CU/sec |
 | `rpc.batch_size` | 100 | Max batch size for RPC requests |
+| `rpc.http2` | `false` | Opt in to HTTP/2 prior-knowledge transport with adaptive window and keep-alive (see below) |
 
 Example:
 ```json
@@ -410,10 +411,42 @@ Example:
     "rpc": {
         "concurrency": 100,
         "requests_per_second": 7500,
-        "batch_size": 1000
+        "batch_size": 1000,
+        "http2": true
     }
 }
 ```
+
+### HTTP/2 Transport
+
+Setting `rpc.http2 = true` switches the underlying `reqwest::Client` from alloy's
+default (which negotiates h2 via ALPN but allows HTTP/1.1 fallback) to a client
+built with:
+
+- `http2_prior_knowledge()` — forces HTTP/2; fails loudly if the server cannot
+  speak h2 instead of silently downgrading to HTTP/1.1.
+- `http2_adaptive_window(true)` — BDP-based flow-control window tuning, useful
+  for streaming large batches of concurrent requests over a single connection.
+- `http2_keep_alive_interval = 30s`, `http2_keep_alive_timeout = 10s`,
+  `http2_keep_alive_while_idle = true` — keeps the multiplexed connection alive
+  through idle periods so we don't pay for repeated TLS + ALPN handshakes.
+- `pool_idle_timeout = 90s` — retains the connection in the pool between bursts.
+
+When to enable:
+
+- **Enable** when connecting to an HTTPS RPC endpoint you have verified speaks
+  HTTP/2 (Alchemy, Infura, QuickNode, most managed providers) and you are running
+  many concurrent requests — HTTP/2 stream multiplexing removes HoL blocking at
+  the connection layer, which is the main throughput lever once rate limiting is
+  not the bottleneck.
+- **Leave off** (the default) when pointing at a provider whose HTTP/2 support is
+  unknown, or at cleartext `http://` endpoints (prior knowledge on cleartext
+  sends h2c, which most providers do not accept), or when you need the h1
+  fallback path.
+
+Enabling this flag does not change the RPC semantics, batching, rate limiting,
+or retry behavior — only the transport. Observability remains the same (all RPC
+metrics are still recorded).
 
 ### Sliding Window Rate Limiter
 

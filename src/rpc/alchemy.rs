@@ -197,6 +197,9 @@ pub struct AlchemyConfig {
     pub retry: RetryConfig,
     /// Max concurrent in-flight RPC requests. Configurable via RPC_CONCURRENCY env var.
     pub rpc_concurrency: usize,
+    /// When true, force the underlying HTTP transport to HTTP/2 prior knowledge
+    /// with adaptive window sizing and keep-alive.
+    pub force_http2: bool,
 }
 
 #[allow(dead_code)]
@@ -210,6 +213,7 @@ impl AlchemyConfig {
             batching_enabled: true,
             retry: RetryConfig::default(),
             rpc_concurrency: 100,
+            force_http2: false,
         }
     }
 
@@ -232,6 +236,11 @@ impl AlchemyConfig {
         self.rpc_concurrency = concurrency;
         self
     }
+
+    pub fn with_force_http2(mut self, force: bool) -> Self {
+        self.force_http2 = force;
+        self
+    }
 }
 
 /// Default compute units per second for Alchemy.
@@ -251,6 +260,7 @@ impl Default for AlchemyConfig {
             batching_enabled: true,
             retry: RetryConfig::default(),
             rpc_concurrency: 100,
+            force_http2: false,
         }
     }
 }
@@ -356,7 +366,9 @@ impl AlchemyClient {
     ) -> Result<Self, RpcError> {
         let rpc_config = RpcClientConfig::new(config.url.clone())
             .with_batch_size(config.max_batch_size)
-            .with_batching(config.batching_enabled);
+            .with_concurrency(config.rpc_concurrency)
+            .with_batching(config.batching_enabled)
+            .with_force_http2(config.force_http2);
 
         let inner = Arc::new(RpcClient::new(rpc_config)?);
 
@@ -388,11 +400,13 @@ impl AlchemyClient {
         rpc_concurrency: usize,
         max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        force_http2: bool,
     ) -> Result<Self, RpcError> {
         let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
         let config = AlchemyConfig::new(url, compute_units_per_second)
             .with_rpc_concurrency(rpc_concurrency)
-            .with_batch_size(max_batch_size);
+            .with_batch_size(max_batch_size)
+            .with_force_http2(force_http2);
         Self::new_with_limiter(config, shared_limiter)
     }
 
@@ -490,6 +504,7 @@ impl AlchemyClient {
 
         let num_requests = requests.len();
         let executor = self.create_concurrent_executor(cost_per_request);
+        let chain = executor.chain.clone();
         let make_request = Arc::new(make_request);
         let mut join_set = JoinSet::new();
         let mut requests_iter = requests.into_iter().enumerate().peekable();
@@ -515,7 +530,11 @@ impl AlchemyClient {
             match result {
                 Ok((idx, value)) => indexed_results.push((idx, value)),
                 Err(e) => {
-                    tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
+                    tracing::error!(
+                        "[{}] Task panicked in execute_concurrent_ordered: {:?}",
+                        chain,
+                        e
+                    );
                     had_panic = true;
                 }
             }
@@ -525,7 +544,8 @@ impl AlchemyClient {
                 && indexed_results.len() < num_requests
             {
                 tracing::debug!(
-                    "Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    "[{}] Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    chain,
                     indexed_results.len(),
                     num_requests,
                     indexed_results.len() as f64 / num_requests as f64 * 100.0,
@@ -577,6 +597,7 @@ impl AlchemyClient {
         use tokio::task::JoinSet;
 
         let executor = self.create_concurrent_executor(cost_per_request);
+        let chain = executor.chain.clone();
         let make_request = Arc::new(make_request);
 
         tokio::spawn(async move {
@@ -600,7 +621,7 @@ impl AlchemyClient {
             // Wait for tasks to complete, spawning replacements to keep the pipeline full
             while let Some(result) = join_set.join_next().await {
                 if let Err(e) = result {
-                    tracing::error!("Task panicked in execute_streaming: {:?}", e);
+                    tracing::error!("[{}] Task panicked in execute_streaming: {:?}", chain, e);
                 }
 
                 // Spawn replacements
@@ -1086,6 +1107,8 @@ impl AlchemyClient {
         hashes: Vec<B256>,
     ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
         let provider = self.inner.provider().clone();
+        let per_request_chain = self.chain_label();
+        let fallback_chain = per_request_chain.clone();
 
         // This method swallows errors and returns None for failed receipts,
         // so we use execute_batch_with_metrics (no error unwrapping)
@@ -1095,23 +1118,34 @@ impl AlchemyClient {
             ComputeUnitCost::GET_TRANSACTION_RECEIPT.cost(),
             move |hash| {
                 let provider = provider.clone();
+                let chain = per_request_chain.clone();
                 async move {
                     match provider.get_transaction_receipt(hash).await {
                         Ok(receipt) => receipt,
                         Err(e) => {
-                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            tracing::debug!(
+                                "[{}] Skipping receipt for tx {:?}: {}",
+                                chain,
+                                hash,
+                                e
+                            );
                             None
                         }
                     }
                 }
             },
-            |hashes| async move {
+            move |hashes| async move {
                 let mut results = Vec::with_capacity(hashes.len());
                 for hash in hashes {
                     match self.get_transaction_receipt(hash).await {
                         Ok(receipt) => results.push(receipt),
                         Err(e) => {
-                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            tracing::debug!(
+                                "[{}] Skipping receipt for tx {:?}: {}",
+                                fallback_chain,
+                                hash,
+                                e
+                            );
                             results.push(None);
                         }
                     }
@@ -1298,6 +1332,7 @@ impl std::fmt::Debug for AlchemyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use url::Url;
 
     /// Test that an entry exactly at the window boundary is considered expired.
     ///
@@ -1411,5 +1446,58 @@ mod tests {
             usage_after, usage,
             "Usage should be the same before and after cleanup"
         );
+    }
+
+    #[test]
+    fn test_inner_rpc_client_inherits_configured_concurrency() {
+        let config = AlchemyConfig::new(
+            Url::parse("https://eth-mainnet.g.alchemy.com/v2/test").unwrap(),
+            7500,
+        )
+        .with_rpc_concurrency(17);
+
+        let client = AlchemyClient::new(config).unwrap();
+
+        assert_eq!(client.config().rpc_concurrency, 17);
+        assert_eq!(client.inner().config().concurrency, 17);
+    }
+
+    /// force_http2 defaults to false and the builder flips it on.
+    #[test]
+    fn test_alchemy_config_force_http2_builder() {
+        let config = AlchemyConfig::default();
+        assert!(!config.force_http2);
+
+        let config = AlchemyConfig::default().with_force_http2(true);
+        assert!(config.force_http2);
+    }
+
+    /// force_http2 propagates from AlchemyConfig into the inner RpcClientConfig.
+    #[test]
+    fn test_alchemy_client_propagates_force_http2() {
+        let config = AlchemyConfig::new(
+            Url::parse("https://eth-mainnet.g.alchemy.com/v2/test").unwrap(),
+            7500,
+        )
+        .with_force_http2(true);
+
+        let client = AlchemyClient::new(config).unwrap();
+        assert!(client.config().force_http2);
+        assert!(client.inner().config().force_http2);
+    }
+
+    /// AlchemyClient::from_url_with_options accepts and honors the flag.
+    #[test]
+    fn test_alchemy_from_url_with_options_http2() {
+        let client = AlchemyClient::from_url_with_options(
+            "https://eth-mainnet.g.alchemy.com/v2/test",
+            7500,
+            100,
+            100,
+            None,
+            true,
+        )
+        .expect("should build Alchemy HTTP/2 client");
+        assert!(client.config().force_http2);
     }
 }

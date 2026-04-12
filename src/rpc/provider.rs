@@ -9,7 +9,6 @@ use alloy::providers::{Provider, RootProvider};
 use alloy::rpc::types::{
     Block, BlockId, BlockNumberOrTag, Filter, Log, Transaction, TransactionReceipt,
 };
-use alloy::transports::http::reqwest;
 use async_trait::async_trait;
 use governor::clock::{QuantaClock, QuantaInstant};
 use governor::middleware::NoOpMiddleware;
@@ -299,6 +298,7 @@ where
     Fut: Future<Output = Result<T, RpcError>>,
 {
     let has_chain = !chain.is_empty();
+    let chain_tag = if has_chain { chain } else { "unknown" };
     let mut errors: Vec<String> = Vec::new();
 
     for attempt in 0..=config.max_retries {
@@ -306,7 +306,8 @@ where
         if attempt > 0 {
             let delay = config.delay_for_attempt(attempt);
             tracing::warn!(
-                "RPC retry {}/{} for '{}' in {:?}",
+                "[{}] RPC retry {}/{} for '{}' in {:?}",
+                chain_tag,
                 attempt,
                 config.max_retries,
                 operation_name,
@@ -319,7 +320,8 @@ where
             Ok(result) => {
                 if attempt > 0 {
                     tracing::info!(
-                        "RPC '{}' succeeded after {} retries",
+                        "[{}] RPC '{}' succeeded after {} retries",
+                        chain_tag,
                         operation_name,
                         attempt
                     );
@@ -334,7 +336,8 @@ where
 
                 if e.is_retryable() && attempt < config.max_retries {
                     tracing::warn!(
-                        "RPC '{}' failed (attempt {}/{}): {}",
+                        "[{}] RPC '{}' failed (attempt {}/{}): {}",
+                        chain_tag,
                         operation_name,
                         attempt + 1,
                         config.max_retries + 1,
@@ -351,7 +354,8 @@ where
                     if errors.len() > 1 {
                         // Multiple attempts failed - log the full error history
                         tracing::error!(
-                            "RPC '{}' failed after {} attempts. Error history: [{}]",
+                            "[{}] RPC '{}' failed after {} attempts. Error history: [{}]",
+                            chain_tag,
                             operation_name,
                             attempt + 1,
                             errors.join("; ")
@@ -371,7 +375,8 @@ where
         record_retries_exhausted(chain, operation_name);
     }
     Err(RpcError::ProviderError(format!(
-        "RPC '{}' exhausted retries. Errors: [{}]",
+        "[{}] RPC '{}' exhausted retries. Errors: [{}]",
+        chain_tag,
         operation_name,
         errors.join("; ")
     )))
@@ -388,6 +393,10 @@ pub struct RpcClientConfig {
     pub batching_enabled: bool,
     pub rate_limit: Option<RateLimitConfig>,
     pub retry: RetryConfig,
+    /// When true, build the underlying reqwest Client with HTTP/2 prior knowledge
+    /// (no HTTP/1.1 fallback), BDP-based adaptive flow-control, and idle keep-alive
+    /// tuned for multiplexed JSON-RPC traffic.
+    pub force_http2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +433,7 @@ impl RpcClientConfig {
             batching_enabled: true,
             rate_limit: None,
             retry: RetryConfig::default(),
+            force_http2: false,
         }
     }
 
@@ -451,6 +461,40 @@ impl RpcClientConfig {
         self.retry = config;
         self
     }
+
+    pub fn with_force_http2(mut self, force: bool) -> Self {
+        self.force_http2 = force;
+        self
+    }
+}
+
+/// Build the underlying alloy `RootProvider` for an RPC endpoint.
+///
+/// When `force_http2` is true, the provider is backed by a custom `reqwest::Client`
+/// with HTTP/2 prior knowledge (no HTTP/1.1 fallback), BDP-based adaptive window
+/// sizing, and idle keep-alive — suited for high-throughput multiplexed RPC.
+/// When false, alloy's default HTTP provider is used, which still negotiates h2
+/// opportunistically via ALPN on HTTPS endpoints.
+fn build_provider(url: Url, force_http2: bool) -> Result<RootProvider<Ethereum>, RpcError> {
+    if !force_http2 {
+        return Ok(RootProvider::<Ethereum>::new_http(url));
+    }
+
+    let http_client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(300))
+        .http2_keep_alive_while_idle(true)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .gzip(true)
+        .build()
+        .map_err(|e| {
+            RpcError::Transport(format!("failed to build reqwest HTTP/2 client: {}", e))
+        })?;
+
+    let rpc_client = alloy::rpc::client::RpcClient::new_http_with_client(http_client, url);
+    Ok(RootProvider::<Ethereum>::new(rpc_client))
 }
 
 #[derive(Clone)]
@@ -464,26 +508,10 @@ pub struct RpcClient {
     chain: String,
 }
 
-/// Default HTTP read timeout for RPC requests (2 minutes).
-/// Large blocks with many receipts/logs can produce multi-MB responses
-/// that need more time than reqwest's default 30s.
-const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Build an alloy RootProvider with a custom reqwest client configured
-/// for large RPC responses.
-fn build_provider(url: &Url) -> Result<RootProvider<Ethereum>, RpcError> {
-    let client = reqwest::Client::builder()
-        .timeout(RPC_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| RpcError::Transport(format!("failed to build HTTP client: {e}")))?;
-    let rpc_client = alloy::rpc::client::RpcClient::new_http_with_client(client, url.clone());
-    Ok(RootProvider::<Ethereum>::new(rpc_client))
-}
-
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = build_provider(&config.url)?;
+        let provider = build_provider(config.url.clone(), config.force_http2)?;
         let chain = chain_label_from_url(&config.url);
         let concurrency = config.concurrency.max(1);
 
@@ -514,7 +542,7 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = build_provider(&config.url)?;
+        let provider = build_provider(config.url.clone(), config.force_http2)?;
         let chain = chain_label_from_url(&config.url);
         let concurrency = config.concurrency.max(1);
         Ok(Self {
@@ -702,7 +730,8 @@ impl RpcClient {
                     Ok(receipt) => Some(receipt),
                     Err(e) => {
                         tracing::debug!(
-                            "Skipping receipt {} in block {:?}: {}",
+                            "[{}] Skipping receipt {} in block {:?}: {}",
+                            self.chain,
                             i,
                             block_number,
                             e
@@ -744,7 +773,8 @@ impl RpcClient {
                     Err(e) => {
                         let failed_block = chunk_block_numbers.get(i);
                         tracing::error!(
-                            "get_block_receipts failed for block {:?}: {}",
+                            "[{}] get_block_receipts failed for block {:?}: {}",
+                            self.chain,
                             failed_block,
                             e
                         );
@@ -879,6 +909,7 @@ impl RpcClient {
     ) -> tokio::task::JoinHandle<()> {
         let max_in_flight = self.streaming_max_in_flight();
         let client = self.clone();
+        let chain = self.chain.clone();
 
         tokio::spawn(async move {
             let mut iter = block_numbers.into_iter();
@@ -897,7 +928,7 @@ impl RpcClient {
             // Pipeline: as tasks complete, spawn replacements
             while let Some(join_result) = join_set.join_next().await {
                 if let Err(e) = join_result {
-                    tracing::error!("Task panicked in get_blocks_streaming: {:?}", e);
+                    tracing::error!("[{}] Task panicked in get_blocks_streaming: {:?}", chain, e);
                 }
 
                 if let Some(number) = iter.next() {
@@ -922,7 +953,12 @@ impl RpcClient {
                 match self.get_transaction_receipt(hash).await {
                     Ok(receipt) => results.push(receipt),
                     Err(e) => {
-                        tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                        tracing::debug!(
+                            "[{}] Skipping receipt for tx {:?}: {}",
+                            self.chain,
+                            hash,
+                            e
+                        );
                         results.push(None);
                     }
                 }
@@ -948,7 +984,12 @@ impl RpcClient {
                 match result {
                     Ok(receipt) => all_results.push(receipt),
                     Err(e) => {
-                        tracing::debug!("Skipping receipt for tx {:?}: {}", chunk[i], e);
+                        tracing::debug!(
+                            "[{}] Skipping receipt for tx {:?}: {}",
+                            self.chain,
+                            chunk[i],
+                            e
+                        );
                         all_results.push(None);
                     }
                 }
@@ -1170,5 +1211,52 @@ mod tests {
     fn default_concurrency_is_100() {
         let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
         assert_eq!(config.concurrency, 100);
+    }
+
+    /// Verify force_http2 defaults to false.
+    #[test]
+    fn default_force_http2_is_false() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap());
+        assert!(!config.force_http2);
+    }
+
+    /// Verify with_force_http2 builder sets the flag.
+    #[test]
+    fn with_force_http2_builder() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_force_http2(true);
+        assert!(config.force_http2);
+    }
+
+    /// Verify that building the reqwest HTTP/2 client actually succeeds.
+    ///
+    /// This exercises the reqwest feature set (http2 + rustls-tls) and the
+    /// `http2_prior_knowledge` + adaptive-window + keep-alive knobs we configure.
+    #[test]
+    fn build_provider_with_http2_succeeds() {
+        let url = Url::parse("http://localhost:8545").unwrap();
+        let provider = build_provider(url, true);
+        assert!(
+            provider.is_ok(),
+            "HTTP/2 provider construction should not fail: {:?}",
+            provider.err()
+        );
+    }
+
+    /// Verify build_provider with http2 disabled returns a default alloy provider.
+    #[test]
+    fn build_provider_without_http2_succeeds() {
+        let url = Url::parse("http://localhost:8545").unwrap();
+        let provider = build_provider(url, false);
+        assert!(provider.is_ok());
+    }
+
+    /// Verify that RpcClient::new propagates force_http2 through to provider build.
+    #[test]
+    fn rpc_client_new_with_force_http2() {
+        let config = RpcClientConfig::new(Url::parse("http://localhost:8545").unwrap())
+            .with_force_http2(true);
+        let client = RpcClient::new(config);
+        assert!(client.is_ok());
     }
 }

@@ -133,6 +133,7 @@ pub fn build_rpc_client(
     let units_per_second = rpc_config
         .units_per_second()
         .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
+    let http2 = rpc_config.http2_enabled();
 
     let rate_limiter = Arc::new(SlidingWindowRateLimiter::new(units_per_second));
 
@@ -142,13 +143,15 @@ pub fn build_rpc_client(
         concurrency,
         batch_size,
         Some(rate_limiter.clone()),
+        http2,
     )?;
 
     tracing::info!(
-        "RPC config: concurrency={}, units_per_second={}, batch_size={}",
+        "RPC config: concurrency={}, units_per_second={}, batch_size={}, http2={}",
         concurrency,
         units_per_second,
-        batch_size
+        batch_size,
+        http2
     );
 
     Ok((rate_limiter, Arc::new(client)))
@@ -172,6 +175,7 @@ pub fn build_rpc_client_with_limiter(
         concurrency,
         batch_size,
         Some(shared_limiter),
+        rpc_config.http2_enabled(),
     )
     .map_err(Into::into)
 }
@@ -352,6 +356,7 @@ impl ChainRuntime {
                 concurrency,
                 rpc_batch_size,
                 Some(limiter.clone()),
+                chain.rpc.http2_enabled(),
             )?;
             (limiter, Arc::new(client))
         } else {
