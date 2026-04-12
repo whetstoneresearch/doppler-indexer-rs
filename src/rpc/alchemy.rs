@@ -197,6 +197,9 @@ pub struct AlchemyConfig {
     pub retry: RetryConfig,
     /// Max concurrent in-flight RPC requests. Configurable via RPC_CONCURRENCY env var.
     pub rpc_concurrency: usize,
+    /// When true, force the underlying HTTP transport to HTTP/2 prior knowledge
+    /// with adaptive window sizing and keep-alive.
+    pub force_http2: bool,
 }
 
 #[allow(dead_code)]
@@ -210,6 +213,7 @@ impl AlchemyConfig {
             batching_enabled: true,
             retry: RetryConfig::default(),
             rpc_concurrency: 100,
+            force_http2: false,
         }
     }
 
@@ -232,6 +236,11 @@ impl AlchemyConfig {
         self.rpc_concurrency = concurrency;
         self
     }
+
+    pub fn with_force_http2(mut self, force: bool) -> Self {
+        self.force_http2 = force;
+        self
+    }
 }
 
 /// Default compute units per second for Alchemy.
@@ -251,6 +260,7 @@ impl Default for AlchemyConfig {
             batching_enabled: true,
             retry: RetryConfig::default(),
             rpc_concurrency: 100,
+            force_http2: false,
         }
     }
 }
@@ -357,7 +367,8 @@ impl AlchemyClient {
         let rpc_config = RpcClientConfig::new(config.url.clone())
             .with_batch_size(config.max_batch_size)
             .with_concurrency(config.rpc_concurrency)
-            .with_batching(config.batching_enabled);
+            .with_batching(config.batching_enabled)
+            .with_force_http2(config.force_http2);
 
         let inner = Arc::new(RpcClient::new(rpc_config)?);
 
@@ -389,11 +400,13 @@ impl AlchemyClient {
         rpc_concurrency: usize,
         max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        force_http2: bool,
     ) -> Result<Self, RpcError> {
         let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
         let config = AlchemyConfig::new(url, compute_units_per_second)
             .with_rpc_concurrency(rpc_concurrency)
-            .with_batch_size(max_batch_size);
+            .with_batch_size(max_batch_size)
+            .with_force_http2(force_http2);
         Self::new_with_limiter(config, shared_limiter)
     }
 
@@ -1447,5 +1460,44 @@ mod tests {
 
         assert_eq!(client.config().rpc_concurrency, 17);
         assert_eq!(client.inner().config().concurrency, 17);
+    }
+
+    /// force_http2 defaults to false and the builder flips it on.
+    #[test]
+    fn test_alchemy_config_force_http2_builder() {
+        let config = AlchemyConfig::default();
+        assert!(!config.force_http2);
+
+        let config = AlchemyConfig::default().with_force_http2(true);
+        assert!(config.force_http2);
+    }
+
+    /// force_http2 propagates from AlchemyConfig into the inner RpcClientConfig.
+    #[test]
+    fn test_alchemy_client_propagates_force_http2() {
+        let config = AlchemyConfig::new(
+            Url::parse("https://eth-mainnet.g.alchemy.com/v2/test").unwrap(),
+            7500,
+        )
+        .with_force_http2(true);
+
+        let client = AlchemyClient::new(config).unwrap();
+        assert!(client.config().force_http2);
+        assert!(client.inner().config().force_http2);
+    }
+
+    /// AlchemyClient::from_url_with_options accepts and honors the flag.
+    #[test]
+    fn test_alchemy_from_url_with_options_http2() {
+        let client = AlchemyClient::from_url_with_options(
+            "https://eth-mainnet.g.alchemy.com/v2/test",
+            7500,
+            100,
+            100,
+            None,
+            true,
+        )
+        .expect("should build Alchemy HTTP/2 client");
+        assert!(client.config().force_http2);
     }
 }
