@@ -1645,6 +1645,10 @@ mod tests {
             block_receipts_method: None,
             factory_collections: HashMap::new(),
             rpc: Default::default(),
+            #[cfg(feature = "solana")]
+            solana_programs: Default::default(),
+            #[cfg(feature = "solana")]
+            commitment: Default::default(),
         }
     }
 
