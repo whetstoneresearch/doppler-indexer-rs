@@ -484,9 +484,10 @@ fn build_provider(url: Url, force_http2: bool) -> Result<RootProvider<Ethereum>,
         .http2_prior_knowledge()
         .http2_adaptive_window(true)
         .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_timeout(Duration::from_secs(300))
         .http2_keep_alive_while_idle(true)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .gzip(true)
         .build()
         .map_err(|e| {
             RpcError::Transport(format!("failed to build reqwest HTTP/2 client: {}", e))
