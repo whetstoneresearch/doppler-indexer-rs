@@ -194,6 +194,20 @@ impl UsdPriceContext {
         Some(volume_decimal * usd_per_quote)
     }
 
+    /// Convert a pre-decimal-adjusted quote-denominated amount to USD.
+    ///
+    /// Used by TVL computation where the amount is already in human-readable
+    /// decimal form (produced by combining base + quote contributions with the
+    /// current price). Returns `None` if the quote token has no USD multiplier.
+    pub fn quote_decimal_amount_to_usd(
+        &self,
+        amount_decimal: &BigDecimal,
+        quote_token: &[u8; 20],
+    ) -> Option<BigDecimal> {
+        let usd_per_quote = self.quote_to_usd_multiplier(quote_token)?;
+        Some(amount_decimal * usd_per_quote)
+    }
+
     /// Get the USD multiplier for a quote token.
     /// WETH → ETH/USD price, USDC/USDT → 1.0, EURC → EURC/USD price.
     fn quote_to_usd_multiplier(&self, quote_token: &[u8; 20]) -> Option<BigDecimal> {
@@ -442,8 +456,17 @@ async fn query_latest_price(
 }
 
 /// Convert a U256 to BigDecimal, dividing by 10^decimals.
-fn u256_to_decimal_adjusted(value: &U256, decimals: u8) -> BigDecimal {
-    let raw = BigDecimal::from(value.to_string().parse::<i128>().unwrap_or(0));
+///
+/// Parses the full U256 range via BigDecimal's string parser; previously this
+/// went through i128 and silently clamped values above i128::MAX to zero,
+/// which would have mis-computed TVL for pools with very large position
+/// amounts (phase 7). Volumes in phase 6 fit in i128 in practice, so no
+/// existing behavior changes.
+pub(crate) fn u256_to_decimal_adjusted(value: &U256, decimals: u8) -> BigDecimal {
+    let raw: BigDecimal = value
+        .to_string()
+        .parse()
+        .expect("U256::to_string produces a valid decimal integer");
     if decimals == 0 {
         return raw;
     }

@@ -67,6 +67,18 @@
                 },
                 "target": "UniswapV4StateView",
                 "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+            },
+            {
+                "function": "getSlot0(bytes32)",
+                "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+                "frequency": {
+                    "on_events": {
+                        "source": "UniswapV4ScheduledMulticurveInitializerHook",
+                        "event": "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
+                    }
+                },
+                "target": "UniswapV4StateView",
+                "params": [{ "type": "bytes32", "from_event": "topics[1]" }]
             }
         ]
     }

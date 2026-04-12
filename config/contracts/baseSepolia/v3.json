@@ -10,7 +10,23 @@
                     "factory_parameters": "topics[1]"
                 },
                 "calls": [
-                    { "function": "fee()", "output_type": "uint24", "frequency": "once" }
+                    { "function": "fee()", "output_type": "uint24", "frequency": "once" },
+                    {
+                        "function": "slot0()",
+                        "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
+                        "frequency": {
+                            "on_events": [
+                                {
+                                    "source": "DopplerV3Pool",
+                                    "event": "Mint(address,address,int24,int24,uint128,uint256,uint256)"
+                                },
+                                {
+                                    "source": "DopplerV3Pool",
+                                    "event": "Burn(address,int24,int24,uint128,uint256,uint256)"
+                                }
+                            ]
+                        }
+                    }
                 ],
                 "events": [
                     { "signature": "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },
@@ -34,7 +50,23 @@
                     "factory_parameters": "topics[1]"
                 },
                 "calls": [
-                    { "function": "fee()", "output_type": "uint24", "frequency": "once" }
+                    { "function": "fee()", "output_type": "uint24", "frequency": "once" },
+                    {
+                        "function": "slot0()",
+                        "output_type": "(uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
+                        "frequency": {
+                            "on_events": [
+                                {
+                                    "source": "DopplerLockableV3Pool",
+                                    "event": "Mint(address,address,int24,int24,uint128,uint256,uint256)"
+                                },
+                                {
+                                    "source": "DopplerLockableV3Pool",
+                                    "event": "Burn(address,int24,int24,uint128,uint256,uint256)"
+                                }
+                            ]
+                        }
+                    }
                 ],
                 "events": [
                     { "signature": "Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)" },

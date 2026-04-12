@@ -277,6 +277,7 @@ FROM (
   ) h24h ON true
   WHERE s.chain_id = $1 AND s.pool_id = $2
     AND s.block_timestamp > ($4 - 86400)
+    AND s.block_timestamp <= $4
 ) sub
 WHERE pool_state.chain_id = $1
   AND pool_state.pool_id = $2
@@ -383,11 +384,7 @@ pub async fn refresh_cache_if_needed(
         .collect();
 
     if !still_missing.is_empty() {
-        let sample: Vec<String> = still_missing
-            .iter()
-            .take(10)
-            .map(hex::encode)
-            .collect();
+        let sample: Vec<String> = still_missing.iter().take(10).map(hex::encode).collect();
         tracing::warn!(
             handler = handler_name,
             source = source_name,
@@ -555,6 +552,7 @@ mod tests {
                 assert!(query.contains("volume_24h_usd"));
                 assert!(query.contains("price_change_1h"));
                 assert!(query.contains("pool_state.block_number = $5"));
+                assert!(query.contains("s.block_timestamp <= $4"));
                 assert_eq!(params.len(), 7);
                 let snapshot = snapshot
                     .as_ref()

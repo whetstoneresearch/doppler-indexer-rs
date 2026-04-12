@@ -254,11 +254,7 @@ impl CompactionService {
                         );
                     }
                     Err(e) => {
-                        tracing::debug!(
-                            "Retry channel full for block {}: {}",
-                            block_number,
-                            e
-                        );
+                        tracing::debug!("Retry channel full for block {}: {}", block_number, e);
                     }
                 }
             }

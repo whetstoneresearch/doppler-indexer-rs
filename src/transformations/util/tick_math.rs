@@ -312,18 +312,34 @@ mod tests {
     fn test_position_entirely_above_current_is_all_token0() {
         // Current at tick 0 (sqrt = 2^96). Position (60, 120) is strictly above.
         let current = U256::from(1u64) << 96;
-        let (a0, a1) = get_amounts_for_position(60, 120, current, 1_000_000_000_000_000_000).unwrap();
-        assert!(a0 > U256::ZERO, "amount0 should be non-zero for above-tick position");
-        assert_eq!(a1, U256::ZERO, "amount1 must be zero for above-tick position");
+        let (a0, a1) =
+            get_amounts_for_position(60, 120, current, 1_000_000_000_000_000_000).unwrap();
+        assert!(
+            a0 > U256::ZERO,
+            "amount0 should be non-zero for above-tick position"
+        );
+        assert_eq!(
+            a1,
+            U256::ZERO,
+            "amount1 must be zero for above-tick position"
+        );
     }
 
     #[test]
     fn test_position_entirely_below_current_is_all_token1() {
         // Current at tick 0. Position (-120, -60) is strictly below.
         let current = U256::from(1u64) << 96;
-        let (a0, a1) = get_amounts_for_position(-120, -60, current, 1_000_000_000_000_000_000).unwrap();
-        assert_eq!(a0, U256::ZERO, "amount0 must be zero for below-tick position");
-        assert!(a1 > U256::ZERO, "amount1 should be non-zero for below-tick position");
+        let (a0, a1) =
+            get_amounts_for_position(-120, -60, current, 1_000_000_000_000_000_000).unwrap();
+        assert_eq!(
+            a0,
+            U256::ZERO,
+            "amount0 must be zero for below-tick position"
+        );
+        assert!(
+            a1 > U256::ZERO,
+            "amount1 should be non-zero for below-tick position"
+        );
     }
 
     #[test]
@@ -349,7 +365,8 @@ mod tests {
     fn test_position_current_at_tick_lower_is_all_token0() {
         // Current sqrt price exactly equals sqrt_lower ⇒ handled by the "<= lower" branch.
         let sqrt_lower = tick_to_sqrt_price_x96(-60).unwrap();
-        let (a0, a1) = get_amounts_for_position(-60, 60, sqrt_lower, 1_000_000_000_000_000_000).unwrap();
+        let (a0, a1) =
+            get_amounts_for_position(-60, 60, sqrt_lower, 1_000_000_000_000_000_000).unwrap();
         assert!(a0 > U256::ZERO);
         assert_eq!(a1, U256::ZERO);
     }
@@ -357,7 +374,8 @@ mod tests {
     #[test]
     fn test_position_current_at_tick_upper_is_all_token1() {
         let sqrt_upper = tick_to_sqrt_price_x96(60).unwrap();
-        let (a0, a1) = get_amounts_for_position(-60, 60, sqrt_upper, 1_000_000_000_000_000_000).unwrap();
+        let (a0, a1) =
+            get_amounts_for_position(-60, 60, sqrt_upper, 1_000_000_000_000_000_000).unwrap();
         assert_eq!(a0, U256::ZERO);
         assert!(a1 > U256::ZERO);
     }
