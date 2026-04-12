@@ -1547,20 +1547,17 @@ mod tests {
         match op {
             DbOperation::RawSql { query, .. } => {
                 // The lateral subqueries should filter by source/source_version.
-                // prev + newer CTEs have the filter (2 each). After the fix in
-                // fix/tvl-sql-and-robustness merges, h1h + h24h + outer lateral
-                // add 3 more (5 total). Assert >= 2 as baseline; bump to >= 5
-                // once the fix PR lands.
+                // prev + newer CTEs (2 each) + h1h + h24h + outer lateral (3 each) = 5.
                 let source_filter_count = query.matches("source = $12").count();
                 assert!(
-                    source_filter_count >= 2,
-                    "expected source=$12 in at least prev + newer, found {} occurrences",
+                    source_filter_count >= 5,
+                    "expected source=$12 in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
                     source_filter_count
                 );
                 let version_filter_count = query.matches("source_version = $13").count();
                 assert!(
-                    version_filter_count >= 2,
-                    "expected source_version=$13 in at least prev + newer, found {} occurrences",
+                    version_filter_count >= 5,
+                    "expected source_version=$13 in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
                     version_filter_count
                 );
             }
