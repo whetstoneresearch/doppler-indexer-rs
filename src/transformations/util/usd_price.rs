@@ -470,7 +470,14 @@ pub(crate) fn u256_to_decimal_adjusted(value: &U256, decimals: u8) -> BigDecimal
     if decimals == 0 {
         return raw;
     }
-    let divisor = BigDecimal::from(10u64.pow(decimals as u32));
+    let divisor: BigDecimal = {
+        let mut d = BigDecimal::from(1u64);
+        let ten = BigDecimal::from(10u64);
+        for _ in 0..decimals {
+            d = &d * &ten;
+        }
+        d
+    };
     raw / divisor
 }
 
