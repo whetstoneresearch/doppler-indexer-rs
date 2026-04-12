@@ -340,18 +340,20 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ## Phase 7: TVL Computation (future)
 
-**Goal**: Compute TVL from in-memory tick maps and update pool_snapshots + pool_state.
+**Goal**: Compute TVL plus USD active-liquidity pricing from in-memory tick maps and update `pool_snapshots` + `pool_state`.
 
 ### Tasks
 1. Implement tick map store: `RwLock<HashMap<pool_id, BTreeMap<(tick_lower, tick_upper), i128>>>`
 2. Rebuild on startup from liquidity_deltas table (one GROUP BY query)
 3. Sequential pass: process liquidity_deltas in order, update tick maps, compute TVL per block
 4. TVL formula: iterate tick map positions, compute token amounts based on position vs current tick
-5. Add amount0, amount1, tvl_usd, market_cap_usd columns to pool_state and pool_snapshots
-6. Market cap = token price × total supply (total_supply from tokens table)
+5. Compute active-liquidity token amounts for positions currently in range, then convert that subset to `active_liquidity_usd`
+6. Add `amount0`, `amount1`, `tvl_usd`, `market_cap_usd`, and `active_liquidity_usd` columns to `pool_state` and `pool_snapshots`
+7. Market cap = token price × total supply (total_supply from tokens table)
 
 ### Design notes
 - This pass is sequential by nature (tick maps are cumulative state)
+- USD active-liquidity pricing is part of the same Phase 7 pass as TVL, not a separate later phase
 - Could be a separate handler or a background task
 - Consider materialized views for protocol-wide TVL aggregation
 
@@ -369,7 +371,7 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 - **Quote token decimals**: hardcoded lookup (WETH=18, USDC=6, USDT=6, EURC=6), extracted to shared util
 - **Indexed poolKey in Swap**: keccak hash of PoolKey = pool_id, so topics[2] = topics[3]
 - **getSlot0 on_event calls**: configured on hook contracts with `target: UniswapV4StateView`; `source_name` on decoded calls = hook contract name (not target)
-- **TVL deferred**: liquidity_deltas written in parallel, TVL computed in a separate sequential pass (Phase 7)
+- **TVL deferred**: liquidity_deltas written in parallel, TVL plus `active_liquidity_usd` computed in a separate sequential pass (Phase 7)
 - **V4 hook swap/liquidity split**: same rationale as V3 — avoids multi-trigger snapshot capture issues
 - **V4 hook metadata caches**: each pool type gets its own `Arc<PoolMetadataCache>`, not shared with create handlers (create handlers don't use the cache)
 - **Shared V4 extraction functions**: `metrics/v4_hook_extract.rs` avoids duplication across 4 handler files

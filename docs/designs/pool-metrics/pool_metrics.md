@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS pool_state (
     price_change_1h  NUMERIC,               -- (phase 3+)
     price_change_24h NUMERIC,               -- (phase 3+)
     swap_count_24h   INTEGER,               -- (phase 3+)
+    amount0          NUMERIC,               -- total token0 held by pool (phase 7)
+    amount1          NUMERIC,               -- total token1 held by pool (phase 7)
+    tvl_usd          NUMERIC,               -- total pool TVL in USD (phase 7)
+    market_cap_usd   NUMERIC,               -- base token market cap in USD (phase 7)
+    active_liquidity_usd NUMERIC,           -- USD value of in-range liquidity only (phase 7)
+    total_supply     NUMERIC,               -- base token total supply (phase 7)
     source           VARCHAR(255) NOT NULL,
     source_version   INT NOT NULL,
     UNIQUE (chain_id, pool_id, source, source_version)
@@ -47,6 +53,11 @@ CREATE TABLE IF NOT EXISTS pool_snapshots (
     volume0          NUMERIC NOT NULL DEFAULT 0,   -- sum of |amount0| across all swaps
     volume1          NUMERIC NOT NULL DEFAULT 0,   -- sum of |amount1| across all swaps
     swap_count       INT NOT NULL DEFAULT 0,
+    amount0          NUMERIC,               -- total token0 held by pool (phase 7)
+    amount1          NUMERIC,               -- total token1 held by pool (phase 7)
+    tvl_usd          NUMERIC,               -- total pool TVL in USD (phase 7)
+    market_cap_usd   NUMERIC,               -- base token market cap in USD (phase 7)
+    active_liquidity_usd NUMERIC,           -- USD value of in-range liquidity only (phase 7)
     source           VARCHAR(255) NOT NULL,
     source_version   INT NOT NULL,
     UNIQUE (chain_id, pool_id, block_number, source, source_version)
@@ -397,6 +408,14 @@ The V4 base Swap event has no `poolId` field. The handler maps `event.contract_a
 
 V4 base Swap events do not emit liquidity, and Doppler auction "active liquidity" isn't directly analogous to a v3 pool's. The handler writes `active_liquidity = 0` for V4 base snapshots.
 
+### active_liquidity_usd
+
+`active_liquidity_usd` is in scope for the same Phase 7 pass as TVL. It is not a
+separate future metric. The computation uses only positions currently in range at
+the pool's current tick, converts those in-range token amounts to USD with the
+same pricing context used for `tvl_usd`, and stores the result on both
+`pool_snapshots` and `pool_state`.
+
 ---
 
 ## Handler Flow
@@ -456,9 +475,19 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
             meta.decimals0, meta.decimals1,
         )
 
+        # compute USD value of in-range liquidity only
+        active_amount0, active_amount1 = compute_active_position_amounts(
+            tick_maps.get(pool_id, {}),
+            acc.tick, acc.sqrt_price_x96,
+            meta.decimals0, meta.decimals1,
+        )
+
         # resolve USD prices (protocol-specific)
         price0_usd, price1_usd = resolve_usd_prices(pool_id, acc.price_close)
         tvl_usd = compute_tvl_usd(amount0, amount1, price0_usd, price1_usd)
+        active_liquidity_usd = compute_tvl_usd(
+            active_amount0, active_amount1, price0_usd, price1_usd
+        )
 
         # market cap
         market_cap = compute_market_cap(price0_usd, meta.total_supply, meta.decimals0)
@@ -480,6 +509,7 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
             pool_id, block_number, block_timestamp,
             acc.price_open, acc.price_close, acc.price_high, acc.price_low,
             acc.active_liquidity, amount0, amount1, tvl_usd, market_cap,
+            active_liquidity_usd,
             acc.volume0, acc.volume1, volume_usd, acc.swap_count,
         ))
 
@@ -489,7 +519,7 @@ def handle_block(block_number: int, block_timestamp, events: list, call_results:
             block_number, block_timestamp,
             acc.tick, acc.sqrt_price_x96,
             acc.price_close, acc.active_liquidity,
-            amount0, amount1, tvl_usd,
+            amount0, amount1, tvl_usd, active_liquidity_usd,
             meta.total_supply, market_cap,
             volume_24h, price_change_1h, price_change_24h,
             acc.swap_count,  # this is just this block, accumulate differently for 24h
@@ -530,6 +560,7 @@ def rebuild_tick_maps():
 ```sql
 -- Top pools by market cap, page 2
 SELECT pool_id, price, market_cap_usd, active_liquidity,
+       active_liquidity_usd,
        tvl_usd, volume_24h_usd, price_change_24h
 FROM pool_state
 ORDER BY market_cap_usd DESC NULLS LAST
@@ -564,6 +595,7 @@ SELECT
     sum(volume_usd) AS volume,
     (array_agg(market_cap_usd ORDER BY block_number DESC))[1] AS market_cap,
     (array_agg(active_liquidity ORDER BY block_number DESC))[1] AS active_liquidity,
+    (array_agg(active_liquidity_usd ORDER BY block_number DESC))[1] AS active_liquidity_usd,
     (array_agg(tvl_usd ORDER BY block_number DESC))[1] AS tvl
 FROM pool_snapshots
 WHERE pool_id = $1
