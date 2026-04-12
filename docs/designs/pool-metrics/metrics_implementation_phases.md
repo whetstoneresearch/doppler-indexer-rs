@@ -12,15 +12,15 @@ This roadmap covers metrics handlers for all 9 pool type variants, shared abstra
 
 ### pool_state — hot query target for dashboards
 
-Keyed by `(chain_id, pool_id, source, source_version)`. Contains latest tick, sqrt_price_x96, price, active_liquidity. Conditional upsert: only update if new `block_number > existing`. TVL and rolling 24h fields added in later phases.
+Keyed by `(chain_id, pool_id, source, source_version)`. Contains latest tick, sqrt_price_x96, price, active_liquidity (raw L), and rolling 24h fields (volume_24h_usd, price_change_1h/24h, swap_count_24h — Phase 6). Phase 7 adds `amount0`, `amount1`, `tvl_usd`, `active_liquidity_usd`, `market_cap_usd`, and `total_supply`. Conditional upsert: only update if new `block_number > existing`.
 
 ### pool_snapshots — per-block time series
 
-Keyed by `(chain_id, pool_id, block_number, source, source_version)`. OHLC prices, active_liquidity, volume0/1, swap_count. One row per (pool, block) with activity. INSERT ON CONFLICT updates all columns (idempotent).
+Keyed by `(chain_id, pool_id, block_number, source, source_version)`. OHLC prices, active_liquidity (raw L), volume0/1, swap_count, volume_usd (Phase 6). Phase 7 adds `amount0`, `amount1`, `tvl_usd`, `active_liquidity_usd`, `market_cap_usd`. One row per (pool, block) with activity. INSERT ON CONFLICT updates all non-TVL columns (idempotent); TVL columns are populated by a second pass via the TVL handler's RawSql UPDATE.
 
 ### liquidity_deltas — append-only recovery log
 
-Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper, liquidity_delta. Simple INSERT. Used to rebuild in-memory tick maps for future TVL computation.
+Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper, liquidity_delta. Simple INSERT. Used by Phase 7's TVL handler to rebuild per-range tick maps (stateless re-query, not an in-memory cache).
 
 ---
 
@@ -42,6 +42,13 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 | DhookLiquidityMetricsHandler | DopplerHookInitializer | ModifyLiquidity (tuple) | — | PoolKey::pool_id() | 3 ✅ | — |
 | V4BaseMetricsHandler | DopplerV4Hook | `Swap(int24, uint256, uint256)` | tick_to_sqrt_price_x96() | hook_address → v4_pool_configs | 4 ✅ | **Sequential** proceeds tracker |
 | MigrationPoolMetricsHandler | UniswapV4PoolManager + MigratorHook | PoolManager Swap + ModifyLiquidity | From event | topics[1] (id) | 5 | Migration pool ID filter |
+| V3TvlMetricsHandler | DopplerV3Pool | V3 Swap | From event | contract_address | 7 | Stateless tick-map UPDATE |
+| LockableV3TvlMetricsHandler | DopplerLockableV3Pool | V3 Swap | From event | contract_address | 7 | Stateless tick-map UPDATE |
+| MulticurveTvlMetricsHandler | UniswapV4MulticurveInitializerHook | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 7 | Stateless tick-map UPDATE |
+| DecayMulticurveTvlMetricsHandler | DecayMulticurveHook | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 7 | Stateless tick-map UPDATE |
+| ScheduledMulticurveTvlMetricsHandler | UniswapV4ScheduledMulticurveInitializerHook | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 7 | Stateless tick-map UPDATE |
+| DhookTvlMetricsHandler | DopplerHookInitializer | V4 hook Swap | getSlot0 on_event call | extract_bytes32("poolId") | 7 | Stateless tick-map UPDATE |
+| MigrationPoolTvlMetricsHandler | UniswapV4MigratorHook | PoolManager Swap | From event | topics[1] (id) | 7 | Stateless tick-map UPDATE |
 
 ---
 
@@ -75,7 +82,7 @@ Keyed by `(chain_id, pool_id, block_number, log_index)`. tick_lower, tick_upper,
 | Swap → pool_state | Parallel OK | Conditional upsert (only if newer block) |
 | Mint/Burn/ModifyLiquidity → liquidity_deltas | Parallel OK | Append-only INSERT with PK |
 | V4 base Swap (proceeds) | **Sequential** (`requires_sequential=true`) | Cumulative totals require ordered per-pool deltas; enforced via capacity-1 FIFO semaphore in catchup |
-| TVL computation | Deferred | Separate future pass over liquidity_deltas |
+| TVL + active liquidity USD → pool_snapshots/pool_state | Parallel OK | Stateless per-range: re-queries `liquidity_deltas` each call. Ordering with respect to swap/liquidity handlers provided by `contiguous_handler_dependencies`, not `requires_sequential`. |
 
 ---
 
@@ -338,7 +345,7 @@ multicurve::metrics::register_handlers(registry, chain_id, multicurve_cache);
 
 ---
 
-## Phase 7: TVL Computation (future)
+## Phase 7: TVL + Active Liquidity USD
 
 **Goal**: Compute TVL plus USD active-liquidity pricing from in-memory tick maps and update `pool_snapshots` + `pool_state`.
 

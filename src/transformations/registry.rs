@@ -1352,21 +1352,23 @@ mod tests {
     #[test]
     fn build_registry_declares_all_migration_pool_create_dependencies() {
         let registry = build_registry(1);
-        let deps = registry
+        let mut deps = registry
             .handler_dependency_graph()
             .get("MigrationPoolCreateHandler")
-            .expect("MigrationPoolCreateHandler should be registered");
+            .expect("MigrationPoolCreateHandler should be registered")
+            .clone();
+        deps.sort();
 
-        assert_eq!(
-            deps,
-            &vec![
-                "V4CreateHandler".to_string(),
-                "V4MulticurveCreateHandler".to_string(),
-                "V4ScheduledMulticurveCreateHandler".to_string(),
-                "V4DecayMulticurveCreateHandler".to_string(),
-                "DopplerHookCreateHandler".to_string(),
-            ]
-        );
+        let mut expected = vec![
+            "V4CreateHandler".to_string(),
+            "V4MulticurveCreateHandler".to_string(),
+            "V4ScheduledMulticurveCreateHandler".to_string(),
+            "V4DecayMulticurveCreateHandler".to_string(),
+            "DopplerHookCreateHandler".to_string(),
+        ];
+        expected.sort();
+
+        assert_eq!(deps, expected);
     }
 
     #[test]

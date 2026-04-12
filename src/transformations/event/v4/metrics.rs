@@ -89,7 +89,9 @@ impl TransformationHandler for V4BaseMetricsHandler {
     fn migration_paths(&self) -> Vec<&'static str> {
         vec![
             "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_state_add_tvl.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
             "migrations/tables/pool_snapshots_add_volume_usd.sql",
             "migrations/tables/v4_base_proceeds_state.sql",
         ]
