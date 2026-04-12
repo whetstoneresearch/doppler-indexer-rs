@@ -239,13 +239,33 @@ fn optional_u256_value(value: Option<&U256>) -> DbValue {
     }
 }
 
+fn optional_i32_value(value: Option<i32>) -> DbValue {
+    match value {
+        Some(v) => DbValue::Int32(v),
+        None => DbValue::Null,
+    }
+}
+
+/// Bootstrap state for LP-only TVL materialization when there is no prior
+/// `pool_state`/`pool_snapshots` row yet for the pool.
+///
+/// Future TVL callers are expected to derive this from per-block state sources
+/// such as V3 `slot0`, V4 hook `getSlot0`, or a pool-type-specific equivalent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TvlBootstrapSeed {
+    pub tick: i32,
+    pub sqrt_price_x96: U256,
+    pub price: BigDecimal,
+}
+
 /// Build a `DbOperation::RawSql` upsert that populates TVL columns on a
 /// `pool_snapshots` row owned by the given `target_source` handler.
 ///
 /// If the per-block snapshot row already exists (the swap path wrote it first),
 /// this updates only TVL-related columns. Otherwise it materializes a new
 /// LP-only block row by carrying forward the latest known `price_close` into
-/// OHLC and initializing swap volumes/counts to zero.
+/// OHLC, or by seeding from `bootstrap_seed` when no prior snapshot exists,
+/// while initializing swap volumes/counts to zero.
 pub fn build_snapshot_tvl_update(
     chain_id: u64,
     pool_id: &[u8],
@@ -257,10 +277,30 @@ pub fn build_snapshot_tvl_update(
     tvl_usd: Option<&BigDecimal>,
     market_cap_usd: Option<&BigDecimal>,
     active_liquidity_usd: Option<&BigDecimal>,
+    bootstrap_seed: Option<&TvlBootstrapSeed>,
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
     let query = r#"
+WITH prev AS (
+  SELECT price_close
+  FROM pool_snapshots
+  WHERE chain_id = $1
+    AND pool_id = $2
+    AND block_number <= $3
+    AND source = $11
+    AND source_version = $12
+  ORDER BY block_number DESC
+  LIMIT 1
+),
+seed_price AS (
+  SELECT prev.price_close
+  FROM prev
+  UNION ALL
+  SELECT $13::numeric
+  WHERE NOT EXISTS (SELECT 1 FROM prev)
+    AND $13::numeric IS NOT NULL
+)
 INSERT INTO pool_snapshots (
   chain_id,
   pool_id,
@@ -288,10 +328,10 @@ SELECT
   $2,
   $3,
   $4,
-  prev.price_close,
-  prev.price_close,
-  prev.price_close,
-  prev.price_close,
+  seed_price.price_close,
+  seed_price.price_close,
+  seed_price.price_close,
+  seed_price.price_close,
   $5,
   0::numeric,
   0::numeric,
@@ -304,17 +344,7 @@ SELECT
   $10,
   $11,
   $12
-FROM LATERAL (
-  SELECT price_close
-  FROM pool_snapshots
-  WHERE chain_id = $1
-    AND pool_id = $2
-    AND block_number <= $3
-    AND source = $11
-    AND source_version = $12
-  ORDER BY block_number DESC
-  LIMIT 1
-) AS prev
+FROM seed_price
 ON CONFLICT (chain_id, pool_id, block_number, source, source_version)
 DO UPDATE SET
   block_timestamp = EXCLUDED.block_timestamp,
@@ -341,6 +371,7 @@ DO UPDATE SET
             optional_decimal_value(active_liquidity_usd),
             DbValue::VarChar(target_source.to_string()),
             DbValue::Int32(target_source_version as i32),
+            optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_snapshots".to_string(),
@@ -368,11 +399,12 @@ DO UPDATE SET
 /// `pool_state` row owned by the given `target_source` handler.
 ///
 /// If the latest `pool_state` row is at or before `block_number`, this advances
-/// that row to the new block while carrying forward price/tick fields and the
-/// rolling 24h metrics. If a swap path already wrote the target block, the
-/// conflict update fills in TVL columns in place. If `pool_state` has already
-/// advanced past `block_number`, the `SELECT` yields no row and the statement is
-/// intentionally a no-op rather than overwriting newer state.
+/// that row to the new block while carrying forward price/tick fields and
+/// recomputing the rolling metrics for the new timestamp. If no prior state row
+/// exists yet, `bootstrap_seed` provides the initial tick/price anchor. If a
+/// swap path already wrote the target block, the conflict update fills in TVL
+/// columns in place. If `pool_state` has already advanced past `block_number`,
+/// the statement is intentionally a no-op rather than overwriting newer state.
 pub fn build_state_tvl_update(
     chain_id: u64,
     pool_id: &[u8],
@@ -385,10 +417,53 @@ pub fn build_state_tvl_update(
     market_cap_usd: Option<&BigDecimal>,
     active_liquidity_usd: Option<&BigDecimal>,
     total_supply: Option<&U256>,
+    bootstrap_seed: Option<&TvlBootstrapSeed>,
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
     let query = r#"
+WITH prev AS (
+  SELECT
+    block_number,
+    tick,
+    sqrt_price_x96,
+    price
+  FROM pool_state
+  WHERE chain_id = $1
+    AND pool_id = $2
+    AND source = $12
+    AND source_version = $13
+    AND block_number <= $3
+  ORDER BY block_number DESC
+  LIMIT 1
+),
+newer AS (
+  SELECT 1
+  FROM pool_state
+  WHERE chain_id = $1
+    AND pool_id = $2
+    AND source = $12
+    AND source_version = $13
+    AND block_number > $3
+  LIMIT 1
+),
+state_seed AS (
+  SELECT
+    prev.tick,
+    prev.sqrt_price_x96,
+    prev.price
+  FROM prev
+  UNION ALL
+  SELECT
+    $14::integer,
+    $15::numeric,
+    $16::numeric
+  WHERE NOT EXISTS (SELECT 1 FROM prev)
+    AND NOT EXISTS (SELECT 1 FROM newer)
+    AND $14::integer IS NOT NULL
+    AND $15::numeric IS NOT NULL
+    AND $16::numeric IS NOT NULL
+)
 INSERT INTO pool_state (
   chain_id,
   pool_id,
@@ -416,14 +491,14 @@ SELECT
   $2,
   $3,
   $4,
-  prev.tick,
-  prev.sqrt_price_x96,
-  prev.price,
+  state_seed.tick,
+  state_seed.sqrt_price_x96,
+  state_seed.price,
   $5,
-  prev.volume_24h_usd,
-  prev.price_change_1h,
-  prev.price_change_24h,
-  prev.swap_count_24h,
+  rolling.vol_24h,
+  rolling.pc_1h,
+  rolling.pc_24h,
+  rolling.swaps_24h,
   $6,
   $7,
   $8,
@@ -432,12 +507,41 @@ SELECT
   $11,
   $12,
   $13
-FROM pool_state AS prev
-WHERE prev.chain_id = $1
-  AND prev.pool_id = $2
-  AND prev.source = $12
-  AND prev.source_version = $13
-  AND prev.block_number <= $3
+FROM state_seed
+CROSS JOIN LATERAL (
+  SELECT
+    COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
+    COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h,
+    CASE WHEN h1h.price_close IS NOT NULL AND h1h.price_close != 0
+         THEN (state_seed.price - h1h.price_close) / h1h.price_close
+    END AS pc_1h,
+    CASE WHEN h24h.price_close IS NOT NULL AND h24h.price_close != 0
+         THEN (state_seed.price - h24h.price_close) / h24h.price_close
+    END AS pc_24h
+  FROM pool_snapshots s
+  LEFT JOIN LATERAL (
+    SELECT price_close
+    FROM pool_snapshots
+    WHERE chain_id = $1
+      AND pool_id = $2
+      AND block_timestamp <= ($4 - 3600)
+    ORDER BY block_timestamp DESC, block_number DESC
+    LIMIT 1
+  ) h1h ON true
+  LEFT JOIN LATERAL (
+    SELECT price_close
+    FROM pool_snapshots
+    WHERE chain_id = $1
+      AND pool_id = $2
+      AND block_timestamp <= ($4 - 86400)
+    ORDER BY block_timestamp DESC, block_number DESC
+    LIMIT 1
+  ) h24h ON true
+  WHERE s.chain_id = $1
+    AND s.pool_id = $2
+    AND s.block_timestamp > ($4 - 86400)
+    AND s.block_timestamp <= $4
+) AS rolling
 ON CONFLICT (chain_id, pool_id, source, source_version)
 DO UPDATE SET
   block_number = EXCLUDED.block_number,
@@ -475,6 +579,12 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
             optional_u256_value(total_supply),
             DbValue::VarChar(target_source.to_string()),
             DbValue::Int32(target_source_version as i32),
+            optional_i32_value(bootstrap_seed.map(|seed| seed.tick)),
+            match bootstrap_seed {
+                Some(seed) => DbValue::Numeric(seed.sqrt_price_x96.to_string()),
+                None => DbValue::Null,
+            },
+            optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_state".to_string(),
@@ -532,6 +642,14 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn sample_bootstrap_seed() -> TvlBootstrapSeed {
+        TvlBootstrapSeed {
+            tick: 42,
+            sqrt_price_x96: q96(),
+            price: bd("2"),
+        }
     }
 
     // ─── compute_position_amounts ───
@@ -812,6 +930,7 @@ mod tests {
 
     #[test]
     fn test_build_snapshot_tvl_update_structure() {
+        let bootstrap_seed = sample_bootstrap_seed();
         let op = build_snapshot_tvl_update(
             8453,
             &[0xAAu8; 20],
@@ -823,6 +942,7 @@ mod tests {
             Some(&bd("5000")),
             Some(&bd("4000000000000")),
             Some(&bd("3200")),
+            Some(&bootstrap_seed),
             "V3SwapMetricsHandler",
             1,
         );
@@ -833,7 +953,9 @@ mod tests {
                 snapshot,
             } => {
                 assert!(query.contains("INSERT INTO pool_snapshots"));
-                assert!(query.contains("prev.price_close"));
+                assert!(query.contains("WITH prev AS"));
+                assert!(query.contains("FROM seed_price"));
+                assert!(query.contains("SELECT $13::numeric"));
                 assert!(query.contains(
                     "ON CONFLICT (chain_id, pool_id, block_number, source, source_version)"
                 ));
@@ -841,10 +963,14 @@ mod tests {
                 assert!(query.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
                 assert!(query.contains("source = $11"));
                 assert!(query.contains("source_version = $12"));
-                assert_eq!(params.len(), 12);
+                assert_eq!(params.len(), 13);
                 match &params[9] {
                     DbValue::Numeric(s) => assert_eq!(s, "3200"),
                     other => panic!("expected Numeric for active_liquidity_usd, got {:?}", other),
+                }
+                match &params[12] {
+                    DbValue::Numeric(s) => assert_eq!(s, "2"),
+                    other => panic!("expected Numeric for bootstrap seed price, got {:?}", other),
                 }
 
                 let snap = snapshot.expect("snapshot should be present");
@@ -879,15 +1005,18 @@ mod tests {
             None,
             None,
             None,
+            None,
             "V3SwapMetricsHandler",
             1,
         );
         match op {
             DbOperation::RawSql { params, .. } => {
-                // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd
+                // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd,
+                // [12] = bootstrap price
                 assert!(matches!(params[7], DbValue::Null));
                 assert!(matches!(params[8], DbValue::Null));
                 assert!(matches!(params[9], DbValue::Null));
+                assert!(matches!(params[12], DbValue::Null));
             }
             _ => panic!("expected RawSql"),
         }
@@ -898,6 +1027,7 @@ mod tests {
     #[test]
     fn test_build_state_tvl_update_structure() {
         let supply = U256::from(1_000_000_000u64);
+        let bootstrap_seed = sample_bootstrap_seed();
         let op = build_state_tvl_update(
             8453,
             &[0xAAu8; 20],
@@ -910,6 +1040,7 @@ mod tests {
             Some(&bd("4000000000000")),
             Some(&bd("3200")),
             Some(&supply),
+            Some(&bootstrap_seed),
             "V3SwapMetricsHandler",
             1,
         );
@@ -920,15 +1051,37 @@ mod tests {
                 snapshot,
             } => {
                 assert!(query.contains("INSERT INTO pool_state"));
-                assert!(query.contains("prev.volume_24h_usd"));
+                assert!(query.contains("WITH prev AS"));
+                assert!(query.contains("$14::integer"));
+                assert!(query.contains("CROSS JOIN LATERAL"));
+                assert!(query.contains("COALESCE(SUM(s.volume_usd), 0) AS vol_24h"));
+                assert!(query.contains("s.block_timestamp <= $4"));
+                assert!(!query.contains("prev.volume_24h_usd"));
+                assert!(!query.contains("prev.price_change_1h"));
                 assert!(query.contains("ON CONFLICT (chain_id, pool_id, source, source_version)"));
                 assert!(query.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
                 assert!(query.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
-                assert!(query.contains("prev.block_number <= $3"));
-                assert_eq!(params.len(), 13);
+                assert_eq!(params.len(), 16);
                 match &params[9] {
                     DbValue::Numeric(s) => assert_eq!(s, "3200"),
                     other => panic!("expected Numeric for active_liquidity_usd, got {:?}", other),
+                }
+                match &params[13] {
+                    DbValue::Int32(v) => assert_eq!(*v, 42),
+                    other => panic!("expected Int32 for bootstrap tick, got {:?}", other),
+                }
+                match &params[14] {
+                    DbValue::Numeric(s) => assert_eq!(s, &q96().to_string()),
+                    other => {
+                        panic!(
+                            "expected Numeric for bootstrap sqrt_price_x96, got {:?}",
+                            other
+                        )
+                    }
+                }
+                match &params[15] {
+                    DbValue::Numeric(s) => assert_eq!(s, "2"),
+                    other => panic!("expected Numeric for bootstrap price, got {:?}", other),
                 }
 
                 let snap = snapshot.expect("snapshot should be present");
@@ -958,17 +1111,21 @@ mod tests {
             None,
             None,
             None,
+            None,
             "V3SwapMetricsHandler",
             1,
         );
         match op {
             DbOperation::RawSql { params, .. } => {
                 // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd,
-                // [10] = total_supply
+                // [10] = total_supply, [13..=15] = bootstrap seed
                 assert!(matches!(params[7], DbValue::Null));
                 assert!(matches!(params[8], DbValue::Null));
                 assert!(matches!(params[9], DbValue::Null));
                 assert!(matches!(params[10], DbValue::Null));
+                assert!(matches!(params[13], DbValue::Null));
+                assert!(matches!(params[14], DbValue::Null));
+                assert!(matches!(params[15], DbValue::Null));
             }
             _ => panic!("expected RawSql"),
         }

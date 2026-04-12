@@ -31,6 +31,7 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::eth_call::{
     encode_call_with_params, EventFieldLocation, EvmType, ParamConfig,
 };
+use crate::types::uniswap::v4::PoolKey;
 
 /// Pending write tasks spawned by process functions.
 /// Returned to the caller so writes can be awaited after releasing concurrency permits.
@@ -227,6 +228,66 @@ pub(crate) fn extract_param_from_event(
             word.copy_from_slice(&trigger.data[start..end]);
             extract_value_from_32_bytes(&word, param_type)
         }
+        EventFieldLocation::V4PoolIdFromKeyData => {
+            extract_v4_pool_id_from_key_data(trigger, param_type)
+        }
+    }
+}
+
+fn extract_v4_pool_id_from_key_data(
+    trigger: &EventTriggerData,
+    param_type: &EvmType,
+) -> Result<(DynSolValue, Vec<u8>), EthCallCollectionError> {
+    if !matches!(param_type, EvmType::Bytes32) {
+        return Err(EthCallCollectionError::EventParamExtraction(format!(
+            "from_event: \"v4_pool_id_from_key_data\" requires param type to be bytes32, got {:?}",
+            param_type
+        )));
+    }
+
+    if trigger.data.len() < 5 * 32 {
+        return Err(EthCallCollectionError::EventParamExtraction(format!(
+            "v4_pool_id_from_key_data requires at least 160 bytes of event data, got {}",
+            trigger.data.len()
+        )));
+    }
+
+    let word = |idx: usize| -> [u8; 32] {
+        let start = idx * 32;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&trigger.data[start..start + 32]);
+        out
+    };
+
+    let pool_id = PoolKey {
+        currency0: Address::from(address_from_word(&word(0))),
+        currency1: Address::from(address_from_word(&word(1))),
+        fee: uint24_from_word(&word(2)),
+        tick_spacing: int24_from_word(&word(3)),
+        hooks: Address::from(address_from_word(&word(4))),
+    }
+    .pool_id();
+
+    let encoded = DynSolValue::FixedBytes(pool_id, 32).abi_encode();
+    Ok((DynSolValue::FixedBytes(pool_id, 32), encoded))
+}
+
+fn address_from_word(word: &[u8; 32]) -> [u8; 20] {
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&word[12..32]);
+    addr
+}
+
+fn uint24_from_word(word: &[u8; 32]) -> u32 {
+    ((word[29] as u32) << 16) | ((word[30] as u32) << 8) | (word[31] as u32)
+}
+
+fn int24_from_word(word: &[u8; 32]) -> i32 {
+    let raw = ((word[29] as i32) << 16) | ((word[30] as i32) << 8) | (word[31] as i32);
+    if (raw & 0x80_0000) != 0 {
+        raw | !0x00FF_FFFF
+    } else {
+        raw
     }
 }
 
@@ -1523,4 +1584,71 @@ pub(crate) fn build_event_call_schema(num_params: usize) -> Arc<Schema> {
     }
 
     Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_param_from_event;
+    use crate::raw_data::historical::receipts::EventTriggerData;
+    use crate::types::config::eth_call::{EventFieldLocation, EvmType};
+    use crate::types::uniswap::v4::PoolKey;
+    use alloy::dyn_abi::DynSolValue;
+    use alloy::primitives::Address;
+    use alloy::sol;
+    use alloy::sol_types::SolValue;
+
+    sol! {
+        struct TestPoolKey {
+            address currency0;
+            address currency1;
+            uint24 fee;
+            int24 tickSpacing;
+            address hooks;
+        }
+    }
+
+    #[test]
+    fn test_extract_param_from_event_v4_pool_id_from_key_data() {
+        let currency0 = Address::from([0x11; 20]);
+        let currency1 = Address::from([0x22; 20]);
+        let hooks = Address::from([0x33; 20]);
+        let fee = 3000u32;
+        let tick_spacing = -60i32;
+
+        let trigger = EventTriggerData {
+            block_number: 100,
+            block_timestamp: 200,
+            log_index: 0,
+            emitter_address: [0u8; 20],
+            source_name: "test".to_string(),
+            event_signature: [0u8; 32],
+            topics: vec![[0u8; 32]],
+            data: TestPoolKey {
+                currency0,
+                currency1,
+                fee: fee.try_into().unwrap(),
+                tickSpacing: tick_spacing.try_into().unwrap(),
+                hooks,
+            }
+            .abi_encode(),
+        };
+
+        let (value, _encoded) = extract_param_from_event(
+            &trigger,
+            &EventFieldLocation::V4PoolIdFromKeyData,
+            &EvmType::Bytes32,
+        )
+        .expect("pool id extraction should succeed");
+
+        let expected = PoolKey {
+            currency0,
+            currency1,
+            fee,
+            tick_spacing,
+            hooks,
+        }
+        .pool_id();
+
+        assert_eq!(value, DynSolValue::FixedBytes(expected, 32));
+    }
 }
