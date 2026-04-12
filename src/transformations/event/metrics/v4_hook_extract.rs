@@ -152,6 +152,7 @@ mod tests {
         DecodedCall, DecodedEvent, DecodedValue, TransformationContext,
     };
     use crate::transformations::historical::HistoricalDataReader;
+    use crate::types::chain::{ChainAddress, LogPosition, TxId};
     use crate::types::uniswap::v4::PoolKey;
 
     use super::{
