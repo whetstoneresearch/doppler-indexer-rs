@@ -861,6 +861,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{batch_to_events, HistoricalDataReader};
+    use crate::types::chain::ChainAddress;
     use crate::types::decoded::DecodedValue;
 
     #[test]

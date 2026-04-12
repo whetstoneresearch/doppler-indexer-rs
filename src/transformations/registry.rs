@@ -194,13 +194,19 @@ impl TransformationRegistry {
                 .push(handler.clone());
         }
 
+        let mut seen_deps: HashSet<String> = HashSet::new();
         let deps: Vec<String> = handler
             .handler_dependencies()
             .into_iter()
             .chain(handler.contiguous_handler_dependencies())
-            .map(|d| d.to_string())
-            .collect::<HashSet<_>>()
-            .into_iter()
+            .filter_map(|dep| {
+                let dep = dep.to_string();
+                if seen_deps.insert(dep.clone()) {
+                    Some(dep)
+                } else {
+                    None
+                }
+            })
             .collect();
         if !deps.is_empty() {
             self.handler_dependency_graph
