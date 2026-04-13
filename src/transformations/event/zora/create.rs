@@ -10,10 +10,15 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::sanitize::strip_nul_bytes;
+use crate::transformations::util::pool_metadata::VersionedSource;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
 
 const SOURCE: &str = "ZoraFactory";
 const ZERO_ADDRESS: [u8; 20] = [0u8; 20];
+pub const ZORA_CREATE_HANDLER_NAME: &str = "ZoraCreateHandler";
+pub const ZORA_CREATE_HANDLER_VERSION: u32 = 1;
+pub const ZORA_CREATE_HANDLER_SCOPE: VersionedSource =
+    VersionedSource::new(ZORA_CREATE_HANDLER_NAME, ZORA_CREATE_HANDLER_VERSION);
 
 #[derive(Clone, Copy)]
 enum CoinKind {
@@ -56,11 +61,11 @@ pub struct ZoraCreateHandler;
 #[async_trait]
 impl TransformationHandler for ZoraCreateHandler {
     fn name(&self) -> &'static str {
-        "ZoraCreateHandler"
+        ZORA_CREATE_HANDLER_NAME
     }
 
     fn version(&self) -> u32 {
-        1
+        ZORA_CREATE_HANDLER_VERSION
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {
