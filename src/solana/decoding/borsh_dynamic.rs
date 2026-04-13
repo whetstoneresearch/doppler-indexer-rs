@@ -137,10 +137,13 @@ pub fn deserialize_value(
 
         IdlType::Option(inner) => {
             let tag = read_u8(cursor)?;
-            if tag == 0 {
-                Ok(DecodedValue::Null)
-            } else {
-                deserialize_value(cursor, inner, defined_types)
+            match tag {
+                0 => Ok(DecodedValue::Null),
+                1 => deserialize_value(cursor, inner, defined_types),
+                _ => Err(SolanaDecodeError::IdlParse(format!(
+                    "invalid Borsh Option tag: {}, expected 0 or 1",
+                    tag
+                ))),
             }
         }
 
@@ -915,5 +918,20 @@ mod tests {
         let result = deserialize_value(&mut cursor, &IdlType::Vec(Box::new(IdlType::U8)), &HashMap::new());
         // Must fail with UnexpectedEof, not OOM.
         assert!(matches!(result, Err(SolanaDecodeError::UnexpectedEof { .. })));
+    }
+
+    #[test]
+    fn test_invalid_option_tag_rejected() {
+        // Tag byte 2 is invalid for Borsh Option (only 0 and 1 are valid).
+        let data: &[u8] = &[2, 0xFF, 0xFF, 0xFF];
+        let mut cursor: &[u8] = data;
+        let result = deserialize_value(
+            &mut cursor,
+            &IdlType::Option(Box::new(IdlType::U8)),
+            &HashMap::new(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid Borsh Option tag"));
     }
 }

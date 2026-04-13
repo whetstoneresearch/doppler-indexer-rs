@@ -638,17 +638,32 @@ fn parse_account_names(value: &serde_json::Value) -> Vec<String> {
     };
 
     let mut names = Vec::new();
-    collect_leaf_account_names(accounts_arr, &mut names);
+    collect_leaf_account_names(accounts_arr, "", &mut names);
     names
 }
 
-fn collect_leaf_account_names(accounts: &[serde_json::Value], out: &mut Vec<String>) {
+fn collect_leaf_account_names(
+    accounts: &[serde_json::Value],
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
     for acc in accounts {
-        // Composite group: has nested "accounts" array — recurse into it.
+        let name = acc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        // Composite group: has nested "accounts" array — recurse with prefix.
         if let Some(nested) = acc.get("accounts").and_then(|a| a.as_array()) {
-            collect_leaf_account_names(nested, out);
-        } else if let Some(name) = acc.get("name").and_then(|n| n.as_str()) {
-            out.push(name.to_string());
+            let child_prefix = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            collect_leaf_account_names(nested, &child_prefix, out);
+        } else if !name.is_empty() {
+            let qualified = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}.{}", prefix, name)
+            };
+            out.push(qualified);
         }
     }
 }
@@ -1291,11 +1306,11 @@ mod tests {
         let result = decoder.decode_instruction(&ix_data, &accounts).unwrap();
         let decoded = result.expect("should decode");
 
-        // Composite group "tokenGroup" should be flattened to leaf accounts.
+        // Composite group leaves are prefixed with parent group name.
         assert_eq!(decoded.named_accounts.len(), 4);
         assert_eq!(decoded.named_accounts["pool"], [1u8; 32]);
-        assert_eq!(decoded.named_accounts["tokenA"], [2u8; 32]);
-        assert_eq!(decoded.named_accounts["tokenB"], [3u8; 32]);
+        assert_eq!(decoded.named_accounts["tokenGroup.tokenA"], [2u8; 32]);
+        assert_eq!(decoded.named_accounts["tokenGroup.tokenB"], [3u8; 32]);
         assert_eq!(decoded.named_accounts["authority"], [4u8; 32]);
     }
 
@@ -1415,5 +1430,55 @@ mod tests {
         } else {
             panic!("Mixed should be a struct");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: duplicate leaf names under different groups get unique keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_composite_accounts_duplicate_leaf_names() {
+        let idl_json = r#"{
+            "name": "dup_test",
+            "instructions": [
+                {
+                    "name": "transfer",
+                    "accounts": [
+                        {
+                            "name": "source",
+                            "accounts": [
+                                {"name": "token", "isMut": true, "isSigner": false},
+                                {"name": "authority", "isMut": false, "isSigner": true}
+                            ]
+                        },
+                        {
+                            "name": "destination",
+                            "accounts": [
+                                {"name": "token", "isMut": true, "isSigner": false},
+                                {"name": "authority", "isMut": false, "isSigner": false}
+                            ]
+                        }
+                    ],
+                    "args": []
+                }
+            ],
+            "events": [],
+            "types": []
+        }"#;
+
+        let decoder = AnchorDecoder::new([0u8; 32], "test".to_string(), idl_json).unwrap();
+        let disc = compute_instruction_discriminator("transfer");
+        let ix_data = disc.to_vec();
+
+        let accounts = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let result = decoder.decode_instruction(&ix_data, &accounts).unwrap();
+        let decoded = result.expect("should decode");
+
+        // Both groups have "token" and "authority" but they must be distinct keys.
+        assert_eq!(decoded.named_accounts.len(), 4);
+        assert_eq!(decoded.named_accounts["source.token"], [1u8; 32]);
+        assert_eq!(decoded.named_accounts["source.authority"], [2u8; 32]);
+        assert_eq!(decoded.named_accounts["destination.token"], [3u8; 32]);
+        assert_eq!(decoded.named_accounts["destination.authority"], [4u8; 32]);
     }
 }
