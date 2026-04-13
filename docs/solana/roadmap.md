@@ -284,39 +284,53 @@ Wraps `solana_client::nonblocking::rpc_client::RpcClient` with:
 - Fetches blocks by slot via `getBlock(slot)`
 - Handles skipped slots gracefully (Solana-specific: not all slots have blocks)
 - Writes `SolanaSlotRecord` to parquet: `slot`, `block_time`, `parent_slot`, `blockhash` (32B), `transaction_count`, `transaction_signatures` (List of 64B)
-- Sends `(slot, block_time, Vec<Signature>)` downstream
+- Sends `SlotData { slot, block }` downstream to extractor via `slot_tx` channel
+- Skipped slots recorded in `skipped_slots.json` index (see design.md §8.5)
 
 ### 5b. Event + instruction extractor (`src/solana/raw_data/events.rs`, `instructions.rs`)
 
+Single-pass extraction over block transactions. Failed transactions (`meta.err.is_some()`) are skipped entirely (see design.md §8.6).
+
 **Events:**
 - Parses `logMessages` from transaction metadata for `"Program data: <base64>"` entries
-- Stack-based program ID tracking (matches "Program X invoke" / "Program X success" patterns)
-- Writes `SolanaEventRecord` to parquet: `slot`, `block_time`, `transaction_signature` (64B), `program_id` (32B), `event_discriminator` (8B), `event_data` (binary), `log_index`
-- Sends events downstream to decoder channel
+- Stack-based program ID tracking with instruction position tracking (matches "Program X invoke [N]" / "Program X success" patterns)
+- `SolanaEventRecord` now includes `instruction_index` and `inner_instruction_index` alongside flat `log_index` (see design.md §8.2)
+- Writes to parquet, sends `SolanaEventsReady` to `event_decoder_tx`
 
 **Instructions** (same pass over transactions):
-- Extracts instruction `data` + `accounts` from `transaction.message.instructions` and `meta.innerInstructions`
+- Extracts from `transaction.message.instructions` (top-level) and `meta.innerInstructions` (CPI)
+- Resolves account indices to pubkeys via `transaction.message.accountKeys`
 - Filters by configured program IDs
-- Writes `SolanaInstructionRecord` to parquet: `slot`, `block_time`, `transaction_signature` (64B), `program_id` (32B), `data` (binary), `accounts` (List of 32B), `instruction_index`, `inner_instruction_index`
-- Sends instructions downstream to decoder channel
-- See design.md §14.3 for full specification
+- Writes `SolanaInstructionRecord` to parquet (see design.md §8.2b for full spec)
+- Sends `SolanaInstructionsReady` to `instr_decoder_tx`
+
+**CPI coverage**: Both `getSignaturesForAddress` and `getBlock` `logMessages` include CPI invocations because invoked programs must be in the transaction's `accountKeys`. See design.md §8.7.
 
 ### 5c. Address discovery (`src/solana/discovery.rs`)
 
-- Event-driven: parse creation events (e.g., `PoolInitialized`) to discover account addresses from decoded event fields
-- Bootstrap fallback: one-time `getProgramAccounts` scan with discriminator filter for initial discovery
-- Feeds discovered addresses to live-mode account reader
-- See design.md §10.2b for full specification
+Follows EVM factory collection timing pattern (see design.md §10.2b):
+- **Bootstrap**: `getProgramAccounts` scan at startup (before backfill), persisted to `known_accounts.json`
+- **During backfill**: event-driven discovery accumulates addresses (no feedback to collection)
+- **During live**: incremental discovery triggers account reads via `discovery_addresses_tx`
+- Catchup barrier (`discovery_catchup_done_tx`) ensures full address set before live account reads start
 
 ### 5d. Historical backfill strategy
 
 **Signature-driven** (not slot-driven) for efficiency:
 1. `getSignaturesForAddress(program_id, { limit: 1000, before: cursor })` — paginate backward
-2. Group signatures by slot range
+2. Group signatures by slot range (aligned to `parquet_block_range`)
 3. Batch-fetch blocks for each range via `getBlock(slot)`
-4. Extract events and instructions
+4. Extract events and instructions in single pass
 
-This avoids iterating every slot (~2/sec = 170K/day) when most won't contain target program transactions.
+This avoids iterating every slot (~2/sec = 170K/day) when most won't contain target program transactions. CPI transactions are captured because `getSignaturesForAddress` matches on `accountKeys` which includes CPI-invoked programs (see design.md §8.7).
+
+### 5e. Skipped slots index
+
+Range-aligned parquet files may contain fewer rows than the slot span due to skipped slots. A `skipped_slots.json` sidecar file per data directory tracks which slots were skipped, enabling the resume logic to distinguish complete ranges from interrupted ones. See design.md §8.5 for format and invariants.
+
+### 5f. Channel topology
+
+Solana uses a parallel channel topology: `slot_tx` → extractor → separate `event_decoder_tx` and `instr_decoder_tx` → both feed `transform_events_tx` → TransformationEngine. Discovery runs as a sidecar via `discovery_tx`. See design.md §10.5 for full topology, message types, and barrier semantics.
 
 **New files**: `src/solana/raw_data/mod.rs`, `slots.rs`, `events.rs`, `instructions.rs`, `catchup.rs`, `src/solana/discovery.rs`
 

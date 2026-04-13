@@ -47,6 +47,38 @@ pub fn factories_dir(chain: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/historical/factories", chain))
 }
 
+// ---------------------------------------------------------------------------
+// Solana path builders
+// ---------------------------------------------------------------------------
+
+/// `data/{chain}/historical/raw/slots`
+#[cfg(feature = "solana")]
+pub fn raw_solana_slots_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/raw/slots", chain))
+}
+
+/// `data/{chain}/historical/raw/events`
+#[cfg(feature = "solana")]
+pub fn raw_solana_events_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/raw/events", chain))
+}
+
+/// `data/{chain}/historical/raw/instructions`
+#[cfg(feature = "solana")]
+pub fn raw_solana_instructions_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/raw/instructions", chain))
+}
+
+/// `data/{chain}/discovery`
+#[cfg(feature = "solana")]
+pub fn solana_discovery_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/discovery", chain))
+}
+
+// ---------------------------------------------------------------------------
+// EVM decoded path builders
+// ---------------------------------------------------------------------------
+
 /// `data/{chain}/historical/decoded`
 pub fn decoded_base_dir(chain: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/historical/decoded", chain))
@@ -116,6 +148,9 @@ pub fn parse_range_from_filename(path: &Path) -> Option<(u64, u64)> {
         .or_else(|| stem.strip_prefix("receipts_"))
         .or_else(|| stem.strip_prefix("logs_"))
         .or_else(|| stem.strip_prefix("decoded_"))
+        .or_else(|| stem.strip_prefix("slots_"))
+        .or_else(|| stem.strip_prefix("events_"))
+        .or_else(|| stem.strip_prefix("instructions_"))
         .unwrap_or(stem);
 
     let mut parts = range_part.splitn(2, '-');

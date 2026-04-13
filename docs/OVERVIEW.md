@@ -194,6 +194,12 @@ migrations/
 - **depends_on**: [rpc]
 - **doc**: `docs/features/metrics.md`
 
+### solana_raw_data
+- **description**: Solana raw data collection behind the `solana` feature flag. Extracts events from transaction log messages via ProgramLogParser (tracking CPI depth and instruction indices) and instructions from the transaction instruction tree (resolving account indices through Address Lookup Tables). Combined single-pass block extraction function processes both in one iteration. All extraction filters by a configured set of program IDs.
+- **entry_points**: `src/solana/raw_data/events.rs`, `src/solana/raw_data/instructions.rs`, `src/solana/raw_data/extraction.rs`
+- **depends_on**: [solana_rpc, configuration]
+- **doc**: `docs/features/solana_raw_data.md`
+
 ---
 
 ## Project Structure
