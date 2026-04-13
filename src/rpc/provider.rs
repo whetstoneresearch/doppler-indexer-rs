@@ -527,7 +527,7 @@ pub struct RpcClient {
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = build_provider(&config.url)?;
+        let provider = build_provider(config.url.clone(), config.force_http2)?;
         let chain: Arc<str> = chain_label_from_url(&config.url).into();
         let concurrency = config.concurrency.max(1);
 
@@ -558,7 +558,7 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = build_provider(&config.url)?;
+        let provider = build_provider(config.url.clone(), config.force_http2)?;
         let chain: Arc<str> = chain_label_from_url(&config.url).into();
         let concurrency = config.concurrency.max(1);
         Ok(Self {
