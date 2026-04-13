@@ -304,27 +304,29 @@ fn parse_type_def(
                 })?;
 
             let mut fields = Vec::with_capacity(fields_arr.len());
-            for field in fields_arr {
-                let field_name = field
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .ok_or_else(|| {
+            for (idx, field) in fields_arr.iter().enumerate() {
+                if field.is_object() {
+                    // Named field: {"name": "x", "type": "u64"}
+                    let field_name = field
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("field_{}", idx));
+
+                    let field_type_val = field.get("type").ok_or_else(|| {
                         SolanaDecodeError::IdlParse(format!(
-                            "field in struct '{}' missing 'name'",
-                            name
+                            "field '{}' in struct '{}' missing 'type'",
+                            field_name, name
                         ))
-                    })?
-                    .to_string();
+                    })?;
 
-                let field_type_val = field.get("type").ok_or_else(|| {
-                    SolanaDecodeError::IdlParse(format!(
-                        "field '{}' in struct '{}' missing 'type'",
-                        field_name, name
-                    ))
-                })?;
-
-                let field_type = parse_idl_type(field_type_val, version)?;
-                fields.push((field_name, field_type));
+                    let field_type = parse_idl_type(field_type_val, version)?;
+                    fields.push((field_name, field_type));
+                } else {
+                    // Unnamed/tuple field: bare type like "u64" or {"vec": "u8"}
+                    let field_type = parse_idl_type(field, version)?;
+                    fields.push((format!("field_{}", idx), field_type));
+                }
             }
 
             Ok((name, IdlTypeDef::Struct { fields }))
@@ -1351,6 +1353,67 @@ mod tests {
             assert_eq!(fields[1].0, "remaining");
         } else {
             panic!("OrderStatus should be an enum");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: tuple-style struct definitions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tuple_struct_fields() {
+        let idl_json = r#"{
+            "name": "tuple_test",
+            "instructions": [],
+            "events": [],
+            "types": [
+                {
+                    "name": "Pair",
+                    "type": {
+                        "kind": "struct",
+                        "fields": ["u64", "pubkey"]
+                    }
+                },
+                {
+                    "name": "Mixed",
+                    "type": {
+                        "kind": "struct",
+                        "fields": [
+                            "u64",
+                            {"name": "label", "type": "string"},
+                            "bool"
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let parsed = parse_idl(idl_json).unwrap();
+
+        // Pure tuple struct
+        let pair = parsed.defined_types.get("Pair").expect("Pair present");
+        if let IdlTypeDef::Struct { fields } = pair {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "field_0");
+            assert_eq!(fields[0].1, IdlType::U64);
+            assert_eq!(fields[1].0, "field_1");
+            assert_eq!(fields[1].1, IdlType::Pubkey);
+        } else {
+            panic!("Pair should be a struct");
+        }
+
+        // Mixed named + unnamed fields
+        let mixed = parsed.defined_types.get("Mixed").expect("Mixed present");
+        if let IdlTypeDef::Struct { fields } = mixed {
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].0, "field_0");
+            assert_eq!(fields[0].1, IdlType::U64);
+            assert_eq!(fields[1].0, "label");
+            assert_eq!(fields[1].1, IdlType::String);
+            assert_eq!(fields[2].0, "field_2");
+            assert_eq!(fields[2].1, IdlType::Bool);
+        } else {
+            panic!("Mixed should be a struct");
         }
     }
 }

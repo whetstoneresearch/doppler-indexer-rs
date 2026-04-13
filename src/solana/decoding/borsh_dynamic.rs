@@ -147,7 +147,9 @@ pub fn deserialize_value(
         IdlType::Vec(inner) => {
             let len_bytes = read_le::<4>(cursor)?;
             let len = u32::from_le_bytes(len_bytes) as usize;
-            let mut items = Vec::with_capacity(len);
+            // Cap pre-allocation to remaining bytes to prevent OOM on malformed input.
+            let safe_cap = len.min(cursor.len());
+            let mut items = Vec::with_capacity(safe_cap);
             for _ in 0..len {
                 items.push(deserialize_value(cursor, inner, defined_types)?);
             }
@@ -900,5 +902,18 @@ mod tests {
         }
 
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn test_vec_malformed_length_does_not_oom() {
+        // 4-byte length claiming 1 billion elements, but only 2 bytes of actual data.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+        data.extend_from_slice(&[0x01, 0x02]);
+
+        let mut cursor: &[u8] = &data;
+        let result = deserialize_value(&mut cursor, &IdlType::Vec(Box::new(IdlType::U8)), &HashMap::new());
+        // Must fail with UnexpectedEof, not OOM.
+        assert!(matches!(result, Err(SolanaDecodeError::UnexpectedEof { .. })));
     }
 }
