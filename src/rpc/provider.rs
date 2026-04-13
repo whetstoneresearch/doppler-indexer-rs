@@ -651,21 +651,27 @@ impl RpcClient {
         full_transactions: bool,
     ) -> Result<Option<Block>, RpcError> {
         let op_name = format!("eth_getBlockByNumber({:?})", block_id);
-        with_retry(&self.config.retry, "eth_getBlockByNumber", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            let builder = self.provider.get_block(block_id);
-            if full_transactions {
-                builder
-                    .full()
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            } else {
-                builder
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            }
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_getBlockByNumber",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                let builder = self.provider.get_block(block_id);
+                if full_transactions {
+                    builder
+                        .full()
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                } else {
+                    builder
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                }
+            },
+        )
         .await
     }
 
@@ -680,14 +686,20 @@ impl RpcClient {
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
-        with_retry(&self.config.retry, "eth_getTransactionByHash", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            self.provider
-                .get_transaction_by_hash(hash)
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_getTransactionByHash",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .get_transaction_by_hash(hash)
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -696,14 +708,20 @@ impl RpcClient {
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
-        with_retry(&self.config.retry, "eth_getTransactionReceipt", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            self.provider
-                .get_transaction_receipt(hash)
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_getTransactionReceipt",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .get_transaction_receipt(hash)
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -813,14 +831,20 @@ impl RpcClient {
             filter.get_from_block(),
             filter.get_to_block()
         );
-        with_retry(&self.config.retry, "eth_getLogs", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            self.provider
-                .get_logs(&filter)
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_getLogs",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .get_logs(&filter)
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -830,15 +854,21 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, "eth_getBalance", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            self.provider
-                .get_balance(address)
-                .block_id(block.unwrap_or(BlockId::latest()))
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_getBalance",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .get_balance(address)
+                    .block_id(block.unwrap_or(BlockId::latest()))
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -848,15 +878,21 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
         let op_name = format!("eth_getCode({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, "eth_getCode", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            self.provider
-                .get_code_at(address)
-                .block_id(block.unwrap_or(BlockId::latest()))
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_getCode",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .get_code_at(address)
+                    .block_id(block.unwrap_or(BlockId::latest()))
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 
@@ -867,15 +903,21 @@ impl RpcClient {
     ) -> Result<Bytes, RpcError> {
         let tx = tx.clone();
         let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
-        with_retry(&self.config.retry, "eth_call", &op_name, &self.chain, || async {
-            self.wait_for_rate_limit().await;
-            let _permit = self.acquire_rpc_permit().await;
-            self.provider
-                .call(tx.clone())
-                .block(block.unwrap_or(BlockId::latest()))
-                .await
-                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-        })
+        with_retry(
+            &self.config.retry,
+            "eth_call",
+            &op_name,
+            &self.chain,
+            || async {
+                self.wait_for_rate_limit().await;
+                let _permit = self.acquire_rpc_permit().await;
+                self.provider
+                    .call(tx.clone())
+                    .block(block.unwrap_or(BlockId::latest()))
+                    .await
+                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+            },
+        )
         .await
     }
 

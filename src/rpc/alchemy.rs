@@ -736,12 +736,18 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
             .await;
         with_metrics(RpcMethod::GetBlockNumber, &chain, || async {
-            with_retry(&retry_config, "eth_blockNumber", "eth_blockNumber", &chain, || async {
-                provider
-                    .get_block_number()
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_blockNumber",
+                "eth_blockNumber",
+                &chain,
+                || async {
+                    provider
+                        .get_block_number()
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -763,19 +769,25 @@ impl AlchemyClient {
 
         self.consume_compute_units(cost).await;
         with_metrics(RpcMethod::GetBlock, &chain, || async {
-            with_retry(&retry_config, "eth_getBlockByNumber", &op_name, &chain, || async {
-                let builder = provider.get_block(block_id);
-                if full_transactions {
-                    builder
-                        .full()
-                        .await
-                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                } else {
-                    builder
-                        .await
-                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                }
-            })
+            with_retry(
+                &retry_config,
+                "eth_getBlockByNumber",
+                &op_name,
+                &chain,
+                || async {
+                    let builder = provider.get_block(block_id);
+                    if full_transactions {
+                        builder
+                            .full()
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    } else {
+                        builder
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    }
+                },
+            )
             .await
         })
         .await
@@ -798,12 +810,18 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
             .await;
         with_metrics(RpcMethod::GetTransaction, &chain, || async {
-            with_retry(&retry_config, "eth_getTransactionByHash", &op_name, &chain, || async {
-                provider
-                    .get_transaction_by_hash(hash)
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_getTransactionByHash",
+                &op_name,
+                &chain,
+                || async {
+                    provider
+                        .get_transaction_by_hash(hash)
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -820,12 +838,18 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
             .await;
         with_metrics(RpcMethod::GetTransactionReceipt, &chain, || async {
-            with_retry(&retry_config, "eth_getTransactionReceipt", &op_name, &chain, || async {
-                provider
-                    .get_transaction_receipt(hash)
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_getTransactionReceipt",
+                &op_name,
+                &chain,
+                || async {
+                    provider
+                        .get_transaction_receipt(hash)
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -965,13 +989,19 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
             .await;
         with_metrics(RpcMethod::GetBalance, &chain, || async {
-            with_retry(&retry_config, "eth_getBalance", &op_name, &chain, || async {
-                provider
-                    .get_balance(address)
-                    .block_id(block.unwrap_or(BlockId::latest()))
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_getBalance",
+                &op_name,
+                &chain,
+                || async {
+                    provider
+                        .get_balance(address)
+                        .block_id(block.unwrap_or(BlockId::latest()))
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -1043,19 +1073,25 @@ impl AlchemyClient {
                 let chain = chain.clone();
                 async move {
                     let op_name = format!("eth_getBlockByNumber({:?})", number);
-                    with_retry(&retry_config, "eth_getBlockByNumber", &op_name, &chain, || async {
-                        let builder = provider.get_block(BlockId::Number(number));
-                        if full_transactions {
-                            builder
-                                .full()
-                                .await
-                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                        } else {
-                            builder
-                                .await
-                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                        }
-                    })
+                    with_retry(
+                        &retry_config,
+                        "eth_getBlockByNumber",
+                        &op_name,
+                        &chain,
+                        || async {
+                            let builder = provider.get_block(BlockId::Number(number));
+                            if full_transactions {
+                                builder
+                                    .full()
+                                    .await
+                                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                            } else {
+                                builder
+                                    .await
+                                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                            }
+                        },
+                    )
                     .await
                 }
             },
@@ -1090,19 +1126,25 @@ impl AlchemyClient {
             let chain = chain.clone();
             async move {
                 let op_name = format!("eth_getBlockByNumber({:?})", number);
-                let result = with_retry(&retry_config, "eth_getBlockByNumber", &op_name, &chain, || async {
-                    let builder = provider.get_block(BlockId::Number(number));
-                    if full_transactions {
-                        builder
-                            .full()
-                            .await
-                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                    } else {
-                        builder
-                            .await
-                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                    }
-                })
+                let result = with_retry(
+                    &retry_config,
+                    "eth_getBlockByNumber",
+                    &op_name,
+                    &chain,
+                    || async {
+                        let builder = provider.get_block(BlockId::Number(number));
+                        if full_transactions {
+                            builder
+                                .full()
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        } else {
+                            builder
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        }
+                    },
+                )
                 .await;
                 (number, result)
             }

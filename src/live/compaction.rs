@@ -498,10 +498,8 @@ impl CompactionService {
 
             if !merged.is_empty() {
                 let rk = range_key(range.start, range.end);
-                let base_dir = PathBuf::from(format!(
-                    "data/{}/historical/raw/eth_calls",
-                    self.chain_name
-                ));
+                let base_dir =
+                    PathBuf::from(format!("data/{}/historical/raw/eth_calls", self.chain_name));
 
                 for (collection_name, expected) in &merged {
                     let collection_dir = base_dir.join(collection_name);

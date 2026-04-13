@@ -9,8 +9,8 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
-use crate::transformations::util::sanitize::strip_nul_bytes;
 use crate::transformations::util::pool_metadata::VersionedSource;
+use crate::transformations::util::sanitize::strip_nul_bytes;
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey};
 
 const SOURCE: &str = "ZoraFactory";

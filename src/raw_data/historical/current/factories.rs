@@ -224,11 +224,8 @@ pub async fn collect_factories(
                     }
                 };
 
-                let (logs_result, _, _) = tokio::join!(
-                    logs_factory_future,
-                    eth_calls_future,
-                    decoder_future,
-                );
+                let (logs_result, _, _) =
+                    tokio::join!(logs_factory_future, eth_calls_future, decoder_future,);
                 logs_result?;
 
                 // Update contract index for each collection

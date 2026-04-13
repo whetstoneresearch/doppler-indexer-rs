@@ -293,10 +293,7 @@ impl TransformationHandler for PriceHandler {
     }
 
     async fn initialize(&self, _db_pool: &DbPool) -> Result<(), TransformationError> {
-        tracing::info!(
-            pool_count = self.configs.len(),
-            "PriceHandler initialized"
-        );
+        tracing::info!(pool_count = self.configs.len(), "PriceHandler initialized");
         Ok(())
     }
 }
@@ -310,10 +307,7 @@ impl EthCallHandler for PriceHandler {
     }
 }
 
-pub fn register_handlers(
-    registry: &mut TransformationRegistry,
-    contracts: Option<&Contracts>,
-) {
+pub fn register_handlers(registry: &mut TransformationRegistry, contracts: Option<&Contracts>) {
     let handler = match contracts {
         Some(contracts) => PriceHandler::from_contracts(contracts),
         None => PriceHandler::empty(),

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use alloy::primitives::B256;
 use alloy::rpc::types::Block;
 use arrow::array::{
-    ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, StringBuilder,
-    UInt32Array, UInt64Array,
+    ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder,
+    StringBuilder, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -218,14 +218,10 @@ pub(crate) fn write_minimal_blocks_to_parquet(
                     records.iter().map(|r| Some(r.transaction_count)).collect();
                 arrays.push(Arc::new(count_arr));
 
-                let mut list_builder =
-                    ListBuilder::new(FixedSizeBinaryBuilder::new(32));
+                let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
                 for record in records {
                     for hash in &record.transaction_hashes {
-                        list_builder
-                            .values()
-                            .append_value(hash.as_slice())
-                            .unwrap();
+                        list_builder.values().append_value(hash.as_slice()).unwrap();
                     }
                     list_builder.append(true);
                 }
@@ -348,10 +344,7 @@ pub(crate) fn write_full_blocks_to_parquet(
     let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
     for record in records {
         for hash in &record.transaction_hashes {
-            list_builder
-                .values()
-                .append_value(hash.as_slice())
-                .unwrap();
+            list_builder.values().append_value(hash.as_slice()).unwrap();
         }
         list_builder.append(true);
     }
@@ -560,8 +553,7 @@ pub fn read_block_info_from_parquet(
                             (0..string_array.len())
                                 .filter_map(|j| {
                                     let hash_str = string_array.value(j);
-                                    let hash_str =
-                                        hash_str.strip_prefix("0x").unwrap_or(hash_str);
+                                    let hash_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
                                     let bytes = hex::decode(hash_str).ok()?;
                                     if bytes.len() == 32 {
                                         Some(B256::from_slice(&bytes))

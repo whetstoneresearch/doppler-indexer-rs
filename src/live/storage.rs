@@ -738,7 +738,8 @@ impl LiveStorage {
 
     /// Path for per-block contract index.
     fn contract_index_path(&self, block_number: u64) -> PathBuf {
-        self.base_dir.join(format!("contract_index/{}.json", block_number))
+        self.base_dir
+            .join(format!("contract_index/{}.json", block_number))
     }
 
     /// Write per-block contract index recording which factory source contracts

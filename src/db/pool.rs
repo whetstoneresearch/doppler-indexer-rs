@@ -69,7 +69,6 @@ impl DbPool {
         let op_count = operations.len();
         let txn_start = Instant::now();
 
-
         counter!(
             "db_transaction_operations_total",
             "method" => "execute_transaction"
@@ -294,14 +293,12 @@ impl DbPool {
         let query_start = Instant::now();
         match client.query(query, params).await {
             Ok(rows) => {
-                histogram!("db_query_duration_seconds")
-                    .record(query_start.elapsed().as_secs_f64());
+                histogram!("db_query_duration_seconds").record(query_start.elapsed().as_secs_f64());
                 counter!("db_queries_total", "status" => "success").increment(1);
                 Ok(rows)
             }
             Err(e) => {
-                histogram!("db_query_duration_seconds")
-                    .record(query_start.elapsed().as_secs_f64());
+                histogram!("db_query_duration_seconds").record(query_start.elapsed().as_secs_f64());
                 counter!("db_queries_total", "status" => "error").increment(1);
                 Err(e.into())
             }
@@ -373,7 +370,9 @@ fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
             table,
             where_clause,
         } => build_delete_sql(&table, &where_clause),
-        DbOperation::RawSql { query, params, .. } => (query.clone(), convert_values_to_params(&params)),
+        DbOperation::RawSql { query, params, .. } => {
+            (query.clone(), convert_values_to_params(&params))
+        }
     }
 }
 

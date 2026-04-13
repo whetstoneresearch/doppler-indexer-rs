@@ -380,7 +380,10 @@ DO UPDATE SET
         snapshot: Some(DbSnapshot {
             table: "pool_snapshots".to_string(),
             key_columns: vec![
-                ("chain_id".to_string(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
+                (
+                    "chain_id".to_string(),
+                    DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
+                ),
                 ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
                 (
                     "block_number".to_string(),
@@ -392,7 +395,9 @@ DO UPDATE SET
                 ),
                 (
                     "source_version".to_string(),
-                    DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
+                    DbValue::Int32(
+                        i32::try_from(target_source_version).expect("source_version fits i32"),
+                    ),
                 ),
             ],
         }),
@@ -599,7 +604,10 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
         snapshot: Some(DbSnapshot {
             table: "pool_state".to_string(),
             key_columns: vec![
-                ("chain_id".to_string(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
+                (
+                    "chain_id".to_string(),
+                    DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
+                ),
                 ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
                 (
                     "source".to_string(),
@@ -607,7 +615,9 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
                 ),
                 (
                     "source_version".to_string(),
-                    DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
+                    DbValue::Int32(
+                        i32::try_from(target_source_version).expect("source_version fits i32"),
+                    ),
                 ),
             ],
         }),
@@ -730,11 +740,13 @@ pub async fn process_tvl(
             .filter(|p| p.tick_lower <= target.tick && target.tick < p.tick_upper)
             .map(|p| p.liquidity)
             .fold(0u128, |acc, l| acc.saturating_add(l));
-        let active_liquidity_dec =
-            BigDecimal::from_str(&active_liquidity.to_string()).expect("u128::to_string is valid decimal");
+        let active_liquidity_dec = BigDecimal::from_str(&active_liquidity.to_string())
+            .expect("u128::to_string is valid decimal");
 
-        let amount0 = BigDecimal::from_str(&total0.to_string()).expect("U256::to_string is valid decimal");
-        let amount1 = BigDecimal::from_str(&total1.to_string()).expect("U256::to_string is valid decimal");
+        let amount0 =
+            BigDecimal::from_str(&total0.to_string()).expect("U256::to_string is valid decimal");
+        let amount1 =
+            BigDecimal::from_str(&total1.to_string()).expect("U256::to_string is valid decimal");
 
         let tvl_usd = compute_tvl_usd(&total0, &total1, &meta, &price_close, usd_ctx);
         let market_cap_usd = compute_market_cap_usd(&meta, &price_close, usd_ctx);
@@ -1368,8 +1380,7 @@ mod tests {
         let quote_raw = U256::from(500_000u64); // 0.5 USDC
         let meta = sample_meta_usdc_quote(true, None);
         let usd_ctx = sample_usd_ctx_with_usdc();
-        let tvl =
-            compute_tvl_usd(&base_raw, &quote_raw, &meta, &bd("2"), &usd_ctx).unwrap();
+        let tvl = compute_tvl_usd(&base_raw, &quote_raw, &meta, &bd("2"), &usd_ctx).unwrap();
         assert_eq!(tvl, bd("2.5"));
     }
 
@@ -1387,15 +1398,24 @@ mod tests {
         }];
 
         let (total0, total1) = compute_position_amounts(&positions, current_sqrt).unwrap();
-        assert!(total0 > U256::ZERO, "straddling position should have token0");
-        assert!(total1 > U256::ZERO, "straddling position should have token1");
+        assert!(
+            total0 > U256::ZERO,
+            "straddling position should have token0"
+        );
+        assert!(
+            total1 > U256::ZERO,
+            "straddling position should have token1"
+        );
 
         let meta = sample_meta(true, None);
         let usd_ctx = sample_usd_ctx(Some("2000"));
         let price_close = sqrt_price_x96_to_price(&current_sqrt, 18, 18, true).unwrap();
 
         let tvl = compute_tvl_usd(&total0, &total1, &meta, &price_close, &usd_ctx);
-        assert!(tvl.is_some(), "tvl_usd should be computable with known quote");
+        assert!(
+            tvl.is_some(),
+            "tvl_usd should be computable with known quote"
+        );
         assert!(
             tvl.as_ref().unwrap() > &bd("0"),
             "tvl_usd should be positive"
@@ -1445,10 +1465,8 @@ mod tests {
         let usd_ctx = sample_usd_ctx(Some("2000"));
         let price = bd("1"); // tick 0 with equal decimals → price ≈ 1
 
-        let total_usd =
-            compute_tvl_usd(&total0, &total1, &meta, &price, &usd_ctx).unwrap();
-        let active_usd =
-            compute_tvl_usd(&active0, &active1, &meta, &price, &usd_ctx).unwrap();
+        let total_usd = compute_tvl_usd(&total0, &total1, &meta, &price, &usd_ctx).unwrap();
+        let active_usd = compute_tvl_usd(&active0, &active1, &meta, &price, &usd_ctx).unwrap();
         assert!(
             total_usd > active_usd,
             "total_usd ({}) should exceed active_usd ({})",

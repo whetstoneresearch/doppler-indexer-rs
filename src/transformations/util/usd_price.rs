@@ -283,19 +283,26 @@ impl UsdPriceContext {
         unresolved_tokens: &[[u8; 20]],
         max_block: Option<u64>,
     ) {
-        use super::price_path::{check_or_resolve_path, derive_price_from_path, invalidate_cached_path};
+        use super::price_path::{
+            check_or_resolve_path, derive_price_from_path, invalidate_cached_path,
+        };
 
-        let priceable: std::collections::HashSet<[u8; 20]> =
-            self.prices.keys().copied().collect();
+        let priceable: std::collections::HashSet<[u8; 20]> = self.prices.keys().copied().collect();
 
         for token in unresolved_tokens {
             if self.prices.contains_key(token) {
                 continue;
             }
 
-            let Some(path) =
-                check_or_resolve_path(db_pool, chain_id, token, &priceable, current_block, max_block)
-                    .await
+            let Some(path) = check_or_resolve_path(
+                db_pool,
+                chain_id,
+                token,
+                &priceable,
+                current_block,
+                max_block,
+            )
+            .await
             else {
                 continue;
             };

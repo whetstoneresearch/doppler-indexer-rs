@@ -1071,7 +1071,14 @@ mod tests {
     #[test]
     fn test_upsert_proceeds_state_op() {
         let pool_id = make_pool_id(0xFF);
-        let op = upsert_proceeds_state(8453, &pool_id, &U256::from(9999u64), &U256::from(1234u64), "DopplerV4Hook", 1);
+        let op = upsert_proceeds_state(
+            8453,
+            &pool_id,
+            &U256::from(9999u64),
+            &U256::from(1234u64),
+            "DopplerV4Hook",
+            1,
+        );
         match op {
             DbOperation::Upsert {
                 table,

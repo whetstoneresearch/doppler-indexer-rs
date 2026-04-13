@@ -147,10 +147,7 @@ async fn resolve_token_price_path(
 
     // Best bottleneck liquidity to reach each token
     let mut best_bottleneck: HashMap<[u8; 20], BigDecimal> = HashMap::new();
-    best_bottleneck.insert(
-        *target_token,
-        BigDecimal::from(i64::MAX),
-    );
+    best_bottleneck.insert(*target_token, BigDecimal::from(i64::MAX));
 
     let mut best_anchor: Option<ResolvedPath> = None;
 

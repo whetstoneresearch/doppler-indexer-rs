@@ -30,9 +30,7 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::event::metrics::swap_data::{
     process_liquidity_deltas, process_swaps, refresh_cache_if_needed, SwapInput,
 };
-use crate::transformations::event::metrics::tvl::{
-    process_tvl, TvlHandlerConfig, TvlTarget,
-};
+use crate::transformations::event::metrics::tvl::{process_tvl, TvlHandlerConfig, TvlTarget};
 use crate::transformations::event::metrics::v4_hook_extract::extract_tuple_modify_liquidity;
 use crate::transformations::event::migration_pool::create::{
     MIGRATION_POOL_CREATE_HANDLER_NAME, MIGRATION_POOL_CREATE_HANDLER_VERSION,
@@ -453,9 +451,15 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
         )
         .await;
 
-        let mut ops =
-            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
-                .await?;
+        let mut ops = process_tvl(
+            &targets,
+            &self.tvl_config,
+            &self.metadata_cache,
+            pool,
+            self.chain_id,
+            &usd_ctx,
+        )
+        .await?;
         ops.extend(price_ops);
         Ok(ops)
     }
@@ -510,7 +514,10 @@ impl EventHandler for MigrationPoolTvlMetricsHandler {
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["MigrationPoolCreateHandler", "MigrationPoolLiquidityMetricsHandler"]
+        vec![
+            "MigrationPoolCreateHandler",
+            "MigrationPoolLiquidityMetricsHandler",
+        ]
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {

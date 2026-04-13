@@ -367,7 +367,9 @@ impl CompletionTracker {
         }
         drop(state);
         let mut contiguous = self.contiguous.write().await;
-        contiguous.watermarks.insert(handler_name.to_string(), watermark);
+        contiguous
+            .watermarks
+            .insert(handler_name.to_string(), watermark);
         contiguous.positions.insert(handler_name.to_string(), pos);
     }
 
@@ -424,8 +426,12 @@ impl CompletionTracker {
         if new_watermark != current_watermark {
             drop(state);
             let mut contiguous = self.contiguous.write().await;
-            contiguous.watermarks.insert(handler_name.to_string(), new_watermark);
-            contiguous.positions.insert(handler_name.to_string(), new_pos);
+            contiguous
+                .watermarks
+                .insert(handler_name.to_string(), new_watermark);
+            contiguous
+                .positions
+                .insert(handler_name.to_string(), new_pos);
         }
     }
 
@@ -480,17 +486,33 @@ impl CompletionTracker {
         {
             let state = self.state.read().await;
             for dep in handler_deps {
-                if state.failed.get(dep).is_some_and(|r| r.contains(&range_start)) {
-                    return DepState::DepFailed { dep_name: dep.clone() };
+                if state
+                    .failed
+                    .get(dep)
+                    .is_some_and(|r| r.contains(&range_start))
+                {
+                    return DepState::DepFailed {
+                        dep_name: dep.clone(),
+                    };
                 }
             }
             for dep in handler_deps {
-                if state.blocked.get(dep).is_some_and(|r| r.contains(&range_start)) {
-                    return DepState::DepBlocked { dep_name: dep.clone() };
+                if state
+                    .blocked
+                    .get(dep)
+                    .is_some_and(|r| r.contains(&range_start))
+                {
+                    return DepState::DepBlocked {
+                        dep_name: dep.clone(),
+                    };
                 }
             }
             for dep in handler_deps {
-                if !state.completed.get(dep).is_some_and(|r| r.contains(&range_start)) {
+                if !state
+                    .completed
+                    .get(dep)
+                    .is_some_and(|r| r.contains(&range_start))
+                {
                     return DepState::Waiting;
                 }
             }
@@ -569,9 +591,7 @@ impl CompletionTracker {
     ///
     /// Returns `(completed_count, failed_count, blocked_count)` per handler.
     /// Takes ONE read lock on `state` (was 3 separate locks).
-    pub(crate) async fn snapshot_progress(
-        &self,
-    ) -> HashMap<String, (usize, usize, usize)> {
+    pub(crate) async fn snapshot_progress(&self) -> HashMap<String, (usize, usize, usize)> {
         let state = self.state.read().await;
 
         let mut result: HashMap<String, (usize, usize, usize)> = HashMap::new();

@@ -23,8 +23,8 @@ use crate::raw_data::historical::eth_calls::{
 };
 use crate::raw_data::historical::factories::get_factory_call_configs;
 use crate::raw_data::historical::receipts::EventTriggerData;
-use crate::storage::contract_index::build_expected_factory_contracts;
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::build_expected_factory_contracts;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::eth_call::encode_call_with_params;
 use crate::types::config::eth_call::{EthCallConfig, Frequency, ParamConfig};

@@ -36,7 +36,9 @@ use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
 use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
-use runtime::{build_rpc_client, build_rpc_client_with_limiter, ChainFeatures, ChainRuntime, CommonChannels};
+use runtime::{
+    build_rpc_client, build_rpc_client_with_limiter, ChainFeatures, ChainRuntime, CommonChannels,
+};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
 use transformations::{
     ExecutionMode, ReorgMessage, TransformationEngine, TransformationEngineConfig,
@@ -742,7 +744,8 @@ async fn repair_only_chain(
         .or(config.raw_data_collection.rpc_batch_size)
         .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
     let (_rate_limiter, client) = if let Some(limiter) = shared_rate_limiter {
-        let client = build_rpc_client_with_limiter(&rpc_url, &chain.rpc, rpc_batch_size, limiter.clone())?;
+        let client =
+            build_rpc_client_with_limiter(&rpc_url, &chain.rpc, rpc_batch_size, limiter.clone())?;
         (limiter, Arc::new(client))
     } else {
         build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?

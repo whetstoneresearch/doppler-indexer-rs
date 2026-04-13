@@ -22,9 +22,7 @@ use crate::transformations::error::TransformationError;
 use crate::transformations::event::metrics::swap_data::{
     process_liquidity_deltas, process_swaps, refresh_cache_if_needed, LiquidityInput, SwapInput,
 };
-use crate::transformations::event::metrics::tvl::{
-    process_tvl, TvlHandlerConfig, TvlTarget,
-};
+use crate::transformations::event::metrics::tvl::{process_tvl, TvlHandlerConfig, TvlTarget};
 use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
@@ -517,9 +515,15 @@ impl TransformationHandler for V3TvlMetricsHandler {
         )
         .await;
 
-        let mut ops =
-            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
-                .await?;
+        let mut ops = process_tvl(
+            &targets,
+            &self.tvl_config,
+            &self.metadata_cache,
+            pool,
+            self.chain_id,
+            &usd_ctx,
+        )
+        .await?;
         ops.extend(price_ops);
         Ok(ops)
     }
@@ -621,9 +625,15 @@ impl TransformationHandler for LockableV3TvlMetricsHandler {
         )
         .await;
 
-        let mut ops =
-            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
-                .await?;
+        let mut ops = process_tvl(
+            &targets,
+            &self.tvl_config,
+            &self.metadata_cache,
+            pool,
+            self.chain_id,
+            &usd_ctx,
+        )
+        .await?;
         ops.extend(price_ops);
         Ok(ops)
     }
@@ -650,7 +660,10 @@ impl EventHandler for LockableV3TvlMetricsHandler {
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["LockableV3CreateHandler", "LockableV3LiquidityMetricsHandler"]
+        vec![
+            "LockableV3CreateHandler",
+            "LockableV3LiquidityMetricsHandler",
+        ]
     }
 
     fn call_dependencies(&self) -> Vec<(String, String)> {

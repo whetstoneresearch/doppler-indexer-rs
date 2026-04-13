@@ -581,9 +581,7 @@ impl TransformationEngine {
         let tracker = Arc::new(CompletionTracker::with_available_starts(
             available_starts.clone(),
         ));
-        let self_completed = self
-            .seed_tracker_from_progress(&handlers, &tracker)
-            .await?;
+        let self_completed = self.seed_tracker_from_progress(&handlers, &tracker).await?;
 
         // 3. Early exit if nothing to do.
         let total_todo: usize = handlers
@@ -654,17 +652,11 @@ impl TransformationEngine {
         );
 
         // 5. Spawn background call-dep scanner.
-        let (cancel_tx, scanner_handle) = self
-            .spawn_call_dep_scanner(&handlers, &tracker)
-            .await;
+        let (cancel_tx, scanner_handle) = self.spawn_call_dep_scanner(&handlers, &tracker).await;
 
         // 6. Spawn progress reporter.
-        let progress_handle = Self::spawn_progress_reporter(
-            tracker.clone(),
-            kind_label,
-            available.len(),
-            &handlers,
-        );
+        let progress_handle =
+            Self::spawn_progress_reporter(tracker.clone(), kind_label, available.len(), &handlers);
 
         // 7. Execute all items.
         let loader = Arc::new(CatchupLoader {
@@ -992,7 +984,10 @@ impl TransformationEngine {
                 for (name, (completed, failed, blocked)) in &snap {
                     let remaining = total_available.saturating_sub(*completed);
                     if remaining > 0 || *failed > 0 || *blocked > 0 {
-                        let key = handler_keys.get(name).cloned().unwrap_or_else(|| name.clone());
+                        let key = handler_keys
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
                         tracing::info!(
                             "  {} — {} done, {} remaining, {} failed, {} blocked",
                             key,

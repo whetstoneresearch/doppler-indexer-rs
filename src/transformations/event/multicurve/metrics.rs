@@ -251,9 +251,15 @@ impl TransformationHandler for MulticurveTvlMetricsHandler {
         )
         .await;
 
-        let mut ops =
-            process_tvl(&targets, &self.tvl_config, &self.metadata_cache, pool, self.chain_id, &usd_ctx)
-                .await?;
+        let mut ops = process_tvl(
+            &targets,
+            &self.tvl_config,
+            &self.metadata_cache,
+            pool,
+            self.chain_id,
+            &usd_ctx,
+        )
+        .await?;
         ops.extend(price_ops);
         Ok(ops)
     }
@@ -287,7 +293,10 @@ impl EventHandler for MulticurveTvlMetricsHandler {
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
-        vec!["V4MulticurveCreateHandler", "MulticurveLiquidityMetricsHandler"]
+        vec![
+            "V4MulticurveCreateHandler",
+            "MulticurveLiquidityMetricsHandler",
+        ]
     }
 }
 
