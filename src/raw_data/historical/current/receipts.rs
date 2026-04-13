@@ -184,10 +184,9 @@ async fn try_finalize_range(
     };
 
     let range_end = state.range_end;
-    let expected: HashSet<u64> = (range_start..range_end).collect();
-    let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
-    let all_received = expected.is_subset(&received);
-    let all_completed = all_received && expected.is_subset(&state.blocks_completed);
+    let range_len = (range_end - range_start) as usize;
+    let all_received = state.blocks_received.len() == range_len;
+    let all_completed = all_received && state.blocks_completed.len() == range_len;
 
     if !all_completed {
         return Ok(false);
@@ -411,9 +410,7 @@ pub async fn collect_receipts(
                             state.blocks_completed.insert(block_number);
 
                             // Check if range is now complete
-                            let expected: HashSet<u64> = (range_start..range_end).collect();
-                            let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
-                            if expected.is_subset(&received) {
+                            if state.blocks_received.len() == (range_end - range_start) as usize {
                                 tracing::info!(
                                     "Skipping receipts for blocks {}-{} (already exists)",
                                     range.start,
