@@ -1,9 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::{
@@ -17,6 +18,115 @@ use crate::storage::contract_index::{
 use crate::storage::{upload_sidecar_to_s3, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
+
+fn build_decoder_addresses(factory_data: &FactoryAddressData) -> HashMap<String, Vec<Address>> {
+    factory_data.addresses_by_block.values().flatten().fold(
+        HashMap::new(),
+        |mut acc, (_, addr, collection)| {
+            acc.entry(collection.clone()).or_default().push(*addr);
+            acc
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_factory_outputs(
+    factory_data: FactoryAddressData,
+    logs_factory_tx: &Option<Sender<FactoryAddressData>>,
+    eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
+    log_decoder_tx: &Option<Sender<DecoderMessage>>,
+    call_decoder_tx: &Option<Sender<DecoderMessage>>,
+) -> Result<(), FactoryCollectionError> {
+    let range_start = factory_data.range_start;
+    let range_end = factory_data.range_end;
+    let addresses = build_decoder_addresses(&factory_data);
+
+    let logs_factory_future = async {
+        if let Some(ref tx) = logs_factory_tx {
+            tx.send(factory_data.clone()).await.map_err(|_| {
+                FactoryCollectionError::ChannelSend(format!(
+                    "logs_factory_tx ({}-{}) - receiver dropped",
+                    factory_data.range_start, factory_data.range_end
+                ))
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    let eth_calls_future = async {
+        if let Some(ref tx) = eth_calls_factory_tx {
+            let _ = tx
+                .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
+                .await;
+            let _ = tx
+                .send(FactoryMessage::RangeComplete {
+                    range_start: factory_data.range_start,
+                    range_end: factory_data.range_end,
+                })
+                .await;
+        }
+    };
+
+    let decoder_future = async {
+        if let Some(ref tx) = log_decoder_tx {
+            let _ = tx
+                .send(DecoderMessage::FactoryAddresses {
+                    range_start,
+                    range_end,
+                    addresses: addresses.clone(),
+                })
+                .await;
+        }
+        if let Some(ref tx) = call_decoder_tx {
+            let _ = tx
+                .send(DecoderMessage::FactoryAddresses {
+                    range_start,
+                    range_end,
+                    addresses,
+                })
+                .await;
+        }
+    };
+
+    let (logs_result, _, _) = tokio::join!(logs_factory_future, eth_calls_future, decoder_future);
+    logs_result
+}
+
+async fn update_factory_contract_indexes(
+    factory_collection_names: &HashSet<String>,
+    chain: &ChainConfig,
+    output_dir: &std::path::Path,
+    range_start: u64,
+    range_end: u64,
+    storage_manager: Option<&Arc<StorageManager>>,
+) {
+    let rk = range_key(range_start, range_end - 1);
+    let expected_for_range =
+        build_expected_factory_contracts_for_range(&chain.contracts, range_end);
+
+    for collection in factory_collection_names {
+        if let Some(expected) = expected_for_range.get(collection) {
+            let dir = output_dir.join(collection);
+            let mut index = read_contract_index(&dir);
+            update_contract_index(&mut index, &rk, expected);
+            if let Err(e) = write_contract_index(&dir, &index) {
+                tracing::error!("Failed to write contract index for {}: {}", collection, e);
+            }
+
+            if let Some(sm) = storage_manager {
+                let index_path = dir.join("contract_index.json");
+                if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                    tracing::warn!(
+                        "Failed to upload contract index for {} to S3: {}",
+                        collection,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_factories(
@@ -34,6 +144,7 @@ pub async fn collect_factories(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), FactoryCollectionError> {
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
+    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8).max(1);
 
     // If no matchers, forward empty ranges from channel
     if matchers.is_empty() {
@@ -110,162 +221,104 @@ pub async fn collect_factories(
     // Streaming phase: Process new logs from channel
     // =========================================================================
     let mut range_data: HashMap<u64, Vec<LogData>> = HashMap::new();
+    let mut ready_ranges: VecDeque<(u64, u64, Vec<LogData>)> = VecDeque::new();
+    let mut range_tasks: JoinSet<Result<FactoryAddressData, FactoryCollectionError>> =
+        JoinSet::new();
+    let mut input_done = false;
+    let mut saw_all_ranges_complete = false;
 
     let factory_collection_names: HashSet<String> =
         matchers.iter().map(|m| m.collection_name.clone()).collect();
 
     tracing::info!(
-        "Starting factory collection for chain {} with {} matchers",
+        "Starting factory collection for chain {} with {} matchers (concurrency {})",
         chain.name,
-        matchers.len()
+        matchers.len(),
+        factory_concurrency
     );
 
     loop {
-        let message = match log_rx.recv().await {
-            Some(msg) => msg,
-            None => break,
-        };
-
-        match message {
-            LogMessage::Logs(logs) => {
-                let logs = Arc::try_unwrap(logs).unwrap_or_else(|arc| (*arc).clone());
-                for log in logs {
-                    let range_start = (log.block_number / range_size) * range_size;
-                    range_data.entry(range_start).or_default().push(log);
-                }
-            }
-            LogMessage::RangeComplete {
-                range_start,
-                range_end,
-            } => {
-                let logs = range_data.remove(&range_start).unwrap_or_default();
-
-                let factory_data = match process_range(
-                    range_start,
-                    range_end,
-                    logs,
-                    &matchers,
-                    &output_dir,
-                    &existing_files,
-                    s3_manifest.as_ref(),
-                    storage_manager.as_ref(),
-                    &chain.name,
+        tokio::select! {
+            Some(join_result) = range_tasks.join_next(), if !range_tasks.is_empty() => {
+                let factory_data = join_result
+                    .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+                forward_factory_outputs(
+                    factory_data.clone(),
+                    &logs_factory_tx,
+                    &eth_calls_factory_tx,
+                    &log_decoder_tx,
+                    &call_decoder_tx,
                 )
-                .await
-                {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::error!(
-                            "Factory processing failed for range {}-{}: {:?}",
-                            range_start,
-                            range_end,
-                            e
-                        );
-                        return Err(e);
-                    }
-                };
+                .await?;
+                update_factory_contract_indexes(
+                    &factory_collection_names,
+                    chain,
+                    output_dir.as_ref(),
+                    factory_data.range_start,
+                    factory_data.range_end,
+                    storage_manager.as_ref(),
+                )
+                .await;
+            }
 
-                // Compute addresses map once for decoder messages
-                let addresses: HashMap<String, Vec<Address>> = factory_data
-                    .addresses_by_block
-                    .values()
-                    .flatten()
-                    .fold(HashMap::new(), |mut acc, (_, addr, collection)| {
-                        acc.entry(collection.clone()).or_default().push(*addr);
-                        acc
-                    });
+            _ = std::future::ready(()), if range_tasks.len() < factory_concurrency && !ready_ranges.is_empty() => {
+                let (range_start, range_end, logs) =
+                    ready_ranges.pop_front().expect("ready range missing");
+                let matchers = matchers.clone();
+                let output_dir = output_dir.clone();
+                let existing_files = existing_files.clone();
+                let s3_manifest = s3_manifest.clone();
+                let storage_manager = storage_manager.clone();
+                let chain_name = chain.name.clone();
 
-                // Send to all downstream channels in parallel
-                let logs_factory_future = async {
-                    if let Some(ref tx) = logs_factory_tx {
-                        tx.send(factory_data.clone()).await.map_err(|_| {
-                            FactoryCollectionError::ChannelSend(format!(
-                                "logs_factory_tx ({}-{}) - receiver dropped",
-                                factory_data.range_start, factory_data.range_end
-                            ))
-                        })
-                    } else {
-                        Ok(())
-                    }
-                };
+                range_tasks.spawn(async move {
+                    process_range(
+                        range_start,
+                        range_end,
+                        logs,
+                        &matchers,
+                        &output_dir,
+                        &existing_files,
+                        s3_manifest.as_ref(),
+                        storage_manager.as_ref(),
+                        &chain_name,
+                    )
+                    .await
+                });
+            }
 
-                let eth_calls_future = async {
-                    if let Some(ref tx) = eth_calls_factory_tx {
-                        let _ = tx
-                            .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
-                            .await;
-                        let _ = tx
-                            .send(FactoryMessage::RangeComplete {
-                                range_start: factory_data.range_start,
-                                range_end: factory_data.range_end,
-                            })
-                            .await;
-                    }
-                };
-
-                let decoder_future = async {
-                    if let Some(ref tx) = log_decoder_tx {
-                        let _ = tx
-                            .send(DecoderMessage::FactoryAddresses {
-                                range_start,
-                                range_end,
-                                addresses: addresses.clone(),
-                            })
-                            .await;
-                    }
-                    if let Some(ref tx) = call_decoder_tx {
-                        let _ = tx
-                            .send(DecoderMessage::FactoryAddresses {
-                                range_start: factory_data.range_start,
-                                range_end: factory_data.range_end,
-                                addresses,
-                            })
-                            .await;
-                    }
-                };
-
-                let (logs_result, _, _) =
-                    tokio::join!(logs_factory_future, eth_calls_future, decoder_future,);
-                logs_result?;
-
-                // Update contract index for each collection
-                let rk = range_key(range_start, range_end - 1);
-                let expected_for_range =
-                    build_expected_factory_contracts_for_range(&chain.contracts, range_end);
-                for collection in &factory_collection_names {
-                    if let Some(expected) = expected_for_range.get(collection) {
-                        let dir = output_dir.join(collection);
-                        let mut index = read_contract_index(&dir);
-                        update_contract_index(&mut index, &rk, expected);
-                        if let Err(e) = write_contract_index(&dir, &index) {
-                            tracing::error!(
-                                "Failed to write contract index for {}: {}",
-                                collection,
-                                e
-                            );
+            message = log_rx.recv(), if !input_done => {
+                match message {
+                    Some(LogMessage::Logs(logs)) => {
+                        let logs = Arc::try_unwrap(logs).unwrap_or_else(|arc| (*arc).clone());
+                        for log in logs {
+                            let range_start = (log.block_number / range_size) * range_size;
+                            range_data.entry(range_start).or_default().push(log);
                         }
-
-                        // Upload to S3
-                        if let Some(ref sm) = storage_manager {
-                            let index_path = dir.join("contract_index.json");
-                            if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
-                                tracing::warn!(
-                                    "Failed to upload contract index for {} to S3: {}",
-                                    collection,
-                                    e
-                                );
-                            }
-                        }
+                    }
+                    Some(LogMessage::RangeComplete { range_start, range_end }) => {
+                        let logs = range_data.remove(&range_start).unwrap_or_default();
+                        ready_ranges.push_back((range_start, range_end, logs));
+                    }
+                    Some(LogMessage::AllRangesComplete) => {
+                        input_done = true;
+                        saw_all_ranges_complete = true;
+                    }
+                    None => {
+                        input_done = true;
                     }
                 }
             }
-            LogMessage::AllRangesComplete => {
-                // Signal all complete to eth_calls
-                if let Some(ref tx) = eth_calls_factory_tx {
-                    let _ = tx.send(FactoryMessage::AllComplete).await;
-                }
-                break;
-            }
+        }
+
+        if input_done && ready_ranges.is_empty() && range_tasks.is_empty() {
+            break;
+        }
+    }
+
+    if saw_all_ranges_complete {
+        if let Some(ref tx) = eth_calls_factory_tx {
+            let _ = tx.send(FactoryMessage::AllComplete).await;
         }
     }
 
