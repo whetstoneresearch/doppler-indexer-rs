@@ -461,7 +461,6 @@ pub async fn collect_eth_calls(
 
     let existing_files = scan_existing_parquet_files_async(base_output_dir.clone()).await;
 
-    let mut range_data: HashMap<u64, Vec<BlockInfo>> = HashMap::new();
     let range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
     let mut range_regular_done: HashSet<u64> = HashSet::new();
     let range_factory_done: HashSet<u64> = HashSet::new();
@@ -670,8 +669,6 @@ pub async fn collect_eth_calls(
                 })
                 .collect();
 
-            range_data.insert(range.start, blocks.clone());
-
             let catchup_ctx = EthCallContext {
                 client,
                 output_dir: &base_output_dir,
@@ -688,7 +685,7 @@ pub async fn collect_eth_calls(
                 if let Some(multicall_addr) = multicall3_address {
                     process_range_multicall(
                         &range,
-                        blocks.clone(),
+                        &blocks,
                         &catchup_ctx,
                         &catchup_call_configs,
                         max_params,
@@ -700,7 +697,7 @@ pub async fn collect_eth_calls(
                 } else {
                     process_range(
                         &range,
-                        blocks.clone(),
+                        &blocks,
                         &catchup_ctx,
                         &catchup_call_configs,
                         max_params,
@@ -1480,7 +1477,7 @@ pub async fn collect_eth_calls(
         s3_manifest,
         factory_addresses,
         frequency_state,
-        range_data,
+        range_data: HashMap::new(),
         range_factory_data,
         range_regular_done,
         range_factory_done,
