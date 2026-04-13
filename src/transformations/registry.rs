@@ -468,6 +468,17 @@ impl TransformationRegistry {
         self.handler_name_to_key.get(name).map(|s| s.as_str())
     }
 
+    /// Resolve a handler name to its handler_key, falling back to the name itself.
+    ///
+    /// Useful when displaying metrics or log messages where a missing mapping
+    /// should not panic.
+    pub fn resolve_handler_key(&self, name: &str) -> String {
+        self.handler_name_to_key
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// Whether a handler was registered with more than one trigger.
     pub fn is_multi_trigger(&self, handler_key: &str) -> bool {
         self.multi_trigger_handler_keys.contains(handler_key)
@@ -1352,21 +1363,23 @@ mod tests {
     #[test]
     fn build_registry_declares_all_migration_pool_create_dependencies() {
         let registry = build_registry(1);
-        let deps = registry
+        let mut deps = registry
             .handler_dependency_graph()
             .get("MigrationPoolCreateHandler")
-            .expect("MigrationPoolCreateHandler should be registered");
+            .expect("MigrationPoolCreateHandler should be registered")
+            .clone();
+        deps.sort();
 
-        assert_eq!(
-            deps,
-            &vec![
-                "V4CreateHandler".to_string(),
-                "V4MulticurveCreateHandler".to_string(),
-                "V4ScheduledMulticurveCreateHandler".to_string(),
-                "V4DecayMulticurveCreateHandler".to_string(),
-                "DopplerHookCreateHandler".to_string(),
-            ]
-        );
+        let mut expected = vec![
+            "V4CreateHandler".to_string(),
+            "V4MulticurveCreateHandler".to_string(),
+            "V4ScheduledMulticurveCreateHandler".to_string(),
+            "V4DecayMulticurveCreateHandler".to_string(),
+            "DopplerHookCreateHandler".to_string(),
+        ];
+        expected.sort();
+
+        assert_eq!(deps, expected);
     }
 
     #[test]
@@ -1381,6 +1394,7 @@ mod tests {
             "DhookSwapMetricsHandler",
             "V4BaseMetricsHandler",
             "MigrationPoolSwapMetricsHandler",
+            "ZoraSwapMetricsHandler",
         ]);
         let chainlink_dep = chainlink_latest_answer_dependency();
         let mut seen = HashSet::new();

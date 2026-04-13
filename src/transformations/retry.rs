@@ -513,7 +513,7 @@ impl RetryProcessor {
             // the correct state for every possible dep via seeding/failing
             // above, so wait_ready resolves immediately for non-missing deps
             // and fails fast for call-blocked deps.
-            let dep_names = rh.handler_deps.clone();
+            let dep_names = Arc::new(rh.handler_deps.clone());
 
             name_to_key.insert(handler_name.clone(), handler_key);
             work_items.push(WorkItem {
@@ -521,8 +521,8 @@ impl RetryProcessor {
                 range_start,
                 range_end,
                 dep_names,
-                contiguous_dep_names: Vec::new(),
-                call_dep_keys: Vec::new(),
+                contiguous_dep_names: Arc::new(Vec::new()),
+                call_dep_keys: Arc::new(Vec::new()),
                 sequential: false,
                 payload: Box::new(RetryPayload {
                     handler: rh.handler.clone(),

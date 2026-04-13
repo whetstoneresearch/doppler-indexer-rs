@@ -89,7 +89,9 @@ impl TransformationHandler for V4BaseMetricsHandler {
     fn migration_paths(&self) -> Vec<&'static str> {
         vec![
             "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_state_add_tvl.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
             "migrations/tables/pool_snapshots_add_volume_usd.sql",
             "migrations/tables/v4_base_proceeds_state.sql",
         ]
@@ -224,6 +226,8 @@ impl TransformationHandler for V4BaseMetricsHandler {
                 pool_id,
                 total_proceeds,
                 total_tokens_sold,
+                SOURCE,
+                self.version(),
             ));
         }
 
@@ -738,6 +742,8 @@ fn upsert_proceeds_state(
     pool_id: &[u8; 32],
     total_proceeds: &U256,
     total_tokens_sold: &U256,
+    source: &str,
+    source_version: u32,
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "v4_base_proceeds_state".to_string(),
@@ -755,12 +761,16 @@ fn upsert_proceeds_state(
         columns: vec![
             "chain_id".to_string(),
             "pool_id".to_string(),
+            "source".to_string(),
+            "source_version".to_string(),
             "total_proceeds".to_string(),
             "total_tokens_sold".to_string(),
         ],
         values: vec![
             DbValue::Int64(chain_id as i64),
             DbValue::Bytes32(*pool_id),
+            DbValue::VarChar(source.to_string()),
+            DbValue::Int32(source_version as i32),
             DbValue::Numeric(total_proceeds.to_string()),
             DbValue::Numeric(total_tokens_sold.to_string()),
         ],
@@ -911,6 +921,7 @@ mod tests {
                 pool_type: "v4".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
+                total_supply: None,
             },
         );
     }
@@ -1059,7 +1070,7 @@ mod tests {
     #[test]
     fn test_upsert_proceeds_state_op() {
         let pool_id = make_pool_id(0xFF);
-        let op = upsert_proceeds_state(8453, &pool_id, &U256::from(9999u64), &U256::from(1234u64));
+        let op = upsert_proceeds_state(8453, &pool_id, &U256::from(9999u64), &U256::from(1234u64), "DopplerV4Hook", 1);
         match op {
             DbOperation::Upsert {
                 table,

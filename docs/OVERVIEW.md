@@ -147,10 +147,10 @@ migrations/
 - **doc**: `docs/features/transformation_utils.md`
 
 ### pool_metrics
-- **description**: Per-block OHLC snapshots and hot-query pool_state table for all pool types (V3, LockableV3, V4 hooks). Shared BlockAccumulator and process_swaps/process_liquidity_deltas functions. liquidity_deltas append-only log for future TVL reconstruction.
+- **description**: Per-block OHLC snapshots, hot-query pool_state table, USD pricing, rolling metrics, and TVL computation for all pool types (V3, LockableV3, V4 hooks, migration pools). Shared BlockAccumulator, process_swaps/process_liquidity_deltas, and process_tvl functions. Per-pool-type TVL handlers compute amount0/1, tvl_usd, market_cap_usd, and active_liquidity_usd from stateless liquidity_deltas re-aggregation.
 - **entry_points**: `src/transformations/event/v3/metrics.rs`, `src/transformations/event/metrics/`
 - **depends_on**: [transformations, transformation_utils]
-- **doc**: `docs/pool-metrics/metrics_implementation_phases.md`
+- **doc**: `docs/designs/pool-metrics/metrics_implementation_phases.md`
 
 ### live_mode
 - **description**: Real-time block processing via WebSocket. Bincode storage for fast per-block writes, reorg detection, automatic compaction to parquet, and gap backfill on reconnect.
@@ -230,7 +230,8 @@ src/
       "rpc": {
         "concurrency": 100,
         "requests_per_second": 7500,
-        "batch_size": 1000
+        "batch_size": 1000,
+        "http2": true
       }
     }
   ],

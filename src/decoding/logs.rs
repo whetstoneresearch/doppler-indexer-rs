@@ -564,7 +564,7 @@ fn decode_log(
 
         let tuple_type = DynSolType::Tuple(data_types);
 
-        match tuple_type.abi_decode(&log.data) {
+        match tuple_type.abi_decode_params(&log.data) {
             Ok(DynSolValue::Tuple(values)) => {
                 for ((value, param), param_idx) in values
                     .iter()
@@ -1401,6 +1401,123 @@ mod tests {
         assert!(matches!(
             decoded.decoded_values.get(3),
             Some(DecodedValue::Int64(value)) if *value == 240
+        ));
+    }
+
+    #[test]
+    fn decode_log_decodes_dynamic_event_data_as_params() {
+        let parsed = ParsedEvent::from_signature(
+            "CreatorCoinCreated(address indexed caller, address indexed payoutRecipient, address indexed platformReferrer, address currency, string uri, string name, string symbol, address coin, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bytes32 poolKeyHash, string version)",
+        )
+        .unwrap();
+
+        let caller = [0x11u8; 20];
+        let payout_recipient = [0x22u8; 20];
+        let platform_referrer = [0x33u8; 20];
+        let currency = [0x44u8; 20];
+        let coin = [0x55u8; 20];
+        let hook = [0x66u8; 20];
+        let pool_key_hash = [0x77u8; 32];
+        let uri = "ipfs://creator-coin";
+        let name = "Creator Coin";
+        let symbol = "COIN";
+        let version = "2.6.0";
+
+        let log = LogData {
+            block_number: 10,
+            block_timestamp: 20,
+            transaction_hash: B256::ZERO,
+            log_index: 30,
+            address: [0x88u8; 20],
+            topics: vec![
+                parsed.topic0,
+                encode_address_topic(caller),
+                encode_address_topic(payout_recipient),
+                encode_address_topic(platform_referrer),
+            ],
+            data: DynSolValue::Tuple(vec![
+                DynSolValue::Address(Address::from_slice(&currency)),
+                DynSolValue::String(uri.to_string()),
+                DynSolValue::String(name.to_string()),
+                DynSolValue::String(symbol.to_string()),
+                DynSolValue::Address(Address::from_slice(&coin)),
+                DynSolValue::Tuple(vec![
+                    DynSolValue::Address(Address::from_slice(&currency)),
+                    DynSolValue::Address(Address::from_slice(&coin)),
+                    DynSolValue::Uint(U256::from(8_388_608u64), 24),
+                    DynSolValue::Int(
+                        alloy::primitives::I256::try_from(200i64).expect("valid i256"),
+                        24,
+                    ),
+                    DynSolValue::Address(Address::from_slice(&hook)),
+                ]),
+                DynSolValue::FixedBytes(pool_key_hash.into(), 32),
+                DynSolValue::String(version.to_string()),
+            ])
+            .abi_encode_params(),
+        };
+
+        let decoded = decode_log(&log, &parsed).unwrap().unwrap();
+
+        assert!(matches!(
+            decoded.decoded_values.first(),
+            Some(DecodedValue::Address(value)) if *value == caller
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(1),
+            Some(DecodedValue::Address(value)) if *value == payout_recipient
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(2),
+            Some(DecodedValue::Address(value)) if *value == platform_referrer
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(3),
+            Some(DecodedValue::Address(value)) if *value == currency
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(4),
+            Some(DecodedValue::String(value)) if value == uri
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(5),
+            Some(DecodedValue::String(value)) if value == name
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(6),
+            Some(DecodedValue::String(value)) if value == symbol
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(7),
+            Some(DecodedValue::Address(value)) if *value == coin
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(8),
+            Some(DecodedValue::Address(value)) if *value == currency
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(9),
+            Some(DecodedValue::Address(value)) if *value == coin
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(10),
+            Some(DecodedValue::Uint64(value)) if *value == 8_388_608
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(11),
+            Some(DecodedValue::Int64(value)) if *value == 200
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(12),
+            Some(DecodedValue::Address(value)) if *value == hook
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(13),
+            Some(DecodedValue::Bytes32(value)) if *value == pool_key_hash
+        ));
+        assert!(matches!(
+            decoded.decoded_values.get(14),
+            Some(DecodedValue::String(value)) if value == version
         ));
     }
 }

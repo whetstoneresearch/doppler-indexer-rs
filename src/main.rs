@@ -11,6 +11,7 @@ mod storage;
 mod transformations;
 mod types;
 
+use std::collections::HashMap;
 use std::env;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -34,8 +35,8 @@ use raw_data::historical::factories::{
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use rpc::{UnifiedRpcClient, WsClient};
-use runtime::{build_rpc_client, ChainFeatures, ChainRuntime, CommonChannels};
+use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
+use runtime::{build_rpc_client, build_rpc_client_with_limiter, ChainFeatures, ChainRuntime, CommonChannels};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
 use transformations::{
     ExecutionMode, ReorgMessage, TransformationEngine, TransformationEngineConfig,
@@ -279,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
             .context("Invalid metrics.addr in config")?;
         metrics::init_metrics_server(addr);
         metrics::describe_rpc_metrics();
+        metrics::describe_db_metrics();
         metrics::describe_transformation_metrics();
         metrics::describe_collection_metrics();
     }
@@ -458,6 +460,38 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn pool metrics sampler if we have a shared pool
+    if let Some(ref pool) = shared_db_pool {
+        tokio::spawn(metrics::sample_pool_stats(
+            Arc::clone(pool),
+            std::time::Duration::from_secs(5),
+        ));
+    }
+
+    // Build shared rate limiters for rate_limit_group references.
+    // Chains that share a group (e.g. "alchemy") will share a single limiter instance,
+    // ensuring the aggregate CU/s across all chains stays within the account-level budget.
+    let shared_rate_limiters: HashMap<String, Arc<SlidingWindowRateLimiter>> = config
+        .rpc_rate_limits
+        .as_ref()
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|(name, group)| {
+                    tracing::info!(
+                        "Created shared rate limiter for group '{}': {} units/s",
+                        name,
+                        group.units_per_second
+                    );
+                    (
+                        name.clone(),
+                        Arc::new(SlidingWindowRateLimiter::new(group.units_per_second)),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut chain_tasks: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
 
     for chain in &config.chains {
@@ -468,11 +502,25 @@ async fn main() -> anyhow::Result<()> {
         let chain = chain.clone();
         let repair_scope = repair_scope.clone();
 
+        // Look up shared rate limiter for this chain's group
+        let shared_rate_limiter = chain
+            .rpc
+            .rate_limit_group
+            .as_ref()
+            .and_then(|group| shared_rate_limiters.get(group).cloned());
+
         chain_tasks.spawn(async move {
             let result = if live_only {
-                process_chain_live_only(&config, &chain, shared_db_pool).await
+                process_chain_live_only(&config, &chain, shared_db_pool, shared_rate_limiter).await
             } else if repair_only {
-                repair_only_chain(&config, &chain, storage_manager, repair_scope).await
+                repair_only_chain(
+                    &config,
+                    &chain,
+                    storage_manager,
+                    repair_scope,
+                    shared_rate_limiter,
+                )
+                .await
             } else if decode_only {
                 decode_only_chain(&config, &chain, repair, repair_scope).await
             } else {
@@ -484,6 +532,7 @@ async fn main() -> anyhow::Result<()> {
                     repair,
                     repair_scope,
                     shared_db_pool,
+                    shared_rate_limiter,
                 )
                 .await
             };
@@ -666,6 +715,7 @@ async fn repair_only_chain(
     chain: &ChainConfig,
     storage_manager: Arc<StorageManager>,
     repair_scope: Option<RepairScope>,
+    shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Repair-only processing for chain: {}", chain.name);
 
@@ -691,7 +741,12 @@ async fn repair_only_chain(
         .batch_size
         .or(config.raw_data_collection.rpc_batch_size)
         .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
-    let (_rate_limiter, client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+    let (_rate_limiter, client) = if let Some(limiter) = shared_rate_limiter {
+        let client = build_rpc_client_with_limiter(&rpc_url, &chain.rpc, rpc_batch_size, limiter.clone())?;
+        (limiter, Arc::new(client))
+    } else {
+        build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
+    };
 
     let no_decoder_tx: Option<mpsc::Sender<DecoderMessage>> = None;
     let s3_manifest = storage_manager.manifest_for(&chain.name);
@@ -745,6 +800,7 @@ async fn process_chain_live_only(
     config: &IndexerConfig,
     chain: &ChainConfig,
     shared_db_pool: Option<Arc<DbPool>>,
+    shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain {} in live-only mode", chain.name);
 
@@ -764,7 +820,7 @@ async fn process_chain_live_only(
     }
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, None).await?;
+    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter).await?;
 
     // Build channels with config-derived capacity
     let channels = CommonChannels::build_for_live_only(
@@ -1379,11 +1435,12 @@ async fn process_chain(
     repair: bool,
     repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
+    shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, None).await?;
+    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter).await?;
 
     let features = &runtime.features;
     let has_factories = features.has_factories;

@@ -893,13 +893,12 @@ pub async fn collect_eth_calls(
         let scoped_log_range_count = log_ranges
             .iter()
             .filter(|log_range| {
-                repair_scope.is_none_or(|scope| {
-                    scope.matches_range(log_range.start, log_range.end)
-                }) && !active_event_output_pairs_for_range(
-                    &catchup_event_call_configs,
-                    log_range.end,
-                )
-                .is_empty()
+                repair_scope.is_none_or(|scope| scope.matches_range(log_range.start, log_range.end))
+                    && !active_event_output_pairs_for_range(
+                        &catchup_event_call_configs,
+                        log_range.end,
+                    )
+                    .is_empty()
             })
             .count();
 

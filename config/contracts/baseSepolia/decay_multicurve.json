@@ -10,7 +10,7 @@
         "calls": [
             {
                 "function": "getState(address)",
-                "output_type": "(address numeraire, uint256 totalTokensOnBondingCurve, address dopplerHook, bytes graduationDopplerHookCalldata, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
+                "output_type": "(address numeraire, uint8 status, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, int24 farTick)",
                 "frequency": {
                     "on_events": {
                         "source": "DecayMulticurveInitializer",
@@ -70,6 +70,18 @@
                 },
                 "target": "UniswapV4StateView",
                 "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+            },
+            {
+                "function": "getSlot0(bytes32)",
+                "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+                "frequency": {
+                    "on_events": {
+                        "source": "DecayMulticurveHook",
+                        "event": "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
+                    }
+                },
+                "target": "UniswapV4StateView",
+                "params": [{ "type": "bytes32", "from_event": "topics[1]" }]
             }
         ]
     }
