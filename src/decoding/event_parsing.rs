@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy::dyn_abi::DynSolType;
 use alloy::primitives::keccak256;
 use arrow::datatypes::DataType;
@@ -31,7 +33,7 @@ pub enum TupleFieldInfo {
 #[allow(dead_code)]
 pub struct FlattenedField {
     /// Full path name like "key.currency0", "deployer", or "poolKey.hash"
-    pub full_name: String,
+    pub full_name: Arc<str>,
     /// The leaf type for this field (FixedBytes(32) for indexed tuple hashes)
     pub leaf_type: DynSolType,
     /// Arrow data type for parquet writing
@@ -156,7 +158,7 @@ fn flatten_param_into(param: &EventParam, prefix: &str, output: &mut Vec<Flatten
     if param.indexed && param.tuple_fields.is_some() {
         if let Some(TupleFieldInfo::Tuple(_)) = &param.tuple_fields {
             output.push(FlattenedField {
-                full_name: format!("{}.hash", prefix),
+                full_name: Arc::from(format!("{}.hash", prefix)),
                 leaf_type: DynSolType::FixedBytes(32),
                 arrow_type: DataType::FixedSizeBinary(32),
                 from_indexed: true,
@@ -170,7 +172,7 @@ fn flatten_param_into(param: &EventParam, prefix: &str, output: &mut Vec<Flatten
         None | Some(TupleFieldInfo::Leaf) => {
             // Leaf field - add directly
             output.push(FlattenedField {
-                full_name: prefix.to_string(),
+                full_name: Arc::from(prefix),
                 leaf_type: param.param_type.clone(),
                 arrow_type: param_type_to_arrow(&param.param_type),
                 from_indexed: param.indexed,
@@ -552,9 +554,9 @@ mod tests {
 
         // Check flattened fields
         assert_eq!(parsed.flattened_fields.len(), 3);
-        assert_eq!(parsed.flattened_fields[0].full_name, "from");
-        assert_eq!(parsed.flattened_fields[1].full_name, "to");
-        assert_eq!(parsed.flattened_fields[2].full_name, "value");
+        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "from");
+        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "to");
+        assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "value");
     }
 
     #[test]
@@ -624,18 +626,18 @@ mod tests {
 
         // Check flattened fields
         assert_eq!(parsed.flattened_fields.len(), 9);
-        assert_eq!(parsed.flattened_fields[0].full_name, "key.currency0");
-        assert_eq!(parsed.flattened_fields[1].full_name, "key.currency1");
-        assert_eq!(parsed.flattened_fields[2].full_name, "key.fee");
-        assert_eq!(parsed.flattened_fields[3].full_name, "key.tickSpacing");
-        assert_eq!(parsed.flattened_fields[4].full_name, "key.hooks");
-        assert_eq!(parsed.flattened_fields[5].full_name, "params.tickLower");
-        assert_eq!(parsed.flattened_fields[6].full_name, "params.tickUpper");
+        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "key.currency0");
+        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "key.currency1");
+        assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "key.fee");
+        assert_eq!(parsed.flattened_fields[3].full_name.as_ref(), "key.tickSpacing");
+        assert_eq!(parsed.flattened_fields[4].full_name.as_ref(), "key.hooks");
+        assert_eq!(parsed.flattened_fields[5].full_name.as_ref(), "params.tickLower");
+        assert_eq!(parsed.flattened_fields[6].full_name.as_ref(), "params.tickUpper");
         assert_eq!(
-            parsed.flattened_fields[7].full_name,
+            parsed.flattened_fields[7].full_name.as_ref(),
             "params.liquidityDelta"
         );
-        assert_eq!(parsed.flattened_fields[8].full_name, "params.salt");
+        assert_eq!(parsed.flattened_fields[8].full_name.as_ref(), "params.salt");
     }
 
     #[test]
@@ -656,14 +658,14 @@ mod tests {
 
         // Check flattened fields - indexed tuple should be a hash
         assert_eq!(parsed.flattened_fields.len(), 3);
-        assert_eq!(parsed.flattened_fields[0].full_name, "sender");
+        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "sender");
         assert!(!parsed.flattened_fields[0]._isindexed_tuple_hash);
 
-        assert_eq!(parsed.flattened_fields[1].full_name, "poolKey.hash");
+        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "poolKey.hash");
         assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
         assert!(parsed.flattened_fields[1].from_indexed);
 
-        assert_eq!(parsed.flattened_fields[2].full_name, "poolId");
+        assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "poolId");
     }
 
     #[test]
@@ -680,9 +682,9 @@ mod tests {
 
         // Check flattened fields
         assert_eq!(parsed.flattened_fields.len(), 3);
-        assert_eq!(parsed.flattened_fields[0].full_name, "key.a");
-        assert_eq!(parsed.flattened_fields[1].full_name, "key.b");
-        assert_eq!(parsed.flattened_fields[2].full_name, "deployer");
+        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "key.a");
+        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "key.b");
+        assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "deployer");
     }
 
     #[test]
@@ -702,22 +704,22 @@ mod tests {
         // Check flattened fields
         // sender, poolKey.hash, poolId, params.zeroForOne, params.amountSpecified, params.sqrtPriceLimitX96, amount0, amount1, hookData
         assert_eq!(parsed.flattened_fields.len(), 9);
-        assert_eq!(parsed.flattened_fields[0].full_name, "sender");
-        assert_eq!(parsed.flattened_fields[1].full_name, "poolKey.hash");
+        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "sender");
+        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "poolKey.hash");
         assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
-        assert_eq!(parsed.flattened_fields[2].full_name, "poolId");
-        assert_eq!(parsed.flattened_fields[3].full_name, "params.zeroForOne");
+        assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "poolId");
+        assert_eq!(parsed.flattened_fields[3].full_name.as_ref(), "params.zeroForOne");
         assert_eq!(
-            parsed.flattened_fields[4].full_name,
+            parsed.flattened_fields[4].full_name.as_ref(),
             "params.amountSpecified"
         );
         assert_eq!(
-            parsed.flattened_fields[5].full_name,
+            parsed.flattened_fields[5].full_name.as_ref(),
             "params.sqrtPriceLimitX96"
         );
-        assert_eq!(parsed.flattened_fields[6].full_name, "amount0");
-        assert_eq!(parsed.flattened_fields[7].full_name, "amount1");
-        assert_eq!(parsed.flattened_fields[8].full_name, "hookData");
+        assert_eq!(parsed.flattened_fields[6].full_name.as_ref(), "amount0");
+        assert_eq!(parsed.flattened_fields[7].full_name.as_ref(), "amount1");
+        assert_eq!(parsed.flattened_fields[8].full_name.as_ref(), "hookData");
     }
 
     #[test]
@@ -728,13 +730,13 @@ mod tests {
 
         assert_eq!(parsed.name, "Swap");
         assert_eq!(parsed.flattened_fields.len(), 8);
-        assert_eq!(parsed.flattened_fields[0].full_name, "id");
-        assert_eq!(parsed.flattened_fields[1].full_name, "sender");
-        assert_eq!(parsed.flattened_fields[2].full_name, "amount0");
-        assert_eq!(parsed.flattened_fields[3].full_name, "amount1");
-        assert_eq!(parsed.flattened_fields[4].full_name, "sqrtPriceX96");
-        assert_eq!(parsed.flattened_fields[5].full_name, "liquidity");
-        assert_eq!(parsed.flattened_fields[6].full_name, "tick");
-        assert_eq!(parsed.flattened_fields[7].full_name, "fee");
+        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "id");
+        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "sender");
+        assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "amount0");
+        assert_eq!(parsed.flattened_fields[3].full_name.as_ref(), "amount1");
+        assert_eq!(parsed.flattened_fields[4].full_name.as_ref(), "sqrtPriceX96");
+        assert_eq!(parsed.flattened_fields[5].full_name.as_ref(), "liquidity");
+        assert_eq!(parsed.flattened_fields[6].full_name.as_ref(), "tick");
+        assert_eq!(parsed.flattened_fields[7].full_name.as_ref(), "fee");
     }
 }

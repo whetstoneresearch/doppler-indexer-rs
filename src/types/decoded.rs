@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::Arc;
 
 use alloy::primitives::{I256, U256};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ pub enum DecodedValue {
     Bytes(Vec<u8>),
     String(String),
     /// Named tuple of (field_name, field_value) pairs
-    NamedTuple(Vec<(String, DecodedValue)>),
+    NamedTuple(Vec<(Arc<str>, DecodedValue)>),
     /// Unnamed tuple of values (no field names)
     UnnamedTuple(Vec<DecodedValue>),
     /// Array of values
@@ -161,7 +162,7 @@ impl DecodedValue {
     pub fn get_field(&self, name: &str) -> Option<&DecodedValue> {
         match self {
             DecodedValue::NamedTuple(fields) => {
-                fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+                fields.iter().find(|(n, _)| &**n == name).map(|(_, v)| v)
             }
             _ => None,
         }

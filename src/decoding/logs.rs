@@ -687,13 +687,13 @@ fn flatten_single_value(
             if let DynSolType::Tuple(types) = &param.param_type {
                 for ((field_name, field_info), field_type) in field_infos.iter().zip(types.iter()) {
                     // Find the matching value
-                    let field_value = match named_values.iter().find(|(n, _)| n == field_name) {
+                    let field_value = match named_values.iter().find(|(n, _)| &**n == field_name) {
                         Some((_, v)) => v.clone(),
                         None => {
                             let expected_fields: Vec<String> =
                                 field_infos.iter().map(|(n, _)| n.clone()).collect();
                             let actual_fields: Vec<String> =
-                                named_values.iter().map(|(n, _)| n.clone()).collect();
+                                named_values.iter().map(|(n, _)| n.to_string()).collect();
                             return FlattenResult::MissingField {
                                 field_name: field_name.clone(),
                                 expected_fields,
@@ -776,7 +776,7 @@ fn convert_dyn_sol_value_with_tuple_info(
             for ((field_name, field_info), val) in field_infos.iter().zip(values.iter()) {
                 let decoded =
                     convert_dyn_sol_value_with_tuple_info(val, &Some(field_info.clone()))?;
-                named_values.push((field_name.clone(), decoded));
+                named_values.push((Arc::from(field_name.as_str()), decoded));
             }
             Ok(DecodedValue::NamedTuple(named_values))
         }
@@ -823,7 +823,7 @@ fn convert_dyn_sol_value(value: &DynSolValue) -> Result<DecodedValue, LogDecodin
                 .enumerate()
                 .map(|(i, v)| {
                     let decoded = convert_dyn_sol_value(v)?;
-                    Ok((format!("field_{}", i), decoded))
+                    Ok((Arc::<str>::from(format!("field_{}", i)), decoded))
                 })
                 .collect::<Result<Vec<_>, LogDecodingError>>()?;
             Ok(DecodedValue::NamedTuple(named))
@@ -853,7 +853,7 @@ fn write_decoded_logs_to_parquet(
     // Add fields from flattened_fields
     for flattened in &event.flattened_fields {
         fields.push(Field::new(
-            &flattened.full_name,
+            &*flattened.full_name,
             flattened.arrow_type.clone(),
             true,
         ));

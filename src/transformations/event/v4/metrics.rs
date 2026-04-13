@@ -865,16 +865,17 @@ mod tests {
         tick: i32,
         total_proceeds: u64,
         total_tokens_sold: u64,
-    ) -> std::collections::HashMap<String, crate::types::decoded::DecodedValue> {
+    ) -> std::collections::HashMap<std::sync::Arc<str>, crate::types::decoded::DecodedValue> {
         use crate::types::decoded::DecodedValue;
+        use std::sync::Arc;
         let mut params = std::collections::HashMap::new();
-        params.insert("currentTick".to_string(), DecodedValue::Int32(tick));
+        params.insert(Arc::from("currentTick"), DecodedValue::Int32(tick));
         params.insert(
-            "totalProceeds".to_string(),
+            Arc::from("totalProceeds"),
             DecodedValue::Uint256(U256::from(total_proceeds)),
         );
         params.insert(
-            "totalTokensSold".to_string(),
+            Arc::from("totalTokensSold"),
             DecodedValue::Uint256(U256::from(total_tokens_sold)),
         );
         params
