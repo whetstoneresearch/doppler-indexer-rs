@@ -1115,7 +1115,7 @@ mod tests {
             source_name: "Pool".to_string(),
             function_name: "slot0".to_string(),
             trigger_log_index: None,
-            result: HashMap::from([("result".to_string(), DecodedValue::Uint64(1))]),
+            result: HashMap::from([(Arc::from("result"), DecodedValue::Uint64(1))]),
             is_reverted: false,
             revert_reason: None,
         }];

@@ -251,9 +251,9 @@ mod tests {
         amount1: i128,
     ) -> DecodedEvent {
         let mut params = HashMap::new();
-        params.insert("poolId".to_string(), DecodedValue::Bytes32(pool_id));
-        params.insert("amount0".to_string(), DecodedValue::Int128(amount0));
-        params.insert("amount1".to_string(), DecodedValue::Int128(amount1));
+        params.insert(Arc::from("poolId"), DecodedValue::Bytes32(pool_id));
+        params.insert(Arc::from("amount0"), DecodedValue::Int128(amount0));
+        params.insert(Arc::from("amount1"), DecodedValue::Int128(amount1));
         DecodedEvent {
             block_number,
             block_timestamp: 1000,
@@ -285,10 +285,10 @@ mod tests {
     ) -> DecodedCall {
         let mut result = HashMap::new();
         result.insert(
-            "sqrtPriceX96".to_string(),
+            Arc::from("sqrtPriceX96"),
             DecodedValue::Uint256(sqrt_price_x96),
         );
-        result.insert("tick".to_string(), DecodedValue::Int32(tick));
+        result.insert(Arc::from("tick"), DecodedValue::Int32(tick));
         DecodedCall {
             block_number,
             block_timestamp: 1000,
@@ -415,23 +415,23 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert(
-            "key.currency0".to_string(),
+            Arc::from("key.currency0"),
             DecodedValue::Address(currency0),
         );
         params.insert(
-            "key.currency1".to_string(),
+            Arc::from("key.currency1"),
             DecodedValue::Address(currency1),
         );
-        params.insert("key.fee".to_string(), DecodedValue::Uint32(fee));
+        params.insert(Arc::from("key.fee"), DecodedValue::Uint32(fee));
         params.insert(
-            "key.tickSpacing".to_string(),
+            Arc::from("key.tickSpacing"),
             DecodedValue::Int32(tick_spacing),
         );
-        params.insert("key.hooks".to_string(), DecodedValue::Address(hooks));
-        params.insert("params.tickLower".to_string(), DecodedValue::Int32(-100));
-        params.insert("params.tickUpper".to_string(), DecodedValue::Int32(100));
+        params.insert(Arc::from("key.hooks"), DecodedValue::Address(hooks));
+        params.insert(Arc::from("params.tickLower"), DecodedValue::Int32(-100));
+        params.insert(Arc::from("params.tickUpper"), DecodedValue::Int32(100));
         params.insert(
-            "params.liquidityDelta".to_string(),
+            Arc::from("params.liquidityDelta"),
             DecodedValue::Int256(I256::try_from(500_000i64).unwrap()),
         );
 
@@ -477,11 +477,11 @@ mod tests {
         let pool_id = [3u8; 32];
 
         let mut params = HashMap::new();
-        params.insert("id".to_string(), DecodedValue::Bytes32(pool_id));
-        params.insert("tickLower".to_string(), DecodedValue::Int32(-200));
-        params.insert("tickUpper".to_string(), DecodedValue::Int32(200));
+        params.insert(Arc::from("id"), DecodedValue::Bytes32(pool_id));
+        params.insert(Arc::from("tickLower"), DecodedValue::Int32(-200));
+        params.insert(Arc::from("tickUpper"), DecodedValue::Int32(200));
         params.insert(
-            "liquidityDelta".to_string(),
+            Arc::from("liquidityDelta"),
             DecodedValue::Int256(I256::try_from(-250_000i64).unwrap()),
         );
 

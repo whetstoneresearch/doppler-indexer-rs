@@ -1,5 +1,7 @@
 //! Value decoding: alloy DynSolType -> DecodedValue.
 
+use std::sync::Arc;
+
 use alloy::dyn_abi::{DynSolType, DynSolValue};
 
 use super::types::EthCallDecodingError;
@@ -84,7 +86,7 @@ fn convert_dyn_sol_value(
             let mut named_values = Vec::with_capacity(fields.len());
             for ((name, field_type), val) in fields.iter().zip(values.iter()) {
                 let decoded = convert_dyn_sol_value(val, field_type)?;
-                named_values.push((name.clone(), decoded));
+                named_values.push((Arc::from(name.as_str()), decoded));
             }
             return Ok(DecodedValue::NamedTuple(named_values));
         } else {
