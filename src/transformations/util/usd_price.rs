@@ -283,7 +283,7 @@ impl UsdPriceContext {
         unresolved_tokens: &[[u8; 20]],
         max_block: Option<u64>,
     ) {
-        use super::price_path::{check_or_resolve_path, derive_price_from_path};
+        use super::price_path::{check_or_resolve_path, derive_price_from_path, invalidate_cached_path};
 
         let priceable: std::collections::HashSet<[u8; 20]> =
             self.prices.keys().copied().collect();
@@ -309,11 +309,18 @@ impl UsdPriceContext {
                 continue;
             };
 
-            if let Some(usd_price) =
-                derive_price_from_path(db_pool, chain_id, &path, token, &anchor_usd, max_block)
-                    .await
+            match derive_price_from_path(db_pool, chain_id, &path, token, &anchor_usd, max_block)
+                .await
             {
-                self.prices.insert(*token, usd_price);
+                Some(usd_price) => {
+                    self.prices.insert(*token, usd_price);
+                }
+                None => {
+                    // Path is broken (pool missing, reorg, etc.) — invalidate so
+                    // it gets re-resolved next invocation instead of persisting
+                    // as a useless cached entry until TTL.
+                    let _ = invalidate_cached_path(db_pool, chain_id, token).await;
+                }
             }
         }
     }

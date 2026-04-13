@@ -424,6 +424,30 @@ async fn upsert_cached_path(
     Ok(())
 }
 
+/// Delete a cached path so it gets re-resolved on the next invocation.
+/// Called when `derive_price_from_path` fails for a cached path, indicating
+/// the path is broken (e.g., pool disappeared after a reorg).
+pub async fn invalidate_cached_path(
+    db_pool: &Pool,
+    chain_id: u64,
+    token: &[u8; 20],
+) -> Result<(), TransformationError> {
+    let client = db_pool
+        .get()
+        .await
+        .map_err(|e| TransformationError::DatabaseError(e.into()))?;
+
+    client
+        .execute(
+            "DELETE FROM token_price_paths WHERE chain_id = $1 AND token_address = $2",
+            &[&(chain_id as i64), &token.to_vec()],
+        )
+        .await
+        .map_err(|e| TransformationError::DatabaseError(e.into()))?;
+
+    Ok(())
+}
+
 /// Query pools touching any of the frontier tokens with >= $1k active liquidity.
 ///
 /// Also includes pools whose `active_liquidity_usd` is NULL but have non-zero
@@ -457,7 +481,7 @@ async fn query_frontier_pools(
                AND (COALESCE(ps.active_liquidity_usd, 0) >= $3 \
                     OR (ps.active_liquidity_usd IS NULL AND ps.active_liquidity > 0)) \
                AND ($4::bigint IS NULL OR ps.block_number < $4) \
-             ORDER BY p.address, ps.active_liquidity_usd DESC NULLS LAST",
+             ORDER BY p.address, ps.block_number DESC",
             &[
                 &(chain_id as i64),
                 &frontier_bytes,
