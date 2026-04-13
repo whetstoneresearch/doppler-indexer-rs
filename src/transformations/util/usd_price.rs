@@ -217,6 +217,52 @@ impl UsdPriceContext {
         Some(amount_decimal * usd_per_quote)
     }
 
+    /// Resolve USD prices for tokens via graph-based path resolution.
+    ///
+    /// For each unresolved token, checks the `token_price_paths` cache and
+    /// resolves via frontier expansion if needed. Adds any newly resolved
+    /// prices to the internal map so subsequent `quote_to_usd_multiplier`
+    /// calls find them.
+    pub async fn resolve_path_prices(
+        &mut self,
+        db_pool: &Pool,
+        chain_id: u64,
+        current_block: u64,
+        unresolved_tokens: &[[u8; 20]],
+    ) {
+        use super::price_path::{check_or_resolve_path, derive_price_from_path};
+
+        let priceable: std::collections::HashSet<[u8; 20]> =
+            self.prices.keys().copied().collect();
+
+        for token in unresolved_tokens {
+            if self.prices.contains_key(token) {
+                continue;
+            }
+
+            let Some(path) =
+                check_or_resolve_path(db_pool, chain_id, token, &priceable, current_block).await
+            else {
+                continue;
+            };
+
+            if !path.is_priceable {
+                continue;
+            }
+
+            // The anchor must already be in our prices map
+            let Some(anchor_usd) = self.prices.get(&path.anchor_token).cloned() else {
+                continue;
+            };
+
+            if let Some(usd_price) =
+                derive_price_from_path(db_pool, chain_id, &path, token, &anchor_usd).await
+            {
+                self.prices.insert(*token, usd_price);
+            }
+        }
+    }
+
     /// Get the USD multiplier for a quote token.
     /// Looks up the token in the resolved prices map.
     /// The zero address (native ETH) maps to the WETH price.
@@ -324,6 +370,40 @@ pub async fn build_usd_price_context(
         prices,
         weth_address,
     };
+
+    (usd_ctx, price_ops)
+}
+
+/// Build a `UsdPriceContext` with Phase 2 graph-based path resolution.
+///
+/// Wraps `build_usd_price_context` (Phase 1) and then resolves any quote
+/// tokens from the metadata cache that are still unpriced via frontier
+/// expansion through the pool graph (Phase 2).
+pub async fn build_usd_price_context_with_paths(
+    ctx: &TransformationContext,
+    cache: &OraclePriceCache,
+    db_pool: &OnceLock<Pool>,
+    chain_id: u64,
+    contracts: &Contracts,
+    metadata_cache: &super::pool_metadata::PoolMetadataCache,
+) -> (UsdPriceContext, Vec<DbOperation>) {
+    let (mut usd_ctx, price_ops) =
+        build_usd_price_context(ctx, cache, db_pool, chain_id, contracts).await;
+
+    // Phase 2: resolve quote tokens not covered by configured anchor pools.
+    if let Some(pool) = db_pool.get() {
+        let quote_tokens = metadata_cache.unique_quote_tokens();
+        let unresolved: Vec<[u8; 20]> = quote_tokens
+            .into_iter()
+            .filter(|t| usd_ctx.quote_to_usd_multiplier(t).is_none())
+            .collect();
+
+        if !unresolved.is_empty() {
+            usd_ctx
+                .resolve_path_prices(pool, chain_id, ctx.blockrange_end, &unresolved)
+                .await;
+        }
+    }
 
     (usd_ctx, price_ops)
 }

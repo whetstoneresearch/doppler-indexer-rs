@@ -208,6 +208,16 @@ impl PoolMetadataCache {
         inner.entry(pool_id).or_insert(meta);
     }
 
+    /// Return all unique quote token addresses in the cache.
+    pub fn unique_quote_tokens(&self) -> Vec<[u8; 20]> {
+        let inner = self.inner.read().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for meta in inner.values() {
+            seen.insert(meta.quote_token);
+        }
+        seen.into_iter().collect()
+    }
+
     /// Re-query the `pools` table and insert any pools not already cached.
     ///
     /// Also resolves `quote_decimals` for all newly inserted entries while

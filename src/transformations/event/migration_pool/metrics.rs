@@ -41,7 +41,7 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::usd_price::{
-    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+    build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
 };
 
 const POOL_MANAGER_SOURCE: &str = "UniswapV4PoolManager";
@@ -183,12 +183,13 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
         )
         .await?;
 
-        let (usd_ctx, price_ops) = build_usd_price_context(
+        let (usd_ctx, price_ops) = build_usd_price_context_with_paths(
             ctx,
             &self.oracle_cache,
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            &self.metadata_cache,
         )
         .await;
 
@@ -442,12 +443,13 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
             return Ok(Vec::new());
         };
 
-        let (usd_ctx, price_ops) = build_usd_price_context(
+        let (usd_ctx, price_ops) = build_usd_price_context_with_paths(
             ctx,
             &self.oracle_cache,
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            &self.metadata_cache,
         )
         .await;
 

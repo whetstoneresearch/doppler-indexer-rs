@@ -230,7 +230,11 @@ impl TransformationHandler for PriceHandler {
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {
-        vec!["migrations/tables/prices.sql"]
+        vec![
+            "migrations/tables/prices.sql",
+            "migrations/tables/pools_token_indexes.sql",
+            "migrations/tables/token_price_paths.sql",
+        ]
     }
 
     fn reorg_tables(&self) -> Vec<&'static str> {

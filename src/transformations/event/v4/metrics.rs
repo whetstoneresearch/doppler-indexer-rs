@@ -47,7 +47,7 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::tick_math::tick_to_sqrt_price_x96;
 use crate::transformations::util::usd_price::{
-    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+    build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
 };
 
 const SOURCE: &str = "DopplerV4Hook";
@@ -200,12 +200,13 @@ impl TransformationHandler for V4BaseMetricsHandler {
             return Ok(Vec::new());
         }
 
-        let (usd_ctx, price_ops) = build_usd_price_context(
+        let (usd_ctx, price_ops) = build_usd_price_context_with_paths(
             ctx,
             &self.oracle_cache,
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            &self.metadata_cache,
         )
         .await;
         let mut ops = process_swaps(
