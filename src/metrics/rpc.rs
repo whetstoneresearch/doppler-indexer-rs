@@ -133,22 +133,28 @@ pub fn record_rate_limit_wait(chain: &str, duration_secs: f64) {
 }
 
 /// Record a retry attempt with its outcome.
-pub fn record_retry_attempt(chain: &str, operation: &str, outcome: &str) {
+///
+/// The `method` parameter should be a static RPC method name (e.g. `"eth_getBlockByNumber"`)
+/// to keep metric cardinality low. Per-call details belong in log messages, not labels.
+pub fn record_retry_attempt(chain: &str, method: &'static str, outcome: &'static str) {
     counter!(
         "rpc_retry_attempts_total",
         "chain" => chain.to_string(),
-        "operation" => operation.to_string(),
-        "outcome" => outcome.to_string()
+        "method" => method,
+        "outcome" => outcome
     )
     .increment(1);
 }
 
 /// Record that retries were fully exhausted for an operation.
-pub fn record_retries_exhausted(chain: &str, operation: &str) {
+///
+/// The `method` parameter should be a static RPC method name (e.g. `"eth_getBlockByNumber"`)
+/// to keep metric cardinality low.
+pub fn record_retries_exhausted(chain: &str, method: &'static str) {
     counter!(
         "rpc_retries_exhausted_total",
         "chain" => chain.to_string(),
-        "operation" => operation.to_string()
+        "method" => method
     )
     .increment(1);
 }

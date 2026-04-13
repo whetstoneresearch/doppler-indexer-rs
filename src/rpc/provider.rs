@@ -1,7 +1,9 @@
 use std::future::Future;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+use regex::RegexSet;
 
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, BlockNumber, Bytes, B256, U256};
@@ -192,31 +194,39 @@ impl RpcError {
     }
 
     fn is_retryable_message(msg: &str) -> bool {
-        let msg_lower = msg.to_lowercase();
-        // Network/connection errors
-        msg_lower.contains("connection")
-            || msg_lower.contains("timeout")
-            || msg_lower.contains("timed out")
-            || msg_lower.contains("reset")
-            || msg_lower.contains("broken pipe")
-            || msg_lower.contains("network")
-            || msg_lower.contains("eof")
-            || msg_lower.contains("sending request")
-            // Rate limiting indicators
-            || msg_lower.contains("rate limit")
-            || msg_lower.contains("too many requests")
-            || msg_lower.contains("429")
-            // Server errors (5xx)
-            || msg_lower.contains("502")
-            || msg_lower.contains("503")
-            || msg_lower.contains("504")
-            || msg_lower.contains("internal server error")
-            || msg_lower.contains("service unavailable")
-            || msg_lower.contains("bad gateway")
-            // Temporary failures
-            || msg_lower.contains("temporarily")
-            || msg_lower.contains("try again")
-            || msg_lower.contains("retry")
+        /// Case-insensitive regex set compiled once. Avoids per-call `to_lowercase()`
+        /// and linear chain of `contains()` checks.
+        static RETRYABLE_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+            RegexSet::new([
+                // Network/connection errors
+                "(?i)connection",
+                "(?i)timeout",
+                "(?i)timed out",
+                "(?i)reset",
+                "(?i)broken pipe",
+                "(?i)network",
+                "(?i)eof",
+                "(?i)sending request",
+                // Rate limiting indicators
+                "(?i)rate limit",
+                "(?i)too many requests",
+                "429",
+                // Server errors (5xx)
+                "502",
+                "503",
+                "504",
+                "(?i)internal server error",
+                "(?i)service unavailable",
+                "(?i)bad gateway",
+                // Temporary failures
+                "(?i)temporarily",
+                "(?i)try again",
+                "(?i)retry",
+            ])
+            .expect("retryable patterns should compile")
+        });
+
+        RETRYABLE_PATTERNS.is_match(msg)
     }
 }
 
@@ -285,10 +295,14 @@ impl RetryConfig {
 /// Retries the operation up to `config.max_retries` times with exponential backoff
 /// for retryable errors. All retry attempts are logged for debugging.
 ///
-/// The `chain` parameter is used for metrics labeling. Pass an empty string to skip
-/// metrics recording.
+/// * `method_name` — static RPC method name used as a low-cardinality metrics label
+///   (e.g. `"eth_getBlockByNumber"`). Pass an empty string to skip metrics recording.
+/// * `operation_name` — human-readable description with per-call details, used only in
+///   log messages (e.g. `"eth_getBlockByNumber(Number(123))"`).
+/// * `chain` — chain label for metrics. Pass an empty string to skip metrics recording.
 pub async fn with_retry<F, Fut, T>(
     config: &RetryConfig,
+    method_name: &'static str,
     operation_name: &str,
     chain: &str,
     mut operation: F,
@@ -297,7 +311,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, RpcError>>,
 {
-    let has_chain = !chain.is_empty();
+    let has_chain = !chain.is_empty() && !method_name.is_empty();
     let chain_tag = if has_chain { chain } else { "unknown" };
     let mut errors: Vec<String> = Vec::new();
 
@@ -326,7 +340,7 @@ where
                         attempt
                     );
                     if has_chain {
-                        record_retry_attempt(chain, operation_name, "success_after_retry");
+                        record_retry_attempt(chain, method_name, "success_after_retry");
                     }
                 }
                 return Ok(result);
@@ -345,7 +359,7 @@ where
                     );
                     errors.push(format!("attempt {}: {}", attempt + 1, error_msg));
                     if has_chain {
-                        record_retry_attempt(chain, operation_name, "retry");
+                        record_retry_attempt(chain, method_name, "retry");
                     }
                 } else {
                     // Non-retryable error or exhausted retries
@@ -361,7 +375,7 @@ where
                             errors.join("; ")
                         );
                         if has_chain {
-                            record_retries_exhausted(chain, operation_name);
+                            record_retries_exhausted(chain, method_name);
                         }
                     }
                     return Err(e);
@@ -372,7 +386,7 @@ where
 
     // This should be unreachable, but provide a meaningful error if it happens
     if has_chain {
-        record_retries_exhausted(chain, operation_name);
+        record_retries_exhausted(chain, method_name);
     }
     Err(RpcError::ProviderError(format!(
         "[{}] RPC '{}' exhausted retries. Errors: [{}]",
@@ -505,14 +519,16 @@ pub struct RpcClient {
     jitter: Option<Jitter>,
     sliding_limiter: Option<Arc<SlidingWindowRateLimiter>>,
     rpc_semaphore: Arc<Semaphore>,
-    chain: String,
+    /// Cached chain label for metrics. Uses `Arc<str>` so clones into spawned
+    /// tasks are cheap refcount bumps instead of heap allocations.
+    chain: Arc<str>,
 }
 
 #[allow(dead_code)]
 impl RpcClient {
     pub fn new(config: RpcClientConfig) -> Result<Self, RpcError> {
-        let provider = build_provider(config.url.clone(), config.force_http2)?;
-        let chain = chain_label_from_url(&config.url);
+        let provider = build_provider(&config.url)?;
+        let chain: Arc<str> = chain_label_from_url(&config.url).into();
         let concurrency = config.concurrency.max(1);
 
         let (rate_limiter, jitter) = if let Some(ref rate_config) = config.rate_limit {
@@ -542,8 +558,8 @@ impl RpcClient {
         config: RpcClientConfig,
         limiter: Arc<SlidingWindowRateLimiter>,
     ) -> Result<Self, RpcError> {
-        let provider = build_provider(config.url.clone(), config.force_http2)?;
-        let chain = chain_label_from_url(&config.url);
+        let provider = build_provider(&config.url)?;
+        let chain: Arc<str> = chain_label_from_url(&config.url).into();
         let concurrency = config.concurrency.max(1);
         Ok(Self {
             provider,
@@ -614,7 +630,8 @@ impl RpcClient {
     pub async fn get_block_number(&self) -> Result<BlockNumber, RpcError> {
         with_retry(
             &self.config.retry,
-            "get_block_number",
+            "eth_blockNumber",
+            "eth_blockNumber",
             &self.chain,
             || async {
                 self.wait_for_rate_limit().await;
@@ -634,7 +651,7 @@ impl RpcClient {
         full_transactions: bool,
     ) -> Result<Option<Block>, RpcError> {
         let op_name = format!("eth_getBlockByNumber({:?})", block_id);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getBlockByNumber", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             let builder = self.provider.get_block(block_id);
@@ -663,7 +680,7 @@ impl RpcClient {
 
     pub async fn get_transaction(&self, hash: B256) -> Result<Option<Transaction>, RpcError> {
         let op_name = format!("eth_getTransactionByHash({:?})", hash);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getTransactionByHash", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             self.provider
@@ -679,7 +696,7 @@ impl RpcClient {
         hash: B256,
     ) -> Result<Option<TransactionReceipt>, RpcError> {
         let op_name = format!("eth_getTransactionReceipt({:?})", hash);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getTransactionReceipt", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             self.provider
@@ -705,9 +722,11 @@ impl RpcClient {
             BlockNumberOrTag::Finalized => "finalized".to_string(),
         };
 
+        let op_name = format!("{}({:?})", method_name, block_number);
         let raw_receipts: Vec<serde_json::Value> = with_retry(
             &self.config.retry,
-            &format!("{}({:?})", method_name, block_number),
+            "eth_getBlockReceipts",
+            &op_name,
             &self.chain,
             || async {
                 self.wait_for_rate_limit().await;
@@ -794,7 +813,7 @@ impl RpcClient {
             filter.get_from_block(),
             filter.get_to_block()
         );
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getLogs", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             self.provider
@@ -811,7 +830,7 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<U256, RpcError> {
         let op_name = format!("eth_getBalance({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getBalance", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             self.provider
@@ -829,7 +848,7 @@ impl RpcClient {
         block: Option<BlockId>,
     ) -> Result<Bytes, RpcError> {
         let op_name = format!("eth_getCode({:?}, {:?})", address, block);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_getCode", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             self.provider
@@ -848,7 +867,7 @@ impl RpcClient {
     ) -> Result<Bytes, RpcError> {
         let tx = tx.clone();
         let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
-        with_retry(&self.config.retry, &op_name, &self.chain, || async {
+        with_retry(&self.config.retry, "eth_call", &op_name, &self.chain, || async {
             self.wait_for_rate_limit().await;
             let _permit = self.acquire_rpc_permit().await;
             self.provider
