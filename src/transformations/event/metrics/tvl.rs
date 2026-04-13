@@ -835,14 +835,11 @@ mod tests {
     }
 
     fn sample_usd_ctx(eth_usd: Option<&str>) -> UsdPriceContext {
-        UsdPriceContext::new_for_test(
-            eth_usd.map(bd),
-            None,
-            Some([0x02; 20]), // WETH = quote for sample_meta
-            None,
-            None,
-            None,
-        )
+        let mut prices = std::collections::HashMap::new();
+        if let Some(p) = eth_usd {
+            prices.insert([0x02; 20], bd(p)); // WETH = quote for sample_meta
+        }
+        UsdPriceContext::new_for_test(prices, Some([0x02; 20]))
     }
 
     fn sample_bootstrap_seed() -> TvlBootstrapSeed {
@@ -1355,14 +1352,10 @@ mod tests {
     }
 
     fn sample_usd_ctx_with_usdc() -> UsdPriceContext {
-        UsdPriceContext::new_for_test(
-            Some(bd("2000")),  // eth_usd
-            None,              // eurc_usd
-            Some([0x02; 20]),  // WETH address
-            Some([0x03; 20]),  // USDC address
-            None,              // usdt
-            None,              // eurc
-        )
+        let mut prices = std::collections::HashMap::new();
+        prices.insert([0x02; 20], bd("2000")); // WETH
+        prices.insert([0x03; 20], bigdecimal::BigDecimal::from(1)); // USDC
+        UsdPriceContext::new_for_test(prices, Some([0x02; 20]))
     }
 
     #[test]

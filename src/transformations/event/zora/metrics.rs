@@ -15,7 +15,7 @@ use crate::transformations::traits::{EventHandler, EventTrigger, TransformationH
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::tick_math::sqrt_price_x96_to_tick;
 use crate::transformations::util::usd_price::{
-    build_usd_price_context, chainlink_latest_answer_dependency, OraclePriceCache,
+    build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
 };
 
 const CREATOR_HOOK_SOURCE: &str = "CreatorCoinHook";
@@ -75,12 +75,13 @@ impl TransformationHandler for ZoraSwapMetricsHandler {
         )
         .await?;
 
-        let (usd_ctx, price_ops) = build_usd_price_context(
+        let (usd_ctx, price_ops) = build_usd_price_context_with_paths(
             ctx,
             &self.oracle_cache,
             &self.db_pool,
             self.chain_id,
             &ctx.contracts,
+            &self.metadata_cache,
         )
         .await;
 
