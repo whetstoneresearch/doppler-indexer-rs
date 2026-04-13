@@ -219,6 +219,45 @@ pub fn read_event_trigger_log_batches_from_parquet(
     Ok(batches)
 }
 
+/// Read only (block_number, log_index) pairs from an event-triggered eth_call parquet file.
+///
+/// Uses column projection to avoid reading target_address, value, is_reverted, etc.
+pub fn read_event_call_row_keys_from_parquet(
+    path: &Path,
+) -> Result<Vec<(u64, u32)>, ParquetReadError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let arrow_schema = builder.schema().clone();
+
+    let needed = ["block_number", "log_index"];
+    let root_indices: Vec<usize> = needed
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+    let reader = builder.with_projection(mask).build()?;
+
+    let mut keys = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result?;
+        let block_numbers = batch
+            .column_by_name("block_number")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+        let log_indexes = batch
+            .column_by_name("log_index")
+            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+
+        if let (Some(bns), Some(lis)) = (block_numbers, log_indexes) {
+            for i in 0..batch.num_rows() {
+                keys.push((bns.value(i), lis.value(i)));
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
 /// Read factory addresses from a parquet file, returning a set of raw 20-byte addresses.
 ///
 /// Reads the `factory_address` column from a factory parquet file.
