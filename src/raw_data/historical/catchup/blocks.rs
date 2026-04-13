@@ -262,10 +262,7 @@ async fn collect_blocks_streaming(
                                 number: block_number,
                                 timestamp,
                                 transaction_count: tx_hashes.len() as u32,
-                                transaction_hashes: tx_hashes
-                                    .iter()
-                                    .map(|h| format!("{:?}", h))
-                                    .collect(),
+                                transaction_hashes: tx_hashes,
                                 uncle_count: block.uncles.len() as u32,
                             },
                         );

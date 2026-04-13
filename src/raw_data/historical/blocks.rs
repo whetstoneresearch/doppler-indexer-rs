@@ -5,8 +5,8 @@ use std::sync::Arc;
 use alloy::primitives::B256;
 use alloy::rpc::types::Block;
 use arrow::array::{
-    ArrayRef, BinaryArray, FixedSizeBinaryArray, ListBuilder, StringBuilder, UInt32Array,
-    UInt64Array,
+    ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, StringBuilder,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -67,7 +67,7 @@ pub(crate) struct FullBlockRecord {
     pub excess_blob_gas: Option<u64>,
     pub parent_beacon_block_root: Option<[u8; 32]>,
     pub transaction_count: u32,
-    pub transaction_hashes: Vec<String>,
+    pub transaction_hashes: Vec<B256>,
     pub uncle_count: u32,
     pub size: Option<u64>,
 }
@@ -77,7 +77,7 @@ pub(crate) struct MinimalBlockRecord {
     pub number: u64,
     pub timestamp: u64,
     pub transaction_count: u32,
-    pub transaction_hashes: Vec<String>,
+    pub transaction_hashes: Vec<B256>,
     pub uncle_count: u32,
 }
 
@@ -87,11 +87,7 @@ pub(crate) fn process_single_block_full(
 ) -> Result<FullBlockRecord, BlockCollectionError> {
     let header = &block.header;
     let inner = &header.inner;
-    let tx_hashes: Vec<String> = block
-        .transactions
-        .hashes()
-        .map(|h| format!("{h:?}"))
-        .collect();
+    let tx_hashes: Vec<B256> = block.transactions.hashes().collect();
 
     Ok(FullBlockRecord {
         number: block_number,
@@ -140,7 +136,11 @@ pub(crate) fn build_block_schema(fields: &Option<Vec<BlockField>>) -> Arc<Schema
                         arrow_fields.push(Field::new("transaction_count", DataType::UInt32, false));
                         arrow_fields.push(Field::new(
                             "transaction_hashes",
-                            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                            DataType::List(Arc::new(Field::new(
+                                "item",
+                                DataType::FixedSizeBinary(32),
+                                true,
+                            ))),
                             false,
                         ));
                     }
@@ -182,7 +182,11 @@ pub(crate) fn build_block_schema(fields: &Option<Vec<BlockField>>) -> Arc<Schema
             Field::new("transaction_count", DataType::UInt32, false),
             Field::new(
                 "transaction_hashes",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::FixedSizeBinary(32),
+                    true,
+                ))),
                 false,
             ),
             Field::new("uncle_count", DataType::UInt32, false),
@@ -214,10 +218,14 @@ pub(crate) fn write_minimal_blocks_to_parquet(
                     records.iter().map(|r| Some(r.transaction_count)).collect();
                 arrays.push(Arc::new(count_arr));
 
-                let mut list_builder = ListBuilder::new(StringBuilder::new());
+                let mut list_builder =
+                    ListBuilder::new(FixedSizeBinaryBuilder::new(32));
                 for record in records {
                     for hash in &record.transaction_hashes {
-                        list_builder.values().append_value(hash);
+                        list_builder
+                            .values()
+                            .append_value(hash.as_slice())
+                            .unwrap();
                     }
                     list_builder.append(true);
                 }
@@ -337,10 +345,13 @@ pub(crate) fn write_full_blocks_to_parquet(
     let arr: UInt32Array = records.iter().map(|r| Some(r.transaction_count)).collect();
     arrays.push(Arc::new(arr));
 
-    let mut list_builder = ListBuilder::new(StringBuilder::new());
+    let mut list_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
     for record in records {
         for hash in &record.transaction_hashes {
-            list_builder.values().append_value(hash);
+            list_builder
+                .values()
+                .append_value(hash.as_slice())
+                .unwrap();
         }
         list_builder.append(true);
     }
@@ -524,15 +535,33 @@ pub fn read_block_info_from_parquet(
                 let timestamp = times.value(i);
 
                 // Extract transaction hashes from the list column
+                // Supports both new FixedSizeBinary(32) and legacy Utf8 formats
                 let tx_hashes: Vec<B256> = if let Some(col) = tx_hashes_col {
                     if let Some(list_array) = col.as_any().downcast_ref::<ListArray>() {
                         let values = list_array.value(i);
-                        if let Some(string_array) = values.as_any().downcast_ref::<StringArray>() {
+                        // Try new format (FixedSizeBinary) first
+                        if let Some(binary_array) =
+                            values.as_any().downcast_ref::<FixedSizeBinaryArray>()
+                        {
+                            (0..binary_array.len())
+                                .filter_map(|j| {
+                                    let bytes = binary_array.value(j);
+                                    if bytes.len() == 32 {
+                                        Some(B256::from_slice(bytes))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        // Fall back to old format (Utf8 strings)
+                        } else if let Some(string_array) =
+                            values.as_any().downcast_ref::<StringArray>()
+                        {
                             (0..string_array.len())
                                 .filter_map(|j| {
                                     let hash_str = string_array.value(j);
-                                    // Parse "0x..." format
-                                    let hash_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
+                                    let hash_str =
+                                        hash_str.strip_prefix("0x").unwrap_or(hash_str);
                                     let bytes = hex::decode(hash_str).ok()?;
                                     if bytes.len() == 32 {
                                         Some(B256::from_slice(&bytes))

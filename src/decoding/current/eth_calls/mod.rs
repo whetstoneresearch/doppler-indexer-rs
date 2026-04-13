@@ -280,6 +280,7 @@ mod tests {
             reorg_depth: None,
             compaction_interval_secs: None,
             transform_retry_grace_period_secs: None,
+            max_receipt_ranges: None,
         }
     }
 
