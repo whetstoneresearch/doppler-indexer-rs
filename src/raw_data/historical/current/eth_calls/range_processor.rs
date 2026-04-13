@@ -56,7 +56,7 @@ pub(super) async fn process_complete_range(
             if let Some(multicall_addr) = state.multicall3_address {
                 process_range_multicall(
                     &range,
-                    blocks.clone(),
+                    blocks,
                     &ctx,
                     &state.call_configs,
                     state.max_params,
@@ -68,7 +68,7 @@ pub(super) async fn process_complete_range(
             } else {
                 process_range(
                     &range,
-                    blocks.clone(),
+                    blocks,
                     &ctx,
                     &state.call_configs,
                     state.max_params,
@@ -221,7 +221,7 @@ pub(super) async fn process_incomplete_range(
         if let Some(multicall_addr) = state.multicall3_address {
             process_range_multicall(
                 &range,
-                blocks.clone(),
+                &blocks,
                 &ctx,
                 &state.call_configs,
                 state.max_params,
@@ -233,7 +233,7 @@ pub(super) async fn process_incomplete_range(
         } else {
             process_range(
                 &range,
-                blocks.clone(),
+                &blocks,
                 &ctx,
                 &state.call_configs,
                 state.max_params,

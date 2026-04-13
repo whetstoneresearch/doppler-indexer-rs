@@ -40,6 +40,10 @@ pub struct RawDataCollectionConfig {
     /// Grace period in seconds before retrying stuck transformations.
     /// Default: 300
     pub transform_retry_grace_period_secs: Option<u64>,
+    /// Maximum number of concurrent receipt batch ranges held in memory.
+    /// Lower values reduce peak memory at the cost of throughput.
+    /// Default: 5
+    pub max_receipt_ranges: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

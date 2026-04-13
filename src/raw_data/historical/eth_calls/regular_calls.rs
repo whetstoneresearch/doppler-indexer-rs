@@ -628,7 +628,7 @@ pub(crate) async fn process_factory_range_multicall(
 
 pub(crate) async fn process_range(
     range: &BlockRange,
-    blocks: Vec<BlockInfo>,
+    blocks: &[BlockInfo],
     ctx: &EthCallContext<'_>,
     call_configs: &[CallConfig],
     max_params: usize,
@@ -818,7 +818,7 @@ pub(crate) async fn process_range(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range_multicall(
     range: &BlockRange,
-    blocks: Vec<BlockInfo>,
+    blocks: &[BlockInfo],
     ctx: &EthCallContext<'_>,
     call_configs: &[CallConfig],
     max_params: usize,
