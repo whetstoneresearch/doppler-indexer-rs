@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::chain::ChainAddress;
 
 /// A decoded value from an event parameter, eth_call result, or account-state field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum DecodedValue {
     Address([u8; 20]),
@@ -30,8 +30,12 @@ pub enum DecodedValue {
     UnnamedTuple(Vec<DecodedValue>),
     /// Array of values
     Array(Vec<DecodedValue>),
-    /// Chain-aware address/pubkey value. Kept last to preserve bincode enum ordinals.
+    /// Chain-aware address/pubkey value.
     ChainAddress(ChainAddress),
+    /// Floating-point value for Borsh f32/f64 fields.
+    Float(f64),
+    /// Null / absent value (e.g., Borsh `Option::None`).
+    Null,
 }
 
 #[allow(dead_code)]
@@ -154,6 +158,19 @@ impl DecodedValue {
         }
     }
 
+    /// Try to get as f64.
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            DecodedValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a Null value.
+    pub fn is_null(&self) -> bool {
+        matches!(self, DecodedValue::Null)
+    }
+
     /// Try to get as bool.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
@@ -205,6 +222,7 @@ impl DecodedValue {
             DecodedValue::Int32(v) => Some(v.to_string()),
             DecodedValue::Uint8(v) => Some(v.to_string()),
             DecodedValue::Int8(v) => Some(v.to_string()),
+            DecodedValue::Float(v) => Some(v.to_string()),
             DecodedValue::String(s) => {
                 if U256::from_str(s.trim()).is_ok() || I256::from_str(s.trim()).is_ok() {
                     Some(s.trim().to_string())
@@ -241,5 +259,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(&encoded[..4], &[18, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_bincode_float_and_null_ordinals() {
+        let float = bincode::serialize(&DecodedValue::Float(1.0)).unwrap();
+        assert_eq!(&float[..4], &[19, 0, 0, 0]);
+
+        let null = bincode::serialize(&DecodedValue::Null).unwrap();
+        assert_eq!(&null[..4], &[20, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_as_float() {
+        assert_eq!(DecodedValue::Float(3.14).as_float(), Some(3.14));
+        assert_eq!(DecodedValue::Uint64(42).as_float(), None);
+    }
+
+    #[test]
+    fn test_is_null() {
+        assert!(DecodedValue::Null.is_null());
+        assert!(!DecodedValue::Bool(false).is_null());
+    }
+
+    #[test]
+    fn test_float_to_numeric_string() {
+        assert_eq!(
+            DecodedValue::Float(42.5).to_numeric_string(),
+            Some("42.5".to_string())
+        );
     }
 }
