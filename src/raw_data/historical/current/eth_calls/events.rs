@@ -70,7 +70,7 @@ pub(super) async fn handle_event_trigger_message(
                             range_start,
                             inclusive_end,
                             &state.contracts,
-                            None,
+                            false,
                         )
                         .await?
                     } else {
@@ -82,7 +82,7 @@ pub(super) async fn handle_event_trigger_message(
                             range_start,
                             inclusive_end,
                             &state.contracts,
-                            None,
+                            false,
                         )
                         .await?
                     };
