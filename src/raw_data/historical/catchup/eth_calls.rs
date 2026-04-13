@@ -26,7 +26,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers, extract_event_triggers_from_batches,
-    EventTriggerMatcher,
+    EventTriggerData, EventTriggerMatcher,
 };
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
@@ -37,8 +37,8 @@ use crate::storage::factory_data::{
     load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
 };
 use crate::storage::parquet_readers::read_event_calls_from_parquet;
-use crate::storage::paths::raw_eth_calls_dir;
-use crate::storage::{DataLoader, S3Manifest, StorageManager};
+use crate::storage::paths::{factories_dir as factories_dir_path, raw_eth_calls_dir};
+use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -152,6 +152,33 @@ fn filter_event_trigger_matchers(
             active_keys.contains(&(matcher.source_name.clone(), matcher.event_topic0))
         })
         .collect()
+}
+
+fn filter_ready_factory_event_triggers(
+    triggers: Vec<EventTriggerData>,
+    factory_addresses: &HashMap<String, HashSet<Address>>,
+    ready_factory_sources_for_range: &HashSet<String>,
+) -> (Vec<EventTriggerData>, usize) {
+    if triggers.is_empty() || ready_factory_sources_for_range.is_empty() {
+        return (triggers, 0);
+    }
+
+    let original_len = triggers.len();
+    let filtered = triggers
+        .into_iter()
+        .filter(|trigger| {
+            if !ready_factory_sources_for_range.contains(&trigger.source_name) {
+                return true;
+            }
+
+            factory_addresses
+                .get(&trigger.source_name)
+                .is_some_and(|known| known.contains(&Address::from(trigger.emitter_address)))
+        })
+        .collect::<Vec<_>>();
+
+    let filtered_out = original_len.saturating_sub(filtered.len());
+    (filtered, filtered_out)
 }
 
 type EventRowKeyCounts = HashMap<(u64, u32), usize>;
@@ -886,6 +913,15 @@ pub async fn collect_eth_calls(
                 .extend(addrs);
         }
 
+        let factories_dir = factories_dir_path(&chain.name);
+        let mut factory_contract_indexes = HashMap::new();
+        for collection_name in &factory_collections {
+            factory_contract_indexes.insert(
+                collection_name.clone(),
+                read_contract_index(&factories_dir.join(collection_name)),
+            );
+        }
+
         let log_ranges =
             get_existing_log_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
         let total_log_ranges = log_ranges.len();
@@ -949,6 +985,27 @@ pub async fn collect_eth_calls(
 
                 let range_start = log_range.start;
                 let inclusive_end = log_range.end - 1;
+                let factory_range_key = range_key(range_start, inclusive_end);
+                let mut ready_factory_sources_for_range: HashSet<String> = HashSet::new();
+                for collection_name in &factory_collections {
+                    let range_is_indexed = factory_contract_indexes
+                        .get(collection_name)
+                        .is_some_and(|index| index.contains_key(&factory_range_key));
+                    if !range_is_indexed {
+                        continue;
+                    }
+
+                    if factory_addresses.contains_key(collection_name) {
+                        ready_factory_sources_for_range.insert(collection_name.clone());
+                    } else {
+                        tracing::warn!(
+                            "Factory range {}-{} for collection {} is marked complete in contract index, but no pre-loaded factory addresses were available; skipping catchup pre-filter for this collection",
+                            range_start,
+                            inclusive_end,
+                            collection_name
+                        );
+                    }
+                }
 
                 if repair {
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -979,6 +1036,7 @@ pub async fn collect_eth_calls(
                     let decoder_tx = decoder_tx.clone();
                     let log_file_path = log_range.file_path.clone();
                     let ci_mutex = ci_mutex.clone();
+                    let ready_factory_sources_for_range = ready_factory_sources_for_range.clone();
 
                     join_set.spawn(async move {
                         let (skipped, mut pending_writes) = {
@@ -1014,7 +1072,22 @@ pub async fn collect_eth_calls(
 
                             let triggers =
                                 extract_event_triggers_from_batches(&batches, &event_matchers);
+                            let (triggers, filtered_factory_triggers) =
+                                filter_ready_factory_event_triggers(
+                                    triggers,
+                                    &factory_addresses,
+                                    &ready_factory_sources_for_range,
+                                );
                             drop(batches);
+
+                            if filtered_factory_triggers > 0 {
+                                tracing::debug!(
+                                    "Catchup: filtered {} factory event triggers for blocks {}-{} using pre-loaded factory addresses",
+                                    filtered_factory_triggers,
+                                    range_start,
+                                    inclusive_end
+                                );
+                            }
 
                             let needs_processing = repair_needs_event_recollection(
                                 &base_output_dir,
@@ -1193,8 +1266,22 @@ pub async fn collect_eth_calls(
                 );
 
                 let triggers = extract_event_triggers(&logs, event_matchers_arc.as_ref());
+                let (triggers, filtered_factory_triggers) = filter_ready_factory_event_triggers(
+                    triggers,
+                    &factory_addresses,
+                    &ready_factory_sources_for_range,
+                );
                 // Drop logs immediately — only triggers (much smaller) are kept for RPC work
                 drop(logs);
+
+                if filtered_factory_triggers > 0 {
+                    tracing::debug!(
+                        "Catchup: filtered {} factory event triggers for blocks {}-{} using pre-loaded factory addresses",
+                        filtered_factory_triggers,
+                        range_start,
+                        inclusive_end
+                    );
+                }
 
                 if repair {
                     needs_processing = repair_needs_event_recollection(
