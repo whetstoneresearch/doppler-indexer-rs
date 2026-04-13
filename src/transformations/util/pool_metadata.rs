@@ -325,6 +325,26 @@ const KNOWN_QUOTE_TOKENS: &[QuoteTokenConfig] = &[
         config_name: "Eurc",
         decimals: 6,
     },
+    QuoteTokenConfig {
+        config_name: "Fxh",
+        decimals: 18,
+    },
+    QuoteTokenConfig {
+        config_name: "Noice",
+        decimals: 18,
+    },
+    QuoteTokenConfig {
+        config_name: "Zora",
+        decimals: 18,
+    },
+    QuoteTokenConfig {
+        config_name: "Bankr",
+        decimals: 18,
+    },
+    QuoteTokenConfig {
+        config_name: "Mon",
+        decimals: 18,
+    },
 ];
 
 /// Parse a NUMERIC-as-text representation of `tokens.total_supply` into a U256.

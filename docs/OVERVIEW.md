@@ -147,10 +147,16 @@ migrations/
 - **doc**: `docs/features/transformation_utils.md`
 
 ### pool_metrics
-- **description**: Per-block OHLC snapshots, hot-query pool_state table, USD pricing, rolling metrics, and TVL computation for all pool types (V3, LockableV3, V4 hooks, migration pools). Shared BlockAccumulator, process_swaps/process_liquidity_deltas, and process_tvl functions. Per-pool-type TVL handlers compute amount0/1, tvl_usd, market_cap_usd, and active_liquidity_usd from stateless liquidity_deltas re-aggregation.
+- **description**: Per-block OHLC snapshots, hot-query pool_state table, USD pricing, rolling metrics, and TVL computation for all pool types (V3, LockableV3, V4 hooks, migration pools). Shared BlockAccumulator, process_swaps/process_liquidity_deltas, and process_tvl functions. Per-pool-type TVL handlers compute amount0/1, tvl_usd, market_cap_usd, and active_liquidity_usd from stateless liquidity_deltas re-aggregation. USD price resolution supports any token with a configured anchor pool in tokens.json via transitive multi-hop resolution (e.g., Bankr → WETH → USD).
 - **entry_points**: `src/transformations/event/v3/metrics.rs`, `src/transformations/event/metrics/`
 - **depends_on**: [transformations, transformation_utils]
 - **doc**: `docs/designs/pool-metrics/metrics_implementation_phases.md`
+
+### quote_token_pricing
+- **description**: Dynamic USD price resolution for pool quote tokens. Phase 1: config-driven anchor pools discovered from tokens.json (e.g., BankrWethPool) with transitive resolution. Phase 2 (planned): graph-based frontier expansion through indexed pools for unconfigured tokens.
+- **entry_points**: `src/transformations/eth_call/price.rs`, `src/transformations/util/usd_price.rs`
+- **depends_on**: [pool_metrics, transformation_utils]
+- **doc**: `docs/features/quote_token_pricing.md`
 
 ### live_mode
 - **description**: Real-time block processing via WebSocket. Bincode storage for fast per-block writes, reorg detection, automatic compaction to parquet, and gap backfill on reconnect.

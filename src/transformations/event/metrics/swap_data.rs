@@ -522,14 +522,11 @@ mod tests {
         let pool_id = vec![0u8; 20];
         let cache = make_cache_with_pool(pool_id.clone());
 
-        let usd_ctx = UsdPriceContext::new_for_test(
-            Some(bigdecimal::BigDecimal::from(2000)),
-            None,
-            Some([1u8; 20]), // quote_token matches cache's quote_token
-            None,
-            None,
-            None,
-        );
+        let usd_ctx = {
+            let mut prices = std::collections::HashMap::new();
+            prices.insert([1u8; 20], bigdecimal::BigDecimal::from(2000)); // WETH / quote_token
+            UsdPriceContext::new_for_test(prices, Some([1u8; 20]))
+        };
 
         let swaps = vec![SwapInput {
             pool_id: pool_id.clone(),

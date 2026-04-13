@@ -701,7 +701,7 @@ pub fn build_registry(chain_id: u64) -> TransformationRegistry {
     super::event::register_handlers(&mut registry, chain_id);
 
     // Register eth_call handlers
-    super::eth_call::register_handlers(&mut registry);
+    super::eth_call::register_handlers(&mut registry, None);
 
     registry.validate_and_sort_handler_dependencies();
 
@@ -744,7 +744,7 @@ pub fn build_registry_for_chain(
     super::event::register_handlers_for_chain(&mut registry, chain_id, contracts);
 
     // Register eth_call handlers (filtered by available sources)
-    super::eth_call::register_handlers(&mut registry);
+    super::eth_call::register_handlers(&mut registry, Some(contracts));
 
     registry.validate_and_sort_handler_dependencies();
 

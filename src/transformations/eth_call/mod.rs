@@ -5,8 +5,9 @@
 mod price;
 
 use super::registry::TransformationRegistry;
+use crate::types::config::contract::Contracts;
 
 /// Register all eth_call handlers with the registry.
-pub fn register_handlers(registry: &mut TransformationRegistry) {
-    price::register_handlers(registry);
+pub fn register_handlers(registry: &mut TransformationRegistry, contracts: Option<&Contracts>) {
+    price::register_handlers(registry, contracts);
 }
