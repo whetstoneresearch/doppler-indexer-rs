@@ -142,7 +142,7 @@ impl OraclePriceCache {
         Ok(())
     }
 
-    fn get(&self, token: &[u8; 20], max_block: Option<u64>) -> Option<BigDecimal> {
+    fn get(&self, token: &[u8; 20], max_block: Option<u64>) -> Option<(BigDecimal, u64)> {
         let inner = self.inner.read().unwrap();
         let entry = inner.get(token)?;
         if let Some(mb) = max_block {
@@ -150,7 +150,7 @@ impl OraclePriceCache {
                 return None;
             }
         }
-        Some(entry.price.clone())
+        Some((entry.price.clone(), entry.provenance_block))
     }
 
     fn set(&self, token: [u8; 20], price: BigDecimal, provenance_block: u64) {
@@ -187,7 +187,7 @@ impl OraclePriceCache {
         }
     }
 
-    fn get_all_within(&self, max_block: Option<u64>) -> Vec<([u8; 20], BigDecimal)> {
+    fn get_all_within(&self, max_block: Option<u64>) -> Vec<([u8; 20], BigDecimal, u64)> {
         let inner = self.inner.read().unwrap();
         inner
             .iter()
@@ -198,7 +198,7 @@ impl OraclePriceCache {
                     true
                 }
             })
-            .map(|(token, entry)| (*token, entry.price.clone()))
+            .map(|(token, entry)| (*token, entry.price.clone(), entry.provenance_block))
             .collect()
     }
 }
@@ -394,9 +394,9 @@ pub async fn build_usd_price_context(
     // Cold-start safety net: if no ETH/USD yet, fall back to DB/cache.
     if eth_usd.is_none() {
         if let Some(weth_addr) = weth_address {
-            if let Some(cached_price) = cache.get(&weth_addr, Some(max_block)) {
-                resolved.insert(weth_addr, (cached_price.clone(), 0));
-                resolved.insert(ZERO_ADDRESS, (cached_price, 0));
+            if let Some((cached_price, prov)) = cache.get(&weth_addr, Some(max_block)) {
+                resolved.insert(weth_addr, (cached_price.clone(), prov));
+                resolved.insert(ZERO_ADDRESS, (cached_price, prov));
             } else if let Some(pool) = db_pool.get() {
                 // Last resort: query DB
                 if let Ok((price, block_number)) = query_latest_price(
@@ -424,9 +424,9 @@ pub async fn build_usd_price_context(
             Err(e) => tracing::warn!(error = %e, "prices query failed, using cache"),
         }
     }
-    // Always backfill from block-aware cache
-    for (token, price) in cache.get_all_within(Some(max_block)) {
-        resolved.entry(token).or_insert((price, 0));
+    // Always backfill from block-aware cache (preserving provenance)
+    for (token, price, prov) in cache.get_all_within(Some(max_block)) {
+        resolved.entry(token).or_insert((price, prov));
     }
 
     // Update the shared cache with all resolved prices (with provenance)
@@ -543,7 +543,7 @@ fn extract_eth_usd_from_oracle(
         Some((price, block_number))
     } else {
         // No oracle data in range — use cached value with block awareness
-        weth_address.and_then(|addr| cache.get(&addr, Some(max_block)).map(|price| (price, 0)))
+        weth_address.and_then(|addr| cache.get(&addr, Some(max_block)))
     }
 }
 
@@ -962,7 +962,7 @@ mod tests {
         // max_block=80 should NOT see the price (provenance=100 >= 80)
         assert!(cache.get(&BANKR, Some(80)).is_none());
         // max_block=101 should see the price (provenance=100 < 101)
-        assert_eq!(cache.get(&BANKR, Some(101)).unwrap(), bd("1000"));
+        assert_eq!(cache.get(&BANKR, Some(101)).unwrap().0, bd("1000"));
     }
 
     #[test]
@@ -973,9 +973,11 @@ mod tests {
         // max_block=100 should NOT see the price (provenance=200 >= 100)
         assert!(cache.get(&WETH, Some(100)).is_none());
         // max_block=201 should see the price (provenance=200 < 201)
-        assert_eq!(cache.get(&WETH, Some(201)).unwrap(), bd("2000"));
+        let (price, prov) = cache.get(&WETH, Some(201)).unwrap();
+        assert_eq!(price, bd("2000"));
+        assert_eq!(prov, 200);
         // No max_block should see the price
-        assert_eq!(cache.get(&WETH, None).unwrap(), bd("2000"));
+        assert_eq!(cache.get(&WETH, None).unwrap().0, bd("2000"));
     }
 
     #[test]
@@ -987,10 +989,13 @@ mod tests {
 
         // max_block=150: should see USDC@50 and WETH@100, but NOT BANKR@200
         let within = cache.get_all_within(Some(150));
-        let within_map: HashMap<[u8; 20], BigDecimal> = within.into_iter().collect();
+        let within_map: HashMap<[u8; 20], (BigDecimal, u64)> = within
+            .into_iter()
+            .map(|(t, p, prov)| (t, (p, prov)))
+            .collect();
         assert_eq!(within_map.len(), 2);
-        assert_eq!(within_map.get(&USDC).unwrap(), &bd("1"));
-        assert_eq!(within_map.get(&WETH).unwrap(), &bd("2000"));
+        assert_eq!(within_map.get(&USDC).unwrap().0, bd("1"));
+        assert_eq!(within_map.get(&WETH).unwrap().0, bd("2000"));
         assert!(within_map.get(&BANKR).is_none());
 
         // None: should see all
