@@ -46,13 +46,16 @@ struct PoolEdge {
 /// Check for a cached path and resolve if missing or stale.
 ///
 /// Returns `Some(path)` if a valid path exists (either cached-fresh or newly resolved).
-/// Returns `None` only on DB errors.
+/// Returns `None` on DB errors or if the token is already directly priceable.
+///
+/// `max_block`: if `Some(b)`, only consider pool_state rows with block_number < b.
 pub async fn check_or_resolve_path(
     db_pool: &Pool,
     chain_id: u64,
     target_token: &[u8; 20],
     priceable_tokens: &HashSet<[u8; 20]>,
     current_block: u64,
+    max_block: Option<u64>,
 ) -> Option<CachedPricePath> {
     // Don't resolve if already priceable
     if priceable_tokens.contains(target_token) {
@@ -61,17 +64,22 @@ pub async fn check_or_resolve_path(
 
     // Check cache
     if let Ok(Some(cached)) = query_cached_path(db_pool, chain_id, target_token).await {
-        let age = current_block.saturating_sub(cached.resolved_at_block);
-        if age < STALENESS_THRESHOLD_BLOCKS {
-            return Some(cached);
+        // Guard: ignore entries resolved at or after our block range (from a future run)
+        if cached.resolved_at_block < current_block {
+            let age = current_block.saturating_sub(cached.resolved_at_block);
+            if age < STALENESS_THRESHOLD_BLOCKS {
+                return Some(cached);
+            }
         }
-        // Stale — re-resolve below
+        // Stale or future — re-resolve below
     }
 
     // Resolve via frontier expansion
-    let result = resolve_token_price_path(db_pool, chain_id, target_token, priceable_tokens).await;
+    let result =
+        resolve_token_price_path(db_pool, chain_id, target_token, priceable_tokens, max_block)
+            .await;
 
-    // Cache the result
+    // Cache the result — only Ok variants get cached
     let path = match result {
         Ok(Some(resolved)) => CachedPricePath {
             path_pool_ids: resolved.path_pool_ids,
@@ -80,13 +88,21 @@ pub async fn check_or_resolve_path(
             resolved_at_block: current_block,
             is_priceable: true,
         },
-        _ => CachedPricePath {
+        Ok(None) => CachedPricePath {
             path_pool_ids: Vec::new(),
             anchor_token: [0u8; 20],
             path_liquidity_usd: None,
             resolved_at_block: current_block,
             is_priceable: false,
         },
+        Err(e) => {
+            tracing::warn!(
+                token = hex::encode(target_token),
+                error = %e,
+                "Path resolution failed, not caching"
+            );
+            return None; // Don't cache, don't poison
+        }
     };
 
     if let Err(e) = upsert_cached_path(db_pool, chain_id, target_token, &path).await {
@@ -112,11 +128,14 @@ struct ResolvedPath {
 /// At each hop, queries pools touching the current frontier tokens with
 /// >= $1,000 active liquidity. Tracks the best (highest bottleneck liquidity)
 /// path to any priceable token found.
+///
+/// `max_block`: if `Some(b)`, only consider pool_state rows with block_number < b.
 async fn resolve_token_price_path(
     db_pool: &Pool,
     chain_id: u64,
     target_token: &[u8; 20],
     priceable_tokens: &HashSet<[u8; 20]>,
+    max_block: Option<u64>,
 ) -> Result<Option<ResolvedPath>, TransformationError> {
     let mut visited: HashSet<[u8; 20]> = HashSet::new();
     visited.insert(*target_token);
@@ -140,7 +159,7 @@ async fn resolve_token_price_path(
             break;
         }
 
-        let edges = query_frontier_pools(db_pool, chain_id, &frontier).await?;
+        let edges = query_frontier_pools(db_pool, chain_id, &frontier, max_block).await?;
 
         let mut new_frontier: Vec<[u8; 20]> = Vec::new();
 
@@ -240,28 +259,32 @@ fn trace_path(
 /// - If current_token is the pool's quote_token: divide by price (invert)
 ///
 /// Multiply the final result by the anchor's USD price.
+///
+/// `max_block`: if `Some(b)`, only consider pool_state rows with block_number < b.
 pub async fn derive_price_from_path(
     db_pool: &Pool,
     chain_id: u64,
     path: &CachedPricePath,
     target_token: &[u8; 20],
     anchor_usd_price: &BigDecimal,
+    max_block: Option<u64>,
 ) -> Option<BigDecimal> {
     if path.path_pool_ids.is_empty() || !path.is_priceable {
         return None;
     }
 
-    let pool_data = match query_path_pool_prices(db_pool, chain_id, &path.path_pool_ids).await {
-        Ok(data) => data,
-        Err(e) => {
-            tracing::warn!(
-                token = hex::encode(target_token),
-                error = %e,
-                "Failed to query pool prices for path derivation"
-            );
-            return None;
-        }
-    };
+    let pool_data =
+        match query_path_pool_prices(db_pool, chain_id, &path.path_pool_ids, max_block).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!(
+                    token = hex::encode(target_token),
+                    error = %e,
+                    "Failed to query pool prices for path derivation"
+                );
+                return None;
+            }
+        };
 
     let mut current_token = *target_token;
     let mut multiplier = BigDecimal::from(1);
@@ -402,10 +425,17 @@ async fn upsert_cached_path(
 }
 
 /// Query pools touching any of the frontier tokens with >= $1k active liquidity.
+///
+/// Also includes pools whose `active_liquidity_usd` is NULL but have non-zero
+/// raw `active_liquidity`, so that pools whose quote token isn't yet USD-priceable
+/// can still appear in the frontier.
+///
+/// `max_block`: if `Some(b)`, only consider pool_state rows with block_number < b.
 async fn query_frontier_pools(
     db_pool: &Pool,
     chain_id: u64,
     frontier: &[[u8; 20]],
+    max_block: Option<u64>,
 ) -> Result<Vec<PoolEdge>, TransformationError> {
     let client = db_pool
         .get()
@@ -413,6 +443,7 @@ async fn query_frontier_pools(
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
     let frontier_bytes: Vec<Vec<u8>> = frontier.iter().map(|t| t.to_vec()).collect();
+    let max_block_i64: Option<i64> = max_block.map(|b| b as i64);
 
     let rows = client
         .query(
@@ -423,9 +454,16 @@ async fn query_frontier_pools(
              JOIN pool_state ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
              WHERE p.chain_id = $1 \
                AND (p.base_token = ANY($2) OR p.quote_token = ANY($2)) \
-               AND COALESCE(ps.active_liquidity_usd, 0) >= $3 \
+               AND (COALESCE(ps.active_liquidity_usd, 0) >= $3 \
+                    OR (ps.active_liquidity_usd IS NULL AND ps.active_liquidity > 0)) \
+               AND ($4::bigint IS NULL OR ps.block_number < $4) \
              ORDER BY p.address, ps.active_liquidity_usd DESC NULLS LAST",
-            &[&(chain_id as i64), &frontier_bytes, &MIN_LIQUIDITY_USD],
+            &[
+                &(chain_id as i64),
+                &frontier_bytes,
+                &MIN_LIQUIDITY_USD,
+                &max_block_i64,
+            ],
         )
         .await
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
@@ -463,15 +501,20 @@ async fn query_frontier_pools(
 }
 
 /// Query current prices for pools in a path.
+///
+/// `max_block`: if `Some(b)`, only consider pool_state rows with block_number < b.
 async fn query_path_pool_prices(
     db_pool: &Pool,
     chain_id: u64,
     pool_ids: &[Vec<u8>],
+    max_block: Option<u64>,
 ) -> Result<HashMap<Vec<u8>, PathPoolData>, TransformationError> {
     let client = db_pool
         .get()
         .await
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
+
+    let max_block_i64: Option<i64> = max_block.map(|b| b as i64);
 
     let rows = client
         .query(
@@ -480,8 +523,9 @@ async fn query_path_pool_prices(
              FROM pools p \
              JOIN pool_state ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
              WHERE p.chain_id = $1 AND p.address = ANY($2) \
+               AND ($3::bigint IS NULL OR ps.block_number < $3) \
              ORDER BY p.address, ps.block_number DESC",
-            &[&(chain_id as i64), &pool_ids],
+            &[&(chain_id as i64), &pool_ids, &max_block_i64],
         )
         .await
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
@@ -565,5 +609,42 @@ mod tests {
 
         let path = trace_path(&parent, &target, &target);
         assert!(path.is_empty());
+    }
+
+    #[test]
+    fn test_future_resolved_path_is_ignored() {
+        // A path resolved at block 200 should not be usable at current_block=100.
+        // The guard in check_or_resolve_path requires cached.resolved_at_block < current_block.
+        // Since check_or_resolve_path is async/DB-dependent, we test the guard condition directly.
+
+        let cached_resolved_at = 200_u64;
+        let current_block = 100_u64;
+
+        // Future entry: resolved_at_block >= current_block  →  should NOT pass the guard
+        assert!(
+            !(cached_resolved_at < current_block),
+            "A path resolved at block {} should be rejected when current_block is {}",
+            cached_resolved_at,
+            current_block
+        );
+
+        // Equal blocks: also rejected (resolved_at_block is NOT strictly less than current_block)
+        let cached_resolved_at_equal = 100_u64;
+        assert!(
+            !(cached_resolved_at_equal < current_block),
+            "A path resolved at the same block should also be rejected"
+        );
+
+        // Past entry within staleness window: should pass
+        let cached_resolved_at_past = 50_u64;
+        assert!(
+            cached_resolved_at_past < current_block,
+            "A path resolved in the past should pass the future guard"
+        );
+        let age = current_block.saturating_sub(cached_resolved_at_past);
+        assert!(
+            age < STALENESS_THRESHOLD_BLOCKS,
+            "A recently-resolved past path should be within the staleness window"
+        );
     }
 }

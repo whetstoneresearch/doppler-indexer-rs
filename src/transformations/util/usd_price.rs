@@ -35,11 +35,18 @@ const ZERO_ADDRESS: [u8; 20] = [0u8; 20];
 
 // ─── OraclePriceCache ────────────────────────────────────────────────
 
+/// A single cached price entry with the block at which it was observed.
+#[derive(Clone)]
+struct CachedPriceEntry {
+    price: BigDecimal,
+    provenance_block: u64,
+}
+
 /// Shared cache for USD prices. Thread-safe, persists across handler
 /// invocations. Seeded from the `prices` table on startup; updated from
 /// ChainlinkEthOracle calls and pool prices during processing.
 pub struct OraclePriceCache {
-    inner: RwLock<HashMap<[u8; 20], BigDecimal>>,
+    inner: RwLock<HashMap<[u8; 20], CachedPriceEntry>>,
     weth_address: Option<[u8; 20]>,
     stablecoin_addresses: Vec<[u8; 20]>,
     seeded_from_db: AtomicBool,
@@ -80,34 +87,34 @@ impl OraclePriceCache {
         db_pool: &Pool,
         chain_id: u64,
     ) -> Result<(), TransformationError> {
-        let mut prices: HashMap<[u8; 20], BigDecimal> = HashMap::new();
+        let mut resolved: HashMap<[u8; 20], (BigDecimal, u64)> = HashMap::new();
 
-        // Seed stablecoins as 1.0
+        // Seed stablecoins as 1.0 with provenance 0
         for addr in &self.stablecoin_addresses {
-            prices.insert(*addr, BigDecimal::from(1));
+            resolved.insert(*addr, (BigDecimal::from(1), 0));
         }
 
-        // Load ETH/USD from Chainlink
+        // Load ETH/USD from Chainlink (unbounded at init)
         if let Some(weth_addr) = self.weth_address {
-            if let Ok(price) =
-                query_latest_price(db_pool, chain_id, &weth_addr, Some(&USD_QUOTE_TOKEN)).await
+            if let Ok((price, block_number)) =
+                query_latest_price(db_pool, chain_id, &weth_addr, Some(&USD_QUOTE_TOKEN), None)
+                    .await
             {
-                prices.insert(weth_addr, price.clone());
-                prices.insert(ZERO_ADDRESS, price);
+                resolved.insert(weth_addr, (price.clone(), block_number));
+                resolved.insert(ZERO_ADDRESS, (price, block_number));
             }
         }
 
-        // Load all token pair prices from the prices table
-        let raw_prices = query_all_latest_prices(db_pool, chain_id).await?;
+        // Load all token pair prices from the prices table (unbounded at init)
+        let raw_prices = query_all_latest_prices(db_pool, chain_id, None).await?;
 
         // Resolve transitively: if a token's quote is already priced in USD,
         // compute the token's USD price.
-        resolve_transitive_prices(&raw_prices, &mut prices);
+        resolve_transitive_prices(&raw_prices, &mut resolved);
 
-        let resolved_count = prices.len();
-        {
-            let mut inner = self.inner.write().unwrap();
-            inner.extend(prices);
+        let resolved_count = resolved.len();
+        for (token, (price, provenance_block)) in &resolved {
+            self.set(*token, price.clone(), *provenance_block);
         }
 
         tracing::info!(
@@ -135,19 +142,64 @@ impl OraclePriceCache {
         Ok(())
     }
 
-    fn get(&self, token: &[u8; 20]) -> Option<BigDecimal> {
-        self.inner.read().unwrap().get(token).cloned()
-    }
-
-    fn set(&self, token: [u8; 20], price: BigDecimal) {
-        self.inner.write().unwrap().insert(token, price);
-    }
-
-    fn set_many(&self, prices: &HashMap<[u8; 20], BigDecimal>) {
-        let mut inner = self.inner.write().unwrap();
-        for (token, price) in prices {
-            inner.insert(*token, price.clone());
+    fn get(&self, token: &[u8; 20], max_block: Option<u64>) -> Option<BigDecimal> {
+        let inner = self.inner.read().unwrap();
+        let entry = inner.get(token)?;
+        if let Some(mb) = max_block {
+            if entry.provenance_block >= mb {
+                return None;
+            }
         }
+        Some(entry.price.clone())
+    }
+
+    fn set(&self, token: [u8; 20], price: BigDecimal, provenance_block: u64) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(existing) = inner.get(&token) {
+            if provenance_block < existing.provenance_block {
+                return;
+            }
+        }
+        inner.insert(
+            token,
+            CachedPriceEntry {
+                price,
+                provenance_block,
+            },
+        );
+    }
+
+    fn set_many(&self, entries: &[([u8; 20], BigDecimal, u64)]) {
+        let mut inner = self.inner.write().unwrap();
+        for (token, price, provenance_block) in entries {
+            if let Some(existing) = inner.get(token) {
+                if *provenance_block < existing.provenance_block {
+                    continue;
+                }
+            }
+            inner.insert(
+                *token,
+                CachedPriceEntry {
+                    price: price.clone(),
+                    provenance_block: *provenance_block,
+                },
+            );
+        }
+    }
+
+    fn get_all_within(&self, max_block: Option<u64>) -> Vec<([u8; 20], BigDecimal)> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .iter()
+            .filter(|(_, entry)| {
+                if let Some(mb) = max_block {
+                    entry.provenance_block < mb
+                } else {
+                    true
+                }
+            })
+            .map(|(token, entry)| (*token, entry.price.clone()))
+            .collect()
     }
 }
 
@@ -229,6 +281,7 @@ impl UsdPriceContext {
         chain_id: u64,
         current_block: u64,
         unresolved_tokens: &[[u8; 20]],
+        max_block: Option<u64>,
     ) {
         use super::price_path::{check_or_resolve_path, derive_price_from_path};
 
@@ -241,7 +294,8 @@ impl UsdPriceContext {
             }
 
             let Some(path) =
-                check_or_resolve_path(db_pool, chain_id, token, &priceable, current_block).await
+                check_or_resolve_path(db_pool, chain_id, token, &priceable, current_block, max_block)
+                    .await
             else {
                 continue;
             };
@@ -256,7 +310,8 @@ impl UsdPriceContext {
             };
 
             if let Some(usd_price) =
-                derive_price_from_path(db_pool, chain_id, &path, token, &anchor_usd).await
+                derive_price_from_path(db_pool, chain_id, &path, token, &anchor_usd, max_block)
+                    .await
             {
                 self.prices.insert(*token, usd_price);
             }
@@ -302,69 +357,90 @@ pub async fn build_usd_price_context(
     contracts: &Contracts,
 ) -> (UsdPriceContext, Vec<DbOperation>) {
     let mut price_ops = Vec::new();
-    let mut prices: HashMap<[u8; 20], BigDecimal> = HashMap::new();
+    let mut resolved: HashMap<[u8; 20], (BigDecimal, u64)> = HashMap::new();
+    let max_block = ctx.blockrange_end;
 
     // Resolve addresses from config
     let weth_address = resolve_contract_address(contracts, "Weth");
     let usdc_address = resolve_contract_address(contracts, "Usdc");
     let usdt_address = resolve_contract_address(contracts, "Usdt");
 
-    // Seed stablecoins
+    // Seed stablecoins (provenance = 0)
     if let Some(addr) = usdc_address {
-        prices.insert(addr, BigDecimal::from(1));
+        resolved.insert(addr, (BigDecimal::from(1), 0));
     }
     if let Some(addr) = usdt_address {
-        prices.insert(addr, BigDecimal::from(1));
+        resolved.insert(addr, (BigDecimal::from(1), 0));
     }
 
     // Extract ETH/USD from oracle calls in the current block range.
-    let eth_usd =
-        extract_eth_usd_from_oracle(ctx, cache, &weth_address, chain_id, &mut price_ops);
+    let eth_usd = extract_eth_usd_from_oracle(
+        ctx,
+        cache,
+        &weth_address,
+        chain_id,
+        &mut price_ops,
+        max_block,
+    );
 
     // Set WETH and zero-address prices
-    if let Some(eth_price) = &eth_usd {
+    if let Some((eth_price, eth_block)) = &eth_usd {
         if let Some(weth_addr) = weth_address {
-            prices.insert(weth_addr, eth_price.clone());
+            resolved.insert(weth_addr, (eth_price.clone(), *eth_block));
         }
-        prices.insert(ZERO_ADDRESS, eth_price.clone());
+        resolved.insert(ZERO_ADDRESS, (eth_price.clone(), *eth_block));
     }
 
     // Cold-start safety net: if no ETH/USD yet, fall back to DB/cache.
     if eth_usd.is_none() {
-        // Try the shared cache first
         if let Some(weth_addr) = weth_address {
-            if let Some(cached_price) = cache.get(&weth_addr) {
-                prices.insert(weth_addr, cached_price.clone());
-                prices.insert(ZERO_ADDRESS, cached_price);
+            if let Some(cached_price) = cache.get(&weth_addr, Some(max_block)) {
+                resolved.insert(weth_addr, (cached_price.clone(), 0));
+                resolved.insert(ZERO_ADDRESS, (cached_price, 0));
             } else if let Some(pool) = db_pool.get() {
                 // Last resort: query DB
-                if let Ok(price) =
-                    query_latest_price(pool, chain_id, &weth_addr, Some(&USD_QUOTE_TOKEN)).await
+                if let Ok((price, block_number)) = query_latest_price(
+                    pool,
+                    chain_id,
+                    &weth_addr,
+                    Some(&USD_QUOTE_TOKEN),
+                    Some(max_block),
+                )
+                .await
                 {
-                    cache.set(weth_addr, price.clone());
-                    cache.set(ZERO_ADDRESS, price.clone());
-                    prices.insert(weth_addr, price.clone());
-                    prices.insert(ZERO_ADDRESS, price);
+                    cache.set(weth_addr, price.clone(), block_number);
+                    cache.set(ZERO_ADDRESS, price.clone(), block_number);
+                    resolved.insert(weth_addr, (price.clone(), block_number));
+                    resolved.insert(ZERO_ADDRESS, (price, block_number));
                 }
             }
         }
     }
 
-    // Query all token pair prices from the prices table and resolve transitively.
+    // Query DB for transitive prices
     if let Some(pool) = db_pool.get() {
-        if let Ok(raw_prices) = query_all_latest_prices(pool, chain_id).await {
-            resolve_transitive_prices(&raw_prices, &mut prices);
-        }
-    } else {
-        // No DB pool available — fall back to cached values for all tokens
-        let inner = cache.inner.read().unwrap();
-        for (token, price) in inner.iter() {
-            prices.entry(*token).or_insert_with(|| price.clone());
+        match query_all_latest_prices(pool, chain_id, Some(max_block)).await {
+            Ok(raw_prices) => resolve_transitive_prices(&raw_prices, &mut resolved),
+            Err(e) => tracing::warn!(error = %e, "prices query failed, using cache"),
         }
     }
+    // Always backfill from block-aware cache
+    for (token, price) in cache.get_all_within(Some(max_block)) {
+        resolved.entry(token).or_insert((price, 0));
+    }
 
-    // Update the shared cache with all resolved prices
-    cache.set_many(&prices);
+    // Update the shared cache with all resolved prices (with provenance)
+    let cache_entries: Vec<([u8; 20], BigDecimal, u64)> = resolved
+        .iter()
+        .map(|(token, (price, prov))| (*token, price.clone(), *prov))
+        .collect();
+    cache.set_many(&cache_entries);
+
+    // Strip provenance for the UsdPriceContext
+    let prices: HashMap<[u8; 20], BigDecimal> = resolved
+        .into_iter()
+        .map(|(token, (price, _))| (token, price))
+        .collect();
 
     let usd_ctx = UsdPriceContext {
         prices,
@@ -400,7 +476,13 @@ pub async fn build_usd_price_context_with_paths(
 
         if !unresolved.is_empty() {
             usd_ctx
-                .resolve_path_prices(pool, chain_id, ctx.blockrange_end, &unresolved)
+                .resolve_path_prices(
+                    pool,
+                    chain_id,
+                    ctx.blockrange_end,
+                    &unresolved,
+                    Some(ctx.blockrange_end),
+                )
                 .await;
         }
     }
@@ -416,7 +498,8 @@ fn extract_eth_usd_from_oracle(
     weth_address: &Option<[u8; 20]>,
     chain_id: u64,
     price_ops: &mut Vec<DbOperation>,
-) -> Option<BigDecimal> {
+    max_block: u64,
+) -> Option<(BigDecimal, u64)> {
     // Find the latest oracle call in the current range
     let mut latest: Option<(u64, u64, BigDecimal)> = None; // (block_number, timestamp, price)
 
@@ -440,10 +523,10 @@ fn extract_eth_usd_from_oracle(
     }
 
     if let Some((block_number, block_timestamp, price)) = latest {
-        // Update cache
+        // Update cache with actual oracle block_number
         if let Some(weth_addr) = weth_address {
-            cache.set(*weth_addr, price.clone());
-            cache.set(ZERO_ADDRESS, price.clone());
+            cache.set(*weth_addr, price.clone(), block_number);
+            cache.set(ZERO_ADDRESS, price.clone(), block_number);
         }
 
         // Emit DB op to persist to prices table
@@ -457,10 +540,10 @@ fn extract_eth_usd_from_oracle(
             ));
         }
 
-        Some(price)
+        Some((price, block_number))
     } else {
-        // No oracle data in range — use cached value
-        weth_address.and_then(|addr| cache.get(&addr))
+        // No oracle data in range — use cached value with block awareness
+        weth_address.and_then(|addr| cache.get(&addr, Some(max_block)).map(|price| (price, 0)))
     }
 }
 
@@ -507,23 +590,26 @@ fn build_oracle_price_op(
 
 // ─── Transitive Resolution ──────────────────────────────────────────
 
-/// A raw price row from the `prices` table: (token, quote_token, price).
+/// A raw price row from the `prices` table: (token, quote_token, price, block_number).
 struct RawTokenPrice {
     token: [u8; 20],
     quote_token: [u8; 20],
     price: BigDecimal,
+    block_number: u64,
 }
 
 /// Resolve raw token pair prices transitively into USD prices.
 ///
 /// Given a set of already-known USD prices (stablecoins, WETH) and a list
-/// of raw (token, quote_token, price) rows from the prices table, iteratively
-/// computes `token_usd = price * quote_token_usd` for each token whose quote
-/// token is already resolved. Repeats until no progress is made, naturally
-/// handling multi-hop chains (e.g., EURC → USDC → USD, Bankr → WETH → USD).
+/// of raw (token, quote_token, price, block_number) rows from the prices table,
+/// iteratively computes `token_usd = price * quote_token_usd` for each token
+/// whose quote token is already resolved. Repeats until no progress is made,
+/// naturally handling multi-hop chains (e.g., EURC → USDC → USD, Bankr → WETH → USD).
+///
+/// Provenance for derived prices is `max(raw.block_number, quote_provenance_block)`.
 fn resolve_transitive_prices(
     raw_prices: &[RawTokenPrice],
-    resolved: &mut HashMap<[u8; 20], BigDecimal>,
+    resolved: &mut HashMap<[u8; 20], (BigDecimal, u64)>,
 ) {
     loop {
         let mut made_progress = false;
@@ -531,9 +617,10 @@ fn resolve_transitive_prices(
             if resolved.contains_key(&raw.token) {
                 continue;
             }
-            if let Some(quote_usd) = resolved.get(&raw.quote_token) {
+            if let Some((quote_usd, quote_provenance)) = resolved.get(&raw.quote_token) {
                 let token_usd = &raw.price * quote_usd;
-                resolved.insert(raw.token, token_usd);
+                let provenance = raw.block_number.max(*quote_provenance);
+                resolved.insert(raw.token, (token_usd, provenance));
                 made_progress = true;
             }
         }
@@ -557,12 +644,14 @@ fn resolve_contract_address(contracts: &Contracts, name: &str) -> Option<[u8; 20
 }
 
 /// Query the latest price from the `prices` table for a token.
+/// When `max_block` is Some, only considers rows with block_number < max_block.
 async fn query_latest_price(
     pool: &Pool,
     chain_id: u64,
     token_address: &[u8; 20],
     quote_token_filter: Option<&[u8; 20]>,
-) -> Result<BigDecimal, TransformationError> {
+    max_block: Option<u64>,
+) -> Result<(BigDecimal, u64), TransformationError> {
     let client = pool
         .get()
         .await
@@ -570,24 +659,32 @@ async fn query_latest_price(
 
     let chain_id_param = chain_id as i64;
     let token_param = token_address.to_vec();
+    let max_block_param: Option<i64> = max_block.map(|b| b as i64);
 
     let row = if let Some(quote_token) = quote_token_filter {
         let quote_token_param = quote_token.to_vec();
         client
             .query_opt(
-                "SELECT price FROM prices \
+                "SELECT price, block_number FROM prices \
                  WHERE chain_id = $1 AND token = $2 AND quote_token = $3 \
+                 AND ($4::bigint IS NULL OR block_number < $4) \
                  ORDER BY block_number DESC LIMIT 1",
-                &[&chain_id_param, &token_param, &quote_token_param],
+                &[
+                    &chain_id_param,
+                    &token_param,
+                    &quote_token_param,
+                    &max_block_param,
+                ],
             )
             .await
     } else {
         client
             .query_opt(
-                "SELECT price FROM prices \
+                "SELECT price, block_number FROM prices \
                  WHERE chain_id = $1 AND token = $2 \
+                 AND ($3::bigint IS NULL OR block_number < $3) \
                  ORDER BY block_number DESC LIMIT 1",
-                &[&chain_id_param, &token_param],
+                &[&chain_id_param, &token_param, &max_block_param],
             )
             .await
     };
@@ -602,17 +699,22 @@ async fn query_latest_price(
         })?;
 
     let price: rust_decimal::Decimal = row.get("price");
-    price
+    let block_number: i64 = row.get("block_number");
+    let price = price
         .to_string()
         .parse::<BigDecimal>()
-        .map_err(|e| TransformationError::ConfigError(format!("Invalid price value: {}", e)))
+        .map_err(|e| TransformationError::ConfigError(format!("Invalid price value: {}", e)))?;
+
+    Ok((price, block_number as u64))
 }
 
 /// Query the latest price for every token from the `prices` table.
-/// Returns one (token, quote_token, price) per token, the most recent by block_number.
+/// Returns one (token, quote_token, price, block_number) per token, the most recent by block_number.
+/// When `max_block` is Some, only considers rows with block_number < max_block.
 async fn query_all_latest_prices(
     pool: &Pool,
     chain_id: u64,
+    max_block: Option<u64>,
 ) -> Result<Vec<RawTokenPrice>, TransformationError> {
     let client = pool
         .get()
@@ -620,14 +722,15 @@ async fn query_all_latest_prices(
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
     let chain_id_param = chain_id as i64;
+    let max_block_param: Option<i64> = max_block.map(|b| b as i64);
 
     let rows = client
         .query(
-            "SELECT DISTINCT ON (token) token, quote_token, price \
+            "SELECT DISTINCT ON (token) token, quote_token, price, block_number \
              FROM prices \
-             WHERE chain_id = $1 \
+             WHERE chain_id = $1 AND ($2::bigint IS NULL OR block_number < $2) \
              ORDER BY token, block_number DESC",
-            &[&chain_id_param],
+            &[&chain_id_param, &max_block_param],
         )
         .await
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
@@ -650,10 +753,13 @@ async fn query_all_latest_prices(
             Err(_) => continue,
         };
 
+        let block_number: i64 = row.get("block_number");
+
         result.push(RawTokenPrice {
             token,
             quote_token,
             price,
+            block_number: block_number as u64,
         });
     }
 
@@ -784,20 +890,19 @@ mod tests {
     #[test]
     fn test_transitive_resolution() {
         // Bankr is priced at 0.5 WETH, WETH is $2000
-        let raw_prices = vec![
-            RawTokenPrice {
-                token: BANKR,
-                quote_token: WETH,
-                price: bd("0.5"),
-            },
-        ];
+        let raw_prices = vec![RawTokenPrice {
+            token: BANKR,
+            quote_token: WETH,
+            price: bd("0.5"),
+            block_number: 100,
+        }];
 
-        let mut resolved = HashMap::new();
-        resolved.insert(WETH, bd("2000"));
+        let mut resolved: HashMap<[u8; 20], (BigDecimal, u64)> = HashMap::new();
+        resolved.insert(WETH, (bd("2000"), 50));
 
         resolve_transitive_prices(&raw_prices, &mut resolved);
 
-        assert_eq!(resolved.get(&BANKR).unwrap(), &bd("1000"));
+        assert_eq!(resolved.get(&BANKR).unwrap().0, bd("1000"));
     }
 
     #[test]
@@ -810,21 +915,87 @@ mod tests {
                 token: EURC,
                 quote_token: USDC,
                 price: bd("1.08"),
+                block_number: 100,
             },
             RawTokenPrice {
                 token: token_a,
                 quote_token: EURC,
                 price: bd("10"),
+                block_number: 200,
             },
         ];
 
-        let mut resolved = HashMap::new();
-        resolved.insert(USDC, BigDecimal::from(1));
+        let mut resolved: HashMap<[u8; 20], (BigDecimal, u64)> = HashMap::new();
+        resolved.insert(USDC, (BigDecimal::from(1), 0));
 
         resolve_transitive_prices(&raw_prices, &mut resolved);
 
-        assert_eq!(resolved.get(&EURC).unwrap(), &bd("1.08"));
-        assert_eq!(resolved.get(&token_a).unwrap(), &bd("10.80"));
+        assert_eq!(resolved.get(&EURC).unwrap().0, bd("1.08"));
+        assert_eq!(resolved.get(&token_a).unwrap().0, bd("10.80"));
+    }
+
+    #[test]
+    fn test_transitive_provenance_propagation() {
+        // BANKR/WETH@block50, WETH/USD@block100
+        // Derived BANKR/USD provenance should be max(50, 100) = 100
+        // With max_block=80, BANKR/USD should NOT be visible in cache
+        let raw_prices = vec![RawTokenPrice {
+            token: BANKR,
+            quote_token: WETH,
+            price: bd("0.5"),
+            block_number: 50,
+        }];
+
+        let mut resolved: HashMap<[u8; 20], (BigDecimal, u64)> = HashMap::new();
+        resolved.insert(WETH, (bd("2000"), 100));
+
+        resolve_transitive_prices(&raw_prices, &mut resolved);
+
+        let (bankr_price, bankr_provenance) = resolved.get(&BANKR).unwrap();
+        assert_eq!(bankr_price, &bd("1000"));
+        assert_eq!(*bankr_provenance, 100);
+
+        // Put into cache and verify block-awareness
+        let cache = OraclePriceCache::new();
+        cache.set(BANKR, bankr_price.clone(), *bankr_provenance);
+
+        // max_block=80 should NOT see the price (provenance=100 >= 80)
+        assert!(cache.get(&BANKR, Some(80)).is_none());
+        // max_block=101 should see the price (provenance=100 < 101)
+        assert_eq!(cache.get(&BANKR, Some(101)).unwrap(), bd("1000"));
+    }
+
+    #[test]
+    fn test_cache_respects_block_bounds() {
+        let cache = OraclePriceCache::new();
+        cache.set(WETH, bd("2000"), 200);
+
+        // max_block=100 should NOT see the price (provenance=200 >= 100)
+        assert!(cache.get(&WETH, Some(100)).is_none());
+        // max_block=201 should see the price (provenance=200 < 201)
+        assert_eq!(cache.get(&WETH, Some(201)).unwrap(), bd("2000"));
+        // No max_block should see the price
+        assert_eq!(cache.get(&WETH, None).unwrap(), bd("2000"));
+    }
+
+    #[test]
+    fn test_cache_get_all_within_filters_future() {
+        let cache = OraclePriceCache::new();
+        cache.set(USDC, bd("1"), 50);
+        cache.set(WETH, bd("2000"), 100);
+        cache.set(BANKR, bd("500"), 200);
+
+        // max_block=150: should see USDC@50 and WETH@100, but NOT BANKR@200
+        let within = cache.get_all_within(Some(150));
+        let within_map: HashMap<[u8; 20], BigDecimal> = within.into_iter().collect();
+        assert_eq!(within_map.len(), 2);
+        assert_eq!(within_map.get(&USDC).unwrap(), &bd("1"));
+        assert_eq!(within_map.get(&WETH).unwrap(), &bd("2000"));
+        assert!(within_map.get(&BANKR).is_none());
+
+        // None: should see all
+        let all = cache.get_all_within(None);
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
