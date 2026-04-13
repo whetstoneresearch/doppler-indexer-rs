@@ -205,7 +205,7 @@ impl RpcError {
                 "(?i)reset",
                 "(?i)broken pipe",
                 "(?i)network",
-                "(?i)eof",
+                "(?i)eof|end of file",
                 "(?i)sending request",
                 // Rate limiting indicators
                 "(?i)rate limit",
