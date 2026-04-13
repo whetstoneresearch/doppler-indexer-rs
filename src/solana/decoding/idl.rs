@@ -359,25 +359,32 @@ fn parse_type_def(
                         None
                     } else {
                         let mut parsed = Vec::with_capacity(fields_arr.len());
-                        for field in fields_arr {
-                            let f_name = field
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .ok_or_else(|| {
+                        for (idx, field) in fields_arr.iter().enumerate() {
+                            if field.is_object() {
+                                // Named field: {"name": "x", "type": "u64"}
+                                let f_name = field
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let f_name = if f_name.is_empty() {
+                                    format!("field_{}", idx)
+                                } else {
+                                    f_name
+                                };
+                                let f_type_val = field.get("type").ok_or_else(|| {
                                     SolanaDecodeError::IdlParse(format!(
-                                        "variant field in enum '{}::{}' missing 'name'",
-                                        name, variant_name
+                                        "variant field '{}' in enum '{}::{}' missing 'type'",
+                                        f_name, name, variant_name
                                     ))
-                                })?
-                                .to_string();
-                            let f_type_val = field.get("type").ok_or_else(|| {
-                                SolanaDecodeError::IdlParse(format!(
-                                    "variant field '{}' in enum '{}::{}' missing 'type'",
-                                    f_name, name, variant_name
-                                ))
-                            })?;
-                            let f_type = parse_idl_type(f_type_val, version)?;
-                            parsed.push((f_name, f_type));
+                                })?;
+                                let f_type = parse_idl_type(f_type_val, version)?;
+                                parsed.push((f_name, f_type));
+                            } else {
+                                // Unnamed/tuple field: bare type like "u64" or {"vec": "u8"}
+                                let f_type = parse_idl_type(field, version)?;
+                                parsed.push((format!("field_{}", idx), f_type));
+                            }
                         }
                         Some(parsed)
                     }
@@ -620,17 +627,28 @@ fn parse_args_array(
     Ok(args)
 }
 
-/// Extract account names from an instruction definition.
+/// Extract account names from an instruction definition, flattening composite
+/// account groups (nested `accounts` arrays) into leaf accounts.
 fn parse_account_names(value: &serde_json::Value) -> Vec<String> {
     let accounts_arr = match value.get("accounts").and_then(|a| a.as_array()) {
         Some(arr) => arr,
         None => return Vec::new(),
     };
 
-    accounts_arr
-        .iter()
-        .filter_map(|acc| acc.get("name").and_then(|n| n.as_str()).map(String::from))
-        .collect()
+    let mut names = Vec::new();
+    collect_leaf_account_names(accounts_arr, &mut names);
+    names
+}
+
+fn collect_leaf_account_names(accounts: &[serde_json::Value], out: &mut Vec<String>) {
+    for acc in accounts {
+        // Composite group: has nested "accounts" array — recurse into it.
+        if let Some(nested) = acc.get("accounts").and_then(|a| a.as_array()) {
+            collect_leaf_account_names(nested, out);
+        } else if let Some(name) = acc.get("name").and_then(|n| n.as_str()) {
+            out.push(name.to_string());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,5 +1240,117 @@ mod tests {
         assert_eq!(decoded.named_accounts["source"], [1u8; 32]);
         assert_eq!(decoded.named_accounts["destination"], [2u8; 32]);
         assert_eq!(decoded.named_accounts["authority"], [3u8; 32]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: composite instruction accounts are flattened
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_composite_account_flattening() {
+        let idl_json = r#"{
+            "name": "composite_test",
+            "instructions": [
+                {
+                    "name": "swap",
+                    "accounts": [
+                        {"name": "pool", "isMut": true, "isSigner": false},
+                        {
+                            "name": "tokenGroup",
+                            "accounts": [
+                                {"name": "tokenA", "isMut": true, "isSigner": false},
+                                {"name": "tokenB", "isMut": true, "isSigner": false}
+                            ]
+                        },
+                        {"name": "authority", "isMut": false, "isSigner": true}
+                    ],
+                    "args": [
+                        {"name": "amount", "type": "u64"}
+                    ]
+                }
+            ],
+            "events": [],
+            "types": []
+        }"#;
+
+        let decoder = AnchorDecoder::new([0u8; 32], "test".to_string(), idl_json).unwrap();
+        let disc = compute_instruction_discriminator("swap");
+        let mut ix_data = Vec::new();
+        ix_data.extend_from_slice(&disc);
+        ix_data.extend_from_slice(&100u64.to_le_bytes());
+
+        let accounts = [
+            [1u8; 32], // pool
+            [2u8; 32], // tokenA (inside tokenGroup)
+            [3u8; 32], // tokenB (inside tokenGroup)
+            [4u8; 32], // authority
+        ];
+
+        let result = decoder.decode_instruction(&ix_data, &accounts).unwrap();
+        let decoded = result.expect("should decode");
+
+        // Composite group "tokenGroup" should be flattened to leaf accounts.
+        assert_eq!(decoded.named_accounts.len(), 4);
+        assert_eq!(decoded.named_accounts["pool"], [1u8; 32]);
+        assert_eq!(decoded.named_accounts["tokenA"], [2u8; 32]);
+        assert_eq!(decoded.named_accounts["tokenB"], [3u8; 32]);
+        assert_eq!(decoded.named_accounts["authority"], [4u8; 32]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: unnamed enum variant fields (tuple-style)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unnamed_enum_variant_fields() {
+        let idl_json = r#"{
+            "name": "enum_test",
+            "instructions": [],
+            "events": [],
+            "types": [
+                {
+                    "name": "OrderStatus",
+                    "type": {
+                        "kind": "enum",
+                        "variants": [
+                            {"name": "Pending"},
+                            {"name": "Filled", "fields": ["u64", "u64"]},
+                            {"name": "Partial", "fields": [
+                                {"name": "filled", "type": "u64"},
+                                {"name": "remaining", "type": "u64"}
+                            ]}
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let parsed = parse_idl(idl_json).unwrap();
+        let type_def = parsed.defined_types.get("OrderStatus").expect("type present");
+
+        if let IdlTypeDef::Enum { variants } = type_def {
+            assert_eq!(variants.len(), 3);
+
+            // Unit variant
+            assert_eq!(variants[0].name, "Pending");
+            assert!(variants[0].fields.is_none());
+
+            // Unnamed/tuple variant
+            assert_eq!(variants[1].name, "Filled");
+            let fields = variants[1].fields.as_ref().unwrap();
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].0, "field_0");
+            assert_eq!(fields[0].1, IdlType::U64);
+            assert_eq!(fields[1].0, "field_1");
+            assert_eq!(fields[1].1, IdlType::U64);
+
+            // Named variant (still works)
+            assert_eq!(variants[2].name, "Partial");
+            let fields = variants[2].fields.as_ref().unwrap();
+            assert_eq!(fields[0].0, "filled");
+            assert_eq!(fields[1].0, "remaining");
+        } else {
+            panic!("OrderStatus should be an enum");
+        }
     }
 }
