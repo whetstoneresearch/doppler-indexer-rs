@@ -155,6 +155,22 @@ pub enum DecoderMessage {
         /// Block numbers that were orphaned and need cleanup
         orphaned: Vec<u64>,
     },
+    /// Solana events ready for Borsh decoding (historical + live)
+    #[cfg(feature = "solana")]
+    SolanaEventsReady {
+        range_start: u64,
+        range_end: u64,
+        events: Vec<crate::solana::raw_data::types::SolanaEventRecord>,
+        live_mode: bool,
+    },
+    /// Solana instructions ready for Borsh decoding (historical + live)
+    #[cfg(feature = "solana")]
+    SolanaInstructionsReady {
+        range_start: u64,
+        range_end: u64,
+        instructions: Vec<crate::solana::raw_data::types::SolanaInstructionRecord>,
+        live_mode: bool,
+    },
     /// All ranges complete (shutdown signal)
     AllComplete,
 }

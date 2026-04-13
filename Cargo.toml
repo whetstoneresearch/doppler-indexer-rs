@@ -10,6 +10,8 @@ solana = [
     "dep:solana-client",
     "dep:solana-sdk",
     "dep:solana-transaction-status",
+    "dep:base64",
+    "dep:bs58",
 ]
 
 [dependencies]
@@ -62,3 +64,5 @@ fs2 = "0.4"
 solana-client = { version = "~2.3", optional = true }
 solana-sdk = { version = "~2.3", optional = true }
 solana-transaction-status = { version = "~2.3", optional = true }
+base64 = { version = "0.22", optional = true }
+bs58 = { version = "0.5", optional = true }

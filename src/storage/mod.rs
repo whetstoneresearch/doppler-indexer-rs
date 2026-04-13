@@ -32,6 +32,8 @@
 mod cached;
 pub mod contract_index;
 mod data_loader;
+#[cfg(feature = "solana")]
+pub mod skipped_slots;
 pub mod decoded_index;
 mod error;
 pub mod factory_data;
