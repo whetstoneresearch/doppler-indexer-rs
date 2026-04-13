@@ -350,9 +350,9 @@ impl CatchupLoader {
 
         let tx_addresses = match payload.kind {
             HandlerKind::Event => {
-                read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await
+                Arc::new(read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await)
             }
-            HandlerKind::Call => HashMap::new(),
+            HandlerKind::Call => Arc::new(HashMap::new()),
         };
 
         run_handler_task(

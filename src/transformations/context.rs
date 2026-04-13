@@ -313,7 +313,7 @@ pub struct TransformationContext {
 
     // ===== Transaction Address Data =====
     /// Transaction hash -> from/to addresses from receipt data
-    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
 
     // ===== Services =====
     /// Historical data reader for querying parquet files
@@ -336,7 +336,7 @@ impl TransformationContext {
         blockrange_end: u64,
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
-        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+        tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
         historical: Arc<HistoricalDataReader>,
         rpc: Arc<UnifiedRpcClient>,
         contracts: Arc<Contracts>,
