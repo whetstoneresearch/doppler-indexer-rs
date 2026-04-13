@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
 
 use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::FactoryAddressData;
 use crate::raw_data::historical::logs::{
-    process_completed_range, LogCollectionError, LogsCatchupState,
+    execute_log_write, prepare_completed_range, LogCollectionError, LogsCatchupState,
 };
 use crate::raw_data::historical::receipts::{LogData, LogMessage};
 use crate::types::config::chain::ChainConfig;
@@ -25,6 +26,9 @@ pub async fn collect_logs(
     let mut range_factory_addresses: HashMap<u64, HashSet<[u8; 20]>> = HashMap::new();
     let mut pending_ranges: HashMap<u64, u64> = HashMap::new();
     let mut factory_ready: HashSet<u64> = HashSet::new();
+
+    let mut write_join_set: JoinSet<Result<(), LogCollectionError>> = JoinSet::new();
+    let mut all_ranges_complete = false;
 
     tracing::info!(
         "Starting log collection for chain {} (contract_logs_only: {}, waiting for factories: {})",
@@ -50,7 +54,7 @@ pub async fn collect_logs(
                                 let factory_data_ready = !state.needs_factory_wait || factory_ready.contains(&range_start);
 
                                 if factory_data_ready {
-                                    process_completed_range(
+                                    if let Some(task) = prepare_completed_range(
                                         range_start,
                                         range_end,
                                         &mut range_data,
@@ -65,15 +69,17 @@ pub async fn collect_logs(
                                         state.s3_manifest.as_ref(),
                                         state.storage_manager.as_ref(),
                                         &state.chain_name,
-                                    )
-                                    .await?;
+                                    ).await? {
+                                        write_join_set.spawn(execute_log_write(task));
+                                    }
                                     factory_ready.remove(&range_start);
                                 } else {
                                     pending_ranges.insert(range_start, range_end);
                                 }
                             }
                             LogMessage::AllRangesComplete => {
-                                if pending_ranges.is_empty() {
+                                all_ranges_complete = true;
+                                if pending_ranges.is_empty() && write_join_set.is_empty() {
                                     break;
                                 }
                             }
@@ -115,7 +121,7 @@ pub async fn collect_logs(
                             .extend(factory_addrs);
 
                         if let Some(pending_end) = pending_ranges.remove(&range_start) {
-                            process_completed_range(
+                            if let Some(task) = prepare_completed_range(
                                 range_start,
                                 pending_end,
                                 &mut range_data,
@@ -130,8 +136,9 @@ pub async fn collect_logs(
                                 state.s3_manifest.as_ref(),
                                 state.storage_manager.as_ref(),
                                 &state.chain_name,
-                            )
-                            .await?;
+                            ).await? {
+                                write_join_set.spawn(execute_log_write(task));
+                            }
                         } else {
                             factory_ready.insert(range_start);
                         }
@@ -142,7 +149,19 @@ pub async fn collect_logs(
                     }
                 }
             }
+
+            Some(join_result) = write_join_set.join_next() => {
+                join_result.map_err(|e| LogCollectionError::JoinError(e.to_string()))??;
+                if all_ranges_complete && pending_ranges.is_empty() && write_join_set.is_empty() {
+                    break;
+                }
+            }
         }
+    }
+
+    // Drain any remaining in-flight writes
+    while let Some(join_result) = write_join_set.join_next().await {
+        join_result.map_err(|e| LogCollectionError::JoinError(e.to_string()))??;
     }
 
     if let Some(tx) = decoder_tx {
