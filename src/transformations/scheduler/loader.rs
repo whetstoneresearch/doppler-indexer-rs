@@ -268,7 +268,9 @@ fn read_receipt_addresses_sync(
 pub(crate) struct CatchupPayload {
     pub handler: Arc<dyn TransformationHandler>,
     pub handler_key: String,
+    #[allow(dead_code)]
     pub handler_name: &'static str,
+    #[allow(dead_code)]
     pub handler_version: u32,
     pub triggers: Arc<Vec<(String, String)>>,
     pub call_deps: Arc<Vec<(String, String)>>,
@@ -506,7 +508,7 @@ impl CallDepScanner {
                 decoded_base: &Path,
                 raw_base: &Path,
                 source: &str,
-                function_name: &str,
+                _function_name: &str,
                 contracts: &Contracts,
                 ranges: &mut HashSet<(u64, u64)>,
             ) -> std::io::Result<()> {
@@ -522,7 +524,7 @@ impl CallDepScanner {
                             decoded_base,
                             raw_base,
                             source,
-                            function_name,
+                            _function_name,
                             contracts,
                             ranges,
                         )?;

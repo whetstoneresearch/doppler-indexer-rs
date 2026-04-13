@@ -747,6 +747,7 @@ impl RetryProcessor {
 
     /// Record full retry-success bookkeeping for handlers that resolve
     /// immediately and never enter the DAG.
+    #[allow(clippy::too_many_arguments)]
     async fn record_handler_retry_success(
         &self,
         handler_key: &str,

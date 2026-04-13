@@ -879,6 +879,7 @@ impl AlchemyClient {
     /// * `block_numbers` - Block numbers to fetch receipts for
     /// * `concurrency` - Maximum concurrency for this batch. The effective concurrency
     ///   is the minimum of this value and the client's configured `rpc_concurrency`.
+    #[allow(clippy::type_complexity)]
     pub async fn get_block_receipts_concurrent(
         &self,
         method_name: &str,

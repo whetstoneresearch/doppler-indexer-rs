@@ -25,7 +25,9 @@ use crate::types::config::contract::Contracts;
 pub(crate) struct HandlerOutcome {
     pub handler_key: String,
     pub handler_name: String,
+    #[allow(dead_code)]
     pub range_start: u64,
+    #[allow(dead_code)]
     pub range_end: u64,
 }
 
@@ -529,7 +531,6 @@ pub(crate) async fn execute_with_snapshot_capture(
             .key_columns
             .iter()
             .cloned()
-            .into_iter()
             .map(|(k, v)| (k, LiveDbValue::from_db_value(&v)))
             .collect();
 

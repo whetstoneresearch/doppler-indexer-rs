@@ -1,6 +1,7 @@
 use crate::db::{DbOperation, DbValue};
 use crate::transformations::TransformationContext;
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_transfer(
     block_number: u64,
     log_index: u32,

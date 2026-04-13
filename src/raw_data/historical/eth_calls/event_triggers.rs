@@ -584,6 +584,7 @@ pub(crate) fn expected_event_call_key_counts_by_output(
 }
 
 /// Process event triggers and make eth_calls
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_event_triggers(
     triggers: Vec<EventTriggerData>,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
@@ -1018,6 +1019,7 @@ async fn write_empty_event_call_file(
 }
 
 /// Process event triggers using Multicall3 aggregate3 to batch all calls per block
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_event_triggers_multicall(
     triggers: Vec<EventTriggerData>,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,

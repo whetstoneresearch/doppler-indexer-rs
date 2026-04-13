@@ -270,6 +270,7 @@ pub struct TvlBootstrapSeed {
 /// LP-only block row by carrying forward the latest known `price_close` into
 /// OHLC, or by seeding from `bootstrap_seed` when no prior snapshot exists,
 /// while initializing swap volumes/counts to zero.
+#[allow(clippy::too_many_arguments)]
 pub fn build_snapshot_tvl_update(
     chain_id: u64,
     pool_id: &[u8],
@@ -414,6 +415,7 @@ DO UPDATE SET
 /// swap path already wrote the target block, the conflict update fills in TVL
 /// columns in place. If `pool_state` has already advanced past `block_number`,
 /// the statement is intentionally a no-op rather than overwriting newer state.
+#[allow(clippy::too_many_arguments)]
 pub fn build_state_tvl_update(
     chain_id: u64,
     pool_id: &[u8],
@@ -783,12 +785,12 @@ pub async fn process_tvl(
             market_cap_usd,
             active_liquidity_usd,
             bootstrap_seed,
-            total_supply: meta.total_supply.clone(),
+            total_supply: meta.total_supply,
         };
 
         let update_latest = latest_per_pool
             .get(&target.pool_id)
-            .map_or(true, |(prev, _)| target.block_number >= prev.block_number);
+            .is_none_or(|(prev, _)| target.block_number >= prev.block_number);
         if update_latest {
             latest_per_pool.insert(target.pool_id.clone(), (target, result));
         }

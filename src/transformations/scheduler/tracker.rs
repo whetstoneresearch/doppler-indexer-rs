@@ -174,6 +174,7 @@ impl CompletionTracker {
     /// Snapshot check: are all `deps` completed for `range_start`?
     ///
     /// Takes ONE read lock on `state` for all failed/blocked/completed checks.
+    #[allow(dead_code)]
     pub(crate) async fn probe(&self, deps: &[String], range_start: u64) -> DepState {
         let state = self.state.read().await;
         // Check failed first so a failed dep is reported even if others are completed.
@@ -221,6 +222,7 @@ impl CompletionTracker {
     /// `poll_notified` compares it to the current count and, if it changed,
     /// transitions directly to `Done`. That's what makes the bare
     /// `notified()` / `probe()` / `.await` sequence race-free here.
+    #[allow(dead_code)]
     pub(crate) async fn wait_ready(
         &self,
         deps: &[String],
@@ -326,6 +328,7 @@ impl CompletionTracker {
     }
 
     /// Clear a transient blocked mark before the next scheduler pass.
+    #[allow(dead_code)]
     pub(crate) async fn clear_blocked(&self, handler_name: &str, range_start: u64) {
         let mut state = self.state.write().await;
         if let Some(ranges) = state.blocked.get_mut(handler_name) {
@@ -436,6 +439,7 @@ impl CompletionTracker {
     }
 
     /// Read the current contiguous watermark for a handler.
+    #[allow(dead_code)]
     pub(crate) async fn contiguous_watermark(&self, handler_name: &str) -> Option<u64> {
         let contiguous = self.contiguous.read().await;
         contiguous.watermarks.get(handler_name).copied().flatten()

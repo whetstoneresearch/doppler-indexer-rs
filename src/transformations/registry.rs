@@ -294,6 +294,7 @@ impl TransformationRegistry {
     }
 
     /// Get the dependency graph (handler name -> dependency names).
+    #[allow(dead_code)]
     pub fn handler_dependency_graph(&self) -> &HashMap<String, Vec<String>> {
         &self.handler_dependency_graph
     }
@@ -472,6 +473,7 @@ impl TransformationRegistry {
     ///
     /// Useful when displaying metrics or log messages where a missing mapping
     /// should not panic.
+    #[allow(dead_code)]
     pub fn resolve_handler_key(&self, name: &str) -> String {
         self.handler_name_to_key
             .get(name)
@@ -488,6 +490,7 @@ impl TransformationRegistry {
     ///
     /// Panics if any dependency name cannot be resolved to a handler key,
     /// which would indicate a registry inconsistency.
+    #[allow(dead_code)]
     pub fn dependency_handler_keys(&self) -> HashSet<String> {
         self.dependency_handler_names
             .iter()

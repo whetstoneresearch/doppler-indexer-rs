@@ -373,6 +373,7 @@ impl TransformationEngine {
         .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))?
     }
 
+    #[allow(dead_code)]
     async fn scan_available_call_dependency_ranges(
         &self,
         source: &str,
@@ -776,7 +777,7 @@ impl TransformationEngine {
     async fn prepare_catchup_handlers(
         &self,
         kind: HandlerKind,
-        handlers: &mut Vec<CatchupHandler>,
+        handlers: &mut [CatchupHandler],
         base_dir: &Path,
         available: &mut Vec<(u64, u64)>,
     ) -> Result<HashMap<String, HashSet<(u64, u64)>>, TransformationError> {
@@ -2466,6 +2467,7 @@ impl TransformationEngine {
     /// one `WorkItem` even when several triggers match the same block. Each
     /// `WorkItem` carries `dep_names` derived from both dependency modes so the
     /// scheduler gates execution on those deps completing first.
+    #[allow(clippy::too_many_arguments)]
     fn build_process_range_items(
         &self,
         event_triggers: &[(String, String)],

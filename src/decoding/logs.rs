@@ -259,6 +259,7 @@ pub(crate) fn build_event_matchers(
 }
 
 /// Process logs and write decoded data
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_logs(
     logs: &[LogData],
     range_start: u64,

@@ -96,6 +96,7 @@ pub struct FactoryMatcher {
     pub data_types: Vec<DynSolType>,
     pub collection_name: String,
     /// Name of the contract in the config that owns this factory matcher.
+    #[allow(dead_code)]
     pub contract_name: String,
 }
 

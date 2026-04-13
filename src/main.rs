@@ -1430,6 +1430,7 @@ impl FullPipelineContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,

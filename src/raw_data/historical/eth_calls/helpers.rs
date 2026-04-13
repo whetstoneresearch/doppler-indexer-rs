@@ -73,6 +73,7 @@ pub(crate) struct OnceFileState {
 ///
 /// This encapsulates the pattern found in `process_once_calls_regular` and
 /// `process_once_calls_multicall`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_regular_once_file_state(
     rel_path: &str,
     file_name: &str,

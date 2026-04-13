@@ -25,6 +25,7 @@ use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::shared::repair::RepairScope;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn decode_eth_calls(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,

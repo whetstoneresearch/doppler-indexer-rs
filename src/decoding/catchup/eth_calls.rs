@@ -136,6 +136,7 @@ fn repair_scope_matches_source_function(
 }
 
 /// Catchup phase: decode existing raw eth_call files
+#[allow(clippy::too_many_arguments)]
 pub async fn catchup_decode_eth_calls(
     raw_calls_dir: &Path,
     output_base: &Path,

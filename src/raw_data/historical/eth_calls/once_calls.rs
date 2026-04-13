@@ -681,7 +681,7 @@ pub(crate) async fn process_factory_once_calls(
             // If existing file is empty/incomplete and we have new results,
             // do a full rewrite combining existing + new data.
             let has_new_addrs = !results_by_address.is_empty();
-            if (existing_is_empty || has_new_addrs) && has_new_addrs {
+            if has_new_addrs {
                 let mut combined: Vec<OnceCallResult> = results_by_address
                     .into_iter()
                     .map(
@@ -1696,7 +1696,7 @@ pub(crate) async fn process_factory_once_calls_multicall(
                 // If existing file is empty/incomplete and we have new results,
                 // do a full rewrite combining existing + new data.
                 let has_new_addrs = !results_by_address.is_empty();
-                if (existing_is_empty || has_new_addrs) && has_new_addrs {
+                if has_new_addrs {
                     // Build combined results: new addresses + existing addresses
                     let mut combined: Vec<OnceCallResult> = results_by_address
                         .into_iter()

@@ -236,6 +236,7 @@ pub fn write_contract_index(dir: &Path, index: &ContractIndex) -> Result<(), io:
 // ---------------------------------------------------------------------------
 
 /// Async wrapper around [`read_contract_index`].
+#[allow(dead_code)]
 pub async fn read_contract_index_async(dir: std::path::PathBuf) -> ContractIndex {
     tokio::task::spawn_blocking(move || read_contract_index(&dir))
         .await
@@ -243,6 +244,7 @@ pub async fn read_contract_index_async(dir: std::path::PathBuf) -> ContractIndex
 }
 
 /// Async wrapper around [`write_contract_index`].
+#[allow(dead_code)]
 pub async fn write_contract_index_async(
     dir: std::path::PathBuf,
     index: ContractIndex,

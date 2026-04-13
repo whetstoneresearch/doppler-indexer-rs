@@ -23,10 +23,13 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 /// Metadata for a single pool needed by metrics handlers.
 #[derive(Debug, Clone)]
 pub struct PoolMetadata {
+    #[allow(dead_code)]
     pub pool_id: Vec<u8>,
+    #[allow(dead_code)]
     pub base_token: [u8; 20],
     pub quote_token: [u8; 20],
     pub is_token_0: bool,
+    #[allow(dead_code)]
     pub pool_type: String,
     pub base_decimals: u8,
     pub quote_decimals: u8,
@@ -203,6 +206,7 @@ impl PoolMetadataCache {
     /// Used by Create handlers to populate the cache in-memory before their
     /// DB transaction commits, so Swap handlers in the same range/block can
     /// find newly created pools without a DB round-trip.
+    #[allow(dead_code)]
     pub fn insert_if_absent(&self, pool_id: Vec<u8>, meta: PoolMetadata) {
         let mut inner = self.inner.write().unwrap();
         inner.entry(pool_id).or_insert(meta);

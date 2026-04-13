@@ -17,7 +17,7 @@ use crate::raw_data::historical::factories::{
 use crate::storage::contract_index::{
     build_address_contract_map, build_expected_factory_contracts_for_range,
     detect_contracts_in_log_parquet, get_missing_contracts, range_key, read_contract_index,
-    update_contract_index, write_contract_index, ContractIndex,
+    update_contract_index, write_contract_index, ContractIndex, ExpectedContracts,
 };
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
@@ -25,6 +25,7 @@ use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
@@ -147,6 +148,8 @@ pub async fn collect_factories(
         contract_indexes.insert(collection.clone(), idx);
     }
 
+    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8);
+
     // =========================================================================
     // Migration: build contract_index.json from existing data if missing
     // =========================================================================
@@ -158,7 +161,7 @@ pub async fn collect_factories(
         tracing::info!(
             "Contract index migration: scanning log files to build index for existing factory ranges"
         );
-        let address_maps = build_address_contract_map(&chain.contracts);
+        let address_maps = Arc::new(build_address_contract_map(&chain.contracts));
         let log_ranges_for_migration = {
             let chain_name = chain.name.clone();
             let s3_manifest_clone = s3_manifest.clone();
@@ -170,6 +173,11 @@ pub async fn collect_factories(
         };
 
         let mut migrated_count = 0usize;
+        let semaphore = Arc::new(Semaphore::new(factory_concurrency));
+        let mut migration_join_set: JoinSet<
+            Result<(u64, u64, HashMap<String, ExpectedContracts>), FactoryCollectionError>,
+        > = JoinSet::new();
+
         for log_range in &log_ranges_for_migration {
             let rk = range_key(log_range.start, log_range.end - 1);
 
@@ -204,35 +212,48 @@ pub async fn collect_factories(
                 continue;
             }
 
-            match detect_contracts_in_log_parquet(&log_range.file_path, &address_maps) {
-                Ok(detected) => {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let address_maps = address_maps.clone();
+            let file_path = log_range.file_path.clone();
+            let start = log_range.start;
+            let end = log_range.end;
+
+            migration_join_set.spawn(async move {
+                let _permit = permit;
+                let detected = tokio::task::spawn_blocking(move || {
+                    detect_contracts_in_log_parquet(&file_path, &address_maps)
+                })
+                .await
+                .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+                .map_err(FactoryCollectionError::Io)?;
+                Ok((start, end, detected))
+            });
+        }
+
+        while let Some(result) = migration_join_set.join_next().await {
+            match result {
+                Ok(Ok((start, end, detected))) => {
+                    let rk = range_key(start, end - 1);
+
                     for (collection, contracts_found) in &detected {
                         let index = contract_indexes.entry(collection.clone()).or_default();
                         if !index.contains_key(&rk) {
                             update_contract_index(index, &rk, contracts_found);
                         }
                     }
+
                     // Also record collections where no source addresses were found
                     // (the range was processed but had no matching events)
                     for collection in &factory_collection_names {
                         if !detected.contains_key(collection) {
-                            let rel_path = format!(
-                                "{}/{}-{}.parquet",
-                                collection,
-                                log_range.start,
-                                log_range.end - 1
-                            );
+                            let rel_path = format!("{}/{}-{}.parquet", collection, start, end - 1);
                             let file_exists = existing_files.contains(&rel_path)
-                                || s3_manifest.as_ref().is_some_and(|m| {
-                                    m.has_factories(collection, log_range.start, log_range.end - 1)
-                                });
+                                || s3_manifest
+                                    .as_ref()
+                                    .is_some_and(|m| m.has_factories(collection, start, end - 1));
                             if file_exists {
                                 let index = contract_indexes.entry(collection.clone()).or_default();
                                 if !index.contains_key(&rk) {
-                                    // No source addresses matched, but the file exists.
-                                    // Record an empty entry so we don't re-scan.
-                                    // Use detected (empty for this collection) which is correct:
-                                    // no contracts contributed, so empty map.
                                     update_contract_index(
                                         index,
                                         &rk,
@@ -242,15 +263,13 @@ pub async fn collect_factories(
                             }
                         }
                     }
+
                     migrated_count += 1;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Migration: failed to scan log parquet {}: {}",
-                        log_range.file_path.display(),
-                        e
-                    );
+                Ok(Err(e)) => {
+                    tracing::warn!("Migration: failed to scan log parquet: {}", e);
                 }
+                Err(e) => return Err(FactoryCollectionError::JoinError(e.to_string())),
             }
         }
 
@@ -291,8 +310,6 @@ pub async fn collect_factories(
         .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
     };
     let mut catchup_count = 0;
-
-    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8);
     let matchers = Arc::new(matchers);
     let existing_files = Arc::new(existing_files);
     let output_dir = Arc::new(output_dir);

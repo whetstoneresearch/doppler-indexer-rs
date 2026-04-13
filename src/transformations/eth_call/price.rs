@@ -75,7 +75,7 @@ fn discover_pool_configs(contracts: &Contracts) -> Vec<DynamicPoolConfig> {
         .collect();
     // Sort by length descending so longer names match first (avoids "Usdc" matching
     // inside a longer name like "BUsdc").
-    token_names.sort_by(|a, b| b.len().cmp(&a.len()));
+    token_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
     let mut configs = Vec::new();
 

@@ -191,6 +191,7 @@ pub async fn collect_blocks(
 /// Streaming block collection: fetches blocks concurrently and forwards to downstream
 /// collectors immediately as each block arrives. Buffers records and returns a
 /// `PendingBlockWrite` so the caller can overlap the parquet I/O with the next fetch.
+#[allow(clippy::too_many_arguments)]
 async fn collect_blocks_streaming(
     client: &UnifiedRpcClient,
     range: &BlockRange,

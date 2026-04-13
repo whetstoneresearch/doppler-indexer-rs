@@ -127,7 +127,7 @@ struct ResolvedPath {
 ///
 /// At each hop, queries pools touching the current frontier tokens with
 /// >= $1,000 active liquidity. Tracks the best (highest bottleneck liquidity)
-/// path to any priceable token found.
+/// > path to any priceable token found.
 ///
 /// `max_block`: if `Some(b)`, only consider snapshot rows with block_number < b.
 async fn resolve_token_price_path(
@@ -297,11 +297,11 @@ pub async fn derive_price_from_path(
 
         if current_token == pool.base_token {
             // Going base → quote: multiply by price (quote_per_base)
-            multiplier = multiplier * &pool.price;
+            multiplier *= &pool.price;
             current_token = pool.quote_token;
         } else if current_token == pool.quote_token {
             // Going quote → base: divide by price
-            if pool.price == BigDecimal::from(0) {
+            if pool.price == 0 {
                 return None;
             }
             multiplier = multiplier / &pool.price;

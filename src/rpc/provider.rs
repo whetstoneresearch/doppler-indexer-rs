@@ -147,6 +147,7 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
 
 /// Extracts the full error chain without any truncation.
 /// Useful for debug-level logging when you need to see the complete response body.
+#[allow(dead_code)]
 pub fn error_chain_full(err: &dyn std::error::Error) -> String {
     let mut chain = vec![err.to_string()];
     let mut source = err.source();

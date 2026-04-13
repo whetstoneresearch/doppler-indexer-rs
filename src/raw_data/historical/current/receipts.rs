@@ -78,6 +78,7 @@ fn take_pending_fallback_batch(
 }
 
 /// Drain one pending fallback micro-batch and spawn its fetch task into the JoinSet.
+#[allow(clippy::too_many_arguments)]
 fn spawn_fallback_flush(
     pending: &mut VecDeque<(u64, BlockInfo)>,
     pending_tx_count: &mut usize,
@@ -119,6 +120,7 @@ fn spawn_fallback_flush(
 
 /// Spawn as many fallback micro-batches as possible without exceeding the
 /// configured in-flight limit.
+#[allow(clippy::too_many_arguments)]
 fn spawn_ready_fallback_flushes(
     pending: &mut VecDeque<(u64, BlockInfo)>,
     pending_tx_count: &mut usize,

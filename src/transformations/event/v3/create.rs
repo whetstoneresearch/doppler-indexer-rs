@@ -31,6 +31,7 @@ pub const LOCKABLE_V3_CREATE_HANDLER_SCOPE: VersionedSource = VersionedSource::n
 );
 
 pub struct V3CreateHandler {
+    #[allow(dead_code)]
     pub(crate) metadata_cache: Arc<PoolMetadataCache>,
 }
 
@@ -203,6 +204,7 @@ impl EventHandler for V3CreateHandler {
 }
 
 pub struct LockableV3CreateHandler {
+    #[allow(dead_code)]
     pub(crate) metadata_cache: Arc<PoolMetadataCache>,
 }
 

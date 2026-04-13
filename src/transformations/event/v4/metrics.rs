@@ -52,6 +52,9 @@ use crate::transformations::util::usd_price::{
 
 const SOURCE: &str = "DopplerV4Hook";
 
+/// pool_id → (total_proceeds, total_tokens_sold) cumulative state.
+type ProceedsState = HashMap<[u8; 32], (U256, U256)>;
+
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 pub struct V4BaseMetricsHandler {
@@ -64,12 +67,12 @@ pub struct V4BaseMetricsHandler {
     hook_pool_map: RwLock<HashMap<[u8; 20], [u8; 32]>>,
     /// pool_id → (total_proceeds, total_tokens_sold) — loaded from v4_base_proceeds_state
     /// at init, refreshed on cache miss, updated optimistically in handle().
-    proceeds_state: RwLock<HashMap<[u8; 32], (U256, U256)>>,
+    proceeds_state: RwLock<ProceedsState>,
     /// Pre-update cumulatives for the currently-in-flight batch, used by
     /// `on_commit_failure` to revert the optimistic cache update. Populated
     /// by `handle()` just before the optimistic write; drained by either
     /// commit hook. Always `None` between batches in normal operation.
-    in_flight_pre: RwLock<Option<HashMap<[u8; 32], (U256, U256)>>>,
+    in_flight_pre: RwLock<Option<ProceedsState>>,
     /// Ranges whose commit failed. `handle()` refuses any range strictly
     /// greater than the minimum entry so delta computation never advances
     /// past a stuck block. Retries drain this set via `on_commit_success`.
@@ -185,7 +188,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
         self.refresh_proceeds_state_for_pools(&pool_ids).await?;
 
         // Snapshot the current in-memory cumulative state for the pools in this batch.
-        let prev_state: HashMap<[u8; 32], (U256, U256)> = {
+        let prev_state: ProceedsState = {
             let state = self.proceeds_state.read().unwrap();
             pool_ids
                 .iter()
@@ -234,7 +237,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
 
         // Stash pre-update cumulatives so `on_commit_failure` can revert the
         // optimistic cache write if the transaction fails.
-        let pre: HashMap<[u8; 32], (U256, U256)> = {
+        let pre: ProceedsState = {
             let state = self.proceeds_state.read().unwrap();
             new_cumulative
                 .keys()
@@ -565,8 +568,8 @@ impl V4BaseMetricsHandler {
     fn extract_swaps(
         &self,
         events: &[&DecodedEvent],
-        prev_state: &HashMap<[u8; 32], (U256, U256)>,
-    ) -> Result<(Vec<SwapInput>, HashMap<[u8; 32], (U256, U256)>), TransformationError> {
+        prev_state: &ProceedsState,
+    ) -> Result<(Vec<SwapInput>, ProceedsState), TransformationError> {
         let hook_pool_map = self.hook_pool_map.read().unwrap();
 
         // Group events by pool_id.
@@ -584,7 +587,7 @@ impl V4BaseMetricsHandler {
         drop(hook_pool_map);
 
         let mut swaps: Vec<SwapInput> = Vec::new();
-        let mut new_cumulative: HashMap<[u8; 32], (U256, U256)> = HashMap::new();
+        let mut new_cumulative: ProceedsState = HashMap::new();
 
         for (pool_id, mut pool_evts) in pool_events {
             pool_evts.sort_by_key(|e| (e.block_number, e.log_index));
@@ -1050,7 +1053,7 @@ mod tests {
         let events = vec![&event];
 
         // Simulate handle()'s snapshot read from the in-memory state:
-        let prev_state: HashMap<[u8; 32], (U256, U256)> = {
+        let prev_state: ProceedsState = {
             let state = handler.proceeds_state.read().unwrap();
             [pool_id]
                 .iter()
