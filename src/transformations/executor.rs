@@ -44,7 +44,7 @@ pub(crate) struct HandlerTask {
     pub handler: Arc<dyn TransformationHandler>,
     pub events: Arc<Vec<DecodedEvent>>,
     pub calls: Arc<Vec<DecodedCall>>,
-    pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    pub tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
 }
 
 /// Opaque payload carried inside a process-range [`WorkItem`].
@@ -58,7 +58,7 @@ pub(crate) struct ProcessRangePayload {
     pub handler: Arc<dyn TransformationHandler>,
     pub events: Arc<Vec<DecodedEvent>>,
     pub calls: Arc<Vec<DecodedCall>>,
-    pub tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    pub tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
     /// `Some(chain_name)` → snapshot-capture mode (live); `None` → direct (historical).
     pub snapshot_chain: Option<String>,
 }
@@ -181,7 +181,7 @@ pub(crate) async fn run_handler_task(
     handler: Arc<dyn TransformationHandler>,
     events: Arc<Vec<DecodedEvent>>,
     calls: Arc<Vec<DecodedCall>>,
-    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
     chain_name: String,
     chain_id: u64,
     range_start: u64,

@@ -59,7 +59,7 @@ struct RetryPayload {
     handler: Arc<dyn super::traits::TransformationHandler>,
     handler_events: Arc<Vec<DecodedEvent>>,
     handler_calls: Arc<Vec<DecodedCall>>,
-    tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+    tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
 }
 
 pub(crate) fn resolve_retry_missing_handlers(
@@ -392,7 +392,7 @@ impl RetryProcessor {
     ) -> Result<HashSet<String>, TransformationError> {
         let range_start = block_number;
         let range_end = block_number + 1;
-        let tx_addresses = read_live_receipt_addresses(&self.chain_name, block_number)?;
+        let tx_addresses = Arc::new(read_live_receipt_addresses(&self.chain_name, block_number)?);
         let events = Arc::new(events);
         let calls = Arc::new(calls);
 
@@ -506,7 +506,7 @@ impl RetryProcessor {
             // tx_addresses for event handlers; empty for call handlers.
             let item_tx_addresses = match rh.kind {
                 HandlerKind::Event => tx_addresses.clone(),
-                HandlerKind::Call => HashMap::new(),
+                HandlerKind::Call => Arc::new(HashMap::new()),
             };
 
             // dep_names are handler names (not keys). The tracker already has

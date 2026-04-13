@@ -232,7 +232,7 @@ mod tests {
             200,
             Arc::new(events),
             Arc::new(calls),
-            HashMap::new(),
+            Arc::new(HashMap::new()),
             historical,
             rpc,
             Arc::new(HashMap::new()),

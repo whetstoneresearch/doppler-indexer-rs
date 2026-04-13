@@ -1700,9 +1700,10 @@ impl TransformationEngine {
         }
 
         // Build HandlerTasks and use executor
-        let tx_addresses = self
-            .read_receipt_addresses(msg.range_start, msg.range_end)
-            .await;
+        let tx_addresses = Arc::new(
+            self.read_receipt_addresses(msg.range_start, msg.range_end)
+                .await,
+        );
         let tasks: Vec<HandlerTask> = ready_handlers
             .into_iter()
             .map(|(handler, calls)| HandlerTask {
@@ -2193,9 +2194,10 @@ impl TransformationEngine {
             // Build HandlerTasks and use executor
             let mut tasks = Vec::new();
             for (_handler_key, event_data, handler) in ready_events {
-                let tx_addresses = self
-                    .read_receipt_addresses(event_data.range_start, event_data.range_end)
-                    .await;
+                let tx_addresses = Arc::new(
+                    self.read_receipt_addresses(event_data.range_start, event_data.range_end)
+                        .await,
+                );
                 tasks.push(HandlerTask {
                     handler,
                     events: Arc::new(event_data.events),
@@ -2474,7 +2476,7 @@ impl TransformationEngine {
         call_triggers: &[(String, String)],
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
-        tx_addresses: HashMap<[u8; 32], TransactionAddresses>,
+        tx_addresses: Arc<HashMap<[u8; 32], TransactionAddresses>>,
         range_start: u64,
         range_end: u64,
         snapshot_chain: Option<String>,
@@ -2587,7 +2589,7 @@ impl TransformationEngine {
             .into_iter()
             .collect();
 
-        let tx_addresses = self.read_receipt_addresses(range_start, range_end).await;
+        let tx_addresses = Arc::new(self.read_receipt_addresses(range_start, range_end).await);
         let events = Arc::new(events);
         let calls = Arc::new(calls);
 
