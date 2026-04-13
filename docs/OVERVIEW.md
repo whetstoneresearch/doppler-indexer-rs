@@ -105,7 +105,7 @@ migrations/
 ## Features Index
 
 ### raw_data_collection
-- **description**: Fetches blocks, transaction receipts, and logs from EVM chains. Two-phase processing (catchup then current). Parquet output with configurable field selection.
+- **description**: Fetches blocks, transaction receipts, and logs from EVM chains. Two-phase processing (catchup then current). Parquet output with configurable field selection. Log writes are pipelined via JoinSet so the select loop remains responsive during I/O.
 - **entry_points**: `src/raw_data/historical/blocks.rs`, `src/raw_data/historical/receipts.rs`, `src/raw_data/historical/logs.rs`, `src/raw_data/historical/catchup/`, `src/raw_data/historical/current/`
 - **depends_on**: [rpc]
 - **doc**: `docs/features/block_collection.md`, `docs/features/receipts_collection.md`, `docs/features/logs_collection.md`

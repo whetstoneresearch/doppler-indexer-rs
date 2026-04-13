@@ -26,7 +26,7 @@ src/raw_data/historical/
     └── logs.rs          # Current phase: channel processing loop
 ```
 
-- **`logs.rs`**: Contains `LogsCatchupState`, `LogCollectionError`, schema building, and parquet writing utilities shared by both phases
+- **`logs.rs`**: Contains `LogsCatchupState`, `LogCollectionError`, `LogWriteTask`, `prepare_completed_range`, `execute_log_write`, schema building, and parquet writing utilities shared by both phases
 - **`catchup/logs.rs`**: Initializes state by scanning existing files and building configuration
 - **`current/logs.rs`**: Processes `LogMessage` from channels using the pre-built state
 
@@ -229,15 +229,18 @@ data/{chain}/historical/raw/logs/
 1. Receives `LogMessage` from the receipt collector via channel
 2. For `LogMessage::Logs`: accumulates logs into per-range buckets
 3. For `LogMessage::RangeComplete`: signals a range is ready to process
-   - Skips the range if the parquet file already exists on disk or in the S3 manifest
-   - If `contract_logs_only` is enabled and factories are configured, waits for factory addresses
-   - Filters logs to configured contracts and factory-created contracts (if filtering enabled)
-   - Sends logs to decoder (if decoder channel provided)
-   - Writes range to Parquet file and uploads to S3 (if storage manager configured)
-4. For `LogMessage::AllRangesComplete`: signals collection is finished
-   - Waits for any pending ranges that need factory data
+   - Calls `prepare_completed_range` which:
+     - Skips the range if the parquet file already exists on disk or in the S3 manifest
+     - If `contract_logs_only` is enabled and factories are configured, waits for factory addresses
+     - Filters logs to configured contracts and factory-created contracts (if filtering enabled)
+     - Sends logs to decoder (if decoder channel provided)
+     - Returns a `LogWriteTask` containing all data needed for the write
+   - Spawns `execute_log_write(task)` onto a `JoinSet`, allowing the parquet write and S3 upload to proceed concurrently with message processing
+4. A dedicated `select!` branch drains completed writes from the `JoinSet` and propagates errors
+5. For `LogMessage::AllRangesComplete`: signals collection is finished
+   - Sets `all_ranges_complete` flag; only breaks when both `pending_ranges` and the write `JoinSet` are empty
+   - Drains remaining in-flight writes after the loop exits
    - Sends `DecoderMessage::AllComplete` to decoder (if configured)
-   - Exits the collection loop
 
 ## Contract Logs Only Filtering
 

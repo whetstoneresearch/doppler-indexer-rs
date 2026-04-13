@@ -8,8 +8,8 @@ Raw data collection runs as multiple concurrent async tasks connected by channel
 
 1. **Blocks Collector** - Fetches blocks from RPC, sends block info downstream
 2. **Receipts Collector** - Fetches transaction receipts, extracts logs
-3. **Logs Collector** - Writes logs to parquet, optionally filters by contract
-4. **Factories Collector** - Extracts factory-created contract addresses from logs
+3. **Logs Collector** - Writes logs to parquet (via pipelined JoinSet), optionally filters by contract
+4. **Factories Collector** - Extracts factory-created contract addresses from logs, forwards to downstream channels in parallel via `tokio::join!`
 5. **Eth Calls Collector** - Executes eth_call requests at historical block heights
 6. **Decoders** - Decode raw logs and eth_call results into typed parquet files
 
