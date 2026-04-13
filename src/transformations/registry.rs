@@ -468,6 +468,17 @@ impl TransformationRegistry {
         self.handler_name_to_key.get(name).map(|s| s.as_str())
     }
 
+    /// Resolve a handler name to its handler_key, falling back to the name itself.
+    ///
+    /// Useful when displaying metrics or log messages where a missing mapping
+    /// should not panic.
+    pub fn resolve_handler_key(&self, name: &str) -> String {
+        self.handler_name_to_key
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// Whether a handler was registered with more than one trigger.
     pub fn is_multi_trigger(&self, handler_key: &str) -> bool {
         self.multi_trigger_handler_keys.contains(handler_key)
