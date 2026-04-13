@@ -293,7 +293,7 @@ pub async fn derive_price_from_path(
         let Some(pool) = pool_data.get(pool_id.as_slice()) else {
             tracing::warn!(
                 pool = hex::encode(pool_id),
-                "Pool in path not found in pool_state, cannot derive price"
+                "Pool in path not found in pool_snapshots, cannot derive price"
             );
             return None;
         };
