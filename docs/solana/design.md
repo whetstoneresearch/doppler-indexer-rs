@@ -969,16 +969,38 @@ Reconnection and gap detection follow the same pattern as the EVM `WsClient` in 
 4. Attribute each event to the currently active program (top of stack)
 5. Filter by configured program IDs
 
-**Stack-based log parser**:
+**Stack-based log parser with instruction position tracking**:
+
+The parser tracks CPI depth to assign each event its structured `(instruction_index, inner_instruction_index)` position. When a `"Program X invoke [1]"` line appears, a new top-level instruction begins (incrementing the instruction counter). Deeper invocations (`[2]`, `[3]`, etc.) are CPI calls that share the same top-level instruction_index but get sequential inner_instruction_index values.
+
+**Trust assumption (fake logs):** Programs can emit arbitrary log messages via `msg!()`, including strings like `"Program data: <base64>"`. The Solana runtime does not distinguish between genuine `emit!()` output and `msg!()` spoofs in `logMessages`. This parser matches exact prefixes and suffixes to minimize false positives, but a malicious program could still inject fake events. In practice, programs don't do this because it confuses their own tooling and indexing. This is a known limitation of Solana log-based event parsing — no parser can fully defend against it without runtime-level support.
 
 ```rust
 struct ProgramLogParser {
     program_stack: Vec<Pubkey>,
     events: Vec<SolanaEventRecord>,
+    /// Current top-level instruction index (incremented on each "invoke [1]")
+    top_level_instruction_index: u16,
+    /// Counter of inner instructions within the current top-level instruction.
+    /// Reset to 0 on each new top-level invoke.
+    inner_instruction_count: u16,
+    /// Whether we've seen any top-level invoke yet
+    has_started: bool,
 }
 
 impl ProgramLogParser {
-    /// Parse a single log line, maintaining the program invocation stack.
+    fn new() -> Self {
+        Self {
+            program_stack: Vec::new(),
+            events: Vec::new(),
+            top_level_instruction_index: 0,
+            inner_instruction_count: 0,
+            has_started: false,
+        }
+    }
+
+    /// Parse a single log line, maintaining the program invocation stack
+    /// and instruction position tracking.
     ///
     /// Log format is stable across Solana runtime versions:
     /// - "Program <base58_pubkey> invoke [<depth>]"  — push to stack
@@ -986,17 +1008,29 @@ impl ProgramLogParser {
     /// - "Program <base58_pubkey> success"             — pop from stack
     /// - "Program <base58_pubkey> failed: <reason>"    — pop from stack
     ///
-    /// Note: programs can emit arbitrary log messages via `msg!()`. The parser must
-    /// match exact prefixes/suffixes to avoid false positives from adversarial logs.
+    /// TRUST ASSUMPTION: Programs can emit arbitrary messages via `msg!()`.
+    /// A malicious program could emit "Program data: <fake_base64>" to inject
+    /// spoofed events. There is no runtime-level defense against this.
+    /// See trust assumption note above.
     fn parse_log_line(&mut self, line: &str, slot: u64, block_time: Option<i64>, tx_sig: &[u8; 64]) {
         // Match "Program <pubkey> invoke [N]" — handles all CPI depths
         if let Some(rest) = line.strip_prefix("Program ") {
-            if let Some(pubkey_str) = rest.strip_suffix(|c: char| c == ']')
+            if let Some((pubkey_str, depth_str)) = rest.strip_suffix(']')
                 .and_then(|s| s.rsplit_once(" invoke ["))
-                .map(|(pk, _depth)| pk)
             {
-                if let Ok(pubkey) = Pubkey::from_str(pubkey_str) {
+                if let (Ok(pubkey), Ok(depth)) = (Pubkey::from_str(pubkey_str), depth_str.parse::<u32>()) {
                     self.program_stack.push(pubkey);
+                    if depth == 1 {
+                        // New top-level instruction
+                        if self.has_started {
+                            self.top_level_instruction_index += 1;
+                        }
+                        self.has_started = true;
+                        self.inner_instruction_count = 0;
+                    } else {
+                        // CPI call — increment inner instruction counter
+                        self.inner_instruction_count += 1;
+                    }
                 }
                 return;
             }
@@ -1025,6 +1059,7 @@ impl ProgramLogParser {
                     let discriminator: [u8; 8] = data[..8].try_into().unwrap();
                     let event_data = data[8..].to_vec();
                     let program_id = self.program_stack.last().copied().unwrap_or_default();
+                    let depth = self.program_stack.len();
                     self.events.push(SolanaEventRecord {
                         slot, block_time,
                         transaction_signature: *tx_sig,
@@ -1032,6 +1067,12 @@ impl ProgramLogParser {
                         event_discriminator: discriminator,
                         event_data,
                         log_index: self.events.len() as u32,
+                        instruction_index: self.top_level_instruction_index,
+                        inner_instruction_index: if depth > 1 {
+                            Some(self.inner_instruction_count.saturating_sub(1))
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -1039,6 +1080,24 @@ impl ProgramLogParser {
     }
 }
 ```
+
+**`SolanaEventRecord`** now includes structured position:
+
+```rust
+pub struct SolanaEventRecord {
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub transaction_signature: [u8; 64],
+    pub program_id: [u8; 32],
+    pub event_discriminator: [u8; 8],
+    pub event_data: Vec<u8>,
+    pub log_index: u32,                         // monotonic counter within tx (for ordering)
+    pub instruction_index: u16,                 // top-level instruction position in tx
+    pub inner_instruction_index: Option<u16>,   // None for top-level, Some for CPI events
+}
+```
+
+The `log_index` is a flat monotonic counter for total ordering within the transaction. The `instruction_index` and `inner_instruction_index` provide the structured position needed to construct `LogPosition::Solana { .. }` at decode time. Both are stored because `log_index` is useful for parquet ordering while the structured position is needed for `LogPosition`.
 
 **Parquet schema**:
 
@@ -1051,6 +1110,174 @@ impl ProgramLogParser {
 | `event_discriminator` | FixedSizeBinary(8) | false |
 | `event_data` | Binary | false |
 | `log_index` | UInt32 | false |
+| `instruction_index` | UInt16 | false |
+| `inner_instruction_index` | UInt16 | true |
+
+### 8.2b Instruction Extractor (`src/solana/raw_data/instructions.rs`)
+
+**Input**: Block data from slot collector (same `UiConfirmedBlock` used by event extractor).
+
+**Process**: For each successful transaction in the block (see §8.6 for failed tx policy):
+1. Resolve the account keys array: `transaction.message.accountKeys` provides all pubkeys referenced by index in instructions
+2. Iterate top-level instructions from `transaction.message.instructions`
+3. Iterate inner (CPI) instructions from `meta.innerInstructions`
+4. For each instruction, resolve `program_id_index` and `accounts` indices to actual pubkeys
+5. Filter by configured program IDs
+6. Produce `SolanaInstructionRecord`
+
+**Account key resolution**: Solana transactions use a compact index scheme. Each instruction's `program_id_index` and `accounts` fields are indices into the transaction's `accountKeys` array, not raw pubkeys. The extractor must resolve these:
+
+```rust
+fn extract_instructions(
+    tx: &EncodedTransactionWithStatusMeta,
+    slot: u64,
+    block_time: Option<i64>,
+    configured_programs: &HashSet<[u8; 32]>,
+) -> Vec<SolanaInstructionRecord> {
+    let message = &tx.transaction.message;
+    let account_keys: Vec<Pubkey> = message.account_keys.clone();
+    let signature = tx.transaction.signatures[0]; // first sig is the tx signature
+    let mut records = Vec::new();
+
+    // Skip failed transactions (meta.err is Some)
+    if let Some(meta) = &tx.meta {
+        if meta.err.is_some() {
+            return records;
+        }
+    }
+
+    // === Top-level instructions ===
+    for (instruction_index, ix) in message.instructions.iter().enumerate() {
+        let program_id = account_keys[ix.program_id_index as usize];
+        if !configured_programs.contains(&program_id.to_bytes()) {
+            continue;
+        }
+        let resolved_accounts: Vec<[u8; 32]> = ix.accounts.iter()
+            .map(|&idx| account_keys[idx as usize].to_bytes())
+            .collect();
+
+        records.push(SolanaInstructionRecord {
+            slot,
+            block_time,
+            transaction_signature: signature.into(),
+            program_id: program_id.to_bytes(),
+            data: ix.data.clone(),
+            accounts: resolved_accounts,
+            instruction_index: instruction_index as u16,
+            inner_instruction_index: None,
+        });
+    }
+
+    // === Inner instructions (CPI) ===
+    if let Some(meta) = &tx.meta {
+        if let Some(inner_instructions) = &meta.inner_instructions {
+            for inner_group in inner_instructions {
+                let parent_index = inner_group.index as u16;
+                for (inner_idx, inner_ix) in inner_group.instructions.iter().enumerate() {
+                    let program_id = account_keys[inner_ix.program_id_index as usize];
+                    if !configured_programs.contains(&program_id.to_bytes()) {
+                        continue;
+                    }
+                    let resolved_accounts: Vec<[u8; 32]> = inner_ix.accounts.iter()
+                        .map(|&idx| account_keys[idx as usize].to_bytes())
+                        .collect();
+
+                    records.push(SolanaInstructionRecord {
+                        slot,
+                        block_time,
+                        transaction_signature: signature.into(),
+                        program_id: program_id.to_bytes(),
+                        data: inner_ix.data.clone(),
+                        accounts: resolved_accounts,
+                        instruction_index: parent_index,
+                        inner_instruction_index: Some(inner_idx as u16),
+                    });
+                }
+            }
+        }
+    }
+
+    records
+}
+```
+
+**Single-pass extraction**: Events and instructions are extracted in the same pass over a block's transactions. The extraction function iterates each transaction once, running both the `ProgramLogParser` (for events from `logMessages`) and `extract_instructions` (for instructions from the structured instruction tree). Both produce their respective record types and write to their respective parquet files and downstream channels.
+
+```rust
+fn extract_events_and_instructions(
+    block: &UiConfirmedBlock,
+    slot: u64,
+    configured_programs: &HashSet<[u8; 32]>,
+) -> (Vec<SolanaEventRecord>, Vec<SolanaInstructionRecord>) {
+    let block_time = block.block_time;
+    let mut all_events = Vec::new();
+    let mut all_instructions = Vec::new();
+
+    if let Some(transactions) = &block.transactions {
+        for tx in transactions {
+            // Skip failed transactions
+            if let Some(meta) = &tx.meta {
+                if meta.err.is_some() {
+                    continue;
+                }
+            }
+
+            let signature = tx.transaction.signatures[0];
+
+            // Events from logMessages (ProgramLogParser)
+            if let Some(meta) = &tx.meta {
+                if let Some(logs) = &meta.log_messages {
+                    let mut parser = ProgramLogParser::new();
+                    for line in logs {
+                        parser.parse_log_line(line, slot, block_time, &signature.into());
+                    }
+                    // Filter events by configured programs
+                    all_events.extend(
+                        parser.events.into_iter()
+                            .filter(|e| configured_programs.contains(&e.program_id))
+                    );
+                }
+            }
+
+            // Instructions from structured data
+            all_instructions.extend(
+                extract_instructions(tx, slot, block_time, configured_programs)
+            );
+        }
+    }
+
+    (all_events, all_instructions)
+}
+```
+
+**`SolanaInstructionRecord`**:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolanaInstructionRecord {
+    pub slot: u64,
+    pub block_time: Option<i64>,
+    pub transaction_signature: [u8; 64],
+    pub program_id: [u8; 32],
+    pub data: Vec<u8>,                         // raw instruction data (includes 8-byte discriminator)
+    pub accounts: Vec<[u8; 32]>,               // resolved pubkeys (not indices)
+    pub instruction_index: u16,                // position in transaction.message.instructions
+    pub inner_instruction_index: Option<u16>,  // None for top-level, Some(n) for CPI
+}
+```
+
+**Parquet schema** (stored in `data/{chain}/historical/raw/instructions/`):
+
+| Column | Arrow Type | Nullable |
+|--------|-----------|----------|
+| `slot` | UInt64 | false |
+| `block_time` | Int64 | true |
+| `transaction_signature` | FixedSizeBinary(64) | false |
+| `program_id` | FixedSizeBinary(32) | false |
+| `data` | Binary | false |
+| `accounts` | List(FixedSizeBinary(32)) | false |
+| `instruction_index` | UInt16 | false |
+| `inner_instruction_index` | UInt16 | true |
 
 ### 8.3 Account Reader (`src/solana/live/accounts.rs`) — Live Mode Only
 
@@ -1098,6 +1325,73 @@ Signature-driven: Program with 1M transactions = 1K pagination calls
 6. Write to parquet files organized by slot range
 
 **Catchup resume**: Scan existing parquet files in `data/{chain}/historical/raw/events/` to find the latest processed slot. Resume from there.
+
+### 8.5 Skipped Slots Index
+
+Solana slots are not contiguous — the leader may fail to produce a block, resulting in "skipped" slots. Parquet file ranges use the same `parquet_block_range` alignment convention as EVM (range boundaries are multiples of `parquet_block_range`), but a range may contain fewer rows than the slot span. A file named `events_250000000-250000999.parquet` may only have 800 rows if 200 slots were skipped.
+
+**Problem**: Without tracking which slots were skipped, the resume logic can't distinguish "this range is complete with some skipped slots" from "this range is incomplete because collection was interrupted."
+
+**Solution**: A single `skipped_slots.json` index file per data directory, following the `contract_index.json` pattern from EVM factory collection:
+
+```rust
+/// Maps range keys ("250000000-250000999") to sorted lists of skipped slots within that range.
+pub type SkippedSlotsIndex = HashMap<String, Vec<u64>>;
+```
+
+**Location**: `data/{chain}/historical/raw/events/skipped_slots.json` (and similarly for `raw/slots/`, `raw/instructions/`)
+
+**File format**:
+```json
+{
+  "250000000-250000999": [250000003, 250000007, 250000042],
+  "250001000-250001999": [250001100, 250001101, 250001500]
+}
+```
+
+**Invariant**: A range is complete if and only if its parquet file exists AND the range key exists in the skipped slots index. If the parquet file exists but the range key is missing from the index, the range may be incomplete (interrupted before the index was written).
+
+**Write ordering**: The index is updated atomically (temp + rename) **after** the parquet file for a range is successfully written. This ensures crash safety — if the process dies between parquet write and index update, resume logic will re-collect the range.
+
+**File naming**: Range boundaries are always aligned to `parquet_block_range` multiples regardless of whether boundary slots are skipped. If slot 250000000 is skipped, the file is still named `events_250000000-250000999.parquet` and 250000000 appears in the skipped slots index.
+
+**Resume logic update**: When computing ranges to fetch, a range is skipped only if:
+1. The parquet file exists locally (or in S3 manifest), AND
+2. The range key exists in `skipped_slots.json`
+
+### 8.6 Failed Transaction Policy
+
+**Decision**: Skip failed transactions entirely.
+
+Failed Solana transactions are included in blocks (they consume fees and compute units) but their state changes are reverted. Their log messages ARE emitted up to the point of failure, which could produce partial/misleading events.
+
+The extractor checks `meta.err` for each transaction:
+```rust
+if let Some(meta) = &tx.meta {
+    if meta.err.is_some() {
+        continue; // skip this transaction
+    }
+}
+```
+
+This applies to both event extraction (from `logMessages`) and instruction extraction (from the instruction tree). Failed transactions are not written to parquet and not sent downstream.
+
+**Rationale**: Failed transaction data is a significant volume increase for minimal value. Handlers that need failed transaction awareness can be added later as a separate opt-in pipeline.
+
+### 8.7 CPI Coverage
+
+Solana programs are frequently invoked via Cross-Program Invocation (CPI) — program Y's instruction calls program X internally. CPI events must be captured for correct indexing.
+
+**Key architectural fact**: All accounts referenced during transaction execution — including program IDs invoked via CPI — must be declared in the transaction's `accountKeys` array before submission. This means:
+
+- **`getSignaturesForAddress(program_id)`** returns transactions where the program was called via CPI, because the program's pubkey is in `accountKeys`. Signature-driven backfill (§8.4) naturally captures CPI transactions.
+- **`getBlock` `logMessages`** include CPI invocations with depth indicators: `"Program X invoke [2]"` indicates X was called at CPI depth 2. The `ProgramLogParser` (§8.2) correctly attributes events to the invoking program via its stack-based tracking.
+- **`logsSubscribe` with `mentions` filter** catches CPI transactions in live mode for the same reason — the filter matches against `accountKeys`.
+- **`meta.innerInstructions`** contains the structured instruction tree for all CPI calls, used by the instruction extractor (§8.2b).
+
+**Log truncation risk**: Solana has a ~10KB per-transaction log truncation limit as a DoS prevention measure. If a transaction generates extensive logs before the target program's CPI invocation, the relevant log lines may be truncated. The `logsSubscribe` notification will still fire (because it matches `accountKeys`), but `logMessages` may be incomplete. For robust extraction, do not rely solely on `logMessages` — use `meta.innerInstructions` as the authoritative source for instruction data, and treat log-based events as best-effort when log truncation is detected (truncated logs end abruptly without a matching "success"/"failed" for all stack entries).
+
+**Address Lookup Table (ALT) caveat**: There is a known Solana issue where `getSignaturesForAddress` may miss transactions when the address is referenced through an Address Lookup Table rather than as a static account key. This is uncommon for program IDs (which are almost always static keys) but worth noting.
 
 ---
 
@@ -1391,6 +1685,15 @@ pub enum DecoderMessage {
         live_mode: bool,
     },
 
+    /// Solana instructions ready for Borsh decoding (historical + live)
+    #[cfg(feature = "solana")]
+    SolanaInstructionsReady {
+        range_start: u64,
+        range_end: u64,
+        instructions: Vec<SolanaInstructionRecord>,
+        live_mode: bool,
+    },
+
     /// Solana account data ready for Borsh decoding (live mode only)
     #[cfg(feature = "solana")]
     SolanaAccountsReady {
@@ -1401,7 +1704,7 @@ pub enum DecoderMessage {
 }
 ```
 
-Note: `SolanaAccountsReady` has no `range_start`/`range_end` or `live_mode` flag — it is always live-only, always for a single slot.
+Note: `SolanaAccountsReady` has no `range_start`/`range_end` or `live_mode` flag — it is always live-only, always for a single slot. `SolanaInstructionsReady` mirrors `SolanaEventsReady` — both flow through the same two-phase (catchup + live) pipeline.
 
 ---
 
@@ -1535,6 +1838,33 @@ pub async fn bootstrap_accounts(
 
 **Reason:** Without address discovery, account reads would require manually listing every account address in config — impractical for protocols with thousands of pools. Event-driven discovery mirrors how EVM factory collection works and scales naturally.
 
+**Discovery timing relative to backfill** (mirrors EVM factory collection):
+
+The discovery module follows the same two-phase pattern as EVM factory address collection:
+
+1. **Bootstrap phase** (before backfill): Run `getProgramAccounts` bootstrap to discover all pre-existing accounts. This runs once at startup and completes before the catchup phase begins. Results are persisted to `data/{chain}/discovery/known_accounts.json` so restarts don't require re-scanning.
+
+2. **Catchup phase** (during backfill): As events are decoded during historical backfill, discovery events (e.g., `PoolInitialized`) are sent to the `DiscoveryManager` via `discovery_tx`. The manager accumulates discovered addresses. Unlike EVM factory collection, there is no feedback loop during historical backfill — discovered addresses don't affect event/instruction collection (we already capture all events from the program). Discovery during backfill is purely about building the address set for live mode account reads.
+
+3. **Live phase** (after backfill): Discovery transitions to incremental mode. New events trigger address registration AND immediate account read scheduling. The `discovery_addresses_tx` channel feeds newly discovered addresses to the `AccountReader`. Buffered triggers are replayed when new addresses arrive (same pattern as EVM factory eth_call replay — see §10.5 channel topology).
+
+**Discovery state persistence**: Discovered addresses are written to `data/{chain}/discovery/known_accounts.json`:
+
+```json
+{
+  "orca_whirlpool": {
+    "Whirlpool": [
+      "HJPjoWMnRgKd...base58...",
+      "7qbRF6YsyGuL...base58..."
+    ]
+  }
+}
+```
+
+Updated atomically (temp + rename) after each batch of new discoveries. On restart, this file is loaded to restore the known address set without re-running bootstrap or re-processing historical events.
+
+**Catchup barrier**: `discovery_catchup_done_tx` fires after both bootstrap and historical discovery complete. The `AccountReader` waits on `discovery_catchup_done_rx` before starting live account reads, ensuring the full address set is available.
+
 ### 10.3 Storage Path Layout
 
 ```
@@ -1562,6 +1892,157 @@ Note: `raw/accounts/` and `decoded/accounts/` exist only under `live/`. There is
 **Skipped slots in live mode**: When `slotSubscribe` notifies of a new slot, the collector calls `getBlock(slot)`. If the slot was skipped, the collector marks it complete in the status file and moves on. No gap backfill needed for skipped slots — they simply don't have data.
 
 **Gap detection on reconnect**: On WebSocket reconnection, compare `last_processed_slot` with `get_slot()` to find missed range. Backfill by iterating the missed slots.
+
+### 10.5 Solana Channel Topology
+
+The Solana pipeline uses a channel topology that mirrors the EVM pipeline's separation of concerns: collection → decoding → transformation, with channels connecting each stage. Events and instructions use separate decoder channels to allow parallel decoding (Borsh deserialization is CPU-intensive).
+
+**Channel diagram (historical mode)**:
+
+```
+                                   ┌─── event_decoder_tx ──► EventDecoder ─── transform_events_tx ──►┐
+SlotCollector ── slot_tx ──► Extractor                                                                 │
+                                   ├─── instr_decoder_tx ──► InstrDecoder ─── transform_events_tx ──►├─► TransformationEngine
+                                   │                                                                   │
+                                   └─── discovery_tx ──► DiscoveryManager                              │
+                                                              │                                        │
+                                                   discovery_addresses_tx                    transform_complete_tx
+                                                              │                                        │
+                                                              ▼ (live mode only)                       │
+                                                         AccountReader ──► AccountDecoder ──────────────┘
+                                                                              │
+                                                                    transform_account_states_tx
+```
+
+**Channel diagram (live mode)**:
+
+```
+slotSubscribe ──► SolanaLiveCollector ──► [same decoder channels as above]
+                         │
+                         └──► SolanaReorgDetector ── transform_reorg_tx ──► TransformationEngine
+```
+
+**Channel definitions**:
+
+```rust
+// === Collection channels (historical only) ===
+
+// SlotCollector → Extractor: full block data for extraction
+let (slot_tx, slot_rx) = mpsc::channel::<SlotData>(channel_capacity);
+
+pub struct SlotData {
+    pub slot: u64,
+    pub block: UiConfirmedBlock,
+}
+
+// === Decoder channels (CommonChannels, shared by historical + live) ===
+
+// Extractor → EventDecoder: raw events for Borsh decoding
+let (event_decoder_tx, event_decoder_rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
+// Carries: DecoderMessage::SolanaEventsReady { range_start, range_end, events, live_mode }
+
+// Extractor → InstructionDecoder: raw instructions for Borsh decoding
+let (instr_decoder_tx, instr_decoder_rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
+// Carries: DecoderMessage::SolanaInstructionsReady { range_start, range_end, instructions, live_mode }
+
+// === Discovery channels ===
+
+// Extractor → DiscoveryManager: decoded events for address discovery
+let (discovery_tx, discovery_rx) = mpsc::channel::<DiscoveryMessage>(channel_capacity);
+// Carries: DiscoveryMessage::DecodedEvents, DiscoveryMessage::RangeComplete, DiscoveryMessage::AllComplete
+
+// DiscoveryManager → AccountReader (live mode only): newly discovered addresses
+let (discovery_addresses_tx, discovery_addresses_rx) = mpsc::channel::<DiscoveryAddresses>(discovery_channel_capacity);
+
+// === Transformation channels (CommonChannels, reused from EVM) ===
+
+// Decoders → TransformationEngine: decoded events (both event and instruction decoders produce DecodedEvent)
+let (transform_events_tx, transform_events_rx) = mpsc::channel::<DecodedEventsMessage>(channel_capacity);
+
+// AccountDecoder → TransformationEngine: decoded account state (live only)
+let (transform_account_states_tx, transform_account_states_rx) = mpsc::channel::<DecodedAccountStatesMessage>(channel_capacity);
+
+// Decoders → TransformationEngine: range completion signals
+let (transform_complete_tx, transform_complete_rx) = mpsc::channel::<RangeCompleteMessage>(channel_capacity);
+
+// ReorgDetector → TransformationEngine: reorg notifications
+let (transform_reorg_tx, transform_reorg_rx) = mpsc::channel::<ReorgMessage>(channel_capacity);
+
+// CompactionService → TransformationEngine: retry requests
+let (transform_retry_tx, transform_retry_rx) = mpsc::channel::<TransformRetryRequest>(100);
+
+// === Synchronization barriers (oneshot) ===
+
+// Extraction catchup complete → live mode can start
+let (extraction_catchup_done_tx, extraction_catchup_done_rx) = oneshot::channel::<()>();
+
+// Discovery catchup complete → account reader can start (live mode)
+let (discovery_catchup_done_tx, discovery_catchup_done_rx) = oneshot::channel::<()>();
+
+// Decoder catchup complete → transformation engine sync
+let (decoder_catchup_done_tx, decoder_catchup_done_rx) = oneshot::channel::<()>();
+```
+
+**Discovery message types**:
+
+```rust
+pub enum DiscoveryMessage {
+    /// Decoded events from a range — scan for address discovery triggers
+    DecodedEvents {
+        range_start: u64,
+        range_end: u64,
+        events: Vec<DecodedEvent>,
+    },
+    /// Range extraction complete
+    RangeComplete { range_start: u64, range_end: u64 },
+    /// All ranges complete (shutdown signal)
+    AllComplete,
+}
+
+pub struct DiscoveryAddresses {
+    pub program_name: String,
+    pub account_type: String,
+    pub addresses: Vec<Pubkey>,
+}
+```
+
+**Sender cloning strategy** (mirrors EVM pattern):
+
+```rust
+// Clone decoder senders for live mode BEFORE moving originals into catchup tasks
+let event_decoder_tx_for_live = event_decoder_tx.clone();
+let instr_decoder_tx_for_live = instr_decoder_tx.clone();
+let transform_events_tx_for_event_decoder = transform_events_tx.clone();
+let transform_events_tx_for_instr_decoder = transform_events_tx.clone();
+let transform_complete_tx_for_event_decoder = transform_complete_tx.clone();
+let transform_complete_tx_for_instr_decoder = transform_complete_tx.clone();
+```
+
+Both event and instruction decoders send to the same `transform_events_tx` channel — they both produce `DecodedEventsMessage`. The TransformationEngine doesn't need to know whether a `DecodedEvent` came from a log event or an instruction; it dispatches on `(source_name, event_signature)` as usual.
+
+**Completion signal flow**:
+
+```
+Extractor finishes range → sends SolanaEventsReady + SolanaInstructionsReady to decoder channels
+    ↓
+EventDecoder finishes decoding → sends DecodedEventsMessage to transform_events_tx
+                                + sends RangeCompleteMessage(kind=Events)
+    ↓
+InstrDecoder finishes decoding → sends DecodedEventsMessage to transform_events_tx
+                                + sends RangeCompleteMessage(kind=Instructions)
+    ↓
+TransformationEngine waits for BOTH Events AND Instructions RangeComplete for same range
+    ↓
+When both complete → Engine processes handlers for that range
+```
+
+This mirrors how the EVM engine waits for both Logs and EthCalls RangeComplete before processing a range.
+
+**Two-phase transition** (catchup → live):
+
+1. **Catchup phase**: SlotCollector iterates historical slot ranges, sends blocks to Extractor. Extractor writes parquet + sends to decoder channels. Decoders write decoded parquet + send to TransformationEngine.
+2. **Barrier**: When catchup completes, `extraction_catchup_done_tx` fires. Discovery manager completes bootstrap, `discovery_catchup_done_tx` fires.
+3. **Live phase**: SolanaLiveCollector takes over, using cloned decoder senders. Same channels, same TransformationEngine. ReorgDetector starts checking parent-slot chains.
 
 ---
 
@@ -2118,15 +2599,29 @@ The following questions remain unresolved and will be decided during implementat
 
 The `ProgramDecoder` trait (§14.2) supports Shank via `idl_format: "shank"`, but the actual Shank IDL parsing logic is unspecified. Shank IDLs have a different JSON structure than Anchor. This can be implemented when a Shank program is first targeted — the trait abstraction ensures it plugs in cleanly.
 
-### 15.2 Instruction decoding trigger semantics
+### 15.2 Instruction decoding trigger semantics — RESOLVED
 
-When both an event AND an instruction fire for the same state change (common in Anchor programs), should handlers receive both? Options:
-- **a)** Deduplicate: prefer event, fall back to instruction if no event emitted
-- **b)** Deliver both: handlers subscribe to event OR instruction triggers independently
-- **c)** Merge: combine event params + instruction accounts into a single enriched event
+**Decision: (b) — deliver both independently.** Handlers explicitly choose their data source by subscribing to either event triggers or instruction triggers. Both produce `DecodedEvent` with the same shape, so the transformation engine doesn't need to distinguish them.
 
-Leaning toward (b) — handlers explicitly choose their data source. But this needs validation against real protocols.
+When both an event AND an instruction fire for the same state change (common in Anchor programs), both are delivered if handlers subscribe to both. Handlers that only need event data subscribe to events; handlers that need instruction account lists subscribe to instructions. No deduplication or merging is performed.
+
+This is the simplest approach and gives handler authors full control. If a handler subscribes to both an event trigger and an instruction trigger for the same state change, it receives two calls — one with event params, one with instruction args + named accounts. The handler is responsible for choosing which to process.
 
 ### 15.3 `LiveTransaction` scope
 
 The `LiveTransaction` type (§14.5) stores all `log_messages` and `account_keys` for a transaction. For blocks with hundreds of transactions where only a few are relevant, this is wasteful. Should we filter transactions by program_id before storage, or store everything and filter at decode time? Filtering saves storage but requires knowing program IDs at collection time (before decoding).
+
+### 15.4 Log truncation recovery
+
+Solana has a ~10KB per-transaction log output limit. When truncation occurs, `logMessages` ends abruptly without matching "success"/"failed" markers for all stack entries. The `ProgramLogParser` can detect this (stack not empty after processing all lines), but what should it do?
+
+Options:
+- **a)** Emit events parsed so far and log a warning — accepts partial data
+- **b)** Fall back to instruction data only (skip log-based events for that tx) — avoids partial data but loses events
+- **c)** Emit events parsed so far, mark them with a `truncated: bool` flag — lets handlers decide
+
+Leaning toward (a) — partial data is better than no data, and truncation is rare for typical DeFi transactions.
+
+### 15.5 Address Lookup Table (ALT) handling
+
+Versioned transactions (v0) can reference accounts through Address Lookup Tables. The instruction extractor (§8.2b) resolves `accountKeys` from the message, but ALT-referenced accounts require additional resolution via `meta.loadedAddresses.writable` and `meta.loadedAddresses.readonly`. The current design assumes `accountKeys` contains all accounts. This needs to be verified against real v0 transactions and updated if ALT accounts are not automatically included in the `accountKeys` array returned by the RPC.
