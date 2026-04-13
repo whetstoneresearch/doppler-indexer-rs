@@ -165,34 +165,7 @@ pub async fn collect_factories(
                     }
                 };
 
-                if let Some(ref tx) = logs_factory_tx {
-                    if tx.send(factory_data.clone()).await.is_err() {
-                        tracing::error!(
-                            "Failed to send factory data for range {}-{} to logs_factory_tx - receiver dropped",
-                            factory_data.range_start,
-                            factory_data.range_end
-                        );
-                        return Err(FactoryCollectionError::ChannelSend(format!(
-                            "logs_factory_tx ({}-{}) - receiver dropped",
-                            factory_data.range_start, factory_data.range_end
-                        )));
-                    }
-                }
-
-                if let Some(ref tx) = eth_calls_factory_tx {
-                    // Send incremental addresses then range complete
-                    let _ = tx
-                        .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
-                        .await;
-                    let _ = tx
-                        .send(FactoryMessage::RangeComplete {
-                            range_start: factory_data.range_start,
-                            range_end: factory_data.range_end,
-                        })
-                        .await;
-                }
-
-                // Send to decoders
+                // Compute addresses map once for decoder messages
                 let addresses: HashMap<String, Vec<Address>> = factory_data
                     .addresses_by_block
                     .values()
@@ -202,25 +175,61 @@ pub async fn collect_factories(
                         acc
                     });
 
-                if let Some(ref tx) = log_decoder_tx {
-                    let _ = tx
-                        .send(DecoderMessage::FactoryAddresses {
-                            range_start,
-                            range_end,
-                            addresses: addresses.clone(),
+                // Send to all downstream channels in parallel
+                let logs_factory_future = async {
+                    if let Some(ref tx) = logs_factory_tx {
+                        tx.send(factory_data.clone()).await.map_err(|_| {
+                            FactoryCollectionError::ChannelSend(format!(
+                                "logs_factory_tx ({}-{}) - receiver dropped",
+                                factory_data.range_start, factory_data.range_end
+                            ))
                         })
-                        .await;
-                }
+                    } else {
+                        Ok(())
+                    }
+                };
 
-                if let Some(ref tx) = call_decoder_tx {
-                    let _ = tx
-                        .send(DecoderMessage::FactoryAddresses {
-                            range_start: factory_data.range_start,
-                            range_end: factory_data.range_end,
-                            addresses,
-                        })
-                        .await;
-                }
+                let eth_calls_future = async {
+                    if let Some(ref tx) = eth_calls_factory_tx {
+                        let _ = tx
+                            .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
+                            .await;
+                        let _ = tx
+                            .send(FactoryMessage::RangeComplete {
+                                range_start: factory_data.range_start,
+                                range_end: factory_data.range_end,
+                            })
+                            .await;
+                    }
+                };
+
+                let decoder_future = async {
+                    if let Some(ref tx) = log_decoder_tx {
+                        let _ = tx
+                            .send(DecoderMessage::FactoryAddresses {
+                                range_start,
+                                range_end,
+                                addresses: addresses.clone(),
+                            })
+                            .await;
+                    }
+                    if let Some(ref tx) = call_decoder_tx {
+                        let _ = tx
+                            .send(DecoderMessage::FactoryAddresses {
+                                range_start: factory_data.range_start,
+                                range_end: factory_data.range_end,
+                                addresses,
+                            })
+                            .await;
+                    }
+                };
+
+                let (logs_result, _, _) = tokio::join!(
+                    logs_factory_future,
+                    eth_calls_future,
+                    decoder_future,
+                );
+                logs_result?;
 
                 // Update contract index for each collection
                 let rk = range_key(range_start, range_end - 1);
