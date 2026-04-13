@@ -469,19 +469,27 @@ async fn query_frontier_pools(
     let frontier_bytes: Vec<Vec<u8>> = frontier.iter().map(|t| t.to_vec()).collect();
     let max_block_i64: Option<i64> = max_block.map(|b| b as i64);
 
+    // First pick the latest snapshot per pool (before max_block), then
+    // filter by liquidity. This avoids selecting a pool based on an older
+    // liquid snapshot when its latest snapshot is illiquid.
     let rows = client
         .query(
-            "SELECT DISTINCT ON (p.address) \
-                 p.address, p.base_token, p.quote_token, \
-                 COALESCE(ps.active_liquidity_usd, 0) as liq \
-             FROM pools p \
-             JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
-             WHERE p.chain_id = $1 \
-               AND (p.base_token = ANY($2) OR p.quote_token = ANY($2)) \
-               AND (COALESCE(ps.active_liquidity_usd, 0) >= $3 \
-                    OR (ps.active_liquidity_usd IS NULL AND ps.active_liquidity > 0)) \
-               AND ($4::bigint IS NULL OR ps.block_number < $4) \
-             ORDER BY p.address, ps.block_number DESC",
+            "WITH latest_snapshots AS ( \
+                 SELECT DISTINCT ON (p.address) \
+                     p.address, p.base_token, p.quote_token, \
+                     ps.active_liquidity_usd, ps.active_liquidity \
+                 FROM pools p \
+                 JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
+                 WHERE p.chain_id = $1 \
+                   AND (p.base_token = ANY($2) OR p.quote_token = ANY($2)) \
+                   AND ($4::bigint IS NULL OR ps.block_number < $4) \
+                 ORDER BY p.address, ps.block_number DESC \
+             ) \
+             SELECT address, base_token, quote_token, \
+                    COALESCE(active_liquidity_usd, 0) as liq \
+             FROM latest_snapshots \
+             WHERE COALESCE(active_liquidity_usd, 0) >= $3 \
+                OR (active_liquidity_usd IS NULL AND active_liquidity > 0)",
             &[
                 &(chain_id as i64),
                 &frontier_bytes,
