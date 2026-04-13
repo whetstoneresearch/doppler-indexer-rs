@@ -50,10 +50,12 @@ impl SolanaInstructionDecoder {
         match decoder.decode_instruction(&record.data, &record.accounts) {
             Ok(Some(fields)) => {
                 // Merge args and named_accounts into one params map.
+                // Account names are prefixed with "accounts." to avoid
+                // collisions with instruction arguments of the same name.
                 let mut params = fields.args;
                 for (name, pubkey) in fields.named_accounts {
                     params.insert(
-                        name,
+                        format!("accounts.{}", name),
                         DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)),
                     );
                 }
@@ -182,15 +184,15 @@ mod tests {
             event.params.get("amount"),
             Some(&DecodedValue::Uint64(100))
         );
-        // Named accounts are merged in as ChainAddress
+        // Named accounts are merged in as ChainAddress with "accounts." prefix
         assert_eq!(
-            event.params.get("source"),
+            event.params.get("accounts.source"),
             Some(&DecodedValue::ChainAddress(ChainAddress::Solana(
                 [10u8; 32]
             )))
         );
         assert_eq!(
-            event.params.get("destination"),
+            event.params.get("accounts.destination"),
             Some(&DecodedValue::ChainAddress(ChainAddress::Solana(
                 [20u8; 32]
             )))
@@ -218,7 +220,7 @@ mod tests {
         let results = router.decode_instruction_batch(&[record], "test");
 
         assert_eq!(results.len(), 1);
-        let val = results[0].params.get("authority").unwrap();
+        let val = results[0].params.get("accounts.authority").unwrap();
         match val {
             DecodedValue::ChainAddress(ChainAddress::Solana(bytes)) => {
                 assert_eq!(*bytes, pubkey);

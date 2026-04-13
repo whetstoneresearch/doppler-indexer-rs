@@ -317,14 +317,19 @@ pub fn group_slots_into_ranges(slots: &BTreeSet<u64>, range_size: u64) -> Vec<Bl
 // Resume logic
 // ---------------------------------------------------------------------------
 
-/// Scan existing parquet files to find the highest slot already processed.
+/// Scan existing parquet files to find the highest fully-completed slot range.
 ///
-/// Looks at all three output directories (slots, events, instructions) and
-/// returns the maximum end-inclusive value from any file's range.
+/// A range is only counted if it has a corresponding entry in the
+/// `skipped_slots.json` index — parquet file existence alone is not
+/// sufficient because a crash between parquet writes and index update
+/// leaves an incomplete range that must be re-processed.
 pub fn find_resume_slot(chain_name: &str) -> Option<u64> {
+    let events_dir = raw_solana_events_dir(chain_name);
+    let skipped_index = crate::storage::skipped_slots::read_skipped_slots_index(&events_dir);
+
     let dirs = [
         raw_solana_slots_dir(chain_name),
-        raw_solana_events_dir(chain_name),
+        events_dir,
         raw_solana_instructions_dir(chain_name),
     ];
 
@@ -332,8 +337,12 @@ pub fn find_resume_slot(chain_name: &str) -> Option<u64> {
 
     for dir in &dirs {
         if let Ok(ranges) = crate::storage::paths::scan_parquet_ranges(dir) {
-            for (_start, end_inclusive, _path) in ranges {
-                max_slot = Some(max_slot.map_or(end_inclusive, |m: u64| m.max(end_inclusive)));
+            for (start, end_inclusive, _path) in ranges {
+                let rk = crate::storage::skipped_slots::range_key(start, end_inclusive);
+                if crate::storage::skipped_slots::is_range_complete(&skipped_index, &rk) {
+                    max_slot =
+                        Some(max_slot.map_or(end_inclusive, |m: u64| m.max(end_inclusive)));
+                }
             }
         }
     }
