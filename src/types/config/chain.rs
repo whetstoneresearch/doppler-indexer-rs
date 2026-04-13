@@ -157,6 +157,18 @@ pub fn resolve_chain_config(
     };
 
     #[cfg(feature = "solana")]
+    let solana_programs = {
+        let mut programs = solana_programs;
+        for (_name, config) in programs.iter_mut() {
+            if let Some(ref idl_path) = config.idl_path {
+                let resolved = base_dir.join(idl_path);
+                config.idl_path = Some(resolved.to_string_lossy().into_owned());
+            }
+        }
+        programs
+    };
+
+    #[cfg(feature = "solana")]
     let commitment = raw_config.commitment.unwrap_or_default();
 
     Ok(ChainConfig {

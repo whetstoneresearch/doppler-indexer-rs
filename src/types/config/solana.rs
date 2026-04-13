@@ -32,6 +32,14 @@ pub struct SolanaProgramConfig {
     #[serde(default)]
     pub idl_path: Option<String>,
 
+    /// IDL format. Currently only "anchor" (default). Future: "shank".
+    #[serde(default)]
+    pub idl_format: Option<String>,
+
+    /// Built-in decoder name (e.g., "spl_token"). Takes precedence over idl_path.
+    #[serde(default)]
+    pub decoder: Option<String>,
+
     /// Events to decode and dispatch to handlers.
     #[serde(default)]
     pub events: Option<Vec<SolanaEventConfig>>,
@@ -221,6 +229,30 @@ mod tests {
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].source, "whirlpool");
         assert_eq!(triggers[0].event, "Traded");
+    }
+
+    #[test]
+    fn solana_program_config_with_decoder_fields() {
+        let json = r#"{
+            "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "decoder": "spl_token"
+        }"#;
+        let cfg: SolanaProgramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.decoder.as_deref(), Some("spl_token"));
+        assert!(cfg.idl_path.is_none());
+        assert!(cfg.idl_format.is_none());
+    }
+
+    #[test]
+    fn solana_program_config_with_idl_format() {
+        let json = r#"{
+            "program_id": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+            "idl_path": "idls/whirlpool.json",
+            "idl_format": "anchor"
+        }"#;
+        let cfg: SolanaProgramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.idl_format.as_deref(), Some("anchor"));
+        assert_eq!(cfg.idl_path.as_deref(), Some("idls/whirlpool.json"));
     }
 
     #[test]
