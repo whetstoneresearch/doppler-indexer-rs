@@ -108,7 +108,9 @@ fn register_handlers_inner(
     ]));
     v4::metrics::register_handlers(registry, chain_id, v4_base_cache, Arc::clone(&oracle_cache));
 
-    let zora_cache = Arc::new(PoolMetadataCache::new());
+    let zora_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
+        zora::create::ZORA_CREATE_HANDLER_SCOPE,
+    ]));
     zora::metrics::register_handlers(registry, chain_id, zora_cache, Arc::clone(&oracle_cache));
 
     // Register migration pool handlers as a group only on chains with a V4
