@@ -302,6 +302,7 @@ pub async fn collect_receipts(
 
     // Batch states for per-block receipt fetching
     let mut batch_states: HashMap<u64, ReceiptBatchState> = HashMap::new();
+    let max_concurrent_ranges = raw_data_config.max_receipt_ranges.unwrap_or(5);
 
     // Build output channels and metrics structs
     let channels = ReceiptOutputChannels {
@@ -370,12 +371,14 @@ pub async fn collect_receipts(
             // Fallback mode: backpressure via pending tx/block buffer caps.
             // Both caps scale with fetch concurrency so sparse chains can queue
             // enough work to keep multiple micro-batches in flight.
-            block_result = block_rx.recv(), if !block_rx_closed && if is_block_receipt_mode {
-                receipt_join_set.len() < receipt_fetch_concurrency
-            } else {
-                pending_tx_count < rpc_batch_size * receipt_fetch_concurrency * 2
-                    && pending_fallback_blocks.len() < rpc_batch_size * receipt_fetch_concurrency * 2
-            } => {
+            block_result = block_rx.recv(), if !block_rx_closed
+                && batch_states.len() < max_concurrent_ranges
+                && if is_block_receipt_mode {
+                    receipt_join_set.len() < receipt_fetch_concurrency
+                } else {
+                    pending_tx_count < rpc_batch_size * receipt_fetch_concurrency * 2
+                        && pending_fallback_blocks.len() < rpc_batch_size * receipt_fetch_concurrency * 2
+                } => {
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
                         let range_start = (block_number / range_size) * range_size;
