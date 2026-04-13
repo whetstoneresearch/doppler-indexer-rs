@@ -440,6 +440,8 @@ mod tests {
             SolanaProgramConfig {
                 program_id: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".to_string(),
                 idl_path: None,
+                idl_format: None,
+                decoder: None,
                 events: None,
                 accounts: None,
                 discovery: Some(vec![SolanaDiscoveryConfig {
@@ -461,6 +463,8 @@ mod tests {
             SolanaProgramConfig {
                 program_id: "11111111111111111111111111111111".to_string(),
                 idl_path: None,
+                idl_format: None,
+                decoder: None,
                 events: Some(vec![]),
                 accounts: None,
                 discovery: None,
@@ -779,6 +783,8 @@ mod tests {
             SolanaProgramConfig {
                 program_id: "22222222222222222222222222222222".to_string(),
                 idl_path: None,
+                idl_format: None,
+                decoder: None,
                 events: None,
                 accounts: None,
                 discovery: Some(vec![SolanaDiscoveryConfig {
@@ -866,6 +872,8 @@ mod tests {
             SolanaProgramConfig {
                 program_id: "11111111111111111111111111111111".to_string(),
                 idl_path: None,
+                idl_format: None,
+                decoder: None,
                 events: None,
                 accounts: None,
                 discovery: Some(vec![SolanaDiscoveryConfig {
