@@ -592,7 +592,7 @@ pub(crate) async fn process_event_triggers(
     range_start: u64,
     range_end: u64,
     contracts: &Contracts,
-    skip_contract_index: bool,
+    contract_index_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
 ) -> Result<(Vec<SkippedFactoryTrigger>, PendingWrites), EthCallCollectionError> {
     let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
     let empty_writes = PendingWrites::new();
@@ -616,7 +616,12 @@ pub(crate) async fn process_event_triggers(
                 range_end,
             )
             .await?;
-            if !skip_contract_index {
+            {
+                let _guard = if let Some(ref m) = contract_index_mutex {
+                    Some(m.lock().await)
+                } else {
+                    None
+                };
                 let sub_dir = ctx
                     .output_dir
                     .join(contract_name)
@@ -867,7 +872,7 @@ pub(crate) async fn process_event_triggers(
             let storage_manager = ctx.storage_manager.cloned();
             let chain_name = ctx.chain_name.to_string();
             let decoder_tx = ctx.decoder_tx.clone();
-            let skip_ci = skip_contract_index;
+            let ci_mutex = contract_index_mutex.clone();
             let contracts = contracts.clone();
 
             write_set.spawn(async move {
@@ -900,7 +905,12 @@ pub(crate) async fn process_event_triggers(
                         })?;
                 }
 
-                if !skip_ci {
+                {
+                    let _guard = if let Some(ref m) = ci_mutex {
+                        Some(m.lock().await)
+                    } else {
+                        None
+                    };
                     let expected_for_range =
                         build_expected_factory_contracts_for_range(&contracts, range_end + 1);
                     if let Some(expected) = expected_for_range.get(&contract_name) {
@@ -948,7 +958,7 @@ pub(crate) async fn process_event_triggers(
         for (contract_name, function_name) in configured_pairs {
             if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
                 let output_dir = ctx.output_dir.to_path_buf();
-                let skip_ci = skip_contract_index;
+                let ci_mutex = contract_index_mutex.clone();
                 let contracts = contracts.clone();
                 write_set.spawn(async move {
                     write_empty_event_call_file(
@@ -959,7 +969,12 @@ pub(crate) async fn process_event_triggers(
                         range_end,
                     )
                     .await?;
-                    if !skip_ci {
+                    {
+                        let _guard = if let Some(ref m) = ci_mutex {
+                            Some(m.lock().await)
+                        } else {
+                            None
+                        };
                         let sub_dir = output_dir
                             .join(&contract_name)
                             .join(&function_name)
@@ -1027,7 +1042,7 @@ pub(crate) async fn process_event_triggers_multicall(
     range_start: u64,
     range_end: u64,
     contracts: &Contracts,
-    skip_contract_index: bool,
+    contract_index_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
 ) -> Result<(Vec<SkippedFactoryTrigger>, PendingWrites), EthCallCollectionError> {
     let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
     let empty_writes = PendingWrites::new();
@@ -1051,7 +1066,12 @@ pub(crate) async fn process_event_triggers_multicall(
                 range_end,
             )
             .await?;
-            if !skip_contract_index {
+            {
+                let _guard = if let Some(ref m) = contract_index_mutex {
+                    Some(m.lock().await)
+                } else {
+                    None
+                };
                 let sub_dir = ctx
                     .output_dir
                     .join(contract_name)
@@ -1373,7 +1393,7 @@ pub(crate) async fn process_event_triggers_multicall(
         let storage_manager = ctx.storage_manager.cloned();
         let chain_name = ctx.chain_name.to_string();
         let decoder_tx = ctx.decoder_tx.clone();
-        let skip_ci = skip_contract_index;
+        let ci_mutex = contract_index_mutex.clone();
         let contracts = contracts.clone();
 
         write_set.spawn(async move {
@@ -1407,7 +1427,12 @@ pub(crate) async fn process_event_triggers_multicall(
                 .map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))?;
             }
 
-            if !skip_ci {
+            {
+                let _guard = if let Some(ref m) = ci_mutex {
+                    Some(m.lock().await)
+                } else {
+                    None
+                };
                 let expected_for_range =
                     build_expected_factory_contracts_for_range(&contracts, range_end + 1);
                 if let Some(expected) = expected_for_range.get(&contract_name) {
@@ -1459,7 +1484,7 @@ pub(crate) async fn process_event_triggers_multicall(
     for (contract_name, function_name) in configured_pairs {
         if !written_pairs.contains(&(contract_name.clone(), function_name.clone())) {
             let output_dir = ctx.output_dir.to_path_buf();
-            let skip_ci = skip_contract_index;
+            let ci_mutex = contract_index_mutex.clone();
             let contracts = contracts.clone();
             write_set.spawn(async move {
                 write_empty_event_call_file(
@@ -1470,7 +1495,12 @@ pub(crate) async fn process_event_triggers_multicall(
                     range_end,
                 )
                 .await?;
-                if !skip_ci {
+                {
+                    let _guard = if let Some(ref m) = ci_mutex {
+                        Some(m.lock().await)
+                    } else {
+                        None
+                    };
                     let sub_dir = output_dir
                         .join(&contract_name)
                         .join(&function_name)

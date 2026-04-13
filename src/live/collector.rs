@@ -1208,6 +1208,14 @@ impl LiveCollector {
             self.storage.write_eth_calls(block_number, &batch.calls)?;
         }
 
+        // Write per-block contract index for factory completeness tracking
+        if let Some(ref collector) = self.eth_call_collector {
+            let expected = collector.expected_factory_contracts();
+            if !expected.is_empty() {
+                self.storage.write_contract_index(block_number, expected)?;
+            }
+        }
+
         let no_decoder = eth_call_decoder_tx.is_none();
         let expectations = &self.expectations;
         self.storage.update_status_atomic(block_number, |status| {
