@@ -465,6 +465,72 @@ impl CompactionService {
             );
         }
 
+        // Merge per-block contract indexes into historical format
+        {
+            use crate::storage::contract_index::{
+                range_key, read_contract_index as read_historical_ci,
+                update_contract_index as update_ci, write_contract_index as write_ci,
+                ExpectedContracts,
+            };
+
+            let mut merged: HashMap<String, ExpectedContracts> = HashMap::new();
+            for block_number in range.start..=range.end {
+                if let Ok(block_ci) = self.storage.read_contract_index(block_number) {
+                    for (collection_name, contracts) in block_ci {
+                        let entry = merged.entry(collection_name).or_default();
+                        for (contract_name, addresses) in contracts {
+                            let addr_entry = entry.entry(contract_name).or_default();
+                            for addr in addresses {
+                                if !addr_entry.contains(&addr) {
+                                    addr_entry.push(addr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for contracts in merged.values_mut() {
+                for addresses in contracts.values_mut() {
+                    addresses.sort();
+                }
+            }
+
+            if !merged.is_empty() {
+                let rk = range_key(range.start, range.end);
+                let base_dir = PathBuf::from(format!(
+                    "data/{}/historical/raw/eth_calls",
+                    self.chain_name
+                ));
+
+                for (collection_name, expected) in &merged {
+                    let collection_dir = base_dir.join(collection_name);
+                    if !collection_dir.exists() {
+                        continue;
+                    }
+
+                    if let Ok(entries) = std::fs::read_dir(&collection_dir) {
+                        for entry in entries.flatten() {
+                            if entry.path().is_dir() {
+                                let on_events_dir = entry.path().join("on_events");
+                                if on_events_dir.exists() {
+                                    let mut ci = read_historical_ci(&on_events_dir);
+                                    update_ci(&mut ci, &rk, expected);
+                                    if let Err(e) = write_ci(&on_events_dir, &ci) {
+                                        tracing::warn!(
+                                            "Failed to write compacted contract index for {}: {}",
+                                            on_events_dir.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Compact decoded logs
         // Note: Full decoded data compaction requires schema information from the event
         // parser. For now, we just delete the decoded bincode files when compacting.

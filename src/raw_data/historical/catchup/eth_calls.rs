@@ -31,14 +31,14 @@ use crate::raw_data::historical::receipts::{
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
-    read_contract_index, update_contract_index, write_contract_index,
+    read_contract_index,
 };
 use crate::storage::factory_data::{
     load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
 };
 use crate::storage::parquet_readers::read_event_calls_from_parquet;
 use crate::storage::paths::raw_eth_calls_dir;
-use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
+use crate::storage::{DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
 use crate::types::config::raw_data::RawDataCollectionConfig;
@@ -929,6 +929,7 @@ pub async fn collect_eth_calls(
         let mut processed_event_ranges: Vec<(u64, u64)> = Vec::new();
         {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency));
+            let ci_mutex = Arc::new(tokio::sync::Mutex::new(()));
             let mut join_set: tokio::task::JoinSet<
                 Result<Option<(u64, u64)>, EthCallCollectionError>,
             > = tokio::task::JoinSet::new();
@@ -977,6 +978,7 @@ pub async fn collect_eth_calls(
                     let client = client.clone();
                     let decoder_tx = decoder_tx.clone();
                     let log_file_path = log_range.file_path.clone();
+                    let ci_mutex = ci_mutex.clone();
 
                     join_set.spawn(async move {
                         let (skipped, mut pending_writes) = {
@@ -1064,7 +1066,7 @@ pub async fn collect_eth_calls(
                                     range_start,
                                     inclusive_end,
                                     &contracts,
-                                    true,
+                                    Some(ci_mutex.clone()),
                                 )
                                 .await?
                             } else {
@@ -1076,7 +1078,7 @@ pub async fn collect_eth_calls(
                                     range_start,
                                     inclusive_end,
                                     &contracts,
-                                    true,
+                                    Some(ci_mutex.clone()),
                                 )
                                 .await?
                             }
@@ -1252,6 +1254,7 @@ pub async fn collect_eth_calls(
                 let chain_name = chain_name_arc.clone();
                 let client = client.clone();
                 let decoder_tx = decoder_tx.clone();
+                let ci_mutex = ci_mutex.clone();
 
                 join_set.spawn(async move {
                     // RPC phase — hold permit to limit concurrent RPC work
@@ -1279,7 +1282,7 @@ pub async fn collect_eth_calls(
                                 range_start,
                                 inclusive_end,
                                 &contracts,
-                                true,
+                                Some(ci_mutex.clone()),
                             )
                             .await?
                         } else {
@@ -1291,7 +1294,7 @@ pub async fn collect_eth_calls(
                                 range_start,
                                 inclusive_end,
                                 &contracts,
-                                true,
+                                Some(ci_mutex.clone()),
                             )
                             .await?
                         }
@@ -1342,55 +1345,6 @@ pub async fn collect_eth_calls(
             }
         }
         let event_catchup_count = processed_event_ranges.len();
-
-        // Batch-write contract indexes for all processed ranges (deferred from concurrent phase)
-        if !processed_event_ranges.is_empty() {
-            let factory_pairs: HashSet<(String, String)> = catchup_event_call_configs
-                .values()
-                .flatten()
-                .filter(|c| c.is_factory)
-                .map(|c| (c.contract_name.clone(), c.function_name.clone()))
-                .collect();
-
-            for (contract_name, function_name) in &factory_pairs {
-                let sub_dir = base_output_dir
-                    .join(contract_name)
-                    .join(function_name)
-                    .join("on_events");
-                let mut ci = read_contract_index(&sub_dir);
-                let mut wrote_any = false;
-
-                for &(start, end) in &processed_event_ranges {
-                    let expected =
-                        build_expected_factory_contracts_for_range(&chain.contracts, end + 1);
-                    if let Some(exp) = expected.get(contract_name.as_str()) {
-                        update_contract_index(&mut ci, &range_key(start, end), exp);
-                        wrote_any = true;
-                    }
-                }
-
-                if wrote_any {
-                    if let Err(e) = write_contract_index(&sub_dir, &ci) {
-                        tracing::warn!(
-                            "Failed to batch-write contract index for {}.{}/on_events: {}",
-                            contract_name,
-                            function_name,
-                            e
-                        );
-                    } else if let Some(sm) = storage_manager.as_ref() {
-                        let index_path = sub_dir.join("contract_index.json");
-                        if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
-                            tracing::warn!(
-                                "Failed to upload contract index sidecar for {}.{}/on_events: {}",
-                                contract_name,
-                                function_name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         if event_catchup_count > 0 {
             tracing::info!(

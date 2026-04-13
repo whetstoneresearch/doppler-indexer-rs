@@ -19,6 +19,7 @@
 //! └── status/{block_number}.json
 //! ```
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -196,6 +197,7 @@ impl LiveStorage {
             "raw/logs",
             "raw/eth_calls",
             "factories",
+            "contract_index",
             "status",
             "decoded/logs",
             "decoded/eth_calls",
@@ -731,6 +733,49 @@ impl LiveStorage {
     }
 
     // =========================================================================
+    // Contract index operations
+    // =========================================================================
+
+    /// Path for per-block contract index.
+    fn contract_index_path(&self, block_number: u64) -> PathBuf {
+        self.base_dir.join(format!("contract_index/{}.json", block_number))
+    }
+
+    /// Write per-block contract index recording which factory source contracts
+    /// were active when this block was collected.
+    pub fn write_contract_index(
+        &self,
+        block_number: u64,
+        index: &HashMap<String, HashMap<String, Vec<String>>>,
+    ) -> Result<(), StorageError> {
+        let path = self.contract_index_path(block_number);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string(index)?;
+        let mut f = BufWriter::new(fs::File::create(&path)?);
+        f.write_all(content.as_bytes())?;
+        Ok(())
+    }
+
+    /// Read per-block contract index.
+    pub fn read_contract_index(
+        &self,
+        block_number: u64,
+    ) -> Result<HashMap<String, HashMap<String, Vec<String>>>, StorageError> {
+        let path = self.contract_index_path(block_number);
+        let file = BufReader::new(
+            fs::File::open(&path).map_err(|_| StorageError::NotFound(block_number))?,
+        );
+        Ok(serde_json::from_reader(file)?)
+    }
+
+    /// Delete per-block contract index.
+    pub fn delete_contract_index(&self, block_number: u64) -> Result<(), StorageError> {
+        safe_delete(&self.contract_index_path(block_number))
+    }
+
+    // =========================================================================
     // Bulk operations
     // =========================================================================
 
@@ -741,6 +786,7 @@ impl LiveStorage {
         self.delete_logs(block_number)?;
         self.delete_eth_calls(block_number)?;
         self.delete_factories(block_number)?;
+        self.delete_contract_index(block_number)?;
         self.delete_status(block_number)?;
         self.delete_all_decoded_logs(block_number)?;
         self.delete_all_decoded_calls(block_number)?;
