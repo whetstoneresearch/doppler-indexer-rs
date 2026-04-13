@@ -85,7 +85,7 @@ quote_to_usd_multiplier(quote_token) -> Option<BigDecimal>
 - Pool name convention `<Base><Quote>Pool` is used for automatic discovery
 - Path resolution caches results for 1 week (~302,400 blocks on Base)
 - Unpriceable tokens (no path within 5 hops at $1k+ liquidity) are cached as is_priceable=false
-- Price derivation walks the path at query time using current pool_state prices (not stale cached prices)
+- Price derivation walks the path at query time using pool_snapshots (historically complete, not latest-only pool_state)
 
 ## Config Convention
 
