@@ -2,6 +2,7 @@
 //! process_factory_once_calls, process_factory_once_calls_multicall.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use alloy::primitives::Address;
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionRequest};
@@ -354,17 +355,49 @@ pub(crate) async fn process_factory_once_calls(
     column_indexes: &HashMap<String, HashMap<String, Vec<String>>>,
     expected_contracts: Option<&HashMap<String, ExpectedContracts>>,
 ) -> Result<(), EthCallCollectionError> {
-    for (collection_name, call_configs) in once_configs {
+    // Wrap shared borrowed data in Arcs for 'static task spawning
+    let existing_files = Arc::new(ctx.existing_files.clone());
+    let factory_data = Arc::new(factory_data.clone());
+    let column_indexes = Arc::new(column_indexes.clone());
+    let expected_contracts: Option<Arc<HashMap<String, ExpectedContracts>>> =
+        expected_contracts.map(|m| Arc::new(m.clone()));
+
+    // Clone cheap shared data
+    let client = ctx.client.clone();
+    let output_dir = ctx.output_dir.to_path_buf();
+    let repair = ctx.repair;
+    let decoder_tx = ctx.decoder_tx.clone();
+    let chain_name = ctx.chain_name.to_string();
+    let storage_manager = ctx.storage_manager.cloned();
+    let range = range.clone();
+
+    let mut join_set: tokio::task::JoinSet<Result<(), EthCallCollectionError>> =
+        tokio::task::JoinSet::new();
+
+    for (collection_name, call_configs) in once_configs.clone() {
         if call_configs.is_empty() {
             continue;
         }
 
+        // Clone per-task shared data
+        let existing_files = Arc::clone(&existing_files);
+        let factory_data = Arc::clone(&factory_data);
+        let column_indexes = Arc::clone(&column_indexes);
+        let expected_contracts = expected_contracts.clone();
+        let client = client.clone();
+        let output_dir = output_dir.clone();
+        let decoder_tx = decoder_tx.clone();
+        let chain_name = chain_name.clone();
+        let storage_manager = storage_manager.clone();
+        let range = range.clone();
+
+        join_set.spawn(async move {
         let file_name = range.file_name("");
         let rel_path = format!("{}/once/{}", collection_name, file_name);
-        let sub_dir = ctx.output_dir.join(collection_name).join("once");
+        let sub_dir = output_dir.join(&collection_name).join("once");
         let output_path = sub_dir.join(&file_name);
 
-        let all_fn_names = extract_fn_names(call_configs);
+        let all_fn_names = extract_fn_names(&call_configs);
 
         // Check parquet file state: returns None if file is already complete
         let file_state = check_factory_once_file_state(
@@ -373,18 +406,18 @@ pub(crate) async fn process_factory_once_calls(
             &sub_dir,
             &output_path,
             &all_fn_names,
-            ctx.existing_files,
-            column_indexes,
-            collection_name,
-            range,
-            factory_data,
-            expected_contracts,
-            ctx.repair,
+            &existing_files,
+            &column_indexes,
+            &collection_name,
+            &range,
+            &factory_data,
+            expected_contracts.as_deref(),
+            repair,
         )
         .await?;
         let file_state = match file_state {
             Some(s) => s,
-            None => continue,
+            None => return Ok(()),
         };
         let missing_fn_names = file_state.missing_fn_names;
         let has_existing_file = file_state.has_existing_file;
@@ -406,7 +439,7 @@ pub(crate) async fn process_factory_once_calls(
 
         for (block_num, addrs) in &factory_data.addresses_by_block {
             for (timestamp, addr, coll_name) in addrs {
-                if coll_name == collection_name {
+                if *coll_name == collection_name {
                     address_discovery
                         .entry(*addr)
                         .or_insert((*block_num, *timestamp));
@@ -417,7 +450,9 @@ pub(crate) async fn process_factory_once_calls(
         // Write empty file when no factory addresses discovered (no data for this range)
         if address_discovery.is_empty() && !has_existing_file {
             write_empty_once_file(&sub_dir, &output_path, &file_name, &all_fn_names).await?;
-            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+            if let Some(expected) =
+                expected_contracts.as_deref().and_then(|m| m.get(&collection_name))
+            {
                 let rk = range_key(range.start, range.end - 1);
                 let mut ci = read_contract_index(&sub_dir);
                 update_ci(&mut ci, &rk, expected);
@@ -429,7 +464,7 @@ pub(crate) async fn process_factory_once_calls(
                     );
                 }
             }
-            if let Some(tx) = ctx.decoder_tx {
+            if let Some(ref tx) = decoder_tx {
                 let _ = tx
                     .send(DecoderMessage::OnceFileBackfilled {
                         range_start: range.start,
@@ -438,7 +473,7 @@ pub(crate) async fn process_factory_once_calls(
                     })
                     .await;
             }
-            continue;
+            return Ok(());
         }
 
         // C. Reuse batches from parquet_state to identify absent addresses
@@ -581,8 +616,8 @@ pub(crate) async fn process_factory_once_calls(
         // H. No-op optimization: if contract-index gate fell through but no calls needed,
         // just write the missing contract_index.json and skip the parquet rewrite.
         if pending_calls.is_empty() && has_existing_file {
-            if !ctx.repair {
-                continue;
+            if !repair {
+                return Ok(());
             }
             // Rewrite empty parquet with full schema when columns are missing
             if !missing_fn_names.is_empty() && existing_addr_set.is_empty() {
@@ -595,7 +630,9 @@ pub(crate) async fn process_factory_once_calls(
                     all_fn_names.len()
                 );
             }
-            if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+            if let Some(expected) =
+                expected_contracts.as_deref().and_then(|m| m.get(&collection_name))
+            {
                 let rk = range_key(range.start, range.end - 1);
                 let mut ci = read_contract_index(&sub_dir);
                 update_ci(&mut ci, &rk, expected);
@@ -612,12 +649,12 @@ pub(crate) async fn process_factory_once_calls(
                     );
                 }
             }
-            continue;
+            return Ok(());
         }
 
         // Skip only if no pending calls AND no existing file to backfill
         if pending_calls.is_empty() && !has_existing_file {
-            continue;
+            return Ok(());
         }
 
         // Execute batch calls only if there are pending calls
@@ -627,7 +664,7 @@ pub(crate) async fn process_factory_once_calls(
                 .map(|(tx, bid, _, _, _, _)| (tx.clone(), *bid))
                 .collect();
 
-            let batch_results = ctx.client.call_batch(batch_calls).await?;
+            let batch_results = client.call_batch(batch_calls).await?;
 
             let mut results_map: AddressResults = HashMap::new();
 
@@ -826,7 +863,7 @@ pub(crate) async fn process_factory_once_calls(
                             .map(|(tx, bid, _, _)| (tx.clone(), *bid))
                             .collect();
 
-                        let batch_results = ctx.client.call_batch(batch_calls).await?;
+                        let batch_results = client.call_batch(batch_calls).await?;
 
                         for (i, result) in batch_results.into_iter().enumerate() {
                             let (_, _, addr_bytes, function_name) = &backfill_calls[i];
@@ -899,12 +936,12 @@ pub(crate) async fn process_factory_once_calls(
         }
 
         // Upload to S3 if configured
-        if let Some(sm) = ctx.storage_manager {
+        if let Some(ref sm) = storage_manager {
             let data_type = format!("raw/eth_calls/{}/once", collection_name);
             upload_parquet_to_s3(
                 sm,
                 &output_path,
-                ctx.chain_name,
+                &chain_name,
                 &data_type,
                 range.start,
                 range.end - 1,
@@ -925,7 +962,9 @@ pub(crate) async fn process_factory_once_calls(
         );
 
         // F. Write contract index after parquet write
-        if let Some(expected) = expected_contracts.and_then(|m| m.get(collection_name)) {
+        if let Some(expected) =
+            expected_contracts.as_deref().and_then(|m| m.get(&collection_name))
+        {
             let rk = range_key(range.start, range.end - 1);
             let mut ci = read_contract_index(&sub_dir);
             update_ci(&mut ci, &rk, expected);
@@ -939,7 +978,7 @@ pub(crate) async fn process_factory_once_calls(
         }
 
         // Notify decoder that this file was updated so it can decode new columns
-        if let Some(tx) = ctx.decoder_tx {
+        if let Some(ref tx) = decoder_tx {
             let _ = tx
                 .send(DecoderMessage::OnceFileBackfilled {
                     range_start: range.start,
@@ -948,6 +987,14 @@ pub(crate) async fn process_factory_once_calls(
                 })
                 .await;
         }
+
+        Ok(())
+        }); // end join_set.spawn
+    }
+
+    // Drain the JoinSet and propagate any errors
+    while let Some(result) = join_set.join_next().await {
+        result.map_err(|e| EthCallCollectionError::Io(std::io::Error::other(e.to_string())))??;
     }
 
     Ok(())
