@@ -7,7 +7,7 @@
 //! Decoded events are also always written to parquet on disk so that output
 //! is persisted regardless of whether the transformation channel is present.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -42,6 +42,7 @@ pub async fn decode_solana_events(
     transform_tx: Option<Sender<DecodedEventsMessage>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
+    function_filter: Option<Arc<HashSet<String>>>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_events_dir(&chain_name);
@@ -84,6 +85,12 @@ pub async fn decode_solana_events(
                         let key = (event.source_name.clone(), event.event_name.clone());
                         by_trigger.entry(key).or_default().push(event);
                     }
+                }
+
+                // Apply function filter: drop groups whose event_name
+                // doesn't match --function scope
+                if let Some(ref filter) = function_filter {
+                    by_trigger.retain(|(_, event_name), _| filter.contains(event_name.as_str()));
                 }
 
                 // Write decoded parquet per (source_name, event_name) group
@@ -185,6 +192,7 @@ pub async fn decode_solana_instructions(
     transform_tx: Option<Sender<DecodedEventsMessage>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
+    function_filter: Option<Arc<HashSet<String>>>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_instructions_dir(&chain_name);
@@ -228,6 +236,11 @@ pub async fn decode_solana_instructions(
                         let key = (event.source_name.clone(), event.event_name.clone());
                         by_trigger.entry(key).or_default().push(event);
                     }
+                }
+
+                // Apply function filter
+                if let Some(ref filter) = function_filter {
+                    by_trigger.retain(|(_, event_name), _| filter.contains(event_name.as_str()));
                 }
 
                 // Write decoded parquet per (source_name, instruction_name) group
@@ -429,6 +442,7 @@ mod tests {
             Some(transform_tx),
             Some(complete_tx),
             chain_name,
+            None,
         ));
 
         // Send an event batch
@@ -495,6 +509,7 @@ mod tests {
             Some(transform_tx),
             Some(complete_tx),
             "test-solana-instr".to_string(),
+            None,
         ));
 
         decoder_tx
@@ -532,6 +547,7 @@ mod tests {
             None,
             None,
             "test-close".to_string(),
+            None,
         ));
 
         // Drop sender to close channel
@@ -571,6 +587,7 @@ mod tests {
             Some(transform_tx),
             Some(complete_tx),
             "test-unknown".to_string(),
+            None,
         ));
 
         // Send batch with one known and one unknown program event

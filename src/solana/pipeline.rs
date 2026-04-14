@@ -389,6 +389,16 @@ pub async fn process_solana_chain(
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
+    // Build function filter from repair scope before moving repair_scope
+    let function_filter = if repair {
+        repair_scope
+            .as_ref()
+            .and_then(|s| s.functions.as_ref())
+            .map(|f| Arc::new(f.clone()))
+    } else {
+        None
+    };
+
     // Backfill task
     {
         let chain_name = runtime.chain.name.clone();
@@ -428,9 +438,10 @@ pub async fn process_solana_chain(
         let tx = transform_events_tx.clone();
         let complete = transform_complete_tx.clone();
         let chain_name = runtime.chain.name.clone();
+        let ff = function_filter.clone();
 
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name)
+            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name, ff)
                 .await;
             Ok(())
         });
@@ -446,6 +457,7 @@ pub async fn process_solana_chain(
         let tx = transform_events_tx.clone();
         let complete = transform_complete_tx.clone();
         let chain_name = runtime.chain.name.clone();
+        let ff = function_filter.clone();
 
         tasks.spawn(async move {
             decode_solana_instructions(
@@ -455,6 +467,7 @@ pub async fn process_solana_chain(
                 tx,
                 complete,
                 chain_name,
+                ff,
             )
             .await;
             Ok(())
@@ -521,15 +534,6 @@ pub async fn decode_only_solana_chain(
         "Decode-only mode for Solana chain"
     );
 
-    if let Some(scope) = &repair_scope {
-        if scope.functions.is_some() {
-            tracing::warn!(
-                chain = chain.name.as_str(),
-                "Decode-only mode does not support --function filtering; all event/instruction types will be re-decoded"
-            );
-        }
-    }
-
     let chain_arc = Arc::new(chain.clone());
     let decoders = build_decoders(&chain_arc)?;
     let program_names = Arc::new(build_program_names(&chain_arc)?);
@@ -539,6 +543,12 @@ pub async fn decode_only_solana_chain(
         .channel_capacity
         .unwrap_or(defaults::raw_data::CHANNEL_CAPACITY);
 
+    // Build function filter from repair scope
+    let function_filter = repair_scope
+        .as_ref()
+        .and_then(|s| s.functions.as_ref())
+        .map(|f| Arc::new(f.clone()));
+
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     // Event decoding
@@ -547,9 +557,10 @@ pub async fn decode_only_solana_chain(
         let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
         let names = program_names.clone();
         let chain_name = chain.name.clone();
+        let ff = function_filter.clone();
 
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, names, rx, None, None, chain_name).await;
+            decode_solana_events(event_decoder, names, rx, None, None, chain_name, ff).await;
             Ok(())
         });
 
@@ -574,9 +585,10 @@ pub async fn decode_only_solana_chain(
         let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
         let names = program_names.clone();
         let chain_name = chain.name.clone();
+        let ff = function_filter.clone();
 
         tasks.spawn(async move {
-            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name).await;
+            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name, ff).await;
             Ok(())
         });
 
