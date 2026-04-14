@@ -799,6 +799,7 @@ async fn process_chain_live_only(
                 expect_log_completion: runtime.features.has_events,
                 expect_eth_call_completion: runtime.features.has_calls,
                 expect_account_state_completion: false,
+                expect_instruction_completion: false,
             },
             runtime.progress_tracker.clone(),
         )
@@ -1644,6 +1645,7 @@ async fn process_chain(
                 expect_log_completion: has_events,
                 expect_eth_call_completion: has_calls,
                 expect_account_state_completion: false,
+                expect_instruction_completion: false,
             },
             pipeline.runtime.progress_tracker.clone(),
         )

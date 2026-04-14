@@ -90,6 +90,7 @@ pub enum RangeCompleteKind {
     Logs,
     EthCalls,
     AccountStates,
+    Instructions,
 }
 
 /// Signal that a reorg occurred and orphaned blocks need cleanup.
@@ -127,6 +128,7 @@ pub struct TransformationEngineConfig {
     pub expect_log_completion: bool,
     pub expect_eth_call_completion: bool,
     pub expect_account_state_completion: bool,
+    pub expect_instruction_completion: bool,
 }
 
 /// A handler paired with the decoded calls it needs to process.
@@ -233,6 +235,7 @@ impl TransformationEngine {
             expect_log_completion: config.expect_log_completion,
             expect_eth_call_completion: config.expect_eth_call_completion,
             expect_account_state_completion: config.expect_account_state_completion,
+            expect_instruction_completion: config.expect_instruction_completion,
         });
 
         let retry_processor = RetryProcessor {
