@@ -333,15 +333,12 @@ pub async fn process_solana_chain(
     repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
 ) -> anyhow::Result<()> {
-    tracing::info!(chain = chain.name.as_str(), "Starting Solana pipeline");
-
-    if repair || repair_scope.is_some() {
-        tracing::warn!(
-            chain = chain.name.as_str(),
-            "Solana repair mode is not yet implemented — running normal backfill instead. \
-             Repair scope will be ignored."
-        );
-    }
+    tracing::info!(
+        chain = chain.name.as_str(),
+        repair,
+        ?repair_scope,
+        "Starting Solana pipeline"
+    );
 
     let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool).await?;
 
@@ -400,6 +397,7 @@ pub async fn process_solana_chain(
         let configured_programs = runtime.configured_programs.clone();
         let event_tx = event_decoder_tx.clone();
         let instr_tx = instr_decoder_tx.clone();
+        let backfill_repair_scope = if repair { repair_scope } else { None };
 
         tasks.spawn(async move {
             let result = signature_driven_backfill(
@@ -410,6 +408,7 @@ pub async fn process_solana_chain(
                 &configured_programs,
                 event_tx.as_ref(),
                 instr_tx.as_ref(),
+                backfill_repair_scope.as_ref(),
             )
             .await;
 
