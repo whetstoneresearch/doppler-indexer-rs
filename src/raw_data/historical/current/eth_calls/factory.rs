@@ -99,6 +99,7 @@ pub(super) async fn handle_factory_message(
                                     buf_range_end,
                                     &state.contracts,
                                     false,
+                                    0, // no trigger batching in live mode
                                 )
                                 .await?
                             } else {
@@ -111,6 +112,7 @@ pub(super) async fn handle_factory_message(
                                     buf_range_end,
                                     &state.contracts,
                                     false,
+                                    0, // no trigger batching in live mode
                                 )
                                 .await?
                             };

@@ -277,6 +277,8 @@ mod tests {
             decoding_concurrency: None,
             factory_concurrency: None,
             event_call_concurrency: None,
+            event_call_window_size: None,
+            event_call_trigger_batch_size: None,
             live_mode: None,
             reorg_depth: None,
             compaction_interval_secs: None,

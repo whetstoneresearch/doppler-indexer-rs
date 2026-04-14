@@ -47,6 +47,12 @@ pub mod raw_data {
     /// Default number of concurrent tasks for factory collection catchup
     pub const FACTORY_CONCURRENCY: usize = 4;
 
+    /// Default event-call catchup window size (multiplied by event_call_concurrency at runtime)
+    pub const EVENT_CALL_WINDOW_MULTIPLIER: usize = 3;
+
+    /// Default maximum triggers per RPC batch within a single range
+    pub const EVENT_CALL_TRIGGER_BATCH_SIZE: usize = 50000;
+
     /// Default number of blocks to track for reorg detection
     pub const REORG_DEPTH: u64 = 128;
 
@@ -134,6 +140,8 @@ mod tests {
         assert_eq!(raw_data::REORG_DEPTH, 128);
         assert_eq!(raw_data::COMPACTION_INTERVAL_SECS, 10);
         assert_eq!(raw_data::TRANSFORM_RETRY_GRACE_PERIOD_SECS, 300);
+        assert_eq!(raw_data::EVENT_CALL_WINDOW_MULTIPLIER, 3);
+        assert_eq!(raw_data::EVENT_CALL_TRIGGER_BATCH_SIZE, 50000);
     }
 
     #[test]
