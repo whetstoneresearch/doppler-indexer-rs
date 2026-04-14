@@ -232,6 +232,15 @@ pub async fn signature_driven_backfill(
         configured_programs.clone()
     };
 
+    // When source-scoped, pass the scoped program IDs to the merge logic so
+    // only records for repaired programs are replaced; other programs' records
+    // in the same slot are preserved.
+    let repair_program_ids = if is_repair && repair_scope.is_some_and(|s| s.sources.is_some()) {
+        Some(&active_configured_programs)
+    } else {
+        None
+    };
+
     for range in &ranges_to_process {
         collect_slots_selective(
             chain_name,
@@ -242,6 +251,7 @@ pub async fn signature_driven_backfill(
             event_decoder_tx,
             instr_decoder_tx,
             merge_slots,
+            repair_program_ids,
         )
         .await?;
     }

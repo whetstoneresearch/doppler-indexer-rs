@@ -8,9 +8,12 @@
 //! is persisted regardless of whether the transformation channel is present.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
+
+use crate::transformations::context::DecodedEvent;
 
 use crate::decoding::DecoderMessage;
 use crate::storage::paths::{decoded_solana_events_dir, decoded_solana_instructions_dir};
@@ -21,6 +24,81 @@ use crate::transformations::engine::{
 use super::decoded_parquet::{build_decoded_event_schema, write_decoded_events_to_parquet};
 use super::events::SolanaEventDecoder;
 use super::instructions::SolanaInstructionDecoder;
+
+// ---------------------------------------------------------------------------
+// Stale decoded parquet cleanup
+// ---------------------------------------------------------------------------
+
+/// Remove decoded parquet files for a range that no longer appear in the
+/// current decoded output. This handles IDL/decoder changes that rename or
+/// remove event/instruction types: after re-decoding, the old
+/// `{source}/{old_event_name}/{range}.parquet` file would otherwise remain
+/// on disk as stale output.
+///
+/// Scans `base_dir/{source}/{event_name}/` for any file named `range_file`
+/// where `(source, event_name)` is NOT in `written_groups`.
+fn cleanup_stale_decoded_parquet(
+    base_dir: &Path,
+    written_groups: &HashMap<(String, String), Vec<DecodedEvent>>,
+    range_file: &str,
+) {
+    let written: HashSet<(&str, &str)> = written_groups
+        .keys()
+        .map(|(s, e)| (s.as_str(), e.as_str()))
+        .collect();
+
+    let Ok(source_dirs) = std::fs::read_dir(base_dir) else {
+        return;
+    };
+
+    for source_entry in source_dirs.flatten() {
+        let source_path = source_entry.path();
+        if !source_path.is_dir() {
+            continue;
+        }
+        let Some(source_name) = source_entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+
+        let Ok(event_dirs) = std::fs::read_dir(&source_path) else {
+            continue;
+        };
+
+        for event_entry in event_dirs.flatten() {
+            let event_path = event_entry.path();
+            if !event_path.is_dir() {
+                continue;
+            }
+            let Some(event_name) = event_entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+
+            // If this (source, event_name) was written in this batch, skip
+            if written.contains(&(source_name.as_str(), event_name.as_str())) {
+                continue;
+            }
+
+            // Check if the stale range file exists and delete it
+            let stale_path = event_path.join(range_file);
+            if stale_path.exists() {
+                if let Err(e) = std::fs::remove_file(&stale_path) {
+                    tracing::warn!(
+                        path = %stale_path.display(),
+                        error = %e,
+                        "Failed to remove stale decoded parquet"
+                    );
+                } else {
+                    tracing::debug!(
+                        source = source_name.as_str(),
+                        event = event_name.as_str(),
+                        path = %stale_path.display(),
+                        "Removed stale decoded parquet"
+                    );
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Event decoder task
@@ -95,6 +173,8 @@ pub async fn decode_solana_events(
 
                 // Write decoded parquet per (source_name, event_name) group
                 let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
+                let range_file = format!("{}-{}.parquet", range_start, range_end_inclusive);
+
                 for ((source_name, event_name), events) in &by_trigger {
                     if events.is_empty() {
                         continue;
@@ -108,8 +188,7 @@ pub async fn decode_solana_events(
                         );
                         continue;
                     }
-                    let file_name = format!("{}-{}.parquet", range_start, range_end_inclusive);
-                    let output_path = output_dir.join(&file_name);
+                    let output_path = output_dir.join(&range_file);
 
                     if let Err(e) = write_decoded_events_to_parquet(events, &schema, &output_path) {
                         tracing::error!(
@@ -127,6 +206,11 @@ pub async fn decode_solana_events(
                         );
                     }
                 }
+
+                // Remove stale decoded parquet for this range: any
+                // (source, event_name) directory that has the range file
+                // but was NOT in this batch's by_trigger output.
+                cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
 
                 // Send one message per (source_name, event_name) group
                 if let Some(ref tx) = transform_tx {
@@ -245,6 +329,8 @@ pub async fn decode_solana_instructions(
 
                 // Write decoded parquet per (source_name, instruction_name) group
                 let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
+                let range_file = format!("{}-{}.parquet", range_start, range_end_inclusive);
+
                 for ((source_name, event_name), events) in &by_trigger {
                     if events.is_empty() {
                         continue;
@@ -258,8 +344,7 @@ pub async fn decode_solana_instructions(
                         );
                         continue;
                     }
-                    let file_name = format!("{}-{}.parquet", range_start, range_end_inclusive);
-                    let output_path = output_dir.join(&file_name);
+                    let output_path = output_dir.join(&range_file);
 
                     if let Err(e) = write_decoded_events_to_parquet(events, &schema, &output_path) {
                         tracing::error!(
@@ -277,6 +362,9 @@ pub async fn decode_solana_instructions(
                         );
                     }
                 }
+
+                // Remove stale decoded parquet for this range
+                cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
 
                 // Send one message per (source_name, instruction_name) group
                 if let Some(ref tx) = transform_tx {

@@ -355,6 +355,7 @@ pub async fn collect_slots_selective(
     event_decoder_tx: Option<&Sender<DecoderMessage>>,
     instr_decoder_tx: Option<&Sender<DecoderMessage>>,
     repair_slots: Option<&BTreeSet<u64>>,
+    repair_program_ids: Option<&HashSet<[u8; 32]>>,
 ) -> Result<(), SolanaCollectionError> {
     let slots_dir = raw_solana_slots_dir(chain_name);
     let events_dir = raw_solana_events_dir(chain_name);
@@ -400,13 +401,26 @@ pub async fn collect_slots_selective(
 
     // In repair mode, merge fresh data with existing records from the parquet
     // file so that non-repaired slots in the same aligned range are preserved.
+    // When repair_program_ids is set (source-scoped repair), only drop records
+    // that match both the repaired slot AND the repaired program; records from
+    // other programs in the same slot are retained.
     if let Some(repaired) = repair_slots {
+        let is_being_repaired = |slot: u64, program_id: &[u8; 32]| -> bool {
+            if !repaired.contains(&slot) {
+                return false;
+            }
+            match repair_program_ids {
+                Some(programs) => programs.contains(program_id),
+                None => true, // unscoped repair: all programs in repaired slots
+            }
+        };
+
         let events_path = events_dir.join(range.file_name("events"));
         if events_path.exists() {
             if let Ok(existing) = read_events_from_parquet(&events_path) {
                 let retained: Vec<_> = existing
                     .into_iter()
-                    .filter(|r| !repaired.contains(&r.slot))
+                    .filter(|r| !is_being_repaired(r.slot, &r.program_id))
                     .collect();
                 all_events.extend(retained);
             }
@@ -418,7 +432,7 @@ pub async fn collect_slots_selective(
             if let Ok(existing) = read_instructions_from_parquet(&instr_path) {
                 let retained: Vec<_> = existing
                     .into_iter()
-                    .filter(|r| !repaired.contains(&r.slot))
+                    .filter(|r| !is_being_repaired(r.slot, &r.program_id))
                     .collect();
                 all_instructions.extend(retained);
             }
