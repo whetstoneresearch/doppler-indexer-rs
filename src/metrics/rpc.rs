@@ -25,6 +25,21 @@ pub enum RpcMethod {
     GetLogsBatch,
     EthCallBatch,
     GetBlockReceiptsConcurrent,
+    // Solana RPC methods
+    #[cfg(feature = "solana")]
+    SolanaGetSlot,
+    #[cfg(feature = "solana")]
+    SolanaGetBlock,
+    #[cfg(feature = "solana")]
+    SolanaGetTransaction,
+    #[cfg(feature = "solana")]
+    SolanaGetSignaturesForAddress,
+    #[cfg(feature = "solana")]
+    SolanaGetAccountInfo,
+    #[cfg(feature = "solana")]
+    SolanaGetMultipleAccounts,
+    #[cfg(feature = "solana")]
+    SolanaGetProgramAccounts,
 }
 
 impl RpcMethod {
@@ -44,6 +59,20 @@ impl RpcMethod {
             Self::GetLogsBatch => "eth_getLogs_batch",
             Self::EthCallBatch => "eth_call_batch",
             Self::GetBlockReceiptsConcurrent => "eth_getBlockReceipts_concurrent",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetSlot => "solana_getSlot",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetBlock => "solana_getBlock",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetTransaction => "solana_getTransaction",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetSignaturesForAddress => "solana_getSignaturesForAddress",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetAccountInfo => "solana_getAccountInfo",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetMultipleAccounts => "solana_getMultipleAccounts",
+            #[cfg(feature = "solana")]
+            Self::SolanaGetProgramAccounts => "solana_getProgramAccounts",
         }
     }
 }
