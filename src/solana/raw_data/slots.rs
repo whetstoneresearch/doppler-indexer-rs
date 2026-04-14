@@ -399,26 +399,14 @@ pub async fn collect_slots_selective(
         }
     }
 
-    // Clone fresh records before the merge so we can send only these to decoders.
-    // Retained records from other programs/slots are preserved in parquet but
-    // should not trigger re-decoding (which would overwrite decoded output for
-    // sources outside the repair scope).
-    let decoder_events = if repair_slots.is_some() {
-        Some(all_events.clone())
-    } else {
-        None
-    };
-    let decoder_instructions = if repair_slots.is_some() {
-        Some(all_instructions.clone())
-    } else {
-        None
-    };
-
     // In repair mode, merge fresh data with existing records from the parquet
     // file so that non-repaired slots in the same aligned range are preserved.
     // When repair_program_ids is set (source-scoped repair), only drop records
     // that match both the repaired slot AND the repaired program; records from
     // other programs in the same slot are retained.
+    //
+    // The merged result is sent to decoders (not just the fresh subset) so that
+    // decoded parquet output is complete for the full aligned range.
     if let Some(repaired) = repair_slots {
         let is_being_repaired = |slot: u64, program_id: &[u8; 32]| -> bool {
             if !repaired.contains(&slot) {
@@ -432,25 +420,23 @@ pub async fn collect_slots_selective(
 
         let events_path = events_dir.join(range.file_name("events"));
         if events_path.exists() {
-            if let Ok(existing) = read_events_from_parquet(&events_path) {
-                let retained: Vec<_> = existing
-                    .into_iter()
-                    .filter(|r| !is_being_repaired(r.slot, &r.program_id))
-                    .collect();
-                all_events.extend(retained);
-            }
+            let existing = read_events_from_parquet(&events_path)?;
+            let retained: Vec<_> = existing
+                .into_iter()
+                .filter(|r| !is_being_repaired(r.slot, &r.program_id))
+                .collect();
+            all_events.extend(retained);
         }
         all_events.sort_by_key(|r| (r.slot, r.log_index));
 
         let instr_path = instructions_dir.join(range.file_name("instructions"));
         if instr_path.exists() {
-            if let Ok(existing) = read_instructions_from_parquet(&instr_path) {
-                let retained: Vec<_> = existing
-                    .into_iter()
-                    .filter(|r| !is_being_repaired(r.slot, &r.program_id))
-                    .collect();
-                all_instructions.extend(retained);
-            }
+            let existing = read_instructions_from_parquet(&instr_path)?;
+            let retained: Vec<_> = existing
+                .into_iter()
+                .filter(|r| !is_being_repaired(r.slot, &r.program_id))
+                .collect();
+            all_instructions.extend(retained);
         }
         all_instructions.sort_by_key(|r| (r.slot, r.instruction_index));
     }
@@ -460,11 +446,10 @@ pub async fn collect_slots_selective(
     if let Some(repaired) = repair_slots {
         let slot_path = slots_dir.join(range.file_name("slots"));
         if slot_path.exists() {
-            if let Ok(existing) = read_slots_from_parquet(&slot_path) {
-                for record in existing {
-                    if !repaired.contains(&record.slot) {
-                        slot_records.entry(record.slot).or_insert(record);
-                    }
+            let existing = read_slots_from_parquet(&slot_path)?;
+            for record in existing {
+                if !repaired.contains(&record.slot) {
+                    slot_records.entry(record.slot).or_insert(record);
                 }
             }
         }
@@ -506,16 +491,11 @@ pub async fn collect_slots_selective(
     }
     skipped_slots::write_skipped_slots_index(&events_dir, &skipped_index)?;
 
-    // During repair, send only the freshly extracted records (cloned before
-    // the merge) to decoders. During normal backfill, send all records.
-    let events_for_decoder = decoder_events.unwrap_or(all_events);
-    let instructions_for_decoder = decoder_instructions.unwrap_or(all_instructions);
-
     if let Some(tx) = event_decoder_tx {
         let msg = DecoderMessage::SolanaEventsReady {
             range_start: range.start,
             range_end: range.end,
-            events: events_for_decoder,
+            events: all_events,
             live_mode: false,
         };
         tx.send(msg)
@@ -529,7 +509,7 @@ pub async fn collect_slots_selective(
         let msg = DecoderMessage::SolanaInstructionsReady {
             range_start: range.start,
             range_end: range.end,
-            instructions: instructions_for_decoder,
+            instructions: all_instructions,
             live_mode: false,
         };
         tx.send(msg)
