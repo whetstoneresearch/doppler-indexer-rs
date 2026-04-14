@@ -513,9 +513,11 @@ pub async fn process_solana_chain(
 pub async fn decode_only_solana_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
+    repair_scope: Option<RepairScope>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         chain = chain.name.as_str(),
+        ?repair_scope,
         "Decode-only mode for Solana chain"
     );
 
@@ -544,8 +546,9 @@ pub async fn decode_only_solana_chain(
 
         // Spawn reader task to feed raw event parquet files into the decoder channel
         let event_chain_name = chain.name.clone();
+        let event_scope = repair_scope.clone();
         tasks.spawn(async move {
-            feed_raw_events_to_decoder(&event_chain_name, tx).await
+            feed_raw_events_to_decoder(&event_chain_name, tx, event_scope.as_ref()).await
         });
     }
 
@@ -563,8 +566,9 @@ pub async fn decode_only_solana_chain(
 
         // Spawn reader task to feed raw instruction parquet files into the decoder channel
         let instr_chain_name = chain.name.clone();
+        let instr_scope = repair_scope.clone();
         tasks.spawn(async move {
-            feed_raw_instructions_to_decoder(&instr_chain_name, tx).await
+            feed_raw_instructions_to_decoder(&instr_chain_name, tx, instr_scope.as_ref()).await
         });
     }
 
@@ -592,6 +596,7 @@ pub async fn decode_only_solana_chain(
 async fn feed_raw_events_to_decoder(
     chain_name: &str,
     tx: mpsc::Sender<DecoderMessage>,
+    repair_scope: Option<&RepairScope>,
 ) -> anyhow::Result<()> {
     let events_dir = raw_solana_events_dir(chain_name);
 
@@ -615,6 +620,15 @@ async fn feed_raw_events_to_decoder(
     );
 
     for (start, end_inclusive, path) in &ranges {
+        let range_end = end_inclusive + 1;
+
+        // Skip ranges outside the repair scope
+        if let Some(scope) = repair_scope {
+            if !scope.matches_range(*start, range_end) {
+                continue;
+            }
+        }
+
         let events = tokio::task::spawn_blocking({
             let path = path.clone();
             move || read_events_from_parquet(&path)
@@ -626,9 +640,6 @@ async fn feed_raw_events_to_decoder(
         if events.is_empty() {
             continue;
         }
-
-        // range_end is exclusive in DecoderMessage convention
-        let range_end = end_inclusive + 1;
 
         if tx
             .send(DecoderMessage::SolanaEventsReady {
@@ -657,6 +668,7 @@ async fn feed_raw_events_to_decoder(
 async fn feed_raw_instructions_to_decoder(
     chain_name: &str,
     tx: mpsc::Sender<DecoderMessage>,
+    repair_scope: Option<&RepairScope>,
 ) -> anyhow::Result<()> {
     let instructions_dir = raw_solana_instructions_dir(chain_name);
 
@@ -680,6 +692,15 @@ async fn feed_raw_instructions_to_decoder(
     );
 
     for (start, end_inclusive, path) in &ranges {
+        let range_end = end_inclusive + 1;
+
+        // Skip ranges outside the repair scope
+        if let Some(scope) = repair_scope {
+            if !scope.matches_range(*start, range_end) {
+                continue;
+            }
+        }
+
         let instructions = tokio::task::spawn_blocking({
             let path = path.clone();
             move || read_instructions_from_parquet(&path)
@@ -697,8 +718,6 @@ async fn feed_raw_instructions_to_decoder(
         if instructions.is_empty() {
             continue;
         }
-
-        let range_end = end_inclusive + 1;
 
         if tx
             .send(DecoderMessage::SolanaInstructionsReady {

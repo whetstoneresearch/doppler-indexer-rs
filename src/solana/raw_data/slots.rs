@@ -25,7 +25,8 @@ use crate::storage::skipped_slots::{self, SkippedSlotsIndex};
 
 use super::extraction::extract_events_and_instructions;
 use super::parquet::{
-    build_event_schema, build_instruction_schema, build_slot_schema, write_events_to_parquet_async,
+    build_event_schema, build_instruction_schema, build_slot_schema, read_events_from_parquet,
+    read_instructions_from_parquet, write_events_to_parquet_async,
     write_instructions_to_parquet_async, write_slots_to_parquet_async,
 };
 use super::types::{SolanaCollectionError, SolanaSlotRecord};
@@ -339,6 +340,11 @@ fn extract_block_signatures(block: &UiConfirmedBlock) -> Vec<[u8; 64]> {
 /// Similar to [`collect_solana_raw_data`] but only fetches the given slots
 /// instead of every slot in the range. Used by the signature-driven backfill
 /// which knows exactly which slots contain relevant transactions.
+///
+/// When `repair_slots` is `Some`, only those specific slots are re-fetched and
+/// the new data is **merged** with existing parquet records for the range.
+/// Records from the repaired slots are replaced; records from other slots in
+/// the range are preserved.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_slots_selective(
     chain_name: &str,
@@ -348,6 +354,7 @@ pub async fn collect_slots_selective(
     configured_programs: &HashSet<[u8; 32]>,
     event_decoder_tx: Option<&Sender<DecoderMessage>>,
     instr_decoder_tx: Option<&Sender<DecoderMessage>>,
+    repair_slots: Option<&BTreeSet<u64>>,
 ) -> Result<(), SolanaCollectionError> {
     let slots_dir = raw_solana_slots_dir(chain_name);
     let events_dir = raw_solana_events_dir(chain_name);
@@ -389,6 +396,34 @@ pub async fn collect_slots_selective(
                 all_instructions.extend(instructions);
             }
         }
+    }
+
+    // In repair mode, merge fresh data with existing records from the parquet
+    // file so that non-repaired slots in the same aligned range are preserved.
+    if let Some(repaired) = repair_slots {
+        let events_path = events_dir.join(range.file_name("events"));
+        if events_path.exists() {
+            if let Ok(existing) = read_events_from_parquet(&events_path) {
+                let retained: Vec<_> = existing
+                    .into_iter()
+                    .filter(|r| !repaired.contains(&r.slot))
+                    .collect();
+                all_events.extend(retained);
+            }
+        }
+        all_events.sort_by_key(|r| (r.slot, r.log_index));
+
+        let instr_path = instructions_dir.join(range.file_name("instructions"));
+        if instr_path.exists() {
+            if let Ok(existing) = read_instructions_from_parquet(&instr_path) {
+                let retained: Vec<_> = existing
+                    .into_iter()
+                    .filter(|r| !repaired.contains(&r.slot))
+                    .collect();
+                all_instructions.extend(retained);
+            }
+        }
+        all_instructions.sort_by_key(|r| (r.slot, r.instruction_index));
     }
 
     // Write parquet files

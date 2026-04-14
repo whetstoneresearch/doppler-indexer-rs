@@ -489,7 +489,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         Ok(())
                     } else if decode_only {
-                        solana::pipeline::decode_only_solana_chain(&config, &chain).await
+                        solana::pipeline::decode_only_solana_chain(&config, &chain, repair_scope).await
                     } else {
                         solana::pipeline::process_solana_chain(
                             &config,

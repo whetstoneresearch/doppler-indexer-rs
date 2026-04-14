@@ -113,9 +113,34 @@ pub async fn signature_driven_backfill(
         "Starting signature-driven backfill"
     );
 
-    // Collect all signatures for all programs, grouped by slot
+    // Filter programs by repair scope sources (if specified)
+    let scoped_programs: SolanaPrograms;
+    let active_programs = if let Some(scope) = repair_scope {
+        if let Some(ref sources) = scope.sources {
+            scoped_programs = programs
+                .iter()
+                .filter(|(name, _)| sources.contains(name.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if scoped_programs.is_empty() {
+                tracing::info!(
+                    chain = chain_name,
+                    ?sources,
+                    "No configured programs match repair source filter"
+                );
+                return Ok(());
+            }
+            &scoped_programs
+        } else {
+            programs
+        }
+    } else {
+        programs
+    };
+
+    // Collect all signatures for active programs, grouped by slot
     let slots_with_sigs =
-        collect_all_signatures(rpc_client, programs, effective_start, end_slot).await?;
+        collect_all_signatures(rpc_client, active_programs, effective_start, end_slot).await?;
 
     if slots_with_sigs.is_empty() {
         tracing::info!(
@@ -180,6 +205,14 @@ pub async fn signature_driven_backfill(
         "Processing signature-discovered ranges"
     );
 
+    // During repair, pass the target slots so collect_slots_selective can
+    // merge fresh data with existing records instead of overwriting.
+    let merge_slots = if is_repair {
+        Some(&target_slots)
+    } else {
+        None
+    };
+
     for range in &ranges_to_process {
         collect_slots_selective(
             chain_name,
@@ -189,6 +222,7 @@ pub async fn signature_driven_backfill(
             configured_programs,
             event_decoder_tx,
             instr_decoder_tx,
+            merge_slots,
         )
         .await?;
     }
