@@ -18,6 +18,7 @@ pub async fn collect_logs(
     mut factory_rx: Option<Receiver<FactoryAddressData>>,
     decoder_tx: Option<Sender<DecoderMessage>>,
     mut state: LogsCatchupState,
+    max_pending_log_ranges: usize,
 ) -> Result<(), LogCollectionError> {
     let has_factory_rx = factory_rx.is_some();
     state.needs_factory_wait = has_factory_rx && state.contract_logs_only;
@@ -38,8 +39,11 @@ pub async fn collect_logs(
     );
 
     loop {
+        let pending_count = range_data.len() + pending_ranges.len();
         tokio::select! {
-            log_result = log_rx.recv() => {
+            // Backpressure: stop draining logs when too many ranges are buffered.
+            // Completed ranges are removed by prepare_completed_range, re-opening the guard.
+            log_result = log_rx.recv(), if pending_count < max_pending_log_ranges => {
                 match log_result {
                     Some(message) => {
                         match message {

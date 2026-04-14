@@ -52,6 +52,11 @@ pub struct RawDataCollectionConfig {
     /// Lower values reduce peak memory at the cost of throughput.
     /// Default: 5
     pub max_receipt_ranges: Option<usize>,
+    /// Maximum number of log ranges buffered in the log and factory collectors
+    /// before backpressure stops draining from the channel.
+    /// Lower values reduce peak memory; higher values improve pipeline throughput.
+    /// Default: 10
+    pub max_pending_log_ranges: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

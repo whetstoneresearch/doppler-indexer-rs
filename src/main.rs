@@ -1178,12 +1178,16 @@ impl FullPipelineContext {
                 }
             },
             move |catchup_state| async move {
+                let max_pending = cfg
+                    .max_pending_log_ranges
+                    .unwrap_or(crate::types::config::defaults::raw_data::MAX_PENDING_LOG_RANGES);
                 raw_data::historical::current::logs::collect_logs(
                     &chain,
                     log_rx,
                     logs_factory_rx,
                     log_decoder_tx,
                     catchup_state,
+                    max_pending,
                 )
                 .await
                 .context("log collection failed")

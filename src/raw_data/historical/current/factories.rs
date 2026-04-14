@@ -145,6 +145,9 @@ pub async fn collect_factories(
 ) -> Result<(), FactoryCollectionError> {
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
     let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8).max(1);
+    let max_pending = raw_data_config
+        .max_pending_log_ranges
+        .unwrap_or(crate::types::config::defaults::raw_data::MAX_PENDING_LOG_RANGES);
 
     // If no matchers, forward empty ranges from channel
     if matchers.is_empty() {
@@ -287,7 +290,9 @@ pub async fn collect_factories(
                 });
             }
 
-            message = log_rx.recv(), if !input_done => {
+            // Backpressure: stop draining logs when too many ranges are buffered
+            message = log_rx.recv(), if !input_done
+                && range_data.len() + ready_ranges.len() < max_pending => {
                 match message {
                     Some(LogMessage::Logs(logs)) => {
                         let logs = Arc::try_unwrap(logs).unwrap_or_else(|arc| (*arc).clone());

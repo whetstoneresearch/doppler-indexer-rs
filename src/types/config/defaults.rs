@@ -53,6 +53,9 @@ pub mod raw_data {
     /// Default maximum triggers per RPC batch within a single range
     pub const EVENT_CALL_TRIGGER_BATCH_SIZE: usize = 50000;
 
+    /// Default maximum pending log ranges before backpressure kicks in
+    pub const MAX_PENDING_LOG_RANGES: usize = 10;
+
     /// Default number of blocks to track for reorg detection
     pub const REORG_DEPTH: u64 = 128;
 

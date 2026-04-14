@@ -849,6 +849,7 @@ mod tests {
             compaction_interval_secs: None,
             transform_retry_grace_period_secs: None,
             max_receipt_ranges: None,
+            max_pending_log_ranges: None,
         }
     }
 
