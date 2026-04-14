@@ -521,6 +521,15 @@ pub async fn decode_only_solana_chain(
         "Decode-only mode for Solana chain"
     );
 
+    if let Some(scope) = &repair_scope {
+        if scope.functions.is_some() {
+            tracing::warn!(
+                chain = chain.name.as_str(),
+                "Decode-only mode does not support --function filtering; all event/instruction types will be re-decoded"
+            );
+        }
+    }
+
     let chain_arc = Arc::new(chain.clone());
     let decoders = build_decoders(&chain_arc)?;
     let program_names = Arc::new(build_program_names(&chain_arc)?);
@@ -547,8 +556,15 @@ pub async fn decode_only_solana_chain(
         // Spawn reader task to feed raw event parquet files into the decoder channel
         let event_chain_name = chain.name.clone();
         let event_scope = repair_scope.clone();
+        let event_program_names = program_names.clone();
         tasks.spawn(async move {
-            feed_raw_events_to_decoder(&event_chain_name, tx, event_scope.as_ref()).await
+            feed_raw_events_to_decoder(
+                &event_chain_name,
+                tx,
+                event_scope.as_ref(),
+                event_program_names.as_ref(),
+            )
+            .await
         });
     }
 
@@ -567,8 +583,15 @@ pub async fn decode_only_solana_chain(
         // Spawn reader task to feed raw instruction parquet files into the decoder channel
         let instr_chain_name = chain.name.clone();
         let instr_scope = repair_scope.clone();
+        let instr_program_names = program_names.clone();
         tasks.spawn(async move {
-            feed_raw_instructions_to_decoder(&instr_chain_name, tx, instr_scope.as_ref()).await
+            feed_raw_instructions_to_decoder(
+                &instr_chain_name,
+                tx,
+                instr_scope.as_ref(),
+                instr_program_names.as_ref(),
+            )
+            .await
         });
     }
 
@@ -597,6 +620,7 @@ async fn feed_raw_events_to_decoder(
     chain_name: &str,
     tx: mpsc::Sender<DecoderMessage>,
     repair_scope: Option<&RepairScope>,
+    program_names: &HashMap<[u8; 32], String>,
 ) -> anyhow::Result<()> {
     let events_dir = raw_solana_events_dir(chain_name);
 
@@ -637,6 +661,24 @@ async fn feed_raw_events_to_decoder(
         .map_err(|e| anyhow::anyhow!("join error reading events: {}", e))?
         .map_err(|e| anyhow::anyhow!("error reading event parquet {}: {}", path.display(), e))?;
 
+        // Filter by source (program name) when repair scope specifies sources
+        let events = if let Some(scope) = repair_scope {
+            if let Some(ref sources) = scope.sources {
+                events
+                    .into_iter()
+                    .filter(|e| {
+                        program_names
+                            .get(&e.program_id)
+                            .is_some_and(|name| sources.contains(name.as_str()))
+                    })
+                    .collect()
+            } else {
+                events
+            }
+        } else {
+            events
+        };
+
         if events.is_empty() {
             continue;
         }
@@ -669,6 +711,7 @@ async fn feed_raw_instructions_to_decoder(
     chain_name: &str,
     tx: mpsc::Sender<DecoderMessage>,
     repair_scope: Option<&RepairScope>,
+    program_names: &HashMap<[u8; 32], String>,
 ) -> anyhow::Result<()> {
     let instructions_dir = raw_solana_instructions_dir(chain_name);
 
@@ -714,6 +757,24 @@ async fn feed_raw_instructions_to_decoder(
                 e
             )
         })?;
+
+        // Filter by source (program name) when repair scope specifies sources
+        let instructions = if let Some(scope) = repair_scope {
+            if let Some(ref sources) = scope.sources {
+                instructions
+                    .into_iter()
+                    .filter(|i| {
+                        program_names
+                            .get(&i.program_id)
+                            .is_some_and(|name| sources.contains(name.as_str()))
+                    })
+                    .collect()
+            } else {
+                instructions
+            }
+        } else {
+            instructions
+        };
 
         if instructions.is_empty() {
             continue;

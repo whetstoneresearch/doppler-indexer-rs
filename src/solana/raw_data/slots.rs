@@ -26,7 +26,7 @@ use crate::storage::skipped_slots::{self, SkippedSlotsIndex};
 use super::extraction::extract_events_and_instructions;
 use super::parquet::{
     build_event_schema, build_instruction_schema, build_slot_schema, read_events_from_parquet,
-    read_instructions_from_parquet, write_events_to_parquet_async,
+    read_instructions_from_parquet, read_slots_from_parquet, write_events_to_parquet_async,
     write_instructions_to_parquet_async, write_slots_to_parquet_async,
 };
 use super::types::{SolanaCollectionError, SolanaSlotRecord};
@@ -426,6 +426,21 @@ pub async fn collect_slots_selective(
         all_instructions.sort_by_key(|r| (r.slot, r.instruction_index));
     }
 
+    // In repair mode, merge slot records with existing so non-repaired slots
+    // in the same aligned range are preserved.
+    if let Some(repaired) = repair_slots {
+        let slot_path = slots_dir.join(range.file_name("slots"));
+        if slot_path.exists() {
+            if let Ok(existing) = read_slots_from_parquet(&slot_path) {
+                for record in existing {
+                    if !repaired.contains(&record.slot) {
+                        slot_records.entry(record.slot).or_insert(record);
+                    }
+                }
+            }
+        }
+    }
+
     // Write parquet files
     let slot_records_vec: Vec<_> = slot_records.into_values().collect();
 
@@ -443,7 +458,23 @@ pub async fn collect_slots_selective(
     // Update skipped slots index
     let mut skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
     let rk = skipped_slots::range_key(range.start, range.end_inclusive());
-    skipped_index.insert(rk, skipped_slots_list);
+    if let Some(repaired) = repair_slots {
+        // Merge: keep existing skipped slots for non-repaired slots,
+        // add new skipped slots from repaired slots
+        let mut merged = skipped_index
+            .get(&rk)
+            .cloned()
+            .unwrap_or_default();
+        // Remove skipped entries for slots being repaired (they may no longer be skipped)
+        merged.retain(|s| !repaired.contains(s));
+        // Add newly discovered skipped slots
+        merged.extend(&skipped_slots_list);
+        merged.sort_unstable();
+        merged.dedup();
+        skipped_index.insert(rk, merged);
+    } else {
+        skipped_index.insert(rk, skipped_slots_list);
+    }
     skipped_slots::write_skipped_slots_index(&events_dir, &skipped_index)?;
 
     // Send downstream

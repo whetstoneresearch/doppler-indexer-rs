@@ -213,13 +213,32 @@ pub async fn signature_driven_backfill(
         None
     };
 
+    // When repair scopes to specific sources, also scope the program IDs
+    // used for event/instruction extraction so unrelated programs in the
+    // same slot are not re-extracted.
+    let active_configured_programs = if let Some(scope) = repair_scope {
+        if scope.sources.is_some() {
+            active_programs
+                .values()
+                .filter_map(|p| {
+                    let bytes = p.program_id.parse::<solana_sdk::pubkey::Pubkey>().ok()?;
+                    Some(bytes.to_bytes())
+                })
+                .collect()
+        } else {
+            configured_programs.clone()
+        }
+    } else {
+        configured_programs.clone()
+    };
+
     for range in &ranges_to_process {
         collect_slots_selective(
             chain_name,
             rpc_client,
             range,
             &target_slots,
-            configured_programs,
+            &active_configured_programs,
             event_decoder_tx,
             instr_decoder_tx,
             merge_slots,
