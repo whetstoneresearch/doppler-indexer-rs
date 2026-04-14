@@ -47,11 +47,13 @@ pub struct SkippedFactoryTrigger {
 /// An event-triggered call matched with its config and encoded parameters,
 /// ready to be grouped by output key.
 pub(super) struct PreparedEventCall {
-    pub trigger: EventTriggerData,
-    pub config: EventTriggeredCallConfig,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub config: Arc<EventTriggeredCallConfig>,
     pub target_address: Address,
     pub decoded_values: Vec<DynSolValue>,
-    pub encoded_params: Vec<Vec<u8>>,
+    pub encoded_params: Arc<Vec<Vec<u8>>>,
 }
 
 /// A fully-built eth_call ready for RPC batch execution.
@@ -59,9 +61,11 @@ pub(super) struct PreparedEventCall {
 pub(super) struct PendingEventCall {
     pub request: TransactionRequest,
     pub block_id: BlockId,
-    pub trigger: EventTriggerData,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
     pub target_address: Address,
-    pub encoded_params: Vec<Vec<u8>>,
+    pub encoded_params: Arc<Vec<Vec<u8>>>,
 }
 
 /// Build event-triggered call configs from contracts configuration
@@ -594,6 +598,7 @@ pub(crate) async fn process_event_triggers(
     range_end: u64,
     contracts: &Contracts,
     skip_contract_index: bool,
+    trigger_batch_size: usize,
 ) -> Result<(Vec<SkippedFactoryTrigger>, PendingWrites), EthCallCollectionError> {
     let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
     let empty_writes = PendingWrites::new();
@@ -638,144 +643,159 @@ pub(crate) async fn process_event_triggers(
         return Ok((skipped_factory_triggers, empty_writes));
     }
 
-    // Group triggers by (source_name, event_signature) and then by (contract_name, function_name)
-    // to batch calls together
-    let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> = HashMap::new();
-
-    for trigger in triggers {
-        let key = (trigger.source_name.clone(), trigger.event_signature);
-
-        if let Some(configs) = event_call_configs.get(&key) {
-            for config in configs {
-                // Skip if trigger block is before contract's start_block
-                if let Some(sb) = config.start_block {
-                    if trigger.block_number < sb {
-                        continue;
-                    }
-                }
-
-                // Determine target address
-                let target_address = if let Some(addr) = config.target_address {
-                    addr
-                } else {
-                    // Factory collection - use event emitter, but ONLY if it's a known factory address
-                    let emitter = Address::from(trigger.emitter_address);
-                    match factory_addresses.get(&config.contract_name) {
-                        Some(known_addresses) => {
-                            if !known_addresses.contains(&emitter) {
-                                // Emitter not in known addresses — could be not-yet-discovered.
-                                // Buffer for replay; factory RangeComplete will drop if
-                                // this is a legitimate miss.
-                                skipped_factory_triggers.push(SkippedFactoryTrigger {
-                                    trigger: trigger.clone(),
-                                });
-                                tracing::debug!(
-                                    "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
-                                    emitter,
-                                    config.contract_name
-                                );
-                                continue;
-                            }
-                            emitter
-                        }
-                        None => {
-                            // No factory addresses known yet for this collection
-                            // Buffer the trigger for replay when addresses arrive
-                            skipped_factory_triggers.push(SkippedFactoryTrigger {
-                                trigger: trigger.clone(),
-                            });
-                            tracing::debug!(
-                                "Buffering event trigger for {}: no factory addresses loaded yet",
-                                config.contract_name
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                // Build parameters
-                let (params, encoded_params) =
-                    match build_event_call_params(&trigger, &config.params) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to build params for {}.{} from event: {}",
-                                config.contract_name,
-                                config.function_name,
-                                e
-                            );
-                            continue;
-                        }
-                    };
-
-                let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output
-                    .entry(output_key)
-                    .or_default()
-                    .push(PreparedEventCall {
-                        trigger: trigger.clone(),
-                        config: config.clone(),
-                        target_address,
-                        decoded_values: params,
-                        encoded_params,
-                    });
-            }
-        }
-    }
-
     // Track which (contract_name, function_name) pairs got results
     let mut written_pairs: HashSet<(String, String)> = HashSet::new();
 
-    // Phase 1: Submit ALL RPC calls across all groups in a single batch
-    // This maximizes RPC throughput vs. the old sequential-per-group approach.
+    // Accumulate results across trigger chunks. Each chunk builds PreparedEventCalls,
+    // submits RPC, and merges results here. Writing happens once after all chunks.
+    let mut group_results: HashMap<(String, String), (Vec<EventCallResult>, usize)> =
+        HashMap::new();
+
     struct TaggedCall {
         output_key: (String, String),
         pending: PendingEventCall,
         max_params: usize,
     }
 
-    let mut all_tagged: Vec<TaggedCall> = Vec::new();
-    for ((contract_name, function_name), calls) in &calls_by_output {
-        if calls.is_empty() {
+    // Determine chunk boundaries: 0 means "no chunking" (old behavior)
+    let chunk_size = if trigger_batch_size == 0 {
+        triggers.len()
+    } else {
+        trigger_batch_size
+    };
+
+    for trigger_chunk in triggers.chunks(chunk_size) {
+        // Group this chunk's triggers by (contract_name, function_name)
+        let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> =
+            HashMap::new();
+
+        for trigger in trigger_chunk {
+            let key = (trigger.source_name.clone(), trigger.event_signature);
+
+            if let Some(configs) = event_call_configs.get(&key) {
+                for config in configs {
+                    // Skip if trigger block is before contract's start_block
+                    if let Some(sb) = config.start_block {
+                        if trigger.block_number < sb {
+                            continue;
+                        }
+                    }
+
+                    // Determine target address
+                    let target_address = if let Some(addr) = config.target_address {
+                        addr
+                    } else {
+                        // Factory collection - use event emitter, but ONLY if it's a known factory address
+                        let emitter = Address::from(trigger.emitter_address);
+                        match factory_addresses.get(&config.contract_name) {
+                            Some(known_addresses) => {
+                                if !known_addresses.contains(&emitter) {
+                                    skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                        trigger: trigger.clone(),
+                                    });
+                                    tracing::debug!(
+                                        "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
+                                        emitter,
+                                        config.contract_name
+                                    );
+                                    continue;
+                                }
+                                emitter
+                            }
+                            None => {
+                                skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                    trigger: trigger.clone(),
+                                });
+                                tracing::debug!(
+                                    "Buffering event trigger for {}: no factory addresses loaded yet",
+                                    config.contract_name
+                                );
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Build parameters
+                    let (params, encoded_params) =
+                        match build_event_call_params(trigger, &config.params) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to build params for {}.{} from event: {}",
+                                    config.contract_name,
+                                    config.function_name,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                    let output_key = (config.contract_name.clone(), config.function_name.clone());
+                    let config_arc = Arc::new(config.clone());
+                    calls_by_output
+                        .entry(output_key)
+                        .or_default()
+                        .push(PreparedEventCall {
+                            block_number: trigger.block_number,
+                            block_timestamp: trigger.block_timestamp,
+                            log_index: trigger.log_index,
+                            config: config_arc,
+                            target_address,
+                            decoded_values: params,
+                            encoded_params: Arc::new(encoded_params),
+                        });
+                }
+            }
+        }
+
+        // Build tagged calls for this chunk's RPC batch
+        let mut all_tagged: Vec<TaggedCall> = Vec::new();
+        for ((contract_name, function_name), calls) in &calls_by_output {
+            if calls.is_empty() {
+                continue;
+            }
+            written_pairs.insert((contract_name.clone(), function_name.clone()));
+
+            let max_params = calls
+                .iter()
+                .map(|c| c.encoded_params.len())
+                .max()
+                .unwrap_or(0);
+
+            for call in calls {
+                let calldata =
+                    encode_call_with_params(call.config.function_selector, &call.decoded_values);
+                let tx = TransactionRequest::default()
+                    .to(call.target_address)
+                    .input(calldata.into());
+                let block_id = BlockId::Number(BlockNumberOrTag::Number(call.block_number));
+                all_tagged.push(TaggedCall {
+                    output_key: (contract_name.clone(), function_name.clone()),
+                    pending: PendingEventCall {
+                        request: tx,
+                        block_id,
+                        block_number: call.block_number,
+                        block_timestamp: call.block_timestamp,
+                        log_index: call.log_index,
+                        target_address: call.target_address,
+                        encoded_params: call.encoded_params.clone(),
+                    },
+                    max_params,
+                });
+            }
+        }
+
+        if all_tagged.is_empty() {
             continue;
         }
-        written_pairs.insert((contract_name.clone(), function_name.clone()));
 
-        let max_params = calls
-            .iter()
-            .map(|c| c.encoded_params.len())
-            .max()
-            .unwrap_or(0);
-
-        for call in calls {
-            let calldata =
-                encode_call_with_params(call.config.function_selector, &call.decoded_values);
-            let tx = TransactionRequest::default()
-                .to(call.target_address)
-                .input(calldata.into());
-            let block_id = BlockId::Number(BlockNumberOrTag::Number(call.trigger.block_number));
-            all_tagged.push(TaggedCall {
-                output_key: (contract_name.clone(), function_name.clone()),
-                pending: PendingEventCall {
-                    request: tx,
-                    block_id,
-                    trigger: call.trigger.clone(),
-                    target_address: call.target_address,
-                    encoded_params: call.encoded_params.clone(),
-                },
-                max_params,
-            });
-        }
-    }
-
-    if !all_tagged.is_empty() {
         let batch_calls: Vec<(TransactionRequest, BlockId)> = all_tagged
             .iter()
             .map(|t| (t.pending.request.clone(), t.pending.block_id))
             .collect();
 
         tracing::info!(
-            "Submitting {} event-triggered eth_calls in single batch for blocks {}-{}",
+            "Submitting {} event-triggered eth_calls in batch for blocks {}-{}",
             batch_calls.len(),
             range_start,
             range_end
@@ -783,22 +803,18 @@ pub(crate) async fn process_event_triggers(
 
         let results = ctx.client.call_batch(batch_calls).await?;
 
-        // Distribute results back to groups
-        let mut group_results: HashMap<(String, String), (Vec<EventCallResult>, usize)> =
-            HashMap::new();
-
         for (i, result) in results.into_iter().enumerate() {
             let tagged = &all_tagged[i];
             let call = &tagged.pending;
 
             let event_result = match result {
                 Ok(bytes) => EventCallResult {
-                    block_number: call.trigger.block_number,
-                    block_timestamp: call.trigger.block_timestamp,
-                    log_index: call.trigger.log_index,
+                    block_number: call.block_number,
+                    block_timestamp: call.block_timestamp,
+                    log_index: call.log_index,
                     target_address: call.target_address.0 .0,
                     value_bytes: bytes.to_vec(),
-                    param_values: call.encoded_params.clone(),
+                    param_values: (*call.encoded_params).clone(),
                     is_reverted: false,
                     revert_reason: None,
                 },
@@ -808,17 +824,17 @@ pub(crate) async fn process_event_triggers(
                         "Event-triggered eth_call reverted for {}.{} at block {} (address {}): {}",
                         tagged.output_key.0,
                         tagged.output_key.1,
-                        call.trigger.block_number,
+                        call.block_number,
                         call.target_address,
                         reason
                     );
                     EventCallResult {
-                        block_number: call.trigger.block_number,
-                        block_timestamp: call.trigger.block_timestamp,
-                        log_index: call.trigger.log_index,
+                        block_number: call.block_number,
+                        block_timestamp: call.block_timestamp,
+                        log_index: call.log_index,
                         target_address: call.target_address.0 .0,
                         value_bytes: Vec::new(),
-                        param_values: call.encoded_params.clone(),
+                        param_values: (*call.encoded_params).clone(),
                         is_reverted: true,
                         revert_reason: Some(reason),
                     }
@@ -830,7 +846,9 @@ pub(crate) async fn process_event_triggers(
                 .or_insert_with(|| (Vec::new(), tagged.max_params));
             entry.0.push(event_result);
         }
+    } // end trigger chunk loop
 
+    if !group_results.is_empty() {
         // Phase 2: Write all groups concurrently
         let mut write_set: tokio::task::JoinSet<Result<(), EthCallCollectionError>> =
             tokio::task::JoinSet::new();
@@ -1030,6 +1048,7 @@ pub(crate) async fn process_event_triggers_multicall(
     range_end: u64,
     contracts: &Contracts,
     skip_contract_index: bool,
+    trigger_batch_size: usize,
 ) -> Result<(Vec<SkippedFactoryTrigger>, PendingWrites), EthCallCollectionError> {
     let mut skipped_factory_triggers: Vec<SkippedFactoryTrigger> = Vec::new();
     let empty_writes = PendingWrites::new();
@@ -1074,254 +1093,258 @@ pub(crate) async fn process_event_triggers_multicall(
         return Ok((skipped_factory_triggers, empty_writes));
     }
 
-    // Group triggers by (source_name, event_signature) and prepare call info
-    // Key: (contract_name, function_name)
-    let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> = HashMap::new();
+    // Accumulate results across trigger chunks. Each chunk builds PreparedEventCalls,
+    // executes multicalls, and merges results here. Writing happens once after all chunks.
+    let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
+    let mut written_pairs: HashSet<(String, String)> = HashSet::new();
 
-    for trigger in triggers {
-        let key = (trigger.source_name.clone(), trigger.event_signature);
+    // Determine chunk boundaries: 0 means "no chunking" (old behavior)
+    let chunk_size = if trigger_batch_size == 0 {
+        triggers.len()
+    } else {
+        trigger_batch_size
+    };
 
-        if let Some(configs) = event_call_configs.get(&key) {
-            for config in configs {
-                // Skip if trigger block is before contract's start_block
-                if let Some(sb) = config.start_block {
-                    if trigger.block_number < sb {
-                        continue;
+    for trigger_chunk in triggers.chunks(chunk_size) {
+        // Group this chunk's triggers by (contract_name, function_name)
+        let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> =
+            HashMap::new();
+
+        for trigger in trigger_chunk {
+            let key = (trigger.source_name.clone(), trigger.event_signature);
+
+            if let Some(configs) = event_call_configs.get(&key) {
+                for config in configs {
+                    if let Some(sb) = config.start_block {
+                        if trigger.block_number < sb {
+                            continue;
+                        }
                     }
-                }
 
-                // Determine target address
-                let target_address = if let Some(addr) = config.target_address {
-                    addr
-                } else {
-                    // Factory collection - use event emitter, but ONLY if it's a known factory address
-                    let emitter = Address::from(trigger.emitter_address);
-                    match factory_addresses.get(&config.contract_name) {
-                        Some(known_addresses) => {
-                            if !known_addresses.contains(&emitter) {
-                                // Emitter not in known addresses — could be not-yet-discovered.
-                                // Buffer for replay; factory RangeComplete will drop if
-                                // this is a legitimate miss.
+                    let target_address = if let Some(addr) = config.target_address {
+                        addr
+                    } else {
+                        let emitter = Address::from(trigger.emitter_address);
+                        match factory_addresses.get(&config.contract_name) {
+                            Some(known_addresses) => {
+                                if !known_addresses.contains(&emitter) {
+                                    skipped_factory_triggers.push(SkippedFactoryTrigger {
+                                        trigger: trigger.clone(),
+                                    });
+                                    tracing::debug!(
+                                        "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
+                                        emitter,
+                                        config.contract_name
+                                    );
+                                    continue;
+                                }
+                                emitter
+                            }
+                            None => {
                                 skipped_factory_triggers.push(SkippedFactoryTrigger {
                                     trigger: trigger.clone(),
                                 });
                                 tracing::debug!(
-                                    "Buffering event trigger: emitter {:?} not yet in known addresses for {}",
-                                    emitter,
+                                    "Buffering event trigger for {}: no factory addresses loaded yet",
                                     config.contract_name
                                 );
                                 continue;
                             }
-                            emitter
-                        }
-                        None => {
-                            // No factory addresses known yet for this collection
-                            // Buffer the trigger for replay when addresses arrive
-                            skipped_factory_triggers.push(SkippedFactoryTrigger {
-                                trigger: trigger.clone(),
-                            });
-                            tracing::debug!(
-                                "Buffering event trigger for {}: no factory addresses loaded yet",
-                                config.contract_name
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                // Build parameters
-                let (params, encoded_params) =
-                    match build_event_call_params(&trigger, &config.params) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to build params for {}.{} from event: {}",
-                                config.contract_name,
-                                config.function_name,
-                                e
-                            );
-                            continue;
                         }
                     };
 
-                let output_key = (config.contract_name.clone(), config.function_name.clone());
-                calls_by_output
-                    .entry(output_key)
-                    .or_default()
-                    .push(PreparedEventCall {
-                        trigger: trigger.clone(),
-                        config: config.clone(),
-                        target_address,
-                        decoded_values: params,
-                        encoded_params,
-                    });
-            }
-        }
-    }
+                    let (params, encoded_params) =
+                        match build_event_call_params(trigger, &config.params) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to build params for {}.{} from event: {}",
+                                    config.contract_name,
+                                    config.function_name,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
 
-    if calls_by_output.is_empty() {
-        return Ok((skipped_factory_triggers, empty_writes));
-    }
-
-    // Group all calls by block number for multicall batching
-    let mut calls_by_block: HashMap<u64, Vec<PreparedEventCall>> = HashMap::new();
-
-    for ((_contract_name, _function_name), calls) in calls_by_output {
-        for call in calls {
-            let block_number = call.trigger.block_number;
-            calls_by_block.entry(block_number).or_default().push(call);
-        }
-    }
-
-    // Build per-block multicalls with block info included in metadata
-    let mut sorted_blocks: Vec<u64> = calls_by_block.keys().copied().collect();
-    sorted_blocks.sort_unstable();
-
-    let mut block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> = Vec::new();
-
-    for block_number in sorted_blocks {
-        if let Some(calls) = calls_by_block.get(&block_number) {
-            let mut slots: Vec<MulticallSlotGeneric<(EventCallMeta, u64, u64)>> = Vec::new();
-
-            for call_info in calls {
-                let calldata = encode_call_with_params(
-                    call_info.config.function_selector,
-                    &call_info.decoded_values,
-                );
-                slots.push(MulticallSlotGeneric {
-                    block_number,
-                    block_timestamp: call_info.trigger.block_timestamp,
-                    target_address: call_info.target_address,
-                    encoded_calldata: calldata,
-                    metadata: (
-                        EventCallMeta {
-                            contract_name: call_info.config.contract_name.clone(),
-                            function_name: call_info.config.function_name.clone(),
-                            target_address: call_info.target_address,
-                            log_index: call_info.trigger.log_index,
-                            param_values: call_info.encoded_params.clone(),
-                        },
-                        block_number,
-                        call_info.trigger.block_timestamp,
-                    ),
-                });
-            }
-
-            if !slots.is_empty() {
-                block_multicalls.push(BlockMulticall {
-                    block_number,
-                    block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
-                    slots,
-                });
-            }
-        }
-    }
-
-    if block_multicalls.is_empty() {
-        return Ok((skipped_factory_triggers, empty_writes));
-    }
-
-    // Get min/max blocks for logging and file naming
-    let min_block = block_multicalls
-        .iter()
-        .map(|bm| bm.block_number)
-        .min()
-        .unwrap();
-    let max_block = block_multicalls
-        .iter()
-        .map(|bm| bm.block_number)
-        .max()
-        .unwrap();
-
-    // Split oversized multicalls to prevent RPC timeouts on blocks with many events.
-    // A single multicall with 50+ sub-calls can take seconds to execute on the node,
-    // causing timeouts and retries that tank throughput.
-    const MAX_SUBCALLS_PER_MULTICALL: usize = 25;
-    let total_subcalls: usize = block_multicalls.iter().map(|bm| bm.slots.len()).sum();
-    let max_subcalls = block_multicalls
-        .iter()
-        .map(|bm| bm.slots.len())
-        .max()
-        .unwrap_or(0);
-
-    let block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> =
-        if max_subcalls > MAX_SUBCALLS_PER_MULTICALL {
-            let mut split = Vec::with_capacity(block_multicalls.len() * 2);
-            for bm in block_multicalls {
-                if bm.slots.len() <= MAX_SUBCALLS_PER_MULTICALL {
-                    split.push(bm);
-                } else {
-                    // Split into chunks, each becoming its own multicall at the same block
-                    for chunk in bm.slots.chunks(MAX_SUBCALLS_PER_MULTICALL) {
-                        split.push(BlockMulticall {
-                            block_number: bm.block_number,
-                            block_id: bm.block_id,
-                            slots: chunk.to_vec(),
+                    let output_key = (config.contract_name.clone(), config.function_name.clone());
+                    let config_arc = Arc::new(config.clone());
+                    calls_by_output
+                        .entry(output_key)
+                        .or_default()
+                        .push(PreparedEventCall {
+                            block_number: trigger.block_number,
+                            block_timestamp: trigger.block_timestamp,
+                            log_index: trigger.log_index,
+                            config: config_arc,
+                            target_address,
+                            decoded_values: params,
+                            encoded_params: Arc::new(encoded_params),
                         });
-                    }
                 }
             }
-            split
-        } else {
-            block_multicalls
-        };
-
-    tracing::info!(
-        "Executing {} multicalls ({} sub-calls, max {}/block) for event-triggered calls in blocks {}-{}",
-        block_multicalls.len(),
-        total_subcalls,
-        max_subcalls,
-        min_block,
-        max_block
-    );
-
-    // Execute all multicalls
-    let results = execute_multicalls_generic(
-        ctx.client,
-        multicall3_address,
-        block_multicalls,
-        ctx.chain_name,
-    )
-    .await?;
-
-    // Distribute results back to groups
-    let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
-
-    for ((meta, block_number, block_timestamp), return_data, success) in results {
-        let key = (meta.contract_name.clone(), meta.function_name.clone());
-        let is_reverted = !success;
-        let revert_reason = if is_reverted {
-            Some(format!(
-                "Multicall3 reported failure for {}.{} at block {}",
-                meta.contract_name, meta.function_name, block_number
-            ))
-        } else {
-            None
-        };
-        if is_reverted {
-            tracing::warn!(
-                "Multicall event-triggered eth_call reverted for {}.{} at block {} (address {}, log_index {})",
-                meta.contract_name,
-                meta.function_name,
-                block_number,
-                meta.target_address,
-                meta.log_index
-            );
         }
-        group_results.entry(key).or_default().push(EventCallResult {
-            block_number,
-            block_timestamp,
-            log_index: meta.log_index,
-            target_address: meta.target_address.0 .0,
-            value_bytes: if is_reverted { Vec::new() } else { return_data },
-            param_values: meta.param_values,
-            is_reverted,
-            revert_reason,
-        });
-    }
 
-    // Track which (contract_name, function_name) pairs got results
-    let mut written_pairs: HashSet<(String, String)> = HashSet::new();
+        if calls_by_output.is_empty() {
+            continue;
+        }
+
+        // Track output pairs for this chunk
+        for key in calls_by_output.keys() {
+            written_pairs.insert(key.clone());
+        }
+
+        // Group all calls by block number for multicall batching
+        let mut calls_by_block: HashMap<u64, Vec<PreparedEventCall>> = HashMap::new();
+
+        for ((_contract_name, _function_name), calls) in calls_by_output {
+            for call in calls {
+                let block_number = call.block_number;
+                calls_by_block.entry(block_number).or_default().push(call);
+            }
+        }
+
+        // Build per-block multicalls with block info included in metadata
+        let mut sorted_blocks: Vec<u64> = calls_by_block.keys().copied().collect();
+        sorted_blocks.sort_unstable();
+
+        let mut block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> = Vec::new();
+
+        for block_number in sorted_blocks {
+            if let Some(calls) = calls_by_block.get(&block_number) {
+                let mut slots: Vec<MulticallSlotGeneric<(EventCallMeta, u64, u64)>> = Vec::new();
+
+                for call_info in calls {
+                    let calldata = encode_call_with_params(
+                        call_info.config.function_selector,
+                        &call_info.decoded_values,
+                    );
+                    slots.push(MulticallSlotGeneric {
+                        block_number,
+                        block_timestamp: call_info.block_timestamp,
+                        target_address: call_info.target_address,
+                        encoded_calldata: calldata,
+                        metadata: (
+                            EventCallMeta {
+                                contract_name: call_info.config.contract_name.clone(),
+                                function_name: call_info.config.function_name.clone(),
+                                target_address: call_info.target_address,
+                                log_index: call_info.log_index,
+                                param_values: call_info.encoded_params.clone(),
+                            },
+                            block_number,
+                            call_info.block_timestamp,
+                        ),
+                    });
+                }
+
+                if !slots.is_empty() {
+                    block_multicalls.push(BlockMulticall {
+                        block_number,
+                        block_id: BlockId::Number(BlockNumberOrTag::Number(block_number)),
+                        slots,
+                    });
+                }
+            }
+        }
+
+        if block_multicalls.is_empty() {
+            continue;
+        }
+
+        // Split oversized multicalls to prevent RPC timeouts
+        const MAX_SUBCALLS_PER_MULTICALL: usize = 25;
+        let total_subcalls: usize = block_multicalls.iter().map(|bm| bm.slots.len()).sum();
+        let max_subcalls = block_multicalls
+            .iter()
+            .map(|bm| bm.slots.len())
+            .max()
+            .unwrap_or(0);
+
+        let min_block = block_multicalls
+            .iter()
+            .map(|bm| bm.block_number)
+            .min()
+            .unwrap();
+        let max_block = block_multicalls
+            .iter()
+            .map(|bm| bm.block_number)
+            .max()
+            .unwrap();
+
+        let block_multicalls: Vec<BlockMulticall<(EventCallMeta, u64, u64)>> =
+            if max_subcalls > MAX_SUBCALLS_PER_MULTICALL {
+                let mut split = Vec::with_capacity(block_multicalls.len() * 2);
+                for bm in block_multicalls {
+                    if bm.slots.len() <= MAX_SUBCALLS_PER_MULTICALL {
+                        split.push(bm);
+                    } else {
+                        for chunk in bm.slots.chunks(MAX_SUBCALLS_PER_MULTICALL) {
+                            split.push(BlockMulticall {
+                                block_number: bm.block_number,
+                                block_id: bm.block_id,
+                                slots: chunk.to_vec(),
+                            });
+                        }
+                    }
+                }
+                split
+            } else {
+                block_multicalls
+            };
+
+        tracing::info!(
+            "Executing {} multicalls ({} sub-calls, max {}/block) for event-triggered calls in blocks {}-{}",
+            block_multicalls.len(),
+            total_subcalls,
+            max_subcalls,
+            min_block,
+            max_block
+        );
+
+        // Execute multicalls for this chunk
+        let results = execute_multicalls_generic(
+            ctx.client,
+            multicall3_address,
+            block_multicalls,
+            ctx.chain_name,
+        )
+        .await?;
+
+        // Merge results into group_results
+        for ((meta, block_number, block_timestamp), return_data, success) in results {
+            let key = (meta.contract_name.clone(), meta.function_name.clone());
+            let is_reverted = !success;
+            let revert_reason = if is_reverted {
+                Some(format!(
+                    "Multicall3 reported failure for {}.{} at block {}",
+                    meta.contract_name, meta.function_name, block_number
+                ))
+            } else {
+                None
+            };
+            if is_reverted {
+                tracing::warn!(
+                    "Multicall event-triggered eth_call reverted for {}.{} at block {} (address {}, log_index {})",
+                    meta.contract_name,
+                    meta.function_name,
+                    block_number,
+                    meta.target_address,
+                    meta.log_index
+                );
+            }
+            group_results.entry(key).or_default().push(EventCallResult {
+                block_number,
+                block_timestamp,
+                log_index: meta.log_index,
+                target_address: meta.target_address.0 .0,
+                value_bytes: if is_reverted { Vec::new() } else { return_data },
+                param_values: (*meta.param_values).clone(),
+                is_reverted,
+                revert_reason,
+            });
+        }
+    } // end trigger chunk loop
 
     // Write parquet, upload S3, and send to decoder for all groups CONCURRENTLY.
     // Each group writes to a different file, so there's no conflict.
@@ -1332,8 +1355,6 @@ pub(crate) async fn process_event_triggers_multicall(
         if results.is_empty() {
             continue;
         }
-
-        written_pairs.insert((contract_name.clone(), function_name.clone()));
 
         results.sort_by_key(|r| (r.block_number, r.log_index, r.target_address));
 
@@ -1385,11 +1406,11 @@ pub(crate) async fn process_event_triggers_multicall(
                 .await?;
 
             tracing::info!(
-                "Wrote {} multicall event-triggered eth_call results to {} (event blocks {}-{})",
+                "Wrote {} multicall event-triggered eth_call results to {} (blocks {}-{})",
                 result_count,
                 output_path.display(),
-                min_block,
-                max_block,
+                range_start,
+                range_end,
             );
 
             if let Some(ref sm) = storage_manager {
