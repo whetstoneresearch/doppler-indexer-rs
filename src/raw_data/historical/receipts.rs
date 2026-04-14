@@ -305,8 +305,10 @@ pub fn extract_event_triggers(
 ///
 /// This avoids materializing full `LogData` rows when only event-trigger audit
 /// data is needed from historical log parquet.
+/// Takes ownership of batches so each is freed immediately after its triggers
+/// are extracted, avoiding holding all Arrow data alongside the growing triggers Vec.
 pub fn extract_event_triggers_from_batches(
-    batches: &[RecordBatch],
+    batches: Vec<RecordBatch>,
     matchers: &[EventTriggerMatcher],
 ) -> Vec<EventTriggerData> {
     let mut triggers = Vec::new();

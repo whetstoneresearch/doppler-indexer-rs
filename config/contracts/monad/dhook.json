@@ -1,10 +1,17 @@
 {
     "DopplerHookInitializer": {
         "address": "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
+        "start_block": 34746371,
         "events": [
-            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
-            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },
-            { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
+            {
+                "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
+            },
+            {
+                "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)"
+            },
+            {
+                "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)"
+            }
         ],
         "calls": [
             {
@@ -17,7 +24,10 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             },
             {
@@ -30,7 +40,10 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             },
             {
@@ -43,7 +56,12 @@
                     }
                 },
                 "target": "UniswapV4StateView",
-                "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+                "params": [
+                    {
+                        "type": "bytes32",
+                        "from_event": "topics[3]"
+                    }
+                ]
             },
             {
                 "function": "getSlot0(bytes32)",
@@ -55,20 +73,28 @@
                     }
                 },
                 "target": "UniswapV4StateView",
-                "params": [{ "type": "bytes32", "from_event": "v4_pool_id_from_key_data" }]
+                "params": [
+                    {
+                        "type": "bytes32",
+                        "from_event": "v4_pool_id_from_key_data"
+                    }
+                ]
             }
         ]
     },
     "RehypeDopplerHook": {
-        "address": "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503"
+        "address": "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
+        "start_block": 34746371
     },
     "DopplerHookMigrator": {
         "address": [
             "0x1e40b0875dda35f41e15cfb475403859b8c860c4",
             "0x65b6737c7a897029afe54dbb61bc4a84b232e0c4"
-        ]
+        ],
+        "start_block": 34746371
     },
     "RehypeDopplerHookMigrator": {
-        "address": "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
+        "address": "0xd199e7836e91654c0475a90e0c1d0e402bb84372",
+        "start_block": 34746371
     }
 }

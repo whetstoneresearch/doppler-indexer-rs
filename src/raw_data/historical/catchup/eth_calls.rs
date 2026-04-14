@@ -1114,15 +1114,17 @@ pub async fn collect_eth_calls(
                             log_count
                         );
 
+                        // Consume batches — each RecordBatch is freed immediately
+                        // after its triggers are extracted, instead of all batches
+                        // living alongside the growing triggers Vec.
                         let triggers =
-                            extract_event_triggers_from_batches(&batches, event_matchers.as_ref());
+                            extract_event_triggers_from_batches(batches, event_matchers.as_ref());
                         let (triggers, filtered_factory_triggers) =
                             filter_ready_factory_event_triggers(
                                 triggers,
                                 &factory_addresses,
                                 &ready_factory_sources_for_range,
                             );
-                        drop(batches);
 
                         if filtered_factory_triggers > 0 {
                             tracing::debug!(
@@ -1161,10 +1163,12 @@ pub async fn collect_eth_calls(
 
                         if !triggers.is_empty() {
                             tracing::info!(
-                                "Extracted {} event triggers for blocks {}-{}",
+                                "Extracted {} event triggers for blocks {}-{} (batch_size={}, ~{}MB est.)",
                                 triggers.len(),
                                 range_start,
-                                inclusive_end
+                                inclusive_end,
+                                trigger_batch_size,
+                                triggers.len() * 400 / 1_000_000, // rough per-trigger estimate
                             );
                         }
 

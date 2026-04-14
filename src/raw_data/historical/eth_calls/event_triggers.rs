@@ -657,19 +657,25 @@ pub(crate) async fn process_event_triggers(
         max_params: usize,
     }
 
-    // Determine chunk boundaries: 0 means "no chunking" (old behavior)
+    // Drain triggers in chunks so each chunk's heap data (topics, data, source_name)
+    // is freed immediately after its RPC batch, instead of all triggers living for
+    // the entire function. 0 means "no chunking" (old behavior).
     let chunk_size = if trigger_batch_size == 0 {
-        triggers.len()
+        usize::MAX
     } else {
         trigger_batch_size
     };
+    let mut triggers = triggers;
 
-    for trigger_chunk in triggers.chunks(chunk_size) {
+    while !triggers.is_empty() {
+        let drain_end = chunk_size.min(triggers.len());
+        let trigger_chunk: Vec<EventTriggerData> = triggers.drain(..drain_end).collect();
+
         // Group this chunk's triggers by (contract_name, function_name)
         let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> =
             HashMap::new();
 
-        for trigger in trigger_chunk {
+        for trigger in &trigger_chunk {
             let key = (trigger.source_name.clone(), trigger.event_signature);
 
             if let Some(configs) = event_call_configs.get(&key) {
@@ -1098,19 +1104,24 @@ pub(crate) async fn process_event_triggers_multicall(
     let mut group_results: HashMap<(String, String), Vec<EventCallResult>> = HashMap::new();
     let mut written_pairs: HashSet<(String, String)> = HashSet::new();
 
-    // Determine chunk boundaries: 0 means "no chunking" (old behavior)
+    // Drain triggers in chunks so each chunk's heap data (topics, data, source_name)
+    // is freed immediately after its multicall batch.
     let chunk_size = if trigger_batch_size == 0 {
-        triggers.len()
+        usize::MAX
     } else {
         trigger_batch_size
     };
+    let mut triggers = triggers;
 
-    for trigger_chunk in triggers.chunks(chunk_size) {
+    while !triggers.is_empty() {
+        let drain_end = chunk_size.min(triggers.len());
+        let trigger_chunk: Vec<EventTriggerData> = triggers.drain(..drain_end).collect();
+
         // Group this chunk's triggers by (contract_name, function_name)
         let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> =
             HashMap::new();
 
-        for trigger in trigger_chunk {
+        for trigger in &trigger_chunk {
             let key = (trigger.source_name.clone(), trigger.event_signature);
 
             if let Some(configs) = event_call_configs.get(&key) {
