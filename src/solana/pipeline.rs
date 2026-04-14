@@ -399,12 +399,10 @@ pub async fn process_solana_chain(
         None
     };
 
-    // Scoped repair: source or function filters narrow the decoded output,
-    // so stale-file cleanup must be skipped (the decoder only sees a subset).
-    let scoped_repair = repair
-        && repair_scope
-            .as_ref()
-            .is_some_and(|s| s.sources.is_some() || s.functions.is_some());
+    // During any repair, the decoder only receives freshly re-collected slots
+    // (not the full aligned range), so stale-file cleanup must be skipped —
+    // the decoder's output is never the authoritative full contents of a range.
+    let scoped_repair = repair;
 
     // Backfill task
     {
@@ -559,10 +557,9 @@ pub async fn decode_only_solana_chain(
         .and_then(|s| s.functions.as_ref())
         .map(|f| Arc::new(f.clone()));
 
-    // Scoped decode-only: source or function filters narrow the output
-    let scoped = repair_scope
-        .as_ref()
-        .is_some_and(|s| s.sources.is_some() || s.functions.is_some());
+    // Any repair scope makes the decode partial (range, source, or function
+    // filters all reduce what the decoder sees), so stale cleanup is unsafe.
+    let scoped = repair_scope.is_some();
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 

@@ -399,12 +399,20 @@ pub async fn collect_slots_selective(
         }
     }
 
-    // Snapshot the fresh record counts before merging in retained records.
-    // Only fresh records should be sent downstream to decoders — retained
-    // records are preserved in parquet but were not re-collected and should
-    // not trigger re-decoding.
-    let fresh_event_count = all_events.len();
-    let fresh_instruction_count = all_instructions.len();
+    // Clone fresh records before the merge so we can send only these to decoders.
+    // Retained records from other programs/slots are preserved in parquet but
+    // should not trigger re-decoding (which would overwrite decoded output for
+    // sources outside the repair scope).
+    let decoder_events = if repair_slots.is_some() {
+        Some(all_events.clone())
+    } else {
+        None
+    };
+    let decoder_instructions = if repair_slots.is_some() {
+        Some(all_instructions.clone())
+    } else {
+        None
+    };
 
     // In repair mode, merge fresh data with existing records from the parquet
     // file so that non-repaired slots in the same aligned range are preserved.
@@ -498,18 +506,16 @@ pub async fn collect_slots_selective(
     }
     skipped_slots::write_skipped_slots_index(&events_dir, &skipped_index)?;
 
-    // Send only the freshly extracted records downstream to decoders.
-    // Retained records from the merge are already decoded and should not
-    // be re-decoded (which would overwrite decoded parquet for sources
-    // outside the repair scope).
-    let decoder_events = all_events[..fresh_event_count].to_vec();
-    let decoder_instructions = all_instructions[..fresh_instruction_count].to_vec();
+    // During repair, send only the freshly extracted records (cloned before
+    // the merge) to decoders. During normal backfill, send all records.
+    let events_for_decoder = decoder_events.unwrap_or(all_events);
+    let instructions_for_decoder = decoder_instructions.unwrap_or(all_instructions);
 
     if let Some(tx) = event_decoder_tx {
         let msg = DecoderMessage::SolanaEventsReady {
             range_start: range.start,
             range_end: range.end,
-            events: decoder_events,
+            events: events_for_decoder,
             live_mode: false,
         };
         tx.send(msg)
@@ -523,7 +529,7 @@ pub async fn collect_slots_selective(
         let msg = DecoderMessage::SolanaInstructionsReady {
             range_start: range.start,
             range_end: range.end,
-            instructions: decoder_instructions,
+            instructions: instructions_for_decoder,
             live_mode: false,
         };
         tx.send(msg)
