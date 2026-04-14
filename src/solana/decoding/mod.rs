@@ -7,3 +7,4 @@ pub mod accounts;
 pub mod events;
 pub mod instructions;
 pub mod spl_token;
+pub mod tasks;
