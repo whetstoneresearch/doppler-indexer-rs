@@ -37,6 +37,11 @@ use super::instructions::SolanaInstructionDecoder;
 ///
 /// Scans `base_dir/{source}/{event_name}/` for any file named `range_file`
 /// where `(source, event_name)` is NOT in `written_groups`.
+///
+/// **Only safe when `written_groups` represents the complete decoded output
+/// for the range.** Callers must skip this when source or function filters
+/// are active, since the written set would be an incomplete subset and
+/// cleanup would delete files for out-of-scope groups.
 fn cleanup_stale_decoded_parquet(
     base_dir: &Path,
     written_groups: &HashMap<(String, String), Vec<DecodedEvent>>,
@@ -113,6 +118,9 @@ fn cleanup_stale_decoded_parquet(
 /// `(source_name, event_name)` so each group gets its own parquet file and
 /// the transformation engine receives one [`DecodedEventsMessage`] per handler
 /// trigger.
+/// When `scoped_repair` is true, stale decoded parquet cleanup is skipped
+/// because the decoder only sees a filtered subset of the range and cannot
+/// determine which other files are genuinely stale vs. out-of-scope.
 pub async fn decode_solana_events(
     decoder: Arc<SolanaEventDecoder>,
     program_names: Arc<HashMap<[u8; 32], String>>,
@@ -121,6 +129,7 @@ pub async fn decode_solana_events(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
+    scoped_repair: bool,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_events_dir(&chain_name);
@@ -207,10 +216,11 @@ pub async fn decode_solana_events(
                     }
                 }
 
-                // Remove stale decoded parquet for this range: any
-                // (source, event_name) directory that has the range file
-                // but was NOT in this batch's by_trigger output.
-                cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
+                // Remove stale decoded parquet for this range — only when the
+                // decoder has the complete picture (no source or function filters).
+                if !scoped_repair {
+                    cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
+                }
 
                 // Send one message per (source_name, event_name) group
                 if let Some(ref tx) = transform_tx {
@@ -277,6 +287,7 @@ pub async fn decode_solana_instructions(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
+    scoped_repair: bool,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_instructions_dir(&chain_name);
@@ -363,8 +374,10 @@ pub async fn decode_solana_instructions(
                     }
                 }
 
-                // Remove stale decoded parquet for this range
-                cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
+                // Remove stale decoded parquet for this range — only when unscoped
+                if !scoped_repair {
+                    cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
+                }
 
                 // Send one message per (source_name, instruction_name) group
                 if let Some(ref tx) = transform_tx {
@@ -531,6 +544,7 @@ mod tests {
             Some(complete_tx),
             chain_name,
             None,
+            false,
         ));
 
         // Send an event batch
@@ -598,6 +612,7 @@ mod tests {
             Some(complete_tx),
             "test-solana-instr".to_string(),
             None,
+            false,
         ));
 
         decoder_tx
@@ -636,6 +651,7 @@ mod tests {
             None,
             "test-close".to_string(),
             None,
+            false,
         ));
 
         // Drop sender to close channel
@@ -676,6 +692,7 @@ mod tests {
             Some(complete_tx),
             "test-unknown".to_string(),
             None,
+            false,
         ));
 
         // Send batch with one known and one unknown program event

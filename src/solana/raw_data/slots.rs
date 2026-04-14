@@ -399,6 +399,13 @@ pub async fn collect_slots_selective(
         }
     }
 
+    // Snapshot the fresh record counts before merging in retained records.
+    // Only fresh records should be sent downstream to decoders — retained
+    // records are preserved in parquet but were not re-collected and should
+    // not trigger re-decoding.
+    let fresh_event_count = all_events.len();
+    let fresh_instruction_count = all_instructions.len();
+
     // In repair mode, merge fresh data with existing records from the parquet
     // file so that non-repaired slots in the same aligned range are preserved.
     // When repair_program_ids is set (source-scoped repair), only drop records
@@ -491,12 +498,18 @@ pub async fn collect_slots_selective(
     }
     skipped_slots::write_skipped_slots_index(&events_dir, &skipped_index)?;
 
-    // Send downstream
+    // Send only the freshly extracted records downstream to decoders.
+    // Retained records from the merge are already decoded and should not
+    // be re-decoded (which would overwrite decoded parquet for sources
+    // outside the repair scope).
+    let decoder_events = all_events[..fresh_event_count].to_vec();
+    let decoder_instructions = all_instructions[..fresh_instruction_count].to_vec();
+
     if let Some(tx) = event_decoder_tx {
         let msg = DecoderMessage::SolanaEventsReady {
             range_start: range.start,
             range_end: range.end,
-            events: all_events,
+            events: decoder_events,
             live_mode: false,
         };
         tx.send(msg)
@@ -510,7 +523,7 @@ pub async fn collect_slots_selective(
         let msg = DecoderMessage::SolanaInstructionsReady {
             range_start: range.start,
             range_end: range.end,
-            instructions: all_instructions,
+            instructions: decoder_instructions,
             live_mode: false,
         };
         tx.send(msg)

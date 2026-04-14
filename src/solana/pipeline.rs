@@ -399,6 +399,13 @@ pub async fn process_solana_chain(
         None
     };
 
+    // Scoped repair: source or function filters narrow the decoded output,
+    // so stale-file cleanup must be skipped (the decoder only sees a subset).
+    let scoped_repair = repair
+        && repair_scope
+            .as_ref()
+            .is_some_and(|s| s.sources.is_some() || s.functions.is_some());
+
     // Backfill task
     {
         let chain_name = runtime.chain.name.clone();
@@ -440,8 +447,9 @@ pub async fn process_solana_chain(
         let chain_name = runtime.chain.name.clone();
         let ff = function_filter.clone();
 
+        let sr = scoped_repair;
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name, ff)
+            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name, ff, sr)
                 .await;
             Ok(())
         });
@@ -458,6 +466,7 @@ pub async fn process_solana_chain(
         let complete = transform_complete_tx.clone();
         let chain_name = runtime.chain.name.clone();
         let ff = function_filter.clone();
+        let sr = scoped_repair;
 
         tasks.spawn(async move {
             decode_solana_instructions(
@@ -468,6 +477,7 @@ pub async fn process_solana_chain(
                 complete,
                 chain_name,
                 ff,
+                sr,
             )
             .await;
             Ok(())
@@ -549,6 +559,11 @@ pub async fn decode_only_solana_chain(
         .and_then(|s| s.functions.as_ref())
         .map(|f| Arc::new(f.clone()));
 
+    // Scoped decode-only: source or function filters narrow the output
+    let scoped = repair_scope
+        .as_ref()
+        .is_some_and(|s| s.sources.is_some() || s.functions.is_some());
+
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
     // Event decoding
@@ -560,7 +575,7 @@ pub async fn decode_only_solana_chain(
         let ff = function_filter.clone();
 
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, names, rx, None, None, chain_name, ff).await;
+            decode_solana_events(event_decoder, names, rx, None, None, chain_name, ff, scoped).await;
             Ok(())
         });
 
@@ -588,7 +603,7 @@ pub async fn decode_only_solana_chain(
         let ff = function_filter.clone();
 
         tasks.spawn(async move {
-            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name, ff).await;
+            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name, ff, scoped).await;
             Ok(())
         });
 
