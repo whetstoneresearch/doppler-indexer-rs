@@ -495,6 +495,8 @@ async fn main() -> anyhow::Result<()> {
                             &config,
                             &chain,
                             catch_up_only,
+                            repair,
+                            repair_scope,
                             shared_db_pool,
                         )
                         .await

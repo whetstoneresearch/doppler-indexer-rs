@@ -20,12 +20,17 @@ use crate::solana::decoding::spl_token::SplTokenDecoder;
 use crate::solana::decoding::tasks::{decode_solana_events, decode_solana_instructions};
 use crate::solana::decoding::traits::ProgramDecoder;
 use crate::solana::raw_data::catchup::signature_driven_backfill;
+use crate::solana::raw_data::parquet::{read_events_from_parquet, read_instructions_from_parquet};
 use crate::solana::rpc::SolanaRpcClient;
+use crate::storage::paths::{
+    raw_solana_events_dir, raw_solana_instructions_dir, scan_parquet_ranges,
+};
 use crate::transformations::registry::{build_registry_for_solana_chain, TransformationRegistry};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::defaults;
 use crate::types::config::indexer::IndexerConfig;
 use crate::types::config::solana::SolanaPrograms;
+use crate::types::shared::repair::RepairScope;
 
 // ---------------------------------------------------------------------------
 // Feature detection
@@ -324,9 +329,19 @@ pub async fn process_solana_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
     catch_up_only: bool,
+    repair: bool,
+    repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
 ) -> anyhow::Result<()> {
     tracing::info!(chain = chain.name.as_str(), "Starting Solana pipeline");
+
+    if repair || repair_scope.is_some() {
+        tracing::warn!(
+            chain = chain.name.as_str(),
+            "Solana repair mode is not yet implemented — running normal backfill instead. \
+             Repair scope will be ignored."
+        );
+    }
 
     let runtime = SolanaChainRuntime::build(config, chain, shared_db_pool).await?;
 
@@ -413,9 +428,11 @@ pub async fn process_solana_chain(
         let program_names = runtime.program_names.clone();
         let tx = transform_events_tx.clone();
         let complete = transform_complete_tx.clone();
+        let chain_name = runtime.chain.name.clone();
 
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, program_names, event_rx, tx, complete).await;
+            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name)
+                .await;
             Ok(())
         });
     }
@@ -429,9 +446,18 @@ pub async fn process_solana_chain(
         let program_names = runtime.program_names.clone();
         let tx = transform_events_tx.clone();
         let complete = transform_complete_tx.clone();
+        let chain_name = runtime.chain.name.clone();
 
         tasks.spawn(async move {
-            decode_solana_instructions(instr_decoder, program_names, instr_rx, tx, complete).await;
+            decode_solana_instructions(
+                instr_decoder,
+                program_names,
+                instr_rx,
+                tx,
+                complete,
+                chain_name,
+            )
+            .await;
             Ok(())
         });
     }
@@ -510,15 +536,18 @@ pub async fn decode_only_solana_chain(
         let event_decoder = Arc::new(SolanaEventDecoder::new(decoders.clone()));
         let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
         let names = program_names.clone();
+        let chain_name = chain.name.clone();
 
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, names, rx, None, None).await;
+            decode_solana_events(event_decoder, names, rx, None, None, chain_name).await;
             Ok(())
         });
 
-        // TODO: Read raw event parquet files and send as SolanaEventsReady messages.
-        // For now, close the channel immediately since parquet reading is not wired.
-        drop(tx);
+        // Spawn reader task to feed raw event parquet files into the decoder channel
+        let event_chain_name = chain.name.clone();
+        tasks.spawn(async move {
+            feed_raw_events_to_decoder(&event_chain_name, tx).await
+        });
     }
 
     // Instruction decoding
@@ -526,14 +555,18 @@ pub async fn decode_only_solana_chain(
         let instr_decoder = Arc::new(SolanaInstructionDecoder::new(decoders.clone()));
         let (tx, rx) = mpsc::channel::<DecoderMessage>(channel_capacity);
         let names = program_names.clone();
+        let chain_name = chain.name.clone();
 
         tasks.spawn(async move {
-            decode_solana_instructions(instr_decoder, names, rx, None, None).await;
+            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name).await;
             Ok(())
         });
 
-        // TODO: Read raw instruction parquet files and send as SolanaInstructionsReady.
-        drop(tx);
+        // Spawn reader task to feed raw instruction parquet files into the decoder channel
+        let instr_chain_name = chain.name.clone();
+        tasks.spawn(async move {
+            feed_raw_instructions_to_decoder(&instr_chain_name, tx).await
+        });
     }
 
     while let Some(result) = tasks.join_next().await {
@@ -545,6 +578,145 @@ pub async fn decode_only_solana_chain(
         "Solana decode-only processing complete"
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Raw parquet file readers for decode-only mode
+// ---------------------------------------------------------------------------
+
+/// Read raw event parquet files from disk and send them as
+/// [`DecoderMessage::SolanaEventsReady`] on the provided channel.
+///
+/// After all files are sent, sends [`DecoderMessage::AllComplete`] and drops
+/// the sender.
+async fn feed_raw_events_to_decoder(
+    chain_name: &str,
+    tx: mpsc::Sender<DecoderMessage>,
+) -> anyhow::Result<()> {
+    let events_dir = raw_solana_events_dir(chain_name);
+
+    let ranges = match scan_parquet_ranges(&events_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                chain = chain_name,
+                "No raw events directory found, skipping event decode"
+            );
+            let _ = tx.send(DecoderMessage::AllComplete).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    tracing::info!(
+        chain = chain_name,
+        files = ranges.len(),
+        "Reading raw event parquet files for decode-only mode"
+    );
+
+    for (start, end_inclusive, path) in &ranges {
+        let events = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || read_events_from_parquet(&path)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("join error reading events: {}", e))?
+        .map_err(|e| anyhow::anyhow!("error reading event parquet {}: {}", path.display(), e))?;
+
+        if events.is_empty() {
+            continue;
+        }
+
+        // range_end is exclusive in DecoderMessage convention
+        let range_end = end_inclusive + 1;
+
+        if tx
+            .send(DecoderMessage::SolanaEventsReady {
+                range_start: *start,
+                range_end,
+                events,
+                live_mode: false,
+            })
+            .await
+            .is_err()
+        {
+            tracing::debug!("Event decoder channel closed early");
+            return Ok(());
+        }
+    }
+
+    let _ = tx.send(DecoderMessage::AllComplete).await;
+    Ok(())
+}
+
+/// Read raw instruction parquet files from disk and send them as
+/// [`DecoderMessage::SolanaInstructionsReady`] on the provided channel.
+///
+/// After all files are sent, sends [`DecoderMessage::AllComplete`] and drops
+/// the sender.
+async fn feed_raw_instructions_to_decoder(
+    chain_name: &str,
+    tx: mpsc::Sender<DecoderMessage>,
+) -> anyhow::Result<()> {
+    let instructions_dir = raw_solana_instructions_dir(chain_name);
+
+    let ranges = match scan_parquet_ranges(&instructions_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                chain = chain_name,
+                "No raw instructions directory found, skipping instruction decode"
+            );
+            let _ = tx.send(DecoderMessage::AllComplete).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    tracing::info!(
+        chain = chain_name,
+        files = ranges.len(),
+        "Reading raw instruction parquet files for decode-only mode"
+    );
+
+    for (start, end_inclusive, path) in &ranges {
+        let instructions = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || read_instructions_from_parquet(&path)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("join error reading instructions: {}", e))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "error reading instruction parquet {}: {}",
+                path.display(),
+                e
+            )
+        })?;
+
+        if instructions.is_empty() {
+            continue;
+        }
+
+        let range_end = end_inclusive + 1;
+
+        if tx
+            .send(DecoderMessage::SolanaInstructionsReady {
+                range_start: *start,
+                range_end,
+                instructions,
+                live_mode: false,
+            })
+            .await
+            .is_err()
+        {
+            tracing::debug!("Instruction decoder channel closed early");
+            return Ok(());
+        }
+    }
+
+    let _ = tx.send(DecoderMessage::AllComplete).await;
     Ok(())
 }
 

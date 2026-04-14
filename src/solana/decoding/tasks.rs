@@ -3,6 +3,9 @@
 //! These functions receive raw events/instructions on a channel, decode them
 //! using [`SolanaEventDecoder`] / [`SolanaInstructionDecoder`], and forward
 //! decoded results to the transformation engine.
+//!
+//! Decoded events are also always written to parquet on disk so that output
+//! is persisted regardless of whether the transformation channel is present.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,10 +13,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::decoding::DecoderMessage;
+use crate::storage::paths::{decoded_solana_events_dir, decoded_solana_instructions_dir};
 use crate::transformations::engine::{
     DecodedEventsMessage, RangeCompleteKind, RangeCompleteMessage,
 };
 
+use super::decoded_parquet::{build_decoded_event_schema, write_decoded_events_to_parquet};
 use super::events::SolanaEventDecoder;
 use super::instructions::SolanaInstructionDecoder;
 
@@ -22,20 +27,25 @@ use super::instructions::SolanaInstructionDecoder;
 // ---------------------------------------------------------------------------
 
 /// Async task that receives [`DecoderMessage::SolanaEventsReady`], decodes
-/// events via the routing layer, and forwards results to the transformation
-/// engine.
+/// events via the routing layer, writes decoded parquet to disk, and
+/// optionally forwards results to the transformation engine.
 ///
 /// Events are grouped by `program_id` before decoding (since each program has
 /// a different decoder). Decoded events are then regrouped by
-/// `(source_name, event_name)` so the transformation engine receives one
-/// [`DecodedEventsMessage`] per handler trigger.
+/// `(source_name, event_name)` so each group gets its own parquet file and
+/// the transformation engine receives one [`DecodedEventsMessage`] per handler
+/// trigger.
 pub async fn decode_solana_events(
     decoder: Arc<SolanaEventDecoder>,
     program_names: Arc<HashMap<[u8; 32], String>>,
     mut decoder_rx: Receiver<DecoderMessage>,
     transform_tx: Option<Sender<DecodedEventsMessage>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
+    chain_name: String,
 ) {
+    let schema = build_decoded_event_schema();
+    let base_dir = decoded_solana_events_dir(&chain_name);
+
     while let Some(msg) = decoder_rx.recv().await {
         match msg {
             #[cfg(feature = "solana")]
@@ -73,6 +83,41 @@ pub async fn decode_solana_events(
                     for event in decoded {
                         let key = (event.source_name.clone(), event.event_name.clone());
                         by_trigger.entry(key).or_default().push(event);
+                    }
+                }
+
+                // Write decoded parquet per (source_name, event_name) group
+                let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
+                for ((source_name, event_name), events) in &by_trigger {
+                    if events.is_empty() {
+                        continue;
+                    }
+                    let output_dir = base_dir.join(source_name).join(event_name);
+                    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+                        tracing::error!(
+                            path = %output_dir.display(),
+                            error = %e,
+                            "Failed to create decoded events output directory"
+                        );
+                        continue;
+                    }
+                    let file_name = format!("{}-{}.parquet", range_start, range_end_inclusive);
+                    let output_path = output_dir.join(&file_name);
+
+                    if let Err(e) = write_decoded_events_to_parquet(events, &schema, &output_path) {
+                        tracing::error!(
+                            path = %output_path.display(),
+                            error = %e,
+                            "Failed to write decoded events parquet"
+                        );
+                    } else {
+                        tracing::debug!(
+                            source = source_name.as_str(),
+                            event = event_name.as_str(),
+                            count = events.len(),
+                            path = %output_path.display(),
+                            "Wrote decoded events parquet"
+                        );
                     }
                 }
 
@@ -128,8 +173,8 @@ pub async fn decode_solana_events(
 // ---------------------------------------------------------------------------
 
 /// Async task that receives [`DecoderMessage::SolanaInstructionsReady`],
-/// decodes instructions via the routing layer, and forwards results to the
-/// transformation engine.
+/// decodes instructions via the routing layer, writes decoded parquet to disk,
+/// and optionally forwards results to the transformation engine.
 ///
 /// Instructions are decoded into [`DecodedEvent`]s (instruction args + named
 /// accounts merged into params) and sent as [`DecodedEventsMessage`]s.
@@ -139,7 +184,11 @@ pub async fn decode_solana_instructions(
     mut decoder_rx: Receiver<DecoderMessage>,
     transform_tx: Option<Sender<DecodedEventsMessage>>,
     complete_tx: Option<Sender<RangeCompleteMessage>>,
+    chain_name: String,
 ) {
+    let schema = build_decoded_event_schema();
+    let base_dir = decoded_solana_instructions_dir(&chain_name);
+
     while let Some(msg) = decoder_rx.recv().await {
         match msg {
             #[cfg(feature = "solana")]
@@ -178,6 +227,41 @@ pub async fn decode_solana_instructions(
                     for event in decoded {
                         let key = (event.source_name.clone(), event.event_name.clone());
                         by_trigger.entry(key).or_default().push(event);
+                    }
+                }
+
+                // Write decoded parquet per (source_name, instruction_name) group
+                let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
+                for ((source_name, event_name), events) in &by_trigger {
+                    if events.is_empty() {
+                        continue;
+                    }
+                    let output_dir = base_dir.join(source_name).join(event_name);
+                    if let Err(e) = std::fs::create_dir_all(&output_dir) {
+                        tracing::error!(
+                            path = %output_dir.display(),
+                            error = %e,
+                            "Failed to create decoded instructions output directory"
+                        );
+                        continue;
+                    }
+                    let file_name = format!("{}-{}.parquet", range_start, range_end_inclusive);
+                    let output_path = output_dir.join(&file_name);
+
+                    if let Err(e) = write_decoded_events_to_parquet(events, &schema, &output_path) {
+                        tracing::error!(
+                            path = %output_path.display(),
+                            error = %e,
+                            "Failed to write decoded instructions parquet"
+                        );
+                    } else {
+                        tracing::debug!(
+                            source = source_name.as_str(),
+                            instruction = event_name.as_str(),
+                            count = events.len(),
+                            path = %output_path.display(),
+                            "Wrote decoded instructions parquet"
+                        );
                     }
                 }
 
@@ -333,12 +417,18 @@ mod tests {
         let (transform_tx, mut transform_rx) = tokio::sync::mpsc::channel(10);
         let (complete_tx, mut complete_rx) = tokio::sync::mpsc::channel(10);
 
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let chain_name = format!("test-{}", tmp_dir.path().file_name().unwrap().to_str().unwrap());
+
+        // Create the expected output directory under a temp-like data dir
+        // We need the test to write to a real dir so use the chain_name approach
         let handle = tokio::spawn(decode_solana_events(
             decoder,
             program_names,
             decoder_rx,
             Some(transform_tx),
             Some(complete_tx),
+            chain_name,
         ));
 
         // Send an event batch
@@ -404,6 +494,7 @@ mod tests {
             decoder_rx,
             Some(transform_tx),
             Some(complete_tx),
+            "test-solana-instr".to_string(),
         ));
 
         decoder_tx
@@ -440,6 +531,7 @@ mod tests {
             decoder_rx,
             None,
             None,
+            "test-close".to_string(),
         ));
 
         // Drop sender to close channel
@@ -478,6 +570,7 @@ mod tests {
             decoder_rx,
             Some(transform_tx),
             Some(complete_tx),
+            "test-unknown".to_string(),
         ));
 
         // Send batch with one known and one unknown program event
