@@ -551,13 +551,17 @@ pub async fn decode_only_solana_chain(
         .and_then(|s| s.functions.as_ref())
         .map(|f| Arc::new(f.clone()));
 
-    // Source scope for stale cleanup: in decode-only mode the feeders already
-    // filter raw records by source, so the decoder has a complete view for those
-    // sources. Pass the source set so cleanup is limited to them.
-    let source_scope: Option<Arc<HashSet<String>>> = repair_scope
+    // Build the set of source names to SKIP during stale cleanup: current
+    // source names for programs NOT in the repair scope. Unknown directories
+    // on disk (e.g. old names from a source rename) are NOT in this set, so
+    // they will still be scanned and cleaned up.
+    let skip_sources: Option<Arc<HashSet<String>>> = repair_scope
         .as_ref()
         .and_then(|s| s.sources.as_ref())
-        .map(|s| Arc::new(s.clone()));
+        .map(|scoped| {
+            let all_names: HashSet<String> = program_names.values().cloned().collect();
+            Arc::new(all_names.difference(scoped).cloned().collect())
+        });
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
@@ -568,7 +572,7 @@ pub async fn decode_only_solana_chain(
         let names = program_names.clone();
         let chain_name = chain.name.clone();
         let ff = function_filter.clone();
-        let ss = source_scope.clone();
+        let ss = skip_sources.clone();
 
         tasks.spawn(async move {
             decode_solana_events(event_decoder, names, rx, None, None, chain_name, ff, ss).await;
@@ -597,7 +601,7 @@ pub async fn decode_only_solana_chain(
         let names = program_names.clone();
         let chain_name = chain.name.clone();
         let ff = function_filter.clone();
-        let ss = source_scope.clone();
+        let ss = skip_sources.clone();
 
         tasks.spawn(async move {
             decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name, ff, ss).await;
