@@ -1,14 +1,15 @@
-//! Arrow schemas and parquet writing for Solana raw data records.
+//! Arrow schemas and parquet writing/reading for Solana raw data records.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder, UInt16Array,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, AsArray, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
+    ListBuilder, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use super::types::{
     SolanaCollectionError, SolanaEventRecord, SolanaInstructionRecord, SolanaSlotRecord,
@@ -311,6 +312,360 @@ pub async fn write_instructions_to_parquet_async(
     })
     .await
     .map_err(|e| SolanaCollectionError::JoinError(e.to_string()))?
+}
+
+// ---------------------------------------------------------------------------
+// Parquet readers
+// ---------------------------------------------------------------------------
+
+/// Read `SolanaEventRecord`s from a parquet file.
+pub fn read_events_from_parquet(path: &Path) -> Result<Vec<SolanaEventRecord>, SolanaCollectionError> {
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
+    let reader = builder
+        .build()
+        .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
+
+    let mut records = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let num_rows = batch.num_rows();
+
+        let slot_arr = batch
+            .column_by_name("slot")
+            .expect("missing slot column")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("slot is not UInt64");
+
+        let block_time_arr = batch
+            .column_by_name("block_time")
+            .expect("missing block_time column")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("block_time is not Int64");
+
+        let tx_sig_arr = batch
+            .column_by_name("transaction_signature")
+            .expect("missing transaction_signature column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("transaction_signature is not FixedSizeBinary");
+
+        let program_id_arr = batch
+            .column_by_name("program_id")
+            .expect("missing program_id column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("program_id is not FixedSizeBinary");
+
+        let discriminator_arr = batch
+            .column_by_name("event_discriminator")
+            .expect("missing event_discriminator column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("event_discriminator is not FixedSizeBinary");
+
+        let data_arr = batch
+            .column_by_name("event_data")
+            .expect("missing event_data column")
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("event_data is not Binary");
+
+        let log_index_arr = batch
+            .column_by_name("log_index")
+            .expect("missing log_index column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("log_index is not UInt32");
+
+        let ix_arr = batch
+            .column_by_name("instruction_index")
+            .expect("missing instruction_index column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("instruction_index is not UInt16");
+
+        let inner_ix_arr = batch
+            .column_by_name("inner_instruction_index")
+            .expect("missing inner_instruction_index column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("inner_instruction_index is not UInt16");
+
+        for i in 0..num_rows {
+            let mut tx_sig = [0u8; 64];
+            tx_sig.copy_from_slice(tx_sig_arr.value(i));
+
+            let mut program_id = [0u8; 32];
+            program_id.copy_from_slice(program_id_arr.value(i));
+
+            let mut discriminator = [0u8; 8];
+            discriminator.copy_from_slice(discriminator_arr.value(i));
+
+            records.push(SolanaEventRecord {
+                slot: slot_arr.value(i),
+                block_time: if block_time_arr.is_null(i) {
+                    None
+                } else {
+                    Some(block_time_arr.value(i))
+                },
+                transaction_signature: tx_sig,
+                program_id,
+                event_discriminator: discriminator,
+                event_data: data_arr.value(i).to_vec(),
+                log_index: log_index_arr.value(i),
+                instruction_index: ix_arr.value(i),
+                inner_instruction_index: if inner_ix_arr.is_null(i) {
+                    None
+                } else {
+                    Some(inner_ix_arr.value(i))
+                },
+            });
+        }
+    }
+
+    Ok(records)
+}
+
+/// Read `SolanaSlotRecord`s from a parquet file.
+pub fn read_slots_from_parquet(path: &Path) -> Result<Vec<SolanaSlotRecord>, SolanaCollectionError> {
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
+    let reader = builder
+        .build()
+        .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
+
+    let mut records = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let num_rows = batch.num_rows();
+
+        let slot_arr = batch
+            .column_by_name("slot")
+            .expect("missing slot column")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("slot is not UInt64");
+
+        let block_time_arr = batch
+            .column_by_name("block_time")
+            .expect("missing block_time column")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("block_time is not Int64");
+
+        let block_height_arr = batch
+            .column_by_name("block_height")
+            .expect("missing block_height column")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("block_height is not UInt64");
+
+        let parent_slot_arr = batch
+            .column_by_name("parent_slot")
+            .expect("missing parent_slot column")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("parent_slot is not UInt64");
+
+        let blockhash_arr = batch
+            .column_by_name("blockhash")
+            .expect("missing blockhash column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("blockhash is not FixedSizeBinary");
+
+        let prev_blockhash_arr = batch
+            .column_by_name("previous_blockhash")
+            .expect("missing previous_blockhash column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("previous_blockhash is not FixedSizeBinary");
+
+        let tx_count_arr = batch
+            .column_by_name("transaction_count")
+            .expect("missing transaction_count column")
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("transaction_count is not UInt32");
+
+        let tx_sigs_col = batch
+            .column_by_name("transaction_signatures")
+            .expect("missing transaction_signatures column");
+        let tx_sigs_list = tx_sigs_col.as_list::<i32>();
+
+        for i in 0..num_rows {
+            let mut blockhash = [0u8; 32];
+            blockhash.copy_from_slice(blockhash_arr.value(i));
+
+            let mut previous_blockhash = [0u8; 32];
+            previous_blockhash.copy_from_slice(prev_blockhash_arr.value(i));
+
+            // Extract transaction_signatures list
+            let mut transaction_signatures: Vec<[u8; 64]> = Vec::new();
+            if !tx_sigs_list.is_null(i) {
+                let sig_values = tx_sigs_list.value(i);
+                let fsb = sig_values
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("transaction_signatures list items are not FixedSizeBinary(64)");
+                for j in 0..fsb.len() {
+                    if !fsb.is_null(j) {
+                        let mut sig = [0u8; 64];
+                        sig.copy_from_slice(fsb.value(j));
+                        transaction_signatures.push(sig);
+                    }
+                }
+            }
+
+            records.push(SolanaSlotRecord {
+                slot: slot_arr.value(i),
+                block_time: if block_time_arr.is_null(i) {
+                    None
+                } else {
+                    Some(block_time_arr.value(i))
+                },
+                block_height: if block_height_arr.is_null(i) {
+                    None
+                } else {
+                    Some(block_height_arr.value(i))
+                },
+                parent_slot: parent_slot_arr.value(i),
+                blockhash,
+                previous_blockhash,
+                transaction_count: tx_count_arr.value(i),
+                transaction_signatures,
+            });
+        }
+    }
+
+    Ok(records)
+}
+
+/// Read `SolanaInstructionRecord`s from a parquet file.
+pub fn read_instructions_from_parquet(
+    path: &Path,
+) -> Result<Vec<SolanaInstructionRecord>, SolanaCollectionError> {
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
+    let reader = builder
+        .build()
+        .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
+
+    let mut records = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let num_rows = batch.num_rows();
+
+        let slot_arr = batch
+            .column_by_name("slot")
+            .expect("missing slot column")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("slot is not UInt64");
+
+        let block_time_arr = batch
+            .column_by_name("block_time")
+            .expect("missing block_time column")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("block_time is not Int64");
+
+        let tx_sig_arr = batch
+            .column_by_name("transaction_signature")
+            .expect("missing transaction_signature column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("transaction_signature is not FixedSizeBinary");
+
+        let program_id_arr = batch
+            .column_by_name("program_id")
+            .expect("missing program_id column")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("program_id is not FixedSizeBinary");
+
+        let data_arr = batch
+            .column_by_name("data")
+            .expect("missing data column")
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("data is not Binary");
+
+        let accounts_col = batch
+            .column_by_name("accounts")
+            .expect("missing accounts column");
+        let accounts_list = accounts_col
+            .as_list::<i32>();
+
+        let ix_arr = batch
+            .column_by_name("instruction_index")
+            .expect("missing instruction_index column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("instruction_index is not UInt16");
+
+        let inner_ix_arr = batch
+            .column_by_name("inner_instruction_index")
+            .expect("missing inner_instruction_index column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("inner_instruction_index is not UInt16");
+
+        for i in 0..num_rows {
+            let mut tx_sig = [0u8; 64];
+            tx_sig.copy_from_slice(tx_sig_arr.value(i));
+
+            let mut program_id = [0u8; 32];
+            program_id.copy_from_slice(program_id_arr.value(i));
+
+            // Extract accounts list
+            let mut accounts: Vec<[u8; 32]> = Vec::new();
+            if !accounts_list.is_null(i) {
+                let account_values = accounts_list.value(i);
+                let fsb = account_values
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("account list items are not FixedSizeBinary(32)");
+                for j in 0..fsb.len() {
+                    if !fsb.is_null(j) {
+                        let mut acc = [0u8; 32];
+                        acc.copy_from_slice(fsb.value(j));
+                        accounts.push(acc);
+                    }
+                }
+            }
+
+            records.push(SolanaInstructionRecord {
+                slot: slot_arr.value(i),
+                block_time: if block_time_arr.is_null(i) {
+                    None
+                } else {
+                    Some(block_time_arr.value(i))
+                },
+                transaction_signature: tx_sig,
+                program_id,
+                data: data_arr.value(i).to_vec(),
+                accounts,
+                instruction_index: ix_arr.value(i),
+                inner_instruction_index: if inner_ix_arr.is_null(i) {
+                    None
+                } else {
+                    Some(inner_ix_arr.value(i))
+                },
+            });
+        }
+    }
+
+    Ok(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -617,5 +972,153 @@ mod tests {
 
         assert!(path.exists());
         assert_eq!(read_parquet_row_count(&path), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Event reader tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_events_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events_rt.parquet");
+        let schema = build_event_schema();
+        let original = sample_event_records();
+
+        write_events_to_parquet(&original, &schema, &path).unwrap();
+        let read_back = read_events_from_parquet(&path).unwrap();
+
+        assert_eq!(read_back.len(), 2);
+        assert_eq!(read_back[0].slot, original[0].slot);
+        assert_eq!(read_back[0].block_time, original[0].block_time);
+        assert_eq!(
+            read_back[0].transaction_signature,
+            original[0].transaction_signature
+        );
+        assert_eq!(read_back[0].program_id, original[0].program_id);
+        assert_eq!(
+            read_back[0].event_discriminator,
+            original[0].event_discriminator
+        );
+        assert_eq!(read_back[0].event_data, original[0].event_data);
+        assert_eq!(read_back[0].log_index, original[0].log_index);
+        assert_eq!(read_back[0].instruction_index, original[0].instruction_index);
+        assert_eq!(
+            read_back[0].inner_instruction_index,
+            original[0].inner_instruction_index
+        );
+
+        // Second record has inner_instruction_index = Some(3)
+        assert_eq!(read_back[1].inner_instruction_index, Some(3));
+    }
+
+    #[test]
+    fn test_read_events_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events_empty_rt.parquet");
+        let schema = build_event_schema();
+
+        write_events_to_parquet(&[], &schema, &path).unwrap();
+        let read_back = read_events_from_parquet(&path).unwrap();
+
+        assert!(read_back.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Instruction reader tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_instructions_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("instructions_rt.parquet");
+        let schema = build_instruction_schema();
+        let original = sample_instruction_records();
+
+        write_instructions_to_parquet(&original, &schema, &path).unwrap();
+        let read_back = read_instructions_from_parquet(&path).unwrap();
+
+        assert_eq!(read_back.len(), 2);
+        assert_eq!(read_back[0].slot, original[0].slot);
+        assert_eq!(read_back[0].block_time, original[0].block_time);
+        assert_eq!(
+            read_back[0].transaction_signature,
+            original[0].transaction_signature
+        );
+        assert_eq!(read_back[0].program_id, original[0].program_id);
+        assert_eq!(read_back[0].data, original[0].data);
+        assert_eq!(read_back[0].accounts.len(), 2);
+        assert_eq!(read_back[0].accounts[0], original[0].accounts[0]);
+        assert_eq!(read_back[0].accounts[1], original[0].accounts[1]);
+        assert_eq!(read_back[0].instruction_index, original[0].instruction_index);
+        assert!(read_back[0].inner_instruction_index.is_none());
+
+        // Second record
+        assert_eq!(read_back[1].inner_instruction_index, Some(0));
+        assert!(read_back[1].accounts.is_empty());
+        assert!(read_back[1].data.is_empty());
+    }
+
+    #[test]
+    fn test_read_instructions_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("instructions_empty_rt.parquet");
+        let schema = build_instruction_schema();
+
+        write_instructions_to_parquet(&[], &schema, &path).unwrap();
+        let read_back = read_instructions_from_parquet(&path).unwrap();
+
+        assert!(read_back.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Slot reader tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_read_slots_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("slots_rt.parquet");
+        let schema = build_slot_schema();
+        let original = sample_slot_records();
+
+        write_slots_to_parquet(&original, &schema, &path).unwrap();
+        let read_back = read_slots_from_parquet(&path).unwrap();
+
+        assert_eq!(read_back.len(), 2);
+
+        // First record
+        assert_eq!(read_back[0].slot, original[0].slot);
+        assert_eq!(read_back[0].block_time, original[0].block_time);
+        assert_eq!(read_back[0].block_height, original[0].block_height);
+        assert_eq!(read_back[0].parent_slot, original[0].parent_slot);
+        assert_eq!(read_back[0].blockhash, original[0].blockhash);
+        assert_eq!(read_back[0].previous_blockhash, original[0].previous_blockhash);
+        assert_eq!(read_back[0].transaction_count, original[0].transaction_count);
+        assert_eq!(read_back[0].transaction_signatures.len(), 2);
+        assert_eq!(read_back[0].transaction_signatures[0], original[0].transaction_signatures[0]);
+        assert_eq!(read_back[0].transaction_signatures[1], original[0].transaction_signatures[1]);
+
+        // Second record (optional fields are None, empty signatures)
+        assert_eq!(read_back[1].slot, original[1].slot);
+        assert!(read_back[1].block_time.is_none());
+        assert!(read_back[1].block_height.is_none());
+        assert_eq!(read_back[1].parent_slot, original[1].parent_slot);
+        assert_eq!(read_back[1].blockhash, original[1].blockhash);
+        assert_eq!(read_back[1].previous_blockhash, original[1].previous_blockhash);
+        assert_eq!(read_back[1].transaction_count, 0);
+        assert!(read_back[1].transaction_signatures.is_empty());
+    }
+
+    #[test]
+    fn test_read_slots_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("slots_empty_rt.parquet");
+        let schema = build_slot_schema();
+
+        write_slots_to_parquet(&[], &schema, &path).unwrap();
+        let read_back = read_slots_from_parquet(&path).unwrap();
+
+        assert!(read_back.is_empty());
     }
 }

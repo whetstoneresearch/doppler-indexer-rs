@@ -75,6 +75,18 @@ pub fn solana_discovery_dir(chain: &str) -> PathBuf {
     PathBuf::from(format!("data/{}/discovery", chain))
 }
 
+/// `data/{chain}/historical/decoded/events`
+#[cfg(feature = "solana")]
+pub fn decoded_solana_events_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/events", chain))
+}
+
+/// `data/{chain}/historical/decoded/instructions`
+#[cfg(feature = "solana")]
+pub fn decoded_solana_instructions_dir(chain: &str) -> PathBuf {
+    PathBuf::from(format!("data/{}/historical/decoded/instructions", chain))
+}
+
 // ---------------------------------------------------------------------------
 // EVM decoded path builders
 // ---------------------------------------------------------------------------
@@ -352,6 +364,19 @@ mod tests {
         assert_eq!(
             decoded_eth_calls_dir("ethereum"),
             PathBuf::from("data/ethereum/historical/decoded/eth_calls")
+        );
+    }
+
+    #[cfg(feature = "solana")]
+    #[test]
+    fn solana_decoded_path_builders() {
+        assert_eq!(
+            decoded_solana_events_dir("solana-mainnet"),
+            PathBuf::from("data/solana-mainnet/historical/decoded/events")
+        );
+        assert_eq!(
+            decoded_solana_instructions_dir("solana-mainnet"),
+            PathBuf::from("data/solana-mainnet/historical/decoded/instructions")
         );
     }
 

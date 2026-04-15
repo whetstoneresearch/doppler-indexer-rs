@@ -886,6 +886,34 @@ pub fn build_registry_for_chain(
     registry
 }
 
+/// Build a transformation registry for a Solana chain.
+///
+/// Sources are derived from `solana_programs` keys instead of EVM contracts.
+/// Handlers are filtered by `ChainType::Solana`.
+#[cfg(feature = "solana")]
+pub fn build_registry_for_solana_chain(
+    chain_id: u64,
+    solana_programs: &crate::types::config::solana::SolanaPrograms,
+) -> TransformationRegistry {
+    let available: HashSet<String> = solana_programs.keys().cloned().collect();
+    let mut registry =
+        TransformationRegistry::with_source_and_chain_filter(available, ChainType::Solana);
+
+    // Solana transformation handlers will be registered here as they're implemented.
+    // For now, the registry is empty but properly source-filtered and chain-type-filtered.
+
+    registry.validate_and_sort_handler_dependencies();
+
+    tracing::info!(
+        "Built Solana transformation registry with {} handlers ({} event triggers, {} account state triggers)",
+        registry.handler_count(),
+        registry.all_event_triggers().len(),
+        registry.all_account_state_triggers().len(),
+    );
+
+    registry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

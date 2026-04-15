@@ -14,9 +14,9 @@ Rather than abstracting everything behind traits, we use a **parallel implementa
 
 ## Branch Status
 
-This branch combines groundwork from data types and trait/runtime phases. Not a runnable Solana pipeline yet.
+Phases 1-7 are complete. The Solana historical pipeline is wired end-to-end: `chain_type: solana` in config activates signature-driven backfill, raw data collection, event/instruction decoding (via IDL or built-in decoders), and dispatches to the transformation engine when handlers exist. Live mode (Phase 8) is stubbed.
 
-Implemented:
+Implemented (Phases 1-2, from earlier work):
 - `src/types/chain.rs` with `ChainAddress`, `TxId`, `LogPosition`, and `ChainType`
 - `ChainConfig.chain_type` with a backward-compatible default of `evm`
 - `TransformationHandler::chain_type()` defaulting to `ChainType::Evm`
@@ -31,14 +31,37 @@ Implemented:
 - `serde-big-array` support for serializing `[u8; 64]` in `TxId::Solana`
 - UTF-8-safe RPC error truncation
 
-Not yet implemented:
-- Generalized `DecodedEvent` / `DecodedCall`
-- `ChainServices` wiring in `TransformationContext` (only a placeholder enum exists)
-- Solana config types such as `programs`, `idl_path`, or account-read config
-- `main.rs` chain-type dispatch or a real Solana pipeline
-- Solana RPC, raw-data, decoding, and live modules under `src/solana/`
+Implemented (Phases 3-6):
+- Solana config types: `SolanaProgramConfig`, `SolanaEventConfig`, `SolanaAccountReadConfig`, `SolanaDiscoveryConfig`, `SolanaCommitment`
+- `SolanaRpcClient` with rate limiting, retry, batch operations
+- `SolanaWsClient` with auto-reconnection and gap detection
+- Raw data collection: slot/block fetching, event/instruction extraction, signature-driven backfill
+- Address discovery: `DiscoveryManager` with bootstrap, event-driven discovery, persistence
+- `ProgramDecoder` trait with `AnchorDecoder` (IDL-driven) and `SplTokenDecoder` (built-in)
+- IDL parser supporting pre-0.30 and 0.30+ Anchor formats
+- Dynamic Borsh deserializer for IDL type trees
+- Event, instruction, and account decoder routers producing `DecodedEvent`/`DecodedAccountState`
 
-Practical implication: `chain_type: solana` is parsed and used for handler filtering, but it does not yet activate Solana collection, decoding, or live processing.
+Implemented (Phase 7):
+- `RangeCompleteKind::Instructions` for independent instruction completion signaling
+- `SolanaChainFeatures` detection from program config
+- `SolanaChainRuntime` with RPC client, decoder construction, program ID mapping
+- Decoder task functions (`decode_solana_events`, `decode_solana_instructions`) as async channel loops
+- `process_solana_chain()` historical pipeline entry point
+- `decode_only_solana_chain()` for re-decoding existing parquet
+- `main.rs` chain-type dispatch routing Solana chains to the new pipeline
+- `build_registry_for_solana_chain()` with source and chain-type filtering
+- Decoded Solana storage paths (`decoded_solana_events_dir`, `decoded_solana_instructions_dir`)
+- Solana RPC method variants in metrics
+
+Not yet implemented (Phase 8 — Live Mode):
+- Live slot collector via WebSocket subscription
+- Solana reorg detection via parent-slot chain verification
+- Live account reader (event-triggered account state fetches)
+- Live storage types and bincode persistence
+- `TransformationEngine` integration for Solana (requires making the EVM RPC client optional)
+
+Practical implication: `chain_type: solana` activates the full historical pipeline (backfill, decode, write parquet). Transformation handlers can be registered by implementing `TransformationHandler` with `chain_type() -> ChainType::Solana`. Live mode logs a warning and is skipped.
 
 ---
 

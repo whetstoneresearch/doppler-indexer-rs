@@ -25,7 +25,8 @@ use crate::storage::skipped_slots::{self, SkippedSlotsIndex};
 
 use super::extraction::extract_events_and_instructions;
 use super::parquet::{
-    build_event_schema, build_instruction_schema, build_slot_schema, write_events_to_parquet_async,
+    build_event_schema, build_instruction_schema, build_slot_schema, read_events_from_parquet,
+    read_instructions_from_parquet, read_slots_from_parquet, write_events_to_parquet_async,
     write_instructions_to_parquet_async, write_slots_to_parquet_async,
 };
 use super::types::{SolanaCollectionError, SolanaSlotRecord};
@@ -76,7 +77,6 @@ pub async fn collect_solana_raw_data(
         start_slot,
         end_slot,
         range_size,
-        &events_dir,
         &skipped_index,
     );
 
@@ -204,7 +204,6 @@ pub fn compute_slot_ranges_to_fetch(
     start: u64,
     end: u64,
     range_size: u64,
-    dir: &Path,
     skipped_index: &SkippedSlotsIndex,
 ) -> Vec<BlockRange> {
     if start >= end || range_size == 0 {
@@ -212,9 +211,6 @@ pub fn compute_slot_ranges_to_fetch(
     }
 
     let aligned_start = (start / range_size) * range_size;
-
-    // Scan existing parquet files for completed ranges
-    let existing_files = crate::storage::paths::scan_parquet_filenames(dir, "events_");
 
     let mut ranges = Vec::new();
     let mut current = aligned_start;
@@ -227,13 +223,13 @@ pub fn compute_slot_ranges_to_fetch(
 
         let rk = skipped_slots::range_key(range.start, range.end_inclusive());
 
-        // Skip if already complete (exists in skipped index, meaning we processed it)
+        // The skipped-slots sidecar is the authoritative completion marker — it
+        // is written after all parquet files for the range. A parquet file alone
+        // is not proof of completion (a crash between parquet write and sidecar
+        // update would leave a partial range).
         let already_complete = skipped_slots::is_range_complete(skipped_index, &rk);
 
-        // Also skip if parquet file already exists
-        let file_exists = existing_files.contains(&range.file_name("events"));
-
-        if !already_complete && !file_exists {
+        if !already_complete {
             ranges.push(range);
         }
 
@@ -339,6 +335,11 @@ fn extract_block_signatures(block: &UiConfirmedBlock) -> Vec<[u8; 64]> {
 /// Similar to [`collect_solana_raw_data`] but only fetches the given slots
 /// instead of every slot in the range. Used by the signature-driven backfill
 /// which knows exactly which slots contain relevant transactions.
+///
+/// When `repair_slots` is `Some`, only those specific slots are re-fetched and
+/// the new data is **merged** with existing parquet records for the range.
+/// Records from the repaired slots are replaced; records from other slots in
+/// the range are preserved.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_slots_selective(
     chain_name: &str,
@@ -348,6 +349,8 @@ pub async fn collect_slots_selective(
     configured_programs: &HashSet<[u8; 32]>,
     event_decoder_tx: Option<&Sender<DecoderMessage>>,
     instr_decoder_tx: Option<&Sender<DecoderMessage>>,
+    repair_slots: Option<&BTreeSet<u64>>,
+    repair_program_ids: Option<&HashSet<[u8; 32]>>,
 ) -> Result<(), SolanaCollectionError> {
     let slots_dir = raw_solana_slots_dir(chain_name);
     let events_dir = raw_solana_events_dir(chain_name);
@@ -363,11 +366,18 @@ pub async fn collect_slots_selective(
         .copied()
         .collect();
 
-    if slots_to_fetch.is_empty() {
+    // In non-repair mode, skip ranges with nothing to fetch. In repair mode,
+    // proceed even with zero slots: the merge step may need to filter out
+    // records from programs no longer in the config.
+    if slots_to_fetch.is_empty() && repair_slots.is_none() {
         return Ok(());
     }
 
-    let block_results = rpc_client.get_blocks_batch(&slots_to_fetch).await?;
+    let block_results = if slots_to_fetch.is_empty() {
+        Vec::new()
+    } else {
+        rpc_client.get_blocks_batch(&slots_to_fetch).await?
+    };
 
     let mut slot_records: BTreeMap<u64, SolanaSlotRecord> = BTreeMap::new();
     let mut all_events = Vec::new();
@@ -391,12 +401,80 @@ pub async fn collect_slots_selective(
         }
     }
 
+    // In repair mode, merge fresh data with existing records from the parquet
+    // file so that non-repaired slots in the same aligned range are preserved.
+    // When repair_program_ids is set (source-scoped repair), only drop records
+    // that match both the repaired slot AND the repaired program; records from
+    // other programs in the same slot are retained.
+    //
+    // The merged result is sent to decoders (not just the fresh subset) so that
+    // decoded parquet output is complete for the full aligned range.
+    if let Some(repaired) = repair_slots {
+        let is_being_repaired = |slot: u64, program_id: &[u8; 32]| -> bool {
+            if !repaired.contains(&slot) {
+                return false;
+            }
+            match repair_program_ids {
+                Some(programs) => programs.contains(program_id),
+                None => true, // unscoped repair: all programs in repaired slots
+            }
+        };
+
+        let events_path = events_dir.join(range.file_name("events"));
+        if events_path.exists() {
+            let existing = read_events_from_parquet(&events_path)?;
+            let retained: Vec<_> = existing
+                .into_iter()
+                .filter(|r| !is_being_repaired(r.slot, &r.program_id))
+                .collect();
+            all_events.extend(retained);
+        }
+        all_events.sort_by_key(|r| (r.slot, r.log_index));
+
+        let instr_path = instructions_dir.join(range.file_name("instructions"));
+        if instr_path.exists() {
+            let existing = read_instructions_from_parquet(&instr_path)?;
+            let retained: Vec<_> = existing
+                .into_iter()
+                .filter(|r| !is_being_repaired(r.slot, &r.program_id))
+                .collect();
+            all_instructions.extend(retained);
+        }
+        all_instructions.sort_by_key(|r| (r.slot, r.instruction_index));
+    }
+
+    // In repair mode, merge slot records with existing so non-repaired slots
+    // in the same aligned range are preserved.
+    if let Some(repaired) = repair_slots {
+        let slot_path = slots_dir.join(range.file_name("slots"));
+        if slot_path.exists() {
+            let existing = read_slots_from_parquet(&slot_path)?;
+            for record in existing {
+                if !repaired.contains(&record.slot) {
+                    slot_records.entry(record.slot).or_insert(record);
+                }
+            }
+        }
+    }
+
+    // During unscoped repair (repair_program_ids is None), drop records from
+    // programs no longer in the config. This cleans up raw data for removed
+    // sources whose ranges are revisited but yield no new signatures.
+    if repair_slots.is_some() && repair_program_ids.is_none() {
+        all_events.retain(|r| configured_programs.contains(&r.program_id));
+        all_instructions.retain(|r| configured_programs.contains(&r.program_id));
+    }
+
     // Write parquet files
     let slot_records_vec: Vec<_> = slot_records.into_values().collect();
 
+    let slot_path = slots_dir.join(range.file_name("slots"));
     if !slot_records_vec.is_empty() {
-        let slot_path = slots_dir.join(range.file_name("slots"));
         write_slots_to_parquet_async(slot_records_vec, slot_schema, slot_path).await?;
+    } else if slot_path.exists() {
+        // All slots in the range resolved to empty/skipped — remove the stale
+        // slot file so it stays consistent with events/instructions.
+        std::fs::remove_file(&slot_path)?;
     }
 
     let events_path = events_dir.join(range.file_name("events"));
@@ -408,10 +486,25 @@ pub async fn collect_slots_selective(
     // Update skipped slots index
     let mut skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
     let rk = skipped_slots::range_key(range.start, range.end_inclusive());
-    skipped_index.insert(rk, skipped_slots_list);
+    if let Some(repaired) = repair_slots {
+        // Merge: keep existing skipped slots for non-repaired slots,
+        // add new skipped slots from repaired slots
+        let mut merged = skipped_index
+            .get(&rk)
+            .cloned()
+            .unwrap_or_default();
+        // Remove skipped entries for slots being repaired (they may no longer be skipped)
+        merged.retain(|s| !repaired.contains(s));
+        // Add newly discovered skipped slots
+        merged.extend(&skipped_slots_list);
+        merged.sort_unstable();
+        merged.dedup();
+        skipped_index.insert(rk, merged);
+    } else {
+        skipped_index.insert(rk, skipped_slots_list);
+    }
     skipped_slots::write_skipped_slots_index(&events_dir, &skipped_index)?;
 
-    // Send downstream
     if let Some(tx) = event_decoder_tx {
         let msg = DecoderMessage::SolanaEventsReady {
             range_start: range.start,
@@ -463,9 +556,8 @@ mod tests {
     #[test]
     fn test_compute_slot_ranges_basic() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
-        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, &empty_index);
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].start, 0);
@@ -479,10 +571,9 @@ mod tests {
     #[test]
     fn test_compute_slot_ranges_alignment() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
         // start_slot=500 should align down to 0
-        let ranges = compute_slot_ranges_to_fetch(500, 2500, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(500, 2500, 1000, &empty_index);
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].start, 0);
@@ -499,9 +590,7 @@ mod tests {
         // Mark range 1000-1999 as complete
         index.insert(skipped_slots::range_key(1000, 1999), vec![1050]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-
-        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, dir.path(), &index);
+        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, &index);
 
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].start, 0);
@@ -516,31 +605,27 @@ mod tests {
         index.insert(skipped_slots::range_key(0, 999), vec![]);
         index.insert(skipped_slots::range_key(1000, 1999), vec![]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-
-        let ranges = compute_slot_ranges_to_fetch(0, 2000, 1000, dir.path(), &index);
+        let ranges = compute_slot_ranges_to_fetch(0, 2000, 1000, &index);
         assert!(ranges.is_empty());
     }
 
     #[test]
     fn test_compute_slot_ranges_empty_input() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
         // start >= end
-        let ranges = compute_slot_ranges_to_fetch(1000, 1000, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(1000, 1000, 1000, &empty_index);
         assert!(ranges.is_empty());
 
-        let ranges = compute_slot_ranges_to_fetch(2000, 1000, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(2000, 1000, 1000, &empty_index);
         assert!(ranges.is_empty());
     }
 
     #[test]
     fn test_compute_slot_ranges_zero_range_size() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
-        let ranges = compute_slot_ranges_to_fetch(0, 1000, 0, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(0, 1000, 0, &empty_index);
         assert!(ranges.is_empty());
     }
 

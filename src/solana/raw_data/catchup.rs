@@ -27,6 +27,7 @@ use crate::storage::paths::{
 };
 use crate::storage::skipped_slots;
 use crate::types::config::solana::SolanaPrograms;
+use crate::types::shared::repair::RepairScope;
 
 use super::slots::collect_slots_selective;
 use super::types::SolanaCollectionError;
@@ -55,11 +56,14 @@ pub async fn signature_driven_backfill(
     configured_programs: &HashSet<[u8; 32]>,
     event_decoder_tx: Option<&Sender<DecoderMessage>>,
     instr_decoder_tx: Option<&Sender<DecoderMessage>>,
+    repair_scope: Option<&RepairScope>,
 ) -> Result<(), SolanaCollectionError> {
     if programs.is_empty() {
         tracing::info!(chain = chain_name, "No Solana programs configured, nothing to backfill");
         return Ok(());
     }
+
+    let is_repair = repair_scope.is_some();
 
     // Create output directories
     let slots_dir = raw_solana_slots_dir(chain_name);
@@ -70,16 +74,6 @@ pub async fn signature_driven_backfill(
     std::fs::create_dir_all(&events_dir)?;
     std::fs::create_dir_all(&instructions_dir)?;
 
-    // Find resume point from existing data
-    let resume_slot = find_resume_slot(chain_name);
-    if let Some(slot) = resume_slot {
-        tracing::info!(
-            chain = chain_name,
-            resume_slot = slot,
-            "Resuming signature-driven backfill from existing data"
-        );
-    }
-
     // Determine global start_slot (minimum across all programs)
     let global_start = programs
         .values()
@@ -87,25 +81,68 @@ pub async fn signature_driven_backfill(
         .min()
         .unwrap_or(0);
 
-    // Effective start: if we have existing data, skip slots we already processed
-    let effective_start = match resume_slot {
-        Some(s) if s >= global_start => s + 1,
-        _ => global_start,
+    // In repair mode, from_block overrides resume and global start.
+    // In normal mode, resume from existing data.
+    let effective_start = if let Some(scope) = repair_scope {
+        scope.from_block.unwrap_or(global_start)
+    } else {
+        let resume_slot = find_resume_slot(chain_name);
+        if let Some(slot) = resume_slot {
+            tracing::info!(
+                chain = chain_name,
+                resume_slot = slot,
+                "Resuming signature-driven backfill from existing data"
+            );
+        }
+        match resume_slot {
+            Some(s) if s >= global_start => s + 1,
+            _ => global_start,
+        }
     };
+
+    // In repair mode, to_block bounds the signature scan.
+    let end_slot = repair_scope.and_then(|s| s.to_block);
 
     tracing::info!(
         chain = chain_name,
         global_start,
         effective_start,
+        ?end_slot,
+        is_repair,
         programs = programs.len(),
         "Starting signature-driven backfill"
     );
 
-    // Collect all signatures for all programs, grouped by slot
-    let slots_with_sigs =
-        collect_all_signatures(rpc_client, programs, effective_start).await?;
+    // Filter programs by repair scope sources (if specified)
+    let scoped_programs: SolanaPrograms;
+    let active_programs = if let Some(scope) = repair_scope {
+        if let Some(ref sources) = scope.sources {
+            scoped_programs = programs
+                .iter()
+                .filter(|(name, _)| sources.contains(name.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if scoped_programs.is_empty() {
+                tracing::info!(
+                    chain = chain_name,
+                    ?sources,
+                    "No configured programs match repair source filter"
+                );
+                return Ok(());
+            }
+            &scoped_programs
+        } else {
+            programs
+        }
+    } else {
+        programs
+    };
 
-    if slots_with_sigs.is_empty() {
+    // Collect all signatures for active programs, grouped by slot
+    let slots_with_sigs =
+        collect_all_signatures(rpc_client, active_programs, effective_start, end_slot).await?;
+
+    if slots_with_sigs.is_empty() && !is_repair {
         tracing::info!(
             chain = chain_name,
             "No new signatures found, backfill complete"
@@ -113,33 +150,74 @@ pub async fn signature_driven_backfill(
         return Ok(());
     }
 
-    let total_slots = slots_with_sigs.len();
-    let min_slot = *slots_with_sigs.keys().next().unwrap();
-    let max_slot = *slots_with_sigs.keys().next_back().unwrap();
+    if !slots_with_sigs.is_empty() {
+        let total_slots = slots_with_sigs.len();
+        let min_slot = *slots_with_sigs.keys().next().unwrap();
+        let max_slot = *slots_with_sigs.keys().next_back().unwrap();
 
-    tracing::info!(
-        chain = chain_name,
-        total_slots,
-        min_slot,
-        max_slot,
-        "Discovered slots with relevant transactions"
-    );
+        tracing::info!(
+            chain = chain_name,
+            total_slots,
+            min_slot,
+            max_slot,
+            "Discovered slots with relevant transactions"
+        );
+    }
 
     // Group slots into aligned ranges
     let target_slots: BTreeSet<u64> = slots_with_sigs.keys().copied().collect();
+    let mut sig_ranges: HashSet<(u64, u64)> = HashSet::new();
     let ranges = group_slots_into_ranges(&target_slots, range_size);
 
-    // Load skipped slots index for completeness check
+    // Filter ranges: skip already-completed ranges (unless repair mode).
+    // In repair mode, also apply repair_scope range bounds.
     let skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
 
-    // Filter out already-completed ranges
-    let ranges_to_process: Vec<BlockRange> = ranges
+    let mut ranges_to_process: Vec<BlockRange> = ranges
         .into_iter()
         .filter(|range| {
-            let rk = skipped_slots::range_key(range.start, range.end_inclusive());
-            !skipped_slots::is_range_complete(&skipped_index, &rk)
+            // In repair mode, skip the "already completed" check to force re-processing
+            if !is_repair {
+                let rk = skipped_slots::range_key(range.start, range.end_inclusive());
+                if skipped_slots::is_range_complete(&skipped_index, &rk) {
+                    return false;
+                }
+            }
+            // Apply repair scope range bounds
+            if let Some(scope) = repair_scope {
+                if !scope.matches_range(range.start, range.end) {
+                    return false;
+                }
+            }
+            sig_ranges.insert((range.start, range.end));
+            true
         })
         .collect();
+
+    // In repair mode, also include existing on-disk ranges that fall within
+    // the repair scope but were not discovered through signatures. This
+    // handles ranges that only contained removed programs: signature
+    // discovery misses them because the program is no longer configured.
+    if is_repair {
+        if let Ok(existing) = crate::storage::paths::scan_parquet_ranges(&events_dir) {
+            for (start, end_inclusive, _) in existing {
+                let range_end = end_inclusive + 1;
+                let range = BlockRange {
+                    start,
+                    end: range_end,
+                };
+                if sig_ranges.contains(&(start, range_end)) {
+                    continue;
+                }
+                if let Some(scope) = repair_scope {
+                    if !scope.matches_range(start, range_end) {
+                        continue;
+                    }
+                }
+                ranges_to_process.push(range);
+            }
+        }
+    }
 
     if ranges_to_process.is_empty() {
         tracing::info!(
@@ -152,8 +230,45 @@ pub async fn signature_driven_backfill(
     tracing::info!(
         chain = chain_name,
         ranges = ranges_to_process.len(),
+        is_repair,
         "Processing signature-discovered ranges"
     );
+
+    // During repair, pass the target slots so collect_slots_selective can
+    // merge fresh data with existing records instead of overwriting.
+    let merge_slots = if is_repair {
+        Some(&target_slots)
+    } else {
+        None
+    };
+
+    // When repair scopes to specific sources, also scope the program IDs
+    // used for event/instruction extraction so unrelated programs in the
+    // same slot are not re-extracted.
+    let active_configured_programs = if let Some(scope) = repair_scope {
+        if scope.sources.is_some() {
+            active_programs
+                .values()
+                .filter_map(|p| {
+                    let bytes = p.program_id.parse::<solana_sdk::pubkey::Pubkey>().ok()?;
+                    Some(bytes.to_bytes())
+                })
+                .collect()
+        } else {
+            configured_programs.clone()
+        }
+    } else {
+        configured_programs.clone()
+    };
+
+    // When source-scoped, pass the scoped program IDs to the merge logic so
+    // only records for repaired programs are replaced; other programs' records
+    // in the same slot are preserved.
+    let repair_program_ids = if is_repair && repair_scope.is_some_and(|s| s.sources.is_some()) {
+        Some(&active_configured_programs)
+    } else {
+        None
+    };
 
     for range in &ranges_to_process {
         collect_slots_selective(
@@ -161,9 +276,11 @@ pub async fn signature_driven_backfill(
             rpc_client,
             range,
             &target_slots,
-            configured_programs,
+            &active_configured_programs,
             event_decoder_tx,
             instr_decoder_tx,
+            merge_slots,
+            repair_program_ids,
         )
         .await?;
     }
@@ -191,6 +308,7 @@ async fn collect_all_signatures(
     rpc_client: &SolanaRpcClient,
     programs: &SolanaPrograms,
     start_slot: u64,
+    end_slot: Option<u64>,
 ) -> Result<BTreeMap<u64, Vec<[u8; 64]>>, SolanaRpcError> {
     let mut all_slots: BTreeMap<u64, Vec<[u8; 64]>> = BTreeMap::new();
 
@@ -208,6 +326,7 @@ async fn collect_all_signatures(
             program = program_name.as_str(),
             pubkey = %pubkey,
             start_slot = effective_start,
+            ?end_slot,
             "Collecting signatures for program"
         );
 
@@ -232,6 +351,13 @@ async fn collect_all_signatures(
                 if sig_info.slot < effective_start {
                     reached_start = true;
                     break;
+                }
+
+                // Skip slots above the end bound (repair scoping)
+                if let Some(end) = end_slot {
+                    if sig_info.slot > end {
+                        continue;
+                    }
                 }
 
                 // Parse the signature string
