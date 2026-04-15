@@ -1340,7 +1340,7 @@ impl FullPipelineContext {
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
         log_rx: mpsc::Receiver<LogMessage>,
-        logs_factory_rx: Option<mpsc::Receiver<FactoryAddressData>>,
+        logs_factory_rx: Option<mpsc::Receiver<Arc<FactoryAddressData>>>,
         log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     ) {
         let chain = self.chain().clone();
@@ -1477,7 +1477,7 @@ impl FullPipelineContext {
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
         factory_log_rx: mpsc::Receiver<LogMessage>,
-        logs_factory_tx: Option<mpsc::Sender<FactoryAddressData>>,
+        logs_factory_tx: Option<mpsc::Sender<Arc<FactoryAddressData>>>,
         eth_calls_factory_tx: Option<mpsc::Sender<FactoryMessage>>,
         log_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
         call_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
@@ -1683,7 +1683,7 @@ async fn process_chain(
     let (factory_log_tx, factory_log_rx) =
         optional_channel::<LogMessage>(has_factories, channel_cap);
     let (logs_factory_tx, logs_factory_rx) =
-        optional_channel::<FactoryAddressData>(needs_factory_filtering, factory_cap);
+        optional_channel::<Arc<FactoryAddressData>>(needs_factory_filtering, factory_cap);
     let (eth_calls_factory_tx, eth_calls_factory_rx) =
         optional_channel::<FactoryMessage>(has_factory_calls, factory_cap);
     let (event_trigger_tx, event_trigger_rx) =

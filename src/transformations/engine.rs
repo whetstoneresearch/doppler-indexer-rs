@@ -1494,7 +1494,7 @@ impl TransformationEngine {
             .increment(filtered_events.len() as u64);
         }
 
-        let events = Arc::new(filtered_events.clone());
+        let events = Arc::new(filtered_events);
         let range_key = (msg.range_start, msg.range_end);
 
         let missing_call_deps: HashSet<(String, String)> = {
@@ -1639,7 +1639,7 @@ impl TransformationEngine {
                         range_end: msg.range_end,
                         source_name: msg.source_name.clone(),
                         event_name: msg.event_name.clone(),
-                        events: filtered_events.clone(),
+                        events: Arc::clone(&events),
                         required_calls: call_deps.clone(),
                         required_handlers: handler_deps,
                     };
@@ -2200,7 +2200,7 @@ impl TransformationEngine {
                 );
                 tasks.push(HandlerTask {
                     handler,
-                    events: Arc::new(event_data.events),
+                    events: event_data.events,
                     calls: calls.clone(),
                     tx_addresses,
                 });

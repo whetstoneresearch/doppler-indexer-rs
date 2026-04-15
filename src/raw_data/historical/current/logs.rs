@@ -15,7 +15,7 @@ use crate::types::config::chain::ChainConfig;
 pub async fn collect_logs(
     chain: &ChainConfig,
     mut log_rx: Receiver<LogMessage>,
-    mut factory_rx: Option<Receiver<FactoryAddressData>>,
+    mut factory_rx: Option<Receiver<Arc<FactoryAddressData>>>,
     decoder_tx: Option<Sender<DecoderMessage>>,
     mut state: LogsCatchupState,
     max_pending_log_ranges: usize,

@@ -141,12 +141,12 @@ pub(super) async fn handle_factory_message(
                     range_end: factory_data.range_end,
                     addresses_by_block: HashMap::new(),
                 });
-            for (block, addrs) in factory_data.addresses_by_block {
+            for (block, addrs) in &factory_data.addresses_by_block {
                 existing
                     .addresses_by_block
-                    .entry(block)
+                    .entry(*block)
                     .or_default()
-                    .extend(addrs);
+                    .extend(addrs.iter().cloned());
             }
         }
         Some(FactoryMessage::RangeComplete {

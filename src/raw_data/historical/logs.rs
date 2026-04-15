@@ -73,7 +73,7 @@ pub(crate) struct MinimalLogRecord {
 /// Data needed to execute a log write (parquet + optional S3 upload) outside the select loop.
 pub(crate) struct LogWriteTask {
     pub range: BlockRange,
-    pub logs: Vec<LogData>,
+    pub logs: Arc<Vec<LogData>>,
     pub log_fields: Option<Vec<LogField>>,
     pub schema: Arc<Schema>,
     pub output_dir: PathBuf,
@@ -166,15 +166,14 @@ pub(crate) async fn prepare_completed_range(
         );
     }
 
-    // Send logs to decoder before building the write task.
-    // The decoder gets an Arc clone; the write task gets its own copy.
+    // Arc-wrap logs once and share between decoder and write task (zero-copy).
+    let logs = Arc::new(logs);
     if let Some(tx) = decoder_tx {
-        let shared_logs = std::sync::Arc::new(logs.clone());
         let _ = tx
             .send(DecoderMessage::LogsReady {
                 range_start,
                 range_end,
-                logs: shared_logs,
+                logs: Arc::clone(&logs),
                 live_mode: false,            // Historical mode: write to parquet
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })

@@ -31,8 +31,8 @@ fn build_decoder_addresses(factory_data: &FactoryAddressData) -> HashMap<String,
 
 #[allow(clippy::too_many_arguments)]
 async fn forward_factory_outputs(
-    factory_data: FactoryAddressData,
-    logs_factory_tx: &Option<Sender<FactoryAddressData>>,
+    factory_data: Arc<FactoryAddressData>,
+    logs_factory_tx: &Option<Sender<Arc<FactoryAddressData>>>,
     eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
     call_decoder_tx: &Option<Sender<DecoderMessage>>,
@@ -43,10 +43,10 @@ async fn forward_factory_outputs(
 
     let logs_factory_future = async {
         if let Some(ref tx) = logs_factory_tx {
-            tx.send(factory_data.clone()).await.map_err(|_| {
+            tx.send(Arc::clone(&factory_data)).await.map_err(|_| {
                 FactoryCollectionError::ChannelSend(format!(
                     "logs_factory_tx ({}-{}) - receiver dropped",
-                    factory_data.range_start, factory_data.range_end
+                    range_start, range_end
                 ))
             })
         } else {
@@ -57,12 +57,12 @@ async fn forward_factory_outputs(
     let eth_calls_future = async {
         if let Some(ref tx) = eth_calls_factory_tx {
             let _ = tx
-                .send(FactoryMessage::IncrementalAddresses(factory_data.clone()))
+                .send(FactoryMessage::IncrementalAddresses(Arc::clone(&factory_data)))
                 .await;
             let _ = tx
                 .send(FactoryMessage::RangeComplete {
-                    range_start: factory_data.range_start,
-                    range_end: factory_data.range_end,
+                    range_start,
+                    range_end,
                 })
                 .await;
         }
@@ -133,7 +133,7 @@ pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     mut log_rx: Receiver<LogMessage>,
-    logs_factory_tx: Option<Sender<FactoryAddressData>>,
+    logs_factory_tx: Option<Sender<Arc<FactoryAddressData>>>,
     eth_calls_factory_tx: Option<Sender<FactoryMessage>>,
     log_decoder_tx: Option<Sender<DecoderMessage>>,
     call_decoder_tx: Option<Sender<DecoderMessage>>,
@@ -158,14 +158,14 @@ pub async fn collect_factories(
                     range_start,
                     range_end,
                 } => {
-                    let empty_data = FactoryAddressData {
+                    let empty_data = Arc::new(FactoryAddressData {
                         range_start,
                         range_end,
                         addresses_by_block: HashMap::new(),
-                    };
+                    });
 
                     if let Some(ref tx) = logs_factory_tx {
-                        if tx.send(empty_data.clone()).await.is_err() {
+                        if tx.send(Arc::clone(&empty_data)).await.is_err() {
                             tracing::error!(
                                 "Failed to send empty factory data for range {}-{} to logs_factory_tx - receiver dropped",
                                 range_start,
@@ -245,8 +245,9 @@ pub async fn collect_factories(
             Some(join_result) = range_tasks.join_next(), if !range_tasks.is_empty() => {
                 let factory_data = join_result
                     .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))??;
+                let factory_data = Arc::new(factory_data);
                 forward_factory_outputs(
-                    factory_data.clone(),
+                    Arc::clone(&factory_data),
                     &logs_factory_tx,
                     &eth_calls_factory_tx,
                     &log_decoder_tx,

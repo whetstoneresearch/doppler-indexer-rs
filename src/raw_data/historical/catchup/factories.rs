@@ -29,7 +29,7 @@ use crate::types::config::raw_data::RawDataCollectionConfig;
 pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
-    logs_factory_tx: &Option<Sender<FactoryAddressData>>,
+    logs_factory_tx: &Option<Sender<Arc<FactoryAddressData>>>,
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
     factory_catchup_done_tx: Option<oneshot::Sender<()>>,
@@ -49,8 +49,9 @@ pub async fn collect_factories(
         );
 
         for factory_data in existing_factory_data {
+            let factory_data = Arc::new(factory_data);
             if let Some(ref tx) = logs_factory_tx {
-                if tx.send(factory_data.clone()).await.is_err() {
+                if tx.send(Arc::clone(&factory_data)).await.is_err() {
                     tracing::error!(
                         "Failed to send existing factory data for range {}-{} to logs_factory_tx - receiver dropped",
                         factory_data.range_start,
@@ -501,8 +502,9 @@ pub async fn collect_factories(
         catchup_results.sort_by_key(|d| d.range_start);
 
         for factory_data in catchup_results {
+            let factory_data = Arc::new(factory_data);
             if let Some(ref tx) = logs_factory_tx {
-                if tx.send(factory_data.clone()).await.is_err() {
+                if tx.send(Arc::clone(&factory_data)).await.is_err() {
                     tracing::error!(
                         "Failed to send catchup factory data for range {}-{} to logs_factory_tx - receiver dropped",
                         factory_data.range_start,

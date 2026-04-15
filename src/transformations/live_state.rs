@@ -4,6 +4,7 @@
 //! and finalization state for the transformation engine's live mode.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::context::{DecodedCall, DecodedEvent};
@@ -16,7 +17,7 @@ pub(crate) struct PendingEventData {
     pub range_end: u64,
     pub source_name: String,
     pub event_name: String,
-    pub events: Vec<DecodedEvent>,
+    pub events: Arc<Vec<DecodedEvent>>,
     /// Call dependencies needed: (source, function_name)
     pub required_calls: Vec<(String, String)>,
     /// Handler dependencies needed: handler name() strings
@@ -395,7 +396,7 @@ mod tests {
             range_end: range_key.1,
             source_name: "Test".to_string(),
             event_name: "Event".to_string(),
-            events: vec![],
+            events: Arc::new(vec![]),
             required_calls,
             required_handlers,
         }

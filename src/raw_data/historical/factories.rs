@@ -57,7 +57,7 @@ pub struct FactoryAddressData {
 #[derive(Debug, Clone)]
 pub enum FactoryMessage {
     /// Incremental batch of factory addresses discovered (sent per rpc_batch_size logs)
-    IncrementalAddresses(FactoryAddressData),
+    IncrementalAddresses(Arc<FactoryAddressData>),
     /// A block range is complete - parquet files written
     RangeComplete { range_start: u64, range_end: u64 },
     /// All processing is complete
