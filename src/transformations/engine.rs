@@ -614,52 +614,14 @@ impl TransformationEngine {
         )
         .set(total_todo as f64);
 
-        // 4. Build work items.
-        let (items, per_handler_submitted) = self
-            .build_catchup_work_items(
-                &handlers,
-                &available,
-                &self_completed,
-                &trigger_range_sets,
-                &tracker,
-            )
-            .await;
-
-        // Per-handler submission summary.
-        for ch in &handlers {
-            let count = per_handler_submitted
-                .get(ch.handler.name())
-                .copied()
-                .unwrap_or(0);
-            if count > 0 {
-                tracing::info!(
-                    "Handler {} catchup: submitting {} range(s)",
-                    ch.handler.handler_key(),
-                    count
-                );
-            }
-        }
-
-        if items.is_empty() {
-            tracing::info!("{} handler catchup: no work items to submit", kind_label);
-            return Ok(());
-        }
-
-        tracing::info!(
-            "{} catchup: executing {} work items across {} handlers",
-            kind_label,
-            items.len(),
-            per_handler_submitted.len()
-        );
-
-        // 5. Spawn background call-dep scanner.
+        // 4. Spawn background call-dep scanner.
         let (cancel_tx, scanner_handle) = self.spawn_call_dep_scanner(&handlers, &tracker).await;
 
-        // 6. Spawn progress reporter.
+        // 5. Spawn progress reporter.
         let progress_handle =
             Self::spawn_progress_reporter(tracker.clone(), kind_label, available.len(), &handlers);
 
-        // 7. Execute all items.
+        // 6. Execute work items in chunks to bound peak allocation.
         let loader = Arc::new(CatchupLoader {
             decoded_logs_dir: self.decoded_logs_dir.clone(),
             decoded_calls_dir: self.decoded_calls_dir.clone(),
@@ -671,25 +633,60 @@ impl TransformationEngine {
             chain_id: self.chain_id,
             db_pool: self.db_pool.clone(),
             finalizer: self.finalizer.clone(),
+            receipt_cache: tokio::sync::RwLock::new(HashMap::new()),
         });
 
         let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
         let catchup_start = Instant::now();
-        let loader_ref = loader.clone();
-        let outcomes = scheduler
-            .execute(items, move |item| {
-                let loader = loader_ref.clone();
-                Box::pin(async move {
-                    match loader.run(item).await {
-                        Ok(()) => WorkItemRunResult::Succeeded,
-                        Err(TransformationError::TransientBlocked(msg)) => {
-                            WorkItemRunResult::Blocked(msg)
+        let chunk_size = self.handler_concurrency * 4;
+        let mut all_outcomes: Vec<WorkItemOutcome> = Vec::new();
+
+        loop {
+            let (items, per_handler_submitted) = self
+                .build_catchup_work_items(
+                    &handlers,
+                    &available,
+                    &trigger_range_sets,
+                    &tracker,
+                    chunk_size,
+                )
+                .await;
+
+            if items.is_empty() {
+                if all_outcomes.is_empty() {
+                    tracing::info!(
+                        "{} handler catchup: no work items to submit",
+                        kind_label
+                    );
+                }
+                break;
+            }
+
+            tracing::info!(
+                "{} catchup: executing chunk of {} work items across {} handlers",
+                kind_label,
+                items.len(),
+                per_handler_submitted.len()
+            );
+
+            let loader_ref = loader.clone();
+            let outcomes = scheduler
+                .execute(items, move |item| {
+                    let loader = loader_ref.clone();
+                    Box::pin(async move {
+                        match loader.run(item).await {
+                            Ok(()) => WorkItemRunResult::Succeeded,
+                            Err(TransformationError::TransientBlocked(msg)) => {
+                                WorkItemRunResult::Blocked(msg)
+                            }
+                            Err(e) => WorkItemRunResult::Failed(e.to_string()),
                         }
-                        Err(e) => WorkItemRunResult::Failed(e.to_string()),
-                    }
+                    })
                 })
-            })
-            .await;
+                .await;
+
+            all_outcomes.extend(outcomes);
+        }
 
         histogram!(
             "transformation_catchup_total_duration_seconds",
@@ -697,14 +694,14 @@ impl TransformationEngine {
         )
         .record(catchup_start.elapsed().as_secs_f64());
 
-        // 8. Cancel background tasks and process outcomes.
+        // 7. Cancel background tasks and process outcomes.
         let _ = cancel_tx.send(true);
         if let Some(handle) = scanner_handle {
             handle.abort();
         }
         progress_handle.abort();
 
-        Self::process_catchup_outcomes(outcomes, &handlers, kind_label, catchup_start)
+        Self::process_catchup_outcomes(all_outcomes, &handlers, kind_label, catchup_start)
     }
 
     // ─── Catchup Sub-steps ──────────────────────────────────────────
@@ -843,24 +840,32 @@ impl TransformationEngine {
         Ok(self_completed)
     }
 
-    /// Build all catchup work items upfront.
+    /// Build the next chunk of catchup work items.
+    ///
+    /// Skips ranges already completed or failed in the tracker. Stops after
+    /// `chunk_size` items to bound peak allocation. The tracker persists across
+    /// chunks, so dependency state from earlier chunks is naturally available.
     async fn build_catchup_work_items(
         &self,
         handlers: &[CatchupHandler],
         available: &[(u64, u64)],
-        self_completed: &HashMap<String, HashSet<u64>>,
         trigger_range_sets: &HashMap<String, HashSet<(u64, u64)>>,
         tracker: &Arc<CompletionTracker>,
+        chunk_size: usize,
     ) -> (Vec<WorkItem>, HashMap<String, usize>) {
         let mut items: Vec<WorkItem> = Vec::new();
         let mut per_handler_submitted: HashMap<String, usize> = HashMap::new();
 
         for ch in handlers {
             let name = ch.handler.name().to_string();
-            let completed = self_completed.get(&name).cloned().unwrap_or_default();
 
             for &(range_start, range_end) in available {
-                if completed.contains(&range_start) {
+                if items.len() >= chunk_size {
+                    return (items, per_handler_submitted);
+                }
+
+                // Skip if already completed in the tracker (DB-seeded + runtime).
+                if tracker.is_completed(&name, range_start).await {
                     continue;
                 }
 

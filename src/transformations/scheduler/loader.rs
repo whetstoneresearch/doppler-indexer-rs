@@ -138,6 +138,7 @@ fn read_receipt_addresses_sync(
 ) -> HashMap<[u8; 32], TransactionAddresses> {
     use arrow::array::{Array, FixedSizeBinaryArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
 
     let file_name = format!("receipts_{}-{}.parquet", range_start, range_end - 1);
     let file_path = raw_receipts_dir.join(&file_name);
@@ -172,7 +173,17 @@ fn read_receipt_addresses_sync(
         }
     };
 
-    let reader = match builder.build() {
+    let num_rows = builder.metadata().file_metadata().num_rows() as usize;
+    let arrow_schema = builder.schema().clone();
+
+    let needed = ["transaction_hash", "from_address", "to_address"];
+    let root_indices: Vec<usize> = needed
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+    let reader = match builder.with_projection(mask).build() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -184,7 +195,7 @@ fn read_receipt_addresses_sync(
         }
     };
 
-    let mut addresses = HashMap::new();
+    let mut addresses = HashMap::with_capacity(num_rows);
 
     for batch_result in reader {
         let batch = match batch_result {
@@ -206,7 +217,7 @@ fn read_receipt_addresses_sync(
 
         let tx_hash_col = match batch.column_by_name("transaction_hash") {
             Some(col) => match col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                Some(arr) => arr.clone(),
+                Some(arr) => arr,
                 None => continue,
             },
             None => continue,
@@ -214,7 +225,7 @@ fn read_receipt_addresses_sync(
 
         let from_col = match batch.column_by_name("from_address") {
             Some(col) => match col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                Some(arr) => arr.clone(),
+                Some(arr) => arr,
                 None => continue,
             },
             None => continue,
@@ -222,7 +233,7 @@ fn read_receipt_addresses_sync(
 
         let to_col = batch
             .column_by_name("to_address")
-            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>().cloned());
+            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>());
 
         for row in 0..num_rows {
             let tx_hash: [u8; 32] = match tx_hash_col.value(row).try_into() {
@@ -235,7 +246,7 @@ fn read_receipt_addresses_sync(
                 Err(_) => continue,
             };
 
-            let to_address = to_col.as_ref().and_then(|col| {
+            let to_address = to_col.and_then(|col| {
                 if col.is_null(row) {
                     None
                 } else {
@@ -294,6 +305,11 @@ pub(crate) struct CatchupLoader {
     pub chain_id: u64,
     pub db_pool: Arc<DbPool>,
     pub finalizer: Arc<RangeFinalizer>,
+    /// Cache of receipt address maps keyed by (range_start, range_end).
+    /// Multiple event handlers processing the same range share one Arc'd HashMap.
+    pub receipt_cache: tokio::sync::RwLock<
+        HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>,
+    >,
 }
 
 impl CatchupLoader {
@@ -350,7 +366,8 @@ impl CatchupLoader {
 
         let tx_addresses = match payload.kind {
             HandlerKind::Event => {
-                Arc::new(read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await)
+                self.get_or_load_receipt_addresses(range_start, range_end)
+                    .await
             }
             HandlerKind::Call => Arc::new(HashMap::new()),
         };
@@ -380,6 +397,35 @@ impl CatchupLoader {
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
+
+    async fn get_or_load_receipt_addresses(
+        &self,
+        range_start: u64,
+        range_end: u64,
+    ) -> Arc<HashMap<[u8; 32], TransactionAddresses>> {
+        let key = (range_start, range_end);
+
+        // Fast path: read lock
+        {
+            let cache = self.receipt_cache.read().await;
+            if let Some(cached) = cache.get(&key) {
+                return cached.clone();
+            }
+        }
+
+        // Slow path: load and insert under write lock
+        let mut cache = self.receipt_cache.write().await;
+        // Double-check after acquiring write lock
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+
+        let addresses = Arc::new(
+            read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await,
+        );
+        cache.insert(key, addresses.clone());
+        addresses
+    }
 
     async fn load_events(
         &self,

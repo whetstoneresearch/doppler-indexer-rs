@@ -113,7 +113,7 @@ pub mod db_pool {
     /// Must be at least as large as `transformations::HANDLER_CONCURRENCY` to
     /// avoid connection starvation during catchup, where each concurrent handler
     /// needs a DB connection for its transaction.
-    pub const MAX_SIZE: usize = 32;
+    pub const MAX_SIZE: usize = 40;
 }
 
 #[cfg(test)]
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_db_pool_defaults() {
-        assert_eq!(db_pool::MAX_SIZE, 32);
+        assert_eq!(db_pool::MAX_SIZE, 40);
     }
 
     #[test]

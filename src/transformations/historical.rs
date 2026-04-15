@@ -280,9 +280,10 @@ impl HistoricalDataReader {
     ) -> Result<Vec<DecodedEvent>, TransformationError> {
         let file = std::fs::File::open(file_path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let num_rows = builder.metadata().file_metadata().num_rows() as usize;
         let reader = builder.build()?;
 
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(num_rows);
 
         for batch_result in reader {
             let batch = batch_result?;
@@ -303,9 +304,10 @@ impl HistoricalDataReader {
     ) -> Result<Vec<DecodedCall>, TransformationError> {
         let file = std::fs::File::open(file_path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let num_rows = builder.metadata().file_metadata().num_rows() as usize;
         let reader = builder.build()?;
 
-        let mut calls = Vec::new();
+        let mut calls = Vec::with_capacity(num_rows);
 
         for batch_result in reader {
             let batch = batch_result?;

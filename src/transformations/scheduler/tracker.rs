@@ -1,23 +1,18 @@
-//! Completion tracking with notify-based wake-up for dependency waiters.
+//! Completion tracking with per-handler watch channels for dependency waiters.
 //!
 //! [`CompletionTracker`] is the synchronization primitive used by [`DagScheduler`]
-//! to gate each `(handler, range_start)` work item on its dependencies. Each
-//! waiter constructs a `Notify::notified()` future, checks shared state, and
-//! awaits the future if any dep is still pending. Every `mark_completed` /
-//! `mark_failed` call wakes all waiters so they can re-check. The ordering
-//! "construct notified() *before* probe" is load-bearing: tokio's Notified
-//! captures the notify_waiters call count at construction and honors any
-//! call that happens before first poll, so no wake can be lost between
-//! probe and `.await`.
+//! to gate each `(handler, range_start)` work item on its dependencies.
 //!
 //! # Wake mechanism
 //!
-//! [`tokio::sync::Notify`] with `notify_waiters` on every completion/failure.
-//! The codebase has no other `Notify` usage, but here it's the natural primitive:
-//! each waiter re-checks its predicate against shared state after being woken.
-//! Under heavy cascade-failure the wake-storm could become noisy; a per-handler
-//! `watch<HashSet<u64>>` would be an isolated drop-in swap if profiling shows
-//! contention.
+//! Per-handler `tokio::sync::watch<()>` channels notify only the waiters that
+//! depend on a specific handler, avoiding the O(total_waiters) wake-storm that
+//! a single global `Notify` would cause. A separate global `Notify` is used for
+//! call-dep file registration events (infrequent, from the background scanner).
+//!
+//! Waiters subscribe to their dep handlers' watch channels before probing state.
+//! `watch::Receiver::changed()` is cancellation-safe and captures any send that
+//! occurs between subscription and `.await`, preserving the race-free invariant.
 //!
 //! # Lock ordering
 //!
@@ -27,11 +22,14 @@
 //! simultaneously. `advance_contiguous_watermark` reads `state` then writes
 //! `contiguous` — safe ordering. `call_dep_ranges` is independent.
 //!
+//! `handler_watches` uses `std::sync::RwLock` for synchronous access (never held
+//! across `.await`).
+//!
 //! [`DagScheduler`]: super::dag::DagScheduler
 
 use std::collections::{HashMap, HashSet};
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, Notify, RwLock};
 
 /// Per-handler completed/failed/blocked range state, grouped under one lock.
 struct HandlerRangeState {
@@ -71,7 +69,12 @@ pub(crate) struct CompletionTracker {
     /// Matched by range_start only (log and call-dep files may have different range sizes).
     /// Updated by the background `CallDepScanner`.
     call_dep_ranges: RwLock<HashMap<(String, String), HashSet<u64>>>,
-    notify: Notify,
+    /// Per-handler watch channels. Sends on completion/failure/block wake only
+    /// the waiters that depend on that specific handler. Lazily populated via
+    /// `get_or_create_watch`. Uses `std::sync::RwLock` (never held across await).
+    handler_watches: std::sync::RwLock<HashMap<String, watch::Sender<()>>>,
+    /// Global notify for call-dep file registration (background scanner).
+    global_notify: Notify,
     /// Sorted list of all available range_starts (immutable after construction).
     available_starts: Vec<u64>,
 }
@@ -113,7 +116,8 @@ impl CompletionTracker {
                 positions: HashMap::new(),
             }),
             call_dep_ranges: RwLock::new(HashMap::new()),
-            notify: Notify::new(),
+            handler_watches: std::sync::RwLock::new(HashMap::new()),
+            global_notify: Notify::new(),
             available_starts: Vec::new(),
         }
     }
@@ -138,9 +142,49 @@ impl CompletionTracker {
                 positions: HashMap::new(),
             }),
             call_dep_ranges: RwLock::new(HashMap::new()),
-            notify: Notify::new(),
+            handler_watches: std::sync::RwLock::new(HashMap::new()),
+            global_notify: Notify::new(),
             available_starts: starts,
         }
+    }
+
+    // ─── Per-handler watch helpers ─────────────────────────────────────
+
+    /// Send a notification on the handler's watch channel.
+    /// Lazily creates the channel if it doesn't exist.
+    fn notify_handler(&self, handler_name: &str) {
+        // Fast path: read lock
+        {
+            let watches = self.handler_watches.read().unwrap();
+            if let Some(tx) = watches.get(handler_name) {
+                let _ = tx.send(());
+                return;
+            }
+        }
+        // Slow path: create and send
+        let mut watches = self.handler_watches.write().unwrap();
+        let tx = watches
+            .entry(handler_name.to_string())
+            .or_insert_with(|| watch::channel(()).0);
+        let _ = tx.send(());
+    }
+
+    /// Subscribe to a handler's watch channel. Returns `None` if the handler
+    /// has no watch yet (caller should fall back to global_notify).
+    fn subscribe_handler(&self, handler_name: &str) -> watch::Receiver<()> {
+        // Fast path: read lock
+        {
+            let watches = self.handler_watches.read().unwrap();
+            if let Some(tx) = watches.get(handler_name) {
+                return tx.subscribe();
+            }
+        }
+        // Slow path: create watch and subscribe
+        let mut watches = self.handler_watches.write().unwrap();
+        let tx = watches
+            .entry(handler_name.to_string())
+            .or_insert_with(|| watch::channel(()).0);
+        tx.subscribe()
     }
 
     /// Pre-populate completed ranges for a handler. Intended for startup
@@ -168,7 +212,7 @@ impl CompletionTracker {
         if !self.available_starts.is_empty() {
             self.recompute_contiguous_watermark(handler_name).await;
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
     }
 
     /// Snapshot check: are all `deps` completed for `range_start`?
@@ -228,11 +272,13 @@ impl CompletionTracker {
         deps: &[String],
         range_start: u64,
     ) -> Result<(), DepWaitError> {
+        // Subscribe to each dep handler's watch channel before the first probe.
+        // `watch::Receiver::changed()` captures any send after subscription,
+        // preserving the same race-free invariant as the old `notified()` pattern.
+        let mut receivers: Vec<watch::Receiver<()>> =
+            deps.iter().map(|d| self.subscribe_handler(d)).collect();
+
         loop {
-            // MUST be created before probing: the stored notify_waiters_calls
-            // counter is the mechanism that catches a mark that fires after
-            // our probe read but before we park on notified.
-            let notified = self.notify.notified();
             match self.probe(deps, range_start).await {
                 DepState::Ready => return Ok(()),
                 DepState::DepFailed { dep_name } => {
@@ -247,7 +293,9 @@ impl CompletionTracker {
                         range_start,
                     })
                 }
-                DepState::Waiting => notified.await,
+                DepState::Waiting => {
+                    wait_any_changed(&mut receivers).await;
+                }
             }
         }
     }
@@ -276,7 +324,16 @@ impl CompletionTracker {
         if !self.available_starts.is_empty() {
             self.advance_contiguous_watermark(handler_name).await;
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
+    }
+
+    /// Check whether `(handler_name, range_start)` has been marked as completed.
+    pub(crate) async fn is_completed(&self, handler_name: &str, range_start: u64) -> bool {
+        let state = self.state.read().await;
+        state
+            .completed
+            .get(handler_name)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 
     /// Check whether `(handler_name, range_start)` has been marked as failed.
@@ -311,7 +368,7 @@ impl CompletionTracker {
                 }
             }
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
     }
 
     /// Mark `(handler_name, range_start)` as transiently blocked for this pass.
@@ -324,7 +381,7 @@ impl CompletionTracker {
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
     }
 
     /// Clear a transient blocked mark before the next scheduler pass.
@@ -469,7 +526,7 @@ impl CompletionTracker {
         let grew = entry.len() > old_len;
         drop(call_deps);
         if grew {
-            self.notify.notify_waiters();
+            self.global_notify.notify_waiters();
         }
     }
 
@@ -556,8 +613,10 @@ impl CompletionTracker {
     /// Call-dep availability is matched by `range_start` only (not range_end)
     /// since log and call-dep parquet files may use different range sizes.
     ///
-    /// Same wake-safety invariant as [`wait_ready`]: `notified()` is constructed
-    /// before probing.
+    /// Subscribes to per-handler watch channels for handler deps and contiguous
+    /// deps before the first probe. `watch::Receiver::changed()` is
+    /// cancellation-safe and captures any send after subscription, preserving
+    /// the race-free invariant. Call-dep changes use the global `Notify`.
     pub(crate) async fn wait_ready_extended(
         &self,
         handler_deps: &[String],
@@ -565,8 +624,35 @@ impl CompletionTracker {
         call_dep_keys: &[(String, String)],
         range_start: u64,
     ) -> Result<(), DepWaitError> {
+        // Collect unique dep handler names from both handler and contiguous deps.
+        let mut unique_dep_names: Vec<&str> = Vec::new();
+        for dep in handler_deps {
+            if !unique_dep_names.contains(&dep.as_str()) {
+                unique_dep_names.push(dep);
+            }
+        }
+        for dep in contiguous_deps {
+            if !unique_dep_names.contains(&dep.as_str()) {
+                unique_dep_names.push(dep);
+            }
+        }
+
+        // Subscribe to each dep handler's watch channel once before any probing.
+        let mut receivers: Vec<watch::Receiver<()>> = unique_dep_names
+            .iter()
+            .map(|d| self.subscribe_handler(d))
+            .collect();
+
+        let has_call_deps = !call_dep_keys.is_empty();
+
         loop {
-            let notified = self.notify.notified();
+            // For call-dep changes, use global notify (created before probe).
+            let global_notified = if has_call_deps {
+                Some(self.global_notify.notified())
+            } else {
+                None
+            };
+
             match self
                 .probe_extended(handler_deps, contiguous_deps, call_dep_keys, range_start)
                 .await
@@ -584,7 +670,17 @@ impl CompletionTracker {
                         range_start,
                     })
                 }
-                DepState::Waiting => notified.await,
+                DepState::Waiting => match global_notified {
+                    Some(global) => {
+                        tokio::select! {
+                            _ = wait_any_changed(&mut receivers) => {},
+                            _ = global => {},
+                        }
+                    }
+                    None => {
+                        wait_any_changed(&mut receivers).await;
+                    }
+                },
             }
         }
     }
@@ -610,6 +706,29 @@ impl CompletionTracker {
         }
         result
     }
+}
+
+/// Wait until any of the given watch receivers reports a change.
+///
+/// Returns immediately if `receivers` is empty (no deps to wait on).
+/// Cancellation-safe: cancelled `changed()` futures do not lose events.
+async fn wait_any_changed(receivers: &mut [watch::Receiver<()>]) {
+    if receivers.is_empty() {
+        // No deps: yield once and return (avoids infinite pending).
+        tokio::task::yield_now().await;
+        return;
+    }
+    if receivers.len() == 1 {
+        // Fast path: single dep, no select overhead.
+        let _ = receivers[0].changed().await;
+        return;
+    }
+    // General case: wait for any receiver to report a change.
+    let futures: Vec<_> = receivers
+        .iter_mut()
+        .map(|rx| Box::pin(rx.changed()))
+        .collect();
+    let _ = futures::future::select_all(futures).await;
 }
 
 #[cfg(test)]
