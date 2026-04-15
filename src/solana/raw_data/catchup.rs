@@ -142,7 +142,7 @@ pub async fn signature_driven_backfill(
     let slots_with_sigs =
         collect_all_signatures(rpc_client, active_programs, effective_start, end_slot).await?;
 
-    if slots_with_sigs.is_empty() {
+    if slots_with_sigs.is_empty() && !is_repair {
         tracing::info!(
             chain = chain_name,
             "No new signatures found, backfill complete"
@@ -150,27 +150,30 @@ pub async fn signature_driven_backfill(
         return Ok(());
     }
 
-    let total_slots = slots_with_sigs.len();
-    let min_slot = *slots_with_sigs.keys().next().unwrap();
-    let max_slot = *slots_with_sigs.keys().next_back().unwrap();
+    if !slots_with_sigs.is_empty() {
+        let total_slots = slots_with_sigs.len();
+        let min_slot = *slots_with_sigs.keys().next().unwrap();
+        let max_slot = *slots_with_sigs.keys().next_back().unwrap();
 
-    tracing::info!(
-        chain = chain_name,
-        total_slots,
-        min_slot,
-        max_slot,
-        "Discovered slots with relevant transactions"
-    );
+        tracing::info!(
+            chain = chain_name,
+            total_slots,
+            min_slot,
+            max_slot,
+            "Discovered slots with relevant transactions"
+        );
+    }
 
     // Group slots into aligned ranges
     let target_slots: BTreeSet<u64> = slots_with_sigs.keys().copied().collect();
+    let mut sig_ranges: HashSet<(u64, u64)> = HashSet::new();
     let ranges = group_slots_into_ranges(&target_slots, range_size);
 
     // Filter ranges: skip already-completed ranges (unless repair mode).
     // In repair mode, also apply repair_scope range bounds.
     let skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
 
-    let ranges_to_process: Vec<BlockRange> = ranges
+    let mut ranges_to_process: Vec<BlockRange> = ranges
         .into_iter()
         .filter(|range| {
             // In repair mode, skip the "already completed" check to force re-processing
@@ -186,9 +189,35 @@ pub async fn signature_driven_backfill(
                     return false;
                 }
             }
+            sig_ranges.insert((range.start, range.end));
             true
         })
         .collect();
+
+    // In repair mode, also include existing on-disk ranges that fall within
+    // the repair scope but were not discovered through signatures. This
+    // handles ranges that only contained removed programs: signature
+    // discovery misses them because the program is no longer configured.
+    if is_repair {
+        if let Ok(existing) = crate::storage::paths::scan_parquet_ranges(&events_dir) {
+            for (start, end_inclusive, _) in existing {
+                let range_end = end_inclusive + 1;
+                let range = BlockRange {
+                    start,
+                    end: range_end,
+                };
+                if sig_ranges.contains(&(start, range_end)) {
+                    continue;
+                }
+                if let Some(scope) = repair_scope {
+                    if !scope.matches_range(start, range_end) {
+                        continue;
+                    }
+                }
+                ranges_to_process.push(range);
+            }
+        }
+    }
 
     if ranges_to_process.is_empty() {
         tracing::info!(

@@ -703,10 +703,9 @@ async fn feed_raw_events_to_decoder(
             events
         };
 
-        if events.is_empty() {
-            continue;
-        }
-
+        // Always send the message — even when empty — so the decoder task
+        // runs stale cleanup for this range. Skipping empty ranges would
+        // leave old decoded parquet behind after an IDL rename/removal.
         if tx
             .send(DecoderMessage::SolanaEventsReady {
                 range_start: *start,
@@ -800,10 +799,7 @@ async fn feed_raw_instructions_to_decoder(
             instructions
         };
 
-        if instructions.is_empty() {
-            continue;
-        }
-
+        // Always send — see comment in feed_raw_events_to_decoder.
         if tx
             .send(DecoderMessage::SolanaInstructionsReady {
                 range_start: *start,

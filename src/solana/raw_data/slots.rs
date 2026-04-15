@@ -366,11 +366,18 @@ pub async fn collect_slots_selective(
         .copied()
         .collect();
 
-    if slots_to_fetch.is_empty() {
+    // In non-repair mode, skip ranges with nothing to fetch. In repair mode,
+    // proceed even with zero slots: the merge step may need to filter out
+    // records from programs no longer in the config.
+    if slots_to_fetch.is_empty() && repair_slots.is_none() {
         return Ok(());
     }
 
-    let block_results = rpc_client.get_blocks_batch(&slots_to_fetch).await?;
+    let block_results = if slots_to_fetch.is_empty() {
+        Vec::new()
+    } else {
+        rpc_client.get_blocks_batch(&slots_to_fetch).await?
+    };
 
     let mut slot_records: BTreeMap<u64, SolanaSlotRecord> = BTreeMap::new();
     let mut all_events = Vec::new();
@@ -450,15 +457,23 @@ pub async fn collect_slots_selective(
         }
     }
 
+    // During unscoped repair (repair_program_ids is None), drop records from
+    // programs no longer in the config. This cleans up raw data for removed
+    // sources whose ranges are revisited but yield no new signatures.
+    if repair_slots.is_some() && repair_program_ids.is_none() {
+        all_events.retain(|r| configured_programs.contains(&r.program_id));
+        all_instructions.retain(|r| configured_programs.contains(&r.program_id));
+    }
+
     // Write parquet files
     let slot_records_vec: Vec<_> = slot_records.into_values().collect();
 
     let slot_path = slots_dir.join(range.file_name("slots"));
     if !slot_records_vec.is_empty() {
         write_slots_to_parquet_async(slot_records_vec, slot_schema, slot_path).await?;
-    } else if repair_slots.is_some() && slot_path.exists() {
-        // All slots in the range resolved to empty/skipped after repair — remove
-        // the stale slot file so it stays consistent with events/instructions.
+    } else if slot_path.exists() {
+        // All slots in the range resolved to empty/skipped — remove the stale
+        // slot file so it stays consistent with events/instructions.
         std::fs::remove_file(&slot_path)?;
     }
 
