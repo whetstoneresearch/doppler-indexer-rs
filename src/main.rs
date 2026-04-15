@@ -14,7 +14,7 @@ mod storage;
 mod transformations;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -199,8 +199,18 @@ async fn main() -> anyhow::Result<()> {
     let catch_up_only = args.iter().any(|a| a == "--catch-up-only");
     let repair_only = args.iter().any(|a| a == "--repair-only");
     let repair_flag = args.iter().any(|a| a == "--repair");
+    let transformation_only = args.iter().any(|a| a == "--transformation-only");
     let repair = repair_flag || repair_only;
     let repair_scope = build_repair_scope(&args)?;
+
+    let transformation_handlers: Option<HashSet<String>> = {
+        let values = collect_flag_values(&args, "--transformation-handlers")?;
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.into_iter().collect())
+        }
+    };
 
     if live_only && decode_only {
         anyhow::bail!("Cannot use --live-only and --decode-only together");
@@ -222,6 +232,21 @@ async fn main() -> anyhow::Result<()> {
     }
     if repair_flag && live_only {
         anyhow::bail!("Cannot use --repair and --live-only together");
+    }
+    if transformation_only && decode_only {
+        anyhow::bail!("Cannot use --transformation-only and --decode-only together");
+    }
+    if transformation_only && live_only {
+        anyhow::bail!("Cannot use --transformation-only and --live-only together");
+    }
+    if transformation_only && catch_up_only {
+        anyhow::bail!("Cannot use --transformation-only and --catch-up-only together");
+    }
+    if transformation_only && repair_only {
+        anyhow::bail!("Cannot use --transformation-only and --repair-only together");
+    }
+    if transformation_only && repair_flag {
+        anyhow::bail!("Cannot use --transformation-only and --repair together");
     }
     if repair_scope.is_some() && !repair {
         anyhow::bail!(
@@ -265,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
             filter
         );
     }
-    if !decode_only {
+    if !decode_only && !transformation_only {
         let require_ws = !catch_up_only && !repair_only;
         load_required_env_vars(&config, require_ws)?;
     }
@@ -420,6 +445,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Running in live-only mode (skips historical processing)");
     } else if catch_up_only {
         tracing::info!("Running in catch-up-only mode (fills gaps in existing data, no live mode)");
+    } else if transformation_only {
+        tracing::info!("Running in transformation-only mode (transformation catchup only, no collection/decoding/live)");
+    }
+    if let Some(ref handlers) = transformation_handlers {
+        tracing::info!("Transformation handler filter: {:?}", handlers);
     }
     if repair_only {
         tracing::info!("Running in repair-only mode (eth_call repair passes only, no live mode)");
@@ -436,7 +466,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_db_pool: Option<Arc<DbPool>> = if !decode_only && !repair_only {
         if let Some(ref tc) = config.transformations {
-            let registry = transformations::build_registry(0);
+            let registry = transformations::build_registry(0, transformation_handlers.as_ref());
             if !registry.is_empty() {
                 let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
                     format!(
@@ -506,6 +536,7 @@ async fn main() -> anyhow::Result<()> {
         let shared_db_pool = shared_db_pool.clone();
         let chain = chain.clone();
         let repair_scope = repair_scope.clone();
+        let transformation_handlers = transformation_handlers.clone();
 
         // Look up shared rate limiter for this chain's group
         let shared_rate_limiter = chain
@@ -515,8 +546,23 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|group| shared_rate_limiters.get(group).cloned());
 
         chain_tasks.spawn(async move {
-            let result = if live_only {
-                process_chain_live_only(&config, &chain, shared_db_pool, shared_rate_limiter).await
+            let result = if transformation_only {
+                transformation_only_chain(
+                    &config,
+                    &chain,
+                    shared_db_pool,
+                    transformation_handlers.as_ref(),
+                )
+                .await
+            } else if live_only {
+                process_chain_live_only(
+                    &config,
+                    &chain,
+                    shared_db_pool,
+                    shared_rate_limiter,
+                    transformation_handlers.as_ref(),
+                )
+                .await
             } else if repair_only {
                 repair_only_chain(
                     &config,
@@ -538,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
                     repair_scope,
                     shared_db_pool,
                     shared_rate_limiter,
+                    transformation_handlers.as_ref(),
                 )
                 .await
             };
@@ -713,6 +760,143 @@ async fn decode_only_chain(
     Ok(())
 }
 
+/// Transformation-only mode: runs transformation catchup on existing decoded
+/// parquet files without any collection, decoding, or live mode.
+///
+/// Useful for re-running transformations after handler changes without
+/// re-collecting or re-decoding raw data.
+async fn transformation_only_chain(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+    shared_db_pool: Option<Arc<DbPool>>,
+    handler_filter: Option<&HashSet<String>>,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        "Transformation-only processing for chain: {}",
+        chain.name
+    );
+
+    let tc = config.transformations.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "transformations config required for --transformation-only mode"
+        )
+    })?;
+
+    // Build handler registry filtered to this chain (and optionally by handler names)
+    let registry = transformations::build_registry_for_chain(
+        chain.chain_id,
+        &chain.contracts,
+        &chain.factory_collections,
+        handler_filter,
+    );
+
+    if registry.is_empty() {
+        tracing::info!(
+            "No transformation handlers registered for chain {}, nothing to do",
+            chain.name
+        );
+        return Ok(());
+    }
+
+    let registry = Arc::new(registry);
+
+    // Setup database pool
+    let db_pool = if let Some(pool) = shared_db_pool {
+        pool
+    } else {
+        let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
+            format!(
+                "env var {} not set for transformations",
+                tc.database_url_env_var
+            )
+        })?;
+        let pool = DbPool::new(&database_url, tc.db_pool_size)
+            .await
+            .context("failed to create database pool")?;
+        pool.run_migrations()
+            .await
+            .context("failed to run database migrations")?;
+        pool.run_handler_migrations(&registry)
+            .await
+            .context("failed to run handler migrations")?;
+        Arc::new(pool)
+    };
+
+    // Build a minimal RPC client (needed by transformation engine for ad-hoc queries).
+    // Load .env if the RPC URL env var is not yet set.
+    if env::var(&chain.rpc_url_env_var).is_err() {
+        dotenvy::dotenv().ok();
+    }
+    let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
+        format!(
+            "env var {} not set for chain {} (needed for transformation ad-hoc RPC queries)",
+            chain.rpc_url_env_var, chain.name
+        )
+    })?;
+    let rpc_batch_size = chain
+        .rpc
+        .batch_size
+        .or(config.raw_data_collection.rpc_batch_size)
+        .unwrap_or(types::config::defaults::rpc::MAX_BATCH_SIZE) as usize;
+    let (_rate_limiter, rpc_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+
+    // Validate call dependencies
+    transformations::registry::validate_call_dependencies(
+        &registry,
+        &chain.contracts,
+        &chain.factory_collections,
+    );
+
+    let mode = if tc.mode.batch_for_catchup {
+        ExecutionMode::Batch {
+            batch_size: tc.mode.catchup_batch_size,
+        }
+    } else {
+        ExecutionMode::Streaming
+    };
+
+    let engine = TransformationEngine::new(
+        registry.clone(),
+        db_pool,
+        rpc_client,
+        TransformationEngineConfig {
+            chain_name: chain.name.clone(),
+            chain_id: chain.chain_id,
+            mode,
+            contracts: chain.contracts.clone(),
+            factory_collections: chain.factory_collections.clone(),
+            handler_concurrency: tc.handler_concurrency,
+            expect_log_completion: false,
+            expect_eth_call_completion: false,
+        },
+        None, // No live progress tracker
+    )
+    .await
+    .context("failed to create transformation engine")?;
+
+    engine
+        .initialize()
+        .await
+        .context("failed to initialize transformation handlers")?;
+
+    tracing::info!(
+        "Transformation engine initialized for chain {} with {} handlers, running catchup",
+        chain.name,
+        registry.handler_count()
+    );
+
+    engine
+        .run_catchup()
+        .await
+        .map_err(|e| anyhow::anyhow!("transformation catchup error: {}", e))?;
+
+    tracing::info!(
+        "Transformation-only processing complete for chain {}",
+        chain.name
+    );
+    Ok(())
+}
+
 /// Repair-only mode: run eth_call repair passes on existing raw/decoded files
 /// without normal collection, transformations, or live mode.
 async fn repair_only_chain(
@@ -805,6 +989,7 @@ async fn process_chain_live_only(
     chain: &ChainConfig,
     shared_db_pool: Option<Arc<DbPool>>,
     shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain {} in live-only mode", chain.name);
 
@@ -824,7 +1009,7 @@ async fn process_chain_live_only(
     }
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter).await?;
+    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter, handler_filter).await?;
 
     // Build channels with config-derived capacity
     let channels = CommonChannels::build_for_live_only(
@@ -1444,11 +1629,12 @@ async fn process_chain(
     repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
     shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter).await?;
+    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter, handler_filter).await?;
 
     let features = &runtime.features;
     let has_factories = features.has_factories;
