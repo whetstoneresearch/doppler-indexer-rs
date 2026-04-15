@@ -38,10 +38,12 @@ use super::instructions::SolanaInstructionDecoder;
 /// Scans `base_dir/{source}/{event_name}/` for any file named `range_file`
 /// where `(source, event_name)` is NOT in `written_groups`.
 ///
-/// When `skip_sources` is `Some`, source directories whose name appears in
-/// the set are skipped — they belong to programs the decoder did not
-/// process in this run. All other directories are scanned, including old
-/// names left behind by source renames.
+/// When `only_sources` is `Some`, the scan is restricted to those source
+/// directories. Directories with unknown names (including old names from
+/// source renames) are left untouched because we cannot distinguish an old
+/// name for an in-scope program from one for an out-of-scope program
+/// without reading parquet content. Source renames are cleaned up by
+/// running unscoped `--decode-only --repair`.
 ///
 /// **Callers must not invoke this when a function filter is active**, since
 /// the written set would be incomplete *within* each source and cleanup
@@ -50,7 +52,7 @@ fn cleanup_stale_decoded_parquet(
     base_dir: &Path,
     written_groups: &HashMap<(String, String), Vec<DecodedEvent>>,
     range_file: &str,
-    skip_sources: Option<&HashSet<String>>,
+    only_sources: Option<&HashSet<String>>,
 ) {
     let written: HashSet<(&str, &str)> = written_groups
         .keys()
@@ -70,11 +72,11 @@ fn cleanup_stale_decoded_parquet(
             continue;
         };
 
-        // Skip sources that are known to belong to programs NOT processed
-        // in this run. Unknown directories (e.g. old names from a source
-        // rename) are still scanned so their stale files are cleaned up.
-        if let Some(skip) = skip_sources {
-            if skip.contains(source_name.as_str()) {
+        // When source-scoped, only scan directories whose name matches an
+        // in-scope source. We leave unknown directories alone to avoid
+        // accidentally deleting data for renamed out-of-scope programs.
+        if let Some(sources) = only_sources {
+            if !sources.contains(source_name.as_str()) {
                 continue;
             }
         }
@@ -132,9 +134,9 @@ fn cleanup_stale_decoded_parquet(
 /// `(source_name, event_name)` so each group gets its own parquet file and
 /// the transformation engine receives one [`DecodedEventsMessage`] per handler
 /// trigger.
-/// When `skip_sources` is `Some`, stale cleanup skips those source
-/// directories (they belong to programs not processed in this run) but
-/// still scans unknown directories such as old names from source renames.
+/// When `only_sources` is `Some`, stale cleanup is restricted to those
+/// source directories. Unknown directories (e.g. old names from a source
+/// rename) are left alone; use unscoped repair to clean those up.
 /// When a `function_filter` is active, cleanup is skipped entirely because
 /// the decoded output is incomplete within each source.
 pub async fn decode_solana_events(
@@ -145,7 +147,7 @@ pub async fn decode_solana_events(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
-    skip_sources: Option<Arc<HashSet<String>>>,
+    only_sources: Option<Arc<HashSet<String>>>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_events_dir(&chain_name);
@@ -234,15 +236,14 @@ pub async fn decode_solana_events(
 
                 // Remove stale decoded parquet for this range. Function
                 // filtering makes the output incomplete per-source, so
-                // cleanup must be skipped. Source scoping skips known
-                // out-of-scope directories but still scans unknown ones
-                // (e.g. old names from source renames).
+                // cleanup must be skipped. Source scoping restricts the
+                // scan to in-scope sources only.
                 if function_filter.is_none() {
                     cleanup_stale_decoded_parquet(
                         &base_dir,
                         &by_trigger,
                         &range_file,
-                        skip_sources.as_deref(),
+                        only_sources.as_deref(),
                     );
                 }
 
@@ -311,7 +312,7 @@ pub async fn decode_solana_instructions(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
-    skip_sources: Option<Arc<HashSet<String>>>,
+    only_sources: Option<Arc<HashSet<String>>>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_instructions_dir(&chain_name);
@@ -404,7 +405,7 @@ pub async fn decode_solana_instructions(
                         &base_dir,
                         &by_trigger,
                         &range_file,
-                        skip_sources.as_deref(),
+                        only_sources.as_deref(),
                     );
                 }
 
