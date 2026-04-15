@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::{Id, JoinSet};
 
 use super::tracker::CompletionTracker;
@@ -80,12 +80,17 @@ pub(crate) enum WorkItemRunResult {
 
 /// Per-handler sequential execution state.
 ///
-/// Groups the capacity-1 FIFO semaphore and the blocked-range marker that
-/// together enforce one-at-a-time ascending-order execution for handlers
-/// with `sequential: true`.
+/// Uses a capacity-1 semaphore for mutual exclusion and a watch channel to
+/// enforce strict ascending range_start ordering. The watch tracks how many
+/// ranges have completed; each task knows its ordinal and waits its turn.
 struct HandlerSequentialState {
     semaphore: Arc<Semaphore>,
     blocked_range: Arc<Mutex<Option<u64>>>,
+    /// Sorted range_starts for this handler (ascending order).
+    sorted_ranges: Arc<Vec<u64>>,
+    /// Broadcasts the index of the next range allowed to execute.
+    /// Tasks wait until this equals their position in `sorted_ranges`.
+    next_index: watch::Sender<usize>,
 }
 
 /// Pure DAG scheduler — owns the [`CompletionTracker`] and a concurrency semaphore.
@@ -128,19 +133,32 @@ impl DagScheduler {
             return Vec::new();
         }
 
-        // Build per-handler sequential state (capacity-1 semaphore + blocked
-        // range marker) in a single pass. Tokio semaphores are FIFO, so items
-        // submitted in ascending range_start order acquire permits in order.
+        // Build per-handler sequential state. Collect and sort range_starts per
+        // handler to enable deterministic ordering via watch channel.
         let seq_state: Arc<HashMap<String, HandlerSequentialState>> = {
-            let mut m = HashMap::new();
+            let mut ranges_per_handler: HashMap<String, Vec<u64>> = HashMap::new();
             for item in &items {
                 if item.sequential {
-                    m.entry(item.handler_name.clone())
-                        .or_insert_with(|| HandlerSequentialState {
-                            semaphore: Arc::new(Semaphore::new(1)),
-                            blocked_range: Arc::new(Mutex::new(None)),
-                        });
+                    ranges_per_handler
+                        .entry(item.handler_name.clone())
+                        .or_default()
+                        .push(item.range_start);
                 }
+            }
+            let mut m = HashMap::new();
+            for (name, mut ranges) in ranges_per_handler {
+                ranges.sort_unstable();
+                ranges.dedup();
+                let (tx, _rx) = watch::channel(0usize);
+                m.insert(
+                    name,
+                    HandlerSequentialState {
+                        semaphore: Arc::new(Semaphore::new(1)),
+                        blocked_range: Arc::new(Mutex::new(None)),
+                        sorted_ranges: Arc::new(ranges),
+                        next_index: tx,
+                    },
+                );
             }
             Arc::new(m)
         };
@@ -198,11 +216,48 @@ impl DagScheduler {
                     }
                 }
 
-                // 2. Per-handler sequential gate (capacity-1 FIFO).
-                //    Acquired after dep-wait so parked sequential tasks don't
-                //    consume global permits. Dropped at end of scope, releasing
-                //    the next range in FIFO order.
+                // 2. Per-handler sequential gate.
+                //    Uses a watch channel to enforce strict ascending range_start
+                //    ordering, then acquires a capacity-1 semaphore for mutual
+                //    exclusion. The watch ensures tasks execute in range_start
+                //    order regardless of dep-wait wake ordering.
                 let handler_seq = seq_state.get(&name_for_task);
+                if let Some(state) = handler_seq {
+                    // Find our ordinal position in the sorted range list.
+                    let my_index = state
+                        .sorted_ranges
+                        .binary_search(&range_start)
+                        .unwrap_or(0);
+
+                    // Wait until it's our turn.
+                    let mut rx = state.next_index.subscribe();
+                    loop {
+                        if *rx.borrow() >= my_index {
+                            break;
+                        }
+                        if rx.changed().await.is_err() {
+                            break; // Sender dropped, proceed anyway.
+                        }
+                    }
+
+                    // Check for earlier blocked range.
+                    let blocking_range = *state.blocked_range.lock().await;
+                    if let Some(blocking_range) = blocking_range.filter(|r| *r < range_start) {
+                        let reason = format!(
+                            "waiting on earlier blocked range {} before processing {}",
+                            blocking_range, range_start
+                        );
+                        tracker.mark_blocked(&name_for_task, range_start).await;
+                        // Advance to next index so subsequent tasks don't hang.
+                        let _ = state.next_index.send(my_index + 1);
+                        return WorkItemOutcome {
+                            handler_name: name_for_task,
+                            range_start,
+                            range_end,
+                            status: OutcomeStatus::Blocked { reason },
+                        };
+                    }
+                }
                 let _seq_permit = match handler_seq {
                     Some(state) => Some(
                         state
@@ -215,23 +270,6 @@ impl DagScheduler {
                     None => None,
                 };
 
-                if let Some(state) = handler_seq {
-                    let blocking_range = *state.blocked_range.lock().await;
-                    if let Some(blocking_range) = blocking_range.filter(|r| *r < range_start) {
-                        let reason = format!(
-                            "waiting on earlier blocked range {} before processing {}",
-                            blocking_range, range_start
-                        );
-                        tracker.mark_blocked(&name_for_task, range_start).await;
-                        return WorkItemOutcome {
-                            handler_name: name_for_task,
-                            range_start,
-                            range_end,
-                            status: OutcomeStatus::Blocked { reason },
-                        };
-                    }
-                }
-
                 // 3. Acquire global permit AFTER waiting to avoid permit-deadlock.
                 let _permit = permits
                     .acquire_owned()
@@ -242,11 +280,13 @@ impl DagScheduler {
                 let result = runner(item).await;
 
                 // 5. Propagate result to tracker + return outcome.
-                match result {
+                //    Advance sequential next_index after each result so the
+                //    next range can proceed.
+                let outcome = match result {
                     WorkItemRunResult::Succeeded => {
                         tracker.mark_completed(&name_for_task, range_start).await;
                         WorkItemOutcome {
-                            handler_name: name_for_task,
+                            handler_name: name_for_task.clone(),
                             range_start,
                             range_end,
                             status: OutcomeStatus::Succeeded,
@@ -255,7 +295,7 @@ impl DagScheduler {
                     WorkItemRunResult::Failed(reason) => {
                         tracker.mark_failed(&name_for_task, range_start).await;
                         WorkItemOutcome {
-                            handler_name: name_for_task,
+                            handler_name: name_for_task.clone(),
                             range_start,
                             range_end,
                             status: OutcomeStatus::HandlerFailed { reason },
@@ -270,13 +310,22 @@ impl DagScheduler {
                         }
                         tracker.mark_blocked(&name_for_task, range_start).await;
                         WorkItemOutcome {
-                            handler_name: name_for_task,
+                            handler_name: name_for_task.clone(),
                             range_start,
                             range_end,
                             status: OutcomeStatus::Blocked { reason },
                         }
                     }
+                };
+
+                // Advance the sequential next_index for the next range.
+                if let Some(state) = seq_state.get(&name_for_task) {
+                    if let Ok(idx) = state.sorted_ranges.binary_search(&range_start) {
+                        let _ = state.next_index.send(idx + 1);
+                    }
                 }
+
+                outcome
             });
             identity.insert(handle.id(), (name, range_start, range_end));
         }
