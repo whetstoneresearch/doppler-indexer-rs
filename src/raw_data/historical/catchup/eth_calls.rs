@@ -3,10 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
-
-use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
@@ -345,7 +342,6 @@ pub async fn collect_eth_calls(
     repair: bool,
     repair_only: bool,
     repair_scope: Option<RepairScope>,
-    decoder_tx: &Option<Sender<DecoderMessage>>,
     has_factory_rx: bool,
     has_event_trigger_rx: bool,
     factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
@@ -856,7 +852,7 @@ pub async fn collect_eth_calls(
                     existing_files: &existing_files,
                     rpc_batch_size,
                     repair,
-                    decoder_tx,
+                    decoder_tx: &None,
                     chain_name: &chain.name,
                     storage_manager: storage_manager.as_ref(),
                     s3_manifest: &s3_manifest,
@@ -1060,7 +1056,6 @@ pub async fn collect_eth_calls(
                     let storage_manager: Option<Arc<StorageManager>> = storage_manager_arc.clone();
                     let chain_name = chain_name_arc.clone();
                     let client = client.clone();
-                    let decoder_tx = decoder_tx.clone();
                     let factory_contract_indexes = factory_contract_indexes_arc.clone();
                     let factory_collections = factory_collections_arc.clone();
                     let log_range = log_range.clone();
@@ -1241,7 +1236,7 @@ pub async fn collect_eth_calls(
                                 existing_files: &existing_files,
                                 rpc_batch_size,
                                 repair,
-                                decoder_tx: &decoder_tx,
+                                decoder_tx: &None,
                                 chain_name: &chain_name,
                                 storage_manager: storage_manager.as_ref(),
                                 s3_manifest: &s3_manifest,

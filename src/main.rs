@@ -754,7 +754,6 @@ async fn repair_only_chain(
         build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
     };
 
-    let no_decoder_tx: Option<mpsc::Sender<DecoderMessage>> = None;
     let s3_manifest = storage_manager.manifest_for(&chain.name);
 
     raw_data::historical::catchup::eth_calls::collect_eth_calls(
@@ -764,7 +763,6 @@ async fn repair_only_chain(
         true,
         true,
         repair_scope.clone(),
-        &no_decoder_tx,
         features.has_factory_calls,
         features.has_event_triggered_calls,
         None,
@@ -1234,7 +1232,6 @@ impl FullPipelineContext {
                         repair,
                         false,
                         repair_scope.clone(),
-                        &call_decoder_tx,
                         has_factory_rx,
                         has_event_trigger_rx,
                         factory_catchup_done_rx,
