@@ -290,8 +290,8 @@ async fn main() -> anyhow::Result<()> {
             filter
         );
     }
-    if !decode_only && !transformation_only {
-        let require_ws = !catch_up_only && !repair_only;
+    if !decode_only {
+        let require_ws = !catch_up_only && !repair_only && !transformation_only;
         load_required_env_vars(&config, require_ws)?;
     }
 
@@ -823,10 +823,6 @@ async fn transformation_only_chain(
     };
 
     // Build a minimal RPC client (needed by transformation engine for ad-hoc queries).
-    // Load .env if the RPC URL env var is not yet set.
-    if env::var(&chain.rpc_url_env_var).is_err() {
-        dotenvy::dotenv().ok();
-    }
     let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
         format!(
             "env var {} not set for chain {} (needed for transformation ad-hoc RPC queries)",
