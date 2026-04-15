@@ -227,6 +227,18 @@ async fn read_raw_event_row_key_counts(output_path: PathBuf) -> Result<EventRowK
     .map_err(|e| e.to_string())?
 }
 
+/// What kind of repair action an event-triggered call range needs.
+enum EventRepairNeed {
+    /// Data and contract index are both correct — skip entirely.
+    None,
+    /// Parquet data is correct but the contract index sidecar is missing or
+    /// incomplete. Only the contract index needs to be stamped (no RPC).
+    ContractIndexOnly,
+    /// Data is missing, unreadable, or doesn't match expectations — full
+    /// re-collection required.
+    FullRecollection,
+}
+
 async fn repair_needs_event_recollection(
     base_output_dir: &std::path::Path,
     event_call_configs: &HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>,
@@ -235,13 +247,15 @@ async fn repair_needs_event_recollection(
     triggers: &[crate::raw_data::historical::receipts::EventTriggerData],
     range_start: u64,
     range_end_inclusive: u64,
-) -> Result<bool, EthCallCollectionError> {
+) -> Result<EventRepairNeed, EthCallCollectionError> {
     let range_end_exclusive = range_end_inclusive + 1;
     let active_pairs = active_event_output_pairs_for_range(event_call_configs, range_end_exclusive);
     let expected_counts =
         expected_event_call_key_counts_by_output(triggers, event_call_configs, factory_addresses);
     let expected_factory_contracts =
         build_expected_factory_contracts_for_range(contracts, range_end_exclusive);
+
+    let mut needs_contract_index_only = false;
 
     for ((contract_name, function_name), is_factory) in active_pairs {
         let output_path = base_output_dir
@@ -258,7 +272,7 @@ async fn repair_needs_event_recollection(
                 range_start,
                 range_end_inclusive
             );
-            return Ok(true);
+            return Ok(EventRepairNeed::FullRecollection);
         }
 
         let actual = match read_raw_event_row_key_counts(output_path.clone()).await {
@@ -269,7 +283,7 @@ async fn repair_needs_event_recollection(
                     output_path.display(),
                     err
                 );
-                return Ok(true);
+                return Ok(EventRepairNeed::FullRecollection);
             }
         };
         let expected = expected_counts
@@ -287,7 +301,7 @@ async fn repair_needs_event_recollection(
                 expected.len(),
                 actual.len()
             );
-            return Ok(true);
+            return Ok(EventRepairNeed::FullRecollection);
         }
 
         if is_factory {
@@ -295,25 +309,32 @@ async fn repair_needs_event_recollection(
                 .join(&contract_name)
                 .join(&function_name)
                 .join("on_events");
-            let index = read_contract_index(&sub_dir);
+            let index_dir = sub_dir.clone();
+            let index = tokio::task::spawn_blocking(move || read_contract_index(&index_dir))
+                .await
+                .unwrap_or_default();
             let rk = range_key(range_start, range_end_inclusive);
             if let Some(expected_contracts) = expected_factory_contracts.get(contract_name.as_str())
             {
                 if !get_missing_contracts(&index, &rk, expected_contracts).is_empty() {
                     tracing::info!(
-                        "Repair flagged missing contract index coverage for {}.{} blocks {}-{}",
+                        "Repair flagged missing contract index coverage for {}.{} blocks {}-{} (data OK, index-only repair)",
                         contract_name,
                         function_name,
                         range_start,
                         range_end_inclusive
                     );
-                    return Ok(true);
+                    needs_contract_index_only = true;
                 }
             }
         }
     }
 
-    Ok(false)
+    if needs_contract_index_only {
+        Ok(EventRepairNeed::ContractIndexOnly)
+    } else {
+        Ok(EventRepairNeed::None)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -963,12 +984,14 @@ pub async fn collect_eth_calls(
         // Skip checks run fully concurrent across ranges (lightweight).
         // The I/O semaphore gates log reads and repair validation to avoid
         // exhausting file descriptors. The RPC semaphore gates network calls.
-        // Contract index writes are deferred to after all ranges complete.
+        // Contract indexes are written incrementally as each range completes
+        // so that progress is preserved if the process is interrupted.
         //
         // Ranges are processed in windows to bound peak memory: only `window_size`
         // tasks are alive in the JoinSet at any time. Each window is fully drained
         // before the next one is spawned.
-        let mut processed_event_ranges: Vec<(u64, u64)> = Vec::new();
+        let mut event_catchup_count: usize = 0;
+        let mut ci_only_count: usize = 0;
 
         // Pre-filter ranges (CPU-only checks, no I/O)
         let eligible_ranges: Vec<(usize, &ExistingLogRange)> = log_ranges
@@ -992,14 +1015,34 @@ pub async fn collect_eth_calls(
             .event_call_trigger_batch_size
             .unwrap_or(defaults::raw_data::EVENT_CALL_TRIGGER_BATCH_SIZE);
 
+        // Pre-compute factory pairs and pre-load their contract indexes into
+        // memory so that the drain loop can update + flush incrementally.
+        let factory_pairs: HashSet<(String, String)> = catchup_event_call_configs
+            .values()
+            .flatten()
+            .filter(|c| c.is_factory)
+            .map(|c| (c.contract_name.clone(), c.function_name.clone()))
+            .collect();
+
+        use crate::storage::contract_index::ContractIndex;
+        let mut ci_state: HashMap<(String, String), ContractIndex> = factory_pairs
+            .iter()
+            .map(|(cn, fn_)| {
+                let sub_dir = base_output_dir.join(cn).join(fn_).join("on_events");
+                let ci = read_contract_index(&sub_dir);
+                ((cn.clone(), fn_.clone()), ci)
+            })
+            .collect();
+
         {
             let io_semaphore =
                 Arc::new(tokio::sync::Semaphore::new(event_call_concurrency * 2));
             let rpc_semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency));
 
             for window in eligible_ranges.chunks(window_size) {
+                // (start, end, contract_index_only)
                 let mut join_set: tokio::task::JoinSet<
-                    Result<Option<(u64, u64)>, EthCallCollectionError>,
+                    Result<Option<(u64, u64, bool)>, EthCallCollectionError>,
                 > = tokio::task::JoinSet::new();
 
                 for &(idx, log_range) in window {
@@ -1137,7 +1180,7 @@ pub async fn collect_eth_calls(
 
                         // Repair validation (repair only, after extraction)
                         if repair {
-                            let needs_processing = repair_needs_event_recollection(
+                            let repair_need = repair_needs_event_recollection(
                                 &base_output_dir,
                                 &event_call_configs,
                                 &factory_addresses,
@@ -1148,13 +1191,26 @@ pub async fn collect_eth_calls(
                             )
                             .await?;
 
-                            if !needs_processing {
-                                tracing::debug!(
-                                    "Skipping event-triggered calls for blocks {}-{} (already verified)",
-                                    range_start,
-                                    inclusive_end
-                                );
-                                return Ok(None);
+                            match repair_need {
+                                EventRepairNeed::None => {
+                                    tracing::debug!(
+                                        "Skipping event-triggered calls for blocks {}-{} (already verified)",
+                                        range_start,
+                                        inclusive_end
+                                    );
+                                    return Ok(None);
+                                }
+                                EventRepairNeed::ContractIndexOnly => {
+                                    tracing::info!(
+                                        "Event-triggered calls for blocks {}-{}: data OK, stamping contract index only (skipping RPC)",
+                                        range_start,
+                                        inclusive_end
+                                    );
+                                    return Ok(Some((range_start, inclusive_end, true)));
+                                }
+                                EventRepairNeed::FullRecollection => {
+                                    // Fall through to RPC phase
+                                }
                             }
                         }
 
@@ -1246,80 +1302,71 @@ pub async fn collect_eth_calls(
                             inclusive_end
                         );
 
-                        Ok(Some((range_start, inclusive_end)))
+                        Ok(Some((range_start, inclusive_end, false)))
                     });
                 }
 
-                // Drain current window before spawning next
+                // Drain current window before spawning next.
+                // Write contract indexes incrementally so progress survives ctrl-C.
                 while let Some(result) = join_set.join_next().await {
-                    match result {
-                        Ok(Ok(Some((start, end)))) => {
-                            processed_event_ranges.push((start, end));
-                        }
-                        Ok(Ok(None)) => {}
+                    let (start, end, ci_only) = match result {
+                        Ok(Ok(Some(tuple))) => tuple,
+                        Ok(Ok(None)) => continue,
                         Ok(Err(e)) => return Err(e),
                         Err(e) => {
                             return Err(EthCallCollectionError::JoinError(e.to_string()));
                         }
+                    };
+
+                    if ci_only {
+                        ci_only_count += 1;
+                    } else {
+                        event_catchup_count += 1;
                     }
-                }
-            }
-        }
-        let event_catchup_count = processed_event_ranges.len();
 
-        // Batch-write contract indexes for all processed ranges (deferred from concurrent phase)
-        if !processed_event_ranges.is_empty() {
-            let factory_pairs: HashSet<(String, String)> = catchup_event_call_configs
-                .values()
-                .flatten()
-                .filter(|c| c.is_factory)
-                .map(|c| (c.contract_name.clone(), c.function_name.clone()))
-                .collect();
-
-            for (contract_name, function_name) in &factory_pairs {
-                let sub_dir = base_output_dir
-                    .join(contract_name)
-                    .join(function_name)
-                    .join("on_events");
-                let mut ci = read_contract_index(&sub_dir);
-                let mut wrote_any = false;
-
-                for &(start, end) in &processed_event_ranges {
+                    // Stamp contract index for every factory pair in this range.
                     let expected =
                         build_expected_factory_contracts_for_range(&chain.contracts, end + 1);
-                    if let Some(exp) = expected.get(contract_name.as_str()) {
-                        update_contract_index(&mut ci, &range_key(start, end), exp);
-                        wrote_any = true;
-                    }
-                }
+                    for (contract_name, function_name) in &factory_pairs {
+                        if let Some(exp) = expected.get(contract_name.as_str()) {
+                            let ci = ci_state
+                                .get_mut(&(contract_name.clone(), function_name.clone()))
+                                .expect("ci_state pre-loaded for all factory_pairs");
+                            update_contract_index(ci, &range_key(start, end), exp);
 
-                if wrote_any {
-                    if let Err(e) = write_contract_index(&sub_dir, &ci) {
-                        tracing::warn!(
-                            "Failed to batch-write contract index for {}.{}/on_events: {}",
-                            contract_name,
-                            function_name,
-                            e
-                        );
-                    } else if let Some(sm) = storage_manager.as_ref() {
-                        let index_path = sub_dir.join("contract_index.json");
-                        if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
-                            tracing::warn!(
-                                "Failed to upload contract index sidecar for {}.{}/on_events: {}",
-                                contract_name,
-                                function_name,
-                                e
-                            );
+                            let sub_dir = base_output_dir
+                                .join(contract_name)
+                                .join(function_name)
+                                .join("on_events");
+                            if let Err(e) = write_contract_index(&sub_dir, ci) {
+                                tracing::warn!(
+                                    "Failed to write contract index for {}.{}/on_events: {}",
+                                    contract_name,
+                                    function_name,
+                                    e
+                                );
+                            } else if let Some(sm) = storage_manager.as_ref() {
+                                let index_path = sub_dir.join("contract_index.json");
+                                if let Err(e) = upload_sidecar_to_s3(sm, &index_path).await {
+                                    tracing::warn!(
+                                        "Failed to upload contract index sidecar for {}.{}/on_events: {}",
+                                        contract_name,
+                                        function_name,
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        if event_catchup_count > 0 {
+        if event_catchup_count > 0 || ci_only_count > 0 {
             tracing::info!(
-                "Event-triggered calls catchup complete: processed {} ranges for chain {}",
+                "Event-triggered calls catchup complete: {} re-collected, {} contract-index-only for chain {}",
                 event_catchup_count,
+                ci_only_count,
                 chain.name
             );
         } else {
