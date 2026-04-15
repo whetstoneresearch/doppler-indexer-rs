@@ -77,7 +77,6 @@ pub async fn collect_solana_raw_data(
         start_slot,
         end_slot,
         range_size,
-        &events_dir,
         &skipped_index,
     );
 
@@ -205,7 +204,6 @@ pub fn compute_slot_ranges_to_fetch(
     start: u64,
     end: u64,
     range_size: u64,
-    dir: &Path,
     skipped_index: &SkippedSlotsIndex,
 ) -> Vec<BlockRange> {
     if start >= end || range_size == 0 {
@@ -213,9 +211,6 @@ pub fn compute_slot_ranges_to_fetch(
     }
 
     let aligned_start = (start / range_size) * range_size;
-
-    // Scan existing parquet files for completed ranges
-    let existing_files = crate::storage::paths::scan_parquet_filenames(dir, "events_");
 
     let mut ranges = Vec::new();
     let mut current = aligned_start;
@@ -228,13 +223,13 @@ pub fn compute_slot_ranges_to_fetch(
 
         let rk = skipped_slots::range_key(range.start, range.end_inclusive());
 
-        // Skip if already complete (exists in skipped index, meaning we processed it)
+        // The skipped-slots sidecar is the authoritative completion marker — it
+        // is written after all parquet files for the range. A parquet file alone
+        // is not proof of completion (a crash between parquet write and sidecar
+        // update would leave a partial range).
         let already_complete = skipped_slots::is_range_complete(skipped_index, &rk);
 
-        // Also skip if parquet file already exists
-        let file_exists = existing_files.contains(&range.file_name("events"));
-
-        if !already_complete && !file_exists {
+        if !already_complete {
             ranges.push(range);
         }
 
@@ -458,9 +453,13 @@ pub async fn collect_slots_selective(
     // Write parquet files
     let slot_records_vec: Vec<_> = slot_records.into_values().collect();
 
+    let slot_path = slots_dir.join(range.file_name("slots"));
     if !slot_records_vec.is_empty() {
-        let slot_path = slots_dir.join(range.file_name("slots"));
         write_slots_to_parquet_async(slot_records_vec, slot_schema, slot_path).await?;
+    } else if repair_slots.is_some() && slot_path.exists() {
+        // All slots in the range resolved to empty/skipped after repair — remove
+        // the stale slot file so it stays consistent with events/instructions.
+        std::fs::remove_file(&slot_path)?;
     }
 
     let events_path = events_dir.join(range.file_name("events"));
@@ -542,9 +541,8 @@ mod tests {
     #[test]
     fn test_compute_slot_ranges_basic() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
-        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, &empty_index);
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].start, 0);
@@ -558,10 +556,9 @@ mod tests {
     #[test]
     fn test_compute_slot_ranges_alignment() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
         // start_slot=500 should align down to 0
-        let ranges = compute_slot_ranges_to_fetch(500, 2500, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(500, 2500, 1000, &empty_index);
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].start, 0);
@@ -578,9 +575,7 @@ mod tests {
         // Mark range 1000-1999 as complete
         index.insert(skipped_slots::range_key(1000, 1999), vec![1050]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-
-        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, dir.path(), &index);
+        let ranges = compute_slot_ranges_to_fetch(0, 3000, 1000, &index);
 
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].start, 0);
@@ -595,31 +590,27 @@ mod tests {
         index.insert(skipped_slots::range_key(0, 999), vec![]);
         index.insert(skipped_slots::range_key(1000, 1999), vec![]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-
-        let ranges = compute_slot_ranges_to_fetch(0, 2000, 1000, dir.path(), &index);
+        let ranges = compute_slot_ranges_to_fetch(0, 2000, 1000, &index);
         assert!(ranges.is_empty());
     }
 
     #[test]
     fn test_compute_slot_ranges_empty_input() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
         // start >= end
-        let ranges = compute_slot_ranges_to_fetch(1000, 1000, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(1000, 1000, 1000, &empty_index);
         assert!(ranges.is_empty());
 
-        let ranges = compute_slot_ranges_to_fetch(2000, 1000, 1000, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(2000, 1000, 1000, &empty_index);
         assert!(ranges.is_empty());
     }
 
     #[test]
     fn test_compute_slot_ranges_zero_range_size() {
         let empty_index = SkippedSlotsIndex::new();
-        let dir = tempfile::TempDir::new().unwrap();
 
-        let ranges = compute_slot_ranges_to_fetch(0, 1000, 0, dir.path(), &empty_index);
+        let ranges = compute_slot_ranges_to_fetch(0, 1000, 0, &empty_index);
         assert!(ranges.is_empty());
     }
 

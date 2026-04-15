@@ -38,14 +38,18 @@ use super::instructions::SolanaInstructionDecoder;
 /// Scans `base_dir/{source}/{event_name}/` for any file named `range_file`
 /// where `(source, event_name)` is NOT in `written_groups`.
 ///
-/// **Only safe when `written_groups` represents the complete decoded output
-/// for the range.** Callers must skip this when source or function filters
-/// are active, since the written set would be an incomplete subset and
-/// cleanup would delete files for out-of-scope groups.
+/// When `only_sources` is `Some`, the scan is limited to those source
+/// directories — other sources are left untouched because the decoder did
+/// not receive their data and cannot judge staleness.
+///
+/// **Callers must not invoke this when a function filter is active**, since
+/// the written set would be incomplete *within* each source and cleanup
+/// would delete files for out-of-scope event/instruction names.
 fn cleanup_stale_decoded_parquet(
     base_dir: &Path,
     written_groups: &HashMap<(String, String), Vec<DecodedEvent>>,
     range_file: &str,
+    only_sources: Option<&HashSet<String>>,
 ) {
     let written: HashSet<(&str, &str)> = written_groups
         .keys()
@@ -64,6 +68,14 @@ fn cleanup_stale_decoded_parquet(
         let Some(source_name) = source_entry.file_name().to_str().map(String::from) else {
             continue;
         };
+
+        // When source-scoped, skip sources outside the scope — we have no
+        // data for them and cannot determine staleness.
+        if let Some(sources) = only_sources {
+            if !sources.contains(source_name.as_str()) {
+                continue;
+            }
+        }
 
         let Ok(event_dirs) = std::fs::read_dir(&source_path) else {
             continue;
@@ -118,9 +130,10 @@ fn cleanup_stale_decoded_parquet(
 /// `(source_name, event_name)` so each group gets its own parquet file and
 /// the transformation engine receives one [`DecodedEventsMessage`] per handler
 /// trigger.
-/// When `scoped_repair` is true, stale decoded parquet cleanup is skipped
-/// because the decoder only sees a filtered subset of the range and cannot
-/// determine which other files are genuinely stale vs. out-of-scope.
+/// When `source_scope` is `Some`, stale cleanup is limited to those sources
+/// (the decoder only received data for them). When a `function_filter` is
+/// active, cleanup is skipped entirely because the decoded output is
+/// incomplete within each source.
 pub async fn decode_solana_events(
     decoder: Arc<SolanaEventDecoder>,
     program_names: Arc<HashMap<[u8; 32], String>>,
@@ -129,7 +142,7 @@ pub async fn decode_solana_events(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
-    scoped_repair: bool,
+    source_scope: Option<Arc<HashSet<String>>>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_events_dir(&chain_name);
@@ -216,10 +229,17 @@ pub async fn decode_solana_events(
                     }
                 }
 
-                // Remove stale decoded parquet for this range — only when the
-                // decoder has the complete picture (no source or function filters).
-                if !scoped_repair {
-                    cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
+                // Remove stale decoded parquet for this range. Function
+                // filtering makes the output incomplete per-source, so
+                // cleanup must be skipped. Source scoping is safe — cleanup
+                // is limited to the scoped sources where we have full data.
+                if function_filter.is_none() {
+                    cleanup_stale_decoded_parquet(
+                        &base_dir,
+                        &by_trigger,
+                        &range_file,
+                        source_scope.as_deref(),
+                    );
                 }
 
                 // Send one message per (source_name, event_name) group
@@ -287,7 +307,7 @@ pub async fn decode_solana_instructions(
     complete_tx: Option<Sender<RangeCompleteMessage>>,
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
-    scoped_repair: bool,
+    source_scope: Option<Arc<HashSet<String>>>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_instructions_dir(&chain_name);
@@ -374,9 +394,14 @@ pub async fn decode_solana_instructions(
                     }
                 }
 
-                // Remove stale decoded parquet for this range — only when unscoped
-                if !scoped_repair {
-                    cleanup_stale_decoded_parquet(&base_dir, &by_trigger, &range_file);
+                // Remove stale decoded parquet — see decode_solana_events
+                if function_filter.is_none() {
+                    cleanup_stale_decoded_parquet(
+                        &base_dir,
+                        &by_trigger,
+                        &range_file,
+                        source_scope.as_deref(),
+                    );
                 }
 
                 // Send one message per (source_name, instruction_name) group
@@ -544,7 +569,7 @@ mod tests {
             Some(complete_tx),
             chain_name,
             None,
-            false,
+            None,
         ));
 
         // Send an event batch
@@ -612,7 +637,7 @@ mod tests {
             Some(complete_tx),
             "test-solana-instr".to_string(),
             None,
-            false,
+            None,
         ));
 
         decoder_tx
@@ -651,7 +676,7 @@ mod tests {
             None,
             "test-close".to_string(),
             None,
-            false,
+            None,
         ));
 
         // Drop sender to close channel
@@ -692,7 +717,7 @@ mod tests {
             Some(complete_tx),
             "test-unknown".to_string(),
             None,
-            false,
+            None,
         ));
 
         // Send batch with one known and one unknown program event

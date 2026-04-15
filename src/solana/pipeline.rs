@@ -399,11 +399,6 @@ pub async fn process_solana_chain(
         None
     };
 
-    // The decoder receives fully merged data for each range (fresh + retained),
-    // so stale cleanup is safe unless a function filter is active — that makes
-    // the decoded output a partial subset of the range's decoded groups.
-    let scoped_repair = function_filter.is_some();
-
     // Backfill task
     {
         let chain_name = runtime.chain.name.clone();
@@ -436,7 +431,8 @@ pub async fn process_solana_chain(
         });
     }
 
-    // Event decoder task
+    // Event decoder task — decoder receives fully merged data for each range
+    // (no source scope needed). Only function filtering makes output partial.
     if let Some(event_rx) = event_decoder_rx {
         let event_decoder = Arc::new(SolanaEventDecoder::new(runtime.decoders.clone()));
         let program_names = runtime.program_names.clone();
@@ -445,9 +441,8 @@ pub async fn process_solana_chain(
         let chain_name = runtime.chain.name.clone();
         let ff = function_filter.clone();
 
-        let sr = scoped_repair;
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name, ff, sr)
+            decode_solana_events(event_decoder, program_names, event_rx, tx, complete, chain_name, ff, None)
                 .await;
             Ok(())
         });
@@ -464,7 +459,6 @@ pub async fn process_solana_chain(
         let complete = transform_complete_tx.clone();
         let chain_name = runtime.chain.name.clone();
         let ff = function_filter.clone();
-        let sr = scoped_repair;
 
         tasks.spawn(async move {
             decode_solana_instructions(
@@ -475,7 +469,7 @@ pub async fn process_solana_chain(
                 complete,
                 chain_name,
                 ff,
-                sr,
+                None,
             )
             .await;
             Ok(())
@@ -557,13 +551,13 @@ pub async fn decode_only_solana_chain(
         .and_then(|s| s.functions.as_ref())
         .map(|f| Arc::new(f.clone()));
 
-    // Range-only scoping still sends complete file contents to the decoder (the
-    // feeder skips entire files, not individual records), so stale cleanup is
-    // safe. Only source or function filters make the decoder's output a partial
-    // subset where cleanup would incorrectly delete out-of-scope files.
-    let scoped = repair_scope.as_ref().is_some_and(|s| {
-        s.sources.is_some() || s.functions.is_some()
-    });
+    // Source scope for stale cleanup: in decode-only mode the feeders already
+    // filter raw records by source, so the decoder has a complete view for those
+    // sources. Pass the source set so cleanup is limited to them.
+    let source_scope: Option<Arc<HashSet<String>>> = repair_scope
+        .as_ref()
+        .and_then(|s| s.sources.as_ref())
+        .map(|s| Arc::new(s.clone()));
 
     let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
 
@@ -574,9 +568,10 @@ pub async fn decode_only_solana_chain(
         let names = program_names.clone();
         let chain_name = chain.name.clone();
         let ff = function_filter.clone();
+        let ss = source_scope.clone();
 
         tasks.spawn(async move {
-            decode_solana_events(event_decoder, names, rx, None, None, chain_name, ff, scoped).await;
+            decode_solana_events(event_decoder, names, rx, None, None, chain_name, ff, ss).await;
             Ok(())
         });
 
@@ -602,9 +597,10 @@ pub async fn decode_only_solana_chain(
         let names = program_names.clone();
         let chain_name = chain.name.clone();
         let ff = function_filter.clone();
+        let ss = source_scope.clone();
 
         tasks.spawn(async move {
-            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name, ff, scoped).await;
+            decode_solana_instructions(instr_decoder, names, rx, None, None, chain_name, ff, ss).await;
             Ok(())
         });
 
