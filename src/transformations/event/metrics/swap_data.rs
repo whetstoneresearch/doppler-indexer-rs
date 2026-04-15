@@ -55,7 +55,7 @@ pub struct LiquidityInput {
 /// are silently skipped — no ghost snapshot rows are emitted.
 ///
 /// When `usd_ctx` is provided, computes `volume_usd` for each snapshot and emits
-/// `RawSql` UPDATE operations for rolling metrics on `pool_state`.
+/// `NamedSql` UPDATE operations for rolling metrics on `pool_state`.
 pub fn process_swaps(
     swaps: &[SwapInput],
     metadata_cache: &PoolMetadataCache,
@@ -214,8 +214,8 @@ pub fn process_swaps(
             active_liquidity: acc.last_liquidity.to_string(),
         }));
 
-        // Emit RawSql to update rolling metrics on pool_state.
-        // This executes after the snapshot upserts (RawSql sorts last in the
+        // Emit NamedSql to update rolling metrics on pool_state.
+        // This executes after the snapshot upserts (NamedSql sorts last in the
         // transaction), so the LATERAL subqueries see the just-inserted data.
         if usd_ctx.is_some() {
             ops.push(build_rolling_metrics_update(
@@ -233,7 +233,7 @@ pub fn process_swaps(
     ops
 }
 
-/// Build a RawSql UPDATE for rolling metrics on pool_state.
+/// Build a NamedSql UPDATE for rolling metrics on pool_state.
 ///
 /// Uses backward-looking LATERAL subqueries: "what was the price N hours ago?"
 /// finds the last known price_close at or before the target timestamp.
@@ -246,7 +246,7 @@ fn build_rolling_metrics_update(
     handler_name: &str,
     source_version: u32,
 ) -> DbOperation {
-    let query = r#"
+    let template = r#"
 UPDATE pool_state SET
   volume_24h_usd = sub.vol_24h,
   swap_count_24h = sub.swaps_24h,
@@ -257,55 +257,65 @@ FROM (
     agg.vol_24h,
     agg.swaps_24h,
     CASE WHEN h1h.price_close IS NOT NULL AND h1h.price_close != 0
-         THEN ($3::text::numeric - h1h.price_close) / h1h.price_close
+         THEN (:price_close - h1h.price_close) / h1h.price_close
     END AS pc_1h,
     CASE WHEN h24h.price_close IS NOT NULL AND h24h.price_close != 0
-         THEN ($3::text::numeric - h24h.price_close) / h24h.price_close
+         THEN (:price_close - h24h.price_close) / h24h.price_close
     END AS pc_24h
   FROM (
     SELECT
       COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
       COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h
     FROM pool_snapshots s
-    WHERE s.chain_id = $1 AND s.pool_id = $2
-      AND s.block_timestamp > ($4::bigint - 86400)
+    WHERE s.chain_id = :chain_id AND s.pool_id = :pool_id
+      AND s.block_timestamp > (:block_timestamp::bigint - 86400)
+      AND s.block_timestamp <= :block_timestamp::bigint
+      AND s.source = :source AND s.source_version = :source_version
   ) agg
   LEFT JOIN LATERAL (
     SELECT price_close FROM pool_snapshots
-    WHERE chain_id = $1 AND pool_id = $2
-      AND block_timestamp <= ($4::bigint - 3600)
-      AND source = $6 AND source_version = $7
+    WHERE chain_id = :chain_id AND pool_id = :pool_id
+      AND block_timestamp <= (:block_timestamp::bigint - 3600)
+      AND source = :source AND source_version = :source_version
     ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
   ) h1h ON true
   LEFT JOIN LATERAL (
     SELECT price_close FROM pool_snapshots
-    WHERE chain_id = $1 AND pool_id = $2
-      AND block_timestamp <= ($4::bigint - 86400)
-      AND source = $6 AND source_version = $7
+    WHERE chain_id = :chain_id AND pool_id = :pool_id
+      AND block_timestamp <= (:block_timestamp::bigint - 86400)
+      AND source = :source AND source_version = :source_version
     ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
   ) h24h ON true
-  WHERE s.chain_id = $1 AND s.pool_id = $2
-    AND s.block_timestamp > ($4 - 86400)
-    AND s.block_timestamp <= $4
-    AND s.source = $6 AND s.source_version = $7
 ) sub
-WHERE pool_state.chain_id = $1
-  AND pool_state.pool_id = $2
-  AND pool_state.block_number = $5
-  AND pool_state.source = $6
-  AND pool_state.source_version = $7
+WHERE pool_state.chain_id = :chain_id
+  AND pool_state.pool_id = :pool_id
+  AND pool_state.block_number = :block_number
+  AND pool_state.source = :source
+  AND pool_state.source_version = :source_version
 "#;
 
-    DbOperation::RawSql {
-        query: query.to_string(),
+    DbOperation::NamedSql {
+        template: template.to_string(),
         params: vec![
-            DbValue::Int64(chain_id as i64),
-            DbValue::Bytes(pool_id.to_vec()),
-            DbValue::Numeric(price_close.to_string()),
-            DbValue::Int64(block_timestamp as i64),
-            DbValue::Int64(block_number as i64),
-            DbValue::VarChar(handler_name.to_string()),
-            DbValue::Int32(source_version as i32),
+            ("chain_id".to_string(), DbValue::Int64(chain_id as i64)),
+            ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
+            (
+                "price_close".to_string(),
+                DbValue::Numeric(price_close.to_string()),
+            ),
+            (
+                "block_timestamp".to_string(),
+                DbValue::Int64(block_timestamp as i64),
+            ),
+            (
+                "block_number".to_string(),
+                DbValue::Int64(block_number as i64),
+            ),
+            ("source".to_string(), DbValue::VarChar(handler_name.to_string())),
+            (
+                "source_version".to_string(),
+                DbValue::Int32(source_version as i32),
+            ),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_state".to_string(),
@@ -542,38 +552,47 @@ mod tests {
         }];
 
         let ops = process_swaps(&swaps, &cache, 8453, "test", "test", Some(&usd_ctx), 1);
-        // snapshot + pool_state + rolling_metrics RawSql
+        // snapshot + pool_state + rolling_metrics NamedSql
         assert_eq!(
             ops.len(),
             3,
-            "USD context should add rolling metrics RawSql"
+            "USD context should add rolling metrics NamedSql"
         );
 
-        // Verify the third op is a RawSql
+        // Verify the third op is a NamedSql
         match &ops[2] {
-            DbOperation::RawSql {
-                query,
+            DbOperation::NamedSql {
+                template,
                 params,
                 snapshot,
             } => {
-                assert!(query.contains("volume_24h_usd"));
-                assert!(query.contains("price_change_1h"));
-                assert!(query.contains("agg.vol_24h"));
-                assert!(query.contains(
+                assert!(template.contains("volume_24h_usd"));
+                assert!(template.contains("price_change_1h"));
+                assert!(template.contains("agg.vol_24h"));
+                assert!(template.contains(
                     "FROM (\n    SELECT\n      COALESCE(SUM(s.volume_usd), 0) AS vol_24h"
                 ));
-                assert!(query.contains("$3::text::numeric"));
-                assert!(query.contains("$4::bigint - 86400"));
-                assert!(query.contains("pool_state.block_number = $5"));
-                assert!(query.contains("s.block_timestamp <= $4"));
+                assert!(template.contains(":price_close"));
+                assert!(template.contains(":block_timestamp::bigint - 86400"));
+                assert!(template.contains("pool_state.block_number = :block_number"));
+                assert!(template.contains("s.block_timestamp <= :block_timestamp::bigint"));
                 assert_eq!(params.len(), 7);
+                // Verify named params have the expected keys
+                let param_names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(param_names.contains(&"chain_id"));
+                assert!(param_names.contains(&"pool_id"));
+                assert!(param_names.contains(&"price_close"));
+                assert!(param_names.contains(&"block_timestamp"));
+                assert!(param_names.contains(&"block_number"));
+                assert!(param_names.contains(&"source"));
+                assert!(param_names.contains(&"source_version"));
                 let snapshot = snapshot
                     .as_ref()
                     .expect("rolling metrics should be snapshotted");
                 assert_eq!(snapshot.table, "pool_state");
                 assert_eq!(snapshot.key_columns.len(), 4);
             }
-            _ => panic!("Expected RawSql for rolling metrics"),
+            _ => panic!("Expected NamedSql for rolling metrics"),
         }
     }
 
@@ -596,12 +615,12 @@ mod tests {
         }];
 
         let ops = process_swaps(&swaps, &cache, 8453, "test", "test", None, 1);
-        // snapshot + pool_state only — no RawSql
+        // snapshot + pool_state only — no NamedSql
         assert_eq!(ops.len(), 2);
         for op in &ops {
             assert!(
-                !matches!(op, DbOperation::RawSql { .. }),
-                "Should not emit RawSql without USD context"
+                !matches!(op, DbOperation::NamedSql { .. }),
+                "Should not emit NamedSql without USD context"
             );
         }
     }

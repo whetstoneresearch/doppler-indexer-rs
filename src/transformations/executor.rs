@@ -383,6 +383,20 @@ pub(crate) fn inject_source_version(
                     snapshot,
                 }
             }
+            DbOperation::NamedSql {
+                template,
+                params,
+                snapshot,
+            } => {
+                tracing::warn!(
+                    "NamedSql operation skipped for source/version injection — handler must manage source/source_version manually"
+                );
+                DbOperation::NamedSql {
+                    template,
+                    params,
+                    snapshot,
+                }
+            }
         })
         .collect()
 }
@@ -490,6 +504,17 @@ pub(crate) async fn execute_with_snapshot_capture(
                 op_index,
             });
         } else if let DbOperation::RawSql {
+            snapshot: Some(snapshot),
+            ..
+        } = op
+        {
+            snapshot_specs.push((snapshot.table.clone(), snapshot.key_columns.clone()));
+            snapshot_metas.push(SnapshotMeta {
+                table: snapshot.table.clone(),
+                key_columns: snapshot.key_columns.clone(),
+                op_index,
+            });
+        } else if let DbOperation::NamedSql {
             snapshot: Some(snapshot),
             ..
         } = op
@@ -651,6 +676,10 @@ mod tests {
                     });
                 }
                 DbOperation::RawSql {
+                    snapshot: Some(snapshot),
+                    ..
+                }
+                | DbOperation::NamedSql {
                     snapshot: Some(snapshot),
                     ..
                 } => {

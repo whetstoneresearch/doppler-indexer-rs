@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use bigdecimal::BigDecimal;
 use deadpool_postgres::Pool;
 
+use crate::db::NamedQueryBuilder;
 use crate::transformations::error::TransformationError;
 
 /// Approximately 1 week of blocks on Base (2s block time).
@@ -465,35 +466,37 @@ async fn query_frontier_pools(
 
     let frontier_bytes: Vec<Vec<u8>> = frontier.iter().map(|t| t.to_vec()).collect();
     let max_block_i64: Option<i64> = max_block.map(|b| b as i64);
+    let chain_id_i64 = chain_id as i64;
 
     // First pick the latest snapshot per pool (before max_block), then
     // filter by liquidity. This avoids selecting a pool based on an older
     // liquid snapshot when its latest snapshot is illiquid.
+    let (sql, params) = NamedQueryBuilder::new(
+        "WITH latest_snapshots AS ( \
+             SELECT DISTINCT ON (p.address) \
+                 p.address, p.base_token, p.quote_token, \
+                 ps.active_liquidity_usd, ps.active_liquidity \
+             FROM pools p \
+             JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
+             WHERE p.chain_id = :chain_id \
+               AND (p.base_token = ANY(:frontier) OR p.quote_token = ANY(:frontier)) \
+               AND (:max_block::bigint IS NULL OR ps.block_number < :max_block) \
+             ORDER BY p.address, ps.block_number DESC \
+         ) \
+         SELECT address, base_token, quote_token, \
+                COALESCE(active_liquidity_usd, 0) as liq \
+         FROM latest_snapshots \
+         WHERE COALESCE(active_liquidity_usd, 0) >= :min_liquidity::bigint \
+            OR (active_liquidity_usd IS NULL AND active_liquidity > 0)",
+    )
+    .bind("chain_id", &chain_id_i64)
+    .bind("frontier", &frontier_bytes)
+    .bind("min_liquidity", &MIN_LIQUIDITY_USD)
+    .bind("max_block", &max_block_i64)
+    .build();
+
     let rows = client
-        .query(
-            "WITH latest_snapshots AS ( \
-                 SELECT DISTINCT ON (p.address) \
-                     p.address, p.base_token, p.quote_token, \
-                     ps.active_liquidity_usd, ps.active_liquidity \
-                 FROM pools p \
-                 JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
-                 WHERE p.chain_id = $1 \
-                   AND (p.base_token = ANY($2) OR p.quote_token = ANY($2)) \
-                   AND ($4::bigint IS NULL OR ps.block_number < $4) \
-                 ORDER BY p.address, ps.block_number DESC \
-             ) \
-             SELECT address, base_token, quote_token, \
-                    COALESCE(active_liquidity_usd, 0) as liq \
-             FROM latest_snapshots \
-             WHERE COALESCE(active_liquidity_usd, 0) >= $3 \
-                OR (active_liquidity_usd IS NULL AND active_liquidity > 0)",
-            &[
-                &(chain_id as i64),
-                &frontier_bytes,
-                &MIN_LIQUIDITY_USD,
-                &max_block_i64,
-            ],
-        )
+        .query(&sql, &params)
         .await
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
@@ -544,18 +547,24 @@ async fn query_path_pool_prices(
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
     let max_block_i64: Option<i64> = max_block.map(|b| b as i64);
+    let chain_id_i64 = chain_id as i64;
+
+    let (sql, params) = NamedQueryBuilder::new(
+        "SELECT DISTINCT ON (p.address) \
+             p.address, p.base_token, p.quote_token, ps.price_close AS price \
+         FROM pools p \
+         JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
+         WHERE p.chain_id = :chain_id AND p.address = ANY(:pool_ids) \
+           AND (:max_block::bigint IS NULL OR ps.block_number < :max_block) \
+         ORDER BY p.address, ps.block_number DESC",
+    )
+    .bind("chain_id", &chain_id_i64)
+    .bind("pool_ids", &pool_ids)
+    .bind("max_block", &max_block_i64)
+    .build();
 
     let rows = client
-        .query(
-            "SELECT DISTINCT ON (p.address) \
-                 p.address, p.base_token, p.quote_token, ps.price_close AS price \
-             FROM pools p \
-             JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
-             WHERE p.chain_id = $1 AND p.address = ANY($2) \
-               AND ($3::bigint IS NULL OR ps.block_number < $3) \
-             ORDER BY p.address, ps.block_number DESC",
-            &[&(chain_id as i64), &pool_ids, &max_block_i64],
-        )
+        .query(&sql, &params)
         .await
         .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 

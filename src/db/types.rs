@@ -100,6 +100,22 @@ pub enum DbOperation {
         params: Vec<DbValue>,
         snapshot: Option<DbSnapshot>,
     },
+    /// Named-parameter SQL for complex operations.
+    ///
+    /// Like `RawSql`, but uses `:param_name` placeholders instead of positional
+    /// `$N`. The build step replaces each `:name` with the correct `$N` and
+    /// applies type-specific casts via `placeholder_for()` (e.g.
+    /// `$5::text::numeric` for `DbValue::Numeric`), eliminating manual cast
+    /// errors.
+    ///
+    /// Same `:name` referenced multiple times reuses the same `$N` index.
+    /// Template names not found in params cause a panic with a descriptive
+    /// message.
+    NamedSql {
+        template: String,
+        params: Vec<(String, DbValue)>,
+        snapshot: Option<DbSnapshot>,
+    },
 }
 
 /// Snapshot metadata for row-modifying operations that cannot be expressed as a

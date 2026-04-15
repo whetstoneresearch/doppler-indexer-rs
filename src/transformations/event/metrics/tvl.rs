@@ -2,7 +2,7 @@
 //!
 //! Rebuilds per-pool tick maps on demand from the `liquidity_deltas` table,
 //! computes token amounts via Uniswap v3 position math, and produces
-//! `DbOperation::RawSql` materializing upserts for `pool_snapshots` +
+//! `DbOperation::NamedSql` materializing upserts for `pool_snapshots` +
 //! `pool_state`.
 //!
 //! Stateless by design: each `handle()` invocation re-queries
@@ -262,7 +262,7 @@ pub struct TvlBootstrapSeed {
     pub price: BigDecimal,
 }
 
-/// Build a `DbOperation::RawSql` upsert that populates TVL columns on a
+/// Build a `DbOperation::NamedSql` upsert that populates TVL columns on a
 /// `pool_snapshots` row owned by the given `target_source` handler.
 ///
 /// If the per-block snapshot row already exists (the swap path wrote it first),
@@ -286,15 +286,15 @@ pub fn build_snapshot_tvl_update(
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
-    let query = r#"
+    let template = r#"
 WITH prev AS (
   SELECT price_close
   FROM pool_snapshots
-  WHERE chain_id = $1
-    AND pool_id = $2
-    AND block_number <= $3
-    AND source = $11
-    AND source_version = $12
+  WHERE chain_id = :chain_id
+    AND pool_id = :pool_id
+    AND block_number <= :block_number
+    AND source = :source
+    AND source_version = :source_version
   ORDER BY block_number DESC
   LIMIT 1
 ),
@@ -302,9 +302,9 @@ seed_price AS (
   SELECT prev.price_close
   FROM prev
   UNION ALL
-  SELECT $13::numeric
+  SELECT :bootstrap_price
   WHERE NOT EXISTS (SELECT 1 FROM prev)
-    AND $13::numeric IS NOT NULL
+    AND :bootstrap_price IS NOT NULL
 )
 INSERT INTO pool_snapshots (
   chain_id,
@@ -329,26 +329,26 @@ INSERT INTO pool_snapshots (
   source_version
 )
 SELECT
-  $1,
-  $2,
-  $3,
-  $4,
+  :chain_id,
+  :pool_id,
+  :block_number,
+  :block_timestamp,
   seed_price.price_close,
   seed_price.price_close,
   seed_price.price_close,
   seed_price.price_close,
-  $5,
+  :active_liquidity,
   0::numeric,
   0::numeric,
   0,
   NULL::numeric,
-  $6,
-  $7,
-  $8,
-  $9,
-  $10,
-  $11,
-  $12
+  :amount0,
+  :amount1,
+  :tvl_usd,
+  :market_cap_usd,
+  :active_liquidity_usd,
+  :source,
+  :source_version
 FROM seed_price
 ON CONFLICT (chain_id, pool_id, block_number, source, source_version)
 DO UPDATE SET
@@ -361,22 +361,22 @@ DO UPDATE SET
   active_liquidity_usd = EXCLUDED.active_liquidity_usd
 "#;
 
-    DbOperation::RawSql {
-        query: query.to_string(),
+    DbOperation::NamedSql {
+        template: template.to_string(),
         params: vec![
-            DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
-            DbValue::Bytes(pool_id.to_vec()),
-            DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
-            DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64")),
-            DbValue::Numeric(active_liquidity.to_string()),
-            DbValue::Numeric(amount0.to_string()),
-            DbValue::Numeric(amount1.to_string()),
-            optional_decimal_value(tvl_usd),
-            optional_decimal_value(market_cap_usd),
-            optional_decimal_value(active_liquidity_usd),
-            DbValue::VarChar(target_source.to_string()),
-            DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
-            optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
+            ("chain_id".into(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
+            ("pool_id".into(), DbValue::Bytes(pool_id.to_vec())),
+            ("block_number".into(), DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64"))),
+            ("block_timestamp".into(), DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64"))),
+            ("active_liquidity".into(), DbValue::Numeric(active_liquidity.to_string())),
+            ("amount0".into(), DbValue::Numeric(amount0.to_string())),
+            ("amount1".into(), DbValue::Numeric(amount1.to_string())),
+            ("tvl_usd".into(), optional_decimal_value(tvl_usd)),
+            ("market_cap_usd".into(), optional_decimal_value(market_cap_usd)),
+            ("active_liquidity_usd".into(), optional_decimal_value(active_liquidity_usd)),
+            ("source".into(), DbValue::VarChar(target_source.to_string())),
+            ("source_version".into(), DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32"))),
+            ("bootstrap_price".into(), optional_decimal_value(bootstrap_seed.map(|seed| &seed.price))),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_snapshots".to_string(),
@@ -405,7 +405,7 @@ DO UPDATE SET
     }
 }
 
-/// Build a `DbOperation::RawSql` upsert that populates TVL columns on the
+/// Build a `DbOperation::NamedSql` upsert that populates TVL columns on the
 /// `pool_state` row owned by the given `target_source` handler.
 ///
 /// If the latest `pool_state` row is at or before `block_number`, this advances
@@ -432,7 +432,7 @@ pub fn build_state_tvl_update(
     target_source: &str,
     target_source_version: u32,
 ) -> DbOperation {
-    let query = r#"
+    let template = r#"
 WITH prev AS (
   SELECT
     block_number,
@@ -440,22 +440,22 @@ WITH prev AS (
     sqrt_price_x96,
     price
   FROM pool_state
-  WHERE chain_id = $1
-    AND pool_id = $2
-    AND source = $12
-    AND source_version = $13
-    AND block_number <= $3
+  WHERE chain_id = :chain_id
+    AND pool_id = :pool_id
+    AND source = :source
+    AND source_version = :source_version
+    AND block_number <= :block_number
   ORDER BY block_number DESC
   LIMIT 1
 ),
 newer AS (
   SELECT 1
   FROM pool_state
-  WHERE chain_id = $1
-    AND pool_id = $2
-    AND source = $12
-    AND source_version = $13
-    AND block_number > $3
+  WHERE chain_id = :chain_id
+    AND pool_id = :pool_id
+    AND source = :source
+    AND source_version = :source_version
+    AND block_number > :block_number
   LIMIT 1
 ),
 state_seed AS (
@@ -466,14 +466,14 @@ state_seed AS (
   FROM prev
   UNION ALL
   SELECT
-    $14::integer,
-    $15::numeric,
-    $16::numeric
+    :bootstrap_tick::integer,
+    :bootstrap_sqrt_price,
+    :bootstrap_price
   WHERE NOT EXISTS (SELECT 1 FROM prev)
     AND NOT EXISTS (SELECT 1 FROM newer)
-    AND $14::integer IS NOT NULL
-    AND $15::numeric IS NOT NULL
-    AND $16::numeric IS NOT NULL
+    AND :bootstrap_tick::integer IS NOT NULL
+    AND :bootstrap_sqrt_price IS NOT NULL
+    AND :bootstrap_price IS NOT NULL
 )
 INSERT INTO pool_state (
   chain_id,
@@ -498,26 +498,26 @@ INSERT INTO pool_state (
   source_version
 )
 SELECT
-  $1,
-  $2,
-  $3,
-  $4,
+  :chain_id,
+  :pool_id,
+  :block_number,
+  :block_timestamp,
   state_seed.tick,
   state_seed.sqrt_price_x96,
   state_seed.price,
-  $5,
+  :active_liquidity,
   rolling.vol_24h,
   rolling.pc_1h,
   rolling.pc_24h,
   rolling.swaps_24h,
-  $6,
-  $7,
-  $8,
-  $9,
-  $10,
-  $11,
-  $12,
-  $13
+  :amount0,
+  :amount1,
+  :tvl_usd,
+  :market_cap_usd,
+  :active_liquidity_usd,
+  :total_supply,
+  :source,
+  :source_version
 FROM state_seed
 CROSS JOIN LATERAL (
   SELECT
@@ -533,31 +533,31 @@ CROSS JOIN LATERAL (
   LEFT JOIN LATERAL (
     SELECT price_close
     FROM pool_snapshots
-    WHERE chain_id = $1
-      AND pool_id = $2
-      AND block_timestamp <= ($4 - 3600)
-      AND source = $12
-      AND source_version = $13
+    WHERE chain_id = :chain_id
+      AND pool_id = :pool_id
+      AND block_timestamp <= (:block_timestamp - 3600)
+      AND source = :source
+      AND source_version = :source_version
     ORDER BY block_timestamp DESC, block_number DESC
     LIMIT 1
   ) h1h ON true
   LEFT JOIN LATERAL (
     SELECT price_close
     FROM pool_snapshots
-    WHERE chain_id = $1
-      AND pool_id = $2
-      AND block_timestamp <= ($4 - 86400)
-      AND source = $12
-      AND source_version = $13
+    WHERE chain_id = :chain_id
+      AND pool_id = :pool_id
+      AND block_timestamp <= (:block_timestamp - 86400)
+      AND source = :source
+      AND source_version = :source_version
     ORDER BY block_timestamp DESC, block_number DESC
     LIMIT 1
   ) h24h ON true
-  WHERE s.chain_id = $1
-    AND s.pool_id = $2
-    AND s.block_timestamp > ($4 - 86400)
-    AND s.block_timestamp <= $4
-    AND s.source = $12
-    AND s.source_version = $13
+  WHERE s.chain_id = :chain_id
+    AND s.pool_id = :pool_id
+    AND s.block_timestamp > (:block_timestamp - 86400)
+    AND s.block_timestamp <= :block_timestamp
+    AND s.source = :source
+    AND s.source_version = :source_version
 ) AS rolling
 ON CONFLICT (chain_id, pool_id, source, source_version)
 DO UPDATE SET
@@ -580,28 +580,28 @@ DO UPDATE SET
 WHERE EXCLUDED.block_number >= pool_state.block_number
 "#;
 
-    DbOperation::RawSql {
-        query: query.to_string(),
+    DbOperation::NamedSql {
+        template: template.to_string(),
         params: vec![
-            DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
-            DbValue::Bytes(pool_id.to_vec()),
-            DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
-            DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64")),
-            DbValue::Numeric(active_liquidity.to_string()),
-            DbValue::Numeric(amount0.to_string()),
-            DbValue::Numeric(amount1.to_string()),
-            optional_decimal_value(tvl_usd),
-            optional_decimal_value(market_cap_usd),
-            optional_decimal_value(active_liquidity_usd),
-            optional_u256_value(total_supply),
-            DbValue::VarChar(target_source.to_string()),
-            DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32")),
-            optional_i32_value(bootstrap_seed.map(|seed| seed.tick)),
-            match bootstrap_seed {
+            ("chain_id".into(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
+            ("pool_id".into(), DbValue::Bytes(pool_id.to_vec())),
+            ("block_number".into(), DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64"))),
+            ("block_timestamp".into(), DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64"))),
+            ("active_liquidity".into(), DbValue::Numeric(active_liquidity.to_string())),
+            ("amount0".into(), DbValue::Numeric(amount0.to_string())),
+            ("amount1".into(), DbValue::Numeric(amount1.to_string())),
+            ("tvl_usd".into(), optional_decimal_value(tvl_usd)),
+            ("market_cap_usd".into(), optional_decimal_value(market_cap_usd)),
+            ("active_liquidity_usd".into(), optional_decimal_value(active_liquidity_usd)),
+            ("total_supply".into(), optional_u256_value(total_supply)),
+            ("source".into(), DbValue::VarChar(target_source.to_string())),
+            ("source_version".into(), DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32"))),
+            ("bootstrap_tick".into(), optional_i32_value(bootstrap_seed.map(|seed| seed.tick))),
+            ("bootstrap_sqrt_price".into(), match bootstrap_seed {
                 Some(seed) => DbValue::Numeric(seed.sqrt_price_x96.to_string()),
                 None => DbValue::Null,
-            },
-            optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
+            }),
+            ("bootstrap_price".into(), optional_decimal_value(bootstrap_seed.map(|seed| &seed.price))),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_state".to_string(),
@@ -1159,28 +1159,30 @@ mod tests {
             1,
         );
         match op {
-            DbOperation::RawSql {
-                query,
+            DbOperation::NamedSql {
+                template,
                 params,
                 snapshot,
             } => {
-                assert!(query.contains("INSERT INTO pool_snapshots"));
-                assert!(query.contains("WITH prev AS"));
-                assert!(query.contains("FROM seed_price"));
-                assert!(query.contains("SELECT $13::numeric"));
-                assert!(query.contains(
+                assert!(template.contains("INSERT INTO pool_snapshots"));
+                assert!(template.contains("WITH prev AS"));
+                assert!(template.contains("FROM seed_price"));
+                assert!(template.contains("SELECT :bootstrap_price"));
+                assert!(template.contains(
                     "ON CONFLICT (chain_id, pool_id, block_number, source, source_version)"
                 ));
-                assert!(query.contains("active_liquidity = EXCLUDED.active_liquidity"));
-                assert!(query.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
-                assert!(query.contains("source = $11"));
-                assert!(query.contains("source_version = $12"));
+                assert!(template.contains("active_liquidity = EXCLUDED.active_liquidity"));
+                assert!(template.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
+                assert!(template.contains("source = :source"));
+                assert!(template.contains("source_version = :source_version"));
                 assert_eq!(params.len(), 13);
-                match &params[9] {
+                assert_eq!(params[9].0, "active_liquidity_usd");
+                match &params[9].1 {
                     DbValue::Numeric(s) => assert_eq!(s, "3200"),
                     other => panic!("expected Numeric for active_liquidity_usd, got {:?}", other),
                 }
-                match &params[12] {
+                assert_eq!(params[12].0, "bootstrap_price");
+                match &params[12].1 {
                     DbValue::Numeric(s) => assert_eq!(s, "2"),
                     other => panic!("expected Numeric for bootstrap seed price, got {:?}", other),
                 }
@@ -1200,7 +1202,7 @@ mod tests {
                     ]
                 );
             }
-            _ => panic!("expected RawSql"),
+            _ => panic!("expected NamedSql"),
         }
     }
 
@@ -1222,15 +1224,19 @@ mod tests {
             1,
         );
         match op {
-            DbOperation::RawSql { params, .. } => {
+            DbOperation::NamedSql { params, .. } => {
                 // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd,
                 // [12] = bootstrap price
-                assert!(matches!(params[7], DbValue::Null));
-                assert!(matches!(params[8], DbValue::Null));
-                assert!(matches!(params[9], DbValue::Null));
-                assert!(matches!(params[12], DbValue::Null));
+                assert_eq!(params[7].0, "tvl_usd");
+                assert!(matches!(params[7].1, DbValue::Null));
+                assert_eq!(params[8].0, "market_cap_usd");
+                assert!(matches!(params[8].1, DbValue::Null));
+                assert_eq!(params[9].0, "active_liquidity_usd");
+                assert!(matches!(params[9].1, DbValue::Null));
+                assert_eq!(params[12].0, "bootstrap_price");
+                assert!(matches!(params[12].1, DbValue::Null));
             }
-            _ => panic!("expected RawSql"),
+            _ => panic!("expected NamedSql"),
         }
     }
 
@@ -1257,32 +1263,35 @@ mod tests {
             1,
         );
         match op {
-            DbOperation::RawSql {
-                query,
+            DbOperation::NamedSql {
+                template,
                 params,
                 snapshot,
             } => {
-                assert!(query.contains("INSERT INTO pool_state"));
-                assert!(query.contains("WITH prev AS"));
-                assert!(query.contains("$14::integer"));
-                assert!(query.contains("CROSS JOIN LATERAL"));
-                assert!(query.contains("COALESCE(SUM(s.volume_usd), 0) AS vol_24h"));
-                assert!(query.contains("s.block_timestamp <= $4"));
-                assert!(!query.contains("prev.volume_24h_usd"));
-                assert!(!query.contains("prev.price_change_1h"));
-                assert!(query.contains("ON CONFLICT (chain_id, pool_id, source, source_version)"));
-                assert!(query.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
-                assert!(query.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
+                assert!(template.contains("INSERT INTO pool_state"));
+                assert!(template.contains("WITH prev AS"));
+                assert!(template.contains(":bootstrap_tick::integer"));
+                assert!(template.contains("CROSS JOIN LATERAL"));
+                assert!(template.contains("COALESCE(SUM(s.volume_usd), 0) AS vol_24h"));
+                assert!(template.contains("s.block_timestamp <= :block_timestamp"));
+                assert!(!template.contains("prev.volume_24h_usd"));
+                assert!(!template.contains("prev.price_change_1h"));
+                assert!(template.contains("ON CONFLICT (chain_id, pool_id, source, source_version)"));
+                assert!(template.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
+                assert!(template.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
                 assert_eq!(params.len(), 16);
-                match &params[9] {
+                assert_eq!(params[9].0, "active_liquidity_usd");
+                match &params[9].1 {
                     DbValue::Numeric(s) => assert_eq!(s, "3200"),
                     other => panic!("expected Numeric for active_liquidity_usd, got {:?}", other),
                 }
-                match &params[13] {
+                assert_eq!(params[13].0, "bootstrap_tick");
+                match &params[13].1 {
                     DbValue::Int32(v) => assert_eq!(*v, 42),
                     other => panic!("expected Int32 for bootstrap tick, got {:?}", other),
                 }
-                match &params[14] {
+                assert_eq!(params[14].0, "bootstrap_sqrt_price");
+                match &params[14].1 {
                     DbValue::Numeric(s) => assert_eq!(s, &q96().to_string()),
                     other => {
                         panic!(
@@ -1291,7 +1300,8 @@ mod tests {
                         )
                     }
                 }
-                match &params[15] {
+                assert_eq!(params[15].0, "bootstrap_price");
+                match &params[15].1 {
                     DbValue::Numeric(s) => assert_eq!(s, "2"),
                     other => panic!("expected Numeric for bootstrap price, got {:?}", other),
                 }
@@ -1305,7 +1315,7 @@ mod tests {
                     vec!["chain_id", "pool_id", "source", "source_version"]
                 );
             }
-            _ => panic!("expected RawSql"),
+            _ => panic!("expected NamedSql"),
         }
     }
 
@@ -1328,18 +1338,25 @@ mod tests {
             1,
         );
         match op {
-            DbOperation::RawSql { params, .. } => {
+            DbOperation::NamedSql { params, .. } => {
                 // params[7] = tvl_usd, [8] = market_cap_usd, [9] = active_liquidity_usd,
                 // [10] = total_supply, [13..=15] = bootstrap seed
-                assert!(matches!(params[7], DbValue::Null));
-                assert!(matches!(params[8], DbValue::Null));
-                assert!(matches!(params[9], DbValue::Null));
-                assert!(matches!(params[10], DbValue::Null));
-                assert!(matches!(params[13], DbValue::Null));
-                assert!(matches!(params[14], DbValue::Null));
-                assert!(matches!(params[15], DbValue::Null));
+                assert_eq!(params[7].0, "tvl_usd");
+                assert!(matches!(params[7].1, DbValue::Null));
+                assert_eq!(params[8].0, "market_cap_usd");
+                assert!(matches!(params[8].1, DbValue::Null));
+                assert_eq!(params[9].0, "active_liquidity_usd");
+                assert!(matches!(params[9].1, DbValue::Null));
+                assert_eq!(params[10].0, "total_supply");
+                assert!(matches!(params[10].1, DbValue::Null));
+                assert_eq!(params[13].0, "bootstrap_tick");
+                assert!(matches!(params[13].1, DbValue::Null));
+                assert_eq!(params[14].0, "bootstrap_sqrt_price");
+                assert!(matches!(params[14].1, DbValue::Null));
+                assert_eq!(params[15].0, "bootstrap_price");
+                assert!(matches!(params[15].1, DbValue::Null));
             }
-            _ => panic!("expected RawSql"),
+            _ => panic!("expected NamedSql"),
         }
     }
 
@@ -1558,23 +1575,23 @@ mod tests {
             1,
         );
         match op {
-            DbOperation::RawSql { query, .. } => {
+            DbOperation::NamedSql { template, .. } => {
                 // The lateral subqueries should filter by source/source_version.
                 // prev + newer CTEs (2 each) + h1h + h24h + outer lateral (3 each) = 5.
-                let source_filter_count = query.matches("source = $12").count();
+                let source_filter_count = template.matches("source = :source").count();
                 assert!(
                     source_filter_count >= 5,
-                    "expected source=$12 in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
+                    "expected source=:source in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
                     source_filter_count
                 );
-                let version_filter_count = query.matches("source_version = $13").count();
+                let version_filter_count = template.matches("source_version = :source_version").count();
                 assert!(
                     version_filter_count >= 5,
-                    "expected source_version=$13 in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
+                    "expected source_version=:source_version in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
                     version_filter_count
                 );
             }
-            _ => panic!("expected RawSql"),
+            _ => panic!("expected NamedSql"),
         }
     }
 
@@ -1600,17 +1617,17 @@ mod tests {
             1,
         );
         match op {
-            DbOperation::RawSql { query, .. } => {
+            DbOperation::NamedSql { template, .. } => {
                 assert!(
-                    query.contains("NOT EXISTS (SELECT 1 FROM newer)"),
+                    template.contains("NOT EXISTS (SELECT 1 FROM newer)"),
                     "state_seed must guard against overwriting newer pool_state"
                 );
                 assert!(
-                    query.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"),
+                    template.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"),
                     "conflict update must respect block ordering"
                 );
             }
-            _ => panic!("expected RawSql"),
+            _ => panic!("expected NamedSql"),
         }
     }
 }

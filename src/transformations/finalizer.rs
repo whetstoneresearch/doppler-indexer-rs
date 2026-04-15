@@ -349,8 +349,8 @@ impl RangeFinalizer {
                     "timed_out_after_secs": handler.timed_out_after_secs,
                 });
 
-                DbOperation::RawSql {
-                    query: "INSERT INTO _handler_retry_backlog (
+                DbOperation::NamedSql {
+                    template: "INSERT INTO _handler_retry_backlog (
                                 chain_id,
                                 handler_key,
                                 range_start,
@@ -358,7 +358,7 @@ impl RangeFinalizer {
                                 failure_reason,
                                 error_message,
                                 debug_context
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                            ) VALUES (:chain_id, :handler_key, :range_start, :range_end, :failure_reason, :error_message, :debug_context)
                             ON CONFLICT (chain_id, handler_key, range_start)
                             DO UPDATE SET
                                 range_end = EXCLUDED.range_end,
@@ -369,13 +369,13 @@ impl RangeFinalizer {
                                 failure_count = _handler_retry_backlog.failure_count + 1"
                         .to_string(),
                     params: vec![
-                        DbValue::Int64(self.chain_id as i64),
-                        DbValue::Text(handler.handler_key.clone()),
-                        DbValue::Int64(range_key.0 as i64),
-                        DbValue::Int64(range_key.1 as i64),
-                        DbValue::Text(failure_reason.to_string()),
-                        DbValue::Text(error_message),
-                        DbValue::JsonB(debug_context),
+                        ("chain_id".to_string(), DbValue::Int64(self.chain_id as i64)),
+                        ("handler_key".to_string(), DbValue::Text(handler.handler_key.clone())),
+                        ("range_start".to_string(), DbValue::Int64(range_key.0 as i64)),
+                        ("range_end".to_string(), DbValue::Int64(range_key.1 as i64)),
+                        ("failure_reason".to_string(), DbValue::Text(failure_reason.to_string())),
+                        ("error_message".to_string(), DbValue::Text(error_message)),
+                        ("debug_context".to_string(), DbValue::JsonB(debug_context)),
                     ],
                     snapshot: None,
                 }

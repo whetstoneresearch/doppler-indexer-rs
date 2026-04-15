@@ -373,6 +373,9 @@ fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
         DbOperation::RawSql { query, params, .. } => {
             (query.clone(), convert_values_to_params(params))
         }
+        DbOperation::NamedSql {
+            template, params, ..
+        } => build_named_sql(template, params),
     }
 }
 
@@ -621,6 +624,183 @@ fn placeholder_for(value: &DbValue, param_idx: usize) -> String {
     }
 }
 
+// ─── Named-parameter SQL expansion ─────────────────────────────────
+
+/// Walk a SQL template and replace `:param_name` placeholders by calling
+/// `resolve(name)` for each. Handles `::` (PostgreSQL cast operator) and
+/// single/double-quoted string literals without false matches.
+fn expand_named_template(template: &str, mut resolve: impl FnMut(&str) -> String) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        InSingleQuote,
+        InDoubleQuote,
+    }
+    let mut state = State::Normal;
+
+    while i < len {
+        let ch = chars[i];
+        match state {
+            State::InSingleQuote => {
+                out.push(ch);
+                if ch == '\'' {
+                    // '' is an escaped quote inside a string literal
+                    if i + 1 < len && chars[i + 1] == '\'' {
+                        out.push('\'');
+                        i += 2;
+                    } else {
+                        state = State::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::InDoubleQuote => {
+                out.push(ch);
+                if ch == '"' {
+                    if i + 1 < len && chars[i + 1] == '"' {
+                        out.push('"');
+                        i += 2;
+                    } else {
+                        state = State::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::Normal => {
+                if ch == '\'' {
+                    state = State::InSingleQuote;
+                    out.push(ch);
+                    i += 1;
+                } else if ch == '"' {
+                    state = State::InDoubleQuote;
+                    out.push(ch);
+                    i += 1;
+                } else if ch == ':' {
+                    if i + 1 < len && chars[i + 1] == ':' {
+                        // PostgreSQL cast operator — emit literally
+                        out.push(':');
+                        out.push(':');
+                        i += 2;
+                    } else if i + 1 < len
+                        && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_')
+                    {
+                        // Named parameter — capture name
+                        let start = i + 1;
+                        let mut end = start;
+                        while end < len
+                            && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                        {
+                            end += 1;
+                        }
+                        let name: String = chars[start..end].iter().collect();
+                        out.push_str(&resolve(&name));
+                        i = end;
+                    } else {
+                        out.push(ch);
+                        i += 1;
+                    }
+                } else {
+                    out.push(ch);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build SQL + SqlParam vec from a named-parameter template and DbValue params.
+///
+/// Each `:name` is replaced with `placeholder_for(value, idx)` which auto-adds
+/// type-specific casts (`::text::numeric`, `to_timestamp()`, `::jsonb`).
+/// Same `:name` used multiple times reuses the same `$N` index.
+fn build_named_sql(template: &str, named_params: &[(String, DbValue)]) -> (String, Vec<SqlParam>) {
+    use std::collections::HashMap;
+
+    let lookup: HashMap<&str, &DbValue> = named_params.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut index_map: HashMap<String, usize> = HashMap::new();
+    let mut sql_params: Vec<SqlParam> = Vec::new();
+
+    let sql = expand_named_template(template, |name| {
+        if let Some(&idx) = index_map.get(name) {
+            // Already assigned — reuse the same $N with the same cast
+            let value = lookup.get(name).expect("param was previously resolved");
+            placeholder_for(value, idx)
+        } else {
+            let value = *lookup
+                .get(name)
+                .unwrap_or_else(|| panic!("NamedSql: template references unbound parameter ':{}'", name));
+            let idx = sql_params.len() + 1; // 1-based PostgreSQL param index
+            index_map.insert(name.to_string(), idx);
+            sql_params.push(convert_db_value(value));
+            placeholder_for(value, idx)
+        }
+    });
+
+    (sql, sql_params)
+}
+
+/// Reusable named-parameter builder for direct `client.query()`/`execute()` calls.
+///
+/// Uses the same parser as `NamedSql` but works with `&(dyn ToSql + Sync)` params
+/// directly, without `DbValue` wrapping. Type casts must be added in the template
+/// where needed (e.g. `:min_liquidity::bigint`).
+pub struct NamedQueryBuilder<'a> {
+    template: &'a str,
+    params: Vec<(&'a str, &'a (dyn ToSql + Sync))>,
+}
+
+impl<'a> NamedQueryBuilder<'a> {
+    pub fn new(template: &'a str) -> Self {
+        Self {
+            template,
+            params: Vec::new(),
+        }
+    }
+
+    pub fn bind(mut self, name: &'a str, value: &'a (dyn ToSql + Sync)) -> Self {
+        self.params.push((name, value));
+        self
+    }
+
+    /// Expand the template and return (sql, ordered_params).
+    ///
+    /// Panics if the template references a name not provided via `bind()`.
+    pub fn build(&self) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+        use std::collections::HashMap;
+
+        let lookup: HashMap<&str, &'a (dyn ToSql + Sync)> =
+            self.params.iter().copied().collect();
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        let mut ordered: Vec<&'a (dyn ToSql + Sync)> = Vec::new();
+
+        let sql = expand_named_template(self.template, |name| {
+            if let Some(&idx) = index_map.get(name) {
+                format!("${}", idx)
+            } else {
+                let value = *lookup
+                    .get(name)
+                    .unwrap_or_else(|| panic!("NamedQueryBuilder: template references unbound parameter ':{}'", name));
+                let idx = ordered.len() + 1;
+                index_map.insert(name.to_string(), idx);
+                ordered.push(value);
+                format!("${}", idx)
+            }
+        });
+
+        (sql, ordered)
+    }
+}
+
 /// Wrap a column name in double quotes to handle reserved keywords.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name)
@@ -852,6 +1032,7 @@ fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
             (3, key)
         }
         DbOperation::RawSql { query, .. } => (4, query.as_bytes().to_vec()),
+        DbOperation::NamedSql { template, .. } => (5, template.as_bytes().to_vec()),
     }
 }
 
@@ -1090,5 +1271,157 @@ mod tests {
         // Should not panic or reorder arbitrarily
         sort_operations_for_lock_ordering(&mut ops);
         assert_eq!(ops.len(), 2);
+    }
+
+    // ── Named-parameter parser tests ───────────────────────────────
+
+    #[test]
+    fn named_sql_basic_substitution() {
+        let (sql, params) = build_named_sql(
+            "SELECT :foo",
+            &[("foo".into(), DbValue::Int64(42))],
+        );
+        assert_eq!(sql, "SELECT $1");
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlParam::Int64(42)));
+    }
+
+    #[test]
+    fn named_sql_numeric_auto_cast() {
+        let (sql, params) = build_named_sql(
+            "INSERT INTO t VALUES (:amount)",
+            &[("amount".into(), DbValue::Numeric("123.45".into()))],
+        );
+        assert_eq!(sql, "INSERT INTO t VALUES ($1::text::numeric)");
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlParam::Text(ref s) if s == "123.45"));
+    }
+
+    #[test]
+    fn named_sql_jsonb_auto_cast() {
+        let (sql, params) = build_named_sql(
+            "INSERT INTO t VALUES (:data)",
+            &[("data".into(), DbValue::JsonB(serde_json::json!({"k": "v"})))],
+        );
+        assert_eq!(sql, "INSERT INTO t VALUES ($1::jsonb)");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn named_sql_timestamp_auto_cast() {
+        let (sql, _) = build_named_sql(
+            "WHERE ts > :ts",
+            &[("ts".into(), DbValue::Timestamp(1700000000))],
+        );
+        assert_eq!(sql, "WHERE ts > to_timestamp($1)");
+    }
+
+    #[test]
+    fn named_sql_deduplication() {
+        let (sql, params) = build_named_sql(
+            "WHERE chain_id = :cid AND s.chain_id = :cid",
+            &[("cid".into(), DbValue::Int64(1))],
+        );
+        assert_eq!(sql, "WHERE chain_id = $1 AND s.chain_id = $1");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn named_sql_cast_operator_preserved() {
+        let (sql, _) = build_named_sql(
+            "SELECT 0::numeric, NULL::text",
+            &[],
+        );
+        assert_eq!(sql, "SELECT 0::numeric, NULL::text");
+    }
+
+    #[test]
+    fn named_sql_single_quoted_string_ignored() {
+        let (sql, params) = build_named_sql(
+            "SELECT ':not_a_param'",
+            &[],
+        );
+        assert_eq!(sql, "SELECT ':not_a_param'");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn named_sql_double_quoted_ident_ignored() {
+        let (sql, params) = build_named_sql(
+            "SELECT \":not_a_param\"",
+            &[],
+        );
+        assert_eq!(sql, "SELECT \":not_a_param\"");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn named_sql_escaped_single_quote() {
+        let (sql, params) = build_named_sql(
+            "SELECT 'it''s :not_a_param'",
+            &[],
+        );
+        assert_eq!(sql, "SELECT 'it''s :not_a_param'");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn named_sql_multiple_distinct_params() {
+        let (sql, params) = build_named_sql(
+            "WHERE a = :x AND b = :y",
+            &[
+                ("x".into(), DbValue::Int64(1)),
+                ("y".into(), DbValue::Int32(2)),
+            ],
+        );
+        assert_eq!(sql, "WHERE a = $1 AND b = $2");
+        assert_eq!(params.len(), 2);
+        assert!(matches!(params[0], SqlParam::Int64(1)));
+        assert!(matches!(params[1], SqlParam::Int32(2)));
+    }
+
+    #[test]
+    fn named_sql_null_no_cast() {
+        let (sql, params) = build_named_sql(
+            "SELECT :val",
+            &[("val".into(), DbValue::Null)],
+        );
+        assert_eq!(sql, "SELECT $1");
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlParam::Null));
+    }
+
+    #[test]
+    fn named_sql_param_followed_by_cast() {
+        // :tick::integer — parser captures :tick, then ::integer is literal
+        let (sql, _) = build_named_sql(
+            "SELECT :tick::integer",
+            &[("tick".into(), DbValue::Int32(100))],
+        );
+        assert_eq!(sql, "SELECT $1::integer");
+    }
+
+    #[test]
+    #[should_panic(expected = "unbound parameter ':unknown'")]
+    fn named_sql_missing_param_panics() {
+        build_named_sql("SELECT :unknown", &[]);
+    }
+
+    #[test]
+    fn named_query_builder_basic() {
+        let chain_id: i64 = 8453;
+        let block: i64 = 100;
+        let (sql, params) = NamedQueryBuilder::new(
+            "WHERE chain_id = :cid AND block = :block AND chain_id = :cid",
+        )
+        .bind("cid", &chain_id)
+        .bind("block", &block)
+        .build();
+
+        assert_eq!(
+            sql,
+            "WHERE chain_id = $1 AND block = $2 AND chain_id = $1"
+        );
+        assert_eq!(params.len(), 2);
     }
 }
