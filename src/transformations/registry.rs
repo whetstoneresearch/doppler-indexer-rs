@@ -486,6 +486,73 @@ impl TransformationRegistry {
         self.multi_trigger_handler_keys.contains(handler_key)
     }
 
+    /// Filter the registry to only include handlers whose `name()` is in the
+    /// provided set. Also removes any trigger entries, dependency graph edges,
+    /// and lookup maps for excluded handlers.
+    ///
+    /// Must be called **before** `validate_and_sort_handler_dependencies()`.
+    pub fn filter_to_handlers(&mut self, names: &HashSet<String>) {
+        // Also include any transitive dependencies so the DAG remains valid.
+        let mut required: HashSet<String> = names.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (handler, deps) in &self.handler_dependency_graph {
+                if required.contains(handler) {
+                    for dep in deps {
+                        if required.insert(dep.clone()) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let remove: HashSet<String> = self
+            .all_handlers
+            .iter()
+            .map(|h| h.name().to_string())
+            .filter(|n| !required.contains(n))
+            .collect();
+
+        if remove.is_empty() {
+            return;
+        }
+
+        // Remove from all_handlers
+        self.all_handlers.retain(|h| !remove.contains(h.name()));
+
+        // Remove from event_handlers map
+        for handlers in self.event_handlers.values_mut() {
+            handlers.retain(|h| !remove.contains(h.name()));
+        }
+        self.event_handlers.retain(|_, v| !v.is_empty());
+
+        // Remove from call_handlers map
+        for handlers in self.call_handlers.values_mut() {
+            handlers.retain(|h| !remove.contains(h.name()));
+        }
+        self.call_handlers.retain(|_, v| !v.is_empty());
+
+        // Remove from dependency graph
+        self.handler_dependency_graph.retain(|k, _| !remove.contains(k));
+
+        // Remove from lookup maps
+        for name in &remove {
+            if let Some(key) = self.handler_name_to_key.remove(name) {
+                self.handler_key_to_name.remove(&key);
+                self.multi_trigger_handler_keys.remove(&key);
+            }
+            self.event_handler_names.remove(name);
+        }
+
+        tracing::info!(
+            "Handler filter: retained {} handlers, removed {}",
+            self.all_handlers.len(),
+            remove.len()
+        );
+    }
+
     /// Get handler keys for all dependency handler names.
     ///
     /// Panics if any dependency name cannot be resolved to a handler key,
@@ -708,7 +775,13 @@ pub fn validate_call_dependencies(
 ///
 /// This is where handlers are registered at compile-time.
 /// Add new handler registrations here as they are implemented.
-pub fn build_registry(chain_id: u64) -> TransformationRegistry {
+///
+/// If `handler_filter` is provided, only handlers whose `name()` matches
+/// one of the names in the set are retained (plus their transitive dependencies).
+pub fn build_registry(
+    chain_id: u64,
+    handler_filter: Option<&HashSet<String>>,
+) -> TransformationRegistry {
     let mut registry = TransformationRegistry::new();
 
     // Register event handlers
@@ -716,6 +789,10 @@ pub fn build_registry(chain_id: u64) -> TransformationRegistry {
 
     // Register eth_call handlers
     super::eth_call::register_handlers(&mut registry, None);
+
+    if let Some(names) = handler_filter {
+        registry.filter_to_handlers(names);
+    }
 
     registry.validate_and_sort_handler_dependencies();
 
@@ -734,10 +811,14 @@ pub fn build_registry(chain_id: u64) -> TransformationRegistry {
 /// Only handlers whose trigger sources all exist in the chain's contracts or
 /// factory collections are registered. This prevents handlers designed for one
 /// chain from being initialized, migrated, or validated on another.
+///
+/// If `handler_filter` is provided, only handlers whose `name()` matches
+/// one of the names in the set are retained (plus their transitive dependencies).
 pub fn build_registry_for_chain(
     chain_id: u64,
     contracts: &Contracts,
     factory_collections: &FactoryCollections,
+    handler_filter: Option<&HashSet<String>>,
 ) -> TransformationRegistry {
     let mut available: HashSet<String> = contracts.keys().cloned().collect();
     available.extend(factory_collections.keys().cloned());
@@ -759,6 +840,10 @@ pub fn build_registry_for_chain(
 
     // Register eth_call handlers (filtered by available sources)
     super::eth_call::register_handlers(&mut registry, Some(contracts));
+
+    if let Some(names) = handler_filter {
+        registry.filter_to_handlers(names);
+    }
 
     registry.validate_and_sort_handler_dependencies();
 
@@ -1350,7 +1435,7 @@ mod tests {
             },
         );
 
-        let registry = build_registry_for_chain(1, &contracts, &empty_factory_collections());
+        let registry = build_registry_for_chain(1, &contracts, &empty_factory_collections(), None);
 
         assert!(registry
             .handler_key_for_name("MigrationPoolCreateHandler")
@@ -1365,7 +1450,7 @@ mod tests {
 
     #[test]
     fn build_registry_declares_all_migration_pool_create_dependencies() {
-        let registry = build_registry(1);
+        let registry = build_registry(1, None);
         let mut deps = registry
             .handler_dependency_graph()
             .get("MigrationPoolCreateHandler")
@@ -1387,7 +1472,7 @@ mod tests {
 
     #[test]
     fn usd_swap_handlers_all_declare_chainlink_dependency() {
-        let registry = build_registry(1);
+        let registry = build_registry(1, None);
         let expected_handlers: HashSet<&'static str> = HashSet::from([
             "V3SwapMetricsHandler",
             "LockableV3SwapMetricsHandler",

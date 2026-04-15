@@ -6,7 +6,7 @@
 
 Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rust. It collects raw blockchain data (blocks, receipts, logs), tracks dynamically created contracts via factory events, reads historical on-chain state via `eth_call`, decodes events and call results into typed Parquet files, and runs custom transformation handlers that write to PostgreSQL.
 
-Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`).
+Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`), Transformation-Only (`--transformation-only`). The `--transformation-handlers` flag filters which handlers run (comma-separated names) and works with any mode.
 
 ### Subsystems
 

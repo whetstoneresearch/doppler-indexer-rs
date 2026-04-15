@@ -3,6 +3,7 @@
 //! This module provides unified setup for both full (historical + live) and
 //! live-only modes, ensuring consistent configuration and avoiding duplication.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -321,6 +322,7 @@ impl ChainRuntime {
         chain: &ChainConfig,
         shared_db_pool: Option<Arc<DbPool>>,
         shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        handler_filter: Option<&HashSet<String>>,
     ) -> anyhow::Result<Self> {
         let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
             format!(
@@ -365,7 +367,7 @@ impl ChainRuntime {
 
         // Build transformation registry filtered to this chain's contracts
         let registry =
-            build_registry_for_chain(chain.chain_id, &chain.contracts, &chain.factory_collections);
+            build_registry_for_chain(chain.chain_id, &chain.contracts, &chain.factory_collections, handler_filter);
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 
         // Validate that all handler call dependencies are satisfied by config
