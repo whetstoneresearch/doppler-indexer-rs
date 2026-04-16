@@ -26,7 +26,9 @@ use crate::transformations::event::multicurve::create::V4_MULTICURVE_CREATE_HAND
 use crate::transformations::event::scheduled_multicurve::create::V4_SCHEDULED_MULTICURVE_CREATE_HANDLER_SCOPE;
 use crate::transformations::event::v4::create::V4_CREATE_HANDLER_SCOPE;
 use crate::transformations::registry::TransformationRegistry;
-use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+use crate::transformations::traits::{
+    dep, EventHandler, EventTrigger, HandlerDependencySpec, TransformationHandler,
+};
 use crate::transformations::util::db::pool::{insert_migration_pool, MigrationPoolData};
 use crate::transformations::util::pool_metadata::VersionedSource;
 
@@ -185,13 +187,13 @@ impl EventHandler for MigrationPoolCreateHandler {
         )]
     }
 
-    fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
         vec![
-            "V4CreateHandler",
-            "V4MulticurveCreateHandler",
-            "V4ScheduledMulticurveCreateHandler",
-            "V4DecayMulticurveCreateHandler",
-            "DopplerHookCreateHandler",
+            dep("V4CreateHandler").except([57073, 143]),
+            dep("V4MulticurveCreateHandler").except([57073, 143]),
+            dep("V4ScheduledMulticurveCreateHandler").except([57073, 143]),
+            dep("V4DecayMulticurveCreateHandler"),
+            dep("DopplerHookCreateHandler"),
         ]
     }
 }

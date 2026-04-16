@@ -858,49 +858,49 @@ impl RetryProcessor {
 
     /// Build a uniform list of retry handler descriptors from both event and call handlers.
     fn build_retry_handler_list(&self) -> Vec<RetryHandler> {
-        let mut handlers = Vec::new();
-
-        for info in self.registry.unique_event_handlers() {
-            let triggers: HashSet<(String, String)> = info
-                .triggers
-                .iter()
-                .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
-                .collect();
-            let call_deps: HashSet<(String, String)> =
-                info.handler.call_dependencies().into_iter().collect();
-            let handler_deps: Vec<String> = info
-                .handler
-                .handler_dependencies()
-                .into_iter()
-                .chain(info.handler.contiguous_handler_dependencies())
-                .map(|s| s.to_string())
-                .collect();
-            handlers.push(RetryHandler {
-                handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
-                triggers,
-                call_deps,
-                handler_deps,
-                kind: HandlerKind::Event,
-            });
-        }
-
-        for info in self.registry.unique_call_handlers() {
-            let triggers: HashSet<(String, String)> = info
-                .triggers
-                .iter()
-                .map(|t| (t.source.clone(), t.function_name.clone()))
-                .collect();
-            handlers.push(RetryHandler {
-                handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
-                triggers,
-                call_deps: HashSet::new(),
-                handler_deps: Vec::new(),
-                kind: HandlerKind::Call,
-            });
-        }
-
-        handlers
+        collect_retry_handlers(&self.registry)
     }
+}
+
+fn collect_retry_handlers(registry: &TransformationRegistry) -> Vec<RetryHandler> {
+    let mut handlers = Vec::new();
+
+    for info in registry.unique_event_handlers() {
+        let triggers: HashSet<(String, String)> = info
+            .triggers
+            .iter()
+            .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
+            .collect();
+        let call_deps: HashSet<(String, String)> =
+            info.handler.call_dependencies().into_iter().collect();
+        let handler_deps = registry
+            .all_handler_dependencies_for(info.handler.name())
+            .to_vec();
+        handlers.push(RetryHandler {
+            handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
+            triggers,
+            call_deps,
+            handler_deps,
+            kind: HandlerKind::Event,
+        });
+    }
+
+    for info in registry.unique_call_handlers() {
+        let triggers: HashSet<(String, String)> = info
+            .triggers
+            .iter()
+            .map(|t| (t.source.clone(), t.function_name.clone()))
+            .collect();
+        handlers.push(RetryHandler {
+            handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
+            triggers,
+            call_deps: HashSet::new(),
+            handler_deps: Vec::new(),
+            kind: HandlerKind::Call,
+        });
+    }
+
+    handlers
 }
 
 // ─── Retry status helpers ───────────────────────────────────────────
@@ -1073,9 +1073,46 @@ pub(crate) fn filter_calls_by_start_block(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::db::DbOperation;
     use crate::live::{LiveBlockStatus, LiveStorage};
-    use crate::transformations::context::DecodedValue;
+    use crate::transformations::context::{DecodedValue, TransformationContext};
+    use crate::transformations::error::TransformationError;
+    use crate::transformations::traits::{
+        dep, EventHandler, EventTrigger, HandlerDependencySpec, TransformationHandler,
+    };
+
+    struct MockEventHandler {
+        name: &'static str,
+        triggers: Vec<EventTrigger>,
+        handler_dep_specs: Vec<HandlerDependencySpec>,
+    }
+
+    #[async_trait]
+    impl TransformationHandler for MockEventHandler {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn handle(
+            &self,
+            _ctx: &TransformationContext,
+        ) -> Result<Vec<DbOperation>, TransformationError> {
+            Ok(vec![])
+        }
+    }
+
+    impl EventHandler for MockEventHandler {
+        fn triggers(&self) -> Vec<EventTrigger> {
+            self.triggers.clone()
+        }
+
+        fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+            self.handler_dep_specs.clone()
+        }
+    }
 
     #[test]
     fn retry_missing_handlers_unions_tracker_and_request() {
@@ -1344,6 +1381,36 @@ mod tests {
         assert!(
             !completed.contains(&range_start_missing),
             "handler not yet committed must not be falsely detected as complete"
+        );
+    }
+
+    #[test]
+    fn collect_retry_handlers_uses_resolved_dependency_graph() {
+        let mut registry = TransformationRegistry::with_source_filter_for_chain(
+            HashSet::from(["Test".to_string()]),
+            57073,
+        );
+        registry.register_event_handler(MockEventHandler {
+            name: "Create",
+            triggers: vec![EventTrigger::new("Test", "Create()")],
+            handler_dep_specs: vec![],
+        });
+        registry.register_event_handler(MockEventHandler {
+            name: "Metrics",
+            triggers: vec![EventTrigger::new("Test", "Metrics()")],
+            handler_dep_specs: vec![dep("Create").only([8453])],
+        });
+        registry.validate_and_sort_handler_dependencies();
+
+        let handlers = collect_retry_handlers(&registry);
+        let metrics = handlers
+            .iter()
+            .find(|handler| handler.handler.name() == "Metrics")
+            .unwrap();
+
+        assert!(
+            metrics.handler_deps.is_empty(),
+            "excluded dependencies must not leak into retry handler construction"
         );
     }
 

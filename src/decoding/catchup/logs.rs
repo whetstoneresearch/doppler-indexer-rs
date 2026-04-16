@@ -16,7 +16,7 @@ use crate::storage::contract_index::{
     read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
 use crate::storage::decoded_index::scan_existing_decoded_files;
-use crate::storage::factory_data::load_factory_addresses_by_range;
+use crate::storage::factory_data::load_accumulated_factory_addresses_from_parquet;
 use crate::storage::parquet_readers::read_raw_logs_from_parquet;
 use crate::transformations::DecodedEventsMessage;
 use crate::types::config::chain::ChainConfig;
@@ -75,16 +75,16 @@ pub async fn catchup_decode_logs(
         raw_files.len()
     );
 
-    // Load factory addresses from factory parquet files for catchup
-    let factory_addresses = Arc::new(load_factory_addresses_by_range(&chain.name)?);
+    // Load the accumulated factory address union once for catchup. Factory-created
+    // contracts can emit logs in any later range, so the decoder must not restrict
+    // visibility to the discovery range where the address first appeared.
+    let factory_addresses = Arc::new(load_accumulated_factory_addresses_from_parquet(
+        &chain.name,
+    )?);
 
-    let total_factory_addrs: usize = factory_addresses
-        .values()
-        .flat_map(|m| m.values())
-        .map(|s| s.len())
-        .sum();
+    let total_factory_addrs: usize = factory_addresses.values().map(|s| s.len()).sum();
     tracing::info!(
-        "Log decoding catchup: loaded {} factory addresses across {} ranges",
+        "Log decoding catchup: loaded {} factory addresses across {} collections",
         total_factory_addrs,
         factory_addresses.len()
     );
@@ -257,12 +257,6 @@ pub async fn catchup_decode_logs(
                 }
             };
 
-            // Get factory addresses for this range
-            let factory_addrs = factory_addresses
-                .get(&range_start)
-                .cloned()
-                .unwrap_or_default();
-
             let matchers = LogMatcherConfig {
                 regular_matchers: &missing_regular,
                 factory_matchers: &missing_factory,
@@ -276,7 +270,7 @@ pub async fn catchup_decode_logs(
                 range_start,
                 range_end,
                 &matchers,
-                &factory_addrs,
+                factory_addresses.as_ref(),
                 &output_base,
                 &outputs,
                 None, // contract index writes are done serially after drain (Fix 3)
@@ -425,4 +419,279 @@ fn get_missing_matchers(
         .collect();
 
     (missing_regular, missing_factory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::catchup_decode_logs;
+    use crate::decoding::event_parsing::ParsedEvent;
+    use crate::decoding::logs::build_event_matchers;
+    use crate::decoding::types::LogMatcherConfig;
+    use crate::raw_data::historical::receipts::LogData;
+    use crate::storage::paths::factories_dir;
+    use crate::types::config::chain::{ChainConfig, RpcConfig};
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, Contracts, EventConfig, FactoryCollectionType,
+        FactoryCollections, FactoryConfig, FactoryEventConfig, FactoryParameterLocation,
+    };
+    use crate::types::config::generic::SingleOrMultiple;
+    use crate::types::config::raw_data::{FieldsConfig, RawDataCollectionConfig};
+    use alloy::primitives::B256;
+    use alloy_primitives::Address;
+    use arrow::array::{
+        ArrayRef, BinaryArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, ListBuilder,
+        StringArray, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct ChainDataCleanup(PathBuf);
+
+    impl Drop for ChainDataCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample_raw_data_config() -> RawDataCollectionConfig {
+        RawDataCollectionConfig {
+            parquet_block_range: None,
+            rpc_batch_size: None,
+            fields: FieldsConfig {
+                block_fields: None,
+                receipt_fields: None,
+                log_fields: None,
+            },
+            contract_logs_only: None,
+            channel_capacity: None,
+            factory_channel_capacity: None,
+            block_receipt_concurrency: None,
+            decoding_concurrency: Some(1),
+            factory_concurrency: None,
+            event_call_concurrency: None,
+            event_call_window_size: None,
+            event_call_trigger_batch_size: None,
+            live_mode: None,
+            reorg_depth: None,
+            compaction_interval_secs: None,
+            transform_retry_grace_period_secs: None,
+            max_receipt_ranges: None,
+            max_pending_log_ranges: None,
+        }
+    }
+
+    fn sample_chain(chain_name: String) -> ChainConfig {
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "Initializer".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::from([0x11; 20])),
+                start_block: None,
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "Hook".to_string(),
+                    factory_events: SingleOrMultiple::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "address".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Topic(1),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        let mut factory_collections = FactoryCollections::new();
+        factory_collections.insert(
+            "Hook".to_string(),
+            FactoryCollectionType {
+                calls: Vec::new(),
+                events: Some(vec![EventConfig {
+                    signature: "Swap()".to_string(),
+                    name: None,
+                }]),
+            },
+        );
+
+        ChainConfig {
+            name: chain_name,
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            from_block: None,
+            to_block: None,
+            contracts,
+            block_receipts_method: None,
+            factory_collections,
+            rpc: RpcConfig::default(),
+        }
+    }
+
+    fn write_factory_parquet(
+        output_path: &Path,
+        collection_name: &str,
+        addresses: &[[u8; 20]],
+    ) -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("factory_address", DataType::FixedSizeBinary(20), false),
+            Field::new("collection_name", DataType::Utf8, false),
+        ]));
+
+        let block_numbers: UInt64Array = addresses.iter().map(|_| Some(1u64)).collect();
+        let timestamps: UInt64Array = addresses.iter().map(|_| Some(2u64)).collect();
+        let address_array = if addresses.is_empty() {
+            FixedSizeBinaryBuilder::new(20).finish()
+        } else {
+            FixedSizeBinaryArray::try_from_iter(addresses.iter().map(|addr| addr.as_slice()))?
+        };
+        let collection_names: StringArray =
+            addresses.iter().map(|_| Some(collection_name)).collect();
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(block_numbers),
+            Arc::new(timestamps),
+            Arc::new(address_array),
+            Arc::new(collection_names),
+        ];
+
+        let batch = RecordBatch::try_new(schema, arrays)?;
+        crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
+        Ok(())
+    }
+
+    fn write_raw_logs_parquet(output_path: &Path, logs: &[LogData]) -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("block_number", DataType::UInt64, false),
+            Field::new("block_timestamp", DataType::UInt64, false),
+            Field::new("transaction_hash", DataType::FixedSizeBinary(32), false),
+            Field::new("log_index", DataType::UInt32, false),
+            Field::new("address", DataType::FixedSizeBinary(20), false),
+            Field::new(
+                "topics",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::FixedSizeBinary(32),
+                    true,
+                ))),
+                false,
+            ),
+            Field::new("data", DataType::Binary, false),
+        ]));
+
+        let block_numbers: UInt64Array = logs.iter().map(|log| Some(log.block_number)).collect();
+        let timestamps: UInt64Array = logs.iter().map(|log| Some(log.block_timestamp)).collect();
+        let tx_hashes = if logs.is_empty() {
+            FixedSizeBinaryBuilder::new(32).finish()
+        } else {
+            FixedSizeBinaryArray::try_from_iter(
+                logs.iter().map(|log| log.transaction_hash.as_slice()),
+            )?
+        };
+        let log_indexes: UInt32Array = logs.iter().map(|log| Some(log.log_index)).collect();
+        let addresses = if logs.is_empty() {
+            FixedSizeBinaryBuilder::new(20).finish()
+        } else {
+            FixedSizeBinaryArray::try_from_iter(logs.iter().map(|log| log.address.as_slice()))?
+        };
+
+        let mut topics_builder = ListBuilder::new(FixedSizeBinaryBuilder::new(32));
+        for log in logs {
+            for topic in &log.topics {
+                topics_builder.values().append_value(topic.as_slice())?;
+            }
+            topics_builder.append(true);
+        }
+        let topics = topics_builder.finish();
+        let data: BinaryArray = logs.iter().map(|log| Some(log.data.as_slice())).collect();
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(block_numbers),
+            Arc::new(timestamps),
+            Arc::new(tx_hashes),
+            Arc::new(log_indexes),
+            Arc::new(addresses),
+            Arc::new(topics),
+            Arc::new(data),
+        ];
+
+        let batch = RecordBatch::try_new(schema, arrays)?;
+        crate::storage::atomic_write_parquet_fast(&batch, output_path)?;
+        Ok(())
+    }
+
+    fn parquet_row_count(path: &Path) -> anyhow::Result<usize> {
+        let file = File::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        Ok(reader
+            .map(|batch| batch.map(|b| b.num_rows()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum())
+    }
+
+    #[tokio::test]
+    async fn catchup_decode_uses_accumulated_factory_addresses_across_ranges() {
+        let tempdir = TempDir::new().unwrap();
+        let raw_logs_dir = tempdir.path().join("raw_logs");
+        let output_base = tempdir.path().join("decoded_logs");
+        std::fs::create_dir_all(&raw_logs_dir).unwrap();
+        std::fs::create_dir_all(&output_base).unwrap();
+
+        let chain_name = format!("catchup-factory-{}", rand::random::<u64>());
+        let _cleanup = ChainDataCleanup(PathBuf::from(format!("data/{}", chain_name)));
+        let chain = sample_chain(chain_name.clone());
+
+        let factory_dir = factories_dir(&chain.name).join("Hook");
+        std::fs::create_dir_all(&factory_dir).unwrap();
+        let hook_address = [0xaa; 20];
+        write_factory_parquet(&factory_dir.join("0-999.parquet"), "Hook", &[hook_address]).unwrap();
+
+        let parsed = ParsedEvent::from_signature("Swap()").unwrap();
+        let log = LogData {
+            block_number: 1500,
+            block_timestamp: 42,
+            transaction_hash: B256::ZERO,
+            log_index: 0,
+            address: hook_address,
+            topics: vec![parsed.topic0],
+            data: Vec::new(),
+        };
+        write_raw_logs_parquet(&raw_logs_dir.join("logs_1000-1999.parquet"), &[log]).unwrap();
+
+        let (regular_matchers, factory_matchers) =
+            build_event_matchers(&chain.contracts, &chain.factory_collections).unwrap();
+        let matchers = LogMatcherConfig {
+            regular_matchers: &regular_matchers,
+            factory_matchers: &factory_matchers,
+        };
+
+        catchup_decode_logs(
+            &raw_logs_dir,
+            &output_base,
+            &matchers,
+            &chain,
+            &sample_raw_data_config(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let decoded_path = output_base
+            .join("Hook")
+            .join("Swap")
+            .join("1000-1999.parquet");
+        assert!(decoded_path.exists());
+        assert_eq!(parquet_row_count(&decoded_path).unwrap(), 1);
+    }
 }

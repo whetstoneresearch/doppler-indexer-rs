@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
@@ -22,7 +21,6 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::{
     get_factory_call_configs, FactoryAddressData, FactoryMessage,
 };
-use crate::types::config::defaults;
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers_from_batches, EventTriggerData,
     EventTriggerMatcher,
@@ -37,8 +35,14 @@ use crate::storage::paths::raw_eth_calls_dir;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
+use crate::types::config::defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::shared::repair::RepairScope;
+use alloy::primitives::Address;
+use tokio::sync::oneshot;
+
+type EthCallJoinSet =
+    tokio::task::JoinSet<Result<Option<(u64, u64, bool)>, EthCallCollectionError>>;
 
 /// Extracted helper: processes factory-once catchup for a single block range.
 ///
@@ -495,7 +499,7 @@ async fn read_raw_event_row_key_counts(output_path: PathBuf) -> Result<EventRowK
     tokio::task::spawn_blocking(move || {
         let keys =
             read_event_call_row_keys_from_parquet(&output_path).map_err(|e| e.to_string())?;
-        Ok::<_, String>(build_event_row_key_counts(keys.into_iter()))
+        Ok::<_, String>(build_event_row_key_counts(keys))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1340,8 +1344,7 @@ pub async fn collect_eth_calls(
             .collect();
 
         {
-            let io_semaphore =
-                Arc::new(tokio::sync::Semaphore::new(event_call_concurrency * 2));
+            let io_semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency * 2));
             let rpc_semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency));
 
             // Bundle the immutable per-task state into a single Arc so each
@@ -1372,9 +1375,7 @@ pub async fn collect_eth_calls(
 
             for window in eligible_ranges.chunks(window_size) {
                 // (start, end, contract_index_only)
-                let mut join_set: tokio::task::JoinSet<
-                    Result<Option<(u64, u64, bool)>, EthCallCollectionError>,
-                > = tokio::task::JoinSet::new();
+                let mut join_set: EthCallJoinSet = tokio::task::JoinSet::new();
 
                 for &(idx, log_range) in window {
                     let task_ctx = Arc::clone(&task_ctx);

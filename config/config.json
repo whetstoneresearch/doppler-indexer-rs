@@ -8,6 +8,7 @@
         {
             "name": "base",
             "chain_id": 8453,
+            "to_block": 40253215,
             "rpc_url_env_var": "BASE_RPC_URL",
             "ws_url_env_var": "BASE_WS_URL",
             "start_block": 26602741,
@@ -28,6 +29,7 @@
         {
             "name": "unichain",
             "chain_id": 130,
+            "to_block": 36551511,
             "rpc_url_env_var": "UNICHAIN_RPC_URL",
             "ws_url_env_var": "UNICHAIN_WS_URL",
             "start_block": 8536880,
@@ -38,6 +40,7 @@
         {
             "name": "ink",
             "chain_id": 57073,
+            "to_block": 33801413,
             "rpc_url_env_var": "INK_RPC_URL",
             "ws_url_env_var": "INK_WS_URL",
             "start_block": 9508011,
@@ -48,6 +51,7 @@
         {
             "name": "monad",
             "chain_id": 143,
+            "to_block": 45876689,
             "rpc_url_env_var": "MONAD_RPC_URL",
             "ws_url_env_var": "MONAD_WS_URL",
             "start_block": 34746370,
@@ -79,13 +83,13 @@
     "raw_data_collection": {
         "event_call_window_size": 20,
         "event_call_trigger_batch_size": 10000,
-        "channel_capacity": 500,
-        "factory_channel_capacity": 500,
+        "channel_capacity": 1000,
+        "factory_channel_capacity": 1000,
         "block_receipt_concurrency": 25,
         "parquet_block_range": 10000,
         "rpc_batch_size": 1000,
         "event_call_concurrency": 32,
-        "decoding_concurrency": 16,
+        "decoding_concurrency": 32,
         "fields": {
             "block_fields": [
                 "number",

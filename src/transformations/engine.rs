@@ -39,6 +39,7 @@ use super::scheduler::loader::{
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
+use crate::metrics::record_chain_head_block;
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
@@ -194,11 +195,7 @@ impl CatchupOutcomeAccumulator {
 
     /// Process one chunk's worth of outcomes, emitting per-item logs and metrics
     /// immediately and retaining only the failure details.
-    fn ingest(
-        &mut self,
-        outcomes: Vec<WorkItemOutcome>,
-        kind_label: &'static str,
-    ) {
+    fn ingest(&mut self, outcomes: Vec<WorkItemOutcome>, kind_label: &'static str) {
         if !outcomes.is_empty() {
             self.has_outcomes = true;
         }
@@ -232,8 +229,11 @@ impl CatchupOutcomeAccumulator {
                     );
                     self.blocked += 1;
                     counts.2 += 1;
-                    self.failed_items
-                        .push((key, outcome.range_start, format!("blocked: {}", reason)));
+                    self.failed_items.push((
+                        key,
+                        outcome.range_start,
+                        format!("blocked: {}", reason),
+                    ));
                 }
                 OutcomeStatus::HandlerFailed { reason } => {
                     tracing::error!(
@@ -243,8 +243,7 @@ impl CatchupOutcomeAccumulator {
                         outcome.range_end,
                         reason
                     );
-                    self.failed_items
-                        .push((key, outcome.range_start, reason));
+                    self.failed_items.push((key, outcome.range_start, reason));
                     counts.1 += 1;
                 }
                 OutcomeStatus::DepCascadeFailed { dep_name } => {
@@ -910,10 +909,7 @@ impl TransformationEngine {
 
             if items.is_empty() {
                 if !acc.has_outcomes {
-                    tracing::info!(
-                        "{} handler catchup: no work items to submit",
-                        kind_label
-                    );
+                    tracing::info!("{} handler catchup: no work items to submit", kind_label);
                 }
                 break;
             }
@@ -981,18 +977,15 @@ impl TransformationEngine {
                         .map(|t| (t.source.clone(), extract_event_name(&t.event_signature)))
                         .collect();
                     let call_deps = info.handler.call_dependencies();
-                    let handler_deps: Vec<String> = info
-                        .handler
-                        .handler_dependencies()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    let contiguous_handler_deps: Vec<String> = info
-                        .handler
-                        .contiguous_handler_dependencies()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let handler_name = info.handler.name();
+                    let handler_deps = self
+                        .registry
+                        .handler_dependencies_for(handler_name)
+                        .to_vec();
+                    let contiguous_handler_deps = self
+                        .registry
+                        .contiguous_handler_dependencies_for(handler_name)
+                        .to_vec();
                     let sequential = info.handler.requires_sequential();
                     CatchupHandler {
                         handler: info.handler as Arc<dyn super::traits::TransformationHandler>,
@@ -1571,6 +1564,8 @@ impl TransformationEngine {
         &self,
         msg: DecodedEventsMessage,
     ) -> Result<(), TransformationError> {
+        record_chain_head_block(&self.chain_name, msg.range_end);
+
         let handlers = self
             .registry
             .handlers_for_event(&msg.source_name, &msg.event_name);
@@ -1631,14 +1626,12 @@ impl TransformationEngine {
             let mut state = self.live_state.lock().await;
             for handler in &handlers {
                 let call_deps = handler.call_dependencies();
-                let handler_deps: Vec<String> = handler
-                    .handler_dependencies()
-                    .into_iter()
-                    .chain(handler.contiguous_handler_dependencies())
-                    .map(|s| s.to_string())
-                    .collect();
-                let handler_key = handler.handler_key();
                 let handler_name = handler.name().to_string();
+                let handler_deps = self
+                    .registry
+                    .all_handler_dependencies_for(&handler_name)
+                    .to_vec();
+                let handler_key = handler.handler_key();
 
                 let call_deps_ready = call_deps.is_empty()
                     || call_deps.iter().all(|dep| {
@@ -2023,6 +2016,8 @@ impl TransformationEngine {
         &self,
         msg: DecodedCallsMessage,
     ) -> Result<(), TransformationError> {
+        record_chain_head_block(&self.chain_name, msg.range_end);
+
         let range_key = (msg.range_start, msg.range_end);
         let call_key = (msg.source_name.clone(), msg.function_name.clone());
 
@@ -2595,20 +2590,13 @@ impl TransformationEngine {
 
         for (source, event_name) in event_triggers {
             for handler in self.registry.handlers_for_event(source, event_name) {
-                // Collect dep_names from EventHandler before upcasting — the
-                // method lives on EventHandler, not on TransformationHandler.
-                let dep_names: Vec<String> = handler
-                    .handler_dependencies()
-                    .into_iter()
-                    .chain(handler.contiguous_handler_dependencies())
-                    .map(|s| s.to_string())
-                    .collect();
+                let name = handler.name().to_string();
+                let dep_names = self.registry.all_handler_dependencies_for(&name).to_vec();
                 let handler: Arc<dyn super::traits::TransformationHandler> = handler;
                 let key = handler.handler_key();
                 if !seen_keys.insert(key.clone()) {
                     continue;
                 }
-                let name = handler.name().to_string();
                 name_to_key.insert(name.clone(), key);
                 items.push(WorkItem {
                     handler_name: name,

@@ -10,7 +10,10 @@ pub use rpc::{
     record_retries_exhausted, record_retry_attempt, set_cu_usage, set_receipt_pipeline_state,
     set_semaphore_utilization, with_metrics, RpcMethod,
 };
-pub use transformations::{describe_transformation_metrics, HandlerMetricsGuard};
+pub use transformations::{
+    describe_transformation_metrics, record_chain_head_block, record_handler_completed_block,
+    HandlerMetricsGuard,
+};
 
 use std::net::SocketAddr;
 

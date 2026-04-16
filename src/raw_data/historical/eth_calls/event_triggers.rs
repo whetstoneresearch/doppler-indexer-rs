@@ -672,8 +672,7 @@ pub(crate) async fn process_event_triggers(
         let trigger_chunk: Vec<EventTriggerData> = triggers.drain(..drain_end).collect();
 
         // Group this chunk's triggers by (contract_name, function_name)
-        let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> =
-            HashMap::new();
+        let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> = HashMap::new();
 
         for trigger in &trigger_chunk {
             let key = (trigger.source_name.clone(), trigger.event_signature);
@@ -1118,8 +1117,7 @@ pub(crate) async fn process_event_triggers_multicall(
         let trigger_chunk: Vec<EventTriggerData> = triggers.drain(..drain_end).collect();
 
         // Group this chunk's triggers by (contract_name, function_name)
-        let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> =
-            HashMap::new();
+        let mut calls_by_output: HashMap<(String, String), Vec<PreparedEventCall>> = HashMap::new();
 
         for trigger in &trigger_chunk {
             let key = (trigger.source_name.clone(), trigger.event_signature);

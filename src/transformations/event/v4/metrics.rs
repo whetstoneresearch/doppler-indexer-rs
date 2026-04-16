@@ -230,8 +230,6 @@ impl TransformationHandler for V4BaseMetricsHandler {
                 pool_id,
                 total_proceeds,
                 total_tokens_sold,
-                SOURCE,
-                self.version(),
             ));
         }
 
@@ -746,17 +744,11 @@ fn upsert_proceeds_state(
     pool_id: &[u8; 32],
     total_proceeds: &U256,
     total_tokens_sold: &U256,
-    source: &str,
-    source_version: u32,
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "v4_base_proceeds_state".to_string(),
-        conflict_columns: vec![
-            "chain_id".to_string(),
-            "pool_id".to_string(),
-            "source".to_string(),
-            "source_version".to_string(),
-        ],
+        // `source`/`source_version` are injected by the executor.
+        conflict_columns: vec!["chain_id".to_string(), "pool_id".to_string()],
         update_columns: vec![
             "total_proceeds".to_string(),
             "total_tokens_sold".to_string(),
@@ -765,16 +757,12 @@ fn upsert_proceeds_state(
         columns: vec![
             "chain_id".to_string(),
             "pool_id".to_string(),
-            "source".to_string(),
-            "source_version".to_string(),
             "total_proceeds".to_string(),
             "total_tokens_sold".to_string(),
         ],
         values: vec![
             DbValue::Int64(chain_id as i64),
             DbValue::Bytes32(*pool_id),
-            DbValue::VarChar(source.to_string()),
-            DbValue::Int32(source_version as i32),
             DbValue::Numeric(total_proceeds.to_string()),
             DbValue::Numeric(total_tokens_sold.to_string()),
         ],
@@ -919,7 +907,6 @@ mod tests {
         handler.metadata_cache.insert_if_absent(
             pool_id.to_vec(),
             PoolMetadata {
-                base_token: [1u8; 20],
                 quote_token: [2u8; 20],
                 is_token_0,
                 base_decimals: 18,
@@ -1073,25 +1060,81 @@ mod tests {
     #[test]
     fn test_upsert_proceeds_state_op() {
         let pool_id = make_pool_id(0xFF);
-        let op = upsert_proceeds_state(
-            8453,
-            &pool_id,
-            &U256::from(9999u64),
-            &U256::from(1234u64),
-            "DopplerV4Hook",
-            1,
-        );
+        let op = upsert_proceeds_state(8453, &pool_id, &U256::from(9999u64), &U256::from(1234u64));
         match op {
             DbOperation::Upsert {
                 table,
+                columns,
                 conflict_columns,
                 update_columns,
                 ..
             } => {
                 assert_eq!(table, "v4_base_proceeds_state");
+                assert_eq!(
+                    columns,
+                    vec![
+                        "chain_id".to_string(),
+                        "pool_id".to_string(),
+                        "total_proceeds".to_string(),
+                        "total_tokens_sold".to_string(),
+                    ]
+                );
+                assert_eq!(
+                    conflict_columns,
+                    vec!["chain_id".to_string(), "pool_id".to_string()]
+                );
                 assert!(conflict_columns.contains(&"pool_id".to_string()));
                 assert!(update_columns.contains(&"total_proceeds".to_string()));
                 assert!(update_columns.contains(&"total_tokens_sold".to_string()));
+            }
+            _ => panic!("expected Upsert"),
+        }
+    }
+
+    #[test]
+    fn test_upsert_proceeds_state_injects_source_once() {
+        let pool_id = make_pool_id(0xFE);
+        let injected = crate::transformations::executor::inject_source_version(
+            vec![upsert_proceeds_state(
+                8453,
+                &pool_id,
+                &U256::from(9999u64),
+                &U256::from(1234u64),
+            )],
+            SOURCE,
+            1,
+        );
+
+        match injected.into_iter().next().unwrap() {
+            DbOperation::Upsert {
+                columns,
+                conflict_columns,
+                values,
+                ..
+            } => {
+                assert_eq!(columns.iter().filter(|c| c.as_str() == "source").count(), 1);
+                assert_eq!(
+                    columns
+                        .iter()
+                        .filter(|c| c.as_str() == "source_version")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    conflict_columns
+                        .iter()
+                        .filter(|c| c.as_str() == "source")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    conflict_columns
+                        .iter()
+                        .filter(|c| c.as_str() == "source_version")
+                        .count(),
+                    1
+                );
+                assert_eq!(columns.len(), values.len());
             }
             _ => panic!("expected Upsert"),
         }

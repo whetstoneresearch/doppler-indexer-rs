@@ -18,8 +18,12 @@ use crate::transformations::util::usd_price::{
     build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
 };
 
-const CREATOR_HOOK_SOURCE: &str = "CreatorCoinHook";
-const CONTENT_HOOK_SOURCE: &str = "ContentCoinHook";
+// The singleton `CreatorCoinHook` / `ContentCoinHook` addresses are subsets
+// of the factory-spawned collections `ZoraCreatorCoinHook` /
+// `ZoraContentCoinHook`, so triggering on the factory collection names
+// captures the singletons as well as every instance spawned by ZoraFactory.
+const CREATOR_HOOK_SOURCE: &str = "ZoraCreatorCoinHook";
+const CONTENT_HOOK_SOURCE: &str = "ZoraContentCoinHook";
 
 pub struct ZoraSwapMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,

@@ -1,7 +1,7 @@
 {
     "ZoraFactory": {
         "address": "0x777777751622c0d3258f214F9DF38E35BF45baF3",
-        "start_block": 31058549,
+        "start_block": 26602741,
         "factories": [
             {
                 "collection_name": "ZoraCreatorCoinV4",
@@ -99,24 +99,6 @@
             },
             {
                 "signature": "CreatorCoinCreated(address indexed caller, address indexed payoutRecipient, address indexed platformReferrer, address currency, string uri, string name, string symbol, address coin, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey, bytes32 poolKeyHash, string version)"
-            }
-        ]
-    },
-    "CreatorCoinHook": {
-        "address": "0xd61A675F8a0c67A73DC3B54FB7318B4D91409040",
-        "start_block": 31058549,
-        "events": [
-            {
-                "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"
-            }
-        ]
-    },
-    "ContentCoinHook": {
-        "address": "0x9ea932730A7787000042e34390B8E435dD839040",
-        "start_block": 31058549,
-        "events": [
-            {
-                "signature": "Swapped(address indexed sender, address indexed swapSender, bool isTrustedSwapSenderAddress, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, bytes32 indexed poolKeyHash, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bool isCoinBuy, bytes hookData, uint160 sqrtPriceX96)"
             }
         ]
     }

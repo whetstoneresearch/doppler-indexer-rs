@@ -573,6 +573,13 @@ impl CompletionTracker {
     ///   `current_pos + 1`, which is always above the pruned threshold
     ///   (since the handler's own watermark >= the minimum).
     ///
+    /// If **any** supplied handler has no contiguous watermark (i.e. it
+    /// has not covered the prefix of `available_starts` from the first
+    /// range), this is a no-op — pruning would otherwise cause
+    /// `is_pruned` to silently report unprocessed early ranges as
+    /// completed for that handler, short-circuiting its work items in
+    /// `build_catchup_work_items`.
+    ///
     /// Only effective when `available_starts` is non-empty (catchup
     /// trackers created with [`with_available_starts`]).
     ///
@@ -583,21 +590,18 @@ impl CompletionTracker {
             return;
         }
 
-        // Find the minimum contiguous watermark across all handlers.
+        // Collect each handler's contiguous watermark. `Vec<Option<u64>>`
+        // collected into `Option<Vec<u64>>` short-circuits to `None` if any
+        // handler has no contiguous coverage from start — in which case we
+        // must not prune (see the doc comment above).
         let contiguous = self.contiguous.read().await;
-        let min_watermark = handler_names
+        let watermarks: Option<Vec<u64>> = handler_names
             .iter()
-            .filter_map(|name| {
-                contiguous
-                    .watermarks
-                    .get(*name)
-                    .copied()
-                    .unwrap_or(None)
-            })
-            .min();
+            .map(|name| contiguous.watermarks.get(*name).copied().unwrap_or(None))
+            .collect();
         drop(contiguous);
 
-        let Some(min_wm) = min_watermark else {
+        let Some(min_wm) = watermarks.and_then(|ws| ws.into_iter().min()) else {
             return;
         };
 
@@ -1347,9 +1351,7 @@ mod tests {
         assert_eq!(tracker.probe(&names(&["A"]), 100).await, DepState::Ready);
         assert_eq!(tracker.probe(&names(&["A"]), 200).await, DepState::Ready);
         assert_eq!(
-            tracker
-                .probe_extended(&names(&["A"]), &[], &[], 100)
-                .await,
+            tracker.probe_extended(&names(&["A"]), &[], &[], 100).await,
             DepState::Ready
         );
     }
@@ -1398,6 +1400,50 @@ mod tests {
         tracker.compact(&["A"]).await;
 
         // No pruning should occur.
+        let state = tracker.state.read().await;
+        assert!(state.completed.get("A").unwrap().contains(&100));
+    }
+
+    /// Regression: a handler with no contiguous coverage from the first
+    /// available range (watermark = None) must block pruning entirely,
+    /// otherwise `is_pruned` would silently mark its unprocessed early
+    /// ranges as completed and `build_catchup_work_items` would skip them.
+    #[tokio::test]
+    async fn compact_skips_when_handler_has_no_watermark() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300, 400, 500]);
+        // A is fully contiguous → watermark = 500.
+        tracker.seed_completed("A", [100, 200, 300, 400, 500]).await;
+        // B has only a sparse middle entry → watermark = None.
+        tracker.seed_completed("B", [300]).await;
+
+        tracker.compact(&["A", "B"]).await;
+
+        // Pruning must NOT happen: B's early ranges are not actually completed.
+        assert!(
+            !tracker.is_completed("B", 100).await,
+            "B@100 must remain not-completed; otherwise the scheduler would skip it"
+        );
+        assert!(!tracker.is_completed("B", 200).await);
+        // A's entries are still in the in-memory set (not pruned).
+        let state = tracker.state.read().await;
+        let a_completed = state.completed.get("A").unwrap();
+        assert!(a_completed.contains(&100));
+        assert!(a_completed.contains(&500));
+    }
+
+    /// A handler not present in the watermarks map at all (e.g. freshly
+    /// registered, never seeded) must also block pruning.
+    #[tokio::test]
+    async fn compact_skips_when_handler_missing_from_watermarks() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300]);
+        tracker.seed_completed("A", [100, 200, 300]).await;
+        // "B" was never seeded or marked — has no entry in `watermarks`.
+
+        tracker.compact(&["A", "B"]).await;
+
+        // Pruning skipped → B@100 still reports as not-completed.
+        assert!(!tracker.is_completed("B", 100).await);
+        // And A's entries remain in memory.
         let state = tracker.state.read().await;
         assert!(state.completed.get("A").unwrap().contains(&100));
     }

@@ -696,8 +696,7 @@ fn expand_named_template(template: &str, mut resolve: impl FnMut(&str) -> String
                         // Named parameter — capture name
                         let start = i + 1;
                         let mut end = start;
-                        while end < len
-                            && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                        while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
                         {
                             end += 1;
                         }
@@ -726,7 +725,8 @@ fn expand_named_template(template: &str, mut resolve: impl FnMut(&str) -> String
 fn build_named_sql(template: &str, named_params: &[(String, DbValue)]) -> (String, Vec<SqlParam>) {
     use std::collections::HashMap;
 
-    let lookup: HashMap<&str, &DbValue> = named_params.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let lookup: HashMap<&str, &DbValue> =
+        named_params.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let mut index_map: HashMap<String, usize> = HashMap::new();
     let mut sql_params: Vec<SqlParam> = Vec::new();
 
@@ -736,9 +736,12 @@ fn build_named_sql(template: &str, named_params: &[(String, DbValue)]) -> (Strin
             let value = lookup.get(name).expect("param was previously resolved");
             placeholder_for(value, idx)
         } else {
-            let value = *lookup
-                .get(name)
-                .unwrap_or_else(|| panic!("NamedSql: template references unbound parameter ':{}'", name));
+            let value = *lookup.get(name).unwrap_or_else(|| {
+                panic!(
+                    "NamedSql: template references unbound parameter ':{}'",
+                    name
+                )
+            });
             let idx = sql_params.len() + 1; // 1-based PostgreSQL param index
             index_map.insert(name.to_string(), idx);
             sql_params.push(convert_db_value(value));
@@ -778,8 +781,7 @@ impl<'a> NamedQueryBuilder<'a> {
     pub fn build(&self) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
         use std::collections::HashMap;
 
-        let lookup: HashMap<&str, &'a (dyn ToSql + Sync)> =
-            self.params.iter().copied().collect();
+        let lookup: HashMap<&str, &'a (dyn ToSql + Sync)> = self.params.iter().copied().collect();
         let mut index_map: HashMap<String, usize> = HashMap::new();
         let mut ordered: Vec<&'a (dyn ToSql + Sync)> = Vec::new();
 
@@ -787,9 +789,12 @@ impl<'a> NamedQueryBuilder<'a> {
             if let Some(&idx) = index_map.get(name) {
                 format!("${}", idx)
             } else {
-                let value = *lookup
-                    .get(name)
-                    .unwrap_or_else(|| panic!("NamedQueryBuilder: template references unbound parameter ':{}'", name));
+                let value = *lookup.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "NamedQueryBuilder: template references unbound parameter ':{}'",
+                        name
+                    )
+                });
                 let idx = ordered.len() + 1;
                 index_map.insert(name.to_string(), idx);
                 ordered.push(value);
@@ -1277,10 +1282,7 @@ mod tests {
 
     #[test]
     fn named_sql_basic_substitution() {
-        let (sql, params) = build_named_sql(
-            "SELECT :foo",
-            &[("foo".into(), DbValue::Int64(42))],
-        );
+        let (sql, params) = build_named_sql("SELECT :foo", &[("foo".into(), DbValue::Int64(42))]);
         assert_eq!(sql, "SELECT $1");
         assert_eq!(params.len(), 1);
         assert!(matches!(params[0], SqlParam::Int64(42)));
@@ -1328,39 +1330,27 @@ mod tests {
 
     #[test]
     fn named_sql_cast_operator_preserved() {
-        let (sql, _) = build_named_sql(
-            "SELECT 0::numeric, NULL::text",
-            &[],
-        );
+        let (sql, _) = build_named_sql("SELECT 0::numeric, NULL::text", &[]);
         assert_eq!(sql, "SELECT 0::numeric, NULL::text");
     }
 
     #[test]
     fn named_sql_single_quoted_string_ignored() {
-        let (sql, params) = build_named_sql(
-            "SELECT ':not_a_param'",
-            &[],
-        );
+        let (sql, params) = build_named_sql("SELECT ':not_a_param'", &[]);
         assert_eq!(sql, "SELECT ':not_a_param'");
         assert!(params.is_empty());
     }
 
     #[test]
     fn named_sql_double_quoted_ident_ignored() {
-        let (sql, params) = build_named_sql(
-            "SELECT \":not_a_param\"",
-            &[],
-        );
+        let (sql, params) = build_named_sql("SELECT \":not_a_param\"", &[]);
         assert_eq!(sql, "SELECT \":not_a_param\"");
         assert!(params.is_empty());
     }
 
     #[test]
     fn named_sql_escaped_single_quote() {
-        let (sql, params) = build_named_sql(
-            "SELECT 'it''s :not_a_param'",
-            &[],
-        );
+        let (sql, params) = build_named_sql("SELECT 'it''s :not_a_param'", &[]);
         assert_eq!(sql, "SELECT 'it''s :not_a_param'");
         assert!(params.is_empty());
     }
@@ -1382,10 +1372,7 @@ mod tests {
 
     #[test]
     fn named_sql_null_no_cast() {
-        let (sql, params) = build_named_sql(
-            "SELECT :val",
-            &[("val".into(), DbValue::Null)],
-        );
+        let (sql, params) = build_named_sql("SELECT :val", &[("val".into(), DbValue::Null)]);
         assert_eq!(sql, "SELECT $1");
         assert_eq!(params.len(), 1);
         assert!(matches!(params[0], SqlParam::Null));
@@ -1411,17 +1398,13 @@ mod tests {
     fn named_query_builder_basic() {
         let chain_id: i64 = 8453;
         let block: i64 = 100;
-        let (sql, params) = NamedQueryBuilder::new(
-            "WHERE chain_id = :cid AND block = :block AND chain_id = :cid",
-        )
-        .bind("cid", &chain_id)
-        .bind("block", &block)
-        .build();
+        let (sql, params) =
+            NamedQueryBuilder::new("WHERE chain_id = :cid AND block = :block AND chain_id = :cid")
+                .bind("cid", &chain_id)
+                .bind("block", &block)
+                .build();
 
-        assert_eq!(
-            sql,
-            "WHERE chain_id = $1 AND block = $2 AND chain_id = $1"
-        );
+        assert_eq!(sql, "WHERE chain_id = $1 AND block = $2 AND chain_id = $1");
         assert_eq!(params.len(), 2);
     }
 }

@@ -224,10 +224,7 @@ impl DagScheduler {
                 let handler_seq = seq_state.get(&name_for_task);
                 if let Some(state) = handler_seq {
                     // Find our ordinal position in the sorted range list.
-                    let my_index = state
-                        .sorted_ranges
-                        .binary_search(&range_start)
-                        .unwrap_or(0);
+                    let my_index = state.sorted_ranges.binary_search(&range_start).unwrap_or(0);
 
                     // Wait until it's our turn.
                     let mut rx = state.next_index.subscribe();

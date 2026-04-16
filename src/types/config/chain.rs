@@ -376,9 +376,9 @@ mod tests {
     #[test]
     fn test_range_in_scope_both_bounds() {
         let config = make_chain_config(Some(200), Some(299));
-        assert!(config.range_in_scope(100, 201));  // overlaps at 200
-        assert!(config.range_in_scope(299, 300));  // overlaps at 299
-        assert!(config.range_in_scope(250, 260));  // fully inside
+        assert!(config.range_in_scope(100, 201)); // overlaps at 200
+        assert!(config.range_in_scope(299, 300)); // overlaps at 299
+        assert!(config.range_in_scope(250, 260)); // fully inside
         assert!(!config.range_in_scope(100, 200)); // ends before from_block
         assert!(!config.range_in_scope(300, 400)); // starts after to_block
     }

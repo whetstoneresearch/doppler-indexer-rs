@@ -871,7 +871,7 @@ pub(crate) async fn fetch_block_receipts_bounded(
         total_rpc_time += rpc_start.elapsed();
 
         let process_start = Instant::now();
-        for (block, result) in chunk.iter().zip(results.into_iter()) {
+        for (block, result) in chunk.iter().zip(results) {
             let receipts = result?;
             let tx_block_info: Vec<(B256, u64, u64)> = receipts
                 .iter()

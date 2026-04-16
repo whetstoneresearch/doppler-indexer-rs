@@ -41,7 +41,9 @@ const ARCHIVE_ROOT: &str = "1k-archive";
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| "data".to_string());
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "data".to_string());
     let data_path = Path::new(&data_dir);
 
     if !data_path.exists() {
@@ -62,10 +64,16 @@ fn main() {
     let errors = AtomicU64::new(0);
 
     files.par_iter().for_each(|entry| {
-        match split_file(&entry.path, entry.range_start, entry.range_end_inclusive, &entry.prefix, data_path) {
+        match split_file(
+            &entry.path,
+            entry.range_start,
+            entry.range_end_inclusive,
+            &entry.prefix,
+            data_path,
+        ) {
             Ok(Split::Done) => {
                 let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 1000 == 0 || n == total as u64 {
+                if n.is_multiple_of(1000) || n == total as u64 {
                     eprintln!("[{}/{}] processed", n, total);
                 }
             }
@@ -430,10 +438,10 @@ fn sort_batch_by_all_columns(
 fn compute_range_mask(array: &UInt64Array, start: u64, end: u64) -> BooleanArray {
     let len = array.len();
     let mut mask = vec![false; len];
-    for i in 0..len {
+    for (i, mask_val) in mask.iter_mut().enumerate() {
         if !array.is_null(i) {
             let v = array.value(i);
-            mask[i] = v >= start && v <= end;
+            *mask_val = v >= start && v <= end;
         }
     }
     BooleanArray::from(mask)

@@ -17,6 +17,7 @@ use crate::storage::contract_index::{
 };
 use crate::storage::{upload_sidecar_to_s3, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::defaults::raw_data as raw_data_defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 fn build_decoder_addresses(factory_data: &FactoryAddressData) -> HashMap<String, Vec<Address>> {
@@ -57,7 +58,9 @@ async fn forward_factory_outputs(
     let eth_calls_future = async {
         if let Some(ref tx) = eth_calls_factory_tx {
             let _ = tx
-                .send(FactoryMessage::IncrementalAddresses(Arc::clone(&factory_data)))
+                .send(FactoryMessage::IncrementalAddresses(Arc::clone(
+                    &factory_data,
+                )))
                 .await;
             let _ = tx
                 .send(FactoryMessage::RangeComplete {
@@ -144,7 +147,10 @@ pub async fn collect_factories(
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<(), FactoryCollectionError> {
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8).max(1);
+    let factory_concurrency = raw_data_config
+        .factory_concurrency
+        .unwrap_or(raw_data_defaults::FACTORY_CONCURRENCY)
+        .max(1);
     let max_pending = raw_data_config
         .max_pending_log_ranges
         .unwrap_or(crate::types::config::defaults::raw_data::MAX_PENDING_LOG_RANGES);

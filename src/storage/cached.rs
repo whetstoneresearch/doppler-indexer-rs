@@ -231,7 +231,7 @@ impl CachedBackend {
                     .iter()
                     .map(|(k, e)| (k.clone(), e.clone()))
                     .collect();
-                candidates.sort_by(|a, b| a.1.last_access.cmp(&b.1.last_access));
+                candidates.sort_by_key(|a| a.1.last_access);
                 candidates
             };
 
@@ -289,7 +289,7 @@ impl CachedBackend {
                 .iter()
                 .map(|(k, e)| (k.clone(), e.clone()))
                 .collect();
-            candidates.sort_by(|a, b| a.1.last_access.cmp(&b.1.last_access));
+            candidates.sort_by_key(|a| a.1.last_access);
             candidates
         };
 

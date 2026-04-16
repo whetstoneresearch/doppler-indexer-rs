@@ -626,13 +626,28 @@ mod tests {
 
         // Check flattened fields
         assert_eq!(parsed.flattened_fields.len(), 9);
-        assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "key.currency0");
-        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "key.currency1");
+        assert_eq!(
+            parsed.flattened_fields[0].full_name.as_ref(),
+            "key.currency0"
+        );
+        assert_eq!(
+            parsed.flattened_fields[1].full_name.as_ref(),
+            "key.currency1"
+        );
         assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "key.fee");
-        assert_eq!(parsed.flattened_fields[3].full_name.as_ref(), "key.tickSpacing");
+        assert_eq!(
+            parsed.flattened_fields[3].full_name.as_ref(),
+            "key.tickSpacing"
+        );
         assert_eq!(parsed.flattened_fields[4].full_name.as_ref(), "key.hooks");
-        assert_eq!(parsed.flattened_fields[5].full_name.as_ref(), "params.tickLower");
-        assert_eq!(parsed.flattened_fields[6].full_name.as_ref(), "params.tickUpper");
+        assert_eq!(
+            parsed.flattened_fields[5].full_name.as_ref(),
+            "params.tickLower"
+        );
+        assert_eq!(
+            parsed.flattened_fields[6].full_name.as_ref(),
+            "params.tickUpper"
+        );
         assert_eq!(
             parsed.flattened_fields[7].full_name.as_ref(),
             "params.liquidityDelta"
@@ -661,7 +676,10 @@ mod tests {
         assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "sender");
         assert!(!parsed.flattened_fields[0]._isindexed_tuple_hash);
 
-        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "poolKey.hash");
+        assert_eq!(
+            parsed.flattened_fields[1].full_name.as_ref(),
+            "poolKey.hash"
+        );
         assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
         assert!(parsed.flattened_fields[1].from_indexed);
 
@@ -705,10 +723,16 @@ mod tests {
         // sender, poolKey.hash, poolId, params.zeroForOne, params.amountSpecified, params.sqrtPriceLimitX96, amount0, amount1, hookData
         assert_eq!(parsed.flattened_fields.len(), 9);
         assert_eq!(parsed.flattened_fields[0].full_name.as_ref(), "sender");
-        assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "poolKey.hash");
+        assert_eq!(
+            parsed.flattened_fields[1].full_name.as_ref(),
+            "poolKey.hash"
+        );
         assert!(parsed.flattened_fields[1]._isindexed_tuple_hash);
         assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "poolId");
-        assert_eq!(parsed.flattened_fields[3].full_name.as_ref(), "params.zeroForOne");
+        assert_eq!(
+            parsed.flattened_fields[3].full_name.as_ref(),
+            "params.zeroForOne"
+        );
         assert_eq!(
             parsed.flattened_fields[4].full_name.as_ref(),
             "params.amountSpecified"
@@ -734,7 +758,10 @@ mod tests {
         assert_eq!(parsed.flattened_fields[1].full_name.as_ref(), "sender");
         assert_eq!(parsed.flattened_fields[2].full_name.as_ref(), "amount0");
         assert_eq!(parsed.flattened_fields[3].full_name.as_ref(), "amount1");
-        assert_eq!(parsed.flattened_fields[4].full_name.as_ref(), "sqrtPriceX96");
+        assert_eq!(
+            parsed.flattened_fields[4].full_name.as_ref(),
+            "sqrtPriceX96"
+        );
         assert_eq!(parsed.flattened_fields[5].full_name.as_ref(), "liquidity");
         assert_eq!(parsed.flattened_fields[6].full_name.as_ref(), "tick");
         assert_eq!(parsed.flattened_fields[7].full_name.as_ref(), "fee");

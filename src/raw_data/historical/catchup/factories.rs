@@ -22,6 +22,7 @@ use crate::storage::contract_index::{
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::defaults::raw_data as raw_data_defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
 /// Streaming send of `IncrementalAddresses` + `RangeComplete` for one
@@ -99,6 +100,51 @@ async fn send_factory_all_complete(tx: &Option<Sender<FactoryMessage>>) {
     }
 }
 
+fn active_factory_contracts_for_range(
+    chain: &ChainConfig,
+    factory_collection_names: &HashSet<String>,
+    range_end_exclusive: u64,
+) -> HashMap<String, ExpectedContracts> {
+    build_expected_factory_contracts_for_range(&chain.contracts, range_end_exclusive)
+        .into_iter()
+        .filter(|(collection, expected)| {
+            factory_collection_names.contains(collection) && !expected.is_empty()
+        })
+        .collect()
+}
+
+fn range_complete_for_active_collections(
+    range_start: u64,
+    range_end_exclusive: u64,
+    active_expected: &HashMap<String, ExpectedContracts>,
+    existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
+    contract_indexes: &HashMap<String, ContractIndex>,
+) -> bool {
+    let rk = range_key(range_start, range_end_exclusive - 1);
+
+    active_expected.iter().all(|(collection, expected)| {
+        let rel_path = format!(
+            "{}/{}-{}.parquet",
+            collection,
+            range_start,
+            range_end_exclusive - 1
+        );
+        let file_exists = existing_files.contains(&rel_path)
+            || s3_manifest
+                .is_some_and(|m| m.has_factories(collection, range_start, range_end_exclusive - 1));
+        if !file_exists {
+            return false;
+        }
+
+        let index = contract_indexes
+            .get(collection)
+            .cloned()
+            .unwrap_or_default();
+        get_missing_contracts(&index, &rk, expected).is_empty()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub async fn collect_factories(
@@ -111,12 +157,23 @@ pub async fn collect_factories(
     recollect_tx: &Option<Sender<RecollectRequest>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
+    repair_all: bool,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
     let output_dir = factories_dir_path(&chain.name);
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    let existing_factory_data =
-        load_factory_addresses_from_parquet_async(output_dir.clone()).await?;
+    if repair_all {
+        tracing::info!(
+            "Factory repair-all mode enabled for chain {}: rebuilding factory ranges from raw logs",
+            chain.name
+        );
+    }
+
+    let existing_factory_data = if repair_all {
+        Vec::new()
+    } else {
+        load_factory_addresses_from_parquet_async(output_dir.clone()).await?
+    };
     if !existing_factory_data.is_empty() {
         tracing::info!(
             "Loaded {} existing factory ranges from parquet for chain {}",
@@ -218,7 +275,9 @@ pub async fn collect_factories(
         contract_indexes.insert(collection.clone(), idx);
     }
 
-    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8);
+    let factory_concurrency = raw_data_config
+        .factory_concurrency
+        .unwrap_or(raw_data_defaults::FACTORY_CONCURRENCY);
 
     // =========================================================================
     // Migration: build contract_index.json from existing data if missing
@@ -227,7 +286,7 @@ pub async fn collect_factories(
         .iter()
         .any(|c| contract_indexes.get(c).is_none_or(|idx| idx.is_empty()));
 
-    if needs_migration {
+    if needs_migration && !repair_all {
         tracing::info!(
             "Contract index migration: scanning log files to build index for existing factory ranges"
         );
@@ -396,40 +455,27 @@ pub async fn collect_factories(
             Result<Option<(u64, u64, FactoryAddressData)>, FactoryCollectionError>,
         > = JoinSet::new();
 
-        for log_range in &log_ranges {
-            let rk = range_key(log_range.start, log_range.end - 1);
+        for log_range in log_ranges
+            .iter()
+            .filter(|lr| chain.range_in_scope(lr.start, lr.end))
+        {
+            let active_expected =
+                active_factory_contracts_for_range(chain, &factory_collection_names, log_range.end);
 
-            let range_complete = factory_collection_names.iter().all(|collection| {
-                let rel_path = format!(
-                    "{}/{}-{}.parquet",
-                    collection,
+            if active_expected.is_empty() {
+                continue;
+            }
+
+            if !repair_all
+                && range_complete_for_active_collections(
                     log_range.start,
-                    log_range.end - 1
-                );
-                let file_exists = existing_files.contains(&rel_path)
-                    || s3_manifest.as_ref().as_ref().is_some_and(|m| {
-                        m.has_factories(collection, log_range.start, log_range.end - 1)
-                    });
-
-                if !file_exists {
-                    return false;
-                }
-
-                // File exists — check contract index for missing contracts
-                let expected_for_range =
-                    build_expected_factory_contracts_for_range(&chain.contracts, log_range.end);
-                if let Some(expected) = expected_for_range.get(collection) {
-                    let index = contract_indexes
-                        .get(collection)
-                        .cloned()
-                        .unwrap_or_default();
-                    get_missing_contracts(&index, &rk, expected).is_empty()
-                } else {
-                    true
-                }
-            });
-
-            if range_complete {
+                    log_range.end,
+                    &active_expected,
+                    existing_files.as_ref(),
+                    s3_manifest.as_ref().as_ref(),
+                    &contract_indexes,
+                )
+            {
                 continue;
             }
 
@@ -677,4 +723,101 @@ pub async fn collect_factories(
         storage_manager,
         chain_name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::contract_index::ContractIndex;
+    use crate::types::config::chain::RpcConfig;
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, Contracts, FactoryCollections, FactoryConfig,
+        FactoryEventConfig, FactoryParameterLocation,
+    };
+    use crate::types::config::generic::SingleOrMultiple;
+    use alloy_primitives::{Address, U256};
+    use std::collections::{HashMap, HashSet};
+
+    fn sample_chain(start_block: Option<u64>) -> ChainConfig {
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "Initializer".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::from([0x11; 20])),
+                start_block: start_block.map(U256::from),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "DERC20".to_string(),
+                    factory_events: SingleOrMultiple::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Topic(1),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            from_block: None,
+            to_block: None,
+            contracts,
+            block_receipts_method: None,
+            factory_collections: FactoryCollections::new(),
+            rpc: RpcConfig::default(),
+        }
+    }
+
+    #[test]
+    fn active_factory_contracts_for_range_skips_pre_start_ranges() {
+        let chain = sample_chain(Some(500));
+        let collections = HashSet::from([String::from("DERC20")]);
+
+        assert!(active_factory_contracts_for_range(&chain, &collections, 500).is_empty());
+
+        let active = active_factory_contracts_for_range(&chain, &collections, 501);
+        assert_eq!(
+            active.get("DERC20").and_then(|c| c.get("Initializer")),
+            Some(&vec![String::from(
+                "0x1111111111111111111111111111111111111111"
+            )])
+        );
+    }
+
+    #[test]
+    fn range_complete_for_active_collections_requires_file_and_index() {
+        let chain = sample_chain(Some(500));
+        let collections = HashSet::from([String::from("DERC20")]);
+        let active = active_factory_contracts_for_range(&chain, &collections, 501);
+
+        assert!(!range_complete_for_active_collections(
+            0,
+            501,
+            &active,
+            &HashSet::new(),
+            None,
+            &HashMap::new(),
+        ));
+
+        let mut files = HashSet::new();
+        files.insert(String::from("DERC20/0-500.parquet"));
+
+        let mut range_index = ContractIndex::new();
+        range_index.insert(String::from("0-500"), active.get("DERC20").unwrap().clone());
+
+        let mut indexes = HashMap::new();
+        indexes.insert(String::from("DERC20"), range_index);
+
+        assert!(range_complete_for_active_collections(
+            0, 501, &active, &files, None, &indexes,
+        ));
+    }
 }

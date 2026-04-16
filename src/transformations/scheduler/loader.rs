@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use super::dag::WorkItem;
 use crate::db::DbPool;
+use crate::metrics::record_chain_head_block;
 use crate::rpc::UnifiedRpcClient;
 use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use crate::transformations::engine::HandlerKind;
@@ -292,6 +293,9 @@ pub(crate) struct CatchupPayload {
 
 /// Shared state needed to execute one [`WorkItem`] during catchup.
 ///
+type ReceiptCache =
+    tokio::sync::RwLock<HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>>;
+
 /// Constructed once per `run_handler_catchup` invocation and shared via `Arc`
 /// across all spawned tasks inside [`DagScheduler::execute`].
 pub(crate) struct CatchupLoader {
@@ -307,9 +311,7 @@ pub(crate) struct CatchupLoader {
     pub finalizer: Arc<RangeFinalizer>,
     /// Cache of receipt address maps keyed by (range_start, range_end).
     /// Multiple event handlers processing the same range share one Arc'd HashMap.
-    pub receipt_cache: tokio::sync::RwLock<
-        HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>,
-    >,
+    pub receipt_cache: ReceiptCache,
 }
 
 impl CatchupLoader {
@@ -325,6 +327,8 @@ impl CatchupLoader {
     pub(crate) async fn run(&self, item: WorkItem) -> Result<(), TransformationError> {
         let range_start = item.range_start;
         let range_end = item.range_end;
+
+        record_chain_head_block(&self.chain_name, range_end);
 
         let payload = item
             .payload
@@ -428,9 +432,8 @@ impl CatchupLoader {
             return cached.clone();
         }
 
-        let addresses = Arc::new(
-            read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await,
-        );
+        let addresses =
+            Arc::new(read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await);
         cache.insert(key, addresses.clone());
         addresses
     }

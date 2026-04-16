@@ -23,7 +23,6 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 /// Metadata for a single pool needed by metrics handlers.
 #[derive(Debug, Clone)]
 pub struct PoolMetadata {
-    pub base_token: [u8; 20],
     pub quote_token: [u8; 20],
     pub is_token_0: bool,
     pub base_decimals: u8,
@@ -102,19 +101,16 @@ impl PoolMetadataCache {
 
         for row in &rows {
             let pool_id: Vec<u8> = row.get("address");
-            let base_token_bytes: Vec<u8> = row.get("base_token");
             let quote_token_bytes: Vec<u8> = row.get("quote_token");
             let is_token_0: bool = row.get("is_token_0");
             let total_supply =
                 parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
 
-            if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
+            if quote_token_bytes.len() != 20 {
                 continue;
             }
 
-            let mut base_token = [0u8; 20];
             let mut quote_token = [0u8; 20];
-            base_token.copy_from_slice(&base_token_bytes);
             quote_token.copy_from_slice(&quote_token_bytes);
 
             let base_decimals = 18u8; // all launched tokens are 18 decimals
@@ -123,7 +119,6 @@ impl PoolMetadataCache {
             map.insert(
                 pool_id,
                 Arc::new(PoolMetadata {
-                    base_token,
                     quote_token,
                     is_token_0,
                     base_decimals,
@@ -255,23 +250,19 @@ impl PoolMetadataCache {
                 continue;
             }
 
-            let base_token_bytes: Vec<u8> = row.get("base_token");
             let quote_token_bytes: Vec<u8> = row.get("quote_token");
             let is_token_0: bool = row.get("is_token_0");
 
-            if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
+            if quote_token_bytes.len() != 20 {
                 continue;
             }
 
-            let mut base_token = [0u8; 20];
             let mut quote_token = [0u8; 20];
-            base_token.copy_from_slice(&base_token_bytes);
             quote_token.copy_from_slice(&quote_token_bytes);
 
             inner.insert(
                 pool_id,
                 Arc::new(PoolMetadata {
-                    base_token,
                     quote_token,
                     is_token_0,
                     base_decimals: 18,
