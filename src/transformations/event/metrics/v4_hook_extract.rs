@@ -414,14 +414,8 @@ mod tests {
         let tick_spacing = 60i32;
 
         let mut params = HashMap::new();
-        params.insert(
-            Arc::from("key.currency0"),
-            DecodedValue::Address(currency0),
-        );
-        params.insert(
-            Arc::from("key.currency1"),
-            DecodedValue::Address(currency1),
-        );
+        params.insert(Arc::from("key.currency0"), DecodedValue::Address(currency0));
+        params.insert(Arc::from("key.currency1"), DecodedValue::Address(currency1));
         params.insert(Arc::from("key.fee"), DecodedValue::Uint32(fee));
         params.insert(
             Arc::from("key.tickSpacing"),

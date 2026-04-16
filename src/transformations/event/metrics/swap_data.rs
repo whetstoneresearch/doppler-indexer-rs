@@ -311,7 +311,10 @@ WHERE pool_state.chain_id = :chain_id
                 "block_number".to_string(),
                 DbValue::Int64(block_number as i64),
             ),
-            ("source".to_string(), DbValue::VarChar(handler_name.to_string())),
+            (
+                "source".to_string(),
+                DbValue::VarChar(handler_name.to_string()),
+            ),
             (
                 "source_version".to_string(),
                 DbValue::Int32(source_version as i32),

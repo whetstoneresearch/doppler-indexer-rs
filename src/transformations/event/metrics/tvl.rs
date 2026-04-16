@@ -364,19 +364,45 @@ DO UPDATE SET
     DbOperation::NamedSql {
         template: template.to_string(),
         params: vec![
-            ("chain_id".into(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
+            (
+                "chain_id".into(),
+                DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
+            ),
             ("pool_id".into(), DbValue::Bytes(pool_id.to_vec())),
-            ("block_number".into(), DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64"))),
-            ("block_timestamp".into(), DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64"))),
-            ("active_liquidity".into(), DbValue::Numeric(active_liquidity.to_string())),
+            (
+                "block_number".into(),
+                DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
+            ),
+            (
+                "block_timestamp".into(),
+                DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64")),
+            ),
+            (
+                "active_liquidity".into(),
+                DbValue::Numeric(active_liquidity.to_string()),
+            ),
             ("amount0".into(), DbValue::Numeric(amount0.to_string())),
             ("amount1".into(), DbValue::Numeric(amount1.to_string())),
             ("tvl_usd".into(), optional_decimal_value(tvl_usd)),
-            ("market_cap_usd".into(), optional_decimal_value(market_cap_usd)),
-            ("active_liquidity_usd".into(), optional_decimal_value(active_liquidity_usd)),
+            (
+                "market_cap_usd".into(),
+                optional_decimal_value(market_cap_usd),
+            ),
+            (
+                "active_liquidity_usd".into(),
+                optional_decimal_value(active_liquidity_usd),
+            ),
             ("source".into(), DbValue::VarChar(target_source.to_string())),
-            ("source_version".into(), DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32"))),
-            ("bootstrap_price".into(), optional_decimal_value(bootstrap_seed.map(|seed| &seed.price))),
+            (
+                "source_version".into(),
+                DbValue::Int32(
+                    i32::try_from(target_source_version).expect("source_version fits i32"),
+                ),
+            ),
+            (
+                "bootstrap_price".into(),
+                optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
+            ),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_snapshots".to_string(),
@@ -521,15 +547,26 @@ SELECT
 FROM state_seed
 CROSS JOIN LATERAL (
   SELECT
-    COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
-    COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h,
+    agg.vol_24h,
+    agg.swaps_24h,
     CASE WHEN h1h.price_close IS NOT NULL AND h1h.price_close != 0
          THEN (state_seed.price - h1h.price_close) / h1h.price_close
     END AS pc_1h,
     CASE WHEN h24h.price_close IS NOT NULL AND h24h.price_close != 0
          THEN (state_seed.price - h24h.price_close) / h24h.price_close
     END AS pc_24h
-  FROM pool_snapshots s
+  FROM (
+    SELECT
+      COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
+      COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h
+    FROM pool_snapshots s
+    WHERE s.chain_id = :chain_id
+      AND s.pool_id = :pool_id
+      AND s.block_timestamp > (:block_timestamp - 86400)
+      AND s.block_timestamp <= :block_timestamp
+      AND s.source = :source
+      AND s.source_version = :source_version
+  ) agg
   LEFT JOIN LATERAL (
     SELECT price_close
     FROM pool_snapshots
@@ -552,12 +589,6 @@ CROSS JOIN LATERAL (
     ORDER BY block_timestamp DESC, block_number DESC
     LIMIT 1
   ) h24h ON true
-  WHERE s.chain_id = :chain_id
-    AND s.pool_id = :pool_id
-    AND s.block_timestamp > (:block_timestamp - 86400)
-    AND s.block_timestamp <= :block_timestamp
-    AND s.source = :source
-    AND s.source_version = :source_version
 ) AS rolling
 ON CONFLICT (chain_id, pool_id, source, source_version)
 DO UPDATE SET
@@ -583,25 +614,57 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
     DbOperation::NamedSql {
         template: template.to_string(),
         params: vec![
-            ("chain_id".into(), DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64"))),
+            (
+                "chain_id".into(),
+                DbValue::Int64(i64::try_from(chain_id).expect("chain_id fits i64")),
+            ),
             ("pool_id".into(), DbValue::Bytes(pool_id.to_vec())),
-            ("block_number".into(), DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64"))),
-            ("block_timestamp".into(), DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64"))),
-            ("active_liquidity".into(), DbValue::Numeric(active_liquidity.to_string())),
+            (
+                "block_number".into(),
+                DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
+            ),
+            (
+                "block_timestamp".into(),
+                DbValue::Int64(i64::try_from(block_timestamp).expect("block_timestamp fits i64")),
+            ),
+            (
+                "active_liquidity".into(),
+                DbValue::Numeric(active_liquidity.to_string()),
+            ),
             ("amount0".into(), DbValue::Numeric(amount0.to_string())),
             ("amount1".into(), DbValue::Numeric(amount1.to_string())),
             ("tvl_usd".into(), optional_decimal_value(tvl_usd)),
-            ("market_cap_usd".into(), optional_decimal_value(market_cap_usd)),
-            ("active_liquidity_usd".into(), optional_decimal_value(active_liquidity_usd)),
+            (
+                "market_cap_usd".into(),
+                optional_decimal_value(market_cap_usd),
+            ),
+            (
+                "active_liquidity_usd".into(),
+                optional_decimal_value(active_liquidity_usd),
+            ),
             ("total_supply".into(), optional_u256_value(total_supply)),
             ("source".into(), DbValue::VarChar(target_source.to_string())),
-            ("source_version".into(), DbValue::Int32(i32::try_from(target_source_version).expect("source_version fits i32"))),
-            ("bootstrap_tick".into(), optional_i32_value(bootstrap_seed.map(|seed| seed.tick))),
-            ("bootstrap_sqrt_price".into(), match bootstrap_seed {
-                Some(seed) => DbValue::Numeric(seed.sqrt_price_x96.to_string()),
-                None => DbValue::Null,
-            }),
-            ("bootstrap_price".into(), optional_decimal_value(bootstrap_seed.map(|seed| &seed.price))),
+            (
+                "source_version".into(),
+                DbValue::Int32(
+                    i32::try_from(target_source_version).expect("source_version fits i32"),
+                ),
+            ),
+            (
+                "bootstrap_tick".into(),
+                optional_i32_value(bootstrap_seed.map(|seed| seed.tick)),
+            ),
+            (
+                "bootstrap_sqrt_price".into(),
+                match bootstrap_seed {
+                    Some(seed) => DbValue::Numeric(seed.sqrt_price_x96.to_string()),
+                    None => DbValue::Null,
+                },
+            ),
+            (
+                "bootstrap_price".into(),
+                optional_decimal_value(bootstrap_seed.map(|seed| &seed.price)),
+            ),
         ],
         snapshot: Some(DbSnapshot {
             table: "pool_state".to_string(),
@@ -1270,11 +1333,16 @@ mod tests {
                 assert!(template.contains("WITH prev AS"));
                 assert!(template.contains(":bootstrap_tick::integer"));
                 assert!(template.contains("CROSS JOIN LATERAL"));
-                assert!(template.contains("COALESCE(SUM(s.volume_usd), 0) AS vol_24h"));
+                assert!(template.contains("agg.vol_24h"));
+                assert!(template.contains(
+                    "FROM (\n    SELECT\n      COALESCE(SUM(s.volume_usd), 0) AS vol_24h"
+                ));
                 assert!(template.contains("s.block_timestamp <= :block_timestamp"));
                 assert!(!template.contains("prev.volume_24h_usd"));
                 assert!(!template.contains("prev.price_change_1h"));
-                assert!(template.contains("ON CONFLICT (chain_id, pool_id, source, source_version)"));
+                assert!(
+                    template.contains("ON CONFLICT (chain_id, pool_id, source, source_version)")
+                );
                 assert!(template.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
                 assert!(template.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
                 assert_eq!(params.len(), 16);
@@ -1580,7 +1648,8 @@ mod tests {
                     "expected source=:source in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
                     source_filter_count
                 );
-                let version_filter_count = template.matches("source_version = :source_version").count();
+                let version_filter_count =
+                    template.matches("source_version = :source_version").count();
                 assert!(
                     version_filter_count >= 5,
                     "expected source_version=:source_version in prev + newer + h1h + h24h + outer lateral, found {} occurrences",
