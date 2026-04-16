@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -25,18 +24,10 @@ use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManage
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
-/// Best-effort streaming send of `IncrementalAddresses` + `RangeComplete`.
-///
-/// Uses `try_send` rather than `send().await` because during catchup the
-/// consumer (`collect_eth_calls` in catchup/eth_calls.rs) is still waiting
-/// on `factory_catchup_done_rx` and isn't draining this channel. Filling
-/// it would deadlock. Dropped messages are safe: the post-barrier path
-/// loads the same factory data from parquet, and any messages that do
-/// make it into the buffer are consumed (idempotently) by the current
-/// phase's `handle_factory_message` after the barrier releases.
-///
-/// Follow-up commits that convert the consumer to a streaming select! loop
-/// will switch this back to `send().await` for proper back-pressure.
+/// Streaming send of `IncrementalAddresses` + `RangeComplete` for one
+/// finalized range. Uses `send().await` so a slow consumer back-pressures
+/// the producer (safe now that `collect_eth_calls` drains factory_rx
+/// concurrently — see catchup/eth_calls.rs).
 async fn send_factory_range_to_eth_calls(
     tx: &Option<Sender<FactoryMessage>>,
     factory_data: &Arc<FactoryAddressData>,
@@ -46,59 +37,33 @@ async fn send_factory_range_to_eth_calls(
     };
     let range_start = factory_data.range_start;
     let range_end = factory_data.range_end;
-    try_send_factory(
-        tx,
-        FactoryMessage::IncrementalAddresses(Arc::clone(factory_data)),
-        range_start,
-        range_end,
-        "IncrementalAddresses",
-    );
-    try_send_factory(
-        tx,
-        FactoryMessage::RangeComplete {
+    if tx
+        .send(FactoryMessage::IncrementalAddresses(Arc::clone(factory_data)))
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "eth_calls_factory_tx (IncrementalAddresses {}-{}) - receiver dropped",
+            range_start, range_end
+        )));
+    }
+    if tx
+        .send(FactoryMessage::RangeComplete {
             range_start,
             range_end,
-        },
-        range_start,
-        range_end,
-        "RangeComplete",
-    );
+        })
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "eth_calls_factory_tx (RangeComplete {}-{}) - receiver dropped",
+            range_start, range_end
+        )));
+    }
     Ok(())
 }
 
-fn try_send_factory(
-    tx: &Sender<FactoryMessage>,
-    msg: FactoryMessage,
-    range_start: u64,
-    range_end: u64,
-    label: &str,
-) {
-    use tokio::sync::mpsc::error::TrySendError;
-    match tx.try_send(msg) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            tracing::debug!(
-                "eth_calls_factory_tx full, dropping streamed {} for range {}-{} (post-barrier disk-load will cover)",
-                label,
-                range_start,
-                range_end
-            );
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "eth_calls_factory_tx closed, dropping streamed {} for range {}-{}",
-                label,
-                range_start,
-                range_end
-            );
-        }
-    }
-}
-
-/// Best-effort `DecoderMessage::FactoryAddresses` send.
-///
-/// See `send_factory_range_to_eth_calls` for rationale — this is also a
-/// no-op during the interim commit and will be tightened later.
+/// Send `DecoderMessage::FactoryAddresses` for a finalized range.
 async fn send_factory_addresses_to_decoder(
     tx: &Option<Sender<DecoderMessage>>,
     label: &str,
@@ -109,38 +74,28 @@ async fn send_factory_addresses_to_decoder(
     let Some(tx) = tx else {
         return Ok(());
     };
-    use tokio::sync::mpsc::error::TrySendError;
-    match tx.try_send(DecoderMessage::FactoryAddresses {
-        range_start,
-        range_end,
-        addresses,
-    }) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => {
-            tracing::debug!(
-                "{} full, dropping streamed FactoryAddresses for range {}-{}",
-                label,
-                range_start,
-                range_end
-            );
-            Ok(())
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::debug!(
-                "{} closed, dropping streamed FactoryAddresses for range {}-{}",
-                label,
-                range_start,
-                range_end
-            );
-            Ok(())
-        }
+    if tx
+        .send(DecoderMessage::FactoryAddresses {
+            range_start,
+            range_end,
+            addresses,
+        })
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "{} {}-{}) - receiver dropped",
+            label, range_start, range_end
+        )));
     }
+    Ok(())
 }
 
-/// Best-effort `AllComplete` send. Dropped if the channel is full or closed.
+/// Best-effort `AllComplete` send. We tolerate a closed channel because in
+/// catch-up-only mode the eth_calls catchup may have already exited.
 async fn send_factory_all_complete(tx: &Option<Sender<FactoryMessage>>) {
     if let Some(tx) = tx {
-        let _ = tx.try_send(FactoryMessage::AllComplete);
+        let _ = tx.send(FactoryMessage::AllComplete).await;
     }
 }
 
@@ -154,7 +109,6 @@ pub async fn collect_factories(
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
     call_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
-    factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
@@ -229,10 +183,6 @@ pub async fn collect_factories(
         );
 
         send_factory_all_complete(eth_calls_factory_tx).await;
-
-        if let Some(tx) = factory_catchup_done_tx {
-            let _ = tx.send(());
-        }
 
         return Ok(FactoryCatchupState {
             matchers: Arc::new(matchers),
@@ -713,10 +663,6 @@ pub async fn collect_factories(
     }
 
     send_factory_all_complete(eth_calls_factory_tx).await;
-
-    if let Some(tx) = factory_catchup_done_tx {
-        let _ = tx.send(());
-    }
 
     // Extract from Arc - at this point all tasks are done so we're the only owner
     let s3_manifest = Arc::try_unwrap(s3_manifest).unwrap_or_else(|arc| (*arc).clone());

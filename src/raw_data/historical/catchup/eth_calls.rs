@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
-use tokio::sync::oneshot;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
@@ -20,7 +19,9 @@ use crate::raw_data::historical::eth_calls::{
     EthCallCatchupState, EthCallCollectionError, EthCallContext, EventCallKey,
     EventTriggeredCallConfig, ExistingLogRange, FrequencyState, OnceCallConfig,
 };
-use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
+use crate::raw_data::historical::factories::{
+    get_factory_call_configs, FactoryAddressData, FactoryMessage,
+};
 use crate::types::config::defaults;
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers_from_batches, EventTriggerData,
@@ -31,11 +32,8 @@ use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
     read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
-use crate::storage::factory_data::{
-    load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
-};
 use crate::storage::parquet_readers::read_event_call_row_keys_from_parquet;
-use crate::storage::paths::{factories_dir as factories_dir_path, raw_eth_calls_dir};
+use crate::storage::paths::raw_eth_calls_dir;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
@@ -623,11 +621,11 @@ pub async fn collect_eth_calls(
     repair_scope: Option<RepairScope>,
     has_factory_rx: bool,
     has_event_trigger_rx: bool,
-    factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
+    mut factory_rx: Option<tokio::sync::mpsc::Receiver<crate::raw_data::historical::factories::FactoryMessage>>,
     decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
-) -> Result<EthCallCatchupState, EthCallCollectionError> {
+) -> Result<(EthCallCatchupState, Option<tokio::sync::mpsc::Receiver<crate::raw_data::historical::factories::FactoryMessage>>), EthCallCollectionError> {
     let base_output_dir = raw_eth_calls_dir(&chain.name);
     tokio::fs::create_dir_all(&base_output_dir).await?;
     let repair_scope = repair.then_some(repair_scope.as_ref()).flatten();
@@ -689,7 +687,7 @@ pub async fn collect_eth_calls(
         && !has_event_triggered_calls
     {
         tracing::info!("No eth_calls configured for chain {}", chain.name);
-        return Ok(EthCallCatchupState {
+        let state = EthCallCatchupState {
             base_output_dir,
             range_size,
             rpc_batch_size,
@@ -719,7 +717,8 @@ pub async fn collect_eth_calls(
             range_factory_done: HashSet::new(),
             factory_skipped_triggers: Vec::new(),
             contracts: chain.contracts.clone(),
-        });
+        };
+        return Ok((state, factory_rx));
     }
 
     // Track known factory addresses for filtering event triggers
@@ -753,7 +752,6 @@ pub async fn collect_eth_calls(
 
     let existing_files = scan_existing_parquet_files_async(base_output_dir.clone()).await;
 
-    let range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
     let mut range_regular_done: HashSet<u64> = HashSet::new();
     let range_factory_done: HashSet<u64> = HashSet::new();
 
@@ -1050,172 +1048,197 @@ pub async fn collect_eth_calls(
     }
 
     // =========================================================================
-    // Wait for factory catchup before factory-dependent catchup phases
+    // Factory stream drain + Phase B (factory-once) per-range processing.
+    //
+    // Replaces the former `factory_catchup_done_rx.await` barrier followed by a
+    // sequential disk-load + per-range loop. We now consume `factory_rx` message
+    // by message:
+    //   * `IncrementalAddresses` → merge into `factory_addresses` (for Phase C
+    //     event-trigger filtering) and `range_factory_data` (per-range).
+    //   * `RangeComplete { range_start, range_end }` → factory catchup has
+    //     finished that range; run factory-once for it immediately (streaming),
+    //     and stamp the in-memory `factory_contract_indexes` with the expected
+    //     contracts for that range so Phase C sees the same readiness signal
+    //     the old on-disk sidecar provided.
+    //   * `AllComplete` (or channel close) → break out; factory catchup is
+    //     fully done, Phase C can run.
     // =========================================================================
-    if let Some(rx) = factory_catchup_done_rx {
-        tracing::info!(
-            "Waiting for factory catchup to complete before factory-dependent catchup..."
-        );
-        let _ = rx.await;
-        tracing::info!("Factory catchup complete, proceeding with factory-dependent catchup");
-    }
 
-    // =========================================================================
-    // Catchup phase for factory once calls: Check for missing columns in existing files
-    // =========================================================================
+    // Per-range factory address data, accumulated from IncrementalAddresses.
+    // Phase B uses this on each RangeComplete. Persisted into state so the
+    // current phase can continue updating it.
+    let mut range_factory_data: HashMap<u64, FactoryAddressData> = HashMap::new();
+
+    // In-memory mirror of the factory contract_index sidecars. Populated from
+    // the stream so Phase C's readiness check (`contains_key(&range_key)`)
+    // works without reading disk.
+    let mut factory_contract_indexes: HashMap<String, crate::storage::contract_index::ContractIndex> =
+        HashMap::new();
+
+    // Column indexes for factory-once directories (still loaded from disk;
+    // these describe column layouts, not range-readiness).
+    let mut factory_once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> =
+        HashMap::new();
     if catchup_has_factory_once_calls {
-        tracing::info!(
-            "Factory once calls catchup: checking {} factory collections for missing columns",
-            catchup_factory_once_configs.len()
-        );
-
-        // Read column indexes for all factory once directories (don't auto-build).
-        // Using read_once_column_index so we can detect when no index file exists
-        // and properly handle null-filling conditions.
-        let mut factory_once_column_indexes: HashMap<String, HashMap<String, Vec<String>>> =
-            HashMap::new();
         for collection_name in catchup_factory_once_configs.keys() {
             let once_dir = base_output_dir.join(collection_name).join("once");
             let index = read_once_column_index_async(once_dir).await;
             factory_once_column_indexes.insert(collection_name.clone(), index);
         }
+    }
 
-        // Load factory address data from existing parquet files
-        let collections_needed: HashSet<String> =
-            catchup_factory_once_configs.keys().cloned().collect();
-        let factory_catchup_data = load_factory_addresses_with_metadata(
-            &chain.name,
-            &collections_needed,
-            s3_manifest.as_ref(),
-            storage_manager.as_ref(),
-        )
-        .await;
+    let mut factory_once_catchup_count = 0usize;
 
-        if !factory_catchup_data.is_empty() {
-            let block_ranges =
-                get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned())
-                    .await;
-            let block_ranges: Vec<_> = block_ranges
-                .into_iter()
-                .filter(|br| chain.range_in_scope(br.start, br.end))
-                .collect();
-            let total_factory_ranges = block_ranges.len();
-            let mut factory_once_catchup_count = 0;
+    if let Some(ref mut rx) = factory_rx {
+        tracing::info!(
+            "Draining factory stream for chain {} (Phase B factory-once: {}, event-triggered readiness: {})",
+            chain.name,
+            catchup_has_factory_once_calls,
+            should_run_event_triggered_catchup(catchup_has_event_triggered_calls, repair, repair_only)
+        );
 
-            for (idx, block_range) in block_ranges.iter().enumerate() {
-                let range = BlockRange {
-                    start: block_range.start,
-                    end: block_range.end,
-                };
-
-                if let Some(scope) = repair_scope {
-                    if !scope.matches_range(range.start, range.end) {
-                        continue;
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                FactoryMessage::IncrementalAddresses(data) => {
+                    // Accumulate flat address set for event-trigger filtering.
+                    for addrs in data.addresses_by_block.values() {
+                        for (_, addr, coll) in addrs {
+                            factory_addresses
+                                .entry(coll.clone())
+                                .or_default()
+                                .insert(*addr);
+                        }
+                    }
+                    // Accumulate per-range data for factory-once processing.
+                    let range_start = data.range_start;
+                    let range_end = data.range_end;
+                    let entry = range_factory_data.entry(range_start).or_insert_with(|| {
+                        FactoryAddressData {
+                            range_start,
+                            range_end,
+                            addresses_by_block: HashMap::new(),
+                        }
+                    });
+                    for (block, addrs) in &data.addresses_by_block {
+                        entry
+                            .addresses_by_block
+                            .entry(*block)
+                            .or_default()
+                            .extend(addrs.iter().cloned());
                     }
                 }
+                FactoryMessage::RangeComplete {
+                    range_start,
+                    range_end,
+                } => {
+                    // Stamp in-memory contract indexes so Phase C's readiness
+                    // check (based on `contains_key(&range_key)`) passes. We
+                    // use `build_expected_factory_contracts_for_range` — the
+                    // same function factory catchup uses when it writes the
+                    // on-disk sidecar.
+                    let rk = range_key(range_start, range_end - 1);
+                    let expected =
+                        build_expected_factory_contracts_for_range(&chain.contracts, range_end);
+                    for (coll, entries) in &expected {
+                        let idx = factory_contract_indexes
+                            .entry(coll.clone())
+                            .or_default();
+                        update_contract_index(idx, &rk, entries);
+                    }
 
-                // Build FactoryAddressData for this range from loaded data
-                let mut addresses_by_block: HashMap<u64, Vec<(u64, Address, String)>> =
-                    HashMap::new();
-                for (collection_name, addr_data) in &factory_catchup_data {
-                    for (addr, block_num, timestamp) in addr_data {
-                        if *block_num >= range.start && *block_num < range.end {
-                            addresses_by_block.entry(*block_num).or_default().push((
-                                *timestamp,
-                                *addr,
-                                collection_name.clone(),
-                            ));
+                    // Phase B: run factory-once for this range now (streaming).
+                    if catchup_has_factory_once_calls {
+                        let run_phase_b = repair_scope
+                            .is_none_or(|scope| scope.matches_range(range_start, range_end));
+                        if run_phase_b {
+                            let data = range_factory_data.get(&range_start).cloned()
+                                .unwrap_or_else(|| FactoryAddressData {
+                                    range_start,
+                                    range_end,
+                                    addresses_by_block: HashMap::new(),
+                                });
+                            let range = BlockRange {
+                                start: range_start,
+                                end: range_end,
+                            };
+                            let factory_once_ctx = EthCallContext {
+                                client,
+                                output_dir: &base_output_dir,
+                                existing_files: &existing_files,
+                                rpc_batch_size,
+                                repair,
+                                decoder_tx: &decoder_tx,
+                                chain_name: &chain.name,
+                                storage_manager: storage_manager.as_ref(),
+                                s3_manifest: &s3_manifest,
+                            };
+                            process_factory_once_catchup_range(
+                                &range,
+                                data.addresses_by_block,
+                                &factory_once_ctx,
+                                &catchup_factory_once_configs,
+                                &factory_once_column_indexes,
+                                &chain.contracts,
+                            )
+                            .await?;
+                            factory_once_catchup_count += 1;
+                            tracing::debug!(
+                                "Factory once calls catchup: processed streaming range (blocks {}-{})",
+                                range_start,
+                                range_end - 1
+                            );
                         }
                     }
                 }
-
-                let factory_once_ctx = EthCallContext {
-                    client,
-                    output_dir: &base_output_dir,
-                    existing_files: &existing_files,
-                    rpc_batch_size,
-                    repair,
-                    decoder_tx: &decoder_tx,
-                    chain_name: &chain.name,
-                    storage_manager: storage_manager.as_ref(),
-                    s3_manifest: &s3_manifest,
-                };
-
-                process_factory_once_catchup_range(
-                    &range,
-                    addresses_by_block,
-                    &factory_once_ctx,
-                    &catchup_factory_once_configs,
-                    &factory_once_column_indexes,
-                    &chain.contracts,
-                )
-                .await?;
-
-                factory_once_catchup_count += 1;
-                tracing::debug!(
-                    "Factory once calls catchup: processed range {}/{} (blocks {}-{})",
-                    idx + 1,
-                    total_factory_ranges,
-                    range.start,
-                    range.end - 1
-                );
+                FactoryMessage::AllComplete => {
+                    break;
+                }
             }
-
-            if factory_once_catchup_count > 0 {
-                tracing::info!(
-                    "Factory once calls catchup complete: checked {} ranges for chain {}",
-                    factory_once_catchup_count,
-                    chain.name
-                );
-            } else {
-                tracing::info!(
-                    "Factory once calls catchup: all {} ranges already complete for chain {}",
-                    total_factory_ranges,
-                    chain.name
-                );
-            }
-        } else {
-            tracing::info!("Factory once calls catchup: no factory address data found, skipping");
         }
+
+        if catchup_has_factory_once_calls {
+            tracing::info!(
+                "Factory once calls catchup complete: processed {} ranges for chain {}",
+                factory_once_catchup_count,
+                chain.name
+            );
+        }
+    } else if catchup_has_factory_once_calls {
+        // No factory_rx (shouldn't normally happen if factories are configured),
+        // fall back to the original disk-load path.
+        tracing::warn!(
+            "catchup_has_factory_once_calls=true but no factory_rx; Phase B skipped"
+        );
     }
 
     // =========================================================================
     // Catchup phase for event-triggered calls: Read from existing log parquet files
     // =========================================================================
     if should_run_event_triggered_catchup(catchup_has_event_triggered_calls, repair, repair_only) {
-        // CRITICAL: Load historical factory addresses BEFORE processing event triggers
-        // This ensures we can properly filter events from factory-created contracts
+        // Factory addresses and contract-index readiness are populated from the
+        // factory_rx stream above (see Phase B/drain loop). No disk-load needed —
+        // the streaming producer (catchup/factories.rs) sends IncrementalAddresses
+        // + RangeComplete for every range (both pre-existing on-disk data and
+        // newly-processed ranges), so by the time we reach this point
+        // `factory_addresses` mirrors what `load_factory_addresses_by_collection`
+        // would have returned, and `factory_contract_indexes` mirrors the on-disk
+        // sidecars via `build_expected_factory_contracts_for_range` stamping.
         let factory_collections: HashSet<String> = catchup_event_call_configs
             .values()
             .flatten()
             .filter(|c| c.is_factory)
             .map(|c| c.contract_name.clone())
             .collect();
-        let historical_factory_addrs = load_factory_addresses_by_collection(
-            &chain.name,
-            &factory_collections,
-            s3_manifest.as_ref(),
-            storage_manager.as_ref(),
-        )
-        .await;
-        for (collection_name, addrs) in historical_factory_addrs {
-            tracing::info!(
-                "Loaded {} historical factory addresses for collection {}",
-                addrs.len(),
-                collection_name
-            );
-            factory_addresses
-                .entry(collection_name)
-                .or_default()
-                .extend(addrs);
-        }
 
-        let factories_dir = factories_dir_path(&chain.name);
-        let mut factory_contract_indexes = HashMap::new();
         for collection_name in &factory_collections {
-            factory_contract_indexes.insert(
-                collection_name.clone(),
-                read_contract_index(&factories_dir.join(collection_name)),
+            let count = factory_addresses
+                .get(collection_name)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            tracing::info!(
+                "Using {} streamed factory addresses for collection {}",
+                count,
+                collection_name
             );
         }
 
@@ -1439,7 +1462,7 @@ pub async fn collect_eth_calls(
         chain.name
     );
 
-    Ok(EthCallCatchupState {
+    let state = EthCallCatchupState {
         base_output_dir,
         range_size,
         rpc_batch_size,
@@ -1467,7 +1490,8 @@ pub async fn collect_eth_calls(
         range_factory_done,
         factory_skipped_triggers: Vec::new(),
         contracts: chain.contracts.clone(),
-    })
+    };
+    Ok((state, factory_rx))
 }
 
 #[cfg(test)]
