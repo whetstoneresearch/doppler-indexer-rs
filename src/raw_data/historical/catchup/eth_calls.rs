@@ -221,7 +221,7 @@ async fn read_raw_event_row_key_counts(output_path: PathBuf) -> Result<EventRowK
     tokio::task::spawn_blocking(move || {
         let keys =
             read_event_call_row_keys_from_parquet(&output_path).map_err(|e| e.to_string())?;
-        Ok::<_, String>(build_event_row_key_counts(keys.into_iter()))
+        Ok::<_, String>(build_event_row_key_counts(keys))
     })
     .await
     .map_err(|e| e.to_string())?

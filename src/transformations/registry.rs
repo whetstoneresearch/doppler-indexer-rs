@@ -96,6 +96,7 @@ impl TransformationRegistry {
     ///
     /// Only handlers whose trigger sources are ALL present in the set will
     /// be registered. Handlers with missing sources are silently skipped.
+    #[allow(dead_code)]
     pub fn with_source_filter(sources: HashSet<String>) -> Self {
         Self::with_scope(Some(sources), None)
     }

@@ -166,6 +166,7 @@ pub enum ChainSelector {
     /// Dependency applies on all chains.
     All,
     /// Dependency applies only on the listed chain IDs.
+    #[allow(dead_code)]
     Only(BTreeSet<u64>),
     /// Dependency applies on all chains except the listed chain IDs.
     Except(BTreeSet<u64>),
@@ -190,6 +191,7 @@ impl HandlerDependencySpec {
         self.name
     }
 
+    #[allow(dead_code)]
     pub fn only<I>(mut self, chain_ids: I) -> Self
     where
         I: IntoIterator<Item = u64>,
