@@ -16,9 +16,6 @@ use crate::storage::parquet_readers::{
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{DataLoader, S3Manifest, StorageManager};
 
-/// Factory addresses grouped by range_start and collection name.
-pub type FactoryAddressesByRange = HashMap<u64, HashMap<String, HashSet<[u8; 20]>>>;
-
 /// Scan a factories directory and return files grouped by collection name.
 ///
 /// Returns `HashMap<collection_name, Vec<PathBuf>>` where each collection is a
@@ -61,6 +58,45 @@ pub fn list_factory_parquet_files(factories_dir: &Path) -> HashMap<String, Vec<P
     }
 
     result
+}
+
+/// Load all historical factory addresses accumulated across every factory parquet
+/// file for the given chain.
+///
+/// Returns `HashMap<collection_name, HashSet<[u8; 20]>>`.
+pub fn load_accumulated_factory_addresses_from_parquet(
+    chain_name: &str,
+) -> Result<HashMap<String, HashSet<[u8; 20]>>, ParquetReadError> {
+    let mut result: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
+
+    let factories_dir = factories_dir_path(chain_name);
+    if !factories_dir.exists() {
+        return Ok(result);
+    }
+
+    let all_files = list_factory_parquet_files(&factories_dir);
+
+    for (collection_name, file_paths) in all_files {
+        for file_path in file_paths {
+            match read_factory_addresses_from_parquet(&file_path) {
+                Ok(addresses) => {
+                    result
+                        .entry(collection_name.clone())
+                        .or_default()
+                        .extend(addresses);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to read factory addresses from {}: {}",
+                        file_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Augment a set of files-to-process with S3 manifest factory ranges that aren't already local.
@@ -257,50 +293,4 @@ pub async fn load_factory_addresses_with_metadata(
     }
 
     result
-}
-
-/// Load factory addresses grouped by range_start and collection. Sync, local-only.
-///
-/// Replaces `decoding/catchup/logs.rs::load_factory_addresses_for_catchup`.
-/// Returns `HashMap<range_start, HashMap<collection_name, HashSet<[u8; 20]>>>`.
-pub fn load_factory_addresses_by_range(
-    chain_name: &str,
-) -> Result<FactoryAddressesByRange, ParquetReadError> {
-    let mut result: FactoryAddressesByRange = HashMap::new();
-
-    let factories_dir = factories_dir_path(chain_name);
-    if !factories_dir.exists() {
-        return Ok(result);
-    }
-
-    let all_files = list_factory_parquet_files(&factories_dir);
-
-    for (collection_name, file_paths) in all_files {
-        for file_path in file_paths {
-            // Parse range from filename
-            let file_name = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let range_str = file_name.strip_suffix(".parquet").unwrap_or("");
-            let parts: Vec<&str> = range_str.split('-').collect();
-            if parts.len() != 2 {
-                continue;
-            }
-
-            let range_start: u64 = match parts[0].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            // Read addresses from parquet
-            if let Ok(addresses) = read_factory_addresses_from_parquet(&file_path) {
-                result
-                    .entry(range_start)
-                    .or_default()
-                    .entry(collection_name.clone())
-                    .or_default()
-                    .extend(addresses);
-            }
-        }
-    }
-
-    Ok(result)
 }
