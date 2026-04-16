@@ -10,8 +10,8 @@ use super::traits::{
 
 /// SPL Token program ID: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
 const SPL_TOKEN_PROGRAM_ID: [u8; 32] = [
-    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133,
-    237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
 ];
 
 /// Hand-written `ProgramDecoder` for the SPL Token program.
@@ -119,10 +119,7 @@ fn read_coption_u64(data: &[u8], offset: usize) -> Result<DecodedValue, SolanaDe
 /// Extract named accounts from the accounts slice, returning only as many as
 /// names are provided. Extra accounts are silently ignored, and missing accounts
 /// leave the name out of the result.
-fn extract_named_accounts(
-    accounts: &[[u8; 32]],
-    names: &[&str],
-) -> HashMap<String, [u8; 32]> {
+fn extract_named_accounts(accounts: &[[u8; 32]], names: &[&str]) -> HashMap<String, [u8; 32]> {
     let mut map = HashMap::new();
     for (i, name) in names.iter().enumerate() {
         if let Some(pubkey) = accounts.get(i) {
@@ -419,15 +416,9 @@ mod tests {
 
         let fields = result.unwrap();
         assert_eq!(fields.instruction_name, "Transfer");
-        assert_eq!(
-            fields.args.get("amount"),
-            Some(&DecodedValue::Uint64(1000))
-        );
+        assert_eq!(fields.args.get("amount"), Some(&DecodedValue::Uint64(1000)));
         assert_eq!(fields.named_accounts.get("source"), Some(&[10u8; 32]));
-        assert_eq!(
-            fields.named_accounts.get("destination"),
-            Some(&[20u8; 32])
-        );
+        assert_eq!(fields.named_accounts.get("destination"), Some(&[20u8; 32]));
         assert_eq!(fields.named_accounts.get("authority"), Some(&[30u8; 32]));
     }
 
@@ -448,17 +439,11 @@ mod tests {
 
         let fields = result.unwrap();
         assert_eq!(fields.instruction_name, "TransferChecked");
-        assert_eq!(
-            fields.args.get("amount"),
-            Some(&DecodedValue::Uint64(5000))
-        );
+        assert_eq!(fields.args.get("amount"), Some(&DecodedValue::Uint64(5000)));
         assert_eq!(fields.args.get("decimals"), Some(&DecodedValue::Uint8(6)));
         assert_eq!(fields.named_accounts.get("source"), Some(&[11u8; 32]));
         assert_eq!(fields.named_accounts.get("mint"), Some(&[22u8; 32]));
-        assert_eq!(
-            fields.named_accounts.get("destination"),
-            Some(&[33u8; 32])
-        );
+        assert_eq!(fields.named_accounts.get("destination"), Some(&[33u8; 32]));
         assert_eq!(fields.named_accounts.get("authority"), Some(&[44u8; 32]));
     }
 
@@ -474,7 +459,9 @@ mod tests {
     #[test]
     fn test_event_returns_none() {
         let decoder = SplTokenDecoder::new();
-        let result = decoder.decode_event(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20]).unwrap();
+        let result = decoder
+            .decode_event(&[1, 2, 3, 4, 5, 6, 7, 8], &[10, 20])
+            .unwrap();
         assert!(result.is_none());
         assert!(decoder.event_types().is_empty());
     }
@@ -514,10 +501,7 @@ mod tests {
             fields.fields.get("supply"),
             Some(&DecodedValue::Uint64(1_000_000))
         );
-        assert_eq!(
-            fields.fields.get("decimals"),
-            Some(&DecodedValue::Uint8(9))
-        );
+        assert_eq!(fields.fields.get("decimals"), Some(&DecodedValue::Uint8(9)));
         assert_eq!(
             fields.fields.get("is_initialized"),
             Some(&DecodedValue::Bool(true))

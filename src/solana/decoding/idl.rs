@@ -90,11 +90,7 @@ enum IdlVersion {
 
 fn detect_version(root: &serde_json::Value) -> IdlVersion {
     // Check for metadata.spec (0.30+ marker).
-    if root
-        .get("metadata")
-        .and_then(|m| m.get("spec"))
-        .is_some()
-    {
+    if root.get("metadata").and_then(|m| m.get("spec")).is_some() {
         return IdlVersion::V030;
     }
 
@@ -193,7 +189,10 @@ fn parse_idl_type(
 
     // Object form: compound/reference types.
     let obj = value.as_object().ok_or_else(|| {
-        SolanaDecodeError::IdlParse(format!("expected string or object for IDL type, got: {}", value))
+        SolanaDecodeError::IdlParse(format!(
+            "expected string or object for IDL type, got: {}",
+            value
+        ))
     })?;
 
     if let Some(inner) = obj.get("option") {
@@ -216,9 +215,10 @@ fn parse_idl_type(
             ));
         }
         let inner_type = parse_idl_type(&arr[0], version)?;
-        let size = arr[1].as_u64().ok_or_else(|| {
-            SolanaDecodeError::IdlParse("array size must be a number".to_string())
-        })? as usize;
+        let size = arr[1]
+            .as_u64()
+            .ok_or_else(|| SolanaDecodeError::IdlParse("array size must be a number".to_string()))?
+            as usize;
         return Ok(IdlType::Array(Box::new(inner_type), size));
     }
 
@@ -248,9 +248,7 @@ fn parse_idl_type(
             IdlVersion::Legacy => {
                 // Legacy: {"defined": "TypeName"}
                 let name = defined.as_str().ok_or_else(|| {
-                    SolanaDecodeError::IdlParse(
-                        "legacy defined type must be a string".to_string(),
-                    )
+                    SolanaDecodeError::IdlParse("legacy defined type must be a string".to_string())
                 })?;
                 return Ok(IdlType::Defined(name.to_string()));
             }
@@ -285,10 +283,7 @@ fn parse_type_def(
         .get("kind")
         .and_then(|k| k.as_str())
         .ok_or_else(|| {
-            SolanaDecodeError::IdlParse(format!(
-                "type definition '{}' missing 'type.kind'",
-                name
-            ))
+            SolanaDecodeError::IdlParse(format!("type definition '{}' missing 'type.kind'", name))
         })?;
 
     match kind {
@@ -297,10 +292,7 @@ fn parse_type_def(
                 .get("fields")
                 .and_then(|f| f.as_array())
                 .ok_or_else(|| {
-                    SolanaDecodeError::IdlParse(format!(
-                        "struct '{}' missing 'fields' array",
-                        name
-                    ))
+                    SolanaDecodeError::IdlParse(format!("struct '{}' missing 'fields' array", name))
                 })?;
 
             let mut fields = Vec::with_capacity(fields_arr.len());
@@ -336,10 +328,7 @@ fn parse_type_def(
                 .get("variants")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
-                    SolanaDecodeError::IdlParse(format!(
-                        "enum '{}' missing 'variants' array",
-                        name
-                    ))
+                    SolanaDecodeError::IdlParse(format!("enum '{}' missing 'variants' array", name))
                 })?;
 
             let mut variants = Vec::with_capacity(variants_arr.len());
@@ -355,44 +344,44 @@ fn parse_type_def(
                     })?
                     .to_string();
 
-                let fields = if let Some(fields_arr) = variant.get("fields").and_then(|f| f.as_array())
-                {
-                    if fields_arr.is_empty() {
-                        None
-                    } else {
-                        let mut parsed = Vec::with_capacity(fields_arr.len());
-                        for (idx, field) in fields_arr.iter().enumerate() {
-                            if field.is_object() {
-                                // Named field: {"name": "x", "type": "u64"}
-                                let f_name = field
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let f_name = if f_name.is_empty() {
-                                    format!("field_{}", idx)
+                let fields =
+                    if let Some(fields_arr) = variant.get("fields").and_then(|f| f.as_array()) {
+                        if fields_arr.is_empty() {
+                            None
+                        } else {
+                            let mut parsed = Vec::with_capacity(fields_arr.len());
+                            for (idx, field) in fields_arr.iter().enumerate() {
+                                if field.is_object() {
+                                    // Named field: {"name": "x", "type": "u64"}
+                                    let f_name = field
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let f_name = if f_name.is_empty() {
+                                        format!("field_{}", idx)
+                                    } else {
+                                        f_name
+                                    };
+                                    let f_type_val = field.get("type").ok_or_else(|| {
+                                        SolanaDecodeError::IdlParse(format!(
+                                            "variant field '{}' in enum '{}::{}' missing 'type'",
+                                            f_name, name, variant_name
+                                        ))
+                                    })?;
+                                    let f_type = parse_idl_type(f_type_val, version)?;
+                                    parsed.push((f_name, f_type));
                                 } else {
-                                    f_name
-                                };
-                                let f_type_val = field.get("type").ok_or_else(|| {
-                                    SolanaDecodeError::IdlParse(format!(
-                                        "variant field '{}' in enum '{}::{}' missing 'type'",
-                                        f_name, name, variant_name
-                                    ))
-                                })?;
-                                let f_type = parse_idl_type(f_type_val, version)?;
-                                parsed.push((f_name, f_type));
-                            } else {
-                                // Unnamed/tuple field: bare type like "u64" or {"vec": "u8"}
-                                let f_type = parse_idl_type(field, version)?;
-                                parsed.push((format!("field_{}", idx), f_type));
+                                    // Unnamed/tuple field: bare type like "u64" or {"vec": "u8"}
+                                    let f_type = parse_idl_type(field, version)?;
+                                    parsed.push((format!("field_{}", idx), f_type));
+                                }
                             }
+                            Some(parsed)
                         }
-                        Some(parsed)
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
 
                 variants.push(IdlEnumVariant {
                     name: variant_name,
@@ -459,9 +448,7 @@ pub fn parse_idl(json: &str) -> Result<ParsedIdl, SolanaDecodeError> {
             let event_name = event_val
                 .get("name")
                 .and_then(|n| n.as_str())
-                .ok_or_else(|| {
-                    SolanaDecodeError::IdlParse("event missing 'name'".to_string())
-                })?
+                .ok_or_else(|| SolanaDecodeError::IdlParse("event missing 'name'".to_string()))?
                 .to_string();
 
             let fields = parse_fields_array(event_val, version)?;
@@ -514,9 +501,7 @@ pub fn parse_idl(json: &str) -> Result<ParsedIdl, SolanaDecodeError> {
             let acc_name = acc_val
                 .get("name")
                 .and_then(|n| n.as_str())
-                .ok_or_else(|| {
-                    SolanaDecodeError::IdlParse("account missing 'name'".to_string())
-                })?
+                .ok_or_else(|| SolanaDecodeError::IdlParse("account missing 'name'".to_string()))?
                 .to_string();
 
             // Get fields from the type definition if present, or from the defined_types map.
@@ -642,11 +627,7 @@ fn parse_account_names(value: &serde_json::Value) -> Vec<String> {
     names
 }
 
-fn collect_leaf_account_names(
-    accounts: &[serde_json::Value],
-    prefix: &str,
-    out: &mut Vec<String>,
-) {
+fn collect_leaf_account_names(accounts: &[serde_json::Value], prefix: &str, out: &mut Vec<String>) {
     for acc in accounts {
         let name = acc.get("name").and_then(|n| n.as_str()).unwrap_or("");
         // Composite group: has nested "accounts" array — recurse with prefix.
@@ -722,8 +703,11 @@ impl ProgramDecoder for AnchorDecoder {
         };
 
         let mut cursor: &[u8] = data;
-        let params =
-            borsh_dynamic::deserialize_struct_fields(&mut cursor, fields, &self.parsed_idl.defined_types)?;
+        let params = borsh_dynamic::deserialize_struct_fields(
+            &mut cursor,
+            fields,
+            &self.parsed_idl.defined_types,
+        )?;
 
         Ok(Some(DecodedEventFields {
             event_name: event_name.clone(),
@@ -1343,7 +1327,10 @@ mod tests {
         }"#;
 
         let parsed = parse_idl(idl_json).unwrap();
-        let type_def = parsed.defined_types.get("OrderStatus").expect("type present");
+        let type_def = parsed
+            .defined_types
+            .get("OrderStatus")
+            .expect("type present");
 
         if let IdlTypeDef::Enum { variants } = type_def {
             assert_eq!(variants.len(), 3);

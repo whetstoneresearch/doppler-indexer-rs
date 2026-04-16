@@ -409,10 +409,7 @@ mod tests {
             instruction_index: 3,
             inner_instruction_index: None,
         };
-        assert_eq!(
-            pos.packed_ordinal_i64(),
-            3 * SOLANA_PACKED_ORDINAL_STRIDE
-        );
+        assert_eq!(pos.packed_ordinal_i64(), 3 * SOLANA_PACKED_ORDINAL_STRIDE);
     }
 
     #[test]

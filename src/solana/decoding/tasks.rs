@@ -148,6 +148,14 @@ pub async fn decode_solana_events(
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
     only_sources: Option<Arc<HashSet<String>>>,
+    live_storage: Option<crate::solana::live::storage::SolanaLiveStorage>,
+    // When true (live mode + discovery-managed account reads configured), sends
+    // a sentinel empty
+    // DecodedEventsMessage through transform_tx after all decoded groups for a
+    // slot. The bridge detects this and forwards RangeComplete to the discovery
+    // loop, which sends mark_complete_only to the reader AFTER all
+    // discovery-triggered account reads for the slot have been enqueued.
+    signal_slot_done: bool,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_events_dir(&chain_name);
@@ -159,15 +167,12 @@ pub async fn decode_solana_events(
                 range_start,
                 range_end,
                 events,
-                live_mode: _,
+                live_mode,
             } => {
                 // Group raw events by program_id
                 let mut by_program: HashMap<[u8; 32], Vec<_>> = HashMap::new();
                 for event in events {
-                    by_program
-                        .entry(event.program_id)
-                        .or_default()
-                        .push(event);
+                    by_program.entry(event.program_id).or_default().push(event);
                 }
 
                 // Decode per-program, then regroup by (source_name, event_name)
@@ -198,53 +203,72 @@ pub async fn decode_solana_events(
                     by_trigger.retain(|(_, event_name), _| filter.contains(event_name.as_str()));
                 }
 
-                // Write decoded parquet per (source_name, event_name) group
-                let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
-                let range_file = format!("{}-{}.parquet", range_start, range_end_inclusive);
+                // In live mode, skip parquet writes — decoded data flows through
+                // channels to the engine, and compaction handles parquet later.
+                // Mark the slot as events_decoded in live storage so the
+                // compaction service sees it as complete.
+                if !live_mode {
+                    let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
+                    let range_file = format!("{}-{}.parquet", range_start, range_end_inclusive);
 
-                for ((source_name, event_name), events) in &by_trigger {
-                    if events.is_empty() {
-                        continue;
+                    for ((source_name, event_name), events) in &by_trigger {
+                        if events.is_empty() {
+                            continue;
+                        }
+                        let output_dir = base_dir.join(source_name).join(event_name);
+                        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+                            tracing::error!(
+                                path = %output_dir.display(),
+                                error = %e,
+                                "Failed to create decoded events output directory"
+                            );
+                            continue;
+                        }
+                        let output_path = output_dir.join(&range_file);
+
+                        if let Err(e) =
+                            write_decoded_events_to_parquet(events, &schema, &output_path)
+                        {
+                            tracing::error!(
+                                path = %output_path.display(),
+                                error = %e,
+                                "Failed to write decoded events parquet"
+                            );
+                        } else {
+                            tracing::debug!(
+                                source = source_name.as_str(),
+                                event = event_name.as_str(),
+                                count = events.len(),
+                                path = %output_path.display(),
+                                "Wrote decoded events parquet"
+                            );
+                        }
                     }
-                    let output_dir = base_dir.join(source_name).join(event_name);
-                    if let Err(e) = std::fs::create_dir_all(&output_dir) {
-                        tracing::error!(
-                            path = %output_dir.display(),
+
+                    // Remove stale decoded parquet for this range. Function
+                    // filtering makes the output incomplete per-source, so
+                    // cleanup must be skipped. Source scoping restricts the
+                    // scan to in-scope sources only.
+                    if function_filter.is_none() {
+                        cleanup_stale_decoded_parquet(
+                            &base_dir,
+                            &by_trigger,
+                            &range_file,
+                            only_sources.as_deref(),
+                        );
+                    }
+                } else if let Some(ref storage) = live_storage {
+                    // In live mode, mark events_decoded in slot status.
+                    // range_start == range_end == slot for live ranges.
+                    if let Err(e) = storage.update_status_atomic(range_start, |s| {
+                        s.events_decoded = true;
+                    }) {
+                        tracing::warn!(
+                            slot = range_start,
                             error = %e,
-                            "Failed to create decoded events output directory"
-                        );
-                        continue;
-                    }
-                    let output_path = output_dir.join(&range_file);
-
-                    if let Err(e) = write_decoded_events_to_parquet(events, &schema, &output_path) {
-                        tracing::error!(
-                            path = %output_path.display(),
-                            error = %e,
-                            "Failed to write decoded events parquet"
-                        );
-                    } else {
-                        tracing::debug!(
-                            source = source_name.as_str(),
-                            event = event_name.as_str(),
-                            count = events.len(),
-                            path = %output_path.display(),
-                            "Wrote decoded events parquet"
+                            "Failed to mark events_decoded in live status"
                         );
                     }
-                }
-
-                // Remove stale decoded parquet for this range. Function
-                // filtering makes the output incomplete per-source, so
-                // cleanup must be skipped. Source scoping restricts the
-                // scan to in-scope sources only.
-                if function_filter.is_none() {
-                    cleanup_stale_decoded_parquet(
-                        &base_dir,
-                        &by_trigger,
-                        &range_file,
-                        only_sources.as_deref(),
-                    );
                 }
 
                 // Send one message per (source_name, event_name) group
@@ -285,6 +309,26 @@ pub async fn decode_solana_events(
                         return;
                     }
                 }
+
+                // Send a slot-done sentinel through the same channel as decoded
+                // events so it follows them through the bridge → discovery
+                // pipeline. The bridge converts this into a RangeComplete for
+                // the discovery loop, which then sends mark_complete_only to
+                // the reader after all discovery-triggered account reads for
+                // the slot have been enqueued.
+                if live_mode && signal_slot_done {
+                    if let Some(ref tx) = transform_tx {
+                        let _ = tx
+                            .send(DecodedEventsMessage {
+                                range_start,
+                                range_end,
+                                source_name: String::new(),
+                                event_name: String::new(),
+                                events: Vec::new(),
+                            })
+                            .await;
+                    }
+                }
             }
             DecoderMessage::AllComplete => break,
             _ => {} // Ignore EVM-specific messages
@@ -313,6 +357,7 @@ pub async fn decode_solana_instructions(
     chain_name: String,
     function_filter: Option<Arc<HashSet<String>>>,
     only_sources: Option<Arc<HashSet<String>>>,
+    live_storage: Option<crate::solana::live::storage::SolanaLiveStorage>,
 ) {
     let schema = build_decoded_event_schema();
     let base_dir = decoded_solana_instructions_dir(&chain_name);
@@ -324,15 +369,12 @@ pub async fn decode_solana_instructions(
                 range_start,
                 range_end,
                 instructions,
-                live_mode: _,
+                live_mode,
             } => {
                 // Group raw instructions by program_id
                 let mut by_program: HashMap<[u8; 32], Vec<_>> = HashMap::new();
                 for instr in instructions {
-                    by_program
-                        .entry(instr.program_id)
-                        .or_default()
-                        .push(instr);
+                    by_program.entry(instr.program_id).or_default().push(instr);
                 }
 
                 // Decode per-program, then regroup by (source_name, event_name)
@@ -350,8 +392,7 @@ pub async fn decode_solana_instructions(
                         }
                     };
 
-                    let decoded =
-                        decoder.decode_instruction_batch(program_instrs, source_name);
+                    let decoded = decoder.decode_instruction_batch(program_instrs, source_name);
                     for event in decoded {
                         let key = (event.source_name.clone(), event.event_name.clone());
                         by_trigger.entry(key).or_default().push(event);
@@ -363,50 +404,63 @@ pub async fn decode_solana_instructions(
                     by_trigger.retain(|(_, event_name), _| filter.contains(event_name.as_str()));
                 }
 
-                // Write decoded parquet per (source_name, instruction_name) group
-                let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
-                let range_file = format!("{}-{}.parquet", range_start, range_end_inclusive);
+                if !live_mode {
+                    let range_end_inclusive = if range_end > 0 { range_end - 1 } else { 0 };
+                    let range_file = format!("{}-{}.parquet", range_start, range_end_inclusive);
 
-                for ((source_name, event_name), events) in &by_trigger {
-                    if events.is_empty() {
-                        continue;
+                    for ((source_name, event_name), events) in &by_trigger {
+                        if events.is_empty() {
+                            continue;
+                        }
+                        let output_dir = base_dir.join(source_name).join(event_name);
+                        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+                            tracing::error!(
+                                path = %output_dir.display(),
+                                error = %e,
+                                "Failed to create decoded instructions output directory"
+                            );
+                            continue;
+                        }
+                        let output_path = output_dir.join(&range_file);
+
+                        if let Err(e) =
+                            write_decoded_events_to_parquet(events, &schema, &output_path)
+                        {
+                            tracing::error!(
+                                path = %output_path.display(),
+                                error = %e,
+                                "Failed to write decoded instructions parquet"
+                            );
+                        } else {
+                            tracing::debug!(
+                                source = source_name.as_str(),
+                                instruction = event_name.as_str(),
+                                count = events.len(),
+                                path = %output_path.display(),
+                                "Wrote decoded instructions parquet"
+                            );
+                        }
                     }
-                    let output_dir = base_dir.join(source_name).join(event_name);
-                    if let Err(e) = std::fs::create_dir_all(&output_dir) {
-                        tracing::error!(
-                            path = %output_dir.display(),
+
+                    // Remove stale decoded parquet — see decode_solana_events
+                    if function_filter.is_none() {
+                        cleanup_stale_decoded_parquet(
+                            &base_dir,
+                            &by_trigger,
+                            &range_file,
+                            only_sources.as_deref(),
+                        );
+                    }
+                } else if let Some(ref storage) = live_storage {
+                    if let Err(e) = storage.update_status_atomic(range_start, |s| {
+                        s.instructions_decoded = true;
+                    }) {
+                        tracing::warn!(
+                            slot = range_start,
                             error = %e,
-                            "Failed to create decoded instructions output directory"
-                        );
-                        continue;
-                    }
-                    let output_path = output_dir.join(&range_file);
-
-                    if let Err(e) = write_decoded_events_to_parquet(events, &schema, &output_path) {
-                        tracing::error!(
-                            path = %output_path.display(),
-                            error = %e,
-                            "Failed to write decoded instructions parquet"
-                        );
-                    } else {
-                        tracing::debug!(
-                            source = source_name.as_str(),
-                            instruction = event_name.as_str(),
-                            count = events.len(),
-                            path = %output_path.display(),
-                            "Wrote decoded instructions parquet"
+                            "Failed to mark instructions_decoded in live status"
                         );
                     }
-                }
-
-                // Remove stale decoded parquet — see decode_solana_events
-                if function_filter.is_none() {
-                    cleanup_stale_decoded_parquet(
-                        &base_dir,
-                        &by_trigger,
-                        &range_file,
-                        only_sources.as_deref(),
-                    );
                 }
 
                 // Send one message per (source_name, instruction_name) group
@@ -463,6 +517,8 @@ mod tests {
         DecodedAccountFields, DecodedEventFields, DecodedInstructionFields, ProgramDecoder,
         SolanaDecodeError,
     };
+    use crate::solana::live::storage::SolanaLiveStorage;
+    use crate::solana::live::types::LiveSlotStatus;
     use crate::solana::raw_data::types::{SolanaEventRecord, SolanaInstructionRecord};
     use crate::types::decoded::DecodedValue;
 
@@ -562,7 +618,10 @@ mod tests {
         let (complete_tx, mut complete_rx) = tokio::sync::mpsc::channel(10);
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
-        let chain_name = format!("test-{}", tmp_dir.path().file_name().unwrap().to_str().unwrap());
+        let chain_name = format!(
+            "test-{}",
+            tmp_dir.path().file_name().unwrap().to_str().unwrap()
+        );
 
         // Create the expected output directory under a temp-like data dir
         // We need the test to write to a real dir so use the chain_name approach
@@ -575,6 +634,8 @@ mod tests {
             chain_name,
             None,
             None,
+            None,
+            false,
         ));
 
         // Send an event batch
@@ -608,23 +669,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_decoder_task_marks_live_slot_complete() {
+        let program_id = [3u8; 32];
+
+        let mut params = HashMap::new();
+        params.insert("amount".to_string(), DecodedValue::Uint64(7));
+
+        let decoder = Arc::new(SolanaEventDecoder::new(vec![Arc::new(MockDecoder {
+            id: program_id,
+            event_result: Some(DecodedEventFields {
+                event_name: "Transfer".to_string(),
+                params,
+            }),
+            instruction_result: None,
+        })]));
+
+        let mut names = HashMap::new();
+        names.insert(program_id, "spl_token".to_string());
+        let program_names = Arc::new(names);
+
+        let storage_root = tempfile::TempDir::new().unwrap();
+        let storage = SolanaLiveStorage::with_base_dir(storage_root.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveSlotStatus::collected();
+        status.block_fetched = true;
+        status.events_extracted = true;
+        storage.write_status(100, &status).unwrap();
+
+        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(10);
+        let handle = tokio::spawn(decode_solana_events(
+            decoder,
+            program_names,
+            decoder_rx,
+            None,
+            None,
+            "test-live-events".to_string(),
+            None,
+            None,
+            Some(storage.clone()),
+            false,
+        ));
+
+        decoder_tx
+            .send(DecoderMessage::SolanaEventsReady {
+                range_start: 100,
+                range_end: 100,
+                events: vec![make_event_record(program_id)],
+                live_mode: true,
+            })
+            .await
+            .unwrap();
+        decoder_tx.send(DecoderMessage::AllComplete).await.unwrap();
+        handle.await.unwrap();
+
+        let updated = storage.read_status(100).unwrap();
+        assert!(updated.events_decoded);
+    }
+
+    #[tokio::test]
     async fn instruction_decoder_task_sends_instruction_complete() {
         let program_id = [2u8; 32];
 
         let mut args = HashMap::new();
         args.insert("amount".to_string(), DecodedValue::Uint64(100));
 
-        let decoder = Arc::new(SolanaInstructionDecoder::new(vec![Arc::new(
-            MockDecoder {
-                id: program_id,
-                event_result: None,
-                instruction_result: Some(DecodedInstructionFields {
-                    instruction_name: "Transfer".to_string(),
-                    args,
-                    named_accounts: HashMap::new(),
-                }),
-            },
-        )]));
+        let decoder = Arc::new(SolanaInstructionDecoder::new(vec![Arc::new(MockDecoder {
+            id: program_id,
+            event_result: None,
+            instruction_result: Some(DecodedInstructionFields {
+                instruction_name: "Transfer".to_string(),
+                args,
+                named_accounts: HashMap::new(),
+            }),
+        })]));
 
         let mut names = HashMap::new();
         names.insert(program_id, "spl_token".to_string());
@@ -641,6 +759,7 @@ mod tests {
             Some(transform_tx),
             Some(complete_tx),
             "test-solana-instr".to_string(),
+            None,
             None,
             None,
         ));
@@ -668,6 +787,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instruction_decoder_task_marks_live_slot_complete() {
+        let program_id = [4u8; 32];
+
+        let mut args = HashMap::new();
+        args.insert("amount".to_string(), DecodedValue::Uint64(9));
+
+        let decoder = Arc::new(SolanaInstructionDecoder::new(vec![Arc::new(MockDecoder {
+            id: program_id,
+            event_result: None,
+            instruction_result: Some(DecodedInstructionFields {
+                instruction_name: "Transfer".to_string(),
+                args,
+                named_accounts: HashMap::new(),
+            }),
+        })]));
+
+        let mut names = HashMap::new();
+        names.insert(program_id, "spl_token".to_string());
+        let program_names = Arc::new(names);
+
+        let storage_root = tempfile::TempDir::new().unwrap();
+        let storage = SolanaLiveStorage::with_base_dir(storage_root.path().to_path_buf());
+        storage.ensure_dirs().unwrap();
+
+        let mut status = LiveSlotStatus::collected();
+        status.block_fetched = true;
+        status.instructions_extracted = true;
+        storage.write_status(200, &status).unwrap();
+
+        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel(10);
+        let handle = tokio::spawn(decode_solana_instructions(
+            decoder,
+            program_names,
+            decoder_rx,
+            None,
+            None,
+            "test-live-instructions".to_string(),
+            None,
+            None,
+            Some(storage.clone()),
+        ));
+
+        decoder_tx
+            .send(DecoderMessage::SolanaInstructionsReady {
+                range_start: 200,
+                range_end: 200,
+                instructions: vec![make_instruction_record(program_id)],
+                live_mode: true,
+            })
+            .await
+            .unwrap();
+        decoder_tx.send(DecoderMessage::AllComplete).await.unwrap();
+        handle.await.unwrap();
+
+        let updated = storage.read_status(200).unwrap();
+        assert!(updated.instructions_decoded);
+    }
+
+    #[tokio::test]
     async fn decoder_task_exits_on_channel_close() {
         let decoder = Arc::new(SolanaEventDecoder::new(vec![]));
         let program_names = Arc::new(HashMap::new());
@@ -682,6 +860,8 @@ mod tests {
             "test-close".to_string(),
             None,
             None,
+            None,
+            false,
         ));
 
         // Drop sender to close channel
@@ -723,6 +903,8 @@ mod tests {
             "test-unknown".to_string(),
             None,
             None,
+            None,
+            false,
         ));
 
         // Send batch with one known and one unknown program event
@@ -730,10 +912,7 @@ mod tests {
             .send(DecoderMessage::SolanaEventsReady {
                 range_start: 0,
                 range_end: 1000,
-                events: vec![
-                    make_event_record(known_id),
-                    make_event_record(unknown_id),
-                ],
+                events: vec![make_event_record(known_id), make_event_record(unknown_id)],
                 live_mode: false,
             })
             .await

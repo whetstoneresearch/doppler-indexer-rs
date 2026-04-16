@@ -147,7 +147,10 @@ pub fn write_decoded_events_to_parquet(
     arrays.push(Arc::new(arr));
 
     // source_name
-    let arr: StringArray = events.iter().map(|e| Some(e.source_name.as_str())).collect();
+    let arr: StringArray = events
+        .iter()
+        .map(|e| Some(e.source_name.as_str()))
+        .collect();
     arrays.push(Arc::new(arr));
 
     // event_name
@@ -244,7 +247,15 @@ mod tests {
         let schema = build_decoded_event_schema();
 
         let events = vec![
-            make_decoded_event(100, "spl_token", "Transfer", [0xAA; 32], [0xBB; 64], 0, None),
+            make_decoded_event(
+                100,
+                "spl_token",
+                "Transfer",
+                [0xAA; 32],
+                [0xBB; 64],
+                0,
+                None,
+            ),
             make_decoded_event(
                 100,
                 "spl_token",

@@ -132,8 +132,7 @@ impl ProgramLogParser {
         if depth == 1 {
             // New top-level instruction.
             if self.has_started {
-                self.top_level_instruction_index =
-                    self.top_level_instruction_index.wrapping_add(1);
+                self.top_level_instruction_index = self.top_level_instruction_index.wrapping_add(1);
             }
             self.has_started = true;
             self.inner_instruction_count = 0;
@@ -149,13 +148,7 @@ impl ProgramLogParser {
         self.program_stack.pop();
     }
 
-    fn handle_data(
-        &mut self,
-        b64: &str,
-        slot: u64,
-        block_time: Option<i64>,
-        tx_sig: &[u8; 64],
-    ) {
+    fn handle_data(&mut self, b64: &str, slot: u64, block_time: Option<i64>, tx_sig: &[u8; 64]) {
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
             return;
         };
@@ -275,9 +268,7 @@ mod tests {
         let event_bytes: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 0xDE, 0xAD, 0xBE, 0xEF];
 
         let logs = vec![
-            format!(
-                "Program 11111111111111111111111111111111 invoke [1]"
-            ),
+            format!("Program 11111111111111111111111111111111 invoke [1]"),
             format!("Program data: {}", b64(&event_bytes)),
             "Program 11111111111111111111111111111111 success".to_string(),
         ];

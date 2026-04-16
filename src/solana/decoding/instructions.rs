@@ -22,10 +22,7 @@ pub struct SolanaInstructionDecoder {
 
 impl SolanaInstructionDecoder {
     pub fn new(decoders: Vec<Arc<dyn ProgramDecoder>>) -> Self {
-        let decoders = decoders
-            .into_iter()
-            .map(|d| (d.program_id(), d))
-            .collect();
+        let decoders = decoders.into_iter().map(|d| (d.program_id(), d)).collect();
         Self { decoders }
     }
 
@@ -180,10 +177,7 @@ mod tests {
         assert_eq!(event.event_name, "Transfer");
         assert_eq!(event.event_signature, "Transfer");
         // Args are merged in
-        assert_eq!(
-            event.params.get("amount"),
-            Some(&DecodedValue::Uint64(100))
-        );
+        assert_eq!(event.params.get("amount"), Some(&DecodedValue::Uint64(100)));
         // Named accounts are merged in as ChainAddress with "accounts." prefix
         assert_eq!(
             event.params.get("accounts.source"),

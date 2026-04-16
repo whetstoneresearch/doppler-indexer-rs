@@ -56,13 +56,8 @@ pub fn extract_events_and_instructions(
         let log_messages: Option<&Vec<String>> = meta.log_messages.as_ref().into();
         if let Some(logs) = log_messages {
             if let Some(sig) = extract_signature_from_tx(&encoded_tx.transaction) {
-                let events = extract_events_from_logs(
-                    logs,
-                    slot,
-                    block_time,
-                    &sig,
-                    configured_programs,
-                );
+                let events =
+                    extract_events_from_logs(logs, slot, block_time, &sig, configured_programs);
                 all_events.extend(events);
             }
         }
@@ -160,8 +155,7 @@ mod tests {
             block_height: None,
         };
 
-        let (events, instructions) =
-            extract_events_and_instructions(&block, 100, &HashSet::new());
+        let (events, instructions) = extract_events_and_instructions(&block, 100, &HashSet::new());
         assert!(events.is_empty());
         assert!(instructions.is_empty());
     }
@@ -180,8 +174,7 @@ mod tests {
             block_height: Some(200_000_000),
         };
 
-        let (events, instructions) =
-            extract_events_and_instructions(&block, 200, &HashSet::new());
+        let (events, instructions) = extract_events_and_instructions(&block, 200, &HashSet::new());
         assert!(events.is_empty());
         assert!(instructions.is_empty());
     }
@@ -213,8 +206,7 @@ mod tests {
             block_height: None,
         };
 
-        let (events, instructions) =
-            extract_events_and_instructions(&block, 300, &HashSet::new());
+        let (events, instructions) = extract_events_and_instructions(&block, 300, &HashSet::new());
         assert!(events.is_empty());
         assert!(instructions.is_empty());
     }
@@ -242,8 +234,7 @@ mod tests {
             block_height: None,
         };
 
-        let (events, instructions) =
-            extract_events_and_instructions(&block, 400, &HashSet::new());
+        let (events, instructions) = extract_events_and_instructions(&block, 400, &HashSet::new());
         assert!(events.is_empty());
         assert!(instructions.is_empty());
     }
@@ -274,17 +265,12 @@ mod tests {
         let tx = Transaction::new(&[&payer], msg, Hash::new_unique());
 
         let tx_bytes = bincode::serialize(&tx).unwrap();
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         // Build log messages with an event from program_id.
         let event_bytes: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80, 0xAA, 0xBB];
-        let event_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &event_bytes,
-        );
+        let event_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &event_bytes);
 
         let logs = vec![
             format!("Program {} invoke [1]", program_id),
@@ -316,8 +302,7 @@ mod tests {
         let mut configured = HashSet::new();
         configured.insert(program_id.to_bytes());
 
-        let (events, instructions) =
-            extract_events_and_instructions(&block, 500, &configured);
+        let (events, instructions) = extract_events_and_instructions(&block, 500, &configured);
 
         // Should have 1 event and 1 instruction.
         assert_eq!(events.len(), 1);
@@ -327,7 +312,10 @@ mod tests {
         assert_eq!(events[0].slot, 500);
         assert_eq!(events[0].block_time, Some(1_700_000_000));
         assert_eq!(events[0].program_id, program_id.to_bytes());
-        assert_eq!(events[0].event_discriminator, [10, 20, 30, 40, 50, 60, 70, 80]);
+        assert_eq!(
+            events[0].event_discriminator,
+            [10, 20, 30, 40, 50, 60, 70, 80]
+        );
         assert_eq!(events[0].event_data, vec![0xAA, 0xBB]);
 
         // Verify instruction.

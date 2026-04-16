@@ -5,9 +5,7 @@ use std::time::Duration;
 use solana_client::client_error::ClientError as SolanaClientError;
 use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClientInner;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-use solana_client::rpc_config::{
-    RpcBlockConfig, RpcProgramAccountsConfig, RpcTransactionConfig,
-};
+use solana_client::rpc_config::{RpcBlockConfig, RpcProgramAccountsConfig, RpcTransactionConfig};
 use solana_client::rpc_filter::RpcFilterType;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::account::Account;
@@ -176,14 +174,11 @@ impl SolanaRpcClient {
         requests_per_second: Option<u32>,
         concurrency: Option<usize>,
     ) -> Result<Self, SolanaRpcError> {
-        let _ = url::Url::parse(rpc_url)
-            .map_err(|e| SolanaRpcError::InvalidUrl(e.to_string()))?;
+        let _ = url::Url::parse(rpc_url).map_err(|e| SolanaRpcError::InvalidUrl(e.to_string()))?;
 
         let commitment_config = commitment_config_from(commitment);
-        let inner = SolanaRpcClientInner::new_with_commitment(
-            rpc_url.to_string(),
-            commitment_config,
-        );
+        let inner =
+            SolanaRpcClientInner::new_with_commitment(rpc_url.to_string(), commitment_config);
 
         let rps = requests_per_second.unwrap_or(defaults::REQUESTS_PER_SECOND);
         let conc = concurrency.unwrap_or(defaults::CONCURRENCY);
@@ -205,14 +200,11 @@ impl SolanaRpcClient {
         shared_limiter: Arc<SlidingWindowRateLimiter>,
         concurrency: Option<usize>,
     ) -> Result<Self, SolanaRpcError> {
-        let _ = url::Url::parse(rpc_url)
-            .map_err(|e| SolanaRpcError::InvalidUrl(e.to_string()))?;
+        let _ = url::Url::parse(rpc_url).map_err(|e| SolanaRpcError::InvalidUrl(e.to_string()))?;
 
         let commitment_config = commitment_config_from(commitment);
-        let inner = SolanaRpcClientInner::new_with_commitment(
-            rpc_url.to_string(),
-            commitment_config,
-        );
+        let inner =
+            SolanaRpcClientInner::new_with_commitment(rpc_url.to_string(), commitment_config);
         let conc = concurrency.unwrap_or(defaults::CONCURRENCY);
 
         Ok(Self {
@@ -282,10 +274,7 @@ impl SolanaRpcClient {
     /// Get a full block with transactions for a given slot.
     ///
     /// Returns `None` if the slot was skipped (no block produced).
-    pub async fn get_block(
-        &self,
-        slot: u64,
-    ) -> Result<Option<UiConfirmedBlock>, SolanaRpcError> {
+    pub async fn get_block(&self, slot: u64) -> Result<Option<UiConfirmedBlock>, SolanaRpcError> {
         let inner = self.inner.clone();
         let commitment = self.commitment;
         let config = RpcBlockConfig {
@@ -370,9 +359,8 @@ impl SolanaRpcClient {
 
         let mut results = Vec::with_capacity(slots.len());
         while let Some(join_result) = join_set.join_next().await {
-            let (slot, block) = join_result.map_err(|e| {
-                SolanaRpcError::Transport(format!("Task join error: {e}"))
-            })??;
+            let (slot, block) = join_result
+                .map_err(|e| SolanaRpcError::Transport(format!("Task join error: {e}")))??;
             results.push((slot, block));
         }
 
@@ -570,12 +558,8 @@ mod tests {
 
     #[test]
     fn test_constructor_invalid_url() {
-        let result = SolanaRpcClient::new(
-            "not a valid url",
-            SolanaCommitment::Confirmed,
-            None,
-            None,
-        );
+        let result =
+            SolanaRpcClient::new("not a valid url", SolanaCommitment::Confirmed, None, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), SolanaRpcError::InvalidUrl(_)));
     }
@@ -622,15 +606,14 @@ mod tests {
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cc = call_count.clone();
 
-        let result: Result<(), SolanaRpcError> =
-            with_solana_retry(&config, "test", || {
-                let cc = cc.clone();
-                async move {
-                    cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Err(SolanaRpcError::InvalidUrl("permanent".into()))
-                }
-            })
-            .await;
+        let result: Result<(), SolanaRpcError> = with_solana_retry(&config, "test", || {
+            let cc = cc.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(SolanaRpcError::InvalidUrl("permanent".into()))
+            }
+        })
+        .await;
 
         assert!(result.is_err());
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -642,19 +625,18 @@ mod tests {
         let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cc = call_count.clone();
 
-        let result: Result<u32, SolanaRpcError> =
-            with_solana_retry(&config, "test", || {
-                let cc = cc.clone();
-                async move {
-                    let count = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if count < 2 {
-                        Err(SolanaRpcError::Transport("timeout".into()))
-                    } else {
-                        Ok(42)
-                    }
+        let result: Result<u32, SolanaRpcError> = with_solana_retry(&config, "test", || {
+            let cc = cc.clone();
+            async move {
+                let count = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if count < 2 {
+                    Err(SolanaRpcError::Transport("timeout".into()))
+                } else {
+                    Ok(42)
                 }
-            })
-            .await;
+            }
+        })
+        .await;
 
         assert_eq!(result.unwrap(), 42);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);

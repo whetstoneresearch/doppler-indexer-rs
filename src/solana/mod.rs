@@ -1,3 +1,4 @@
+pub mod live;
 pub mod rpc;
 pub mod ws;
 

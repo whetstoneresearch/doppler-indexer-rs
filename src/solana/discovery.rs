@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
@@ -18,6 +19,15 @@ use solana_sdk::pubkey::Pubkey;
 use crate::solana::rpc::{SolanaRpcClient, SolanaRpcError};
 use crate::storage::paths::solana_discovery_dir;
 use crate::types::config::solana::{SolanaDiscoveryConfig, SolanaPrograms};
+
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+/// Shared registry of known account addresses, grouped by program name and
+/// account type. The account_type grouping is preserved so the reader can
+/// apply per-type cadence filtering (EveryNSlots, Duration).
+pub type SharedKnownAccounts = Arc<RwLock<HashMap<String, HashMap<String, Vec<[u8; 32]>>>>>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -39,6 +49,7 @@ pub enum DiscoveryMessage {
     DecodedEvents {
         range_start: u64,
         range_end: u64,
+        block_time: Option<i64>,
         source_name: String,
         events: Vec<DiscoveryEventData>,
     },
@@ -371,6 +382,36 @@ impl DiscoveryManager {
             .sum()
     }
 
+    /// Snapshot known addresses filtered by an allowlist of
+    /// `(program_name, account_type)` pairs. Preserves the two-level grouping
+    /// so the reader can apply per-type cadence filtering.
+    pub fn snapshot_filtered(
+        &self,
+        allowed_types: &HashMap<String, HashSet<String>>,
+    ) -> HashMap<String, HashMap<String, Vec<[u8; 32]>>> {
+        self.known_accounts
+            .iter()
+            .filter_map(|(program_name, types)| {
+                let allowed = allowed_types.get(program_name)?;
+                let filtered: HashMap<String, Vec<[u8; 32]>> = types
+                    .iter()
+                    .filter(|(acct_type, _)| allowed.contains(acct_type.as_str()))
+                    .map(|(acct_type, set)| {
+                        (
+                            acct_type.clone(),
+                            set.iter().map(|pk| pk.to_bytes()).collect(),
+                        )
+                    })
+                    .collect();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some((program_name.clone(), filtered))
+                }
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -381,8 +422,7 @@ impl DiscoveryManager {
 
         for (program_name, account_types) in &self.known_accounts {
             for (account_type, pubkeys) in account_types {
-                let mut addresses: Vec<String> =
-                    pubkeys.iter().map(|pk| pk.to_string()).collect();
+                let mut addresses: Vec<String> = pubkeys.iter().map(|pk| pk.to_string()).collect();
                 addresses.sort();
 
                 known_accounts
@@ -680,10 +720,7 @@ mod tests {
             event_name: "SomeEvent".to_string(),
             fields: {
                 let mut fields = HashMap::new();
-                fields.insert(
-                    "addr".to_string(),
-                    DiscoveryFieldValue::Pubkey([99u8; 32]),
-                );
+                fields.insert("addr".to_string(), DiscoveryFieldValue::Pubkey([99u8; 32]));
                 fields
             },
         }];
@@ -807,10 +844,7 @@ mod tests {
             event_name: "VaultCreated".to_string(),
             fields: {
                 let mut fields = HashMap::new();
-                fields.insert(
-                    "vault".to_string(),
-                    DiscoveryFieldValue::Pubkey([2u8; 32]),
-                );
+                fields.insert("vault".to_string(), DiscoveryFieldValue::Pubkey([2u8; 32]));
                 fields
             },
         }];
@@ -906,5 +940,92 @@ mod tests {
         // Verify it shows up under "unknown" account type.
         let addrs = manager.known_addresses("test_program", "unknown");
         assert_eq!(addrs.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: snapshot_filtered
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_filtered_includes_matching_types() {
+        let programs = make_programs_with_discovery();
+        let mut manager = DiscoveryManager::new(&programs);
+
+        let events = vec![
+            make_pool_initialized_event([1u8; 32]),
+            make_pool_initialized_event([2u8; 32]),
+        ];
+        manager.process_events("orca_whirlpool", &events);
+
+        // Allow all types for this program
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "orca_whirlpool".to_string(),
+            HashSet::from(["Whirlpool".to_string()]),
+        );
+
+        let snapshot = manager.snapshot_filtered(&allowed);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot["orca_whirlpool"]["Whirlpool"].len(), 2);
+    }
+
+    #[test]
+    fn snapshot_filtered_excludes_non_matching_types() {
+        let mut programs = make_programs_with_discovery();
+        let prog = programs.get_mut("orca_whirlpool").unwrap();
+        prog.discovery
+            .as_mut()
+            .unwrap()
+            .push(SolanaDiscoveryConfig {
+                event_name: "PositionOpened".to_string(),
+                address_field: "position".to_string(),
+                account_type: Some("Position".to_string()),
+            });
+
+        let mut manager = DiscoveryManager::new(&programs);
+
+        // Discover Whirlpool
+        manager.process_events("orca_whirlpool", &[make_pool_initialized_event([1u8; 32])]);
+        // Discover Position
+        manager.process_events(
+            "orca_whirlpool",
+            &[DiscoveryEventData {
+                event_name: "PositionOpened".to_string(),
+                fields: {
+                    let mut f = HashMap::new();
+                    f.insert(
+                        "position".to_string(),
+                        DiscoveryFieldValue::Pubkey([2u8; 32]),
+                    );
+                    f
+                },
+            }],
+        );
+
+        assert_eq!(manager.total_known_addresses(), 2);
+
+        // Only allow Whirlpool, not Position
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "orca_whirlpool".to_string(),
+            HashSet::from(["Whirlpool".to_string()]),
+        );
+
+        let filtered = manager.snapshot_filtered(&allowed);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered["orca_whirlpool"].contains_key("Whirlpool"));
+        assert!(!filtered["orca_whirlpool"].contains_key("Position"));
+    }
+
+    #[test]
+    fn snapshot_filtered_empty_filter_returns_empty() {
+        let programs = make_programs_with_discovery();
+        let mut manager = DiscoveryManager::new(&programs);
+
+        manager.process_events("orca_whirlpool", &[make_pool_initialized_event([1u8; 32])]);
+
+        let empty: HashMap<String, HashSet<String>> = HashMap::new();
+        let filtered = manager.snapshot_filtered(&empty);
+        assert!(filtered.is_empty());
     }
 }

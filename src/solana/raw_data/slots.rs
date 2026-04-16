@@ -73,12 +73,7 @@ pub async fn collect_solana_raw_data(
     let mut skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
 
     // Compute ranges to fetch
-    let ranges = compute_slot_ranges_to_fetch(
-        start_slot,
-        end_slot,
-        range_size,
-        &skipped_index,
-    );
+    let ranges = compute_slot_ranges_to_fetch(start_slot, end_slot, range_size, &skipped_index);
 
     if ranges.is_empty() {
         tracing::info!(chain = chain_name, "No slot ranges to collect");
@@ -158,11 +153,11 @@ pub async fn collect_solana_raw_data(
                 events: all_events,
                 live_mode: false,
             };
-            tx.send(msg)
-                .await
-                .map_err(|e: tokio::sync::mpsc::error::SendError<DecoderMessage>| {
+            tx.send(msg).await.map_err(
+                |e: tokio::sync::mpsc::error::SendError<DecoderMessage>| {
                     SolanaCollectionError::ChannelSend(e.to_string())
-                })?;
+                },
+            )?;
         }
 
         if let Some(tx) = instr_decoder_tx {
@@ -172,11 +167,11 @@ pub async fn collect_solana_raw_data(
                 instructions: all_instructions,
                 live_mode: false,
             };
-            tx.send(msg)
-                .await
-                .map_err(|e: tokio::sync::mpsc::error::SendError<DecoderMessage>| {
+            tx.send(msg).await.map_err(
+                |e: tokio::sync::mpsc::error::SendError<DecoderMessage>| {
                     SolanaCollectionError::ChannelSend(e.to_string())
-                })?;
+                },
+            )?;
         }
 
         tracing::info!(
@@ -481,7 +476,12 @@ pub async fn collect_slots_selective(
     write_events_to_parquet_async(all_events.clone(), event_schema, events_path).await?;
 
     let instructions_path = instructions_dir.join(range.file_name("instructions"));
-    write_instructions_to_parquet_async(all_instructions.clone(), instruction_schema, instructions_path).await?;
+    write_instructions_to_parquet_async(
+        all_instructions.clone(),
+        instruction_schema,
+        instructions_path,
+    )
+    .await?;
 
     // Update skipped slots index
     let mut skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
@@ -489,10 +489,7 @@ pub async fn collect_slots_selective(
     if let Some(repaired) = repair_slots {
         // Merge: keep existing skipped slots for non-repaired slots,
         // add new skipped slots from repaired slots
-        let mut merged = skipped_index
-            .get(&rk)
-            .cloned()
-            .unwrap_or_default();
+        let mut merged = skipped_index.get(&rk).cloned().unwrap_or_default();
         // Remove skipped entries for slots being repaired (they may no longer be skipped)
         merged.retain(|s| !repaired.contains(s));
         // Add newly discovered skipped slots
@@ -714,10 +711,7 @@ mod tests {
         let expected_sig = tx.signatures[0];
 
         let tx_bytes = bincode::serialize(&tx).unwrap();
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         let encoded_tx = EncodedTransactionWithStatusMeta {
             transaction: EncodedTransaction::Binary(b64, TransactionBinaryEncoding::Base64),

@@ -17,10 +17,7 @@ pub struct SolanaAccountDecoder {
 
 impl SolanaAccountDecoder {
     pub fn new(decoders: Vec<Arc<dyn ProgramDecoder>>) -> Self {
-        let decoders = decoders
-            .into_iter()
-            .map(|d| (d.program_id(), d))
-            .collect();
+        let decoders = decoders.into_iter().map(|d| (d.program_id(), d)).collect();
         Self { decoders }
     }
 
@@ -148,10 +145,7 @@ mod tests {
             state.fields.get("supply"),
             Some(&DecodedValue::Uint64(1_000_000))
         );
-        assert_eq!(
-            state.fields.get("decimals"),
-            Some(&DecodedValue::Uint8(6))
-        );
+        assert_eq!(state.fields.get("decimals"), Some(&DecodedValue::Uint8(6)));
     }
 
     #[test]

@@ -32,8 +32,6 @@
 mod cached;
 pub mod contract_index;
 mod data_loader;
-#[cfg(feature = "solana")]
-pub mod skipped_slots;
 pub mod decoded_index;
 mod error;
 pub mod factory_data;
@@ -45,6 +43,8 @@ pub mod parquet_writer;
 pub mod paths;
 mod retry;
 mod s3;
+#[cfg(feature = "solana")]
+pub mod skipped_slots;
 mod upload;
 
 pub use cached::CachedBackend;

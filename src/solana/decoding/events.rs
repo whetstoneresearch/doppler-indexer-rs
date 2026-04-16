@@ -18,10 +18,7 @@ pub struct SolanaEventDecoder {
 
 impl SolanaEventDecoder {
     pub fn new(decoders: Vec<Arc<dyn ProgramDecoder>>) -> Self {
-        let decoders = decoders
-            .into_iter()
-            .map(|d| (d.program_id(), d))
-            .collect();
+        let decoders = decoders.into_iter().map(|d| (d.program_id(), d)).collect();
         Self { decoders }
     }
 
@@ -162,10 +159,7 @@ mod tests {
         assert_eq!(event.event_name, "Transfer");
         assert_eq!(event.source_name, "spl_token");
         assert_eq!(event.contract_address, ChainAddress::Solana([1u8; 32]));
-        assert_eq!(
-            event.params.get("amount"),
-            Some(&DecodedValue::Uint64(42))
-        );
+        assert_eq!(event.params.get("amount"), Some(&DecodedValue::Uint64(42)));
     }
 
     #[test]

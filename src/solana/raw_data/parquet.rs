@@ -31,7 +31,11 @@ pub fn build_slot_schema() -> Arc<Schema> {
         Field::new("transaction_count", DataType::UInt32, false),
         Field::new(
             "transaction_signatures",
-            DataType::List(Arc::new(Field::new("item", DataType::FixedSizeBinary(64), true))),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeBinary(64),
+                true,
+            ))),
             false,
         ),
     ]))
@@ -229,7 +233,11 @@ pub fn build_instruction_schema() -> Arc<Schema> {
         Field::new("data", DataType::Binary, false),
         Field::new(
             "accounts",
-            DataType::List(Arc::new(Field::new("item", DataType::FixedSizeBinary(32), true))),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeBinary(32),
+                true,
+            ))),
             false,
         ),
         Field::new("instruction_index", DataType::UInt16, false),
@@ -272,10 +280,7 @@ pub fn write_instructions_to_parquet(
     arrays.push(Arc::new(arr));
 
     // data (Binary)
-    let arr: BinaryArray = records
-        .iter()
-        .map(|r| Some(r.data.as_slice()))
-        .collect();
+    let arr: BinaryArray = records.iter().map(|r| Some(r.data.as_slice())).collect();
     arrays.push(Arc::new(arr));
 
     // accounts (List(FixedSizeBinary(32)))
@@ -319,7 +324,9 @@ pub async fn write_instructions_to_parquet_async(
 // ---------------------------------------------------------------------------
 
 /// Read `SolanaEventRecord`s from a parquet file.
-pub fn read_events_from_parquet(path: &Path) -> Result<Vec<SolanaEventRecord>, SolanaCollectionError> {
+pub fn read_events_from_parquet(
+    path: &Path,
+) -> Result<Vec<SolanaEventRecord>, SolanaCollectionError> {
     let file = std::fs::File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
@@ -432,7 +439,9 @@ pub fn read_events_from_parquet(path: &Path) -> Result<Vec<SolanaEventRecord>, S
 }
 
 /// Read `SolanaSlotRecord`s from a parquet file.
-pub fn read_slots_from_parquet(path: &Path) -> Result<Vec<SolanaSlotRecord>, SolanaCollectionError> {
+pub fn read_slots_from_parquet(
+    path: &Path,
+) -> Result<Vec<SolanaSlotRecord>, SolanaCollectionError> {
     let file = std::fs::File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| SolanaCollectionError::ParquetWrite(e.to_string()))?;
@@ -603,8 +612,7 @@ pub fn read_instructions_from_parquet(
         let accounts_col = batch
             .column_by_name("accounts")
             .expect("missing accounts column");
-        let accounts_list = accounts_col
-            .as_list::<i32>();
+        let accounts_list = accounts_col.as_list::<i32>();
 
         let ix_arr = batch
             .column_by_name("instruction_index")
@@ -1002,7 +1010,10 @@ mod tests {
         );
         assert_eq!(read_back[0].event_data, original[0].event_data);
         assert_eq!(read_back[0].log_index, original[0].log_index);
-        assert_eq!(read_back[0].instruction_index, original[0].instruction_index);
+        assert_eq!(
+            read_back[0].instruction_index,
+            original[0].instruction_index
+        );
         assert_eq!(
             read_back[0].inner_instruction_index,
             original[0].inner_instruction_index
@@ -1050,7 +1061,10 @@ mod tests {
         assert_eq!(read_back[0].accounts.len(), 2);
         assert_eq!(read_back[0].accounts[0], original[0].accounts[0]);
         assert_eq!(read_back[0].accounts[1], original[0].accounts[1]);
-        assert_eq!(read_back[0].instruction_index, original[0].instruction_index);
+        assert_eq!(
+            read_back[0].instruction_index,
+            original[0].instruction_index
+        );
         assert!(read_back[0].inner_instruction_index.is_none());
 
         // Second record
@@ -1093,11 +1107,23 @@ mod tests {
         assert_eq!(read_back[0].block_height, original[0].block_height);
         assert_eq!(read_back[0].parent_slot, original[0].parent_slot);
         assert_eq!(read_back[0].blockhash, original[0].blockhash);
-        assert_eq!(read_back[0].previous_blockhash, original[0].previous_blockhash);
-        assert_eq!(read_back[0].transaction_count, original[0].transaction_count);
+        assert_eq!(
+            read_back[0].previous_blockhash,
+            original[0].previous_blockhash
+        );
+        assert_eq!(
+            read_back[0].transaction_count,
+            original[0].transaction_count
+        );
         assert_eq!(read_back[0].transaction_signatures.len(), 2);
-        assert_eq!(read_back[0].transaction_signatures[0], original[0].transaction_signatures[0]);
-        assert_eq!(read_back[0].transaction_signatures[1], original[0].transaction_signatures[1]);
+        assert_eq!(
+            read_back[0].transaction_signatures[0],
+            original[0].transaction_signatures[0]
+        );
+        assert_eq!(
+            read_back[0].transaction_signatures[1],
+            original[0].transaction_signatures[1]
+        );
 
         // Second record (optional fields are None, empty signatures)
         assert_eq!(read_back[1].slot, original[1].slot);
@@ -1105,7 +1131,10 @@ mod tests {
         assert!(read_back[1].block_height.is_none());
         assert_eq!(read_back[1].parent_slot, original[1].parent_slot);
         assert_eq!(read_back[1].blockhash, original[1].blockhash);
-        assert_eq!(read_back[1].previous_blockhash, original[1].previous_blockhash);
+        assert_eq!(
+            read_back[1].previous_blockhash,
+            original[1].previous_blockhash
+        );
         assert_eq!(read_back[1].transaction_count, 0);
         assert!(read_back[1].transaction_signatures.is_empty());
     }
