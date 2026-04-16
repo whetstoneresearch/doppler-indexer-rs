@@ -125,13 +125,16 @@ fn parse_block_overrides(args: &[String]) -> anyhow::Result<BlockOverrides> {
     for val in &from_values {
         if let Some((chain, block_str)) = val.split_once(':') {
             let block = block_str.parse::<u64>().with_context(|| {
-                format!("Invalid numeric value '{}' for --from-block (chain '{}')", block_str, chain)
+                format!(
+                    "Invalid numeric value '{}' for --from-block (chain '{}')",
+                    block_str, chain
+                )
             })?;
             per_chain_from.insert(chain.to_string(), block);
         } else {
-            let block = val.parse::<u64>().with_context(|| {
-                format!("Invalid numeric value '{}' for --from-block", val)
-            })?;
+            let block = val
+                .parse::<u64>()
+                .with_context(|| format!("Invalid numeric value '{}' for --from-block", val))?;
             global_from = Some(block);
         }
     }
@@ -142,13 +145,16 @@ fn parse_block_overrides(args: &[String]) -> anyhow::Result<BlockOverrides> {
     for val in &to_values {
         if let Some((chain, block_str)) = val.split_once(':') {
             let block = block_str.parse::<u64>().with_context(|| {
-                format!("Invalid numeric value '{}' for --to-block (chain '{}')", block_str, chain)
+                format!(
+                    "Invalid numeric value '{}' for --to-block (chain '{}')",
+                    block_str, chain
+                )
             })?;
             per_chain_to.insert(chain.to_string(), block);
         } else {
-            let block = val.parse::<u64>().with_context(|| {
-                format!("Invalid numeric value '{}' for --to-block", val)
-            })?;
+            let block = val
+                .parse::<u64>()
+                .with_context(|| format!("Invalid numeric value '{}' for --to-block", val))?;
             global_to = Some(block);
         }
     }
@@ -198,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
     let live_only = args.iter().any(|a| a == "--live-only");
     let catch_up_only = args.iter().any(|a| a == "--catch-up-only");
     let repair_only = args.iter().any(|a| a == "--repair-only");
+    let repair_factories = args.iter().any(|a| a == "--repair-factories");
     let repair_flag = args.iter().any(|a| a == "--repair");
     let transformation_only = args.iter().any(|a| a == "--transformation-only");
     let repair = repair_flag || repair_only;
@@ -232,6 +239,21 @@ async fn main() -> anyhow::Result<()> {
     if repair_only && catch_up_only {
         anyhow::bail!("Cannot use --repair-only and --catch-up-only together");
     }
+    if repair_factories && live_only {
+        anyhow::bail!("Cannot use --repair-factories and --live-only together");
+    }
+    if repair_factories && decode_only {
+        anyhow::bail!("Cannot use --repair-factories and --decode-only together");
+    }
+    if repair_factories && catch_up_only {
+        anyhow::bail!("Cannot use --repair-factories and --catch-up-only together");
+    }
+    if repair_factories && repair_only {
+        anyhow::bail!("Cannot use --repair-factories and --repair-only together");
+    }
+    if repair_factories && repair_flag {
+        anyhow::bail!("Cannot use --repair-factories and --repair together");
+    }
     if repair_flag && live_only {
         anyhow::bail!("Cannot use --repair and --live-only together");
     }
@@ -250,8 +272,15 @@ async fn main() -> anyhow::Result<()> {
     if transformation_only && repair_flag {
         anyhow::bail!("Cannot use --transformation-only and --repair together");
     }
-    let has_source_or_function = args.iter().any(|a| a == "--source" || a.starts_with("--source="))
-        || args.iter().any(|a| a == "--function" || a.starts_with("--function="));
+    let has_source_or_function = args
+        .iter()
+        .any(|a| a == "--source" || a.starts_with("--source="))
+        || args
+            .iter()
+            .any(|a| a == "--function" || a.starts_with("--function="));
+    if has_source_or_function && repair_factories {
+        anyhow::bail!("--source/--function are not supported with --repair-factories");
+    }
     if has_source_or_function && !repair {
         anyhow::bail!("--source/--function require --repair or --repair-only");
     }
@@ -323,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if !decode_only {
+    if !decode_only && !repair_factories {
         let require_ws = !catch_up_only && !repair_only && !transformation_only;
         load_required_env_vars(&config, require_ws)?;
     }
@@ -478,6 +507,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Running in live-only mode (skips historical processing)");
     } else if catch_up_only {
         tracing::info!("Running in catch-up-only mode (fills gaps in existing data, no live mode)");
+    } else if repair_factories {
+        tracing::info!(
+            "Running in repair-factories mode (rebuild factory parquet and contract indexes from raw logs)"
+        );
     } else if transformation_only {
         tracing::info!("Running in transformation-only mode (transformation catchup only, no collection/decoding/live)");
     }
@@ -504,7 +537,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
-    let shared_db_pool: Option<Arc<DbPool>> = if !decode_only && !repair_only {
+    let shared_db_pool: Option<Arc<DbPool>> = if !decode_only && !repair_only && !repair_factories {
         if let Some(ref tc) = config.transformations {
             let registry = transformations::build_registry(0, transformation_handlers.as_ref());
             if !registry.is_empty() {
@@ -630,6 +663,8 @@ async fn main() -> anyhow::Result<()> {
                     shared_rate_limiter,
                 )
                 .await
+            } else if repair_factories {
+                repair_factories_chain(&config, &chain, storage_manager).await
             } else if decode_only {
                 decode_only_chain(&config, &chain, repair, repair_scope).await
             } else {
@@ -829,15 +864,10 @@ async fn transformation_only_chain(
     shared_db_pool: Option<Arc<DbPool>>,
     handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
-    tracing::info!(
-        "Transformation-only processing for chain: {}",
-        chain.name
-    );
+    tracing::info!("Transformation-only processing for chain: {}", chain.name);
 
     let tc = config.transformations.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "transformations config required for --transformation-only mode"
-        )
+        anyhow::anyhow!("transformations config required for --transformation-only mode")
     })?;
 
     // Build handler registry filtered to this chain (and optionally by handler names)
@@ -1038,6 +1068,46 @@ async fn repair_only_chain(
     Ok(())
 }
 
+/// Repair-factories mode: rebuild factory parquet and contract indexes from
+/// existing raw log parquet without running decoding, transformations, or live mode.
+async fn repair_factories_chain(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+    storage_manager: Arc<StorageManager>,
+) -> anyhow::Result<()> {
+    tracing::info!("Repair-factories processing for chain: {}", chain.name);
+
+    let has_factories = chain.contracts.values().any(|c| has_items(&c.factories));
+    if !has_factories {
+        tracing::info!(
+            "No factory configs for chain {}, nothing to repair",
+            chain.name
+        );
+        return Ok(());
+    }
+
+    let s3_manifest = storage_manager.manifest_for(&chain.name);
+    raw_data::historical::catchup::factories::collect_factories(
+        chain,
+        &config.raw_data_collection,
+        &None,
+        &None,
+        &None,
+        None,
+        s3_manifest,
+        Some(storage_manager),
+        true,
+    )
+    .await
+    .context("factory repair failed")?;
+
+    tracing::info!(
+        "Repair-factories processing complete for chain {}",
+        chain.name
+    );
+    Ok(())
+}
+
 /// Live-only mode: skips historical processing and starts directly in live mode.
 /// Useful for testing live mode in isolation or running on a dedicated machine.
 async fn process_chain_live_only(
@@ -1065,7 +1135,14 @@ async fn process_chain_live_only(
     }
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter, handler_filter).await?;
+    let runtime = ChainRuntime::build(
+        config,
+        chain,
+        shared_db_pool,
+        shared_rate_limiter,
+        handler_filter,
+    )
+    .await?;
 
     // Build channels with config-derived capacity
     let channels = CommonChannels::build_for_live_only(
@@ -1561,6 +1638,7 @@ impl FullPipelineContext {
                         factory_catchup_done_tx,
                         s3_manifest,
                         Some(sm),
+                        false,
                     )
                     .await
                     .context("factory catchup failed")
@@ -1692,7 +1770,14 @@ async fn process_chain(
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, shared_rate_limiter, handler_filter).await?;
+    let runtime = ChainRuntime::build(
+        config,
+        chain,
+        shared_db_pool,
+        shared_rate_limiter,
+        handler_filter,
+    )
+    .await?;
 
     let features = &runtime.features;
     let has_factories = features.has_factories;
