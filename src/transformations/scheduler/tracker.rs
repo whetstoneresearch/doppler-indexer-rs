@@ -1351,9 +1351,7 @@ mod tests {
         assert_eq!(tracker.probe(&names(&["A"]), 100).await, DepState::Ready);
         assert_eq!(tracker.probe(&names(&["A"]), 200).await, DepState::Ready);
         assert_eq!(
-            tracker
-                .probe_extended(&names(&["A"]), &[], &[], 100)
-                .await,
+            tracker.probe_extended(&names(&["A"]), &[], &[], 100).await,
             DepState::Ready
         );
     }

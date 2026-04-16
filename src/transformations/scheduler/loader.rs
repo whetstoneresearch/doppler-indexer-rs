@@ -307,9 +307,8 @@ pub(crate) struct CatchupLoader {
     pub finalizer: Arc<RangeFinalizer>,
     /// Cache of receipt address maps keyed by (range_start, range_end).
     /// Multiple event handlers processing the same range share one Arc'd HashMap.
-    pub receipt_cache: tokio::sync::RwLock<
-        HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>,
-    >,
+    pub receipt_cache:
+        tokio::sync::RwLock<HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>>,
 }
 
 impl CatchupLoader {
@@ -428,9 +427,8 @@ impl CatchupLoader {
             return cached.clone();
         }
 
-        let addresses = Arc::new(
-            read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await,
-        );
+        let addresses =
+            Arc::new(read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await);
         cache.insert(key, addresses.clone());
         addresses
     }
