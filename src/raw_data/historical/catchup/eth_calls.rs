@@ -486,6 +486,10 @@ pub async fn collect_eth_calls(
         let block_ranges =
             get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned())
                 .await;
+        let block_ranges: Vec<_> = block_ranges
+            .into_iter()
+            .filter(|br| chain.range_in_scope(br.start, br.end))
+            .collect();
         tracing::info!(
             "eth_calls catchup: checking {} block ranges (regular={}, once={})",
             block_ranges.len(),
@@ -816,6 +820,10 @@ pub async fn collect_eth_calls(
             let block_ranges =
                 get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned())
                     .await;
+            let block_ranges: Vec<_> = block_ranges
+                .into_iter()
+                .filter(|br| chain.range_in_scope(br.start, br.end))
+                .collect();
             let total_factory_ranges = block_ranges.len();
             let mut factory_once_catchup_count = 0;
 
@@ -938,6 +946,10 @@ pub async fn collect_eth_calls(
 
         let log_ranges =
             get_existing_log_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
+        let log_ranges: Vec<_> = log_ranges
+            .into_iter()
+            .filter(|lr| chain.range_in_scope(lr.start, lr.end))
+            .collect();
         let total_log_ranges = log_ranges.len();
         let event_call_concurrency = raw_data_config.event_call_concurrency.unwrap_or(4);
         let scoped_log_range_count = log_ranges

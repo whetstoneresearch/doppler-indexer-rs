@@ -95,6 +95,14 @@ pub struct ChainConfigRaw {
     /// Environment variable name for WebSocket URL (for live mode).
     pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
+    /// Operational override: start processing from this block instead of `start_block`.
+    /// Set via config JSON or `--from-block chain:block` CLI flag.
+    #[serde(default)]
+    pub from_block: Option<u64>,
+    /// Operational override: stop processing at this block (inclusive).
+    /// Suppresses live mode when set. Set via config JSON or `--to-block chain:block` CLI flag.
+    #[serde(default)]
+    pub to_block: Option<u64>,
     pub contracts: InlineOrPath<Contracts>,
     pub block_receipts_method: Option<BlockReceiptsMethod>,
     #[serde(default)]
@@ -112,11 +120,53 @@ pub struct ChainConfig {
     /// Environment variable name for WebSocket URL (for live mode).
     pub ws_url_env_var: Option<String>,
     pub start_block: Option<U256>,
+    /// Operational override: start processing from this block instead of `start_block`.
+    pub from_block: Option<u64>,
+    /// Operational override: stop processing at this block (inclusive).
+    /// Suppresses live mode when set.
+    pub to_block: Option<u64>,
     pub contracts: Contracts,
     pub block_receipts_method: Option<BlockReceiptsMethod>,
     pub factory_collections: FactoryCollections,
     /// RPC client configuration (rate limiting, concurrency).
     pub rpc: RpcConfig,
+}
+
+impl ChainConfig {
+    /// Effective start block: `from_block` overrides `start_block` when set.
+    pub fn effective_start_block(&self) -> u64 {
+        self.from_block
+            .or(self.start_block.map(|u| u.to::<u64>()))
+            .unwrap_or(0)
+    }
+
+    /// Effective upper bound: clamp `chain_head` down to `to_block` when set.
+    pub fn effective_upper_bound(&self, chain_head: u64) -> u64 {
+        match self.to_block {
+            Some(cap) => cap.min(chain_head),
+            None => chain_head,
+        }
+    }
+
+    /// Check if a half-open range `[range_start, range_end)` overlaps
+    /// the active scope `[from_block, to_block]`.
+    pub fn range_in_scope(&self, range_start: u64, range_end_exclusive: u64) -> bool {
+        if range_end_exclusive <= range_start {
+            return false;
+        }
+        let end_inclusive = range_end_exclusive - 1;
+        if let Some(from) = self.from_block {
+            if end_inclusive < from {
+                return false;
+            }
+        }
+        if let Some(to) = self.to_block {
+            if range_start > to {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub fn resolve_chain_config(
@@ -145,6 +195,8 @@ pub fn resolve_chain_config(
         rpc_url_env_var: raw_config.rpc_url_env_var,
         ws_url_env_var: raw_config.ws_url_env_var,
         start_block: raw_config.start_block,
+        from_block: raw_config.from_block,
+        to_block: raw_config.to_block,
         contracts,
         block_receipts_method: raw_config.block_receipts_method,
         factory_collections,
@@ -199,6 +251,8 @@ mod tests {
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: InlineOrPath::Path("nonexistent/contracts.json".to_string()),
             block_receipts_method: None,
             factory_collections: None,
@@ -216,6 +270,8 @@ mod tests {
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: InlineOrPath::Inline(Contracts::new()),
             block_receipts_method: Some(BlockReceiptsMethod::EthGetBlockReceipts),
             factory_collections: None,
@@ -274,5 +330,79 @@ mod tests {
         let rpc: RpcConfig = serde_json::from_str(json).unwrap();
         assert_eq!(rpc.http2, None);
         assert!(!rpc.http2_enabled());
+    }
+
+    fn make_chain_config(from_block: Option<u64>, to_block: Option<u64>) -> ChainConfig {
+        ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: Some(U256::from(1000)),
+            from_block,
+            to_block,
+            contracts: Contracts::new(),
+            block_receipts_method: None,
+            factory_collections: FactoryCollections::new(),
+            rpc: RpcConfig::default(),
+        }
+    }
+
+    #[test]
+    fn test_effective_start_block_uses_from_block_when_set() {
+        let config = make_chain_config(Some(500), None);
+        assert_eq!(config.effective_start_block(), 500);
+    }
+
+    #[test]
+    fn test_effective_start_block_falls_back_to_start_block() {
+        let config = make_chain_config(None, None);
+        assert_eq!(config.effective_start_block(), 1000);
+    }
+
+    #[test]
+    fn test_effective_upper_bound_clamps_to_to_block() {
+        let config = make_chain_config(None, Some(5000));
+        assert_eq!(config.effective_upper_bound(10000), 5000);
+        assert_eq!(config.effective_upper_bound(3000), 3000);
+    }
+
+    #[test]
+    fn test_effective_upper_bound_no_cap() {
+        let config = make_chain_config(None, None);
+        assert_eq!(config.effective_upper_bound(10000), 10000);
+    }
+
+    #[test]
+    fn test_range_in_scope_both_bounds() {
+        let config = make_chain_config(Some(200), Some(299));
+        assert!(config.range_in_scope(100, 201));  // overlaps at 200
+        assert!(config.range_in_scope(299, 300));  // overlaps at 299
+        assert!(config.range_in_scope(250, 260));  // fully inside
+        assert!(!config.range_in_scope(100, 200)); // ends before from_block
+        assert!(!config.range_in_scope(300, 400)); // starts after to_block
+    }
+
+    #[test]
+    fn test_range_in_scope_no_bounds() {
+        let config = make_chain_config(None, None);
+        assert!(config.range_in_scope(0, 1000));
+        assert!(config.range_in_scope(999999, 1000000));
+    }
+
+    #[test]
+    fn test_range_in_scope_only_from() {
+        let config = make_chain_config(Some(500), None);
+        assert!(!config.range_in_scope(0, 500));
+        assert!(config.range_in_scope(0, 501));
+        assert!(config.range_in_scope(500, 1000));
+    }
+
+    #[test]
+    fn test_range_in_scope_only_to() {
+        let config = make_chain_config(None, Some(999));
+        assert!(config.range_in_scope(0, 1000));
+        assert!(config.range_in_scope(999, 1000));
+        assert!(!config.range_in_scope(1000, 2000));
     }
 }

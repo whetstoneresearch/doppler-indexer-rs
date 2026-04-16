@@ -107,68 +107,68 @@ fn collect_flag_values(args: &[String], flag: &str) -> anyhow::Result<Vec<String
     Ok(values)
 }
 
-fn parse_optional_u64_flag(args: &[String], flag: &str) -> anyhow::Result<Option<u64>> {
-    let mut value = None;
-    let mut idx = 0usize;
-
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg == flag {
-            let Some(next) = args.get(idx + 1) else {
-                anyhow::bail!("Missing value for {}", flag);
-            };
-            if next.starts_with("--") {
-                anyhow::bail!("Missing value for {}", flag);
-            }
-            value = Some(
-                next.parse::<u64>()
-                    .with_context(|| format!("Invalid numeric value '{}' for {}", next, flag))?,
-            );
-            idx += 2;
-            continue;
-        }
-
-        let prefix = format!("{}=", flag);
-        if let Some(raw) = arg.strip_prefix(&prefix) {
-            value = Some(
-                raw.parse::<u64>()
-                    .with_context(|| format!("Invalid numeric value '{}' for {}", raw, flag))?,
-            );
-        }
-
-        idx += 1;
-    }
-
-    Ok(value)
+/// Parsed per-chain and global block overrides from CLI.
+struct BlockOverrides {
+    global_from: Option<u64>,
+    global_to: Option<u64>,
+    per_chain_from: HashMap<String, u64>,
+    per_chain_to: HashMap<String, u64>,
 }
 
-fn build_repair_scope(args: &[String]) -> anyhow::Result<Option<RepairScope>> {
-    let from_block = parse_optional_u64_flag(args, "--from-block")?;
-    let to_block = parse_optional_u64_flag(args, "--to-block")?;
-    let sources = collect_flag_values(args, "--source")?;
-    let functions = collect_flag_values(args, "--function")?;
+fn parse_block_overrides(args: &[String]) -> anyhow::Result<BlockOverrides> {
+    let from_values = collect_flag_values(args, "--from-block")?;
+    let to_values = collect_flag_values(args, "--to-block")?;
 
-    if let (Some(from_block), Some(to_block)) = (from_block, to_block) {
+    let mut global_from: Option<u64> = None;
+    let mut per_chain_from: HashMap<String, u64> = HashMap::new();
+
+    for val in &from_values {
+        if let Some((chain, block_str)) = val.split_once(':') {
+            let block = block_str.parse::<u64>().with_context(|| {
+                format!("Invalid numeric value '{}' for --from-block (chain '{}')", block_str, chain)
+            })?;
+            per_chain_from.insert(chain.to_string(), block);
+        } else {
+            let block = val.parse::<u64>().with_context(|| {
+                format!("Invalid numeric value '{}' for --from-block", val)
+            })?;
+            global_from = Some(block);
+        }
+    }
+
+    let mut global_to: Option<u64> = None;
+    let mut per_chain_to: HashMap<String, u64> = HashMap::new();
+
+    for val in &to_values {
+        if let Some((chain, block_str)) = val.split_once(':') {
+            let block = block_str.parse::<u64>().with_context(|| {
+                format!("Invalid numeric value '{}' for --to-block (chain '{}')", block_str, chain)
+            })?;
+            per_chain_to.insert(chain.to_string(), block);
+        } else {
+            let block = val.parse::<u64>().with_context(|| {
+                format!("Invalid numeric value '{}' for --to-block", val)
+            })?;
+            global_to = Some(block);
+        }
+    }
+
+    // Validate global from <= to when both set
+    if let (Some(from), Some(to)) = (global_from, global_to) {
         anyhow::ensure!(
-            from_block <= to_block,
+            from <= to,
             "--from-block ({}) cannot be greater than --to-block ({})",
-            from_block,
-            to_block
+            from,
+            to
         );
     }
 
-    let scope = RepairScope {
-        from_block,
-        to_block,
-        sources: (!sources.is_empty()).then(|| sources.into_iter().collect()),
-        functions: (!functions.is_empty()).then(|| functions.into_iter().collect()),
-    };
-
-    if scope.is_unscoped() {
-        Ok(None)
-    } else {
-        Ok(Some(scope))
-    }
+    Ok(BlockOverrides {
+        global_from,
+        global_to,
+        per_chain_from,
+        per_chain_to,
+    })
 }
 
 fn live_pipeline_expectations(
@@ -201,7 +201,9 @@ async fn main() -> anyhow::Result<()> {
     let repair_flag = args.iter().any(|a| a == "--repair");
     let transformation_only = args.iter().any(|a| a == "--transformation-only");
     let repair = repair_flag || repair_only;
-    let repair_scope = build_repair_scope(&args)?;
+    let block_overrides = parse_block_overrides(&args)?;
+    let parsed_sources = collect_flag_values(&args, "--source")?;
+    let parsed_functions = collect_flag_values(&args, "--function")?;
 
     let transformation_handlers: Option<HashSet<String>> = {
         let values = collect_flag_values(&args, "--transformation-handlers")?;
@@ -248,10 +250,10 @@ async fn main() -> anyhow::Result<()> {
     if transformation_only && repair_flag {
         anyhow::bail!("Cannot use --transformation-only and --repair together");
     }
-    if repair_scope.is_some() && !repair {
-        anyhow::bail!(
-            "--from-block/--to-block/--source/--function require --repair or --repair-only"
-        );
+    let has_source_or_function = args.iter().any(|a| a == "--source" || a.starts_with("--source="))
+        || args.iter().any(|a| a == "--function" || a.starts_with("--function="));
+    if has_source_or_function && !repair {
+        anyhow::bail!("--source/--function require --repair or --repair-only");
     }
 
     let chains_filter: Option<Vec<String>> = args
@@ -290,6 +292,37 @@ async fn main() -> anyhow::Result<()> {
             filter
         );
     }
+
+    // Merge CLI block range overrides into chain configs
+    for chain in &mut config.chains {
+        // Priority: per-chain CLI > global CLI > config JSON
+        chain.from_block = block_overrides
+            .per_chain_from
+            .get(&chain.name)
+            .copied()
+            .or(block_overrides.global_from)
+            .or(chain.from_block);
+        chain.to_block = block_overrides
+            .per_chain_to
+            .get(&chain.name)
+            .copied()
+            .or(block_overrides.global_to)
+            .or(chain.to_block);
+    }
+
+    // Validate per-chain from <= to after merging
+    for chain in &config.chains {
+        if let (Some(from), Some(to)) = (chain.from_block, chain.to_block) {
+            anyhow::ensure!(
+                from <= to,
+                "from_block ({}) cannot be greater than to_block ({}) for chain '{}'",
+                from,
+                to,
+                chain.name
+            );
+        }
+    }
+
     if !decode_only {
         let require_ws = !catch_up_only && !repair_only && !transformation_only;
         load_required_env_vars(&config, require_ws)?;
@@ -458,8 +491,15 @@ async fn main() -> anyhow::Result<()> {
             "Repair mode enabled: rebuilding once indexes from parquet, auditing raw-vs-decoded once schema drift, and repairing legacy factory-once sidecars"
         );
     }
-    if let Some(scope) = &repair_scope {
-        tracing::info!("Repair scope: {:?}", scope);
+    for chain in &config.chains {
+        if chain.from_block.is_some() || chain.to_block.is_some() {
+            tracing::info!(
+                "Chain {} block range override: from={:?}, to={:?}",
+                chain.name,
+                chain.from_block,
+                chain.to_block
+            );
+        }
     }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
@@ -535,8 +575,26 @@ async fn main() -> anyhow::Result<()> {
         let storage_manager = storage_manager.clone();
         let shared_db_pool = shared_db_pool.clone();
         let chain = chain.clone();
-        let repair_scope = repair_scope.clone();
         let transformation_handlers = transformation_handlers.clone();
+
+        // Build per-chain repair scope from the chain's merged block overrides
+        let repair_scope = if repair {
+            let scope = RepairScope {
+                from_block: chain.from_block,
+                to_block: chain.to_block,
+                sources: (!parsed_sources.is_empty())
+                    .then(|| parsed_sources.iter().cloned().collect()),
+                functions: (!parsed_functions.is_empty())
+                    .then(|| parsed_functions.iter().cloned().collect()),
+            };
+            if scope.is_unscoped() {
+                None
+            } else {
+                Some(scope)
+            }
+        } else {
+            None
+        };
 
         // Look up shared rate limiter for this chain's group
         let shared_rate_limiter = chain
@@ -864,6 +922,8 @@ async fn transformation_only_chain(
             handler_concurrency: tc.handler_concurrency,
             expect_log_completion: false,
             expect_eth_call_completion: false,
+            from_block: chain.from_block,
+            to_block: chain.to_block,
         },
         None, // No live progress tracker
     )
@@ -1035,6 +1095,8 @@ async fn process_chain_live_only(
                 handler_concurrency: tc.handler_concurrency,
                 expect_log_completion: runtime.features.has_events,
                 expect_eth_call_completion: runtime.features.has_calls,
+                from_block: chain.from_block,
+                to_block: chain.to_block,
             },
             runtime.progress_tracker.clone(),
         )
@@ -1735,7 +1797,17 @@ async fn process_chain(
         None
     };
 
-    let live_mode_enabled = !catch_up_only && should_enable_live_mode(config, &runtime.chain);
+    let live_mode_enabled = !catch_up_only
+        && runtime.chain.to_block.is_none()
+        && should_enable_live_mode(config, &runtime.chain);
+
+    if runtime.chain.to_block.is_some() && !catch_up_only {
+        tracing::info!(
+            "Live mode suppressed for chain {}: to_block={} is set",
+            runtime.chain.name,
+            runtime.chain.to_block.unwrap()
+        );
+    }
 
     // Clone for live mode transition (before originals are moved)
     let log_decoder_tx_for_live = if live_mode_enabled && has_events {
@@ -1876,6 +1948,8 @@ async fn process_chain(
                 handler_concurrency: tc.handler_concurrency,
                 expect_log_completion: has_events,
                 expect_eth_call_completion: has_calls,
+                from_block: pipeline.runtime.chain.from_block,
+                to_block: pipeline.runtime.chain.to_block,
             },
             pipeline.runtime.progress_tracker.clone(),
         )
