@@ -1007,6 +1007,7 @@ async fn repair_only_chain(
         features.has_event_triggered_calls,
         None,
         None,
+        None, // decoder_tx: repair-only mode has no live decoder
         s3_manifest,
         Some(storage_manager),
     )
@@ -1466,6 +1467,11 @@ impl FullPipelineContext {
             tasks,
             {
                 let (chain, cfg, sm) = (chain.clone(), cfg.clone(), sm.clone());
+                // Clone decoder_tx so the catchup phase can stream per-range
+                // EthCallsReady/OnceCallsReady/EventCallsReady messages to the
+                // decoder as raw parquet files are finalized. The original
+                // sender is kept for the current phase (below).
+                let call_decoder_tx_catchup = call_decoder_tx.clone();
                 async move {
                     let sm_for_current = sm.clone();
                     raw_data::historical::catchup::eth_calls::collect_eth_calls(
@@ -1479,6 +1485,7 @@ impl FullPipelineContext {
                         has_event_trigger_rx,
                         factory_catchup_done_rx,
                         eth_calls_catchup_done_tx,
+                        call_decoder_tx_catchup,
                         s3_manifest,
                         Some(sm),
                     )
