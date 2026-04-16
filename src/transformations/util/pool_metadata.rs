@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use alloy_primitives::{Address, U256};
 use deadpool_postgres::Pool;
@@ -23,14 +23,9 @@ use crate::types::config::contract::{AddressOrAddresses, Contracts};
 /// Metadata for a single pool needed by metrics handlers.
 #[derive(Debug, Clone)]
 pub struct PoolMetadata {
-    #[allow(dead_code)]
-    pub pool_id: Vec<u8>,
-    #[allow(dead_code)]
     pub base_token: [u8; 20],
     pub quote_token: [u8; 20],
     pub is_token_0: bool,
-    #[allow(dead_code)]
-    pub pool_type: String,
     pub base_decimals: u8,
     pub quote_decimals: u8,
     /// Total supply of the base token, resolved lazily via LEFT JOIN on `tokens`.
@@ -55,7 +50,7 @@ impl VersionedSource {
 
 /// Thread-safe cache of pool metadata keyed by pool_id bytes.
 pub struct PoolMetadataCache {
-    inner: RwLock<HashMap<Vec<u8>, PoolMetadata>>,
+    inner: RwLock<HashMap<Vec<u8>, Arc<PoolMetadata>>>,
     loaded: AtomicBool,
     pool_scopes: Vec<VersionedSource>,
     token_scopes: Vec<VersionedSource>,
@@ -110,7 +105,6 @@ impl PoolMetadataCache {
             let base_token_bytes: Vec<u8> = row.get("base_token");
             let quote_token_bytes: Vec<u8> = row.get("quote_token");
             let is_token_0: bool = row.get("is_token_0");
-            let pool_type: String = row.get("type");
             let total_supply =
                 parse_total_supply(row.get::<_, Option<String>>("total_supply_text"));
 
@@ -127,17 +121,15 @@ impl PoolMetadataCache {
             let quote_decimals = 18u8; // resolved later via resolve_quote_decimals()
 
             map.insert(
-                pool_id.clone(),
-                PoolMetadata {
-                    pool_id,
+                pool_id,
+                Arc::new(PoolMetadata {
                     base_token,
                     quote_token,
                     is_token_0,
-                    pool_type,
                     base_decimals,
                     quote_decimals,
                     total_supply,
-                },
+                }),
             );
         }
 
@@ -192,13 +184,13 @@ impl PoolMetadataCache {
         let mut inner = self.inner.write().unwrap();
         for meta in inner.values_mut() {
             if let Some(decimals) = quote_token_decimals(&meta.quote_token, contracts) {
-                meta.quote_decimals = decimals;
+                Arc::make_mut(meta).quote_decimals = decimals;
             }
         }
     }
 
     /// Look up metadata by pool_id.
-    pub fn get(&self, pool_id: &[u8]) -> Option<PoolMetadata> {
+    pub fn get(&self, pool_id: &[u8]) -> Option<Arc<PoolMetadata>> {
         self.inner.read().unwrap().get(pool_id).cloned()
     }
 
@@ -209,7 +201,7 @@ impl PoolMetadataCache {
     #[allow(dead_code)]
     pub fn insert_if_absent(&self, pool_id: Vec<u8>, meta: PoolMetadata) {
         let mut inner = self.inner.write().unwrap();
-        inner.entry(pool_id).or_insert(meta);
+        inner.entry(pool_id).or_insert_with(|| Arc::new(meta));
     }
 
     /// Return all unique quote token addresses in the cache.
@@ -258,7 +250,7 @@ impl PoolMetadataCache {
             // before the tokens row was committed.
             if let Some(existing) = inner.get_mut(&pool_id) {
                 if existing.total_supply.is_none() && total_supply.is_some() {
-                    existing.total_supply = total_supply;
+                    Arc::make_mut(existing).total_supply = total_supply;
                 }
                 continue;
             }
@@ -266,7 +258,6 @@ impl PoolMetadataCache {
             let base_token_bytes: Vec<u8> = row.get("base_token");
             let quote_token_bytes: Vec<u8> = row.get("quote_token");
             let is_token_0: bool = row.get("is_token_0");
-            let pool_type: String = row.get("type");
 
             if base_token_bytes.len() != 20 || quote_token_bytes.len() != 20 {
                 continue;
@@ -278,17 +269,15 @@ impl PoolMetadataCache {
             quote_token.copy_from_slice(&quote_token_bytes);
 
             inner.insert(
-                pool_id.clone(),
-                PoolMetadata {
-                    pool_id,
+                pool_id,
+                Arc::new(PoolMetadata {
                     base_token,
                     quote_token,
                     is_token_0,
-                    pool_type,
                     base_decimals: 18,
                     quote_decimals: 18,
                     total_supply,
-                },
+                }),
             );
             new_count += 1;
         }
@@ -301,7 +290,7 @@ impl PoolMetadataCache {
         for meta in inner.values_mut() {
             if meta.quote_decimals == 18 {
                 if let Some(decimals) = quote_token_decimals(&meta.quote_token, contracts) {
-                    meta.quote_decimals = decimals;
+                    Arc::make_mut(meta).quote_decimals = decimals;
                 }
             }
         }
@@ -419,7 +408,7 @@ WITH pool_scope AS (
 token_scope AS (
   SELECT * FROM unnest($4::text[], $5::int4[]) AS scope(source, source_version)
 )
-SELECT p.address, p.base_token, p.quote_token, p.is_token_0, p.type,
+SELECT p.address, p.base_token, p.quote_token, p.is_token_0,
        t.total_supply::text AS total_supply_text
 FROM pools p
 JOIN pool_scope ps
