@@ -313,6 +313,14 @@ pub(crate) struct CatchupLoader {
 }
 
 impl CatchupLoader {
+    /// Drop all cached receipt address maps.
+    ///
+    /// Called between scheduler chunks so that ranges processed in earlier chunks
+    /// do not pin their receipt data for the remainder of catchup.
+    pub(crate) async fn clear_receipt_cache(&self) {
+        self.receipt_cache.write().await.clear();
+    }
+
     /// Load data, invoke handler, execute DB ops, and record progress for one [`WorkItem`].
     pub(crate) async fn run(&self, item: WorkItem) -> Result<(), TransformationError> {
         let range_start = item.range_start;

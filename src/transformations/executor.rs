@@ -200,7 +200,11 @@ pub(crate) async fn run_handler_task(
         DbExecMode::WithSnapshotCapture { .. } => "live",
         DbExecMode::Direct => "catchup",
     };
-    let guard = HandlerMetricsGuard::new(&handler_key, mode_label);
+    let blocks = match db_exec_mode {
+        DbExecMode::WithSnapshotCapture { .. } => 1,
+        DbExecMode::Direct => range_end - range_start,
+    };
+    let guard = HandlerMetricsGuard::new(&handler_key, &chain_name, mode_label, blocks);
 
     let ctx = TransformationContext::new(
         chain_name,

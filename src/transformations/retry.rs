@@ -484,6 +484,7 @@ impl RetryProcessor {
                     tracker.mark_failed(&handler_name, range_start).await;
                     counter!(
                         "transformation_retry_attempts_total",
+                        "chain" => self.chain_name.clone(),
                         "handler_key" => handler_key.clone(),
                         "outcome" => "blocked",
                     )
@@ -570,7 +571,7 @@ impl RetryProcessor {
                         payload.handler_events,
                         payload.handler_calls,
                         payload.tx_addresses,
-                        chain_name,
+                        chain_name.clone(),
                         chain_id,
                         range_start,
                         range_end,
@@ -595,6 +596,7 @@ impl RetryProcessor {
                             .await;
                             counter!(
                                 "transformation_retry_attempts_total",
+                                "chain" => chain_name.clone(),
                                 "handler_key" => handler_key.clone(),
                                 "outcome" => "success",
                             )
@@ -604,6 +606,7 @@ impl RetryProcessor {
                         Err(TransformationError::TransientBlocked(msg)) => {
                             counter!(
                                 "transformation_retry_attempts_total",
+                                "chain" => chain_name.clone(),
                                 "handler_key" => handler_key.clone(),
                                 "outcome" => "blocked",
                             )
@@ -613,6 +616,7 @@ impl RetryProcessor {
                         Err(e) => {
                             counter!(
                                 "transformation_retry_attempts_total",
+                                "chain" => chain_name.clone(),
                                 "handler_key" => handler_key.clone(),
                                 "outcome" => "failure",
                             )
@@ -686,6 +690,7 @@ impl RetryProcessor {
                         );
                         counter!(
                             "transformation_retry_attempts_total",
+                            "chain" => self.chain_name.clone(),
                             "handler_key" => key.clone(),
                             "outcome" => "blocked",
                         )
