@@ -41,7 +41,9 @@ const ARCHIVE_ROOT: &str = "1k-archive";
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 fn main() {
-    let data_dir = std::env::args().nth(1).unwrap_or_else(|| "data".to_string());
+    let data_dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "data".to_string());
     let data_path = Path::new(&data_dir);
 
     if !data_path.exists() {
@@ -62,7 +64,13 @@ fn main() {
     let errors = AtomicU64::new(0);
 
     files.par_iter().for_each(|entry| {
-        match split_file(&entry.path, entry.range_start, entry.range_end_inclusive, &entry.prefix, data_path) {
+        match split_file(
+            &entry.path,
+            entry.range_start,
+            entry.range_end_inclusive,
+            &entry.prefix,
+            data_path,
+        ) {
             Ok(Split::Done) => {
                 let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
                 if n % 1000 == 0 || n == total as u64 {
