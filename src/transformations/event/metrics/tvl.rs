@@ -527,7 +527,7 @@ SELECT
   :chain_id,
   :pool_id,
   :block_number,
-  :block_timestamp,
+  :block_timestamp::bigint,
   state_seed.tick,
   state_seed.sqrt_price_x96,
   state_seed.price,
@@ -562,8 +562,8 @@ CROSS JOIN LATERAL (
     FROM pool_snapshots s
     WHERE s.chain_id = :chain_id
       AND s.pool_id = :pool_id
-      AND s.block_timestamp > (:block_timestamp - 86400)
-      AND s.block_timestamp <= :block_timestamp
+      AND s.block_timestamp > (:block_timestamp::bigint - 86400)
+      AND s.block_timestamp <= :block_timestamp::bigint
       AND s.source = :source
       AND s.source_version = :source_version
   ) agg
@@ -572,7 +572,7 @@ CROSS JOIN LATERAL (
     FROM pool_snapshots
     WHERE chain_id = :chain_id
       AND pool_id = :pool_id
-      AND block_timestamp <= (:block_timestamp - 3600)
+      AND block_timestamp <= (:block_timestamp::bigint - 3600)
       AND source = :source
       AND source_version = :source_version
     ORDER BY block_timestamp DESC, block_number DESC
@@ -583,7 +583,7 @@ CROSS JOIN LATERAL (
     FROM pool_snapshots
     WHERE chain_id = :chain_id
       AND pool_id = :pool_id
-      AND block_timestamp <= (:block_timestamp - 86400)
+      AND block_timestamp <= (:block_timestamp::bigint - 86400)
       AND source = :source
       AND source_version = :source_version
     ORDER BY block_timestamp DESC, block_number DESC
@@ -1336,7 +1336,8 @@ mod tests {
                 assert!(template.contains(
                     "FROM (\n    SELECT\n      COALESCE(SUM(s.volume_usd), 0) AS vol_24h"
                 ));
-                assert!(template.contains("s.block_timestamp <= :block_timestamp"));
+                assert!(template.contains(":block_timestamp::bigint"));
+                assert!(template.contains("s.block_timestamp <= :block_timestamp::bigint"));
                 assert!(!template.contains("prev.volume_24h_usd"));
                 assert!(!template.contains("prev.price_change_1h"));
                 assert!(
