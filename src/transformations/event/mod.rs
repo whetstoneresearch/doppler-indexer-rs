@@ -39,14 +39,14 @@ fn register_handlers_inner(
     chain_id: u64,
     contracts: Option<&Contracts>,
 ) {
-    // derc20_transfer::register_handlers(registry);
+    derc20_transfer::register_handlers(registry);
     v4::create::register_handlers(registry);
     multicurve::create::register_handlers(registry);
     scheduled_multicurve::create::register_handlers(registry);
-    //decay_multicurve::create::register_handlers(registry);
-    //dhook::create::register_handlers(registry);
+    decay_multicurve::create::register_handlers(registry);
+    dhook::create::register_handlers(registry);
     zora::create::register_handlers(registry);
-    //zora::transfer::register_handlers(registry);
+    zora::transfer::register_handlers(registry);
 
     // Shared oracle price cache across all swap metrics handlers.
     // ETH/USD and EURC/USD prices are shared so a single oracle reading
@@ -77,15 +77,15 @@ fn register_handlers_inner(
         Arc::clone(&oracle_cache),
     );
 
-    // let decay_multicurve_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
-    //     decay_multicurve::create::V4_DECAY_MULTICURVE_CREATE_HANDLER_SCOPE,
-    // ]));
-    // decay_multicurve::metrics::register_handlers(
-    //     registry,
-    //     chain_id,
-    //     decay_multicurve_cache,
-    //     Arc::clone(&oracle_cache),
-    // );
+    let decay_multicurve_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
+        decay_multicurve::create::V4_DECAY_MULTICURVE_CREATE_HANDLER_SCOPE,
+    ]));
+    decay_multicurve::metrics::register_handlers(
+        registry,
+        chain_id,
+        decay_multicurve_cache,
+        Arc::clone(&oracle_cache),
+    );
 
     let scheduled_multicurve_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
         scheduled_multicurve::create::V4_SCHEDULED_MULTICURVE_CREATE_HANDLER_SCOPE,
@@ -97,10 +97,10 @@ fn register_handlers_inner(
         Arc::clone(&oracle_cache),
     );
 
-    // let dhook_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
-    //     dhook::create::DOPPLER_HOOK_CREATE_HANDLER_SCOPE,
-    // ]));
-    // dhook::metrics::register_handlers(registry, chain_id, dhook_cache, Arc::clone(&oracle_cache));
+    let dhook_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
+        dhook::create::DOPPLER_HOOK_CREATE_HANDLER_SCOPE,
+    ]));
+    dhook::metrics::register_handlers(registry, chain_id, dhook_cache, Arc::clone(&oracle_cache));
 
     // V4 base (DopplerV4Hook) — sequential handler, own metadata cache
     let v4_base_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
