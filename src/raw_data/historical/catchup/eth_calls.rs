@@ -29,7 +29,7 @@ use crate::raw_data::historical::receipts::{
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
-    read_contract_index, update_contract_index, write_contract_index,
+    read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
 use crate::storage::factory_data::{
     load_factory_addresses_by_collection, load_factory_addresses_with_metadata,
@@ -69,6 +69,284 @@ pub(crate) async fn process_factory_once_catchup_range(
         Some(&expected_once),
     )
     .await
+}
+
+/// Shared context for processing a single event-triggered catchup range.
+///
+/// Bundles the per-task state that was previously cloned at each
+/// `JoinSet::spawn` site, so callers pass it as a single `Arc`.
+pub(crate) struct EventTriggeredCatchupContext {
+    pub io_semaphore: Arc<tokio::sync::Semaphore>,
+    pub rpc_semaphore: Arc<tokio::sync::Semaphore>,
+    pub event_matchers: Arc<Vec<EventTriggerMatcher>>,
+    pub event_call_configs: Arc<HashMap<EventCallKey, Vec<EventTriggeredCallConfig>>>,
+    pub factory_addresses: Arc<HashMap<String, HashSet<Address>>>,
+    pub existing_files: Arc<HashSet<String>>,
+    pub contracts: Arc<Contracts>,
+    pub base_output_dir: Arc<PathBuf>,
+    pub s3_manifest: Option<S3Manifest>,
+    pub s3_manifest_check: Option<Arc<S3Manifest>>,
+    pub storage_manager: Option<Arc<StorageManager>>,
+    pub chain_name: Arc<str>,
+    pub client: UnifiedRpcClient,
+    pub factory_contract_indexes: Arc<HashMap<String, ContractIndex>>,
+    pub factory_collections: Arc<HashSet<String>>,
+    pub multicall3_address: Option<Address>,
+    pub rpc_batch_size: usize,
+    pub repair: bool,
+    pub trigger_batch_size: usize,
+    pub total_log_ranges: usize,
+}
+
+/// Process one event-triggered catchup range.
+///
+/// Returns:
+/// - `Ok(None)` — range was skipped (already complete, empty triggers, unreadable file, or repair pass declared no work needed).
+/// - `Ok(Some((range_start, inclusive_end, contract_index_only)))` — range was processed; `contract_index_only=true` indicates a repair-mode index-stamp without RPC work.
+/// - `Err(_)` — fatal error.
+pub(crate) async fn process_event_triggered_catchup_range(
+    ctx: &EventTriggeredCatchupContext,
+    log_range: ExistingLogRange,
+    idx: usize,
+) -> Result<Option<(u64, u64, bool)>, EthCallCollectionError> {
+    let range_start = log_range.start;
+    let inclusive_end = log_range.end - 1;
+    let factory_range_key = range_key(range_start, inclusive_end);
+    let ready_factory_sources_for_range: HashSet<String> = ctx
+        .factory_collections
+        .iter()
+        .filter(|collection_name| {
+            ctx.factory_contract_indexes
+                .get(*collection_name)
+                .is_some_and(|index| index.contains_key(&factory_range_key))
+                && ctx.factory_addresses.contains_key(*collection_name)
+        })
+        .cloned()
+        .collect();
+
+    // === Skip check (non-repair only) ===
+    if !ctx.repair {
+        let event_expected_for_range =
+            build_expected_factory_contracts_for_range(&ctx.contracts, log_range.end);
+
+        let mut all_exist = true;
+        'outer: for configs in ctx.event_call_configs.values() {
+            for config in configs {
+                if let Some(sb) = config.start_block {
+                    if log_range.end <= sb {
+                        continue;
+                    }
+                }
+                let expected_for_config = if config.is_factory {
+                    event_expected_for_range.get(&config.contract_name).cloned()
+                } else {
+                    None
+                };
+                if !event_output_exists_async(
+                    ctx.base_output_dir.to_path_buf(),
+                    config.contract_name.clone(),
+                    config.function_name.clone(),
+                    log_range.start,
+                    log_range.end,
+                    ctx.s3_manifest_check.clone(),
+                    expected_for_config,
+                )
+                .await?
+                {
+                    all_exist = false;
+                    break 'outer;
+                }
+            }
+        }
+
+        if all_exist {
+            tracing::debug!(
+                "Skipping event-triggered calls for blocks {}-{} (already exists)",
+                range_start,
+                inclusive_end
+            );
+            return Ok(None);
+        }
+    }
+
+    // === I/O phase: acquire permit to limit concurrent file reads ===
+    let _io_permit = Arc::clone(&ctx.io_semaphore)
+        .acquire_owned()
+        .await
+        .unwrap();
+
+    // Read projected parquet + extract triggers
+    let batches =
+        match read_event_trigger_log_batches_from_parquet_async(log_range.file_path.clone()).await
+        {
+            Ok(batches) => batches,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read projected logs from {}: {}",
+                    log_range.file_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+    let log_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if log_count == 0 {
+        return Ok(None);
+    }
+
+    tracing::info!(
+        "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
+        range_start,
+        inclusive_end,
+        log_count
+    );
+
+    // Consume batches — each RecordBatch is freed immediately
+    // after its triggers are extracted, instead of all batches
+    // living alongside the growing triggers Vec.
+    let triggers = extract_event_triggers_from_batches(batches, ctx.event_matchers.as_ref());
+    let (triggers, filtered_factory_triggers) = filter_ready_factory_event_triggers(
+        triggers,
+        &ctx.factory_addresses,
+        &ready_factory_sources_for_range,
+    );
+
+    if filtered_factory_triggers > 0 {
+        tracing::debug!(
+            "Catchup: filtered {} factory event triggers for blocks {}-{} using pre-loaded factory addresses",
+            filtered_factory_triggers,
+            range_start,
+            inclusive_end
+        );
+    }
+
+    // Repair validation (repair only, after extraction)
+    if ctx.repair {
+        let repair_need = repair_needs_event_recollection(
+            &ctx.base_output_dir,
+            &ctx.event_call_configs,
+            &ctx.factory_addresses,
+            &ctx.contracts,
+            &triggers,
+            range_start,
+            inclusive_end,
+        )
+        .await?;
+
+        match repair_need {
+            EventRepairNeed::None => {
+                tracing::debug!(
+                    "Skipping event-triggered calls for blocks {}-{} (already verified)",
+                    range_start,
+                    inclusive_end
+                );
+                return Ok(None);
+            }
+            EventRepairNeed::ContractIndexOnly => {
+                tracing::info!(
+                    "Event-triggered calls for blocks {}-{}: data OK, stamping contract index only (skipping RPC)",
+                    range_start,
+                    inclusive_end
+                );
+                return Ok(Some((range_start, inclusive_end, true)));
+            }
+            EventRepairNeed::FullRecollection => {
+                // Fall through to RPC phase
+            }
+        }
+    }
+
+    // Release I/O permit before RPC phase
+    drop(_io_permit);
+
+    if !triggers.is_empty() {
+        tracing::info!(
+            "Extracted {} event triggers for blocks {}-{} (batch_size={}, ~{}MB est.)",
+            triggers.len(),
+            range_start,
+            inclusive_end,
+            ctx.trigger_batch_size,
+            triggers.len() * 400 / 1_000_000, // rough per-trigger estimate
+        );
+    }
+
+    // === Acquire permit for RPC phase ===
+    let permit = Arc::clone(&ctx.rpc_semaphore)
+        .acquire_owned()
+        .await
+        .unwrap();
+
+    // RPC phase — hold permit to limit concurrent RPC work
+    let (skipped, mut pending_writes) = {
+        let _permit = permit; // dropped at end of this block
+
+        let event_ctx = EthCallContext {
+            client: &ctx.client,
+            output_dir: ctx.base_output_dir.as_path(),
+            existing_files: ctx.existing_files.as_ref(),
+            rpc_batch_size: ctx.rpc_batch_size,
+            repair: ctx.repair,
+            decoder_tx: &None,
+            chain_name: ctx.chain_name.as_ref(),
+            storage_manager: ctx.storage_manager.as_ref(),
+            s3_manifest: &ctx.s3_manifest,
+        };
+        if let Some(multicall_addr) = ctx.multicall3_address {
+            process_event_triggers_multicall(
+                triggers,
+                &ctx.event_call_configs,
+                &ctx.factory_addresses,
+                &event_ctx,
+                multicall_addr,
+                range_start,
+                inclusive_end,
+                &ctx.contracts,
+                true,
+                ctx.trigger_batch_size,
+            )
+            .await?
+        } else {
+            process_event_triggers(
+                triggers,
+                &ctx.event_call_configs,
+                &ctx.factory_addresses,
+                &event_ctx,
+                range_start,
+                inclusive_end,
+                &ctx.contracts,
+                true,
+                ctx.trigger_batch_size,
+            )
+            .await?
+        }
+    }; // permit released — next range's RPC can start immediately
+
+    if !skipped.is_empty() {
+        tracing::warn!(
+            "Unexpected skipped factory triggers during catchup ({} triggers) — factory addresses should be pre-loaded",
+            skipped.len()
+        );
+    }
+
+    // Write phase — no permit held, runs concurrently with other ranges' RPC
+    while let Some(result) = pending_writes.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(EthCallCollectionError::JoinError(e.to_string())),
+        }
+    }
+
+    tracing::debug!(
+        "Event-triggered calls catchup: processed range {}/{} (blocks {}-{})",
+        idx + 1,
+        ctx.total_log_ranges,
+        range_start,
+        inclusive_end
+    );
+
+    Ok(Some((range_start, inclusive_end, false)))
 }
 
 fn should_run_event_triggered_catchup(
@@ -1032,7 +1310,6 @@ pub async fn collect_eth_calls(
             .map(|c| (c.contract_name.clone(), c.function_name.clone()))
             .collect();
 
-        use crate::storage::contract_index::ContractIndex;
         let mut ci_state: HashMap<(String, String), ContractIndex> = factory_pairs
             .iter()
             .map(|(cn, fn_)| {
@@ -1047,6 +1324,31 @@ pub async fn collect_eth_calls(
                 Arc::new(tokio::sync::Semaphore::new(event_call_concurrency * 2));
             let rpc_semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency));
 
+            // Bundle the immutable per-task state into a single Arc so each
+            // spawned task only clones one handle instead of fifteen.
+            let task_ctx = Arc::new(EventTriggeredCatchupContext {
+                io_semaphore,
+                rpc_semaphore,
+                event_matchers: event_matchers_arc.clone(),
+                event_call_configs: event_call_configs_arc.clone(),
+                factory_addresses: factory_addresses_arc.clone(),
+                existing_files: existing_files_arc.clone(),
+                contracts: contracts_arc.clone(),
+                base_output_dir: base_output_dir_arc.clone(),
+                s3_manifest: s3_manifest.clone(),
+                s3_manifest_check: s3_manifest_arc.clone(),
+                storage_manager: storage_manager_arc.clone(),
+                chain_name: chain_name_arc.clone(),
+                client: client.clone(),
+                factory_contract_indexes: factory_contract_indexes_arc.clone(),
+                factory_collections: factory_collections_arc.clone(),
+                multicall3_address,
+                rpc_batch_size,
+                repair,
+                trigger_batch_size,
+                total_log_ranges,
+            });
+
             for window in eligible_ranges.chunks(window_size) {
                 // (start, end, contract_index_only)
                 let mut join_set: tokio::task::JoinSet<
@@ -1054,262 +1356,11 @@ pub async fn collect_eth_calls(
                 > = tokio::task::JoinSet::new();
 
                 for &(idx, log_range) in window {
-                    // Clone per-task data
-                    let io_semaphore = io_semaphore.clone();
-                    let rpc_semaphore = rpc_semaphore.clone();
-                    let event_matchers = event_matchers_arc.clone();
-                    let event_call_configs = event_call_configs_arc.clone();
-                    let factory_addresses = factory_addresses_arc.clone();
-                    let existing_files = existing_files_arc.clone();
-                    let contracts = contracts_arc.clone();
-                    let base_output_dir = base_output_dir_arc.clone();
-                    let s3_manifest = s3_manifest.clone();
-                    let s3_manifest_check = s3_manifest_arc.clone();
-                    let storage_manager: Option<Arc<StorageManager>> = storage_manager_arc.clone();
-                    let chain_name = chain_name_arc.clone();
-                    let client = client.clone();
-                    let factory_contract_indexes = factory_contract_indexes_arc.clone();
-                    let factory_collections = factory_collections_arc.clone();
+                    let task_ctx = Arc::clone(&task_ctx);
                     let log_range = log_range.clone();
 
                     join_set.spawn(async move {
-                        let range_start = log_range.start;
-                        let inclusive_end = log_range.end - 1;
-                        let factory_range_key = range_key(range_start, inclusive_end);
-                        let ready_factory_sources_for_range: HashSet<String> = factory_collections
-                            .iter()
-                            .filter(|collection_name| {
-                                factory_contract_indexes
-                                    .get(*collection_name)
-                                    .is_some_and(|index| index.contains_key(&factory_range_key))
-                                    && factory_addresses.contains_key(*collection_name)
-                            })
-                            .cloned()
-                            .collect();
-
-                        // === Skip check (non-repair only) ===
-                        if !repair {
-                            let event_expected_for_range =
-                                build_expected_factory_contracts_for_range(&contracts, log_range.end);
-
-                            let mut all_exist = true;
-                            'outer: for configs in event_call_configs.values() {
-                                for config in configs {
-                                    if let Some(sb) = config.start_block {
-                                        if log_range.end <= sb {
-                                            continue;
-                                        }
-                                    }
-                                    let expected_for_config = if config.is_factory {
-                                        event_expected_for_range.get(&config.contract_name).cloned()
-                                    } else {
-                                        None
-                                    };
-                                    if !event_output_exists_async(
-                                        base_output_dir.to_path_buf(),
-                                        config.contract_name.clone(),
-                                        config.function_name.clone(),
-                                        log_range.start,
-                                        log_range.end,
-                                        s3_manifest_check.clone(),
-                                        expected_for_config,
-                                    )
-                                    .await?
-                                    {
-                                        all_exist = false;
-                                        break 'outer;
-                                    }
-                                }
-                            }
-
-                            if all_exist {
-                                tracing::debug!(
-                                    "Skipping event-triggered calls for blocks {}-{} (already exists)",
-                                    range_start,
-                                    inclusive_end
-                                );
-                                return Ok(None);
-                            }
-                        }
-
-                        // === I/O phase: acquire permit to limit concurrent file reads ===
-                        let _io_permit = io_semaphore.acquire_owned().await.unwrap();
-
-                        // Read projected parquet + extract triggers
-                        let batches = match read_event_trigger_log_batches_from_parquet_async(
-                            log_range.file_path.clone(),
-                        )
-                        .await
-                        {
-                            Ok(batches) => batches,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to read projected logs from {}: {}",
-                                    log_range.file_path.display(),
-                                    e
-                                );
-                                return Ok(None);
-                            }
-                        };
-
-                        let log_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-                        if log_count == 0 {
-                            return Ok(None);
-                        }
-
-                        tracing::info!(
-                            "Catchup: processing event-triggered calls for blocks {}-{} ({} logs)",
-                            range_start,
-                            inclusive_end,
-                            log_count
-                        );
-
-                        // Consume batches — each RecordBatch is freed immediately
-                        // after its triggers are extracted, instead of all batches
-                        // living alongside the growing triggers Vec.
-                        let triggers =
-                            extract_event_triggers_from_batches(batches, event_matchers.as_ref());
-                        let (triggers, filtered_factory_triggers) =
-                            filter_ready_factory_event_triggers(
-                                triggers,
-                                &factory_addresses,
-                                &ready_factory_sources_for_range,
-                            );
-
-                        if filtered_factory_triggers > 0 {
-                            tracing::debug!(
-                                "Catchup: filtered {} factory event triggers for blocks {}-{} using pre-loaded factory addresses",
-                                filtered_factory_triggers,
-                                range_start,
-                                inclusive_end
-                            );
-                        }
-
-                        // Repair validation (repair only, after extraction)
-                        if repair {
-                            let repair_need = repair_needs_event_recollection(
-                                &base_output_dir,
-                                &event_call_configs,
-                                &factory_addresses,
-                                &contracts,
-                                &triggers,
-                                range_start,
-                                inclusive_end,
-                            )
-                            .await?;
-
-                            match repair_need {
-                                EventRepairNeed::None => {
-                                    tracing::debug!(
-                                        "Skipping event-triggered calls for blocks {}-{} (already verified)",
-                                        range_start,
-                                        inclusive_end
-                                    );
-                                    return Ok(None);
-                                }
-                                EventRepairNeed::ContractIndexOnly => {
-                                    tracing::info!(
-                                        "Event-triggered calls for blocks {}-{}: data OK, stamping contract index only (skipping RPC)",
-                                        range_start,
-                                        inclusive_end
-                                    );
-                                    return Ok(Some((range_start, inclusive_end, true)));
-                                }
-                                EventRepairNeed::FullRecollection => {
-                                    // Fall through to RPC phase
-                                }
-                            }
-                        }
-
-                        // Release I/O permit before RPC phase
-                        drop(_io_permit);
-
-                        if !triggers.is_empty() {
-                            tracing::info!(
-                                "Extracted {} event triggers for blocks {}-{} (batch_size={}, ~{}MB est.)",
-                                triggers.len(),
-                                range_start,
-                                inclusive_end,
-                                trigger_batch_size,
-                                triggers.len() * 400 / 1_000_000, // rough per-trigger estimate
-                            );
-                        }
-
-                        // === Acquire permit for RPC phase ===
-                        let permit = rpc_semaphore.acquire_owned().await.unwrap();
-
-                        // RPC phase — hold permit to limit concurrent RPC work
-                        let (skipped, mut pending_writes) = {
-                            let _permit = permit; // dropped at end of this block
-
-                            let event_ctx = EthCallContext {
-                                client: &client,
-                                output_dir: &base_output_dir,
-                                existing_files: &existing_files,
-                                rpc_batch_size,
-                                repair,
-                                decoder_tx: &None,
-                                chain_name: &chain_name,
-                                storage_manager: storage_manager.as_ref(),
-                                s3_manifest: &s3_manifest,
-                            };
-                            if let Some(multicall_addr) = multicall3_address {
-                                process_event_triggers_multicall(
-                                    triggers,
-                                    &event_call_configs,
-                                    &factory_addresses,
-                                    &event_ctx,
-                                    multicall_addr,
-                                    range_start,
-                                    inclusive_end,
-                                    &contracts,
-                                    true,
-                                    trigger_batch_size,
-                                )
-                                .await?
-                            } else {
-                                process_event_triggers(
-                                    triggers,
-                                    &event_call_configs,
-                                    &factory_addresses,
-                                    &event_ctx,
-                                    range_start,
-                                    inclusive_end,
-                                    &contracts,
-                                    true,
-                                    trigger_batch_size,
-                                )
-                                .await?
-                            }
-                        }; // permit released — next range's RPC can start immediately
-
-                        if !skipped.is_empty() {
-                            tracing::warn!(
-                                "Unexpected skipped factory triggers during catchup ({} triggers) — factory addresses should be pre-loaded",
-                                skipped.len()
-                            );
-                        }
-
-                        // Write phase — no permit held, runs concurrently with other ranges' RPC
-                        while let Some(result) = pending_writes.join_next().await {
-                            match result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => return Err(e),
-                                Err(e) => {
-                                    return Err(EthCallCollectionError::JoinError(e.to_string()))
-                                }
-                            }
-                        }
-
-                        tracing::debug!(
-                            "Event-triggered calls catchup: processed range {}/{} (blocks {}-{})",
-                            idx + 1,
-                            total_log_ranges,
-                            range_start,
-                            inclusive_end
-                        );
-
-                        Ok(Some((range_start, inclusive_end, false)))
+                        process_event_triggered_catchup_range(&task_ctx, log_range, idx).await
                     });
                 }
 
