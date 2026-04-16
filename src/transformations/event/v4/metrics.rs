@@ -919,11 +919,9 @@ mod tests {
         handler.metadata_cache.insert_if_absent(
             pool_id.to_vec(),
             PoolMetadata {
-                pool_id: pool_id.to_vec(),
                 base_token: [1u8; 20],
                 quote_token: [2u8; 20],
                 is_token_0,
-                pool_type: "v4".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
                 total_supply: None,

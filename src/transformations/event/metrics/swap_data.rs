@@ -4,7 +4,7 @@
 //! then call process_swaps()/process_liquidity_deltas() to produce DbOperations.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use alloy_primitives::{I256, U256};
 use deadpool_postgres::Pool;
@@ -15,7 +15,7 @@ use crate::transformations::util::db::pool_metrics::{
     insert_liquidity_delta, insert_pool_snapshot, upsert_pool_state, LiquidityDeltaData,
     PoolStateData, SnapshotData,
 };
-use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
 use crate::transformations::util::price::sqrt_price_x96_to_price;
 use crate::transformations::util::usd_price::UsdPriceContext;
 
@@ -83,8 +83,9 @@ pub fn process_swaps(
     // Track the latest block per pool for pool_state upserts
     let mut latest_per_pool: BTreeMap<Vec<u8>, (u64, &BlockAccumulator)> = BTreeMap::new();
 
-    // We need to collect accumulators first, then reference them
-    let mut accumulators: Vec<(Vec<u8>, u64, BlockAccumulator)> = Vec::new();
+    // We need to collect accumulators first, then reference them.
+    // Metadata is cached alongside each accumulator to avoid a second cache lookup.
+    let mut accumulators: Vec<(Vec<u8>, u64, BlockAccumulator, Arc<PoolMetadata>)> = Vec::new();
 
     // Track skipped swaps for a single summary log at the end.
     // Collect a few (pool, block, tx_hash) samples for debugging.
@@ -140,7 +141,7 @@ pub fn process_swaps(
             continue;
         }
 
-        accumulators.push((pool_id.clone(), *block_number, acc));
+        accumulators.push((pool_id.clone(), *block_number, acc, meta));
     }
 
     if skipped_swap_count > 0 {
@@ -158,7 +159,7 @@ pub fn process_swaps(
         );
     }
 
-    for (pool_id, block_number, acc) in &accumulators {
+    for (pool_id, block_number, acc, meta) in &accumulators {
         // price_open/close/high/low are guaranteed Some because swap_count > 0.
         let price_open = acc.price_open.as_ref().unwrap().to_string();
         let price_close = acc.price_close.as_ref().unwrap().to_string();
@@ -167,7 +168,6 @@ pub fn process_swaps(
 
         // Compute volume_usd from quote-side volume if USD context is available.
         let volume_usd = usd_ctx.and_then(|ctx| {
-            let meta = metadata_cache.get(pool_id)?;
             // Quote-side volume: volume1 if base is token0, volume0 otherwise.
             let quote_volume = if meta.is_token_0 {
                 &acc.volume1
@@ -427,11 +427,9 @@ mod tests {
         cache.insert_if_absent(
             pool_id.clone(),
             PoolMetadata {
-                pool_id,
                 base_token: [0u8; 20],
                 quote_token: [1u8; 20],
                 is_token_0: true,
-                pool_type: "v3".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
                 total_supply: None,

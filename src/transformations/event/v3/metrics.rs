@@ -804,11 +804,9 @@ mod tests {
         cache.insert_if_absent(
             pool_id.clone(),
             PoolMetadata {
-                pool_id: pool_id.clone(),
                 base_token: [0u8; 20],
                 quote_token: [0u8; 20],
                 is_token_0: true,
-                pool_type: "v3".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
                 total_supply: None,
