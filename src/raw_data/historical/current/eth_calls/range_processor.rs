@@ -124,8 +124,7 @@ pub(super) async fn process_complete_range(
         let multicall_addr = state.multicall3_address;
         let factory_max_params = state.factory_max_params;
         let empty_index = HashMap::new();
-        let expected_once =
-            build_expected_factory_contracts_for_range(&state.contracts, range.end);
+        let expected_once = build_expected_factory_contracts_for_range(&state.contracts, range.end);
 
         let factory_range_fut = async {
             if has_factory && factory_not_done {

@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
-use tokio::sync::oneshot;
 use crate::raw_data::historical::blocks::{
     get_existing_block_ranges_async, read_block_info_from_parquet_async,
 };
@@ -21,7 +19,6 @@ use crate::raw_data::historical::eth_calls::{
     EventTriggeredCallConfig, ExistingLogRange, FrequencyState, OnceCallConfig,
 };
 use crate::raw_data::historical::factories::{get_factory_call_configs, FactoryAddressData};
-use crate::types::config::defaults;
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers_from_batches, EventTriggerData,
     EventTriggerMatcher,
@@ -39,8 +36,11 @@ use crate::storage::paths::{factories_dir as factories_dir_path, raw_eth_calls_d
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
+use crate::types::config::defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::shared::repair::RepairScope;
+use alloy::primitives::Address;
+use tokio::sync::oneshot;
 
 /// Extracted helper: processes factory-once catchup for a single block range.
 ///
@@ -1043,8 +1043,7 @@ pub async fn collect_eth_calls(
             .collect();
 
         {
-            let io_semaphore =
-                Arc::new(tokio::sync::Semaphore::new(event_call_concurrency * 2));
+            let io_semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency * 2));
             let rpc_semaphore = Arc::new(tokio::sync::Semaphore::new(event_call_concurrency));
 
             for window in eligible_ranges.chunks(window_size) {
