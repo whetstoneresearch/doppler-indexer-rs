@@ -42,6 +42,9 @@ use crate::types::shared::repair::RepairScope;
 use alloy::primitives::Address;
 use tokio::sync::oneshot;
 
+type EthCallJoinSet =
+    tokio::task::JoinSet<Result<Option<(u64, u64, bool)>, EthCallCollectionError>>;
+
 /// Extracted helper: processes factory-once catchup for a single block range.
 ///
 /// Builds a `FactoryAddressData` from the provided `addresses_by_block`, computes
@@ -1048,9 +1051,7 @@ pub async fn collect_eth_calls(
 
             for window in eligible_ranges.chunks(window_size) {
                 // (start, end, contract_index_only)
-                let mut join_set: tokio::task::JoinSet<
-                    Result<Option<(u64, u64, bool)>, EthCallCollectionError>,
-                > = tokio::task::JoinSet::new();
+                let mut join_set: EthCallJoinSet = tokio::task::JoinSet::new();
 
                 for &(idx, log_range) in window {
                     // Clone per-task data

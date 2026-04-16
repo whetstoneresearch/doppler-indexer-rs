@@ -1886,12 +1886,14 @@ async fn process_chain(
         && runtime.chain.to_block.is_none()
         && should_enable_live_mode(config, &runtime.chain);
 
-    if runtime.chain.to_block.is_some() && !catch_up_only {
-        tracing::info!(
-            "Live mode suppressed for chain {}: to_block={} is set",
-            runtime.chain.name,
-            runtime.chain.to_block.unwrap()
-        );
+    if !catch_up_only {
+        if let Some(to_block) = runtime.chain.to_block {
+            tracing::info!(
+                "Live mode suppressed for chain {}: to_block={} is set",
+                runtime.chain.name,
+                to_block
+            );
+        }
     }
 
     // Clone for live mode transition (before originals are moved)

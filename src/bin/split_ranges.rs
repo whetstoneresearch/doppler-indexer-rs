@@ -73,7 +73,7 @@ fn main() {
         ) {
             Ok(Split::Done) => {
                 let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 1000 == 0 || n == total as u64 {
+                if n.is_multiple_of(1000) || n == total as u64 {
                     eprintln!("[{}/{}] processed", n, total);
                 }
             }
@@ -438,10 +438,10 @@ fn sort_batch_by_all_columns(
 fn compute_range_mask(array: &UInt64Array, start: u64, end: u64) -> BooleanArray {
     let len = array.len();
     let mut mask = vec![false; len];
-    for i in 0..len {
+    for (i, mask_val) in mask.iter_mut().enumerate() {
         if !array.is_null(i) {
             let v = array.value(i);
-            mask[i] = v >= start && v <= end;
+            *mask_val = v >= start && v <= end;
         }
     }
     BooleanArray::from(mask)

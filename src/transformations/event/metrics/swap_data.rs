@@ -430,7 +430,6 @@ mod tests {
         cache.insert_if_absent(
             pool_id.clone(),
             PoolMetadata {
-                base_token: [0u8; 20],
                 quote_token: [1u8; 20],
                 is_token_0: true,
                 base_decimals: 18,

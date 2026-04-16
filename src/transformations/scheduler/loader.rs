@@ -292,6 +292,9 @@ pub(crate) struct CatchupPayload {
 
 /// Shared state needed to execute one [`WorkItem`] during catchup.
 ///
+type ReceiptCache =
+    tokio::sync::RwLock<HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>>;
+
 /// Constructed once per `run_handler_catchup` invocation and shared via `Arc`
 /// across all spawned tasks inside [`DagScheduler::execute`].
 pub(crate) struct CatchupLoader {
@@ -307,8 +310,7 @@ pub(crate) struct CatchupLoader {
     pub finalizer: Arc<RangeFinalizer>,
     /// Cache of receipt address maps keyed by (range_start, range_end).
     /// Multiple event handlers processing the same range share one Arc'd HashMap.
-    pub receipt_cache:
-        tokio::sync::RwLock<HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>>,
+    pub receipt_cache: ReceiptCache,
 }
 
 impl CatchupLoader {

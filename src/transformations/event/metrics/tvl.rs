@@ -900,7 +900,6 @@ mod tests {
 
     fn sample_meta(is_token_0: bool, total_supply: Option<U256>) -> PoolMetadata {
         PoolMetadata {
-            base_token: [0x01; 20],
             quote_token: [0x02; 20],
             is_token_0,
             base_decimals: 18,
@@ -1437,7 +1436,6 @@ mod tests {
     /// Build a USDC-quoted metadata (base=18 decimals, quote=6 decimals).
     fn sample_meta_usdc_quote(is_token_0: bool, total_supply: Option<U256>) -> PoolMetadata {
         PoolMetadata {
-            base_token: [0x01; 20],
             quote_token: [0x03; 20], // USDC address
             is_token_0,
             base_decimals: 18,
