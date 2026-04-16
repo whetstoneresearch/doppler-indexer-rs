@@ -1551,12 +1551,20 @@ impl FullPipelineContext {
             tasks,
             {
                 let (chain, cfg) = (chain.clone(), cfg.clone());
+                // Clone the streaming senders so catchup and current each have
+                // their own handles. The catchup phase emits FactoryMessage and
+                // DecoderMessage::FactoryAddresses per range to match the live
+                // phase's behavior (see catchup/factories.rs).
+                let eth_calls_factory_tx_catchup = eth_calls_factory_tx.clone();
+                let call_decoder_tx_catchup = call_decoder_tx_for_factories.clone();
                 async move {
                     raw_data::historical::catchup::factories::collect_factories(
                         &chain,
                         &cfg,
                         &logs_factory_tx,
+                        &eth_calls_factory_tx_catchup,
                         &log_decoder_tx_for_factories,
+                        &call_decoder_tx_catchup,
                         &recollect_tx_for_factories,
                         factory_catchup_done_tx,
                         s3_manifest,
