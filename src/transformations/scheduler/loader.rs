@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use super::dag::WorkItem;
 use crate::db::DbPool;
+use crate::metrics::record_chain_head_block;
 use crate::rpc::UnifiedRpcClient;
 use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use crate::transformations::engine::HandlerKind;
@@ -326,6 +327,8 @@ impl CatchupLoader {
     pub(crate) async fn run(&self, item: WorkItem) -> Result<(), TransformationError> {
         let range_start = item.range_start;
         let range_end = item.range_end;
+
+        record_chain_head_block(&self.chain_name, range_end);
 
         let payload = item
             .payload
