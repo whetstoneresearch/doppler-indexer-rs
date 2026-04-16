@@ -39,8 +39,8 @@ use super::scheduler::loader::{
 };
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
-use crate::metrics::record_chain_head_block;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
+use crate::metrics::record_chain_head_block;
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
