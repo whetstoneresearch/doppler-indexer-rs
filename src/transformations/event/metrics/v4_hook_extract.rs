@@ -181,8 +181,8 @@ mod tests {
             Arc::new(Vec::new()),
             HashMap::new(),
             historical,
-            rpc,
-            Arc::new(HashMap::new()),
+            Some(rpc),
+            Some(Arc::new(HashMap::new())),
         )
     }
 
@@ -242,7 +242,9 @@ mod tests {
             contract_address: ChainAddress::Evm([0u8; 20]),
             source_name: SOURCE.to_string(),
             function_name: "getSlot0".to_string(),
-            trigger_position: Some(LogPosition::Evm { log_index: trigger_log_index }),
+            trigger_position: Some(LogPosition::Evm {
+                log_index: trigger_log_index,
+            }),
             result,
             is_reverted,
             revert_reason: None,

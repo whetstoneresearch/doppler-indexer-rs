@@ -7,6 +7,7 @@
 //! - Compaction to merge live blocks into parquet ranges
 //! - Catchup for incomplete blocks on restart
 
+pub(crate) mod bincode_io;
 mod catchup;
 mod collector;
 mod compaction;
@@ -17,11 +18,12 @@ mod reorg;
 mod storage;
 mod types;
 
+pub use bincode_io::StorageError;
 pub use collector::LiveCollector;
 pub use compaction::{CompactionService, TransformRetryRequest};
 pub use eth_calls::LiveEthCallCollector;
-pub use progress::LiveProgressTracker;
-pub use storage::{LiveStorage, StorageError};
+pub use progress::{LiveProgressTracker, ProgressStatusStorage};
+pub use storage::LiveStorage;
 #[allow(unused_imports)]
 pub use types::{
     LiveBlockStatus, LiveDbValue, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog,

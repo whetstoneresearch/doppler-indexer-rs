@@ -145,8 +145,12 @@ impl LiveProcessingState {
         expect_instructions: bool,
     ) -> (bool, Vec<TimedOutPendingHandler>) {
         let completion = self.completion.get(&range_key).copied().unwrap_or_default();
-        let streams_ready =
-            completion.is_ready(expect_logs, expect_eth_calls, expect_account_states, expect_instructions);
+        let streams_ready = completion.is_ready(
+            expect_logs,
+            expect_eth_calls,
+            expect_account_states,
+            expect_instructions,
+        );
 
         // Check for timed-out pending events
         let timeout = Duration::from_secs(PENDING_EVENT_TIMEOUT_SECS);
@@ -234,7 +238,12 @@ impl LiveProcessingState {
         }
 
         let ready = !has_pending
-            && completion.is_ready(expect_logs, expect_eth_calls, expect_account_states, expect_instructions);
+            && completion.is_ready(
+                expect_logs,
+                expect_eth_calls,
+                expect_account_states,
+                expect_instructions,
+            );
         (ready, timed_out.into_values().collect())
     }
 
@@ -316,7 +325,12 @@ impl RangeCompletionState {
         expect_account_states: bool,
         expect_instructions: bool,
     ) -> bool {
-        self.has_required_completions(expect_logs, expect_eth_calls, expect_account_states, expect_instructions)
+        self.has_required_completions(
+            expect_logs,
+            expect_eth_calls,
+            expect_account_states,
+            expect_instructions,
+        )
     }
 }
 
@@ -624,7 +638,8 @@ mod tests {
             .or_default()
             .mark(RangeCompleteKind::Logs);
 
-        let (ready, timed_out) = state.check_finalization_readiness(range_key, true, true, false, false);
+        let (ready, timed_out) =
+            state.check_finalization_readiness(range_key, true, true, false, false);
         assert!(!ready);
         assert!(
             timed_out.is_empty(),
@@ -636,7 +651,8 @@ mod tests {
             .entry(range_key)
             .or_default()
             .mark(RangeCompleteKind::EthCalls);
-        let (_, timed_out) = state.check_finalization_readiness(range_key, true, true, false, false);
+        let (_, timed_out) =
+            state.check_finalization_readiness(range_key, true, true, false, false);
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0].handler_key, "handler_v1");
     }

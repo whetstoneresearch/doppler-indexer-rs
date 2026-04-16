@@ -17,11 +17,12 @@ use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio_postgres::types::ToSql;
 
+use super::bincode_io::StorageError;
 use super::catchup::{CollectionResumeRequest, CollectionResumeStage, LiveCatchupService};
 use super::eth_calls::{CollectedEthCallBatch, LiveEthCallCollector};
 use super::progress::LiveProgressTracker;
 use super::reorg::{ReorgDetector, ReorgEvent};
-use super::storage::{LiveStorage, StorageError};
+use super::storage::LiveStorage;
 use super::types::{
     LiveBlock, LiveBlockStatus, LiveFactoryAddresses, LiveLog, LiveMessage, LiveModeConfig,
     LivePipelineExpectations, LiveReceipt,

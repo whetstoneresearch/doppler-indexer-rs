@@ -439,11 +439,11 @@ pub struct TransformationContext {
     // ===== Services =====
     /// Historical data reader for querying parquet files
     pub(crate) historical: Arc<HistoricalDataReader>,
-    /// RPC client for ad-hoc eth_calls
-    pub(crate) rpc: Arc<UnifiedRpcClient>,
+    /// RPC client for ad-hoc eth_calls (None for non-EVM chains)
+    pub(crate) rpc: Option<Arc<UnifiedRpcClient>>,
 
     // ===== Contract Configuration =====
-    /// Contract configurations for the chain
+    /// Contract configurations for the chain (empty for non-EVM chains like Solana)
     pub(crate) contracts: Arc<Contracts>,
 }
 
@@ -460,8 +460,8 @@ impl TransformationContext {
         account_states: Arc<Vec<DecodedAccountState>>,
         tx_addresses: HashMap<TxId, TransactionAddresses>,
         historical: Arc<HistoricalDataReader>,
-        rpc: Arc<UnifiedRpcClient>,
-        contracts: Arc<Contracts>,
+        rpc: Option<Arc<UnifiedRpcClient>>,
+        contracts: Option<Arc<Contracts>>,
     ) -> Self {
         Self {
             chain_name,
@@ -474,7 +474,7 @@ impl TransformationContext {
             tx_addresses,
             historical,
             rpc,
-            contracts,
+            contracts: contracts.unwrap_or_else(|| Arc::new(Contracts::new())),
         }
     }
 
@@ -482,6 +482,7 @@ impl TransformationContext {
 
     /// Get events of a specific type from the current block range.
     /// Filters out events before the contract's start_block if configured.
+    /// When contracts config is unavailable (non-EVM chains), no start_block filtering is applied.
     pub fn events_of_type(
         &self,
         source: &str,
@@ -627,6 +628,12 @@ impl TransformationContext {
     }
 
     // ===== Contract Configuration Helpers =====
+
+    /// Returns a reference to the contracts config.
+    /// Returns an empty map for non-EVM chains (e.g. Solana).
+    pub fn contracts_ref(&self) -> &Contracts {
+        &self.contracts
+    }
 
     /// Get the start_block for a contract or collection by name.
     pub fn get_contract_start_block(&self, name: &str) -> Option<u64> {
@@ -776,8 +783,10 @@ impl TransformationContext {
         let calldata = encode_calldata(&selector, &params)?;
 
         // Build call
-        let result = self
-            .rpc
+        let rpc = self.rpc.as_ref().ok_or_else(|| {
+            TransformationError::RpcError("RPC client not available (non-EVM chain)".to_string())
+        })?;
+        let result = rpc
             .eth_call(
                 Address::from(contract_address),
                 Bytes::from(calldata),
@@ -804,8 +813,10 @@ impl TransformationContext {
         topic0: B256,
     ) -> Result<[u8; 20], TransformationError> {
         let tx_hash = B256::from(transaction_hash);
-        let receipt = self
-            .rpc
+        let rpc = self.rpc.as_ref().ok_or_else(|| {
+            TransformationError::RpcError("RPC client not available (non-EVM chain)".to_string())
+        })?;
+        let receipt = rpc
             .get_transaction_receipt(tx_hash)
             .await
             .map_err(|e| TransformationError::RpcError(e.to_string()))?

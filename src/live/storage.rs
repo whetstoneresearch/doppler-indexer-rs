@@ -20,94 +20,19 @@
 //! ```
 
 use std::fs;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use thiserror::Error;
-
+use super::bincode_io::{
+    atomic_write_with, is_temp_file, list_numbered_entries, map_io_not_found, map_not_found,
+    read_bincode, safe_delete, safe_delete_dir_all, write_bincode, StorageError,
+};
 use super::types::{
     LiveBlock, LiveBlockStatus, LiveDecodedCall, LiveDecodedEventCall, LiveDecodedLog,
     LiveDecodedOnceCall, LiveEthCall, LiveFactoryAddresses, LiveLog, LiveReceipt,
     LiveUpsertSnapshot,
 };
-
-#[derive(Debug, Error)]
-pub enum StorageError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("Block not found: {0}")]
-    NotFound(u64),
-}
-
-/// Generate path, write, read, and delete methods for a bincode storage entity.
-///
-/// Two forms:
-/// - `slice`: write takes `&[T]`, read returns `Vec<T>`
-/// - `ref`: write takes `&T`, read returns `T`
-macro_rules! storage_entity {
-    // Slice variant: write_foo(block_number, &[T]), read_foo(block_number) -> Vec<T>
-    (slice $name:ident, $type:ty, $subdir:expr) => {
-        paste::paste! {
-            fn [<$name _path>](&self, block_number: u64) -> PathBuf {
-                self.base_dir.join(format!(concat!($subdir, "/{}.bin"), block_number))
-            }
-
-            pub fn [<write_ $name>](
-                &self,
-                block_number: u64,
-                data: &[$type],
-            ) -> Result<(), StorageError> {
-                write_bincode(&self.[<$name _path>](block_number), data)
-            }
-
-            pub fn [<read_ $name>](
-                &self,
-                block_number: u64,
-            ) -> Result<Vec<$type>, StorageError> {
-                read_bincode(&self.[<$name _path>](block_number))
-                    .map_err(|e| map_not_found(e, block_number))
-            }
-
-            pub fn [<delete_ $name>](&self, block_number: u64) -> Result<(), StorageError> {
-                safe_delete(&self.[<$name _path>](block_number))
-            }
-        }
-    };
-    // Ref variant: write_foo(block_number, &T), read_foo(block_number) -> T
-    (ref $name:ident, $type:ty, $subdir:expr) => {
-        paste::paste! {
-            fn [<$name _path>](&self, block_number: u64) -> PathBuf {
-                self.base_dir.join(format!(concat!($subdir, "/{}.bin"), block_number))
-            }
-
-            pub fn [<write_ $name>](
-                &self,
-                block_number: u64,
-                data: &$type,
-            ) -> Result<(), StorageError> {
-                write_bincode(&self.[<$name _path>](block_number), data)
-            }
-
-            pub fn [<read_ $name>](
-                &self,
-                block_number: u64,
-            ) -> Result<$type, StorageError> {
-                read_bincode(&self.[<$name _path>](block_number))
-                    .map_err(|e| map_not_found(e, block_number))
-            }
-
-            pub fn [<delete_ $name>](&self, block_number: u64) -> Result<(), StorageError> {
-                safe_delete(&self.[<$name _path>](block_number))
-            }
-        }
-    };
-}
+use crate::storage_entity;
 
 /// Storage manager for live mode block data.
 #[derive(Debug, Clone)]
@@ -248,7 +173,7 @@ impl LiveStorage {
 
     /// List all block numbers in storage.
     pub fn list_blocks(&self) -> Result<Vec<u64>, StorageError> {
-        list_block_numbers(&self.base_dir.join("raw/blocks"))
+        list_numbered_entries(&self.base_dir.join("raw/blocks"))
     }
 
     // =========================================================================
@@ -277,7 +202,7 @@ impl LiveStorage {
 
     /// List all block numbers with factory address files.
     pub fn list_factory_blocks(&self) -> Result<Vec<u64>, StorageError> {
-        list_block_numbers(&self.base_dir.join("factories"))
+        list_numbered_entries(&self.base_dir.join("factories"))
     }
 
     // =========================================================================
@@ -736,141 +661,7 @@ impl LiveStorage {
     }
 }
 
-// =========================================================================
-// Helper functions
-// =========================================================================
-
-/// Atomically write to a file using a caller-supplied write function.
-///
-/// Uses write-to-temp, flush, rename pattern for atomicity.
-/// When `durable` is true, also calls `sync_all()` before rename for crash safety.
-/// Uses unique temp file names to avoid race conditions between concurrent writers.
-fn atomic_write_with<F>(path: &Path, durable: bool, write_fn: F) -> Result<(), StorageError>
-where
-    F: FnOnce(&mut BufWriter<fs::File>) -> Result<(), StorageError>,
-{
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let random_suffix: u32 = rand::random();
-    let temp_name = format!(
-        "{}.tmp.{}",
-        path.file_name().unwrap().to_string_lossy(),
-        random_suffix
-    );
-    let temp_path = path.with_file_name(temp_name);
-
-    let file = fs::File::create(&temp_path)?;
-    let mut writer = BufWriter::new(file);
-
-    let result = (|| -> Result<(), StorageError> {
-        write_fn(&mut writer)?;
-        writer.flush()?;
-        let file = writer.into_inner().map_err(std::io::Error::other)?;
-        if durable {
-            file.sync_all()?;
-        }
-        fs::rename(&temp_path, path)?;
-        Ok(())
-    })();
-
-    if let Err(e) = &result {
-        tracing::debug!(
-            "Cleaning up temp file after write error: {:?} ({})",
-            temp_path,
-            e
-        );
-        let _ = fs::remove_file(&temp_path);
-    }
-
-    result
-}
-
-/// Atomically write bincode-serialized data to a file without sync_all().
-///
-/// Data writes skip fsync because they are rebuildable — the status file
-/// is the crash-safety gatekeeper.
-fn write_bincode<T: Serialize + ?Sized>(path: &Path, data: &T) -> Result<(), StorageError> {
-    atomic_write_with(path, false, |writer| {
-        bincode::serialize_into(writer, data)?;
-        Ok(())
-    })
-}
-
-fn read_bincode<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let data = bincode::deserialize_from(reader)?;
-    Ok(data)
-}
-
-/// Map IO NotFound errors to StorageError::NotFound for bincode operations.
-fn map_not_found(err: StorageError, block_number: u64) -> StorageError {
-    match err {
-        StorageError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
-            StorageError::NotFound(block_number)
-        }
-        other => other,
-    }
-}
-
-/// Map raw IO NotFound errors to StorageError::NotFound.
-fn map_io_not_found(err: std::io::Error, block_number: u64) -> StorageError {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        StorageError::NotFound(block_number)
-    } else {
-        StorageError::Io(err)
-    }
-}
-
-/// Check if a file is a temp file (has `.tmp.{random}` suffix).
-fn is_temp_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| name.contains(".tmp."))
-}
-
-fn list_block_numbers(dir: &Path) -> Result<Vec<u64>, StorageError> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut blocks = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some(stem) = path.file_stem() {
-            if let Some(stem_str) = stem.to_str() {
-                if let Ok(block_number) = stem_str.parse::<u64>() {
-                    blocks.push(block_number);
-                }
-            }
-        }
-    }
-    blocks.sort_unstable();
-    Ok(blocks)
-}
-
-/// TOCTOU-safe file deletion. Ignores NotFound errors since the file
-/// may have been deleted between check and remove (or never existed).
-fn safe_delete(path: &Path) -> Result<(), StorageError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StorageError::Io(e)),
-    }
-}
-
-/// TOCTOU-safe directory deletion. Ignores NotFound errors since the directory
-/// may have been deleted between check and remove (or never existed).
-fn safe_delete_dir_all(path: &Path) -> Result<(), StorageError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StorageError::Io(e)),
-    }
-}
+// Helper functions moved to `super::bincode_io`.
 
 #[cfg(test)]
 mod tests {

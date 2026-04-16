@@ -400,8 +400,8 @@ mod tests {
             Arc::new(Vec::new()),
             HashMap::new(),
             historical,
-            rpc,
-            Arc::new(HashMap::new()),
+            Some(rpc),
+            Some(Arc::new(HashMap::new())),
         )
     }
 

@@ -20,8 +20,9 @@ use arrow::record_batch::RecordBatch;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use super::bincode_io::StorageError;
 use super::progress::LiveProgressTracker;
-use super::storage::{LiveStorage, StorageError};
+use super::storage::LiveStorage;
 use super::types::{LiveModeConfig, LivePipelineExpectations};
 use crate::db::DbPool;
 use crate::storage::StorageManager;

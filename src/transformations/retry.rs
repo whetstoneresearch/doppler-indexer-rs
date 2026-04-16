@@ -25,7 +25,9 @@ use crate::decoding::eth_calls::{
 };
 use crate::decoding::event_parsing::ParsedEvent;
 use crate::decoding::logs::build_event_matchers;
-use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
+use crate::live::{
+    LiveProgressTracker, LiveStorage, ProgressStatusStorage, StorageError, TransformRetryRequest,
+};
 use crate::rpc::UnifiedRpcClient;
 use crate::types::chain::{ChainAddress, LogPosition, TxId};
 use crate::types::config::contract::{Contracts, FactoryCollections};
@@ -121,14 +123,18 @@ pub(crate) fn classify_live_retry_call_artifact(
 pub(crate) struct RetryProcessor {
     pub registry: Arc<TransformationRegistry>,
     pub db_pool: Arc<DbPool>,
-    pub rpc_client: Arc<UnifiedRpcClient>,
+    pub rpc_client: Option<Arc<UnifiedRpcClient>>,
     pub historical_reader: Arc<HistoricalDataReader>,
-    pub contracts: Arc<Contracts>,
-    pub factory_collections: Arc<FactoryCollections>,
+    pub contracts: Option<Arc<Contracts>>,
+    pub factory_collections: Option<Arc<FactoryCollections>>,
     pub chain_name: String,
     pub chain_id: u64,
     pub handler_concurrency: usize,
     pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    /// Status-file storage backend (EVM `LiveStorage` or `SolanaLiveStorage`).
+    /// Used for reading/updating `completed_handlers`, `failed_handlers`,
+    /// and the `transformed` flag regardless of the chain family.
+    pub status_storage: Arc<dyn ProgressStatusStorage>,
 }
 
 use crate::db::DbPool;
@@ -169,13 +175,9 @@ impl RetryProcessor {
 
         // Union in persisted failed_handlers so stale tracker state can't hide
         // known failures. This must happen BEFORE the empty check.
-        let storage = LiveStorage::new(&self.chain_name);
-        if let Ok(status) = storage.read_status(block_number) {
-            if !status.failed_handlers.is_empty() {
-                missing_handlers = missing_handlers
-                    .union(&status.failed_handlers)
-                    .cloned()
-                    .collect();
+        if let Ok((failed, _completed)) = self.status_storage.read_handler_sets(block_number) {
+            if !failed.is_empty() {
+                missing_handlers = missing_handlers.union(&failed).cloned().collect();
             }
         }
 
@@ -186,8 +188,8 @@ impl RetryProcessor {
         }
 
         let (events, calls) = self.read_live_retry_data(block_number).await?;
-        let events = filter_events_by_start_block(&self.contracts, events);
-        let calls = filter_calls_by_start_block(&self.contracts, calls);
+        let events = filter_events_by_start_block(self.contracts.as_deref(), events);
+        let calls = filter_calls_by_start_block(self.contracts.as_deref(), calls);
 
         let blocked_handlers = self
             .execute_live_retry_handlers(block_number, events, calls, &missing_handlers)
@@ -215,8 +217,15 @@ impl RetryProcessor {
         let mut events = Vec::new();
         let mut calls = Vec::new();
 
-        let (regular_matchers, factory_matchers) =
-            build_event_matchers(&self.contracts, &self.factory_collections).map_err(|e| {
+        let empty_contracts = Contracts::new();
+        let empty_factory_collections = FactoryCollections::new();
+        let contracts_ref = self.contracts.as_deref().unwrap_or(&empty_contracts);
+        let factory_ref = self
+            .factory_collections
+            .as_deref()
+            .unwrap_or(&empty_factory_collections);
+        let (regular_matchers, factory_matchers) = build_event_matchers(contracts_ref, factory_ref)
+            .map_err(|e| {
                 TransformationError::DecodeError(format!(
                     "failed to build live retry event matchers: {}",
                     e
@@ -259,7 +268,7 @@ impl RetryProcessor {
             }
         }
 
-        let (regular_configs, once_configs, event_configs) = build_decode_configs(&self.contracts);
+        let (regular_configs, once_configs, event_configs) = build_decode_configs(contracts_ref);
         let regular_map: HashMap<(String, String), CallDecodeConfig> = regular_configs
             .into_iter()
             .map(|config| {
@@ -342,8 +351,8 @@ impl RetryProcessor {
             }
         }
 
-        let mut once_sources: HashSet<String> = self.contracts.keys().cloned().collect();
-        for contract in self.contracts.values() {
+        let mut once_sources: HashSet<String> = contracts_ref.keys().cloned().collect();
+        for contract in contracts_ref.values() {
             if let Some(factories) = &contract.factories {
                 once_sources.extend(factories.iter().map(|factory| factory.collection.clone()));
             }
@@ -715,9 +724,8 @@ impl RetryProcessor {
             .collect();
 
         // Update status file: mark succeeded handlers, track failed ones.
-        let storage = LiveStorage::new(&self.chain_name);
         if let Err(e) = update_retry_status(
-            &storage,
+            &*self.status_storage,
             block_number,
             &attempted_keys,
             &succeeded_keys,
@@ -906,7 +914,7 @@ impl RetryProcessor {
 /// that is `finalize_range()`'s responsibility after all `_handler_progress`
 /// rows are recorded.
 pub(crate) fn update_retry_status(
-    storage: &LiveStorage,
+    storage: &dyn ProgressStatusStorage,
     block_number: u64,
     attempted_keys: &HashSet<String>,
     succeeded_keys: &HashSet<String>,
@@ -918,17 +926,17 @@ pub(crate) fn update_retry_status(
         .cloned()
         .collect();
 
-    storage.update_status_atomic(block_number, |status| {
+    storage.update_handler_sets_atomic(block_number, &mut |completed, failed, transformed| {
         for key in succeeded_keys {
-            status.failed_handlers.remove(key);
-            status.completed_handlers.insert(key.clone());
+            failed.remove(key);
+            completed.insert(key.clone());
         }
         for key in &failed_keys {
-            status.failed_handlers.insert(key.clone());
-            status.completed_handlers.remove(key);
+            failed.insert(key.clone());
+            completed.remove(key);
         }
         if !failed_keys.is_empty() {
-            status.transformed = false;
+            *transformed = false;
         }
         // Don't set transformed=true here — finalize_range() handles that
         // after recording _handler_progress for all handlers.
@@ -1042,9 +1050,12 @@ fn read_live_receipt_addresses(
 // ─── Start block filtering helpers ───────────────────────────────────
 
 pub(crate) fn filter_events_by_start_block(
-    contracts: &Contracts,
+    contracts: Option<&Contracts>,
     events: Vec<DecodedEvent>,
 ) -> Vec<DecodedEvent> {
+    let Some(contracts) = contracts else {
+        return events;
+    };
     events
         .into_iter()
         .filter(|e| {
@@ -1057,9 +1068,12 @@ pub(crate) fn filter_events_by_start_block(
 }
 
 pub(crate) fn filter_calls_by_start_block(
-    contracts: &Contracts,
+    contracts: Option<&Contracts>,
     calls: Vec<DecodedCall>,
 ) -> Vec<DecodedCall> {
+    let Some(contracts) = contracts else {
+        return calls;
+    };
     calls
         .into_iter()
         .filter(|c| {

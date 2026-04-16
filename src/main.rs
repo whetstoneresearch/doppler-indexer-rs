@@ -839,7 +839,7 @@ async fn process_chain_live_only(
         let engine = TransformationEngine::new(
             runtime.registry.clone(),
             runtime.db_pool.clone().unwrap(),
-            rpc_client,
+            Some(rpc_client),
             TransformationEngineConfig {
                 chain_name: chain.name.clone(),
                 chain_id: chain.chain_id,
@@ -1685,7 +1685,7 @@ async fn process_chain(
         let engine = TransformationEngine::new(
             pipeline.runtime.registry.clone(),
             pipeline.runtime.db_pool.clone().unwrap(),
-            rpc_client,
+            Some(rpc_client),
             TransformationEngineConfig {
                 chain_name: pipeline.runtime.chain.name.clone(),
                 chain_id: pipeline.runtime.chain.chain_id,

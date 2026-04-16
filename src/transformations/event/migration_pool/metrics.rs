@@ -116,7 +116,8 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
         self.decimals_init.call_once(|| {
-            self.metadata_cache.resolve_quote_decimals(&ctx.contracts);
+            self.metadata_cache
+                .resolve_quote_decimals(ctx.contracts_ref());
         });
 
         // Refresh the migration pool ID set from DB to pick up any pools
@@ -159,7 +160,7 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
             &self.metadata_cache,
             &self.db_pool,
             self.chain_id,
-            &ctx.contracts,
+            ctx.contracts_ref(),
             self.name(),
             POOL_MANAGER_SOURCE,
         )

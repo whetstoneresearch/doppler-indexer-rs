@@ -133,6 +133,18 @@ The engine delegates to sub-components:
 - **RetryProcessor** (`retry.rs`): Re-processing failed live blocks from bincode storage
 - **LiveProcessingState** (`live_state.rs`): Pending event buffering for handlers with unmet call dependencies
 
+### Optional EVM Fields (Multi-Chain Support)
+
+The transformation engine, executor, retry processor, and catchup loader accept optional EVM-specific fields so non-EVM chains (e.g. Solana) can reuse the engine without requiring an EVM RPC client:
+
+| Field | Type | Behavior when `None` |
+|-------|------|---------------------|
+| `rpc_client` | `Option<Arc<UnifiedRpcClient>>` | Ad-hoc `eth_call` and `find_log_emitter` on `TransformationContext` return an error. Handlers that don't use EVM RPC are unaffected. |
+| `contracts` | `Option<Arc<Contracts>>` | Start-block filtering passes all events/calls through unfiltered. `TransformationContext` receives an empty `Contracts` map. Factory contract index checks use an empty map. |
+| `factory_collections` | `Option<Arc<FactoryCollections>>` | Event matcher building uses an empty map, producing no factory matchers. |
+
+EVM callers pass `Some(rpc_client)` and the engine derives `contracts`/`factory_collections` from `TransformationEngineConfig`. Solana callers pass `None` for `rpc_client` and empty collections for `contracts`/`factory_collections` in the config.
+
 ## Configuration
 
 Configure transformations in your `config.json`. Transformations are automatically enabled when:

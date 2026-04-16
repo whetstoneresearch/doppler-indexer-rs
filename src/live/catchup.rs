@@ -15,7 +15,8 @@ use alloy::primitives::{Address, B256};
 use tokio::sync::mpsc;
 use tokio_postgres::types::ToSql;
 
-use super::storage::{LiveStorage, StorageError};
+use super::bincode_io::StorageError;
+use super::storage::LiveStorage;
 use super::types::{LiveBlockStatus, LivePipelineExpectations};
 use crate::db::DbPool;
 use crate::decoding::{DecoderMessage, EthCallResult};

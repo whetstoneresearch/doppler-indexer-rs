@@ -70,8 +70,8 @@ pub(crate) struct ProcessRangePayload {
 pub(crate) struct HandlerExecutor {
     pub db_pool: Arc<DbPool>,
     pub historical_reader: Arc<HistoricalDataReader>,
-    pub rpc_client: Arc<UnifiedRpcClient>,
-    pub contracts: Arc<Contracts>,
+    pub rpc_client: Option<Arc<UnifiedRpcClient>>,
+    pub contracts: Option<Arc<Contracts>>,
     pub chain_name: String,
     pub chain_id: u64,
     pub handler_concurrency: usize,
@@ -193,8 +193,8 @@ pub(crate) async fn run_handler_task(
     range_start: u64,
     range_end: u64,
     historical: Arc<HistoricalDataReader>,
-    rpc: Arc<UnifiedRpcClient>,
-    contracts: Arc<Contracts>,
+    rpc: Option<Arc<UnifiedRpcClient>>,
+    contracts: Option<Arc<Contracts>>,
     db_pool: Arc<DbPool>,
     db_exec_mode: &DbExecMode,
 ) -> Result<HandlerOutcome, TransformationError> {
