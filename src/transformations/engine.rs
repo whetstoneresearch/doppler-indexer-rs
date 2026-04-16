@@ -158,6 +158,211 @@ struct CatchupHandler {
     sequential: bool,
 }
 
+/// Incrementally accumulates [`WorkItemOutcome`]s across scheduler chunks.
+///
+/// Replaces the previous pattern of collecting all outcomes into a single
+/// `Vec<WorkItemOutcome>` which grew unboundedly during large catchups.
+/// Counters, per-handler stats, and failure details are updated per-chunk;
+/// the successful-outcome `WorkItemOutcome` values themselves are dropped
+/// immediately after accounting.
+struct CatchupOutcomeAccumulator {
+    handler_name_to_key: HashMap<String, String>,
+    succeeded: usize,
+    blocked: usize,
+    cascade_blocked: usize,
+    cascade_failed: usize,
+    /// Only non-success outcomes are retained (for the final error report).
+    failed_items: Vec<(String, u64, String)>,
+    /// Per-handler (ok, failed, blocked, cascade_failed, cascade_blocked, panicked).
+    per_handler: HashMap<String, (usize, usize, usize, usize, usize, usize)>,
+    /// True once at least one outcome has been ingested.
+    has_outcomes: bool,
+}
+
+impl CatchupOutcomeAccumulator {
+    fn new(handler_name_to_key: HashMap<String, String>) -> Self {
+        Self {
+            handler_name_to_key,
+            succeeded: 0,
+            blocked: 0,
+            cascade_blocked: 0,
+            cascade_failed: 0,
+            failed_items: Vec::new(),
+            per_handler: HashMap::new(),
+            has_outcomes: false,
+        }
+    }
+
+    /// Process one chunk's worth of outcomes, emitting per-item logs and metrics
+    /// immediately and retaining only the failure details.
+    fn ingest(
+        &mut self,
+        outcomes: Vec<WorkItemOutcome>,
+        kind_label: &'static str,
+    ) {
+        if !outcomes.is_empty() {
+            self.has_outcomes = true;
+        }
+        for outcome in outcomes {
+            let counts = self
+                .per_handler
+                .entry(outcome.handler_name.clone())
+                .or_default();
+            let key = TransformationEngine::catchup_outcome_key(
+                &self.handler_name_to_key,
+                &outcome.handler_name,
+            );
+            match outcome.status {
+                OutcomeStatus::Succeeded => {
+                    self.succeeded += 1;
+                    counts.0 += 1;
+                    counter!(
+                        "transformation_catchup_ranges_completed_total",
+                        "handler_key" => key,
+                        "kind" => kind_label,
+                    )
+                    .increment(1);
+                }
+                OutcomeStatus::Blocked { reason } => {
+                    tracing::info!(
+                        "Handler {} blocked on range {}-{}: {}",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        outcome.range_end,
+                        reason
+                    );
+                    self.blocked += 1;
+                    counts.2 += 1;
+                    self.failed_items
+                        .push((key, outcome.range_start, format!("blocked: {}", reason)));
+                }
+                OutcomeStatus::HandlerFailed { reason } => {
+                    tracing::error!(
+                        "Handler {} failed on range {}-{}: {}",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        outcome.range_end,
+                        reason
+                    );
+                    self.failed_items
+                        .push((key, outcome.range_start, reason));
+                    counts.1 += 1;
+                }
+                OutcomeStatus::DepCascadeFailed { dep_name } => {
+                    tracing::warn!(
+                        "Handler {} cascade-failed on range {} due to dep '{}'",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        dep_name
+                    );
+                    self.failed_items.push((
+                        key,
+                        outcome.range_start,
+                        format!("cascade-failed: dep '{}' failed", dep_name),
+                    ));
+                    self.cascade_failed += 1;
+                    counts.3 += 1;
+                }
+                OutcomeStatus::DepCascadeBlocked { dep_name } => {
+                    tracing::info!(
+                        "Handler {} cascade-blocked on range {} due to dep '{}'",
+                        outcome.handler_name,
+                        outcome.range_start,
+                        dep_name
+                    );
+                    self.failed_items.push((
+                        key,
+                        outcome.range_start,
+                        format!("cascade-blocked: dep '{}' blocked", dep_name),
+                    ));
+                    self.cascade_blocked += 1;
+                    counts.4 += 1;
+                }
+                OutcomeStatus::Panicked => {
+                    tracing::error!(
+                        "Handler {} panicked on range {}",
+                        outcome.handler_name,
+                        outcome.range_start
+                    );
+                    self.failed_items
+                        .push((key, outcome.range_start, "task panicked".to_string()));
+                    counts.5 += 1;
+                }
+            }
+        }
+    }
+
+    /// Emit final per-handler summaries and return the overall result.
+    fn finish(
+        self,
+        handlers: &[CatchupHandler],
+        kind_label: &'static str,
+        catchup_start: Instant,
+    ) -> Result<(), TransformationError> {
+        for ch in handlers {
+            let name = ch.handler.name();
+            let Some(&(ok, failed, blocked_count, cascade, cascade_blocked_count, panicked)) =
+                self.per_handler.get(name)
+            else {
+                continue;
+            };
+            let total = ok + failed + blocked_count + cascade + cascade_blocked_count + panicked;
+            if failed > 0
+                || blocked_count > 0
+                || cascade > 0
+                || cascade_blocked_count > 0
+                || panicked > 0
+            {
+                tracing::info!(
+                    "Handler {} catchup result: {}/{} succeeded \
+                     ({} failed, {} blocked, {} cascade-failed, {} cascade-blocked, {} panicked)",
+                    ch.handler.handler_key(),
+                    ok,
+                    total,
+                    failed,
+                    blocked_count,
+                    cascade,
+                    cascade_blocked_count,
+                    panicked
+                );
+            } else {
+                tracing::debug!(
+                    "Handler {} catchup result: {} range(s) ok",
+                    ch.handler.handler_key(),
+                    ok
+                );
+            }
+        }
+
+        tracing::info!(
+            "{} catchup complete: {} succeeded, {} blocked, {} cascade-blocked, {} cascade-failed in {:.1}s",
+            kind_label,
+            self.succeeded,
+            self.blocked,
+            self.cascade_blocked,
+            self.cascade_failed,
+            catchup_start.elapsed().as_secs_f64()
+        );
+
+        gauge!(
+            "transformation_catchup_ranges_remaining",
+            "kind" => kind_label,
+        )
+        .set(0.0f64);
+
+        if self.failed_items.is_empty() {
+            return Ok(());
+        }
+
+        let failed_handlers: Vec<(String, String)> = self
+            .failed_items
+            .iter()
+            .map(|(key, range, reason)| (key.clone(), format!("range {}: {}", range, reason)))
+            .collect();
+        TransformationEngine::catchup_failure_error(&failed_handlers)
+    }
+}
+
 /// The transformation engine processes decoded data and invokes handlers.
 ///
 /// Progress is tracked per handler (keyed by `handler_key()`) in the
@@ -685,7 +890,13 @@ impl TransformationEngine {
         let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
         let catchup_start = Instant::now();
         let chunk_size = self.handler_concurrency * 4;
-        let mut all_outcomes: Vec<WorkItemOutcome> = Vec::new();
+
+        let handler_name_to_key: HashMap<String, String> = handlers
+            .iter()
+            .map(|ch| (ch.handler.name().to_string(), ch.handler.handler_key()))
+            .collect();
+        let handler_names: Vec<&str> = handlers.iter().map(|ch| ch.handler.name()).collect();
+        let mut acc = CatchupOutcomeAccumulator::new(handler_name_to_key);
 
         loop {
             let (items, per_handler_submitted) = self
@@ -699,7 +910,7 @@ impl TransformationEngine {
                 .await;
 
             if items.is_empty() {
-                if all_outcomes.is_empty() {
+                if !acc.has_outcomes {
                     tracing::info!(
                         "{} handler catchup: no work items to submit",
                         kind_label
@@ -731,7 +942,12 @@ impl TransformationEngine {
                 })
                 .await;
 
-            all_outcomes.extend(outcomes);
+            acc.ingest(outcomes, kind_label);
+
+            // Release receipt data cached during this chunk and prune
+            // completed entries the tracker no longer needs.
+            loader.clear_receipt_cache().await;
+            tracker.compact(&handler_names).await;
         }
 
         histogram!(
@@ -747,7 +963,7 @@ impl TransformationEngine {
         }
         progress_handle.abort();
 
-        Self::process_catchup_outcomes(all_outcomes, &handlers, kind_label, catchup_start)
+        acc.finish(&handlers, kind_label, catchup_start)
     }
 
     // ─── Catchup Sub-steps ──────────────────────────────────────────
@@ -1064,190 +1280,14 @@ impl TransformationEngine {
     }
 
     /// Process DAG scheduler outcomes: log, collect metrics, and return errors.
-    fn process_catchup_outcomes(
-        outcomes: Vec<WorkItemOutcome>,
-        handlers: &[CatchupHandler],
-        kind_label: &'static str,
-        catchup_start: Instant,
-    ) -> Result<(), TransformationError> {
-        let handler_name_to_key: HashMap<String, String> = handlers
-            .iter()
-            .map(|ch| (ch.handler.name().to_string(), ch.handler.handler_key()))
-            .collect();
-
-        let mut failed_items: Vec<(String, u64, String)> = Vec::new();
-        let mut succeeded = 0usize;
-        let mut blocked = 0usize;
-        let mut cascade_blocked = 0usize;
-        let mut cascade_failed = 0usize;
-        let mut per_handler_outcomes: HashMap<String, (usize, usize, usize, usize, usize, usize)> =
-            HashMap::new();
-
-        for outcome in &outcomes {
-            let counts = per_handler_outcomes
-                .entry(outcome.handler_name.clone())
-                .or_default();
-            match &outcome.status {
-                OutcomeStatus::Succeeded => {
-                    succeeded += 1;
-                    counts.0 += 1;
-                    let key = handler_name_to_key
-                        .get(&outcome.handler_name)
-                        .cloned()
-                        .unwrap_or_else(|| outcome.handler_name.clone());
-                    counter!(
-                        "transformation_catchup_ranges_completed_total",
-                        "handler_key" => key,
-                        "kind" => kind_label,
-                    )
-                    .increment(1);
-                }
-                OutcomeStatus::Blocked { reason } => {
-                    tracing::info!(
-                        "Handler {} blocked on range {}-{}: {}",
-                        outcome.handler_name,
-                        outcome.range_start,
-                        outcome.range_end,
-                        reason
-                    );
-                    blocked += 1;
-                    counts.2 += 1;
-                    let key = handler_name_to_key
-                        .get(&outcome.handler_name)
-                        .cloned()
-                        .unwrap_or_else(|| outcome.handler_name.clone());
-                    failed_items.push((key, outcome.range_start, format!("blocked: {}", reason)));
-                }
-                OutcomeStatus::HandlerFailed { reason } => {
-                    tracing::error!(
-                        "Handler {} failed on range {}-{}: {}",
-                        outcome.handler_name,
-                        outcome.range_start,
-                        outcome.range_end,
-                        reason
-                    );
-                    let key = handler_name_to_key
-                        .get(&outcome.handler_name)
-                        .cloned()
-                        .unwrap_or_else(|| outcome.handler_name.clone());
-                    failed_items.push((key, outcome.range_start, reason.clone()));
-                    counts.1 += 1;
-                }
-                OutcomeStatus::DepCascadeFailed { dep_name } => {
-                    tracing::warn!(
-                        "Handler {} cascade-failed on range {} due to dep '{}'",
-                        outcome.handler_name,
-                        outcome.range_start,
-                        dep_name
-                    );
-                    let key = handler_name_to_key
-                        .get(&outcome.handler_name)
-                        .cloned()
-                        .unwrap_or_else(|| outcome.handler_name.clone());
-                    failed_items.push((
-                        key,
-                        outcome.range_start,
-                        format!("cascade-failed: dep '{}' failed", dep_name),
-                    ));
-                    cascade_failed += 1;
-                    counts.3 += 1;
-                }
-                OutcomeStatus::DepCascadeBlocked { dep_name } => {
-                    tracing::info!(
-                        "Handler {} cascade-blocked on range {} due to dep '{}'",
-                        outcome.handler_name,
-                        outcome.range_start,
-                        dep_name
-                    );
-                    let key = handler_name_to_key
-                        .get(&outcome.handler_name)
-                        .cloned()
-                        .unwrap_or_else(|| outcome.handler_name.clone());
-                    failed_items.push((
-                        key,
-                        outcome.range_start,
-                        format!("cascade-blocked: dep '{}' blocked", dep_name),
-                    ));
-                    cascade_blocked += 1;
-                    counts.4 += 1;
-                }
-                OutcomeStatus::Panicked => {
-                    tracing::error!(
-                        "Handler {} panicked on range {}",
-                        outcome.handler_name,
-                        outcome.range_start
-                    );
-                    let key = handler_name_to_key
-                        .get(&outcome.handler_name)
-                        .cloned()
-                        .unwrap_or_else(|| outcome.handler_name.clone());
-                    failed_items.push((key, outcome.range_start, "task panicked".to_string()));
-                    counts.5 += 1;
-                }
-            }
-        }
-
-        // Per-handler outcome summary.
-        for ch in handlers {
-            let name = ch.handler.name();
-            let Some(&(ok, failed, blocked_count, cascade, cascade_blocked_count, panicked)) =
-                per_handler_outcomes.get(name)
-            else {
-                continue;
-            };
-            let total = ok + failed + blocked_count + cascade + cascade_blocked_count + panicked;
-            if failed > 0
-                || blocked_count > 0
-                || cascade > 0
-                || cascade_blocked_count > 0
-                || panicked > 0
-            {
-                tracing::info!(
-                    "Handler {} catchup result: {}/{} succeeded \
-                     ({} failed, {} blocked, {} cascade-failed, {} cascade-blocked, {} panicked)",
-                    ch.handler.handler_key(),
-                    ok,
-                    total,
-                    failed,
-                    blocked_count,
-                    cascade,
-                    cascade_blocked_count,
-                    panicked
-                );
-            } else {
-                tracing::debug!(
-                    "Handler {} catchup result: {} range(s) ok",
-                    ch.handler.handler_key(),
-                    ok
-                );
-            }
-        }
-
-        tracing::info!(
-            "{} catchup complete: {} succeeded, {} blocked, {} cascade-blocked, {} cascade-failed in {:.1}s",
-            kind_label,
-            succeeded,
-            blocked,
-            cascade_blocked,
-            cascade_failed,
-            catchup_start.elapsed().as_secs_f64()
-        );
-
-        gauge!(
-            "transformation_catchup_ranges_remaining",
-            "kind" => kind_label,
-        )
-        .set(0.0f64);
-
-        if failed_items.is_empty() {
-            return Ok(());
-        }
-
-        let failed_handlers: Vec<(String, String)> = failed_items
-            .iter()
-            .map(|(key, range, reason)| (key.clone(), format!("range {}: {}", range, reason)))
-            .collect();
-        Self::catchup_failure_error(&failed_handlers)
+    fn catchup_outcome_key(
+        handler_name_to_key: &HashMap<String, String>,
+        handler_name: &str,
+    ) -> String {
+        handler_name_to_key
+            .get(handler_name)
+            .cloned()
+            .unwrap_or_else(|| handler_name.to_string())
     }
 
     fn resolve_decoded_call_path(
