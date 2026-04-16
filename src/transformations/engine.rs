@@ -195,11 +195,7 @@ impl CatchupOutcomeAccumulator {
 
     /// Process one chunk's worth of outcomes, emitting per-item logs and metrics
     /// immediately and retaining only the failure details.
-    fn ingest(
-        &mut self,
-        outcomes: Vec<WorkItemOutcome>,
-        kind_label: &'static str,
-    ) {
+    fn ingest(&mut self, outcomes: Vec<WorkItemOutcome>, kind_label: &'static str) {
         if !outcomes.is_empty() {
             self.has_outcomes = true;
         }
@@ -233,8 +229,11 @@ impl CatchupOutcomeAccumulator {
                     );
                     self.blocked += 1;
                     counts.2 += 1;
-                    self.failed_items
-                        .push((key, outcome.range_start, format!("blocked: {}", reason)));
+                    self.failed_items.push((
+                        key,
+                        outcome.range_start,
+                        format!("blocked: {}", reason),
+                    ));
                 }
                 OutcomeStatus::HandlerFailed { reason } => {
                     tracing::error!(
@@ -244,8 +243,7 @@ impl CatchupOutcomeAccumulator {
                         outcome.range_end,
                         reason
                     );
-                    self.failed_items
-                        .push((key, outcome.range_start, reason));
+                    self.failed_items.push((key, outcome.range_start, reason));
                     counts.1 += 1;
                 }
                 OutcomeStatus::DepCascadeFailed { dep_name } => {
@@ -911,10 +909,7 @@ impl TransformationEngine {
 
             if items.is_empty() {
                 if !acc.has_outcomes {
-                    tracing::info!(
-                        "{} handler catchup: no work items to submit",
-                        kind_label
-                    );
+                    tracing::info!("{} handler catchup: no work items to submit", kind_label);
                 }
                 break;
             }
