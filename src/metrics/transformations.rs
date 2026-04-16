@@ -61,6 +61,38 @@ pub fn describe_transformation_metrics() {
         "transformation_handlers_in_flight",
         "Handler tasks currently executing"
     );
+    describe_gauge!(
+        "transformation_handler_completed_block",
+        "Highest block number (range_end) completed by each handler, per chain"
+    );
+    describe_gauge!(
+        "transformation_chain_head_block",
+        "Latest block number seen by the transformation engine, per chain"
+    );
+}
+
+/// Update the highest completed block gauge for a handler.
+///
+/// Call this after a handler successfully records progress for a range.
+pub fn record_handler_completed_block(handler_key: &str, chain: &str, block_end: u64) {
+    gauge!(
+        "transformation_handler_completed_block",
+        "handler_key" => handler_key.to_string(),
+        "chain" => chain.to_string(),
+    )
+    .set(block_end as f64);
+}
+
+/// Update the chain head block gauge.
+///
+/// Call this when the engine receives or begins processing a new block range,
+/// so the gauge reflects the latest block the engine is aware of.
+pub fn record_chain_head_block(chain: &str, block: u64) {
+    gauge!(
+        "transformation_chain_head_block",
+        "chain" => chain.to_string(),
+    )
+    .set(block as f64);
 }
 
 /// RAII guard for recording handler execution metrics.

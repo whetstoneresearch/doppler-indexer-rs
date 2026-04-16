@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use metrics::histogram;
+
+use crate::metrics::record_handler_completed_block;
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -85,6 +87,8 @@ impl RangeFinalizer {
                 update_condition: None,
             }])
             .await?;
+
+        record_handler_completed_block(handler_key, &self.chain_name, range_end);
 
         Ok(())
     }
