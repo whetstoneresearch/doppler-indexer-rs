@@ -8,6 +8,8 @@ Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rus
 
 Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`), Transformation-Only (`--transformation-only`). The `--transformation-handlers` flag filters which handlers run (comma-separated names) and works with any mode.
 
+Per-chain block range overrides (`from_block`/`to_block`) limit all phases to a specific block range. Set via config JSON per chain or CLI (`--from-block [chain:]block`, `--to-block [chain:]block`). When `to_block` is set, live mode is suppressed. Priority: per-chain CLI > global CLI > config JSON.
+
 ### Subsystems
 
 | Subsystem | Description |

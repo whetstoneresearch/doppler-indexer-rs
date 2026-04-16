@@ -116,6 +116,10 @@ pub async fn collect_receipts(
     // =========================================================================
     let block_ranges =
         get_existing_block_ranges_async(chain.name.clone(), s3_manifest.as_ref().cloned()).await;
+    let block_ranges: Vec<_> = block_ranges
+        .into_iter()
+        .filter(|br| chain.range_in_scope(br.start, br.end))
+        .collect();
     let mut catchup_count = 0;
 
     // Check existing logs files

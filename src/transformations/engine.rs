@@ -116,6 +116,10 @@ pub struct TransformationEngineConfig {
     pub handler_concurrency: usize,
     pub expect_log_completion: bool,
     pub expect_eth_call_completion: bool,
+    /// Optional lower bound (inclusive) for catchup block range filtering.
+    pub from_block: Option<u64>,
+    /// Optional upper bound (inclusive) for catchup block range filtering.
+    pub to_block: Option<u64>,
 }
 
 /// A handler paired with the decoded calls it needs to process.
@@ -178,6 +182,10 @@ pub struct TransformationEngine {
     live_state: Mutex<LiveProcessingState>,
     /// Live mode progress tracker for marking block completion.
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    /// Optional lower bound (inclusive) for catchup block range filtering.
+    from_block: Option<u64>,
+    /// Optional upper bound (inclusive) for catchup block range filtering.
+    to_block: Option<u64>,
 }
 
 impl TransformationEngine {
@@ -254,6 +262,8 @@ impl TransformationEngine {
             retry_processor,
             live_state: Mutex::new(LiveProcessingState::default()),
             progress_tracker,
+            from_block: config.from_block,
+            to_block: config.to_block,
         })
     }
 
@@ -371,6 +381,27 @@ impl TransformationEngine {
         })
         .await
         .map_err(|e| TransformationError::IoError(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Check whether a range `[range_start, range_end_exclusive)` overlaps the
+    /// configured `from_block..=to_block` window.  Returns `false` for empty
+    /// ranges or ranges entirely outside the window.
+    fn range_in_scope(&self, range_start: u64, range_end_exclusive: u64) -> bool {
+        if range_end_exclusive <= range_start {
+            return false;
+        }
+        let end_inclusive = range_end_exclusive - 1;
+        if let Some(from) = self.from_block {
+            if end_inclusive < from {
+                return false;
+            }
+        }
+        if let Some(to) = self.to_block {
+            if range_start > to {
+                return false;
+            }
+        }
+        true
     }
 
     #[allow(dead_code)]
@@ -561,6 +592,21 @@ impl TransformationEngine {
         };
 
         let mut available = self.scan_available_ranges(base_dir).await?;
+
+        if self.from_block.is_some() || self.to_block.is_some() {
+            let before = available.len();
+            available.retain(|(start, end)| self.range_in_scope(*start, *end));
+            if available.len() < before {
+                tracing::info!(
+                    "{} handler catchup: filtered {} to {} ranges by block range override (from={:?}, to={:?})",
+                    kind_label,
+                    before,
+                    available.len(),
+                    self.from_block,
+                    self.to_block
+                );
+            }
+        }
 
         if available.is_empty() {
             tracing::info!(

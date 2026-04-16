@@ -1662,6 +1662,8 @@ mod tests {
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),

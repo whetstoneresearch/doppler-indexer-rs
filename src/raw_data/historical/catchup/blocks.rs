@@ -53,9 +53,10 @@ pub async fn collect_blocks(
     tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-    let start_block = chain.start_block.map(|u| u.to::<u64>()).unwrap_or(0);
+    let start_block = chain.effective_start_block();
 
-    let chain_head = client.get_block_number().await?;
+    let raw_chain_head = client.get_block_number().await?;
+    let chain_head = chain.effective_upper_bound(raw_chain_head);
 
     tracing::info!(
         "Chain {} head at block {}, starting collection from block {}",
