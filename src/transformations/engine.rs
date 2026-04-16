@@ -1397,6 +1397,15 @@ impl TransformationEngine {
     // ─── Live Processing ─────────────────────────────────────────────
 
     /// Run the transformation engine, processing messages from channels.
+    ///
+    /// Runs `run_catchup` concurrently with the live `select!` loop rather
+    /// than sequentially behind a `decode_catchup_done_rx` barrier. The
+    /// live loop must start draining `events_rx`/`calls_rx` from message #1
+    /// to avoid back-pressuring the decoder (which is now also streaming
+    /// during its own catchup). `CompletionTracker.register_call_dep_ranges`
+    /// via the background `CallDepScanner` provides streaming readiness for
+    /// call dependencies, so `run_catchup`'s DAG scheduling naturally picks
+    /// up ranges as the decoder finishes them.
     pub async fn run(
         &self,
         mut events_rx: Receiver<DecodedEventsMessage>,
@@ -1404,28 +1413,32 @@ impl TransformationEngine {
         mut complete_rx: Receiver<RangeCompleteMessage>,
         mut reorg_rx: Option<Receiver<ReorgMessage>>,
         mut retry_rx: Option<Receiver<TransformRetryRequest>>,
-        decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
+        _decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<(), TransformationError> {
-        if let Some(rx) = decode_catchup_done_rx {
-            tracing::info!(
-                "Waiting for eth_call decode catchup to complete before transformation catchup..."
-            );
-            let _ = rx.await;
-            tracing::info!(
-                "Eth_call decode catchup complete, proceeding with transformation catchup"
-            );
-        }
-
-        self.run_catchup().await?;
-
         tracing::info!(
             "Transformation engine started for chain {} in {:?} mode",
             self.chain_name,
             self.mode
         );
 
-        loop {
-            tokio::select! {
+        let catchup_fut = async {
+            let res = self.run_catchup().await;
+            match &res {
+                Ok(()) => tracing::info!(
+                    "Transformation catchup complete for chain {}",
+                    self.chain_name
+                ),
+                Err(e) => tracing::error!(
+                    "Transformation catchup failed for chain {}: {}",
+                    self.chain_name, e
+                ),
+            }
+            res
+        };
+
+        let live_fut = async {
+            loop {
+                tokio::select! {
                 biased;
 
                 Some(msg) = events_rx.recv() => {
@@ -1535,12 +1548,18 @@ impl TransformationEngine {
                         .await?;
                 }
 
-                else => {
-                    tracing::info!("All channels closed, transformation engine shutting down");
-                    break;
+                    else => {
+                        tracing::info!("All channels closed, transformation engine shutting down");
+                        break;
+                    }
                 }
             }
-        }
+            Ok::<(), TransformationError>(())
+        };
+
+        let (catchup_res, live_res) = tokio::join!(catchup_fut, live_fut);
+        catchup_res?;
+        live_res?;
 
         tracing::info!(
             "Transformation engine completed for chain {}",
