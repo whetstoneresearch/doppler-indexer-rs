@@ -624,7 +624,6 @@ pub async fn collect_eth_calls(
     has_factory_rx: bool,
     has_event_trigger_rx: bool,
     factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
-    eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
     decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
@@ -690,10 +689,6 @@ pub async fn collect_eth_calls(
         && !has_event_triggered_calls
     {
         tracing::info!("No eth_calls configured for chain {}", chain.name);
-        // Signal catchup done immediately
-        if let Some(tx) = eth_calls_catchup_done_tx {
-            let _ = tx.send(());
-        }
         return Ok(EthCallCatchupState {
             base_output_dir,
             range_size,
@@ -1443,11 +1438,6 @@ pub async fn collect_eth_calls(
         "Eth_call collection catchup finished for chain {}",
         chain.name
     );
-
-    // Signal that all catchup phases are complete
-    if let Some(tx) = eth_calls_catchup_done_tx {
-        let _ = tx.send(());
-    }
 
     Ok(EthCallCatchupState {
         base_output_dir,

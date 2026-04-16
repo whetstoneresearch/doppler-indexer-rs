@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use metrics::{counter, gauge, histogram};
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 
 use super::context::{DecodedCall, DecodedEvent, TransactionAddresses};
@@ -1413,7 +1412,6 @@ impl TransformationEngine {
         mut complete_rx: Receiver<RangeCompleteMessage>,
         mut reorg_rx: Option<Receiver<ReorgMessage>>,
         mut retry_rx: Option<Receiver<TransformRetryRequest>>,
-        _decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
     ) -> Result<(), TransformationError> {
         tracing::info!(
             "Transformation engine started for chain {} in {:?} mode",

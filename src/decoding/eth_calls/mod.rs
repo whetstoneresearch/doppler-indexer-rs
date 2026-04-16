@@ -16,7 +16,6 @@ pub use transform::{build_result_map, build_result_map_for_merge};
 use std::time::Instant;
 
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
 
 use super::catchup;
 use super::current;
@@ -31,8 +30,6 @@ pub async fn decode_eth_calls(
     raw_data_config: &RawDataCollectionConfig,
     decoder_rx: Receiver<super::types::DecoderMessage>,
     outputs: EthCallDecoderOutputs<'_>,
-    _eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
-    decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
     repair: bool,
     repair_scope: Option<RepairScope>,
@@ -48,10 +45,6 @@ pub async fn decode_eth_calls(
             "No eth_calls configured for decoding on chain {}",
             chain.name
         );
-        // Signal barrier before early return so the engine doesn't wait forever
-        if let Some(tx) = decode_catchup_done_tx {
-            let _ = tx.send(());
-        }
         // Drain channel and return
         let mut decoder_rx = decoder_rx;
         while decoder_rx.recv().await.is_some() {}
@@ -98,9 +91,6 @@ pub async fn decode_eth_calls(
                     chain.name
                 );
             }
-            if let Some(tx) = decode_catchup_done_tx {
-                let _ = tx.send(());
-            }
             return Ok::<(), EthCallDecodingError>(());
         }
 
@@ -124,9 +114,6 @@ pub async fn decode_eth_calls(
             decode_start.elapsed().as_secs_f64()
         );
 
-        if let Some(tx) = decode_catchup_done_tx {
-            let _ = tx.send(());
-        }
         Ok(())
     };
 
