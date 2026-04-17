@@ -76,7 +76,7 @@ fn instruction_indices(pos: &LogPosition) -> (u16, Option<u16>) {
 }
 
 /// Serialize params to JSON string.
-fn params_to_json(params: &HashMap<String, DecodedValue>) -> String {
+fn params_to_json(params: &HashMap<Arc<str>, DecodedValue>) -> String {
     serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string())
 }
 

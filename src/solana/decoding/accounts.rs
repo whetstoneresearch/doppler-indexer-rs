@@ -40,7 +40,11 @@ impl SolanaAccountDecoder {
                 owner_program: ChainAddress::Solana(owner_program),
                 source_name: source_name.to_string(),
                 account_type: fields.account_type,
-                fields: fields.fields,
+                fields: fields
+                    .fields
+                    .into_iter()
+                    .map(|(name, value)| (Arc::<str>::from(name), value))
+                    .collect(),
             }),
             Ok(None) => None,
             Err(e) => {

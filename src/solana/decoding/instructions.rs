@@ -49,10 +49,14 @@ impl SolanaInstructionDecoder {
                 // Merge args and named_accounts into one params map.
                 // Account names are prefixed with "accounts." to avoid
                 // collisions with instruction arguments of the same name.
-                let mut params = fields.args;
+                let mut params: HashMap<Arc<str>, DecodedValue> = fields
+                    .args
+                    .into_iter()
+                    .map(|(name, value)| (Arc::<str>::from(name), value))
+                    .collect();
                 for (name, pubkey) in fields.named_accounts {
                     params.insert(
-                        format!("accounts.{}", name),
+                        Arc::<str>::from(format!("accounts.{}", name)),
                         DecodedValue::ChainAddress(ChainAddress::Solana(pubkey)),
                     );
                 }

@@ -53,7 +53,11 @@ impl SolanaEventDecoder {
                 source_name: source_name.to_string(),
                 event_name: fields.event_name.clone(),
                 event_signature: fields.event_name,
-                params: fields.params,
+                params: fields
+                    .params
+                    .into_iter()
+                    .map(|(name, value)| (Arc::<str>::from(name), value))
+                    .collect(),
             }),
             Ok(None) => None,
             Err(e) => {

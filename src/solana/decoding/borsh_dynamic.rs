@@ -4,6 +4,7 @@
 //! the `borsh` crate -- all byte reading is done manually from a cursor.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::types::chain::ChainAddress;
 use crate::types::decoded::DecodedValue;
@@ -177,7 +178,7 @@ pub fn deserialize_value(
                     let mut pairs = Vec::with_capacity(fields.len());
                     for (field_name, field_type) in fields {
                         let val = deserialize_value(cursor, field_type, defined_types)?;
-                        pairs.push((field_name.clone(), val));
+                        pairs.push((Arc::<str>::from(field_name.as_str()), val));
                     }
                     Ok(DecodedValue::NamedTuple(pairs))
                 }
@@ -194,12 +195,12 @@ pub fn deserialize_value(
                         Some(fields) => {
                             let mut pairs = Vec::with_capacity(fields.len() + 1);
                             pairs.push((
-                                "variant".to_owned(),
+                                Arc::<str>::from("variant"),
                                 DecodedValue::String(variant.name.clone()),
                             ));
                             for (field_name, field_type) in fields {
                                 let val = deserialize_value(cursor, field_type, defined_types)?;
-                                pairs.push((field_name.clone(), val));
+                                pairs.push((Arc::<str>::from(field_name.as_str()), val));
                             }
                             Ok(DecodedValue::NamedTuple(pairs))
                         }

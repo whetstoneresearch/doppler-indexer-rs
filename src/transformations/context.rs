@@ -247,7 +247,7 @@ pub struct DecodedCall {
     pub source_name: String,
     /// Function name (e.g., "slot0", "balanceOf")
     pub function_name: String,
-    /// For event-triggered calls, the log index of the triggering event
+    /// For event-triggered calls, the position of the triggering event
     pub trigger_position: Option<LogPosition>,
     /// Decoded return value(s) keyed by field name.
     /// For single return values, the key is the function name or "result".
@@ -286,15 +286,6 @@ impl DecodedCall {
             .as_evm_ref()
             .expect("evm_address_ref() called on non-EVM call")
     }
-
-    /// EVM convenience accessor.
-    pub fn trigger_log_index(&self) -> Option<u32> {
-        self.trigger_position.map(|position| {
-            position
-                .evm_log_index()
-                .expect("trigger_log_index() called on non-EVM call")
-        })
-    }
 }
 
 impl FieldExtractor for DecodedCall {
@@ -323,7 +314,7 @@ pub struct DecodedAccountState {
     /// Account type name from IDL (e.g., "Whirlpool")
     pub account_type: String,
     /// Decoded field values keyed by field name
-    pub fields: HashMap<String, DecodedValue>,
+    pub fields: HashMap<Arc<str>, DecodedValue>,
 }
 
 #[allow(dead_code)]
@@ -342,7 +333,7 @@ impl DecodedAccountState {
 }
 
 impl FieldExtractor for DecodedAccountState {
-    fn field_values(&self) -> &HashMap<String, DecodedValue> {
+    fn field_values(&self) -> &HashMap<Arc<str>, DecodedValue> {
         &self.fields
     }
 
@@ -973,7 +964,7 @@ mod tests {
         }
     }
 
-    fn make_test_account_state(fields: HashMap<String, DecodedValue>) -> DecodedAccountState {
+    fn make_test_account_state(fields: HashMap<Arc<str>, DecodedValue>) -> DecodedAccountState {
         DecodedAccountState {
             block_number: 100,
             block_timestamp: 1234567890,
@@ -999,7 +990,7 @@ mod tests {
     fn test_field_extractor_extract_address_from_chain_address() {
         let mut params = HashMap::new();
         params.insert(
-            "from".to_string(),
+            Arc::from("from"),
             DecodedValue::ChainAddress(ChainAddress::Evm([42u8; 20])),
         );
         let event = make_test_event(params);
@@ -1012,7 +1003,7 @@ mod tests {
     fn test_field_extractor_extract_pubkey_from_account_state() {
         let mut fields = HashMap::new();
         fields.insert(
-            "authority".to_string(),
+            Arc::from("authority"),
             DecodedValue::ChainAddress(ChainAddress::Solana([42u8; 32])),
         );
         let account_state = make_test_account_state(fields);
@@ -1025,7 +1016,7 @@ mod tests {
     fn test_field_extractor_extract_chain_address_from_account_state() {
         let mut fields = HashMap::new();
         fields.insert(
-            "pool".to_string(),
+            Arc::from("pool"),
             DecodedValue::ChainAddress(ChainAddress::Solana([7u8; 32])),
         );
         let account_state = make_test_account_state(fields);
