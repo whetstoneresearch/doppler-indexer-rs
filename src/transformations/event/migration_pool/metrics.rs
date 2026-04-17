@@ -179,7 +179,7 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
             ctx.contracts_ref(),
             self.name(),
             POOL_MANAGER_SOURCE,
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -432,7 +432,7 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             POOL_MANAGER_SOURCE,
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

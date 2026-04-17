@@ -168,7 +168,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
             ctx.contracts_ref(),
             self.name(),
             SOURCE,
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

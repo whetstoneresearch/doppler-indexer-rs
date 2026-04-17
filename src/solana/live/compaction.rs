@@ -24,8 +24,12 @@ use crate::solana::raw_data::parquet::{
     build_event_schema, build_instruction_schema, build_slot_schema, write_events_to_parquet,
     write_instructions_to_parquet, write_slots_to_parquet,
 };
-use crate::solana::raw_data::types::{SolanaEventRecord, SolanaInstructionRecord, SolanaSlotRecord};
-use crate::storage::paths::{raw_solana_events_dir, raw_solana_instructions_dir, raw_solana_slots_dir};
+use crate::solana::raw_data::types::{
+    SolanaEventRecord, SolanaInstructionRecord, SolanaSlotRecord,
+};
+use crate::storage::paths::{
+    raw_solana_events_dir, raw_solana_instructions_dir, raw_solana_slots_dir,
+};
 use crate::storage::skipped_slots;
 
 // ---------------------------------------------------------------------------
@@ -1061,7 +1065,11 @@ mod tests {
         let skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
         let rk = skipped_slots::range_key(0, 9);
         let skipped = skipped_index.get(&rk).cloned().unwrap_or_default();
-        assert_eq!(skipped.len(), 10, "All 10 slots should be in skipped_slots.json");
+        assert_eq!(
+            skipped.len(),
+            10,
+            "All 10 slots should be in skipped_slots.json"
+        );
 
         // Slots parquet must exist for find_resume_slot
         let slots_path = raw_solana_slots_dir(chain_name).join("0-9.parquet");

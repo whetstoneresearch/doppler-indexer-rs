@@ -80,7 +80,7 @@ impl TransformationHandler for DecayMulticurveSwapMetricsHandler {
             ctx.contracts_ref(),
             self.name(),
             SOURCE,
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -233,7 +233,7 @@ impl TransformationHandler for DecayMulticurveTvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             SOURCE,
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

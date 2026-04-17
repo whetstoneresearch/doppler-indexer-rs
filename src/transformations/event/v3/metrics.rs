@@ -156,7 +156,7 @@ impl TransformationHandler for V3SwapMetricsHandler {
             ctx.contracts_ref(),
             self.name(),
             "DopplerV3Pool",
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -314,7 +314,7 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
             ctx.contracts_ref(),
             self.name(),
             "DopplerLockableV3Pool",
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -496,7 +496,7 @@ impl TransformationHandler for V3TvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             "DopplerV3Pool",
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -604,7 +604,7 @@ impl TransformationHandler for LockableV3TvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             "DopplerLockableV3Pool",
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

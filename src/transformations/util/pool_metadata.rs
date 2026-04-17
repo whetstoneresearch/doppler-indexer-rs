@@ -553,10 +553,9 @@ WHERE p.chain_id = $1
                 .await
                 .map_err(|e| TransformationError::DatabaseError(e.into()))
         }
-        (false, false) => {
-            client
-                .query(
-                    r#"
+        (false, false) => client
+            .query(
+                r#"
 WITH pool_scope AS (
   SELECT * FROM unnest($2::text[], $3::int4[]) AS scope(source, source_version)
 ),
@@ -597,17 +596,16 @@ LEFT JOIN tokens t
  )
 WHERE p.chain_id = $1
 "#,
-                    &[
-                        &(chain_id as i64),
-                        &pool_sources,
-                        &pool_versions,
-                        &token_sources,
-                        &token_versions,
-                    ],
-                )
-                .await
-                .map_err(|e| TransformationError::DatabaseError(e.into()))
-        }
+                &[
+                    &(chain_id as i64),
+                    &pool_sources,
+                    &pool_versions,
+                    &token_sources,
+                    &token_versions,
+                ],
+            )
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into())),
     }
 }
 

@@ -652,18 +652,17 @@ fn extract_live_transactions(block: &UiConfirmedBlock, slot: u64) -> Vec<LiveTra
             Some(s) => s,
             None => continue,
         };
-        let (is_err, err_msg, fee, compute_units_consumed, log_messages) =
-            match &encoded_tx.meta {
-                Some(meta) => {
-                    let is_err = meta.err.is_some();
-                    let err_msg = meta.err.as_ref().map(|e| e.to_string());
-                    let fee = meta.fee;
-                    let cu: Option<u64> = meta.compute_units_consumed.clone().into();
-                    let logs: Option<&Vec<String>> = meta.log_messages.as_ref().into();
-                    (is_err, err_msg, fee, cu, logs.cloned().unwrap_or_default())
-                }
-                None => (false, None, 0, None, Vec::new()),
-            };
+        let (is_err, err_msg, fee, compute_units_consumed, log_messages) = match &encoded_tx.meta {
+            Some(meta) => {
+                let is_err = meta.err.is_some();
+                let err_msg = meta.err.as_ref().map(|e| e.to_string());
+                let fee = meta.fee;
+                let cu: Option<u64> = meta.compute_units_consumed.clone().into();
+                let logs: Option<&Vec<String>> = meta.log_messages.as_ref().into();
+                (is_err, err_msg, fee, cu, logs.cloned().unwrap_or_default())
+            }
+            None => (false, None, 0, None, Vec::new()),
+        };
         result.push(LiveTransaction {
             slot,
             block_time,

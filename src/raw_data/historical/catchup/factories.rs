@@ -39,7 +39,9 @@ async fn send_factory_range_to_eth_calls(
     let range_start = factory_data.range_start;
     let range_end = factory_data.range_end;
     if tx
-        .send(FactoryMessage::IncrementalAddresses(Arc::clone(factory_data)))
+        .send(FactoryMessage::IncrementalAddresses(Arc::clone(
+            factory_data,
+        )))
         .await
         .is_err()
     {
