@@ -18,7 +18,7 @@ use solana_sdk::pubkey::Pubkey;
 
 use crate::solana::rpc::{SolanaRpcClient, SolanaRpcError};
 use crate::storage::paths::solana_discovery_dir;
-use crate::types::config::solana::{SolanaDiscoveryConfig, SolanaPrograms};
+use crate::types::config::solana::{SolanaDiscoveryConfig, SolanaProgramConfig, SolanaPrograms};
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -294,9 +294,10 @@ impl DiscoveryManager {
     /// Bootstrap: discover existing accounts via `getProgramAccounts` with
     /// discriminator filter.
     ///
-    /// For each program that has discovery configs with an `account_type`,
-    /// computes the Anchor discriminator (`sha256("account:<Type>")[..8]`) and
-    /// fetches all matching accounts from the RPC node.
+    /// For each program that names an account type either in discovery configs
+    /// or account-read configs, computes the Anchor discriminator
+    /// (`sha256("account:<Type>")[..8]`) and fetches all matching accounts from
+    /// the RPC node.
     ///
     /// This is expensive and should run once at startup.
     pub async fn bootstrap(
@@ -305,21 +306,15 @@ impl DiscoveryManager {
         programs: &SolanaPrograms,
     ) -> Result<(), SolanaRpcError> {
         for (program_name, program_config) in programs {
-            let discovery = match &program_config.discovery {
-                Some(d) if !d.is_empty() => d,
-                _ => continue,
-            };
+            let account_types = bootstrap_account_types(program_config);
+            if account_types.is_empty() {
+                continue;
+            }
 
             let program_id = Pubkey::from_str(&program_config.program_id)
                 .map_err(|e| SolanaRpcError::InvalidPubkey(e.to_string()))?;
 
-            // Collect unique account types from discovery configs.
-            let account_types: HashSet<&str> = discovery
-                .iter()
-                .filter_map(|d| d.account_type.as_deref())
-                .collect();
-
-            for account_type in account_types {
+            for account_type in &account_types {
                 let discriminator = anchor_account_discriminator(account_type);
 
                 let filter =
@@ -329,7 +324,7 @@ impl DiscoveryManager {
                     program = %program_name,
                     account_type = %account_type,
                     program_id = %program_id,
-                    "Bootstrapping discovery via getProgramAccounts"
+                    "Bootstrapping known accounts via getProgramAccounts"
                 );
 
                 let accounts = rpc
@@ -340,7 +335,7 @@ impl DiscoveryManager {
                     .known_accounts
                     .entry(program_name.clone())
                     .or_default()
-                    .entry(account_type.to_string())
+                    .entry(account_type.clone())
                     .or_default();
 
                 let mut new_count = 0usize;
@@ -356,7 +351,7 @@ impl DiscoveryManager {
                     total_fetched = accounts.len(),
                     newly_discovered = new_count,
                     total_known = known_set.len(),
-                    "Bootstrap discovery complete for account type"
+                    "Bootstrap known-account discovery complete for account type"
                 );
             }
         }
@@ -436,6 +431,26 @@ impl DiscoveryManager {
     }
 }
 
+fn bootstrap_account_types(program_config: &SolanaProgramConfig) -> HashSet<String> {
+    let mut account_types = HashSet::new();
+
+    if let Some(discovery) = &program_config.discovery {
+        for config in discovery {
+            if let Some(account_type) = config.account_type.as_deref() {
+                account_types.insert(account_type.to_string());
+            }
+        }
+    }
+
+    if let Some(accounts) = &program_config.accounts {
+        for account in accounts {
+            account_types.insert(account.account_type.clone());
+        }
+    }
+
+    account_types
+}
+
 impl std::fmt::Debug for DiscoveryManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscoveryManager")
@@ -470,7 +485,8 @@ pub fn anchor_account_discriminator(account_type: &str) -> [u8; DISCRIMINATOR_LE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::config::solana::SolanaProgramConfig;
+    use crate::types::config::eth_call::Frequency;
+    use crate::types::config::solana::{SolanaAccountReadConfig, SolanaProgramConfig};
 
     /// Helper: build a minimal SolanaPrograms map with one program that has discovery.
     fn make_programs_with_discovery() -> SolanaPrograms {
@@ -507,6 +523,28 @@ mod tests {
                 decoder: None,
                 events: Some(vec![]),
                 accounts: None,
+                discovery: None,
+                start_slot: None,
+            },
+        );
+        programs
+    }
+
+    fn make_programs_with_accounts_only() -> SolanaPrograms {
+        let mut programs = HashMap::new();
+        programs.insert(
+            "accounts_only".to_string(),
+            SolanaProgramConfig {
+                program_id: "11111111111111111111111111111111".to_string(),
+                idl_path: None,
+                idl_format: None,
+                decoder: None,
+                events: None,
+                accounts: Some(vec![SolanaAccountReadConfig {
+                    name: "vault".to_string(),
+                    account_type: "Vault".to_string(),
+                    frequency: Frequency::Once,
+                }]),
                 discovery: None,
                 start_slot: None,
             },
@@ -553,6 +591,28 @@ mod tests {
 
         assert!(manager.discovery_configs.is_empty());
         assert_eq!(manager.total_known_addresses(), 0);
+    }
+
+    #[test]
+    fn bootstrap_account_types_include_accounts_without_discovery() {
+        let programs = make_programs_with_accounts_only();
+        let account_types = bootstrap_account_types(programs.get("accounts_only").unwrap());
+
+        assert_eq!(account_types, HashSet::from([String::from("Vault")]));
+    }
+
+    #[test]
+    fn bootstrap_account_types_deduplicate_discovery_and_accounts() {
+        let mut programs = make_programs_with_discovery();
+        programs.get_mut("orca_whirlpool").unwrap().accounts =
+            Some(vec![SolanaAccountReadConfig {
+                name: "whirlpool_state".to_string(),
+                account_type: "Whirlpool".to_string(),
+                frequency: Frequency::Once,
+            }]);
+
+        let account_types = bootstrap_account_types(programs.get("orca_whirlpool").unwrap());
+        assert_eq!(account_types, HashSet::from([String::from("Whirlpool")]));
     }
 
     // -----------------------------------------------------------------------
