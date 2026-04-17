@@ -15,7 +15,7 @@ The database module provides a PostgreSQL connection pool, typed operation build
 
 - Query planning or ORM functionality -- SQL is generated from typed operations, not a query DSL
 - Schema design -- table schemas are defined in migration files, not in Rust types
-- Connection encryption -- connections use `NoTls` (TLS is not configured)
+- Connection encryption -- plaintext local Postgres is supported, but managed/public Postgres deployments should use TLS via the connection string
 - Read replicas or multi-database routing
 
 ## Module Structure
@@ -300,7 +300,7 @@ Properties:
 6. **Migration deduplication**: Handler migration paths are deduplicated before execution. Two handlers declaring the same migration path will not cause double-execution.
 7. **Pool validation**: `DbPool::new` acquires and releases a connection immediately, failing fast on unreachable databases or invalid credentials.
 8. **Uint64 overflow**: `DbValue::Uint64` is cast to `i64` for PostgreSQL `BIGINT`. Values exceeding `i64::MAX` will overflow silently.
-9. **No TLS**: Connections use `NoTls`. This is appropriate for localhost or VPC-internal databases but not for connections over the public internet.
+9. **TLS depends on the connection string**: `sslmode=disable` keeps local plaintext Postgres working, while managed/public Postgres deployments should use `sslmode=require` or stricter.
 
 ## Dependencies
 

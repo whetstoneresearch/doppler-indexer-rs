@@ -27,3 +27,6 @@ CREATE TABLE IF NOT EXISTS pools (
     source_version INT NOT NULL,
     UNIQUE (chain_id, address, source, source_version)
 );
+
+CREATE INDEX IF NOT EXISTS idx_pools_chain_source
+    ON pools (chain_id, source, source_version);
