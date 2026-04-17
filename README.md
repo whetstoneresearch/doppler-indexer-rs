@@ -40,8 +40,6 @@ On pushes to `main`, the `Publish Image` workflow builds and pushes the image to
 - `ghcr.io/${owner}/doppler-indexer-rs:<git-sha>`
 - `ghcr.io/${owner}/doppler-indexer-rs:main`
 
-Project-specific deployment automation is intentionally kept outside this repository.
-
 ## Questions
 
 Join the [Doppler Telegram community](https://doppler.lol/telegram) or open an issue in this repository to get in touch.
