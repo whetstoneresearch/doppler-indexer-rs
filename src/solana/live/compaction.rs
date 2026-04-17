@@ -21,11 +21,11 @@ use super::storage::SolanaLiveStorage;
 use super::types::SolanaLivePipelineExpectations;
 use crate::live::{LiveModeConfig, LiveProgressTracker, TransformRetryRequest};
 use crate::solana::raw_data::parquet::{
-    build_event_schema, build_instruction_schema, write_events_to_parquet,
-    write_instructions_to_parquet,
+    build_event_schema, build_instruction_schema, build_slot_schema, write_events_to_parquet,
+    write_instructions_to_parquet, write_slots_to_parquet,
 };
-use crate::solana::raw_data::types::{SolanaEventRecord, SolanaInstructionRecord};
-use crate::storage::paths::{raw_solana_events_dir, raw_solana_instructions_dir};
+use crate::solana::raw_data::types::{SolanaEventRecord, SolanaInstructionRecord, SolanaSlotRecord};
+use crate::storage::paths::{raw_solana_events_dir, raw_solana_instructions_dir, raw_solana_slots_dir};
 use crate::storage::skipped_slots;
 
 // ---------------------------------------------------------------------------
@@ -290,17 +290,40 @@ impl SolanaCompactionService {
         &self,
     ) -> Result<Vec<CompactableRange>, SolanaCompactionError> {
         let slots = self.storage.list_slots()?;
-        if slots.is_empty() {
+        let status_slots = self.storage.list_statuses()?;
+
+        if slots.is_empty() && status_slots.is_empty() {
             return Ok(Vec::new());
         }
 
         let range_size = self.config.range_size;
+        let slots_set: HashSet<u64> = slots.iter().copied().collect();
 
-        // Group slots by aligned range: range_start = (slot / range_size) * range_size
+        // Use max of all known slots (data + status-only) for the reorg boundary.
+        // Without this, ranges made entirely of skipped slots would have no
+        // data-slot max to compare against and would bypass the reorg check.
+        let latest_known = slots.iter().chain(status_slots.iter()).copied().max();
+
+        // Group data slots by aligned range.
         let mut ranges: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-        for slot_number in slots {
+        for &slot_number in &slots {
             let range_start = (slot_number / range_size) * range_size;
             ranges.entry(range_start).or_default().push(slot_number);
+        }
+
+        // Build a map of status-only (skipped) slots per range.  Ranges
+        // that have only skipped slots are inserted into `ranges` with an
+        // empty data-slot list so they become candidates below.
+        let mut status_only_by_range: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for &slot_number in &status_slots {
+            if !slots_set.contains(&slot_number) {
+                let range_start = (slot_number / range_size) * range_size;
+                status_only_by_range
+                    .entry(range_start)
+                    .or_default()
+                    .push(slot_number);
+                ranges.entry(range_start).or_default();
+            }
         }
 
         let mut compactable = Vec::new();
@@ -309,7 +332,7 @@ impl SolanaCompactionService {
         for (range_start, slot_numbers) in ranges {
             let range_end = range_start + range_size - 1;
 
-            // Check if all slots in this group are fully processed
+            // Check if all data slots in this range are fully processed.
             let mut all_complete = true;
             for &slot_number in &slot_numbers {
                 if let Ok(status) = self.storage.read_status(slot_number) {
@@ -322,10 +345,26 @@ impl SolanaCompactionService {
                     break;
                 }
 
-                // Check progress tracker
                 if !progress.is_block_complete(slot_number) {
                     all_complete = false;
                     break;
+                }
+            }
+
+            // Check status-only (skipped) slots in this range.  Skipped
+            // slots are not registered in the progress tracker, so we only
+            // check the persisted status file.
+            if all_complete {
+                if let Some(skipped) = status_only_by_range.get(&range_start) {
+                    for &slot_number in skipped {
+                        match self.storage.read_status(slot_number) {
+                            Ok(status) if status.is_complete_with(&self.expectations) => {}
+                            _ => {
+                                all_complete = false;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -333,15 +372,15 @@ impl SolanaCompactionService {
                 continue;
             }
 
-            // Only compact ranges safely beyond reorg depth
-            if let Ok(Some(latest_slot)) = self.storage.max_slot_number() {
-                let safe_boundary = latest_slot.saturating_sub(self.config.reorg_depth);
+            // Only compact ranges safely beyond reorg depth.
+            if let Some(latest) = latest_known {
+                let safe_boundary = latest.saturating_sub(self.config.reorg_depth);
                 if range_end >= safe_boundary {
                     tracing::debug!(
                         chain = %self.chain_name,
                         range_start,
                         range_end,
-                        latest_slot,
+                        latest_slot = latest,
                         safe_boundary,
                         "Skipping Solana range: within reorg depth"
                     );
@@ -385,6 +424,7 @@ impl SolanaCompactionService {
 
         let mut all_events: Vec<SolanaEventRecord> = Vec::new();
         let mut all_instructions: Vec<SolanaInstructionRecord> = Vec::new();
+        let mut slot_records: Vec<SolanaSlotRecord> = Vec::new();
 
         for &slot_number in &slots_in_range {
             match self.storage.read_events(slot_number) {
@@ -418,6 +458,45 @@ impl SolanaCompactionService {
                 }
                 Err(e) => return Err(e.into()),
             }
+
+            // Build SolanaSlotRecord for the slots parquet.  Transactions are
+            // read for their signatures; if missing (e.g. events-only programs)
+            // the signatures list is left empty but the record is still written.
+            if let Ok(live_slot) = self.storage.read_slot(slot_number) {
+                let transaction_signatures: Vec<[u8; 64]> = self
+                    .storage
+                    .read_transactions(slot_number)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tx| tx.signature)
+                    .collect();
+                slot_records.push(SolanaSlotRecord {
+                    slot: live_slot.slot,
+                    block_time: live_slot.block_time,
+                    block_height: live_slot.block_height,
+                    parent_slot: live_slot.parent_slot,
+                    blockhash: live_slot.blockhash,
+                    previous_blockhash: live_slot.previous_blockhash,
+                    transaction_count: live_slot.transaction_count,
+                    transaction_signatures,
+                });
+            }
+        }
+
+        // Always write slots parquet so that find_resume_slot() can advance past
+        // this range on restart and collect_slots_selective() repair can merge
+        // unrepaired slot metadata.  The file is created even when empty (all
+        // slots in the range were skipped) to satisfy the parquet-existence check.
+        let slots_dir = raw_solana_slots_dir(&self.chain_name);
+        let slots_path = slots_dir.join(format!("{}-{}.parquet", range.start, range.end));
+        self.write_slots_parquet(&slot_records, &slots_path)?;
+        if !slot_records.is_empty() {
+            tracing::info!(
+                chain = %self.chain_name,
+                count = slot_records.len(),
+                path = %slots_path.display(),
+                "Wrote Solana slots parquet"
+            );
         }
 
         // Write events parquet to historical directory
@@ -517,6 +596,21 @@ impl SolanaCompactionService {
                 "Failed to write instructions parquet: {}",
                 e
             ))
+        })
+    }
+
+    /// Write slot records to a parquet file.
+    fn write_slots_parquet(
+        &self,
+        slots: &[SolanaSlotRecord],
+        path: &PathBuf,
+    ) -> Result<(), SolanaCompactionError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let schema = build_slot_schema();
+        write_slots_to_parquet(slots, &schema, path).map_err(|e| {
+            SolanaCompactionError::ParquetWrite(format!("Failed to write slots parquet: {}", e))
         })
     }
 }
@@ -800,9 +894,12 @@ mod tests {
     #[tokio::test]
     async fn test_compact_range_empty_events_and_instructions() {
         let tmp = TempDir::new().unwrap();
-        let (service, expectations) = make_service(&tmp, 10);
+        let chain_name = "test-solana-empty-evt-instr";
+        let historical_dir = PathBuf::from(format!("data/{chain_name}"));
+        let _ = std::fs::remove_dir_all(&historical_dir);
 
-        // Create slots with empty events/instructions
+        let (service, expectations) = make_service_with_chain(&tmp, chain_name, 10);
+
         for i in 0..3 {
             let slot = make_slot(i);
             service.storage.write_slot(i, &slot).unwrap();
@@ -820,12 +917,160 @@ mod tests {
             slot_count: 3,
         };
 
-        // Should succeed without writing parquet (no data)
         service.compact_range(&range).await.unwrap();
 
-        // All slots should be cleaned up
+        // All live slots should be cleaned up
         let remaining = service.storage.list_slots().unwrap();
         assert!(remaining.is_empty());
+
+        // Slots parquet must exist even though events/instructions are empty
+        let slots_path = raw_solana_slots_dir(chain_name).join("0-9.parquet");
+        assert!(
+            slots_path.exists(),
+            "Slots parquet must be written for find_resume_slot to advance"
+        );
+
+        let _ = std::fs::remove_dir_all(&historical_dir);
+    }
+
+    #[tokio::test]
+    async fn test_compact_range_slots_parquet_has_correct_records() {
+        use crate::solana::raw_data::parquet::read_slots_from_parquet;
+
+        let tmp = TempDir::new().unwrap();
+        let chain_name = "test-solana-slots-parquet-records";
+        let historical_dir = PathBuf::from(format!("data/{chain_name}"));
+        let _ = std::fs::remove_dir_all(&historical_dir);
+
+        let (service, expectations) = make_service_with_chain(&tmp, chain_name, 10);
+
+        for i in 0..3u64 {
+            let slot = make_slot(i);
+            service.storage.write_slot(i, &slot).unwrap();
+            service
+                .storage
+                .write_status(i, &make_complete_status(&expectations))
+                .unwrap();
+            service.storage.write_events(i, &[]).unwrap();
+            service.storage.write_instructions(i, &[]).unwrap();
+        }
+
+        let range = CompactableRange {
+            start: 0,
+            end: 9,
+            slot_count: 3,
+        };
+        service.compact_range(&range).await.unwrap();
+
+        let slots_path = raw_solana_slots_dir(chain_name).join("0-9.parquet");
+        let records = read_slots_from_parquet(&slots_path).unwrap();
+        assert_eq!(records.len(), 3);
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.slot, i as u64);
+        }
+
+        let _ = std::fs::remove_dir_all(&historical_dir);
+    }
+
+    #[tokio::test]
+    async fn test_find_compactable_ranges_skipped_only() {
+        // Ranges composed entirely of skipped slots (status files only, no
+        // data files) must be discovered so their status dirs can be cleaned
+        // up and their skipped-slot markers reach skipped_slots.json.
+        let tmp = TempDir::new().unwrap();
+        let (service, expectations) = make_service(&tmp, 1); // range_size=1 triggers the bug
+
+        // Slots 5, 6, 7 are all skipped
+        for i in [5u64, 6, 7] {
+            let mut status = LiveSlotStatus::collected();
+            status.block_fetched = true;
+            status.events_extracted = true;
+            status.instructions_extracted = true;
+            status.apply_expectations(&expectations);
+            service.storage.write_status(i, &status).unwrap();
+        }
+
+        // A data slot far enough away that slots 5-7 are beyond reorg depth
+        // (reorg_depth=150, latest=200, safe_boundary=50 > 7)
+        let latest = make_slot(200);
+        service.storage.write_slot(200, &latest).unwrap();
+        service
+            .storage
+            .write_status(200, &make_complete_status(&expectations))
+            .unwrap();
+
+        let ranges = service.find_compactable_ranges().await.unwrap();
+        let range_starts: Vec<u64> = ranges.iter().map(|r| r.start).collect();
+
+        assert!(
+            range_starts.contains(&5),
+            "Skipped-only range 5 should be compactable"
+        );
+        assert!(
+            range_starts.contains(&6),
+            "Skipped-only range 6 should be compactable"
+        );
+        assert!(
+            range_starts.contains(&7),
+            "Skipped-only range 7 should be compactable"
+        );
+
+        for range in &ranges {
+            if [5u64, 6, 7].contains(&range.start) {
+                assert_eq!(
+                    range.slot_count, 0,
+                    "Status-only range should have slot_count=0"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compact_skipped_only_range() {
+        // Compacting a range made entirely of skipped slots should clean up
+        // the status files, write skipped_slots.json, and emit a slots parquet
+        // so find_resume_slot can advance past the range.
+        let tmp = TempDir::new().unwrap();
+        let chain_name = "test-solana-skipped-only-compact";
+        let historical_dir = PathBuf::from(format!("data/{chain_name}"));
+        let _ = std::fs::remove_dir_all(&historical_dir);
+
+        let (service, expectations) = make_service_with_chain(&tmp, chain_name, 10);
+
+        for i in 0..10u64 {
+            let mut status = LiveSlotStatus::collected();
+            status.block_fetched = true;
+            status.events_extracted = true;
+            status.instructions_extracted = true;
+            status.apply_expectations(&expectations);
+            service.storage.write_status(i, &status).unwrap();
+        }
+
+        let range = CompactableRange {
+            start: 0,
+            end: 9,
+            slot_count: 0,
+        };
+        service.compact_range(&range).await.unwrap();
+
+        // All status files cleaned up
+        assert!(service.storage.list_statuses().unwrap().is_empty());
+
+        // All 10 slots recorded as skipped
+        let events_dir = raw_solana_events_dir(chain_name);
+        let skipped_index = skipped_slots::read_skipped_slots_index(&events_dir);
+        let rk = skipped_slots::range_key(0, 9);
+        let skipped = skipped_index.get(&rk).cloned().unwrap_or_default();
+        assert_eq!(skipped.len(), 10, "All 10 slots should be in skipped_slots.json");
+
+        // Slots parquet must exist for find_resume_slot
+        let slots_path = raw_solana_slots_dir(chain_name).join("0-9.parquet");
+        assert!(
+            slots_path.exists(),
+            "Slots parquet must be written even for all-skipped ranges"
+        );
+
+        let _ = std::fs::remove_dir_all(&historical_dir);
     }
 
     #[tokio::test]
