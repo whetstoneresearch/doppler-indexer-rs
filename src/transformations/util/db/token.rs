@@ -10,10 +10,10 @@ use crate::types::uniswap::v4::PoolAddressOrPoolId;
 pub struct TokenData<'a> {
     pub block_number: u64,
     pub block_timestamp: u64,
-    pub tx_id: &'a [u8; 32],
-    pub creator_address: Option<&'a [u8; 20]>,
-    pub integrator: Option<&'a [u8; 20]>,
-    pub token_address: &'a [u8; 20],
+    pub tx_id: &'a [u8],
+    pub creator_address: Option<&'a [u8]>,
+    pub integrator: Option<&'a [u8]>,
+    pub token_address: &'a [u8],
     pub pool: Option<&'a PoolAddressOrPoolId>,
     pub name: &'a str,
     pub symbol: &'a str,
@@ -23,8 +23,8 @@ pub struct TokenData<'a> {
     pub is_derc20: bool,
     pub is_creator_coin: bool,
     pub is_content_coin: bool,
-    pub creator_coin_pool: Option<&'a [u8; 32]>,
-    pub governance: Option<&'a [u8; 20]>,
+    pub creator_coin_pool: Option<&'a [u8]>,
+    pub governance: Option<&'a [u8]>,
 }
 
 pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOperation {
@@ -36,7 +36,7 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
         columns: vec![
             "chain_id".to_string(),
             "tx_id".to_string(),
-            "block_number".to_string(),
+            "block_height".to_string(),
             "created_at".to_string(),
             "creator_address".to_string(),
             "integrator".to_string(),
@@ -55,21 +55,21 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
         ],
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
-            DbValue::Bytes32(*data.tx_id),
+            DbValue::Bytes(data.tx_id.to_vec()),
             DbValue::Uint64(data.block_number),
             DbValue::Timestamp(data.block_timestamp as i64),
             match data.creator_address {
-                Some(creator) => DbValue::Address(*creator),
+                Some(creator) => DbValue::Bytes(creator.to_vec()),
                 None => DbValue::Null,
             },
             match data.integrator {
-                Some(int_addr) => DbValue::Address(*int_addr),
+                Some(int_addr) => DbValue::Bytes(int_addr.to_vec()),
                 None => DbValue::Null,
             },
-            DbValue::Address(*data.token_address),
+            DbValue::Bytes(data.token_address.to_vec()),
             match data.pool {
-                Some(PoolAddressOrPoolId::Address(address)) => DbValue::Address(*address),
-                Some(PoolAddressOrPoolId::PoolId(pool_id)) => DbValue::Bytes32(*pool_id),
+                Some(PoolAddressOrPoolId::Address(address)) => DbValue::Bytes(address.to_vec()),
+                Some(PoolAddressOrPoolId::PoolId(pool_id)) => DbValue::Bytes(pool_id.to_vec()),
                 None => DbValue::Null,
             },
             DbValue::Text(data.name.to_string()),
@@ -87,11 +87,11 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
             DbValue::Bool(data.is_creator_coin),
             DbValue::Bool(data.is_content_coin),
             match data.creator_coin_pool {
-                Some(creator_coin_pool) => DbValue::Bytes32(*creator_coin_pool),
+                Some(creator_coin_pool) => DbValue::Bytes(creator_coin_pool.to_vec()),
                 None => DbValue::Null,
             },
             match data.governance {
-                Some(gov_addr) => DbValue::Address(*gov_addr),
+                Some(gov_addr) => DbValue::Bytes(gov_addr.to_vec()),
                 None => DbValue::Null,
             },
         ],

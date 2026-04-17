@@ -64,7 +64,7 @@ pub fn insert_pool(data: &PoolData, ctx: &TransformationContext) -> DbOperation 
         update_condition: None,
         columns: vec![
             "chain_id".to_string(),
-            "block_number".to_string(),
+            "block_height".to_string(),
             "created_at".to_string(),
             "address".to_string(),
             "base_token".to_string(),
@@ -165,7 +165,7 @@ pub fn insert_migration_pool(
         update_condition: None,
         columns: vec![
             "chain_id".to_string(),
-            "block_number".to_string(),
+            "block_height".to_string(),
             "created_at".to_string(),
             "address".to_string(),
             "base_token".to_string(),

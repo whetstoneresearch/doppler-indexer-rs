@@ -42,7 +42,7 @@ pub struct LiquidityDeltaData {
     pub chain_id: u64,
     pub pool_id: Vec<u8>,
     pub block_number: u64,
-    pub log_index: u32,
+    pub log_position: i64,
     pub tick_lower: i32,
     pub tick_upper: i32,
     pub liquidity_delta: String,
@@ -62,7 +62,7 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
         columns: vec![
             "chain_id".into(),
             "pool_id".into(),
-            "block_number".into(),
+            "block_height".into(),
             "block_timestamp".into(),
             "tick".into(),
             "sqrt_price".into(),
@@ -84,7 +84,7 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
         ],
         conflict_columns: vec!["chain_id".into(), "pool_id".into()],
         update_columns: vec![
-            "block_number".into(),
+            "block_height".into(),
             "block_timestamp".into(),
             "tick".into(),
             "sqrt_price".into(),
@@ -92,7 +92,7 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
             "active_liquidity".into(),
         ],
         update_condition: Some(
-            "EXCLUDED.\"block_number\" > \"pool_state\".\"block_number\"".into(),
+            "EXCLUDED.\"block_height\" > \"pool_state\".\"block_height\"".into(),
         ),
     }
 }
@@ -104,7 +104,7 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
         columns: vec![
             "chain_id".into(),
             "pool_id".into(),
-            "block_number".into(),
+            "block_height".into(),
             "block_timestamp".into(),
             "price_open".into(),
             "price_close".into(),
@@ -134,7 +134,7 @@ pub fn insert_pool_snapshot(data: &SnapshotData) -> DbOperation {
                 .map(|v| DbValue::Numeric(v.clone()))
                 .unwrap_or(DbValue::Null),
         ],
-        conflict_columns: vec!["chain_id".into(), "pool_id".into(), "block_number".into()],
+        conflict_columns: vec!["chain_id".into(), "pool_id".into(), "block_height".into()],
         update_columns: vec![
             "block_timestamp".into(),
             "price_open".into(),
@@ -161,8 +161,8 @@ pub fn insert_liquidity_delta(data: &LiquidityDeltaData) -> DbOperation {
         columns: vec![
             "chain_id".into(),
             "pool_id".into(),
-            "block_number".into(),
-            "log_index".into(),
+            "block_height".into(),
+            "log_position".into(),
             "tick_lower".into(),
             "tick_upper".into(),
             "liquidity_delta".into(),
@@ -171,7 +171,7 @@ pub fn insert_liquidity_delta(data: &LiquidityDeltaData) -> DbOperation {
             DbValue::Int64(data.chain_id as i64),
             DbValue::Bytes(data.pool_id.clone()),
             DbValue::Int64(data.block_number as i64),
-            DbValue::Int64(data.log_index as i64),
+            DbValue::Int64(data.log_position),
             DbValue::Int32(data.tick_lower),
             DbValue::Int32(data.tick_upper),
             DbValue::Numeric(data.liquidity_delta.clone()),
@@ -179,8 +179,8 @@ pub fn insert_liquidity_delta(data: &LiquidityDeltaData) -> DbOperation {
         conflict_columns: vec![
             "chain_id".into(),
             "pool_id".into(),
-            "block_number".into(),
-            "log_index".into(),
+            "block_height".into(),
+            "log_position".into(),
         ],
         update_columns: vec![],
         update_condition: None,
