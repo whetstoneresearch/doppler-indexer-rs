@@ -99,6 +99,7 @@ impl SolanaWsClient {
         let mut reconnect_attempt = 0u32;
 
         loop {
+            let last_slot_before_connect = last_slot;
             match self.connect_and_listen(&event_tx, &mut last_slot).await {
                 Ok(()) => {
                     tracing::info!("Solana WebSocket subscription ended cleanly");
@@ -113,6 +114,12 @@ impl SolanaWsClient {
                     {
                         return Err(SolanaWsError::ChannelClosed);
                     }
+
+                    reset_reconnect_attempt_if_session_made_progress(
+                        &mut reconnect_attempt,
+                        last_slot_before_connect,
+                        last_slot,
+                    );
 
                     if self.reconnect_config.max_attempts > 0
                         && reconnect_attempt >= self.reconnect_config.max_attempts
@@ -208,6 +215,24 @@ impl SolanaWsClient {
     }
 }
 
+fn session_made_progress(previous_last_slot: Option<u64>, current_last_slot: Option<u64>) -> bool {
+    match (previous_last_slot, current_last_slot) {
+        (None, Some(_)) => true,
+        (Some(previous), Some(current)) => current > previous,
+        _ => false,
+    }
+}
+
+fn reset_reconnect_attempt_if_session_made_progress(
+    reconnect_attempt: &mut u32,
+    previous_last_slot: Option<u64>,
+    current_last_slot: Option<u64>,
+) {
+    if session_made_progress(previous_last_slot, current_last_slot) {
+        *reconnect_attempt = 0;
+    }
+}
+
 impl std::fmt::Debug for SolanaWsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SolanaWsClient")
@@ -278,5 +303,33 @@ mod tests {
 
         let err = SolanaWsError::ChannelClosed;
         assert!(err.to_string().contains("closed"));
+    }
+
+    #[test]
+    fn test_session_progress_detection() {
+        assert!(session_made_progress(None, Some(10)));
+        assert!(session_made_progress(Some(10), Some(11)));
+        assert!(!session_made_progress(None, None));
+        assert!(!session_made_progress(Some(10), Some(10)));
+        assert!(!session_made_progress(Some(10), Some(9)));
+    }
+
+    #[test]
+    fn test_reconnect_attempt_resets_after_progress() {
+        let mut reconnect_attempt = 3;
+        reset_reconnect_attempt_if_session_made_progress(
+            &mut reconnect_attempt,
+            Some(100),
+            Some(101),
+        );
+        assert_eq!(reconnect_attempt, 0);
+
+        let mut reconnect_attempt = 3;
+        reset_reconnect_attempt_if_session_made_progress(
+            &mut reconnect_attempt,
+            Some(100),
+            Some(100),
+        );
+        assert_eq!(reconnect_attempt, 3);
     }
 }
