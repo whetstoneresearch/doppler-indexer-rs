@@ -287,6 +287,20 @@ impl LiveProgressTracker {
         self.handler_keys.difference(&completed).cloned().collect()
     }
 
+    /// Restore completed-handler progress from a persisted source.
+    ///
+    /// Called on startup to reseed the in-memory tracker from saved status
+    /// files so that compaction can recognize slots that finished transformation
+    /// before the last restart.
+    pub fn restore_completed(&mut self, block_number: u64, handlers: HashSet<String>) {
+        if !handlers.is_empty() {
+            self.completed
+                .entry(block_number)
+                .or_default()
+                .extend(handlers);
+        }
+    }
+
     /// Clear progress for a block (used after compaction).
     pub fn clear_block(&mut self, block_number: u64) {
         self.completed.remove(&block_number);

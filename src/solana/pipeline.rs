@@ -21,7 +21,7 @@ use crate::solana::decoding::instructions::SolanaInstructionDecoder;
 use crate::solana::decoding::spl_token::SplTokenDecoder;
 use crate::solana::decoding::tasks::{decode_solana_events, decode_solana_instructions};
 use crate::solana::decoding::traits::ProgramDecoder;
-use crate::solana::discovery::{DiscoveryManager, SharedKnownAccounts};
+use crate::solana::discovery::{DiscoveryEventData, DiscoveryManager, SharedKnownAccounts};
 use crate::solana::live::accounts::SolanaLiveAccountReader;
 use crate::solana::live::catchup::{SolanaCatchupScanResult, SolanaLiveCatchupService};
 use crate::solana::live::collector::SolanaLiveCollector;
@@ -37,9 +37,12 @@ use crate::storage::paths::{
     raw_solana_events_dir, raw_solana_instructions_dir, scan_parquet_ranges,
 };
 use crate::transformations::engine::{
-    ExecutionMode, ReorgMessage, TransformationEngine, TransformationEngineConfig,
+    DecodedEventsMessage, ExecutionMode, ReorgMessage, TransformationEngine,
+    TransformationEngineConfig,
 };
-use crate::transformations::registry::{build_registry_for_solana_chain, TransformationRegistry};
+use crate::transformations::registry::{
+    build_registry_for_solana_chain, extract_event_name, TransformationRegistry,
+};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{Contracts, FactoryCollections};
 use crate::types::config::defaults;
@@ -57,6 +60,7 @@ pub struct SolanaChainFeatures {
     pub has_events: bool,
     pub has_instructions: bool,
     pub has_discovery: bool,
+    pub has_on_events_account_reads: bool,
     pub has_account_reads: bool,
 }
 
@@ -65,6 +69,7 @@ impl SolanaChainFeatures {
         let mut has_events = false;
         let mut has_instructions = false;
         let mut has_discovery = false;
+        let mut has_on_events_account_reads = false;
         let mut has_account_reads = false;
 
         for program in programs.values() {
@@ -87,6 +92,13 @@ impl SolanaChainFeatures {
 
             if program.accounts.as_ref().is_some_and(|a| !a.is_empty()) {
                 has_account_reads = true;
+                if program.accounts.as_ref().is_some_and(|accounts| {
+                    accounts
+                        .iter()
+                        .any(|account| account.frequency.is_on_events())
+                }) {
+                    has_on_events_account_reads = true;
+                }
             }
         }
 
@@ -94,6 +106,7 @@ impl SolanaChainFeatures {
             has_events,
             has_instructions,
             has_discovery,
+            has_on_events_account_reads,
             has_account_reads,
         }
     }
@@ -216,6 +229,7 @@ impl SolanaChainRuntime {
             has_events = features.has_events,
             has_instructions = features.has_instructions,
             has_discovery = features.has_discovery,
+            has_on_events_account_reads = features.has_on_events_account_reads,
             has_account_reads = features.has_account_reads,
             transformations_enabled,
             programs = chain.solana_programs.len(),
@@ -701,21 +715,31 @@ fn build_once_account_types(programs: &SolanaPrograms) -> HashMap<String, HashSe
         .collect()
 }
 
-/// Build the OnEvents lookup: `(source_name, event_name)` → list of
-/// account types whose known addresses should be read when that event fires.
-fn build_on_events_lookup(programs: &SolanaPrograms) -> HashMap<(String, String), Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OnEventAccountReadTarget {
+    owner_program: String,
+    account_type: String,
+}
+
+type OnEventsLookup = HashMap<(String, String), Vec<OnEventAccountReadTarget>>;
+
+/// Build the OnEvents lookup: `(trigger_source, decoded_event_name)` → list of
+/// account owner/account type pairs whose known addresses should be read when
+/// that event fires.
+fn build_on_events_lookup(programs: &SolanaPrograms) -> OnEventsLookup {
     use crate::types::config::eth_call::Frequency;
 
-    let mut map: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for (_name, config) in programs {
+    let mut map: OnEventsLookup = HashMap::new();
+    for (owner_program, config) in programs {
         if let Some(ref accounts) = config.accounts {
             for a in accounts {
                 if let Frequency::OnEvents(ref triggers) = a.frequency {
                     for trigger in triggers.iter() {
-                        // In Solana, EventTriggerConfig.source is the program name
-                        // and .event is the decoded event name.
-                        let key = (trigger.source.clone(), trigger.event.clone());
-                        map.entry(key).or_default().push(a.account_type.clone());
+                        let key = (trigger.source.clone(), extract_event_name(&trigger.event));
+                        map.entry(key).or_default().push(OnEventAccountReadTarget {
+                            owner_program: owner_program.clone(),
+                            account_type: a.account_type.clone(),
+                        });
                     }
                 }
             }
@@ -724,12 +748,58 @@ fn build_on_events_lookup(programs: &SolanaPrograms) -> HashMap<(String, String)
     map
 }
 
+fn collect_on_event_account_read_triggers(
+    slot: u64,
+    block_time: Option<i64>,
+    trigger_source_name: &str,
+    events: &[DiscoveryEventData],
+    on_events_lookup: &OnEventsLookup,
+    discovery_manager: &DiscoveryManager,
+    already_enqueued_targets: &mut HashSet<OnEventAccountReadTarget>,
+) -> Vec<AccountReadTrigger> {
+    let mut triggers = Vec::new();
+
+    for event in events {
+        let key = (trigger_source_name.to_string(), event.event_name.clone());
+        let Some(targets) = on_events_lookup.get(&key) else {
+            continue;
+        };
+
+        for target in targets {
+            let known_addresses =
+                discovery_manager.known_addresses(&target.owner_program, &target.account_type);
+            if known_addresses.is_empty() {
+                continue;
+            }
+            if !already_enqueued_targets.insert(target.clone()) {
+                continue;
+            }
+
+            triggers.push(AccountReadTrigger {
+                slot,
+                block_time,
+                source_name: target.owner_program.clone(),
+                addresses: known_addresses
+                    .into_iter()
+                    .map(|address| address.to_bytes())
+                    .collect(),
+                await_completion_barrier: true,
+                mark_complete_only: false,
+            });
+        }
+    }
+
+    triggers
+}
+
 /// In live mode, defer slot-level account completion through the discovery loop
 /// whenever decoded events can enqueue account reads after the collector's
 /// per-slot trigger. This covers both newly discovered addresses and OnEvents
 /// reads.
 fn should_defer_live_account_completion(features: &SolanaChainFeatures) -> bool {
-    features.has_account_reads && features.has_discovery && features.has_events
+    features.has_account_reads
+        && features.has_events
+        && (features.has_discovery || features.has_on_events_account_reads)
 }
 
 fn decoded_events_block_time(
@@ -738,6 +808,40 @@ fn decoded_events_block_time(
     events
         .first()
         .and_then(|event| i64::try_from(event.block_timestamp).ok())
+}
+
+fn build_live_decoder_destinations(
+    has_discovery: bool,
+    transform_events_tx: Option<mpsc::Sender<DecodedEventsMessage>>,
+    discovery_events_tx: Option<mpsc::Sender<DecodedEventsMessage>>,
+) -> (
+    Option<mpsc::Sender<DecodedEventsMessage>>,
+    Option<mpsc::Sender<DecodedEventsMessage>>,
+) {
+    let event_decoder_dest = if has_discovery {
+        discovery_events_tx
+    } else {
+        transform_events_tx.clone()
+    };
+    let instruction_decoder_dest = transform_events_tx;
+
+    (event_decoder_dest, instruction_decoder_dest)
+}
+
+fn build_startup_once_account_read_trigger(
+    slot: u64,
+    block_time: Option<i64>,
+    source_name: String,
+    addresses: Vec<[u8; 32]>,
+) -> AccountReadTrigger {
+    AccountReadTrigger {
+        slot,
+        block_time,
+        source_name,
+        addresses,
+        await_completion_barrier: false,
+        mark_complete_only: false,
+    }
 }
 
 async fn resolve_startup_once_trigger_metadata(
@@ -908,6 +1012,21 @@ async fn run_solana_live_mode(
         }
     }
 
+    // Reload handler progress from persisted status files so that compaction
+    // can recognize slots that completed transformation before the last crash.
+    if let Some(ref tracker) = runtime.progress_tracker {
+        let mut guard = tracker.lock().await;
+        for slot in live_storage.list_statuses().unwrap_or_default() {
+            if let Ok(status) = live_storage.read_status(slot) {
+                guard.restore_completed(slot, status.completed_handlers);
+            }
+        }
+        tracing::info!(
+            chain = chain.name.as_str(),
+            "Reloaded handler progress from persisted status files",
+        );
+    }
+
     let expected_start_slot =
         compute_live_expected_start_slot(live_storage.max_slot_number()?, &deleted_slots);
 
@@ -915,8 +1034,10 @@ async fn run_solana_live_mode(
     // while slot 200 survives). The collector backfills these before the WS loop.
     let startup_gaps = live_storage.find_gaps()?;
 
-    // Load discovery state
-    let discovery_manager = if runtime.features.has_discovery {
+    // Load known-account state whenever account reads are configured so
+    // persisted addresses remain available even without discovery rules.
+    let discovery_manager = if runtime.features.has_discovery || runtime.features.has_account_reads
+    {
         let mut manager = DiscoveryManager::load_persisted(&chain.name, &chain.solana_programs);
         tracing::info!(
             chain = chain.name.as_str(),
@@ -1042,7 +1163,10 @@ async fn run_solana_live_mode(
 
     // Discovery channels — the bridge task (spawned below) taps decoded events
     // and forwards DiscoveryMessages to this channel.
-    let (discovery_tx, discovery_rx) = if runtime.features.has_discovery {
+    let needs_event_driven_account_reads =
+        runtime.features.has_discovery || runtime.features.has_on_events_account_reads;
+
+    let (discovery_tx, discovery_rx) = if needs_event_driven_account_reads {
         let (tx, rx) = mpsc::channel(channel_capacity);
         (Some(tx), Some(rx))
     } else {
@@ -1109,30 +1233,37 @@ async fn run_solana_live_mode(
                 .await
                 .map_err(|e| anyhow::anyhow!("Solana live collector error: {}", e))
         });
+        // Drop the original sender so the engine's reorg input closes when
+        // the collector (holding the clone) exits.
+        drop(transform_reorg_tx);
     }
 
     // When discovery is active, decoders write to an intermediate channel.
     // A bridge task forwards to both the transform engine and the discovery
     // manager. When discovery is inactive, decoders write to transform_events_tx
     // directly.
-    let (decoder_events_tx, decoder_events_rx) = if runtime.features.has_discovery {
+    let (decoder_events_tx, decoder_events_rx) = if needs_event_driven_account_reads {
         let (tx, rx) = mpsc::channel(channel_capacity);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
 
-    // Decide where decoder sends events: bridge channel if discovery, engine directly otherwise.
-    let events_dest_tx = decoder_events_tx
-        .clone()
-        .or_else(|| transform_events_tx.clone());
+    // Discovery is event-only. When enabled, decoded events flow through the
+    // bridge so discovery/account reads can inspect them before the engine.
+    // Decoded instructions always go directly to the engine.
+    let (event_decoder_dest_tx, instruction_decoder_dest_tx) = build_live_decoder_destinations(
+        needs_event_driven_account_reads,
+        transform_events_tx.clone(),
+        decoder_events_tx.clone(),
+    );
 
     // Event decoder task (live mode)
     let defer_live_account_completion = should_defer_live_account_completion(&runtime.features);
     if let Some(event_rx) = event_decoder_rx {
         let event_decoder = Arc::new(SolanaEventDecoder::new(runtime.decoders.clone()));
         let program_names = runtime.program_names.clone();
-        let tx = events_dest_tx.clone();
+        let tx = event_decoder_dest_tx.clone();
         let complete = transform_complete_tx.clone();
         let chain_name = runtime.chain.name.clone();
         let storage_for_decoder = live_storage.clone();
@@ -1160,7 +1291,7 @@ async fn run_solana_live_mode(
     if let Some(instr_rx) = instr_decoder_rx {
         let instr_decoder = Arc::new(SolanaInstructionDecoder::new(runtime.decoders.clone()));
         let program_names = runtime.program_names.clone();
-        let tx = events_dest_tx.clone();
+        let tx = instruction_decoder_dest_tx.clone();
         let complete = transform_complete_tx.clone();
         let chain_name = runtime.chain.name.clone();
         let storage_for_decoder = live_storage.clone();
@@ -1182,7 +1313,8 @@ async fn run_solana_live_mode(
         });
     }
     drop(instr_decoder_tx);
-    drop(events_dest_tx);
+    drop(event_decoder_dest_tx);
+    drop(instruction_decoder_dest_tx);
     drop(decoder_events_tx);
     // Save a clone for the account reader before dropping the original
     let account_reader_complete_tx = transform_complete_tx.clone();
@@ -1278,6 +1410,8 @@ async fn run_solana_live_mode(
         let per_slot_types_for_discovery = per_slot_account_types.clone();
         let on_events_for_discovery = on_events_lookup.clone();
         let defer_live_account_completion = defer_live_account_completion;
+        let mut seen_on_event_targets_by_slot: HashMap<u64, HashSet<OnEventAccountReadTarget>> =
+            HashMap::new();
 
         tasks.spawn(async move {
             use crate::solana::discovery::DiscoveryMessage;
@@ -1319,6 +1453,7 @@ async fn run_solana_live_mode(
                                             block_time,
                                             source_name: addrs.program_name.clone(),
                                             addresses,
+                                            await_completion_barrier: true,
                                             mark_complete_only: false,
                                         })
                                         .await;
@@ -1330,42 +1465,27 @@ async fn run_solana_live_mode(
                         //    an OnEvents trigger, read all known addresses for the
                         //    matching account types.
                         if !on_events_for_discovery.is_empty() {
-                            for event in &events {
-                                let key =
-                                    (source_name.clone(), event.event_name.clone());
-                                if let Some(account_types) =
-                                    on_events_for_discovery.get(&key)
-                                {
-                                    for acct_type in account_types {
-                                        let addrs = manager_instance
-                                            .known_addresses(&source_name, acct_type);
-                                        if addrs.is_empty() {
-                                            continue;
-                                        }
-                                        if let Some(ref tx) = account_tx {
-                                            let addresses: Vec<[u8; 32]> = addrs
-                                                .iter()
-                                                .map(|pk| pk.to_bytes())
-                                                .collect();
-                                            let _ = tx
-                                                .send(AccountReadTrigger {
-                                                    slot: range_start,
-                                                    block_time,
-                                                    source_name: source_name.clone(),
-                                                    addresses,
-                                                    mark_complete_only: false,
-                                                })
-                                                .await;
-                                        }
-                                    }
+                            if let Some(ref tx) = account_tx {
+                                let seen_targets =
+                                    seen_on_event_targets_by_slot.entry(range_start).or_default();
+                                for trigger in collect_on_event_account_read_triggers(
+                                    range_start,
+                                    block_time,
+                                    &source_name,
+                                    &events,
+                                    &on_events_for_discovery,
+                                    &manager_instance,
+                                    seen_targets,
+                                ) {
+                                    let _ = tx.send(trigger).await;
                                 }
                             }
-
                         }
                     }
                     DiscoveryMessage::RangeComplete {
                         range_start, ..
                     } => {
+                        seen_on_event_targets_by_slot.remove(&range_start);
                         // All events for this slot have been decoded and
                         // forwarded through this loop. Any discovery-triggered
                         // reads for this slot have already been enqueued on
@@ -1379,6 +1499,7 @@ async fn run_solana_live_mode(
                                         block_time: None,
                                         source_name: String::new(),
                                         addresses: Vec::new(),
+                                        await_completion_barrier: false,
                                         mark_complete_only: true,
                                     })
                                     .await;
@@ -1458,13 +1579,12 @@ async fn run_solana_live_mode(
                     "Sending initial Once read for startup-known accounts",
                 );
                 let _ = tx
-                    .send(AccountReadTrigger {
-                        slot: startup_slot,
-                        block_time: startup_block_time,
-                        source_name: program_name.clone(),
-                        addresses: addresses.clone(),
-                        mark_complete_only: false,
-                    })
+                    .send(build_startup_once_account_read_trigger(
+                        startup_slot,
+                        startup_block_time,
+                        program_name.clone(),
+                        addresses.clone(),
+                    ))
                     .await;
             }
         }
@@ -1558,6 +1678,9 @@ async fn run_solana_live_mode(
                 .await
                 .map_err(|e| anyhow::anyhow!("Transformation engine error: {}", e))
         });
+        // No other task holds this sender (retry is disabled for Solana live);
+        // drop it so the engine's retry input closes immediately.
+        drop(transform_retry_tx);
     }
 
     // --- Run until shutdown ---
@@ -1943,10 +2066,13 @@ async fn feed_raw_instructions_to_decoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solana::discovery::{DiscoveryEventData, DiscoveryFieldValue};
     use crate::solana::live::catchup::{SlotCollectionResumeRequest, SlotCollectionResumeStage};
+    use crate::types::config::eth_call::{EventTriggerConfig, EventTriggerConfigs, Frequency};
     use crate::types::config::solana::{
         SolanaAccountReadConfig, SolanaDiscoveryConfig, SolanaEventConfig, SolanaProgramConfig,
     };
+    use tokio::sync::mpsc;
 
     fn make_programs(configs: Vec<(&str, SolanaProgramConfig)>) -> SolanaPrograms {
         configs
@@ -2078,6 +2204,26 @@ mod tests {
     }
 
     #[test]
+    fn features_on_events_account_reads_detected_without_discovery() {
+        let mut prog = idl_program("11111111111111111111111111111111");
+        prog.accounts = Some(vec![SolanaAccountReadConfig {
+            name: "pool_state".to_string(),
+            account_type: "Pool".to_string(),
+            frequency: Frequency::OnEvents(EventTriggerConfigs::single(EventTriggerConfig {
+                source: "emitter".to_string(),
+                event: "PoolInitialized(address,address)".to_string(),
+            })),
+        }]);
+
+        let programs = make_programs(vec![("test", prog)]);
+        let features = SolanaChainFeatures::detect(&programs);
+
+        assert!(features.has_account_reads);
+        assert!(features.has_on_events_account_reads);
+        assert!(!features.has_discovery);
+    }
+
+    #[test]
     fn live_account_completion_defers_for_discovery_once_reads_without_on_events() {
         let mut prog = idl_program("11111111111111111111111111111111");
         prog.discovery = Some(vec![SolanaDiscoveryConfig {
@@ -2096,6 +2242,230 @@ mod tests {
 
         assert!(build_on_events_lookup(&programs).is_empty());
         assert!(should_defer_live_account_completion(&features));
+    }
+
+    #[tokio::test]
+    async fn live_account_completion_defers_for_on_events_without_discovery() {
+        let mut prog = idl_program("11111111111111111111111111111111");
+        prog.accounts = Some(vec![SolanaAccountReadConfig {
+            name: "pool_state".to_string(),
+            account_type: "Pool".to_string(),
+            frequency: Frequency::OnEvents(EventTriggerConfigs::single(EventTriggerConfig {
+                source: "emitter".to_string(),
+                event: "PoolInitialized(address,address)".to_string(),
+            })),
+        }]);
+
+        let programs = make_programs(vec![("test", prog)]);
+        let features = SolanaChainFeatures::detect(&programs);
+
+        assert!(features.has_on_events_account_reads);
+        assert!(should_defer_live_account_completion(&features));
+    }
+
+    #[tokio::test]
+    async fn live_decoder_destinations_keep_instructions_out_of_discovery_bridge() {
+        let (transform_tx, mut transform_rx) = mpsc::channel(1);
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(1);
+
+        let (event_tx, instruction_tx) =
+            build_live_decoder_destinations(true, Some(transform_tx), Some(bridge_tx));
+
+        event_tx
+            .unwrap()
+            .send(DecodedEventsMessage {
+                range_start: 1,
+                range_end: 2,
+                source_name: "program".to_string(),
+                event_name: "Swap".to_string(),
+                events: Vec::new(),
+            })
+            .await
+            .unwrap();
+        instruction_tx
+            .unwrap()
+            .send(DecodedEventsMessage {
+                range_start: 1,
+                range_end: 2,
+                source_name: "program".to_string(),
+                event_name: "Transfer".to_string(),
+                events: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let bridged = bridge_rx.recv().await.unwrap();
+        let transformed = transform_rx.recv().await.unwrap();
+
+        assert_eq!(bridged.event_name, "Swap");
+        assert_eq!(transformed.event_name, "Transfer");
+        assert!(bridge_rx.try_recv().is_err());
+        assert!(transform_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn on_events_lookup_normalizes_event_signatures_to_decoded_names() {
+        let mut prog = idl_program("11111111111111111111111111111111");
+        prog.accounts = Some(vec![SolanaAccountReadConfig {
+            name: "pool_state".to_string(),
+            account_type: "Pool".to_string(),
+            frequency: Frequency::OnEvents(EventTriggerConfigs::single(EventTriggerConfig {
+                source: "emitter".to_string(),
+                event: "PoolInitialized(address,address)".to_string(),
+            })),
+        }]);
+
+        let programs = make_programs(vec![("owner_program", prog)]);
+        let lookup = build_on_events_lookup(&programs);
+
+        assert_eq!(
+            lookup.get(&("emitter".to_string(), "PoolInitialized".to_string())),
+            Some(&vec![OnEventAccountReadTarget {
+                owner_program: "owner_program".to_string(),
+                account_type: "Pool".to_string(),
+            }]),
+        );
+        assert!(!lookup.contains_key(&(
+            "emitter".to_string(),
+            "PoolInitialized(address,address)".to_string(),
+        )));
+    }
+
+    #[test]
+    fn on_event_account_triggers_use_owning_program_addresses() {
+        let mut owner_prog = idl_program("11111111111111111111111111111111");
+        owner_prog.discovery = Some(vec![SolanaDiscoveryConfig {
+            event_name: "PoolInitialized".to_string(),
+            address_field: "pool".to_string(),
+            account_type: Some("Pool".to_string()),
+        }]);
+        owner_prog.accounts = Some(vec![SolanaAccountReadConfig {
+            name: "pool_state".to_string(),
+            account_type: "Pool".to_string(),
+            frequency: Frequency::OnEvents(EventTriggerConfigs::single(EventTriggerConfig {
+                source: "program_b".to_string(),
+                event: "PoolInitialized(address,address)".to_string(),
+            })),
+        }]);
+
+        let emitter_prog = idl_program("Sysvar1111111111111111111111111111111111111");
+        let programs = make_programs(vec![("program_a", owner_prog), ("program_b", emitter_prog)]);
+        let lookup = build_on_events_lookup(&programs);
+
+        let mut manager = DiscoveryManager::new(&programs);
+        let known_address = [0xAB; 32];
+        manager.process_events(
+            "program_a",
+            &[DiscoveryEventData {
+                event_name: "PoolInitialized".to_string(),
+                fields: HashMap::from([(
+                    "pool".to_string(),
+                    DiscoveryFieldValue::Pubkey(known_address),
+                )]),
+            }],
+        );
+
+        let triggers = collect_on_event_account_read_triggers(
+            42,
+            Some(1_700_000_123),
+            "program_b",
+            &[DiscoveryEventData {
+                event_name: "PoolInitialized".to_string(),
+                fields: HashMap::new(),
+            }],
+            &lookup,
+            &manager,
+            &mut HashSet::new(),
+        );
+
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].slot, 42);
+        assert_eq!(triggers[0].block_time, Some(1_700_000_123));
+        assert_eq!(triggers[0].source_name, "program_a");
+        assert_eq!(triggers[0].addresses, vec![known_address]);
+        assert!(triggers[0].await_completion_barrier);
+        assert!(!triggers[0].mark_complete_only);
+    }
+
+    #[test]
+    fn startup_once_account_triggers_bypass_deferred_completion_barrier() {
+        let trigger = build_startup_once_account_read_trigger(
+            42,
+            Some(1_700_000_123),
+            "program_a".to_string(),
+            vec![[0xEF; 32]],
+        );
+
+        assert_eq!(trigger.slot, 42);
+        assert_eq!(trigger.block_time, Some(1_700_000_123));
+        assert_eq!(trigger.source_name, "program_a");
+        assert_eq!(trigger.addresses, vec![[0xEF; 32]]);
+        assert!(!trigger.await_completion_barrier);
+        assert!(!trigger.mark_complete_only);
+    }
+
+    #[test]
+    fn on_event_account_triggers_dedupe_per_slot() {
+        let mut owner_prog = idl_program("11111111111111111111111111111111");
+        owner_prog.discovery = Some(vec![SolanaDiscoveryConfig {
+            event_name: "PoolInitialized".to_string(),
+            address_field: "pool".to_string(),
+            account_type: Some("Pool".to_string()),
+        }]);
+        owner_prog.accounts = Some(vec![SolanaAccountReadConfig {
+            name: "pool_state".to_string(),
+            account_type: "Pool".to_string(),
+            frequency: Frequency::OnEvents(EventTriggerConfigs::single(EventTriggerConfig {
+                source: "program_b".to_string(),
+                event: "PoolInitialized(address,address)".to_string(),
+            })),
+        }]);
+
+        let emitter_prog = idl_program("Sysvar1111111111111111111111111111111111111");
+        let programs = make_programs(vec![("program_a", owner_prog), ("program_b", emitter_prog)]);
+        let lookup = build_on_events_lookup(&programs);
+
+        let mut manager = DiscoveryManager::new(&programs);
+        let known_address = [0xCD; 32];
+        manager.process_events(
+            "program_a",
+            &[DiscoveryEventData {
+                event_name: "PoolInitialized".to_string(),
+                fields: HashMap::from([(
+                    "pool".to_string(),
+                    DiscoveryFieldValue::Pubkey(known_address),
+                )]),
+            }],
+        );
+
+        let mut seen_targets = HashSet::new();
+        let first = collect_on_event_account_read_triggers(
+            42,
+            Some(1_700_000_123),
+            "program_b",
+            &[DiscoveryEventData {
+                event_name: "PoolInitialized".to_string(),
+                fields: HashMap::new(),
+            }],
+            &lookup,
+            &manager,
+            &mut seen_targets,
+        );
+        let second = collect_on_event_account_read_triggers(
+            42,
+            Some(1_700_000_123),
+            "program_b",
+            &[DiscoveryEventData {
+                event_name: "PoolInitialized".to_string(),
+                fields: HashMap::new(),
+            }],
+            &lookup,
+            &manager,
+            &mut seen_targets,
+        );
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 0);
     }
 
     #[test]
