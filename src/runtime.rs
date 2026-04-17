@@ -274,32 +274,20 @@ impl CommonChannels {
 
     /// Build channels for full mode.
     ///
-    /// Historically this branched from `build_for_live_only` to add a
-    /// decode-catchup oneshot barrier; that barrier was removed when the
-    /// engine started running `run_catchup` concurrently with its live loop.
-    /// The two constructors now produce the same channels, but the two
-    /// methods are kept for call-site clarity.
+    /// This currently matches `build_for_live_only`, but the separate
+    /// constructor is kept for call-site clarity.
     pub fn build_for_full(
         config: &IndexerConfig,
         features: &ChainFeatures,
         transformations_enabled: bool,
         has_account_state_handlers: bool,
     ) -> Self {
-        let mut channels = Self::build_for_live_only(
+        Self::build_for_live_only(
             config,
             features,
             transformations_enabled,
             has_account_state_handlers,
-        );
-
-        // Add decode catchup barrier for full mode
-        if transformations_enabled && features.has_calls {
-            let (tx, rx) = oneshot::channel();
-            channels.decode_catchup_done_tx = Some(tx);
-            channels.decode_catchup_done_rx = Some(rx);
-        }
-
-        channels
+        )
     }
 }
 

@@ -718,7 +718,12 @@ async fn main() -> anyhow::Result<()> {
 
                 // Without solana feature, all chains use the EVM pipeline
                 #[cfg(not(feature = "solana"))]
-                if transformation_only {
+                if chain.chain_type == types::chain::ChainType::Solana {
+                    Err(anyhow::anyhow!(
+                        "Chain '{}' is configured as Solana, but this build does not include Solana support. Rebuild with --features solana.",
+                        chain.name
+                    ))
+                } else if transformation_only {
                     transformation_only_chain(
                         &config,
                         &chain,
@@ -906,17 +911,9 @@ async fn decode_only_chain(
                     complete_tx: None,
                     retry_tx: None,
                 };
-                decode_eth_calls(
-                    &chain,
-                    &cfg,
-                    rx,
-                    outputs,
-                    false,
-                    repair,
-                    repair_scope,
-                )
-                .await
-                .context("eth call decoding failed")
+                decode_eth_calls(&chain, &cfg, rx, outputs, false, repair, repair_scope)
+                    .await
+                    .context("eth call decoding failed")
             }
         });
     }
@@ -1022,7 +1019,7 @@ async fn transformation_only_chain(
     let engine = TransformationEngine::new(
         registry.clone(),
         db_pool,
-        rpc_client,
+        Some(rpc_client),
         TransformationEngineConfig {
             chain_name: chain.name.clone(),
             chain_id: chain.chain_id,
@@ -1032,6 +1029,8 @@ async fn transformation_only_chain(
             handler_concurrency: tc.handler_concurrency,
             expect_log_completion: false,
             expect_eth_call_completion: false,
+            expect_account_state_completion: false,
+            expect_instruction_completion: false,
             from_block: chain.from_block,
             to_block: chain.to_block,
         },
@@ -1898,8 +1897,6 @@ async fn process_chain(
         transform_reorg_rx,
         transform_retry_tx,
         transform_retry_rx,
-        decode_catchup_done_tx,
-        decode_catchup_done_rx,
     } = CommonChannels::build_for_full(
         config,
         features,
