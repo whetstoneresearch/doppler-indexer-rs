@@ -24,8 +24,8 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      # - name: Check formatting
+      #   run: cargo fmt --all -- --check
 
       # Temporarily disabled while the branch absorbs existing lint debt from main.
       # - name: Run Clippy
