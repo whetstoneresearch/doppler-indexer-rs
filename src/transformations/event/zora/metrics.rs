@@ -76,7 +76,7 @@ impl TransformationHandler for ZoraSwapMetricsHandler {
             &ctx.contracts,
             self.name(),
             CREATOR_HOOK_SOURCE,
-        Some((ctx.blockrange_start, ctx.blockrange_end)),
+            Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -148,7 +148,7 @@ fn extract_zora_swaps(ctx: &TransformationContext) -> Result<Vec<SwapInput>, Tra
                     tracing::warn!(
                         source,
                         block = event.block_number,
-                        log_index = event.log_index,
+                        log_index = event.log_index(),
                         sqrt_price_x96 = %sqrt_price_x96,
                         "Skipping Zora swap with invalid sqrtPriceX96: {}",
                         err
@@ -159,10 +159,10 @@ fn extract_zora_swaps(ctx: &TransformationContext) -> Result<Vec<SwapInput>, Tra
 
             swaps.push(SwapInput {
                 pool_id: event.extract_bytes32("poolKeyHash")?.to_vec(),
-                transaction_hash: event.transaction_hash,
+                transaction_hash: event.evm_tx_hash(),
                 block_number: event.block_number,
                 block_timestamp: event.block_timestamp,
-                log_index: event.log_index,
+                log_index: event.log_index(),
                 amount0: event.extract_int256("amount0")?,
                 amount1: event.extract_int256("amount1")?,
                 sqrt_price_x96,

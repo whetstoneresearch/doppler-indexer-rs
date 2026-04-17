@@ -158,7 +158,7 @@ impl ZoraCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: &event.transaction_hash,
+                    tx_hash: event.evm_tx_hash_ref(),
                     creator_address: Some(&payout_recipient),
                     integrator: non_zero_address(platform_referrer).as_ref(),
                     token_address: &coin,
@@ -182,7 +182,7 @@ impl ZoraCreateHandler {
                     &TokenData {
                         block_number: event.block_number,
                         block_timestamp: event.block_timestamp,
-                        tx_hash: &event.transaction_hash,
+                        tx_hash: event.evm_tx_hash_ref(),
                         creator_address: None,
                         integrator: None,
                         token_address: &currency,
