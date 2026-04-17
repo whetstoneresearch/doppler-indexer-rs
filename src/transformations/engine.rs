@@ -1472,7 +1472,8 @@ impl TransformationEngine {
                 ),
                 Err(e) => tracing::error!(
                     "Transformation catchup failed for chain {}: {}",
-                    self.chain_name, e
+                    self.chain_name,
+                    e
                 ),
             }
             res
@@ -2224,7 +2225,9 @@ impl TransformationEngine {
         for call in calls {
             let chain_id = self.chain_id as i64;
             let block_number = call.block_number as i64;
-            let log_index = call.trigger_log_index().map(i64::from);
+            let log_index = call
+                .trigger_position
+                .map(|position| position.packed_ordinal_i64());
             let source_name = &call.source_name;
             let function_name = &call.function_name;
             let target_address = call.contract_address.as_slice();
@@ -2792,9 +2795,9 @@ impl TransformationEngine {
                     handler_name: name,
                     range_start,
                     range_end,
-                    dep_names: vec![],
-                    contiguous_dep_names: Vec::new(),
-                    call_dep_keys: Vec::new(),
+                    dep_names: Arc::new(Vec::new()),
+                    contiguous_dep_names: Arc::new(Vec::new()),
+                    call_dep_keys: Arc::new(Vec::new()),
                     sequential: false,
                     payload: Box::new(ProcessRangePayload {
                         handler,

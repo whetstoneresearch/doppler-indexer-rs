@@ -10,6 +10,7 @@ use alloy_primitives::U256;
 
 use crate::transformations::context::{FieldExtractor, TransformationContext};
 use crate::transformations::error::TransformationError;
+use crate::types::chain::LogPosition;
 use crate::types::uniswap::v4::PoolKey;
 
 use super::swap_data::{LiquidityInput, SwapInput};
@@ -19,7 +20,7 @@ use super::tvl::TvlTarget;
 ///
 /// V4 hook Swap events contain amount0/amount1 but not sqrtPriceX96/tick. The getSlot0
 /// on_event call (configured in JSON) provides these values. Each call result is matched
-/// to its triggering Swap event via `trigger_log_index`.
+/// to its triggering Swap event via `trigger_position`.
 pub fn extract_v4_hook_swaps(
     ctx: &TransformationContext,
     event_source: &str,
@@ -27,11 +28,11 @@ pub fn extract_v4_hook_swaps(
 ) -> Result<Vec<SwapInput>, TransformationError> {
     // Build a lookup map once so each swap event can find its matching getSlot0 result
     // in O(1) rather than re-scanning the full call list for every event (O(n²)).
-    let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
+    let slot0_by_event_key: HashMap<(u64, LogPosition), _> = ctx
         .calls_of_type(call_source, "getSlot0")
         .filter_map(|call| {
-            call.trigger_log_index()
-                .map(|idx| ((call.block_number, idx), call))
+            call.trigger_position
+                .map(|position| ((call.block_number, position), call))
         })
         .collect();
 
@@ -41,7 +42,7 @@ pub fn extract_v4_hook_swaps(
         let pool_id = event.extract_bytes32("poolId")?;
 
         let Some(slot0) = slot0_by_event_key
-            .get(&(event.block_number, event.log_index()))
+            .get(&(event.block_number, event.position))
             .copied()
         else {
             return Err(TransformationError::MissingData(format!(
@@ -92,11 +93,11 @@ pub fn extract_v4_hook_tvl_targets(
     event_source: &str,
     call_source: &str,
 ) -> Result<Vec<TvlTarget>, TransformationError> {
-    let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
+    let slot0_by_event_key: HashMap<(u64, LogPosition), _> = ctx
         .calls_of_type(call_source, "getSlot0")
         .filter_map(|call| {
-            call.trigger_log_index
-                .map(|idx| ((call.block_number, idx), call))
+            call.trigger_position
+                .map(|position| ((call.block_number, position), call))
         })
         .collect();
 
@@ -106,12 +107,14 @@ pub fn extract_v4_hook_tvl_targets(
         let pool_id = event.extract_bytes32("poolId")?;
 
         let Some(slot0) = slot0_by_event_key
-            .get(&(event.block_number, event.log_index))
+            .get(&(event.block_number, event.position))
             .copied()
         else {
             return Err(TransformationError::MissingData(format!(
                 "No getSlot0 call for TVL target at block {} log_index {} (source: {})",
-                event.block_number, event.log_index, call_source
+                event.block_number,
+                event.log_index(),
+                call_source
             )));
         };
 
@@ -272,17 +275,23 @@ mod tests {
     }
 
     fn slot0_call(
-        trigger_log_index: u32,
+        trigger_position_index: u32,
         sqrt_price_x96: U256,
         tick: i32,
         is_reverted: bool,
     ) -> DecodedCall {
-        slot0_call_at_block(100, trigger_log_index, sqrt_price_x96, tick, is_reverted)
+        slot0_call_at_block(
+            100,
+            trigger_position_index,
+            sqrt_price_x96,
+            tick,
+            is_reverted,
+        )
     }
 
     fn slot0_call_at_block(
         block_number: u64,
-        trigger_log_index: u32,
+        trigger_position_index: u32,
         sqrt_price_x96: U256,
         tick: i32,
         is_reverted: bool,
@@ -300,7 +309,7 @@ mod tests {
             source_name: SOURCE.to_string(),
             function_name: "getSlot0".to_string(),
             trigger_position: Some(LogPosition::Evm {
-                log_index: trigger_log_index,
+                log_index: trigger_position_index,
             }),
             result,
             is_reverted,

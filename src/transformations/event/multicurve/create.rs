@@ -82,7 +82,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 .calls_of_type("UniswapV4MulticurveInitializer", "getState")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index() == Some(event.log_index())
+                        && call.trigger_position == Some(event.position)
                 })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
@@ -188,7 +188,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 .calls_of_type("UniswapV4MulticurveInitializer", "getPositions")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index() == Some(event.log_index())
+                        && call.trigger_position == Some(event.position)
                 })
                 .ok_or_else(|| {
                     TransformationError::MissingData(format!(
@@ -339,7 +339,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 .calls_of_type("UniswapV4MulticurveInitializer", "getBeneficiaries")
                 .find(|call| {
                     call.block_number == event.block_number
-                        && call.trigger_log_index() == Some(event.log_index())
+                        && call.trigger_position == Some(event.position)
                 })
                 .and_then(|call| call.result.get("getBeneficiaries"))
                 .map(|val| match val {
