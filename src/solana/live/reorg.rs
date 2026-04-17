@@ -378,12 +378,10 @@ impl SolanaReorgDetector {
 
     /// Remove tracked slots that fall outside the retention window.
     fn prune_old_slots(&mut self, current_slot: u64) {
-        if self.retention_depth == 0 {
-            return;
-        }
         let min_slot = current_slot.saturating_sub(self.retention_depth);
         // BTreeMap::split_off returns everything >= key, which is exactly what
-        // we want to keep.
+        // we want to keep.  When retention_depth == 0 this keeps only the
+        // current slot, preventing unbounded growth in finalized mode.
         self.recent_slots = self.recent_slots.split_off(&min_slot);
     }
 }
