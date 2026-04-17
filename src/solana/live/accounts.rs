@@ -500,7 +500,7 @@ impl SolanaLiveAccountReader {
             let msg = DecodedAccountStatesMessage {
                 range_start: slot,
                 range_end: slot + 1,
-                source_name: effective_source,
+                source_name: effective_source.clone(),
                 account_type,
                 account_states: states,
             };

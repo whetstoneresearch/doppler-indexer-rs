@@ -147,8 +147,8 @@ impl SolanaChainRuntime {
         let rpc_client = Arc::new(SolanaRpcClient::new(
             &rpc_url,
             chain.commitment,
-            None,
-            None,
+            chain.rpc.units_per_second(),
+            chain.rpc.concurrency,
         )?);
 
         // Detect features
@@ -544,6 +544,8 @@ pub async fn process_solana_chain(
             expect_eth_call_completion: false,
             expect_account_state_completion: false,
             expect_instruction_completion: runtime.features.has_instructions,
+            from_block: chain.from_block,
+            to_block: chain.to_block,
         };
 
         let engine = TransformationEngine::new(
@@ -567,15 +569,7 @@ pub async fn process_solana_chain(
 
         tasks.spawn(async move {
             engine
-                .run(
-                    events_rx,
-                    dummy_calls_rx,
-                    None,
-                    complete_rx,
-                    None,
-                    None,
-                    None,
-                )
+                .run(events_rx, dummy_calls_rx, None, complete_rx, None, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("Transformation engine error: {}", e))
         });
@@ -1373,7 +1367,7 @@ async fn run_solana_live_mode(
                                     Some(bytes) => DiscoveryFieldValue::Pubkey(bytes),
                                     None => DiscoveryFieldValue::Other,
                                 };
-                                (k.clone(), field_val)
+                                (k.to_string(), field_val)
                             })
                             .collect();
                         DiscoveryEventData {
@@ -1641,6 +1635,8 @@ async fn run_solana_live_mode(
             expect_eth_call_completion: false,
             expect_account_state_completion: expectations.expect_account_reads,
             expect_instruction_completion: expectations.expect_instruction_decode,
+            from_block: chain.from_block,
+            to_block: chain.to_block,
         };
 
         let engine = TransformationEngine::new(
@@ -1673,7 +1669,6 @@ async fn run_solana_live_mode(
                     complete_rx,
                     transform_reorg_rx,
                     transform_retry_rx,
-                    None,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("Transformation engine error: {}", e))
