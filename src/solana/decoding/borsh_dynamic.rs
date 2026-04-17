@@ -596,9 +596,9 @@ mod tests {
         match &val {
             DecodedValue::NamedTuple(fields) => {
                 assert_eq!(fields.len(), 2);
-                assert_eq!(fields[0].0, "x");
+                assert_eq!(fields[0].0.as_ref(), "x");
                 assert_eq!(fields[0].1.as_i32(), Some(10));
-                assert_eq!(fields[1].0, "y");
+                assert_eq!(fields[1].0.as_ref(), "y");
                 assert_eq!(fields[1].1.as_i32(), Some(-20));
             }
             other => panic!("expected NamedTuple, got {:?}", other),
@@ -686,11 +686,11 @@ mod tests {
 
         match &val {
             DecodedValue::NamedTuple(fields) => {
-                assert_eq!(fields[0].0, "variant");
+                assert_eq!(fields[0].0.as_ref(), "variant");
                 assert_eq!(fields[0].1.as_string(), Some("Rect"));
-                assert_eq!(fields[1].0, "w");
+                assert_eq!(fields[1].0.as_ref(), "w");
                 assert_eq!(fields[1].1.as_u32(), Some(5));
-                assert_eq!(fields[2].0, "h");
+                assert_eq!(fields[2].0.as_ref(), "h");
                 assert_eq!(fields[2].1.as_u32(), Some(10));
             }
             other => panic!("expected NamedTuple, got {:?}", other),
@@ -734,12 +734,12 @@ mod tests {
 
         match &val {
             DecodedValue::NamedTuple(fields) => {
-                assert_eq!(fields[0].0, "label");
+                assert_eq!(fields[0].0.as_ref(), "label");
                 assert_eq!(fields[0].1.as_u8(), Some(7));
-                assert_eq!(fields[1].0, "inner");
+                assert_eq!(fields[1].0.as_ref(), "inner");
                 match &fields[1].1 {
                     DecodedValue::NamedTuple(inner_fields) => {
-                        assert_eq!(inner_fields[0].0, "val");
+                        assert_eq!(inner_fields[0].0.as_ref(), "val");
                         assert_eq!(inner_fields[0].1.as_u64(), Some(42));
                     }
                     other => panic!("expected NamedTuple for inner, got {:?}", other),
@@ -893,19 +893,19 @@ mod tests {
                 assert_eq!(fields.len(), 4);
 
                 // amount
-                assert_eq!(fields[0].0, "amount");
+                assert_eq!(fields[0].0.as_ref(), "amount");
                 assert_eq!(fields[0].1.as_u64(), Some(1_000_000));
 
                 // authority
-                assert_eq!(fields[1].0, "authority");
+                assert_eq!(fields[1].0.as_ref(), "authority");
                 assert_eq!(fields[1].1.as_pubkey(), Some([0xAA; 32]));
 
                 // maybe_fee
-                assert_eq!(fields[2].0, "maybe_fee");
+                assert_eq!(fields[2].0.as_ref(), "maybe_fee");
                 assert_eq!(fields[2].1.as_u32(), Some(500));
 
                 // tags
-                assert_eq!(fields[3].0, "tags");
+                assert_eq!(fields[3].0.as_ref(), "tags");
                 match &fields[3].1 {
                     DecodedValue::Array(items) => {
                         assert_eq!(items.len(), 3);

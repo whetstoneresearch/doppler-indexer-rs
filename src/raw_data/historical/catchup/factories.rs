@@ -766,6 +766,7 @@ mod tests {
         ChainConfig {
             name: "test".to_string(),
             chain_id: 1,
+            chain_type: crate::types::chain::ChainType::Evm,
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
@@ -775,6 +776,10 @@ mod tests {
             block_receipts_method: None,
             factory_collections: FactoryCollections::new(),
             rpc: RpcConfig::default(),
+            #[cfg(feature = "solana")]
+            solana_programs: Default::default(),
+            #[cfg(feature = "solana")]
+            commitment: Default::default(),
         }
     }
 

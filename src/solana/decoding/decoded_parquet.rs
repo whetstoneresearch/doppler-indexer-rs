@@ -176,6 +176,7 @@ mod tests {
     use crate::types::chain::{ChainAddress, LogPosition, TxId};
     use crate::types::decoded::DecodedValue;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn make_decoded_event(
@@ -188,8 +189,11 @@ mod tests {
         inner: Option<u16>,
     ) -> DecodedEvent {
         let mut params = HashMap::new();
-        params.insert("amount".to_string(), DecodedValue::Uint64(42));
-        params.insert("name".to_string(), DecodedValue::String("test".to_string()));
+        params.insert(Arc::<str>::from("amount"), DecodedValue::Uint64(42));
+        params.insert(
+            Arc::<str>::from("name"),
+            DecodedValue::String("test".to_string()),
+        );
 
         DecodedEvent {
             block_number: slot,
@@ -288,8 +292,8 @@ mod tests {
     #[test]
     fn test_params_json_serialization() {
         let mut params = HashMap::new();
-        params.insert("amount".to_string(), DecodedValue::Uint64(42));
-        params.insert("flag".to_string(), DecodedValue::Bool(true));
+        params.insert(Arc::<str>::from("amount"), DecodedValue::Uint64(42));
+        params.insert(Arc::<str>::from("flag"), DecodedValue::Bool(true));
 
         let json = params_to_json(&params);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
