@@ -76,6 +76,7 @@ impl TransformationHandler for ZoraSwapMetricsHandler {
             &ctx.contracts,
             self.name(),
             CREATOR_HOOK_SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

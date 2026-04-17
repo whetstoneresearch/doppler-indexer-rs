@@ -178,6 +178,7 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
             &ctx.contracts,
             self.name(),
             POOL_MANAGER_SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -209,7 +210,6 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-
         // Seed the migration pool ID set from pools that have already graduated.
         let client = db_pool.inner().get().await?;
         let rows = client
@@ -431,6 +431,7 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             POOL_MANAGER_SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -466,7 +467,6 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-
         let client = db_pool.inner().get().await?;
         let rows = client
             .query(

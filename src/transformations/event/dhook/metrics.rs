@@ -79,6 +79,7 @@ impl TransformationHandler for DhookSwapMetricsHandler {
             &ctx.contracts,
             self.name(),
             SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -230,6 +231,7 @@ impl TransformationHandler for DhookTvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

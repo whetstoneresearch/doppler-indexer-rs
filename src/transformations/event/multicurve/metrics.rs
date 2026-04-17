@@ -79,6 +79,7 @@ impl TransformationHandler for MulticurveSwapMetricsHandler {
             &ctx.contracts,
             self.name(),
             SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -231,6 +232,7 @@ impl TransformationHandler for MulticurveTvlMetricsHandler {
             &ctx.contracts,
             self.name(),
             SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 

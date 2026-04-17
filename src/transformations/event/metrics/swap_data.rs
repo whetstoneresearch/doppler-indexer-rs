@@ -369,6 +369,7 @@ pub async fn refresh_cache_if_needed(
     contracts: &crate::types::config::contract::Contracts,
     handler_name: &str,
     source_name: &str,
+    block_window: Option<(u64, u64)>,
 ) -> Result<(), TransformationError> {
     let missing: Vec<_> = {
         let unique: HashSet<&Vec<u8>> = pool_ids.collect();
@@ -386,7 +387,10 @@ pub async fn refresh_cache_if_needed(
     };
 
     let missing_owned: Vec<Vec<u8>> = missing.iter().map(|id| (*id).clone()).collect();
-    match cache.refresh(pool, chain_id, contracts, &missing_owned).await {
+    match cache
+        .refresh(pool, chain_id, contracts, &missing_owned, block_window)
+        .await
+    {
         Ok(new_count) if new_count > 0 => {
             tracing::info!(
                 handler = handler_name,
