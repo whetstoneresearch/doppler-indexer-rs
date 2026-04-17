@@ -3,10 +3,11 @@
 //! This module provides unified setup for both full (historical + live) and
 //! live-only modes, ensuring consistent configuration and avoiding duplication.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::db::DbPool;
 use crate::decoding::DecoderMessage;
@@ -133,6 +134,7 @@ pub fn build_rpc_client(
     let units_per_second = rpc_config
         .units_per_second()
         .unwrap_or(rpc_defaults::ALCHEMY_CU_PER_SECOND);
+    let http2 = rpc_config.http2_enabled();
 
     let rate_limiter = Arc::new(SlidingWindowRateLimiter::new(units_per_second));
 
@@ -142,13 +144,15 @@ pub fn build_rpc_client(
         concurrency,
         batch_size,
         Some(rate_limiter.clone()),
+        http2,
     )?;
 
     tracing::info!(
-        "RPC config: concurrency={}, units_per_second={}, batch_size={}",
+        "RPC config: concurrency={}, units_per_second={}, batch_size={}, http2={}",
         concurrency,
         units_per_second,
-        batch_size
+        batch_size,
+        http2
     );
 
     Ok((rate_limiter, Arc::new(client)))
@@ -172,6 +176,7 @@ pub fn build_rpc_client_with_limiter(
         concurrency,
         batch_size,
         Some(shared_limiter),
+        rpc_config.http2_enabled(),
     )
     .map_err(Into::into)
 }
@@ -197,10 +202,6 @@ pub struct CommonChannels {
     pub transform_reorg_rx: Option<mpsc::Receiver<ReorgMessage>>,
     pub transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
     pub transform_retry_rx: Option<mpsc::Receiver<TransformRetryRequest>>,
-
-    // Decode catchup barrier (full mode only, None for live-only)
-    pub decode_catchup_done_tx: Option<oneshot::Sender<()>>,
-    pub decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl CommonChannels {
@@ -268,15 +269,16 @@ impl CommonChannels {
             transform_reorg_rx,
             transform_retry_tx,
             transform_retry_rx,
-            decode_catchup_done_tx: None,
-            decode_catchup_done_rx: None,
         }
     }
 
     /// Build channels for full mode.
     ///
-    /// Same as live-only but also creates the decode catchup barrier
-    /// if transformations and calls are both enabled.
+    /// Historically this branched from `build_for_live_only` to add a
+    /// decode-catchup oneshot barrier; that barrier was removed when the
+    /// engine started running `run_catchup` concurrently with its live loop.
+    /// The two constructors now produce the same channels, but the two
+    /// methods are kept for call-site clarity.
     pub fn build_for_full(
         config: &IndexerConfig,
         features: &ChainFeatures,
@@ -333,6 +335,7 @@ impl ChainRuntime {
         chain: &ChainConfig,
         shared_db_pool: Option<Arc<DbPool>>,
         shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        handler_filter: Option<&HashSet<String>>,
     ) -> anyhow::Result<Self> {
         let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
             format!(
@@ -368,6 +371,7 @@ impl ChainRuntime {
                 concurrency,
                 rpc_batch_size,
                 Some(limiter.clone()),
+                chain.rpc.http2_enabled(),
             )?;
             (limiter, Arc::new(client))
         } else {
@@ -377,9 +381,9 @@ impl ChainRuntime {
         // Build transformation registry filtered to this chain's contracts
         let registry = build_registry_for_chain(
             chain.chain_id,
-            chain.chain_type,
             &chain.contracts,
             &chain.factory_collections,
+            handler_filter,
         );
         let transformations_enabled = config.transformations.is_some() && !registry.is_empty();
 

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -12,34 +11,169 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::{
     build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet_async,
     process_range_batches, read_log_batches_from_parquet_async, scan_existing_parquet_files,
-    FactoryAddressData, FactoryCatchupState, FactoryCollectionError, RecollectRequest,
+    FactoryAddressData, FactoryCatchupState, FactoryCollectionError, FactoryMessage,
+    RecollectRequest,
 };
 use crate::storage::contract_index::{
     build_address_contract_map, build_expected_factory_contracts_for_range,
     detect_contracts_in_log_parquet, get_missing_contracts, range_key, read_contract_index,
-    update_contract_index, write_contract_index, ContractIndex,
+    update_contract_index, write_contract_index, ContractIndex, ExpectedContracts,
 };
 use crate::storage::paths::factories_dir as factories_dir_path;
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
+use crate::types::config::defaults::raw_data as raw_data_defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 
+/// Streaming send of `IncrementalAddresses` + `RangeComplete` for one
+/// finalized range. Uses `send().await` so a slow consumer back-pressures
+/// the producer (safe now that `collect_eth_calls` drains factory_rx
+/// concurrently — see catchup/eth_calls.rs).
+async fn send_factory_range_to_eth_calls(
+    tx: &Option<Sender<FactoryMessage>>,
+    factory_data: &Arc<FactoryAddressData>,
+) -> Result<(), FactoryCollectionError> {
+    let Some(tx) = tx else {
+        return Ok(());
+    };
+    let range_start = factory_data.range_start;
+    let range_end = factory_data.range_end;
+    if tx
+        .send(FactoryMessage::IncrementalAddresses(Arc::clone(factory_data)))
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "eth_calls_factory_tx (IncrementalAddresses {}-{}) - receiver dropped",
+            range_start, range_end
+        )));
+    }
+    if tx
+        .send(FactoryMessage::RangeComplete {
+            range_start,
+            range_end,
+        })
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "eth_calls_factory_tx (RangeComplete {}-{}) - receiver dropped",
+            range_start, range_end
+        )));
+    }
+    Ok(())
+}
+
+/// Send `DecoderMessage::FactoryAddresses` for a finalized range.
+async fn send_factory_addresses_to_decoder(
+    tx: &Option<Sender<DecoderMessage>>,
+    label: &str,
+    range_start: u64,
+    range_end: u64,
+    addresses: HashMap<String, Vec<Address>>,
+) -> Result<(), FactoryCollectionError> {
+    let Some(tx) = tx else {
+        return Ok(());
+    };
+    if tx
+        .send(DecoderMessage::FactoryAddresses {
+            range_start,
+            range_end,
+            addresses,
+        })
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "{} {}-{}) - receiver dropped",
+            label, range_start, range_end
+        )));
+    }
+    Ok(())
+}
+
+/// Best-effort `AllComplete` send. We tolerate a closed channel because in
+/// catch-up-only mode the eth_calls catchup may have already exited.
+async fn send_factory_all_complete(tx: &Option<Sender<FactoryMessage>>) {
+    if let Some(tx) = tx {
+        let _ = tx.send(FactoryMessage::AllComplete).await;
+    }
+}
+
+fn active_factory_contracts_for_range(
+    chain: &ChainConfig,
+    factory_collection_names: &HashSet<String>,
+    range_end_exclusive: u64,
+) -> HashMap<String, ExpectedContracts> {
+    build_expected_factory_contracts_for_range(&chain.contracts, range_end_exclusive)
+        .into_iter()
+        .filter(|(collection, expected)| {
+            factory_collection_names.contains(collection) && !expected.is_empty()
+        })
+        .collect()
+}
+
+fn range_complete_for_active_collections(
+    range_start: u64,
+    range_end_exclusive: u64,
+    active_expected: &HashMap<String, ExpectedContracts>,
+    existing_files: &HashSet<String>,
+    s3_manifest: Option<&S3Manifest>,
+    contract_indexes: &HashMap<String, ContractIndex>,
+) -> bool {
+    let rk = range_key(range_start, range_end_exclusive - 1);
+
+    active_expected.iter().all(|(collection, expected)| {
+        let rel_path = format!(
+            "{}/{}-{}.parquet",
+            collection,
+            range_start,
+            range_end_exclusive - 1
+        );
+        let file_exists = existing_files.contains(&rel_path)
+            || s3_manifest
+                .is_some_and(|m| m.has_factories(collection, range_start, range_end_exclusive - 1));
+        if !file_exists {
+            return false;
+        }
+
+        let index = contract_indexes
+            .get(collection)
+            .cloned()
+            .unwrap_or_default();
+        get_missing_contracts(&index, &rk, expected).is_empty()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
-    logs_factory_tx: &Option<Sender<FactoryAddressData>>,
+    logs_factory_tx: &Option<Sender<Arc<FactoryAddressData>>>,
+    eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
+    call_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
-    factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
+    repair_all: bool,
 ) -> Result<FactoryCatchupState, FactoryCollectionError> {
     let output_dir = factories_dir_path(&chain.name);
     tokio::fs::create_dir_all(&output_dir).await?;
 
-    let existing_factory_data =
-        load_factory_addresses_from_parquet_async(output_dir.clone()).await?;
+    if repair_all {
+        tracing::info!(
+            "Factory repair-all mode enabled for chain {}: rebuilding factory ranges from raw logs",
+            chain.name
+        );
+    }
+
+    let existing_factory_data = if repair_all {
+        Vec::new()
+    } else {
+        load_factory_addresses_from_parquet_async(output_dir.clone()).await?
+    };
     if !existing_factory_data.is_empty() {
         tracing::info!(
             "Loaded {} existing factory ranges from parquet for chain {}",
@@ -48,8 +182,9 @@ pub async fn collect_factories(
         );
 
         for factory_data in existing_factory_data {
+            let factory_data = Arc::new(factory_data);
             if let Some(ref tx) = logs_factory_tx {
-                if tx.send(factory_data.clone()).await.is_err() {
+                if tx.send(Arc::clone(&factory_data)).await.is_err() {
                     tracing::error!(
                         "Failed to send existing factory data for range {}-{} to logs_factory_tx - receiver dropped",
                         factory_data.range_start,
@@ -62,13 +197,11 @@ pub async fn collect_factories(
                 }
             }
 
-            // Note: eth_calls_factory_tx and call_decoder_tx sends are intentionally
-            // skipped during catchup. Both consumers load factory addresses from parquet
-            // during their own catchup phases. Sending here would deadlock because those
-            // channels (capacity 1000) aren't consumed until after factory catchup completes.
-            // The channels are used during the live/current phase instead.
+            // Stream the same data to eth_calls and call_decoder consumers per
+            // range. Safe because those consumers run concurrently with this
+            // task and drain their channels — see catchup/eth_calls.rs.
+            send_factory_range_to_eth_calls(eth_calls_factory_tx, &factory_data).await?;
 
-            // Send to log decoder
             let addresses: HashMap<String, Vec<Address>> = factory_data
                 .addresses_by_block
                 .values()
@@ -78,26 +211,23 @@ pub async fn collect_factories(
                     acc
                 });
 
-            if let Some(ref tx) = log_decoder_tx {
-                if tx
-                    .send(DecoderMessage::FactoryAddresses {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                        addresses,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        "Failed to send factory addresses to log decoder for range {}-{} - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    );
-                    return Err(FactoryCollectionError::ChannelSend(format!(
-                        "log_decoder_tx (existing factory data {}-{}) - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    )));
-                }
-            }
+            send_factory_addresses_to_decoder(
+                log_decoder_tx,
+                "log_decoder_tx (existing factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses.clone(),
+            )
+            .await?;
+
+            send_factory_addresses_to_decoder(
+                call_decoder_tx,
+                "call_decoder_tx (existing factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses,
+            )
+            .await?;
         }
     }
 
@@ -109,9 +239,7 @@ pub async fn collect_factories(
             chain.name
         );
 
-        if let Some(tx) = factory_catchup_done_tx {
-            let _ = tx.send(());
-        }
+        send_factory_all_complete(eth_calls_factory_tx).await;
 
         return Ok(FactoryCatchupState {
             matchers: Arc::new(matchers),
@@ -147,6 +275,10 @@ pub async fn collect_factories(
         contract_indexes.insert(collection.clone(), idx);
     }
 
+    let factory_concurrency = raw_data_config
+        .factory_concurrency
+        .unwrap_or(raw_data_defaults::FACTORY_CONCURRENCY);
+
     // =========================================================================
     // Migration: build contract_index.json from existing data if missing
     // =========================================================================
@@ -154,11 +286,11 @@ pub async fn collect_factories(
         .iter()
         .any(|c| contract_indexes.get(c).is_none_or(|idx| idx.is_empty()));
 
-    if needs_migration {
+    if needs_migration && !repair_all {
         tracing::info!(
             "Contract index migration: scanning log files to build index for existing factory ranges"
         );
-        let address_maps = build_address_contract_map(&chain.contracts);
+        let address_maps = Arc::new(build_address_contract_map(&chain.contracts));
         let log_ranges_for_migration = {
             let chain_name = chain.name.clone();
             let s3_manifest_clone = s3_manifest.clone();
@@ -170,6 +302,11 @@ pub async fn collect_factories(
         };
 
         let mut migrated_count = 0usize;
+        let semaphore = Arc::new(Semaphore::new(factory_concurrency));
+        let mut migration_join_set: JoinSet<
+            Result<(u64, u64, HashMap<String, ExpectedContracts>), FactoryCollectionError>,
+        > = JoinSet::new();
+
         for log_range in &log_ranges_for_migration {
             let rk = range_key(log_range.start, log_range.end - 1);
 
@@ -204,35 +341,48 @@ pub async fn collect_factories(
                 continue;
             }
 
-            match detect_contracts_in_log_parquet(&log_range.file_path, &address_maps) {
-                Ok(detected) => {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let address_maps = address_maps.clone();
+            let file_path = log_range.file_path.clone();
+            let start = log_range.start;
+            let end = log_range.end;
+
+            migration_join_set.spawn(async move {
+                let _permit = permit;
+                let detected = tokio::task::spawn_blocking(move || {
+                    detect_contracts_in_log_parquet(&file_path, &address_maps)
+                })
+                .await
+                .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
+                .map_err(FactoryCollectionError::Io)?;
+                Ok((start, end, detected))
+            });
+        }
+
+        while let Some(result) = migration_join_set.join_next().await {
+            match result {
+                Ok(Ok((start, end, detected))) => {
+                    let rk = range_key(start, end - 1);
+
                     for (collection, contracts_found) in &detected {
                         let index = contract_indexes.entry(collection.clone()).or_default();
                         if !index.contains_key(&rk) {
                             update_contract_index(index, &rk, contracts_found);
                         }
                     }
+
                     // Also record collections where no source addresses were found
                     // (the range was processed but had no matching events)
                     for collection in &factory_collection_names {
                         if !detected.contains_key(collection) {
-                            let rel_path = format!(
-                                "{}/{}-{}.parquet",
-                                collection,
-                                log_range.start,
-                                log_range.end - 1
-                            );
+                            let rel_path = format!("{}/{}-{}.parquet", collection, start, end - 1);
                             let file_exists = existing_files.contains(&rel_path)
-                                || s3_manifest.as_ref().is_some_and(|m| {
-                                    m.has_factories(collection, log_range.start, log_range.end - 1)
-                                });
+                                || s3_manifest
+                                    .as_ref()
+                                    .is_some_and(|m| m.has_factories(collection, start, end - 1));
                             if file_exists {
                                 let index = contract_indexes.entry(collection.clone()).or_default();
                                 if !index.contains_key(&rk) {
-                                    // No source addresses matched, but the file exists.
-                                    // Record an empty entry so we don't re-scan.
-                                    // Use detected (empty for this collection) which is correct:
-                                    // no contracts contributed, so empty map.
                                     update_contract_index(
                                         index,
                                         &rk,
@@ -242,15 +392,13 @@ pub async fn collect_factories(
                             }
                         }
                     }
+
                     migrated_count += 1;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Migration: failed to scan log parquet {}: {}",
-                        log_range.file_path.display(),
-                        e
-                    );
+                Ok(Err(e)) => {
+                    tracing::warn!("Migration: failed to scan log parquet: {}", e);
                 }
+                Err(e) => return Err(FactoryCollectionError::JoinError(e.to_string())),
             }
         }
 
@@ -291,8 +439,6 @@ pub async fn collect_factories(
         .map_err(|e| FactoryCollectionError::JoinError(e.to_string()))?
     };
     let mut catchup_count = 0;
-
-    let factory_concurrency = raw_data_config.factory_concurrency.unwrap_or(8);
     let matchers = Arc::new(matchers);
     let existing_files = Arc::new(existing_files);
     let output_dir = Arc::new(output_dir);
@@ -309,40 +455,27 @@ pub async fn collect_factories(
             Result<Option<(u64, u64, FactoryAddressData)>, FactoryCollectionError>,
         > = JoinSet::new();
 
-        for log_range in &log_ranges {
-            let rk = range_key(log_range.start, log_range.end - 1);
+        for log_range in log_ranges
+            .iter()
+            .filter(|lr| chain.range_in_scope(lr.start, lr.end))
+        {
+            let active_expected =
+                active_factory_contracts_for_range(chain, &factory_collection_names, log_range.end);
 
-            let range_complete = factory_collection_names.iter().all(|collection| {
-                let rel_path = format!(
-                    "{}/{}-{}.parquet",
-                    collection,
+            if active_expected.is_empty() {
+                continue;
+            }
+
+            if !repair_all
+                && range_complete_for_active_collections(
                     log_range.start,
-                    log_range.end - 1
-                );
-                let file_exists = existing_files.contains(&rel_path)
-                    || s3_manifest.as_ref().as_ref().is_some_and(|m| {
-                        m.has_factories(collection, log_range.start, log_range.end - 1)
-                    });
-
-                if !file_exists {
-                    return false;
-                }
-
-                // File exists — check contract index for missing contracts
-                let expected_for_range =
-                    build_expected_factory_contracts_for_range(&chain.contracts, log_range.end);
-                if let Some(expected) = expected_for_range.get(collection) {
-                    let index = contract_indexes
-                        .get(collection)
-                        .cloned()
-                        .unwrap_or_default();
-                    get_missing_contracts(&index, &rk, expected).is_empty()
-                } else {
-                    true
-                }
-            });
-
-            if range_complete {
+                    log_range.end,
+                    &active_expected,
+                    existing_files.as_ref(),
+                    s3_manifest.as_ref().as_ref(),
+                    &contract_indexes,
+                )
+            {
                 continue;
             }
 
@@ -484,8 +617,9 @@ pub async fn collect_factories(
         catchup_results.sort_by_key(|d| d.range_start);
 
         for factory_data in catchup_results {
+            let factory_data = Arc::new(factory_data);
             if let Some(ref tx) = logs_factory_tx {
-                if tx.send(factory_data.clone()).await.is_err() {
+                if tx.send(Arc::clone(&factory_data)).await.is_err() {
                     tracing::error!(
                         "Failed to send catchup factory data for range {}-{} to logs_factory_tx - receiver dropped",
                         factory_data.range_start,
@@ -498,8 +632,7 @@ pub async fn collect_factories(
                 }
             }
 
-            // eth_calls_factory_tx and call_decoder_tx sends skipped during catchup
-            // (see comment in existing data forwarding loop above)
+            send_factory_range_to_eth_calls(eth_calls_factory_tx, &factory_data).await?;
 
             let addresses: HashMap<String, Vec<Address>> = factory_data
                 .addresses_by_block
@@ -510,26 +643,23 @@ pub async fn collect_factories(
                     acc
                 });
 
-            if let Some(ref tx) = log_decoder_tx {
-                if tx
-                    .send(DecoderMessage::FactoryAddresses {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                        addresses,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        "Failed to send factory addresses to log decoder for range {}-{} - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    );
-                    return Err(FactoryCollectionError::ChannelSend(format!(
-                        "log_decoder_tx (catchup factory data {}-{}) - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    )));
-                }
-            }
+            send_factory_addresses_to_decoder(
+                log_decoder_tx,
+                "log_decoder_tx (catchup factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses.clone(),
+            )
+            .await?;
+
+            send_factory_addresses_to_decoder(
+                call_decoder_tx,
+                "call_decoder_tx (catchup factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses,
+            )
+            .await?;
 
             catchup_count += 1;
         }
@@ -578,9 +708,7 @@ pub async fn collect_factories(
         );
     }
 
-    if let Some(tx) = factory_catchup_done_tx {
-        let _ = tx.send(());
-    }
+    send_factory_all_complete(eth_calls_factory_tx).await;
 
     // Extract from Arc - at this point all tasks are done so we're the only owner
     let s3_manifest = Arc::try_unwrap(s3_manifest).unwrap_or_else(|arc| (*arc).clone());
@@ -595,4 +723,101 @@ pub async fn collect_factories(
         storage_manager,
         chain_name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::contract_index::ContractIndex;
+    use crate::types::config::chain::RpcConfig;
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, Contracts, FactoryCollections, FactoryConfig,
+        FactoryEventConfig, FactoryParameterLocation,
+    };
+    use crate::types::config::generic::SingleOrMultiple;
+    use alloy_primitives::{Address, U256};
+    use std::collections::{HashMap, HashSet};
+
+    fn sample_chain(start_block: Option<u64>) -> ChainConfig {
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "Initializer".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(Address::from([0x11; 20])),
+                start_block: start_block.map(U256::from),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "DERC20".to_string(),
+                    factory_events: SingleOrMultiple::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Topic(1),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+
+        ChainConfig {
+            name: "test".to_string(),
+            chain_id: 1,
+            rpc_url_env_var: "RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            from_block: None,
+            to_block: None,
+            contracts,
+            block_receipts_method: None,
+            factory_collections: FactoryCollections::new(),
+            rpc: RpcConfig::default(),
+        }
+    }
+
+    #[test]
+    fn active_factory_contracts_for_range_skips_pre_start_ranges() {
+        let chain = sample_chain(Some(500));
+        let collections = HashSet::from([String::from("DERC20")]);
+
+        assert!(active_factory_contracts_for_range(&chain, &collections, 500).is_empty());
+
+        let active = active_factory_contracts_for_range(&chain, &collections, 501);
+        assert_eq!(
+            active.get("DERC20").and_then(|c| c.get("Initializer")),
+            Some(&vec![String::from(
+                "0x1111111111111111111111111111111111111111"
+            )])
+        );
+    }
+
+    #[test]
+    fn range_complete_for_active_collections_requires_file_and_index() {
+        let chain = sample_chain(Some(500));
+        let collections = HashSet::from([String::from("DERC20")]);
+        let active = active_factory_contracts_for_range(&chain, &collections, 501);
+
+        assert!(!range_complete_for_active_collections(
+            0,
+            501,
+            &active,
+            &HashSet::new(),
+            None,
+            &HashMap::new(),
+        ));
+
+        let mut files = HashSet::new();
+        files.insert(String::from("DERC20/0-500.parquet"));
+
+        let mut range_index = ContractIndex::new();
+        range_index.insert(String::from("0-500"), active.get("DERC20").unwrap().clone());
+
+        let mut indexes = HashMap::new();
+        indexes.insert(String::from("DERC20"), range_index);
+
+        assert!(range_complete_for_active_collections(
+            0, 501, &active, &files, None, &indexes,
+        ));
+    }
 }

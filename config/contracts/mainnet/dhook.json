@@ -4,10 +4,17 @@
             "0xaa096f558f3d4c9226de77e7cc05f18e180b2544",
             "0xbdf938149ac6a781f94faa0ed45e6a0e984c6544"
         ],
+        "start_block": 24326115,
         "events": [
-            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" },
-            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" },
-            { "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)" }
+            {
+                "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
+            },
+            {
+                "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)"
+            },
+            {
+                "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)"
+            }
         ],
         "calls": [
             {
@@ -20,7 +27,10 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             },
             {
@@ -33,7 +43,10 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             },
             {
@@ -46,7 +59,29 @@
                     }
                 },
                 "target": "UniswapV4StateView",
-                "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+                "params": [
+                    {
+                        "type": "bytes32",
+                        "from_event": "topics[3]"
+                    }
+                ]
+            },
+            {
+                "function": "getSlot0(bytes32)",
+                "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+                "frequency": {
+                    "on_events": {
+                        "source": "DopplerHookInitializer",
+                        "event": "ModifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32))"
+                    }
+                },
+                "target": "UniswapV4StateView",
+                "params": [
+                    {
+                        "type": "bytes32",
+                        "from_event": "v4_pool_id_from_key_data"
+                    }
+                ]
             }
         ]
     },
@@ -54,25 +89,29 @@
         "address": [
             "0x97cad5684fb7cc2bed9a9b5ebfba67138f4f2503",
             "0x3ec4798a9b11e8243a8db99687f7a23597b96623"
-        ]
+        ],
+        "start_block": 24326115
     },
     "DopplerHookMigrator": {
         "address": [
             "0x1e40b0875dda35f41e15cfb475403859b8c860c4",
             "0x65b6737c7a897029afe54dbb61bc4a84b232e0c4"
-        ]
+        ],
+        "start_block": 24326115
     },
     "RehypeDopplerHookMigrator": {
         "address": [
             "0xc3c9f4cfd1dc0a7837cc4b202b3455b4156a8005",
             "0x82d5e22911fbbcb8d3e45812d74ee6203c5824e0",
             "0xd199e7836e91654c0475a90e0c1d0e402bb84372"
-        ]
+        ],
+        "start_block": 24326115
     },
     "RehypeDopplerHookInitializer": {
         "address": [
             "0x6ab5ae3191c914de8437431091776fc90f314be4",
             "0xC918c6Edb8e0B62B5B73B3F812249a986ba8066d"
-        ]
+        ],
+        "start_block": 24326115
     }
 }

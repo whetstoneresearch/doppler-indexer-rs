@@ -57,7 +57,7 @@ pub struct FactoryAddressData {
 #[derive(Debug, Clone)]
 pub enum FactoryMessage {
     /// Incremental batch of factory addresses discovered (sent per rpc_batch_size logs)
-    IncrementalAddresses(FactoryAddressData),
+    IncrementalAddresses(Arc<FactoryAddressData>),
     /// A block range is complete - parquet files written
     RangeComplete { range_start: u64, range_end: u64 },
     /// All processing is complete
@@ -96,7 +96,9 @@ pub struct FactoryMatcher {
     pub data_types: Vec<DynSolType>,
     pub collection_name: String,
     /// Name of the contract in the config that owns this factory matcher.
+    #[allow(dead_code)]
     pub contract_name: String,
+    pub start_block: Option<u64>,
 }
 
 /// State computed during factory catchup, passed to current/streaming phase
@@ -114,6 +116,7 @@ pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
     let mut matchers = Vec::new();
 
     for (contract_name, contract) in contracts {
+        let start_block = contract.start_block.and_then(|u| u.try_into().ok());
         let contract_addresses: Vec<[u8; 20]> = match &contract.address {
             AddressOrAddresses::Single(addr) => vec![addr.0 .0],
             AddressOrAddresses::Multiple(addrs) => addrs.iter().map(|a| a.0 .0).collect(),
@@ -148,6 +151,7 @@ pub fn build_factory_matchers(contracts: &Contracts) -> Vec<FactoryMatcher> {
                             data_types: data_types.clone(),
                             collection_name: factory.collection.clone(),
                             contract_name: contract_name.clone(),
+                            start_block,
                         });
                     }
                 }
@@ -215,6 +219,13 @@ pub(crate) async fn process_range(
 
     for log in &logs {
         for matcher in matchers {
+            if matcher
+                .start_block
+                .is_some_and(|start_block| log.block_number < start_block)
+            {
+                continue;
+            }
+
             if log.address != matcher.factory_contract_address {
                 continue;
             }
@@ -393,8 +404,17 @@ pub(crate) async fn process_range_batches(
             if addr_bytes.len() != 20 {
                 continue;
             }
+            let block_number = block_nums.value(i);
+            let block_timestamp = timestamps.value(i);
 
             for matcher in matchers {
+                if matcher
+                    .start_block
+                    .is_some_and(|start_block| block_number < start_block)
+                {
+                    continue;
+                }
+
                 if addr_bytes != matcher.factory_contract_address.as_slice() {
                     continue;
                 }
@@ -412,9 +432,6 @@ pub(crate) async fn process_range_batches(
                 if !topic0_match {
                     continue;
                 }
-
-                let block_number = block_nums.value(i);
-                let block_timestamp = timestamps.value(i);
 
                 let extracted_address = match &matcher.param_location {
                     FactoryParameterLocation::Topic(idx) => match (topics_offsets, topics_inner) {
@@ -1014,4 +1031,113 @@ pub(crate) fn get_existing_log_ranges(
 
     ranges.sort_by_key(|r| r.start);
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_data::historical::receipts::LogData;
+    use crate::types::config::contract::{
+        AddressOrAddresses, ContractConfig, Contracts, FactoryConfig, FactoryEventConfig,
+        FactoryParameterLocation,
+    };
+    use crate::types::config::generic::SingleOrMultiple;
+    use alloy::primitives::B256;
+    use alloy_primitives::{Address as PrimitiveAddress, U256};
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    fn sample_contracts(start_block: Option<u64>) -> Contracts {
+        let mut contracts = Contracts::new();
+        contracts.insert(
+            "Initializer".to_string(),
+            ContractConfig {
+                address: AddressOrAddresses::Single(PrimitiveAddress::from([0x11; 20])),
+                start_block: start_block.map(U256::from),
+                calls: None,
+                factories: Some(vec![FactoryConfig {
+                    collection: "DERC20".to_string(),
+                    factory_events: SingleOrMultiple::Single(FactoryEventConfig {
+                        name: "Created".to_string(),
+                        topics_signature: "".to_string(),
+                        data_signature: None,
+                        factory_parameters: FactoryParameterLocation::Topic(1),
+                    }),
+                    calls: None,
+                    events: None,
+                }]),
+                events: None,
+            },
+        );
+        contracts
+    }
+
+    #[test]
+    fn build_factory_matchers_carries_start_block() {
+        let matchers = build_factory_matchers(&sample_contracts(Some(500)));
+        assert_eq!(matchers.len(), 1);
+        assert_eq!(matchers[0].start_block, Some(500));
+    }
+
+    #[tokio::test]
+    async fn process_range_respects_matcher_start_block() {
+        let dir = TempDir::new().unwrap();
+        let matcher = FactoryMatcher {
+            factory_contract_address: [0x11; 20],
+            event_topic0: [0x22; 32],
+            param_location: FactoryParameterLocation::Topic(1),
+            data_types: Vec::new(),
+            collection_name: "DERC20".to_string(),
+            contract_name: "Initializer".to_string(),
+            start_block: Some(100),
+        };
+
+        let logs = vec![
+            LogData {
+                block_number: 99,
+                block_timestamp: 1,
+                transaction_hash: B256::ZERO,
+                log_index: 0,
+                address: [0x11; 20],
+                topics: vec![[0x22; 32], {
+                    let mut topic = [0u8; 32];
+                    topic[12..32].copy_from_slice(&[0xaa; 20]);
+                    topic
+                }],
+                data: Vec::new(),
+            },
+            LogData {
+                block_number: 100,
+                block_timestamp: 2,
+                transaction_hash: B256::ZERO,
+                log_index: 1,
+                address: [0x11; 20],
+                topics: vec![[0x22; 32], {
+                    let mut topic = [0u8; 32];
+                    topic[12..32].copy_from_slice(&[0xbb; 20]);
+                    topic
+                }],
+                data: Vec::new(),
+            },
+        ];
+
+        let result = process_range(
+            0,
+            200,
+            logs,
+            &[matcher],
+            dir.path(),
+            &HashSet::new(),
+            None,
+            None,
+            "test-chain",
+        )
+        .await
+        .unwrap();
+
+        let entries = result.addresses_by_block.get(&100).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, Address::from([0xbb; 20]));
+        assert!(!result.addresses_by_block.contains_key(&99));
+    }
 }

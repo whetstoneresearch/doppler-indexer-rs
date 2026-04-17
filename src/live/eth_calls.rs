@@ -24,6 +24,7 @@ use crate::raw_data::historical::eth_calls::{
 use crate::raw_data::historical::factories::get_factory_call_configs;
 use crate::raw_data::historical::receipts::EventTriggerData;
 use crate::rpc::UnifiedRpcClient;
+use crate::storage::contract_index::build_expected_factory_contracts;
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::eth_call::encode_call_with_params;
 use crate::types::config::eth_call::{EthCallConfig, Frequency, ParamConfig};
@@ -45,6 +46,8 @@ pub struct LiveEthCallCollector {
     frequency_state: FrequencyState,
     _multicall3_address: Option<Address>,
     rpc_batch_size: usize,
+    /// Precomputed expected factory contracts from config, for writing per-block contract indexes.
+    expected_factory_contracts: HashMap<String, HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +76,7 @@ impl LiveEthCallCollector {
         let factory_once_configs =
             build_factory_once_call_configs(&factory_call_configs, &chain.contracts);
         let event_call_configs = build_event_triggered_call_configs(&chain.contracts);
+        let expected_factory_contracts = build_expected_factory_contracts(&chain.contracts);
 
         tracing::info!(
             "LiveEthCallCollector initialized: {} regular calls, {} once configs, {} factory configs, {} event configs",
@@ -98,6 +102,7 @@ impl LiveEthCallCollector {
             },
             _multicall3_address: multicall3_address,
             rpc_batch_size,
+            expected_factory_contracts,
         }
     }
 
@@ -107,6 +112,11 @@ impl LiveEthCallCollector {
             || !self.once_configs.is_empty()
             || !self.factory_call_configs.is_empty()
             || !self.event_call_configs.is_empty()
+    }
+
+    /// Get the precomputed expected factory contracts for writing per-block contract indexes.
+    pub fn expected_factory_contracts(&self) -> &HashMap<String, HashMap<String, Vec<String>>> {
+        &self.expected_factory_contracts
     }
 
     /// Update factory addresses with newly discovered ones.
@@ -826,6 +836,8 @@ mod tests {
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),

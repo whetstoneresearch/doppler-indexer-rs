@@ -51,110 +51,144 @@ pub(super) async fn process_complete_range(
         s3_manifest: &state.s3_manifest,
     };
 
-    if state.has_regular_calls {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_range_multicall(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.call_configs,
-                state.max_params,
-                &mut state.frequency_state,
-                multicall_addr,
-                None,
-            )
-            .await?;
-        } else {
-            process_range(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.call_configs,
-                state.max_params,
-                &mut state.frequency_state,
-                None,
-            )
-            .await?;
-        }
-    }
+    if !state.range_regular_done.contains(&range_start) {
+        let has_regular = state.has_regular_calls;
+        let has_once = state.has_once_calls;
+        let multicall_addr = state.multicall3_address;
+        let max_params = state.max_params;
 
-    if state.has_once_calls {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_once_calls_multicall(
-                &range,
-                blocks,
-                &ctx,
-                &state.once_configs,
-                &chain.contracts,
-                multicall_addr,
-            )
-            .await?;
-        } else {
-            process_once_calls_regular(&range, blocks, &ctx, &state.once_configs, &chain.contracts)
-                .await?;
-        }
+        let regular_fut = async {
+            if has_regular {
+                if let Some(addr) = multicall_addr {
+                    process_range_multicall(
+                        &range,
+                        blocks,
+                        &ctx,
+                        &state.call_configs,
+                        max_params,
+                        &mut state.frequency_state,
+                        addr,
+                        None,
+                    )
+                    .await?;
+                } else {
+                    process_range(
+                        &range,
+                        blocks,
+                        &ctx,
+                        &state.call_configs,
+                        max_params,
+                        &mut state.frequency_state,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), EthCallCollectionError>(())
+        };
+
+        let once_fut = async {
+            if has_once {
+                if let Some(addr) = multicall_addr {
+                    process_once_calls_multicall(
+                        &range,
+                        blocks,
+                        &ctx,
+                        &state.once_configs,
+                        &chain.contracts,
+                        addr,
+                    )
+                    .await?;
+                } else {
+                    process_once_calls_regular(
+                        &range,
+                        blocks,
+                        &ctx,
+                        &state.once_configs,
+                        &chain.contracts,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), EthCallCollectionError>(())
+        };
+
+        tokio::try_join!(regular_fut, once_fut)?;
+        state.range_regular_done.insert(range_start);
     }
-    state.range_regular_done.insert(range_start);
 
     if let Some(factory_data) = state.range_factory_data.get(&range_start) {
-        if state.has_factory_calls && !state.range_factory_done.contains(&range_start) {
-            if let Some(multicall_addr) = state.multicall3_address {
-                process_factory_range_multicall(
-                    &range,
-                    blocks,
-                    &ctx,
-                    factory_data,
-                    &state.factory_call_configs,
-                    state.factory_max_params,
-                    &mut state.frequency_state,
-                    multicall_addr,
-                    None,
-                    &state.contracts,
-                )
-                .await?;
-            } else {
-                process_factory_range(
-                    &range,
-                    blocks,
-                    &ctx,
-                    factory_data,
-                    &state.factory_call_configs,
-                    state.factory_max_params,
-                    &mut state.frequency_state,
-                    None,
-                    &state.contracts,
-                )
-                .await?;
-            }
-        }
+        let has_factory = state.has_factory_calls;
+        let has_factory_once = state.has_factory_once_calls;
+        let factory_not_done = !state.range_factory_done.contains(&range_start);
+        let multicall_addr = state.multicall3_address;
+        let factory_max_params = state.factory_max_params;
+        let empty_index = HashMap::new();
+        let expected_once = build_expected_factory_contracts_for_range(&state.contracts, range.end);
 
-        if state.has_factory_once_calls {
-            let empty_index = HashMap::new();
-            let expected_once =
-                build_expected_factory_contracts_for_range(&state.contracts, range.end);
-            if let Some(multicall_addr) = state.multicall3_address {
-                process_factory_once_calls_multicall(
-                    &range,
-                    &ctx,
-                    factory_data,
-                    &state.factory_once_configs,
-                    &empty_index,
-                    multicall_addr,
-                    Some(&expected_once),
-                )
-                .await?;
-            } else {
-                process_factory_once_calls(
-                    &range,
-                    &ctx,
-                    factory_data,
-                    &state.factory_once_configs,
-                    &empty_index,
-                    Some(&expected_once),
-                )
-                .await?;
+        let factory_range_fut = async {
+            if has_factory && factory_not_done {
+                if let Some(addr) = multicall_addr {
+                    process_factory_range_multicall(
+                        &range,
+                        blocks,
+                        &ctx,
+                        factory_data,
+                        &state.factory_call_configs,
+                        factory_max_params,
+                        &mut state.frequency_state,
+                        addr,
+                        None,
+                        &state.contracts,
+                    )
+                    .await?;
+                } else {
+                    process_factory_range(
+                        &range,
+                        blocks,
+                        &ctx,
+                        factory_data,
+                        &state.factory_call_configs,
+                        factory_max_params,
+                        &mut state.frequency_state,
+                        None,
+                        &state.contracts,
+                    )
+                    .await?;
+                }
             }
-        }
+            Ok::<(), EthCallCollectionError>(())
+        };
+
+        let factory_once_fut = async {
+            if has_factory_once {
+                if let Some(addr) = multicall_addr {
+                    process_factory_once_calls_multicall(
+                        &range,
+                        &ctx,
+                        factory_data,
+                        &state.factory_once_configs,
+                        &empty_index,
+                        addr,
+                        Some(&expected_once),
+                    )
+                    .await?;
+                } else {
+                    process_factory_once_calls(
+                        &range,
+                        &ctx,
+                        factory_data,
+                        &state.factory_once_configs,
+                        &empty_index,
+                        Some(&expected_once),
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), EthCallCollectionError>(())
+        };
+
+        tokio::try_join!(factory_range_fut, factory_once_fut)?;
         state.range_factory_done.insert(range_start);
     }
 
@@ -209,70 +243,95 @@ pub(super) async fn process_incomplete_range(
         s3_manifest: &state.s3_manifest,
     };
 
-    if state.has_regular_calls && !state.range_regular_done.contains(&range_start) {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_range_multicall(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.call_configs,
-                state.max_params,
-                &mut state.frequency_state,
-                multicall_addr,
-                None,
-            )
-            .await?;
-        } else {
-            process_range(
-                &range,
-                blocks.clone(),
-                &ctx,
-                &state.call_configs,
-                state.max_params,
-                &mut state.frequency_state,
-                None,
-            )
-            .await?;
-        }
+    if !state.range_regular_done.contains(&range_start) {
+        let has_regular = state.has_regular_calls;
+        let has_once = state.has_once_calls;
+        let multicall_addr = state.multicall3_address;
+        let max_params = state.max_params;
+
+        let regular_fut = async {
+            if has_regular {
+                if let Some(addr) = multicall_addr {
+                    process_range_multicall(
+                        &range,
+                        &blocks,
+                        &ctx,
+                        &state.call_configs,
+                        max_params,
+                        &mut state.frequency_state,
+                        addr,
+                        None,
+                    )
+                    .await?;
+                } else {
+                    process_range(
+                        &range,
+                        &blocks,
+                        &ctx,
+                        &state.call_configs,
+                        max_params,
+                        &mut state.frequency_state,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), EthCallCollectionError>(())
+        };
+
+        let once_fut = async {
+            if has_once {
+                if let Some(addr) = multicall_addr {
+                    process_once_calls_multicall(
+                        &range,
+                        &blocks,
+                        &ctx,
+                        &state.once_configs,
+                        &chain.contracts,
+                        addr,
+                    )
+                    .await?;
+                } else {
+                    process_once_calls_regular(
+                        &range,
+                        &blocks,
+                        &ctx,
+                        &state.once_configs,
+                        &chain.contracts,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), EthCallCollectionError>(())
+        };
+
+        tokio::try_join!(regular_fut, once_fut)?;
     }
 
-    if state.has_once_calls && !state.range_regular_done.contains(&range_start) {
-        if let Some(multicall_addr) = state.multicall3_address {
-            process_once_calls_multicall(
-                &range,
-                &blocks,
-                &ctx,
-                &state.once_configs,
-                &chain.contracts,
-                multicall_addr,
-            )
-            .await?;
-        } else {
-            process_once_calls_regular(
-                &range,
-                &blocks,
-                &ctx,
-                &state.once_configs,
-                &chain.contracts,
-            )
-            .await?;
-        }
-    }
-
-    if state.has_factory_calls || state.has_factory_once_calls {
+    if (state.has_factory_calls || state.has_factory_once_calls)
+        && !state.range_factory_done.contains(&range_start)
+    {
         if let Some(factory_data) = state.range_factory_data.get(&range_start) {
-            if !state.range_factory_done.contains(&range_start) {
-                if state.has_factory_calls {
-                    if let Some(multicall_addr) = state.multicall3_address {
+            let has_factory = state.has_factory_calls;
+            let has_factory_once = state.has_factory_once_calls;
+            let multicall_addr = state.multicall3_address;
+            let factory_max_params = state.factory_max_params;
+            let empty_index = HashMap::new();
+            let expected_once =
+                build_expected_factory_contracts_for_range(&state.contracts, range.end);
+
+            let factory_range_fut = async {
+                if has_factory {
+                    if let Some(addr) = multicall_addr {
                         process_factory_range_multicall(
                             &range,
                             &blocks,
                             &ctx,
                             factory_data,
                             &state.factory_call_configs,
-                            state.factory_max_params,
+                            factory_max_params,
                             &mut state.frequency_state,
-                            multicall_addr,
+                            addr,
                             None,
                             &state.contracts,
                         )
@@ -284,7 +343,7 @@ pub(super) async fn process_incomplete_range(
                             &ctx,
                             factory_data,
                             &state.factory_call_configs,
-                            state.factory_max_params,
+                            factory_max_params,
                             &mut state.frequency_state,
                             None,
                             &state.contracts,
@@ -292,19 +351,19 @@ pub(super) async fn process_incomplete_range(
                         .await?;
                     }
                 }
+                Ok::<(), EthCallCollectionError>(())
+            };
 
-                if state.has_factory_once_calls {
-                    let empty_index = HashMap::new();
-                    let expected_once =
-                        build_expected_factory_contracts_for_range(&state.contracts, range.end);
-                    if let Some(multicall_addr) = state.multicall3_address {
+            let factory_once_fut = async {
+                if has_factory_once {
+                    if let Some(addr) = multicall_addr {
                         process_factory_once_calls_multicall(
                             &range,
                             &ctx,
                             factory_data,
                             &state.factory_once_configs,
                             &empty_index,
-                            multicall_addr,
+                            addr,
                             Some(&expected_once),
                         )
                         .await?;
@@ -320,7 +379,10 @@ pub(super) async fn process_incomplete_range(
                         .await?;
                     }
                 }
-            }
+                Ok::<(), EthCallCollectionError>(())
+            };
+
+            tokio::try_join!(factory_range_fut, factory_once_fut)?;
         }
     }
 
@@ -353,6 +415,8 @@ mod tests {
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),
@@ -473,6 +537,54 @@ mod tests {
         );
         // Factory not done yet
         assert!(!state.range_factory_done.contains(&0));
+    }
+
+    #[tokio::test]
+    async fn test_complete_range_processes_factory_work_after_catchup_marked_regular_done() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let chain = test_chain();
+        let mut state = factory_once_only_state(tmp.path());
+
+        state.range_regular_done.insert(0);
+        state.range_data.insert(
+            0,
+            vec![BlockInfo {
+                block_number: 0,
+                timestamp: 100,
+            }],
+        );
+        state.range_factory_data.insert(
+            0,
+            FactoryAddressData {
+                range_start: 0,
+                range_end: 100,
+                addresses_by_block: HashMap::new(),
+            },
+        );
+
+        process_complete_range(0, &mut state, &client, &chain, &None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            state.range_factory_done.contains(&0),
+            "factory work should run even when regular work was already completed during catchup"
+        );
+        assert!(
+            !state.range_data.contains_key(&0),
+            "range_data should be cleaned up after factory work completes"
+        );
+        assert!(
+            !state.range_factory_data.contains_key(&0),
+            "range_factory_data should be cleaned up after factory work completes"
+        );
+
+        let parquet_path = tmp.path().join("test_collection/once/0-99.parquet");
+        assert!(
+            parquet_path.exists(),
+            "factory once output must be written during the follow-up current-phase pass"
+        );
     }
 
     #[tokio::test]

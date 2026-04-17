@@ -13,19 +13,25 @@ use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::db::v4_pool_configs::{insert_pool_config, PoolConfigData};
 use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
+use crate::transformations::util::pool_metadata::VersionedSource;
 
 use crate::types::uniswap::v4::{PoolAddressOrPoolId, PoolKey, V4PoolConfig};
+
+pub const V4_CREATE_HANDLER_NAME: &str = "V4CreateHandler";
+pub const V4_CREATE_HANDLER_VERSION: u32 = 1;
+pub const V4_CREATE_HANDLER_SCOPE: VersionedSource =
+    VersionedSource::new(V4_CREATE_HANDLER_NAME, V4_CREATE_HANDLER_VERSION);
 
 pub struct V4CreateHandler;
 
 #[async_trait]
 impl TransformationHandler for V4CreateHandler {
     fn name(&self) -> &'static str {
-        "V4CreateHandler"
+        V4_CREATE_HANDLER_NAME
     }
 
     fn version(&self) -> u32 {
-        1
+        V4_CREATE_HANDLER_VERSION
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {

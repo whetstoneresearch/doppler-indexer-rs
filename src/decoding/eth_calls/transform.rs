@@ -1,6 +1,7 @@
 //! Transform helpers: build_result_map, convert_to_transform_call.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::types::{DecodedCallRecord, DecodedEventCallRecord};
 use crate::transformations::DecodedCall as TransformDecodedCall;
@@ -12,11 +13,11 @@ pub fn build_result_map(
     value: &DecodedValue,
     output_type: &EvmType,
     function_name: &str,
-) -> HashMap<String, DecodedValue> {
+) -> HashMap<Arc<str>, DecodedValue> {
     let mut result = HashMap::new();
     match output_type {
         EvmType::Named { name, .. } => {
-            result.insert(name.clone(), value.clone());
+            result.insert(Arc::from(name.as_str()), value.clone());
         }
         EvmType::NamedTuple(fields) => {
             if let DecodedValue::NamedTuple(named_values) = value {
@@ -26,7 +27,7 @@ pub fn build_result_map(
             }
         }
         _ => {
-            result.insert(function_name.to_string(), value.clone());
+            result.insert(Arc::from(function_name), value.clone());
         }
     }
     result
@@ -40,12 +41,12 @@ pub fn build_result_map_for_merge(
     value: &DecodedValue,
     output_type: &EvmType,
     function_name: &str,
-) -> HashMap<String, DecodedValue> {
+) -> HashMap<Arc<str>, DecodedValue> {
     let base = build_result_map(value, output_type, function_name);
     match output_type {
         EvmType::NamedTuple(_) => base
             .into_iter()
-            .map(|(k, v)| (format!("{}.{}", function_name, k), v))
+            .map(|(k, v)| (Arc::<str>::from(format!("{}.{}", function_name, k)), v))
             .collect(),
         _ => base,
     }
@@ -53,7 +54,7 @@ pub fn build_result_map_for_merge(
 
 /// Recursively flatten nested NamedTuples into dot-notation keys.
 fn insert_flattened(
-    result: &mut HashMap<String, DecodedValue>,
+    result: &mut HashMap<Arc<str>, DecodedValue>,
     prefix: &str,
     field_type: &EvmType,
     value: &DecodedValue,
@@ -70,7 +71,7 @@ fn insert_flattened(
             insert_flattened(result, prefix, inner, value);
         }
         _ => {
-            result.insert(prefix.to_string(), value.clone());
+            result.insert(Arc::from(prefix), value.clone());
         }
     }
 }

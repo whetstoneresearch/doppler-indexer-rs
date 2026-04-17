@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use super::defaults::{database, db_pool, transformations as defaults};
+use super::defaults::{database, transformations as defaults};
 
 /// Configuration for the transformation system.
 ///
@@ -65,7 +65,7 @@ fn default_catchup_batch_size() -> usize {
 }
 
 fn default_db_pool_size() -> usize {
-    db_pool::MAX_SIZE
+    defaults::HANDLER_CONCURRENCY + 8
 }
 
 impl Default for TransformationConfig {

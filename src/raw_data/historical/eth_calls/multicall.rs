@@ -1,5 +1,6 @@
 //! Multicall3 infrastructure: types, calldata encoding/decoding, and generic executor.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use metrics::histogram;
@@ -60,7 +61,7 @@ pub(crate) struct EventCallMeta {
     pub(crate) function_name: String,
     pub(crate) target_address: Address,
     pub(crate) log_index: u32,
-    pub(crate) param_values: Vec<Vec<u8>>,
+    pub(crate) param_values: Arc<Vec<Vec<u8>>>,
 }
 
 /// Metadata for once calls.

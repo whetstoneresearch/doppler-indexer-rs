@@ -136,6 +136,7 @@ fn repair_scope_matches_source_function(
 }
 
 /// Catchup phase: decode existing raw eth_call files
+#[allow(clippy::too_many_arguments)]
 pub async fn catchup_decode_eth_calls(
     raw_calls_dir: &Path,
     output_base: &Path,
@@ -841,10 +842,14 @@ mod tests {
             decoding_concurrency: Some(1),
             factory_concurrency: None,
             event_call_concurrency: None,
+            event_call_window_size: None,
+            event_call_trigger_batch_size: None,
             live_mode: None,
             reorg_depth: None,
             compaction_interval_secs: None,
             transform_retry_grace_period_secs: None,
+            max_receipt_ranges: None,
+            max_pending_log_ranges: None,
         }
     }
 

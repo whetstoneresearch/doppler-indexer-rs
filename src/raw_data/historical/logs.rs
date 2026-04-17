@@ -70,8 +70,39 @@ pub(crate) struct MinimalLogRecord {
     pub(crate) data: Vec<u8>,
 }
 
+/// Data needed to execute a log write (parquet + optional S3 upload) outside the select loop.
+pub(crate) struct LogWriteTask {
+    pub range: BlockRange,
+    pub logs: Arc<Vec<LogData>>,
+    pub log_fields: Option<Vec<LogField>>,
+    pub schema: Arc<Schema>,
+    pub output_dir: PathBuf,
+    pub storage_manager: Option<Arc<StorageManager>>,
+    pub chain_name: String,
+}
+
+/// Execute a log write task (parquet write + optional S3 upload).
+///
+/// This is designed to be spawned onto a `JoinSet` so the caller's select loop
+/// remains responsive while I/O is in progress.
+pub(crate) async fn execute_log_write(task: LogWriteTask) -> Result<(), LogCollectionError> {
+    process_range(
+        &task.range,
+        &task.logs,
+        &task.log_fields,
+        &task.schema,
+        &task.output_dir,
+        task.storage_manager.as_ref(),
+        &task.chain_name,
+    )
+    .await
+}
+
+/// Prepare a completed range for writing: skip checks, data extraction, log
+/// filtering, and decoder notification.  Returns `Some(LogWriteTask)` when a
+/// write is needed, or `None` when the range was skipped (already on disk / S3).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn process_completed_range(
+pub(crate) async fn prepare_completed_range(
     range_start: u64,
     range_end: u64,
     range_data: &mut HashMap<u64, Vec<LogData>>,
@@ -86,7 +117,7 @@ pub(crate) async fn process_completed_range(
     s3_manifest: Option<&S3Manifest>,
     storage_manager: Option<&Arc<StorageManager>>,
     chain_name: &str,
-) -> Result<(), LogCollectionError> {
+) -> Result<Option<LogWriteTask>, LogCollectionError> {
     let range = BlockRange {
         start: range_start,
         end: range_end,
@@ -102,7 +133,7 @@ pub(crate) async fn process_completed_range(
         );
         range_data.remove(&range_start);
         range_factory_addresses.remove(&range_start);
-        return Ok(());
+        return Ok(None);
     }
 
     // Check if range exists in S3 manifest
@@ -114,7 +145,7 @@ pub(crate) async fn process_completed_range(
         );
         range_data.remove(&range_start);
         range_factory_addresses.remove(&range_start);
-        return Ok(());
+        return Ok(None);
     }
 
     let mut logs = range_data.remove(&range_start).unwrap_or_default();
@@ -135,42 +166,29 @@ pub(crate) async fn process_completed_range(
         );
     }
 
-    // Send logs to decoder before processing (decoder will receive them for decoding).
-    // Wrap in Arc so we can share without cloning when process_range also needs ownership.
+    // Arc-wrap logs once and share between decoder and write task (zero-copy).
+    let logs = Arc::new(logs);
     if let Some(tx) = decoder_tx {
-        let logs = std::sync::Arc::new(logs);
         let _ = tx
             .send(DecoderMessage::LogsReady {
                 range_start,
                 range_end,
-                logs: std::sync::Arc::clone(&logs),
+                logs: Arc::clone(&logs),
                 live_mode: false,            // Historical mode: write to parquet
                 has_factory_matchers: false, // Factory addresses handled separately in historical mode
             })
             .await;
-
-        process_range(
-            &range,
-            logs.as_ref(),
-            log_fields,
-            schema,
-            output_dir,
-            storage_manager,
-            chain_name,
-        )
-        .await
-    } else {
-        process_range(
-            &range,
-            &logs,
-            log_fields,
-            schema,
-            output_dir,
-            storage_manager,
-            chain_name,
-        )
-        .await
     }
+
+    Ok(Some(LogWriteTask {
+        range,
+        logs,
+        log_fields: log_fields.clone(),
+        schema: Arc::clone(schema),
+        output_dir: output_dir.to_path_buf(),
+        storage_manager: storage_manager.cloned(),
+        chain_name: chain_name.to_string(),
+    }))
 }
 
 pub(crate) fn build_configured_addresses(contracts: &Contracts) -> HashSet<[u8; 20]> {

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int16Array, Int32Array, Int64Array,
@@ -284,9 +284,10 @@ impl HistoricalDataReader {
     ) -> Result<Vec<DecodedEvent>, TransformationError> {
         let file = std::fs::File::open(file_path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let num_rows = builder.metadata().file_metadata().num_rows() as usize;
         let reader = builder.build()?;
 
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(num_rows);
 
         for batch_result in reader {
             let batch = batch_result?;
@@ -307,9 +308,10 @@ impl HistoricalDataReader {
     ) -> Result<Vec<DecodedCall>, TransformationError> {
         let file = std::fs::File::open(file_path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let num_rows = builder.metadata().file_metadata().num_rows() as usize;
         let reader = builder.build()?;
 
-        let mut calls = Vec::new();
+        let mut calls = Vec::with_capacity(num_rows);
 
         for batch_result in reader {
             let batch = batch_result?;
@@ -478,7 +480,7 @@ fn batch_to_events(
 
         for (col_idx, field) in &param_columns {
             if let Some(value) = extract_value_from_batch(&batch, *col_idx, row)? {
-                params.insert(field.name().clone(), value);
+                params.insert(Arc::from(field.name().as_str()), value);
             }
         }
 
@@ -545,10 +547,10 @@ fn batch_to_calls(
         for (col_idx, field) in &result_columns {
             if let Some(value) = extract_value_from_batch(&batch, *col_idx, row)? {
                 // Map generic "decoded_value" column to the function name for handler access
-                let key = if field.name() == "decoded_value" {
-                    function_name.to_string()
+                let key: Arc<str> = if field.name() == "decoded_value" {
+                    Arc::from(function_name)
                 } else {
-                    field.name().clone()
+                    Arc::from(field.name().as_str())
                 };
                 result.insert(key, value);
             }
@@ -759,7 +761,7 @@ fn extract_struct_value(
     for (col_idx, field) in fields.iter().enumerate() {
         let col = struct_arr.column(col_idx);
         let val = extract_value_from_array(col.as_ref(), row)?;
-        values.push((field.name().clone(), val));
+        values.push((Arc::from(field.name().as_str()), val));
     }
 
     if is_unnamed {

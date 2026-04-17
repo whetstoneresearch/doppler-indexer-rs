@@ -58,7 +58,7 @@ macro_rules! impl_field_extractor {
 #[allow(dead_code)]
 pub trait FieldExtractor {
     /// Returns the underlying field values map.
-    fn field_values(&self) -> &HashMap<String, DecodedValue>;
+    fn field_values(&self) -> &HashMap<Arc<str>, DecodedValue>;
 
     /// Returns contextual information for error messages (e.g., event name, block number).
     fn context_info(&self) -> String;
@@ -167,7 +167,7 @@ pub struct DecodedEvent {
     pub event_signature: String,
     /// Decoded parameter values keyed by field name.
     /// Uses flattened field names like "key.currency0" for nested tuples.
-    pub params: HashMap<String, DecodedValue>,
+    pub params: HashMap<Arc<str>, DecodedValue>,
 }
 
 #[allow(dead_code)]
@@ -221,7 +221,7 @@ impl DecodedEvent {
 }
 
 impl FieldExtractor for DecodedEvent {
-    fn field_values(&self) -> &HashMap<String, DecodedValue> {
+    fn field_values(&self) -> &HashMap<Arc<str>, DecodedValue> {
         &self.params
     }
 
@@ -252,7 +252,7 @@ pub struct DecodedCall {
     /// Decoded return value(s) keyed by field name.
     /// For single return values, the key is the function name or "result".
     /// For tuples, uses field names from the output type.
-    pub result: HashMap<String, DecodedValue>,
+    pub result: HashMap<Arc<str>, DecodedValue>,
     /// Whether this call reverted during execution
     pub is_reverted: bool,
     /// If the call reverted, the reason string
@@ -298,7 +298,7 @@ impl DecodedCall {
 }
 
 impl FieldExtractor for DecodedCall {
-    fn field_values(&self) -> &HashMap<String, DecodedValue> {
+    fn field_values(&self) -> &HashMap<Arc<str>, DecodedValue> {
         &self.result
     }
 
@@ -434,7 +434,7 @@ pub struct TransformationContext {
 
     // ===== Transaction Address Data =====
     /// Transaction hash -> from/to addresses from receipt data
-    tx_addresses: HashMap<TxId, TransactionAddresses>,
+    tx_addresses: Arc<HashMap<TxId, TransactionAddresses>>,
 
     // ===== Services =====
     /// Historical data reader for querying parquet files
@@ -458,7 +458,7 @@ impl TransformationContext {
         events: Arc<Vec<DecodedEvent>>,
         calls: Arc<Vec<DecodedCall>>,
         account_states: Arc<Vec<DecodedAccountState>>,
-        tx_addresses: HashMap<TxId, TransactionAddresses>,
+        tx_addresses: Arc<HashMap<TxId, TransactionAddresses>>,
         historical: Arc<HistoricalDataReader>,
         rpc: Option<Arc<UnifiedRpcClient>>,
         contracts: Option<Arc<Contracts>>,
@@ -945,7 +945,7 @@ pub enum ChainServices {
 mod tests {
     use super::*;
 
-    fn make_test_event(params: HashMap<String, DecodedValue>) -> DecodedEvent {
+    fn make_test_event(params: HashMap<Arc<str>, DecodedValue>) -> DecodedEvent {
         DecodedEvent {
             block_number: 100,
             block_timestamp: 1234567890,
@@ -959,7 +959,7 @@ mod tests {
         }
     }
 
-    fn make_test_call(result: HashMap<String, DecodedValue>) -> DecodedCall {
+    fn make_test_call(result: HashMap<Arc<str>, DecodedValue>) -> DecodedCall {
         DecodedCall {
             block_number: 100,
             block_timestamp: 1234567890,
@@ -988,7 +988,7 @@ mod tests {
     #[test]
     fn test_field_extractor_extract_address() {
         let mut params = HashMap::new();
-        params.insert("from".to_string(), DecodedValue::Address([42u8; 20]));
+        params.insert(Arc::from("from"), DecodedValue::Address([42u8; 20]));
         let event = make_test_event(params);
 
         let addr = event.extract_address("from").unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
     #[test]
     fn test_field_extractor_extract_address_wrong_type() {
         let mut params = HashMap::new();
-        params.insert("from".to_string(), DecodedValue::Uint256(U256::from(100)));
+        params.insert(Arc::from("from"), DecodedValue::Uint256(U256::from(100)));
         let event = make_test_event(params);
 
         let result = event.extract_address("from");
@@ -1050,7 +1050,7 @@ mod tests {
     #[test]
     fn test_field_extractor_extract_uint256() {
         let mut params = HashMap::new();
-        params.insert("value".to_string(), DecodedValue::Uint256(U256::from(1000)));
+        params.insert(Arc::from("value"), DecodedValue::Uint256(U256::from(1000)));
         let event = make_test_event(params);
 
         let value = event.extract_uint256("value").unwrap();
@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     fn test_field_extractor_extract_bool() {
         let mut result = HashMap::new();
-        result.insert("isToken0".to_string(), DecodedValue::Bool(true));
+        result.insert(Arc::from("isToken0"), DecodedValue::Bool(true));
         let call = make_test_call(result);
 
         let is_token0 = call.extract_bool("isToken0").unwrap();
@@ -1082,20 +1082,20 @@ mod tests {
     fn test_field_extractor_u64_flexible() {
         // Test with native u64
         let mut params = HashMap::new();
-        params.insert("timestamp".to_string(), DecodedValue::Uint64(1234567890));
+        params.insert(Arc::from("timestamp"), DecodedValue::Uint64(1234567890));
         let event = make_test_event(params);
         assert_eq!(event.extract_u64_flexible("timestamp").unwrap(), 1234567890);
 
         // Test with i64 (common in some encodings)
         let mut params = HashMap::new();
-        params.insert("timestamp".to_string(), DecodedValue::Int64(1234567890));
+        params.insert(Arc::from("timestamp"), DecodedValue::Int64(1234567890));
         let event = make_test_event(params);
         assert_eq!(event.extract_u64_flexible("timestamp").unwrap(), 1234567890);
 
         // Test with string
         let mut params = HashMap::new();
         params.insert(
-            "timestamp".to_string(),
+            Arc::from("timestamp"),
             DecodedValue::String("1234567890".to_string()),
         );
         let event = make_test_event(params);
@@ -1106,20 +1106,20 @@ mod tests {
     fn test_field_extractor_i32_flexible() {
         // Test with native i32
         let mut params = HashMap::new();
-        params.insert("tick".to_string(), DecodedValue::Int32(-12345));
+        params.insert(Arc::from("tick"), DecodedValue::Int32(-12345));
         let event = make_test_event(params);
         assert_eq!(event.extract_i32_flexible("tick").unwrap(), -12345);
 
         // Test with u32 (common for positive ticks)
         let mut params = HashMap::new();
-        params.insert("tick".to_string(), DecodedValue::Uint32(12345));
+        params.insert(Arc::from("tick"), DecodedValue::Uint32(12345));
         let event = make_test_event(params);
         assert_eq!(event.extract_i32_flexible("tick").unwrap(), 12345);
 
         // Test with string
         let mut params = HashMap::new();
         params.insert(
-            "tick".to_string(),
+            Arc::from("tick"),
             DecodedValue::String("-12345".to_string()),
         );
         let event = make_test_event(params);
@@ -1130,19 +1130,19 @@ mod tests {
     fn test_field_extractor_u32_flexible() {
         // Test with native u32
         let mut params = HashMap::new();
-        params.insert("fee".to_string(), DecodedValue::Uint32(3000));
+        params.insert(Arc::from("fee"), DecodedValue::Uint32(3000));
         let event = make_test_event(params);
         assert_eq!(event.extract_u32_flexible("fee").unwrap(), 3000);
 
         // Test with i32 (common in some encodings)
         let mut params = HashMap::new();
-        params.insert("fee".to_string(), DecodedValue::Int32(3000));
+        params.insert(Arc::from("fee"), DecodedValue::Int32(3000));
         let event = make_test_event(params);
         assert_eq!(event.extract_u32_flexible("fee").unwrap(), 3000);
 
         // Test with string
         let mut params = HashMap::new();
-        params.insert("fee".to_string(), DecodedValue::String("3000".to_string()));
+        params.insert(Arc::from("fee"), DecodedValue::String("3000".to_string()));
         let event = make_test_event(params);
         assert_eq!(event.extract_u32_flexible("fee").unwrap(), 3000);
     }
@@ -1182,10 +1182,10 @@ mod tests {
     fn test_decoded_call_implements_field_extractor() {
         let mut result = HashMap::new();
         result.insert(
-            "poolKey.currency0".to_string(),
+            Arc::from("poolKey.currency0"),
             DecodedValue::Address([10u8; 20]),
         );
-        result.insert("poolKey.fee".to_string(), DecodedValue::Uint32(3000));
+        result.insert(Arc::from("poolKey.fee"), DecodedValue::Uint32(3000));
         let call = make_test_call(result);
 
         // Use FieldExtractor methods

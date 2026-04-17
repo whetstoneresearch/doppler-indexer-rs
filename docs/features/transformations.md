@@ -76,7 +76,27 @@ Returns outcomes for ALL items, including those that were cascade-failed due to 
 
 ### Handler Dependency Chains
 
-Handlers declare ordering constraints via `handler_dependencies()`, which returns `Vec<&'static str>` of handler names that must complete for a given block range before this handler can execute.
+Handlers declare ordering constraints via dependency specs on `EventHandler`.
+The ergonomic entry point is `dep("HandlerName")`, which defaults to all chains:
+
+```rust
+use crate::transformations::traits::dep;
+
+fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+    vec![
+        dep("V3CreateHandler"),
+        dep("MigrationPoolCreateHandler").except([57073, 143]),
+    ]
+}
+```
+
+`handler_dependency_specs()` controls same-range dependencies.
+`contiguous_handler_dependency_specs()` controls catchup-only contiguous dependencies.
+If no selector is attached, the dependency applies to all chains. `.only([...])` and `.except([...])`
+filter by `chain_id`.
+
+For backward compatibility, the legacy `handler_dependencies()` / `contiguous_handler_dependencies()`
+methods still exist and are wrapped into dependency specs automatically.
 
 **Cascade failures:** If handler A fails on range R, all handlers that depend (directly or transitively) on A immediately cascade-fail for range R without being attempted.
 
@@ -86,7 +106,7 @@ Handlers declare ordering constraints via `handler_dependencies()`, which return
 - **Cycles**: If the dependency graph contains a cycle, the process panics with a diagnostic trace showing the cycle path
 - **Dep type validation**: All declared dependencies must be event handlers
 
-**Topological sort** of the validated graph determines execution order for both catchup and live processing.
+**Topological sort** of the resolved per-chain graph determines execution order for both catchup and live processing.
 
 ### Sequential Execution
 
@@ -299,16 +319,11 @@ pub trait EventHandler: TransformationHandler {
     /// in decoded parquet files before this handler can process a range.
     fn call_dependencies(&self) -> Vec<(String, String)> { vec![] }
 
-    /// Handler names (via `TransformationHandler::name()`) that must complete
-    /// before this handler can execute for a given block range.
-    ///
-    /// Used to enforce ordering when one handler populates shared in-memory
-    /// state (e.g., a metadata cache) that another handler reads. References
-    /// `name()` rather than `handler_key()` so version bumps on the dependency
-    /// don't require updating dependents.
-    ///
-    /// All declared names must resolve to registered handlers — missing names
-    /// cause a panic at startup. Cycles are also detected at startup.
+    /// Declarative same-range handler dependencies. Defaults to wrapping the
+    /// legacy `handler_dependencies()` string API if present.
+    fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> { vec![] }
+
+    /// Legacy string-only dependency API. Still supported for compatibility.
     fn handler_dependencies(&self) -> Vec<&'static str> { vec![] }
 }
 ```
@@ -527,7 +542,7 @@ pub fn register_handlers(registry: &mut TransformationRegistry) {
 }
 ```
 
-`build_registry(chain_id)` builds a global registry (used for running migrations at startup). `build_registry_for_chain(chain_id, contracts, factory_collections)` builds a registry filtered to handlers whose trigger sources are present in the chain's config.
+`build_registry(chain_id)` builds a global registry (used for running migrations at startup). In this mode, chain-filtered dependency specs are kept so migrations and startup validation see the full graph. `build_registry_for_chain(chain_id, contracts, factory_collections)` builds a registry filtered to handlers whose trigger sources are present in the chain's config and resolves dependency specs for that concrete `chain_id`.
 
 ## TransformationContext
 

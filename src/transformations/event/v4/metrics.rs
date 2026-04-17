@@ -46,13 +46,20 @@ use crate::transformations::registry::TransformationRegistry;
 use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
 use crate::transformations::util::pool_metadata::PoolMetadataCache;
 use crate::transformations::util::tick_math::tick_to_sqrt_price_x96;
+use crate::transformations::util::usd_price::{
+    build_usd_price_context_with_paths, chainlink_latest_answer_dependency, OraclePriceCache,
+};
 
 const SOURCE: &str = "DopplerV4Hook";
+
+/// pool_id → (total_proceeds, total_tokens_sold) cumulative state.
+type ProceedsState = HashMap<[u8; 32], (U256, U256)>;
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 pub struct V4BaseMetricsHandler {
     metadata_cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
     decimals_init: Once,
     chain_id: u64,
     db_pool: OnceLock<Pool>,
@@ -60,12 +67,12 @@ pub struct V4BaseMetricsHandler {
     hook_pool_map: RwLock<HashMap<[u8; 20], [u8; 32]>>,
     /// pool_id → (total_proceeds, total_tokens_sold) — loaded from v4_base_proceeds_state
     /// at init, refreshed on cache miss, updated optimistically in handle().
-    proceeds_state: RwLock<HashMap<[u8; 32], (U256, U256)>>,
+    proceeds_state: RwLock<ProceedsState>,
     /// Pre-update cumulatives for the currently-in-flight batch, used by
     /// `on_commit_failure` to revert the optimistic cache update. Populated
     /// by `handle()` just before the optimistic write; drained by either
     /// commit hook. Always `None` between batches in normal operation.
-    in_flight_pre: RwLock<Option<HashMap<[u8; 32], (U256, U256)>>>,
+    in_flight_pre: RwLock<Option<ProceedsState>>,
     /// Ranges whose commit failed. `handle()` refuses any range strictly
     /// greater than the minimum entry so delta computation never advances
     /// past a stuck block. Retries drain this set via `on_commit_success`.
@@ -85,7 +92,10 @@ impl TransformationHandler for V4BaseMetricsHandler {
     fn migration_paths(&self) -> Vec<&'static str> {
         vec![
             "migrations/tables/pool_state.sql",
+            "migrations/tables/pool_state_add_tvl.sql",
             "migrations/tables/pool_snapshots.sql",
+            "migrations/tables/pool_snapshots_add_tvl.sql",
+            "migrations/tables/pool_snapshots_add_volume_usd.sql",
             "migrations/tables/v4_base_proceeds_state.sql",
         ]
     }
@@ -158,6 +168,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
             ctx.contracts_ref(),
             self.name(),
             SOURCE,
+        Some((ctx.blockrange_start, ctx.blockrange_end)),
         )
         .await?;
 
@@ -179,7 +190,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
         self.refresh_proceeds_state_for_pools(&pool_ids).await?;
 
         // Snapshot the current in-memory cumulative state for the pools in this batch.
-        let prev_state: HashMap<[u8; 32], (U256, U256)> = {
+        let prev_state: ProceedsState = {
             let state = self.proceeds_state.read().unwrap();
             pool_ids
                 .iter()
@@ -194,13 +205,25 @@ impl TransformationHandler for V4BaseMetricsHandler {
             return Ok(Vec::new());
         }
 
+        let (usd_ctx, price_ops) = build_usd_price_context_with_paths(
+            ctx,
+            &self.oracle_cache,
+            &self.db_pool,
+            self.chain_id,
+            &ctx.contracts,
+            &self.metadata_cache,
+        )
+        .await;
         let mut ops = process_swaps(
             &swaps,
             &self.metadata_cache,
             self.chain_id,
             self.name(),
             SOURCE,
+            Some(&usd_ctx),
+            self.version(),
         );
+        ops.extend(price_ops);
 
         // Durably checkpoint the new cumulative totals.
         for (pool_id, (total_proceeds, total_tokens_sold)) in &new_cumulative {
@@ -214,7 +237,7 @@ impl TransformationHandler for V4BaseMetricsHandler {
 
         // Stash pre-update cumulatives so `on_commit_failure` can revert the
         // optimistic cache write if the transaction fails.
-        let pre: HashMap<[u8; 32], (U256, U256)> = {
+        let pre: ProceedsState = {
             let state = self.proceeds_state.read().unwrap();
             new_cumulative
                 .keys()
@@ -242,8 +265,8 @@ impl TransformationHandler for V4BaseMetricsHandler {
 
     async fn initialize(&self, db_pool: &DbPool) -> Result<(), TransformationError> {
         self.db_pool.set(db_pool.inner().clone()).ok();
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
+        self.oracle_cache
+            .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
         self.load_hook_pool_map(db_pool).await?;
         self.load_all_proceeds_state(db_pool).await?;
@@ -290,6 +313,10 @@ impl TransformationHandler for V4BaseMetricsHandler {
 impl EventHandler for V4BaseMetricsHandler {
     fn triggers(&self) -> Vec<EventTrigger> {
         vec![EventTrigger::new(SOURCE, "Swap(int24,uint256,uint256)")]
+    }
+
+    fn call_dependencies(&self) -> Vec<(String, String)> {
+        vec![chainlink_latest_answer_dependency()]
     }
 
     fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
@@ -538,8 +565,8 @@ impl V4BaseMetricsHandler {
     fn extract_swaps(
         &self,
         events: &[&DecodedEvent],
-        prev_state: &HashMap<[u8; 32], (U256, U256)>,
-    ) -> Result<(Vec<SwapInput>, HashMap<[u8; 32], (U256, U256)>), TransformationError> {
+        prev_state: &ProceedsState,
+    ) -> Result<(Vec<SwapInput>, ProceedsState), TransformationError> {
         let hook_pool_map = self.hook_pool_map.read().unwrap();
 
         // Group events by pool_id.
@@ -557,7 +584,7 @@ impl V4BaseMetricsHandler {
         drop(hook_pool_map);
 
         let mut swaps: Vec<SwapInput> = Vec::new();
-        let mut new_cumulative: HashMap<[u8; 32], (U256, U256)> = HashMap::new();
+        let mut new_cumulative: ProceedsState = HashMap::new();
 
         for (pool_id, mut pool_evts) in pool_events {
             pool_evts.sort_by_key(|e| (e.block_number, e.log_index()));
@@ -719,12 +746,8 @@ fn upsert_proceeds_state(
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "v4_base_proceeds_state".to_string(),
-        conflict_columns: vec![
-            "chain_id".to_string(),
-            "pool_id".to_string(),
-            "source".to_string(),
-            "source_version".to_string(),
-        ],
+        // `source`/`source_version` are injected by the executor.
+        conflict_columns: vec!["chain_id".to_string(), "pool_id".to_string()],
         update_columns: vec![
             "total_proceeds".to_string(),
             "total_tokens_sold".to_string(),
@@ -751,9 +774,11 @@ pub fn register_handlers(
     registry: &mut TransformationRegistry,
     chain_id: u64,
     cache: Arc<PoolMetadataCache>,
+    oracle_cache: Arc<OraclePriceCache>,
 ) {
     registry.register_event_handler(V4BaseMetricsHandler {
         metadata_cache: cache,
+        oracle_cache,
         decimals_init: Once::new(),
         chain_id,
         db_pool: OnceLock::new(),
@@ -804,6 +829,7 @@ mod tests {
     fn make_handler(chain_id: u64) -> V4BaseMetricsHandler {
         V4BaseMetricsHandler {
             metadata_cache: Arc::new(PoolMetadataCache::new()),
+            oracle_cache: Arc::new(OraclePriceCache::new()),
             decimals_init: Once::new(),
             chain_id,
             db_pool: OnceLock::new(),
@@ -826,16 +852,17 @@ mod tests {
         tick: i32,
         total_proceeds: u64,
         total_tokens_sold: u64,
-    ) -> std::collections::HashMap<String, crate::types::decoded::DecodedValue> {
+    ) -> std::collections::HashMap<std::sync::Arc<str>, crate::types::decoded::DecodedValue> {
         use crate::types::decoded::DecodedValue;
+        use std::sync::Arc;
         let mut params = std::collections::HashMap::new();
-        params.insert("currentTick".to_string(), DecodedValue::Int32(tick));
+        params.insert(Arc::from("currentTick"), DecodedValue::Int32(tick));
         params.insert(
-            "totalProceeds".to_string(),
+            Arc::from("totalProceeds"),
             DecodedValue::Uint256(U256::from(total_proceeds)),
         );
         params.insert(
-            "totalTokensSold".to_string(),
+            Arc::from("totalTokensSold"),
             DecodedValue::Uint256(U256::from(total_tokens_sold)),
         );
         params
@@ -879,13 +906,11 @@ mod tests {
         handler.metadata_cache.insert_if_absent(
             pool_id.to_vec(),
             PoolMetadata {
-                pool_id: pool_id.to_vec(),
-                base_token: [1u8; 20],
                 quote_token: [2u8; 20],
                 is_token_0,
-                pool_type: "v4".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
+                total_supply: None,
             },
         );
     }
@@ -1013,7 +1038,7 @@ mod tests {
         let events = vec![&event];
 
         // Simulate handle()'s snapshot read from the in-memory state:
-        let prev_state: HashMap<[u8; 32], (U256, U256)> = {
+        let prev_state: ProceedsState = {
             let state = handler.proceeds_state.read().unwrap();
             [pool_id]
                 .iter()
@@ -1038,17 +1063,88 @@ mod tests {
         match op {
             DbOperation::Upsert {
                 table,
+                columns,
                 conflict_columns,
                 update_columns,
                 ..
             } => {
                 assert_eq!(table, "v4_base_proceeds_state");
+                assert_eq!(
+                    columns,
+                    vec![
+                        "chain_id".to_string(),
+                        "pool_id".to_string(),
+                        "total_proceeds".to_string(),
+                        "total_tokens_sold".to_string(),
+                    ]
+                );
+                assert_eq!(
+                    conflict_columns,
+                    vec!["chain_id".to_string(), "pool_id".to_string()]
+                );
                 assert!(conflict_columns.contains(&"pool_id".to_string()));
                 assert!(update_columns.contains(&"total_proceeds".to_string()));
                 assert!(update_columns.contains(&"total_tokens_sold".to_string()));
             }
             _ => panic!("expected Upsert"),
         }
+    }
+
+    #[test]
+    fn test_upsert_proceeds_state_injects_source_once() {
+        let pool_id = make_pool_id(0xFE);
+        let injected = crate::transformations::executor::inject_source_version(
+            vec![upsert_proceeds_state(
+                8453,
+                &pool_id,
+                &U256::from(9999u64),
+                &U256::from(1234u64),
+            )],
+            SOURCE,
+            1,
+        );
+
+        match injected.into_iter().next().unwrap() {
+            DbOperation::Upsert {
+                columns,
+                conflict_columns,
+                values,
+                ..
+            } => {
+                assert_eq!(columns.iter().filter(|c| c.as_str() == "source").count(), 1);
+                assert_eq!(
+                    columns
+                        .iter()
+                        .filter(|c| c.as_str() == "source_version")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    conflict_columns
+                        .iter()
+                        .filter(|c| c.as_str() == "source")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    conflict_columns
+                        .iter()
+                        .filter(|c| c.as_str() == "source_version")
+                        .count(),
+                    1
+                );
+                assert_eq!(columns.len(), values.len());
+            }
+            _ => panic!("expected Upsert"),
+        }
+    }
+
+    #[test]
+    fn test_handler_declares_chainlink_dependency() {
+        let handler = make_handler(8453);
+        assert!(handler
+            .call_dependencies()
+            .contains(&chainlink_latest_answer_dependency()));
     }
 
     // ── commit hooks / gate / reorg ───────────────────────────────────────────
@@ -1186,7 +1282,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
-            StdHashMap::new(),
+            Arc::new(StdHashMap::new()),
             historical,
             Some(rpc),
             Some(Arc::new(StdHashMap::new())),

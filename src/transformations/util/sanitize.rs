@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use alloy_primitives::{address, Address};
 
 pub fn is_precompile_address(addr: Address) -> bool {
@@ -24,4 +26,34 @@ pub fn is_precompile_address(addr: Address) -> bool {
     let is_precompile: bool = precompile_addresses.contains(&addr);
 
     is_precompile
+}
+
+/// PostgreSQL text columns reject embedded NUL bytes, but some on-chain string
+/// values arrive padded or corrupted with `\0`. Strip them while borrowing when
+/// possible to avoid unnecessary allocations on the hot path.
+pub fn strip_nul_bytes(value: &str) -> Cow<'_, str> {
+    if value.as_bytes().contains(&0) {
+        Cow::Owned(value.replace('\0', ""))
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_nul_bytes;
+
+    #[test]
+    fn strip_nul_bytes_borrows_when_clean() {
+        let input = "hello";
+        let output = strip_nul_bytes(input);
+        assert_eq!(output, "hello");
+        assert!(matches!(output, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn strip_nul_bytes_removes_embedded_nuls() {
+        let output = strip_nul_bytes("he\0ll\0o");
+        assert_eq!(output, "hello");
+    }
 }

@@ -1,8 +1,10 @@
 {
     "UniswapV2Factory": {
-        "address": "0xfe57A6BA1951F69aE2Ed4abe23e0f095DF500C04"
+        "address": "0xfe57A6BA1951F69aE2Ed4abe23e0f095DF500C04",
+        "start_block": 9508011
     },
     "UniswapV2Migrator": {
-        "address": "0x5F3bA43D44375286296Cb85F1EA2EBfa25dde731"
+        "address": "0x5F3bA43D44375286296Cb85F1EA2EBfa25dde731",
+        "start_block": 9508011
     }
 }

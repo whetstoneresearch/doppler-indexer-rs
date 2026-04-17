@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -186,14 +185,12 @@ pub async fn collect_eth_calls(
                         });
 
                         if let Some(blocks) = state.range_data.get(&range_start) {
-                            let expected_blocks: HashSet<u64> =
-                                (range_start..range_start + state.range_size).collect();
-                            let received_blocks: HashSet<u64> =
-                                blocks.iter().map(|b| b.block_number).collect();
+                            let range_complete = blocks.len() == state.range_size as usize;
+                            let needs_processing = !state.range_regular_done.contains(&range_start)
+                                || ((state.has_factory_calls || state.has_factory_once_calls)
+                                    && !state.range_factory_done.contains(&range_start));
 
-                            if expected_blocks.is_subset(&received_blocks)
-                                && !state.range_regular_done.contains(&range_start)
-                            {
+                            if range_complete && needs_processing {
                                 process_complete_range(
                                     range_start,
                                     &mut state,

@@ -16,7 +16,6 @@ pub use transform::{build_result_map, build_result_map_for_merge};
 use std::time::Instant;
 
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
 
 use super::catchup;
 use super::current;
@@ -25,13 +24,12 @@ use crate::types::config::chain::ChainConfig;
 use crate::types::config::raw_data::RawDataCollectionConfig;
 use crate::types::shared::repair::RepairScope;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn decode_eth_calls(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     decoder_rx: Receiver<super::types::DecoderMessage>,
     outputs: EthCallDecoderOutputs<'_>,
-    eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
-    decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     skip_catchup: bool,
     repair: bool,
     repair_scope: Option<RepairScope>,
@@ -47,10 +45,6 @@ pub async fn decode_eth_calls(
             "No eth_calls configured for decoding on chain {}",
             chain.name
         );
-        // Signal barrier before early return so the engine doesn't wait forever
-        if let Some(tx) = decode_catchup_done_tx {
-            let _ = tx.send(());
-        }
         // Drain channel and return
         let mut decoder_rx = decoder_rx;
         while decoder_rx.recv().await.is_some() {}
@@ -67,66 +61,63 @@ pub async fn decode_eth_calls(
 
     let raw_calls_dir = crate::storage::paths::raw_eth_calls_dir(&chain.name);
 
-    if !skip_catchup {
-        // =========================================================================
-        // Wait for eth_call collection catchup before decoding
-        // =========================================================================
-        if let Some(rx) = eth_calls_catchup_done_rx {
-            tracing::info!(
-                "Waiting for eth_call collection catchup to complete before decoding..."
-            );
-            let _ = rx.await;
-            tracing::info!("Eth_call collection catchup complete, proceeding with decoding");
-        }
-
-        // =========================================================================
-        // Catchup phase: Process existing raw eth_call files
-        // =========================================================================
-        if raw_calls_dir.exists() {
-            let decode_start = Instant::now();
-            // Pass None for transform_tx during catchup to avoid deadlock:
-            // the engine is blocked waiting for our barrier signal and won't read
-            // from the channel, so sends could block forever. The engine will read
-            // decoded parquet files during its own catchup instead.
-            catchup::catchup_decode_eth_calls(
-                &raw_calls_dir,
-                &output_base,
-                &regular_configs,
-                &once_configs,
-                &event_configs,
-                raw_data_config,
-                None,
-                repair,
-                repair_scope.clone(),
-            )
-            .await?;
-
-            tracing::info!(
-                "Eth_call decoding catchup complete for chain {} in {:.1}s",
-                chain.name,
-                decode_start.elapsed().as_secs_f64()
-            );
-        } else {
-            tracing::info!(
-                "Eth_call decoding catchup complete for chain {} (no raw files)",
-                chain.name
-            );
-        }
-
-        if let Some(tx) = decode_catchup_done_tx {
-            let _ = tx.send(());
-        }
-    }
-
     // =========================================================================
-    // Live phase: Process new data as it arrives
+    // Catchup (disk-scan) runs concurrently with the live loop.
+    //
+    // The disk-scan catches up ranges that existed on-disk before this run
+    // started (resumability). The live loop drains streaming DecoderMessage
+    // messages from the eth_calls catchup (now plumbed with decoder_tx) and
+    // from the current phase. Concurrent execution removes the old
+    // `eth_calls_catchup_done_rx` barrier — the decoder no longer blocks
+    // on raw catchup completing.
+    //
+    // Safety vs the old deadlock (see prior comment at this location): the
+    // transformation engine is still gated on `decode_catchup_done_tx` in
+    // this commit, so catchup_decode_eth_calls must still pass `None` for
+    // transform_tx to avoid filling the engine's buffered channel. A later
+    // commit lifts the engine barrier and will flip this to `Some(...)`.
     // =========================================================================
     let configs = EthCallDecodeConfigs {
         regular: &regular_configs,
         once: &once_configs,
         event: &event_configs,
     };
-    current::decode_eth_calls_live(
+
+    let catchup_fut = async {
+        if skip_catchup || !raw_calls_dir.exists() {
+            if !raw_calls_dir.exists() {
+                tracing::info!(
+                    "Eth_call decoding catchup complete for chain {} (no raw files)",
+                    chain.name
+                );
+            }
+            return Ok::<(), EthCallDecodingError>(());
+        }
+
+        let decode_start = Instant::now();
+        catchup::catchup_decode_eth_calls(
+            &raw_calls_dir,
+            &output_base,
+            &regular_configs,
+            &once_configs,
+            &event_configs,
+            raw_data_config,
+            None,
+            repair,
+            repair_scope.clone(),
+        )
+        .await?;
+
+        tracing::info!(
+            "Eth_call decoding catchup complete for chain {} in {:.1}s",
+            chain.name,
+            decode_start.elapsed().as_secs_f64()
+        );
+
+        Ok(())
+    };
+
+    let live_fut = current::decode_eth_calls_live(
         decoder_rx,
         &raw_calls_dir,
         &output_base,
@@ -135,8 +126,11 @@ pub async fn decode_eth_calls(
         raw_data_config,
         &outputs,
         repair,
-    )
-    .await?;
+    );
+
+    let (catchup_res, live_res) = tokio::join!(catchup_fut, live_fut);
+    catchup_res?;
+    live_res?;
 
     tracing::info!("Eth_call decoding complete for chain {}", chain.name);
     Ok(())

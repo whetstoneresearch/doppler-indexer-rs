@@ -3,6 +3,7 @@ use alloy::primitives::{Address, Bytes, B256, I256, U256};
 use arrow::datatypes::{DataType, Field};
 use serde::de::{self, Visitor};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -15,6 +16,8 @@ use crate::types::config::generic::SingleOrMultiple;
 /// - `"address"` - the address that emitted the event
 /// - `"topics[N]"` - topic at index N (e.g., `"topics[1]"`)
 /// - `"data[N]"` - data word at index N (e.g., `"data[0]"`)
+/// - `"v4_pool_id_from_key_data"` - derive a V4 pool id from a tuple-encoded
+///   `PoolKey` at the head of the event data
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventFieldLocation {
     /// The address that emitted the event
@@ -23,15 +26,23 @@ pub enum EventFieldLocation {
     Topic(usize),
     /// A specific data word by index (e.g., data[0])
     Data(usize),
+    /// Derive a V4 pool id by hashing the leading tuple-encoded PoolKey in the
+    /// event data. This is used for tuple-format `ModifyLiquidity` events that
+    /// carry a PoolKey but no explicit pool id.
+    V4PoolIdFromKeyData,
 }
 
 impl EventFieldLocation {
     /// Convert back to the canonical string representation.
-    pub fn as_str_repr(&self) -> String {
+    ///
+    /// Returns `Cow::Borrowed` for the `Address` variant (zero-alloc) and
+    /// `Cow::Owned` for indexed variants that require formatting.
+    pub fn as_str_repr(&self) -> Cow<'static, str> {
         match self {
-            Self::Address => "address".to_string(),
-            Self::Topic(idx) => format!("topics[{}]", idx),
-            Self::Data(idx) => format!("data[{}]", idx),
+            Self::Address => Cow::Borrowed("address"),
+            Self::Topic(idx) => Cow::Owned(format!("topics[{}]", idx)),
+            Self::Data(idx) => Cow::Owned(format!("data[{}]", idx)),
+            Self::V4PoolIdFromKeyData => Cow::Borrowed("v4_pool_id_from_key_data"),
         }
     }
 }
@@ -52,6 +63,10 @@ impl<'de> Deserialize<'de> for EventFieldLocation {
 
         if s == "address" {
             return Ok(EventFieldLocation::Address);
+        }
+
+        if s == "v4_pool_id_from_key_data" {
+            return Ok(EventFieldLocation::V4PoolIdFromKeyData);
         }
 
         if let Some(rest) = s.strip_prefix("topics[") {
@@ -81,7 +96,7 @@ impl<'de> Deserialize<'de> for EventFieldLocation {
         }
 
         Err(de::Error::custom(format!(
-            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", or \"data[N]\")",
+            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", \"data[N]\", or \"v4_pool_id_from_key_data\")",
             s
         )))
     }
@@ -1776,6 +1791,13 @@ mod tests {
     }
 
     #[test]
+    fn test_event_field_location_v4_pool_id_from_key_data() {
+        let json = r#""v4_pool_id_from_key_data""#;
+        let loc: EventFieldLocation = serde_json::from_str(json).unwrap();
+        assert_eq!(loc, EventFieldLocation::V4PoolIdFromKeyData);
+    }
+
+    #[test]
     fn test_event_field_location_invalid() {
         let json = r#""invalid_format""#;
         let result = serde_json::from_str::<EventFieldLocation>(json);
@@ -1787,5 +1809,9 @@ mod tests {
         assert_eq!(EventFieldLocation::Address.as_str_repr(), "address");
         assert_eq!(EventFieldLocation::Topic(2).as_str_repr(), "topics[2]");
         assert_eq!(EventFieldLocation::Data(0).as_str_repr(), "data[0]");
+        assert_eq!(
+            EventFieldLocation::V4PoolIdFromKeyData.as_str_repr(),
+            "v4_pool_id_from_key_data"
+        );
     }
 }

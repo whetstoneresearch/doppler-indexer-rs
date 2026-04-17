@@ -25,6 +25,7 @@ use self::state::DecoderState;
 
 /// Live phase: Process new data as it arrives via channel.
 /// Returns when AllComplete message is received or channel closes.
+#[allow(clippy::too_many_arguments)]
 pub async fn decode_eth_calls_live(
     mut decoder_rx: Receiver<DecoderMessage>,
     raw_calls_dir: &Path,
@@ -276,10 +277,14 @@ mod tests {
             decoding_concurrency: None,
             factory_concurrency: None,
             event_call_concurrency: None,
+            event_call_window_size: None,
+            event_call_trigger_batch_size: None,
             live_mode: None,
             reorg_depth: None,
             compaction_interval_secs: None,
             transform_retry_grace_period_secs: None,
+            max_receipt_ranges: None,
+            max_pending_log_ranges: None,
         }
     }
 

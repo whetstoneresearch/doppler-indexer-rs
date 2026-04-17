@@ -53,9 +53,10 @@ pub async fn collect_blocks(
     tokio::fs::create_dir_all(&output_dir).await?;
 
     let range_size = raw_data_config.parquet_block_range.unwrap_or(1000) as u64;
-    let start_block = chain.start_block.map(|u| u.to::<u64>()).unwrap_or(0);
+    let start_block = chain.effective_start_block();
 
-    let chain_head = client.get_block_number().await?;
+    let raw_chain_head = client.get_block_number().await?;
+    let chain_head = chain.effective_upper_bound(raw_chain_head);
 
     tracing::info!(
         "Chain {} head at block {}, starting collection from block {}",
@@ -191,6 +192,7 @@ pub async fn collect_blocks(
 /// Streaming block collection: fetches blocks concurrently and forwards to downstream
 /// collectors immediately as each block arrives. Buffers records and returns a
 /// `PendingBlockWrite` so the caller can overlap the parquet I/O with the next fetch.
+#[allow(clippy::too_many_arguments)]
 async fn collect_blocks_streaming(
     client: &UnifiedRpcClient,
     range: &BlockRange,
@@ -262,10 +264,7 @@ async fn collect_blocks_streaming(
                                 number: block_number,
                                 timestamp,
                                 transaction_count: tx_hashes.len() as u32,
-                                transaction_hashes: tx_hashes
-                                    .iter()
-                                    .map(|h| format!("{:?}", h))
-                                    .collect(),
+                                transaction_hashes: tx_hashes,
                                 uncle_count: block.uncles.len() as u32,
                             },
                         );

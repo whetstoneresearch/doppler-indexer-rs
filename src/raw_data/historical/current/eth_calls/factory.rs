@@ -99,6 +99,7 @@ pub(super) async fn handle_factory_message(
                                     buf_range_end,
                                     &state.contracts,
                                     false,
+                                    0, // no trigger batching in live mode
                                 )
                                 .await?
                             } else {
@@ -111,6 +112,7 @@ pub(super) async fn handle_factory_message(
                                     buf_range_end,
                                     &state.contracts,
                                     false,
+                                    0, // no trigger batching in live mode
                                 )
                                 .await?
                             };
@@ -139,12 +141,12 @@ pub(super) async fn handle_factory_message(
                     range_end: factory_data.range_end,
                     addresses_by_block: HashMap::new(),
                 });
-            for (block, addrs) in factory_data.addresses_by_block {
+            for (block, addrs) in &factory_data.addresses_by_block {
                 existing
                     .addresses_by_block
-                    .entry(block)
+                    .entry(*block)
                     .or_default()
-                    .extend(addrs);
+                    .extend(addrs.iter().cloned());
             }
         }
         Some(FactoryMessage::RangeComplete {
@@ -159,11 +161,13 @@ pub(super) async fn handle_factory_message(
                         start: range_start,
                         end: range_end,
                     };
+                    let mut processed_factory_work = false;
 
                     if let (Some(blocks), Some(factory_data)) = (
                         state.range_data.get(&range_start),
                         state.range_factory_data.get(&range_start),
                     ) {
+                        processed_factory_work = true;
                         let ctx = EthCallContext {
                             client,
                             output_dir: &state.base_output_dir,
@@ -236,32 +240,41 @@ pub(super) async fn handle_factory_message(
                                 .await?;
                             }
                         }
+                    } else {
+                        tracing::debug!(
+                            "Deferring factory completion for range {}-{} until blocks and factory data are both available",
+                            range_start,
+                            range_end - 1
+                        );
                     }
-                    state.range_factory_done.insert(range_start);
 
-                    // Factory address discovery is complete for this range.
-                    // Any buffered triggers for this range whose emitters still aren't
-                    // in factory_addresses are legitimately not factory instances — drop them.
-                    if !state.factory_skipped_triggers.is_empty() {
-                        let before: usize = state
-                            .factory_skipped_triggers
-                            .iter()
-                            .map(|(t, _, _)| t.len())
-                            .sum();
-                        state
-                            .factory_skipped_triggers
-                            .retain(|(_, buf_start, _)| *buf_start != range_start);
-                        let after: usize = state
-                            .factory_skipped_triggers
-                            .iter()
-                            .map(|(t, _, _)| t.len())
-                            .sum();
-                        let dropped = before - after;
-                        if dropped > 0 {
-                            tracing::debug!(
-                                "Dropped {} buffered triggers for range {} — factory discovery complete, addresses not found",
-                                dropped, range_start
-                            );
+                    if processed_factory_work {
+                        state.range_factory_done.insert(range_start);
+
+                        // Factory address discovery is complete for this range.
+                        // Any buffered triggers for this range whose emitters still aren't
+                        // in factory_addresses are legitimately not factory instances — drop them.
+                        if !state.factory_skipped_triggers.is_empty() {
+                            let before: usize = state
+                                .factory_skipped_triggers
+                                .iter()
+                                .map(|(t, _, _)| t.len())
+                                .sum();
+                            state
+                                .factory_skipped_triggers
+                                .retain(|(_, buf_start, _)| *buf_start != range_start);
+                            let after: usize = state
+                                .factory_skipped_triggers
+                                .iter()
+                                .map(|(t, _, _)| t.len())
+                                .sum();
+                            let dropped = before - after;
+                            if dropped > 0 {
+                                tracing::debug!(
+                                    "Dropped {} buffered triggers for range {} — factory discovery complete, addresses not found",
+                                    dropped, range_start
+                                );
+                            }
                         }
                     }
                 }
@@ -461,6 +474,39 @@ mod tests {
                 .join("test_collection/once/contract_index.json")
                 .exists(),
             "contract_index.json must be written when expected_contracts is non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_factory_rangecomplete_defers_until_range_state_is_ready() {
+        let tmp = TempDir::new().unwrap();
+        let client = dummy_client();
+        let mut state = factory_once_only_state(tmp.path());
+
+        // Catchup may have already marked the range as regular-done before the
+        // current phase has received the full block list for this range.
+        state.range_regular_done.insert(0);
+
+        let mut factory_rx = None;
+
+        handle_factory_message(
+            Some(FactoryMessage::RangeComplete {
+                range_start: 0,
+                range_end: 100,
+            }),
+            &mut state,
+            &client,
+            &mut factory_rx,
+            &None,
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !state.range_factory_done.contains(&0),
+            "factory completion must wait until blocks and factory data are available"
         );
     }
 }

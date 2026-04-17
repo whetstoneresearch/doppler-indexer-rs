@@ -9,11 +9,11 @@
       "title": "Events /s",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 0 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(transformation_events_processed_total[$__rate_interval])) or vector(0)",
+          "expr": "sum(rate(transformation_events_processed_total{chain=~\"$chain\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "events"
         }
       ],
@@ -34,12 +34,37 @@
       "title": "Calls /s",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 0 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(rate(transformation_calls_processed_total[$__rate_interval])) or vector(0)",
+          "expr": "sum(rate(transformation_calls_processed_total{chain=~\"$chain\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "calls"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "title": "Blocks /s",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 5, "x": 10, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(transformation_handlers_completed_total{chain=~\"$chain\"}[$__rate_interval])) or vector(0)",
+          "legendFormat": "blocks"
         }
       ],
       "fieldConfig": {
@@ -59,11 +84,11 @@
       "title": "Handlers In Flight",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 15, "y": 0 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(transformation_handlers_in_flight) or vector(0)",
+          "expr": "sum(transformation_handlers_in_flight{chain=~\"$chain\"}) or vector(0)",
           "legendFormat": "handlers"
         }
       ],
@@ -84,11 +109,11 @@
       "title": "Pending Events",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(transformation_pending_events) or vector(0)",
+          "expr": "sum(transformation_pending_events{chain=~\"$chain\"}) or vector(0)",
           "legendFormat": "pending"
         }
       ],
@@ -113,7 +138,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(10, histogram_quantile(0.95, sum by (le, handler_key, mode) (rate(transformation_handler_duration_seconds_bucket{status=\"success\"}[$__rate_interval]))))",
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, handler_key, mode) (rate(transformation_handler_duration_seconds_bucket{status=\"success\", chain=~\"$chain\"}[$__rate_interval]))))",
           "legendFormat": "{{handler_key}} {{mode}}"
         }
       ],
@@ -130,7 +155,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(10, sum by (handler_key, error_type) (rate(transformation_handler_errors_total[$__rate_interval])))",
+          "expr": "topk(10, sum by (handler_key, error_type) (rate(transformation_handler_errors_total{chain=~\"$chain\"}[$__rate_interval])))",
           "legendFormat": "{{handler_key}} {{error_type}}"
         }
       ],
@@ -147,7 +172,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(12, sum by (handler_key, outcome) (rate(transformation_retry_attempts_total[$__rate_interval])))",
+          "expr": "topk(12, sum by (handler_key, outcome) (rate(transformation_retry_attempts_total{chain=~\"$chain\"}[$__rate_interval])))",
           "legendFormat": "{{handler_key}} {{outcome}}"
         }
       ],
@@ -164,12 +189,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(transformation_range_finalization_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(transformation_range_finalization_duration_seconds_bucket{chain=~\"$chain\"}[$__rate_interval])))",
           "legendFormat": "p50"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(transformation_range_finalization_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(transformation_range_finalization_duration_seconds_bucket{chain=~\"$chain\"}[$__rate_interval])))",
           "legendFormat": "p95"
         }
       ],
@@ -186,7 +211,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(10, sum by (source_name, event_name) (rate(transformation_events_processed_total[$__rate_interval])))",
+          "expr": "topk(10, sum by (source_name, event_name) (rate(transformation_events_processed_total{chain=~\"$chain\"}[$__rate_interval])))",
           "legendFormat": "{{source_name}} {{event_name}}"
         }
       ],
@@ -203,7 +228,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(10, sum by (source_name, function_name) (rate(transformation_calls_processed_total[$__rate_interval])))",
+          "expr": "topk(10, sum by (source_name, function_name) (rate(transformation_calls_processed_total{chain=~\"$chain\"}[$__rate_interval])))",
           "legendFormat": "{{source_name}} {{function_name}}"
         }
       ],
@@ -220,7 +245,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(10, transformation_pending_events)",
+          "expr": "topk(10, transformation_pending_events{chain=~\"$chain\"})",
           "legendFormat": "{{handler_key}}"
         }
       ],
@@ -237,8 +262,84 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "topk(10, transformation_handlers_in_flight)",
+          "expr": "topk(10, transformation_handlers_in_flight{chain=~\"$chain\"})",
           "legendFormat": "{{handler_key}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Blocks /s by Handler",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(10, sum by (handler_key, mode) (rate(transformation_handlers_completed_total{status=\"success\", chain=~\"$chain\"}[$__rate_interval])))",
+          "legendFormat": "{{handler_key}} {{mode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Blocks /s by Chain",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (chain) (rate(transformation_handlers_completed_total{chain=~\"$chain\"}[$__rate_interval]))",
+          "legendFormat": "{{chain}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Catchup ETA",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(transformation_catchup_blocks_remaining{chain=~\"$chain\"}) / clamp_min(sum(rate(transformation_handlers_completed_total{chain=~\"$chain\", mode=\"catchup\"}[$__rate_interval])), 1e-10)",
+          "legendFormat": "estimated remaining"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 3600 }, { "color": "red", "value": 86400 }] } },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      }
+    },
+    {
+      "title": "Catchup Blocks Remaining",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (chain, kind) (transformation_catchup_blocks_remaining{chain=~\"$chain\"})",
+          "legendFormat": "{{chain}} {{kind}}"
         }
       ],
       "fieldConfig": {
@@ -250,7 +351,22 @@
   "refresh": "10s",
   "schemaVersion": 39,
   "tags": ["doppler", "transformations", "metrics"],
-  "templating": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(transformation_handlers_in_flight, chain)",
+        "includeAll": true,
+        "multi": true,
+        "name": "chain",
+        "query": { "qryType": 1, "query": "label_values(transformation_handlers_in_flight, chain)" },
+        "refresh": 2,
+        "type": "query"
+      }
+    ]
+  },
   "time": { "from": "now-30m", "to": "now" },
   "timezone": "browser",
   "title": "Doppler Transformations",

@@ -3,6 +3,8 @@
 //! Handlers implement these traits to receive decoded events and eth_calls,
 //! transform the data, and produce database operations.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 
 use crate::db::{DbOperation, DbPool};
@@ -183,6 +185,82 @@ impl AccountStateTrigger {
     }
 }
 
+/// Per-edge chain applicability for handler dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainSelector {
+    /// Dependency applies on all chains.
+    All,
+    /// Dependency applies only on the listed chain IDs.
+    #[allow(dead_code)]
+    Only(BTreeSet<u64>),
+    /// Dependency applies on all chains except the listed chain IDs.
+    Except(BTreeSet<u64>),
+}
+
+/// Declarative dependency edge with optional chain filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerDependencySpec {
+    name: &'static str,
+    selector: ChainSelector,
+}
+
+impl HandlerDependencySpec {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            selector: ChainSelector::All,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[allow(dead_code)]
+    pub fn only<I>(mut self, chain_ids: I) -> Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.assert_selector_is_default("only");
+        self.selector = ChainSelector::Only(chain_ids.into_iter().collect());
+        self
+    }
+
+    pub fn except<I>(mut self, chain_ids: I) -> Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        self.assert_selector_is_default("except");
+        self.selector = ChainSelector::Except(chain_ids.into_iter().collect());
+        self
+    }
+
+    pub fn applies_to_chain(&self, chain_id: Option<u64>) -> bool {
+        let Some(chain_id) = chain_id else {
+            return true;
+        };
+
+        match &self.selector {
+            ChainSelector::All => true,
+            ChainSelector::Only(ids) => ids.contains(&chain_id),
+            ChainSelector::Except(ids) => !ids.contains(&chain_id),
+        }
+    }
+
+    fn assert_selector_is_default(&self, method: &str) {
+        assert!(
+            matches!(self.selector, ChainSelector::All),
+            "HandlerDependencySpec::{}() cannot be combined with another chain selector",
+            method
+        );
+    }
+}
+
+/// Builder helper for declarative handler dependency specs.
+pub fn dep(name: &'static str) -> HandlerDependencySpec {
+    HandlerDependencySpec::new(name)
+}
+
 /// Marker trait for handlers that respond to events.
 pub trait EventHandler: TransformationHandler {
     /// Event triggers this handler responds to.
@@ -195,10 +273,25 @@ pub trait EventHandler: TransformationHandler {
         vec![]
     }
 
+    /// Declarative same-range handler dependencies. Defaults to wrapping the
+    /// legacy string-only dependency API so existing handlers remain unchanged.
+    fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+        self.handler_dependencies().into_iter().map(dep).collect()
+    }
+
     /// Handler names (via `TransformationHandler::name()`) that must complete
     /// before this handler can execute for a given block range.
     fn handler_dependencies(&self) -> Vec<&'static str> {
         vec![]
+    }
+
+    /// Declarative contiguous handler dependencies. Defaults to wrapping the
+    /// legacy string-only dependency API so existing handlers remain unchanged.
+    fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+        self.contiguous_handler_dependencies()
+            .into_iter()
+            .map(dep)
+            .collect()
     }
 
     /// Handler names that must be completed contiguously through the current

@@ -11,7 +11,7 @@ use crate::decoding::logs::{
 use crate::decoding::types::{DecoderMessage, LogDecoderOutputs, LogMatcherConfig};
 use crate::live::LiveStorage;
 use crate::storage::contract_index::build_expected_factory_contracts_for_range;
-use crate::storage::parquet_readers::read_factory_addresses_from_parquet;
+use crate::storage::factory_data::load_accumulated_factory_addresses_from_parquet;
 use crate::types::config::contract::Contracts;
 
 /// Load accumulated factory addresses from both compacted parquet and uncompacted bincode files.
@@ -21,48 +21,7 @@ use crate::types::config::contract::Contracts;
 fn load_accumulated_factory_addresses(
     chain_name: &str,
 ) -> Result<HashMap<String, HashSet<[u8; 20]>>, LogDecodingError> {
-    let mut result: HashMap<String, HashSet<[u8; 20]>> = HashMap::new();
-
-    // 1. Load from compacted parquet files: data/{chain}/historical/factories/{collection}/*.parquet
-    let factories_dir = crate::storage::paths::factories_dir(chain_name);
-    if factories_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&factories_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                let collection_name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                // Read all parquet files in this collection
-                if let Ok(files) = std::fs::read_dir(&path) {
-                    for file_entry in files.flatten() {
-                        let file_path = file_entry.path();
-                        if !file_path
-                            .extension()
-                            .map(|e| e == "parquet")
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-
-                        // Read addresses from parquet
-                        if let Ok(addresses) = read_factory_addresses_from_parquet(&file_path) {
-                            result
-                                .entry(collection_name.clone())
-                                .or_default()
-                                .extend(addresses);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut result = load_accumulated_factory_addresses_from_parquet(chain_name)?;
 
     // 2. Load from uncompacted bincode files: data/{chain}/live/factories/{block}.bin
     let live_storage = LiveStorage::new(chain_name);

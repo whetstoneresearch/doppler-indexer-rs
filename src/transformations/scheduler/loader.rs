@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use super::dag::WorkItem;
 use crate::db::DbPool;
+use crate::metrics::record_chain_head_block;
 use crate::rpc::UnifiedRpcClient;
 use crate::transformations::context::{DecodedCall, DecodedEvent, TransactionAddresses};
 use crate::transformations::engine::HandlerKind;
@@ -139,6 +140,7 @@ fn read_receipt_addresses_sync(
 ) -> HashMap<TxId, TransactionAddresses> {
     use arrow::array::{Array, FixedSizeBinaryArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
 
     let file_name = format!("receipts_{}-{}.parquet", range_start, range_end - 1);
     let file_path = raw_receipts_dir.join(&file_name);
@@ -173,7 +175,17 @@ fn read_receipt_addresses_sync(
         }
     };
 
-    let reader = match builder.build() {
+    let num_rows = builder.metadata().file_metadata().num_rows() as usize;
+    let arrow_schema = builder.schema().clone();
+
+    let needed = ["transaction_hash", "from_address", "to_address"];
+    let root_indices: Vec<usize> = needed
+        .iter()
+        .filter_map(|name| arrow_schema.index_of(name).ok())
+        .collect();
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), root_indices);
+    let reader = match builder.with_projection(mask).build() {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -185,7 +197,7 @@ fn read_receipt_addresses_sync(
         }
     };
 
-    let mut addresses = HashMap::new();
+    let mut addresses = HashMap::with_capacity(num_rows);
 
     for batch_result in reader {
         let batch = match batch_result {
@@ -207,7 +219,7 @@ fn read_receipt_addresses_sync(
 
         let tx_hash_col = match batch.column_by_name("transaction_hash") {
             Some(col) => match col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                Some(arr) => arr.clone(),
+                Some(arr) => arr,
                 None => continue,
             },
             None => continue,
@@ -215,7 +227,7 @@ fn read_receipt_addresses_sync(
 
         let from_col = match batch.column_by_name("from_address") {
             Some(col) => match col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-                Some(arr) => arr.clone(),
+                Some(arr) => arr,
                 None => continue,
             },
             None => continue,
@@ -223,7 +235,7 @@ fn read_receipt_addresses_sync(
 
         let to_col = batch
             .column_by_name("to_address")
-            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>().cloned());
+            .and_then(|col| col.as_any().downcast_ref::<FixedSizeBinaryArray>());
 
         for row in 0..num_rows {
             let tx_hash: [u8; 32] = match tx_hash_col.value(row).try_into() {
@@ -236,7 +248,7 @@ fn read_receipt_addresses_sync(
                 Err(_) => continue,
             };
 
-            let to_address = to_col.as_ref().and_then(|col| {
+            let to_address = to_col.and_then(|col| {
                 if col.is_null(row) {
                     None
                 } else {
@@ -270,10 +282,12 @@ fn read_receipt_addresses_sync(
 pub(crate) struct CatchupPayload {
     pub handler: Arc<dyn TransformationHandler>,
     pub handler_key: String,
+    #[allow(dead_code)]
     pub handler_name: &'static str,
+    #[allow(dead_code)]
     pub handler_version: u32,
-    pub triggers: Vec<(String, String)>,
-    pub call_deps: Vec<(String, String)>,
+    pub triggers: Arc<Vec<(String, String)>>,
+    pub call_deps: Arc<Vec<(String, String)>>,
     pub kind: HandlerKind,
 }
 
@@ -281,6 +295,9 @@ pub(crate) struct CatchupPayload {
 
 /// Shared state needed to execute one [`WorkItem`] during catchup.
 ///
+type ReceiptCache =
+    tokio::sync::RwLock<HashMap<(u64, u64), Arc<HashMap<[u8; 32], TransactionAddresses>>>>;
+
 /// Constructed once per `run_handler_catchup` invocation and shared via `Arc`
 /// across all spawned tasks inside [`DagScheduler::execute`].
 pub(crate) struct CatchupLoader {
@@ -294,13 +311,26 @@ pub(crate) struct CatchupLoader {
     pub chain_id: u64,
     pub db_pool: Arc<DbPool>,
     pub finalizer: Arc<RangeFinalizer>,
+    /// Cache of receipt address maps keyed by (range_start, range_end).
+    /// Multiple event handlers processing the same range share one Arc'd HashMap.
+    pub receipt_cache: ReceiptCache,
 }
 
 impl CatchupLoader {
+    /// Drop all cached receipt address maps.
+    ///
+    /// Called between scheduler chunks so that ranges processed in earlier chunks
+    /// do not pin their receipt data for the remainder of catchup.
+    pub(crate) async fn clear_receipt_cache(&self) {
+        self.receipt_cache.write().await.clear();
+    }
+
     /// Load data, invoke handler, execute DB ops, and record progress for one [`WorkItem`].
     pub(crate) async fn run(&self, item: WorkItem) -> Result<(), TransformationError> {
         let range_start = item.range_start;
         let range_end = item.range_end;
+
+        record_chain_head_block(&self.chain_name, range_end);
 
         let payload = item
             .payload
@@ -350,9 +380,10 @@ impl CatchupLoader {
 
         let tx_addresses = match payload.kind {
             HandlerKind::Event => {
-                read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await
+                self.get_or_load_receipt_addresses(range_start, range_end)
+                    .await
             }
-            HandlerKind::Call => HashMap::new(),
+            HandlerKind::Call => Arc::new(HashMap::new()),
         };
 
         run_handler_task(
@@ -381,6 +412,34 @@ impl CatchupLoader {
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
+
+    async fn get_or_load_receipt_addresses(
+        &self,
+        range_start: u64,
+        range_end: u64,
+    ) -> Arc<HashMap<[u8; 32], TransactionAddresses>> {
+        let key = (range_start, range_end);
+
+        // Fast path: read lock
+        {
+            let cache = self.receipt_cache.read().await;
+            if let Some(cached) = cache.get(&key) {
+                return cached.clone();
+            }
+        }
+
+        // Slow path: load and insert under write lock
+        let mut cache = self.receipt_cache.write().await;
+        // Double-check after acquiring write lock
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+
+        let addresses =
+            Arc::new(read_receipt_addresses(&self.raw_receipts_dir, range_start, range_end).await);
+        cache.insert(key, addresses.clone());
+        addresses
+    }
 
     async fn load_events(
         &self,
@@ -512,7 +571,7 @@ impl CallDepScanner {
                 decoded_base: &Path,
                 raw_base: &Path,
                 source: &str,
-                function_name: &str,
+                _function_name: &str,
                 contracts: &Contracts,
                 ranges: &mut HashSet<(u64, u64)>,
             ) -> std::io::Result<()> {
@@ -528,7 +587,7 @@ impl CallDepScanner {
                             decoded_base,
                             raw_base,
                             source,
-                            function_name,
+                            _function_name,
                             contracts,
                             ranges,
                         )?;
@@ -694,9 +753,9 @@ mod tests {
             handler_name: name.to_string(),
             range_start,
             range_end: range_start + 1000,
-            dep_names: deps.iter().map(|s| s.to_string()).collect(),
-            contiguous_dep_names: Vec::new(),
-            call_dep_keys: Vec::new(),
+            dep_names: Arc::new(deps.iter().map(|s| s.to_string()).collect()),
+            contiguous_dep_names: Arc::new(Vec::new()),
+            call_dep_keys: Arc::new(Vec::new()),
             sequential: false,
             payload: Box::new(()),
         }

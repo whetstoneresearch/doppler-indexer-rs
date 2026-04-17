@@ -8,7 +8,7 @@ Handlers currently execute concurrently with no ordering guarantees relative to 
 
 ### Trait Change
 
-Add a `handler_dependencies()` method to `EventHandler` with a default empty implementation:
+Add declarative dependency specs to `EventHandler` with a default empty implementation:
 
 ```rust
 pub trait EventHandler: TransformationHandler {
@@ -18,19 +18,18 @@ pub trait EventHandler: TransformationHandler {
         vec![]
     }
 
-    /// Handler names (via `TransformationHandler::name()`) that must complete
-    /// before this handler can execute for a given block range.
-    fn handler_dependencies(&self) -> Vec<&'static str> {
+    /// Same-range handler dependencies.
+    fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
         vec![]
     }
 }
 ```
 
-Dependencies reference the `name()` of other handlers (e.g., `"V3CreateHandler"`), not the versioned `handler_key()`. This means bumping a dependency's version doesn't require updating dependents.
+The ergonomic constructor is `dep("V3CreateHandler")`, with optional `.only([...])` / `.except([...])` chain filters. No selector means all chains. Dependencies still reference the dependency handler's `name()` rather than its versioned `handler_key()`, so version bumps do not require updating dependents.
 
 ### Startup Validation
 
-During registry construction, validate the dependency graph:
+During registry construction, resolve dependency specs for the active chain, then validate the resulting graph:
 
 1. **Missing dependency check** — if a handler declares a dependency on a name that isn't registered, panic with a descriptive error. Same pattern as the existing `validate_call_dependencies()`.
 2. **Cycle detection** — perform a topological sort of the handler dependency graph. If a cycle is detected, panic with the cycle path. This catches `A -> B -> A` and longer cycles.

@@ -47,6 +47,15 @@ pub mod raw_data {
     /// Default number of concurrent tasks for factory collection catchup
     pub const FACTORY_CONCURRENCY: usize = 4;
 
+    /// Default event-call catchup window size (multiplied by event_call_concurrency at runtime)
+    pub const EVENT_CALL_WINDOW_MULTIPLIER: usize = 3;
+
+    /// Default maximum triggers per RPC batch within a single range
+    pub const EVENT_CALL_TRIGGER_BATCH_SIZE: usize = 50000;
+
+    /// Default maximum pending log ranges before backpressure kicks in
+    pub const MAX_PENDING_LOG_RANGES: usize = 10;
+
     /// Default number of blocks to track for reorg detection
     pub const REORG_DEPTH: u64 = 128;
 
@@ -69,6 +78,33 @@ pub mod rpc {
     pub const ALCHEMY_CU_PER_SECOND: u32 = 7500;
 }
 
+/// Storage and S3 defaults
+pub mod storage {
+    /// Default AWS region for S3-compatible storage
+    pub const REGION: &str = "us-east-1";
+
+    /// Default maximum cache size in gigabytes
+    pub const MAX_SIZE_GB: u64 = 100;
+
+    /// Default eviction threshold as a fraction of max_size_gb
+    pub const EVICTION_THRESHOLD: f64 = 0.8;
+
+    /// Default number of recent ranges to check markers directly
+    pub const MARKER_FRESHNESS_RANGES: u64 = 10;
+
+    /// Default manifest refresh interval in seconds
+    pub const MANIFEST_REFRESH_SECS: u64 = 60;
+
+    /// Default retry interval for failed uploads in seconds
+    pub const RETRY_INTERVAL_SECS: u64 = 30;
+
+    /// Default maximum number of retry attempts
+    pub const MAX_RETRIES: u32 = 10;
+
+    /// Default prefixes that are pinned (never evicted from cache)
+    pub const PINNED_PREFIXES: &[&str] = &["factories", "decoded"];
+}
+
 /// Database pool defaults
 #[allow(dead_code)]
 pub mod db_pool {
@@ -77,7 +113,7 @@ pub mod db_pool {
     /// Must be at least as large as `transformations::HANDLER_CONCURRENCY` to
     /// avoid connection starvation during catchup, where each concurrent handler
     /// needs a DB connection for its transaction.
-    pub const MAX_SIZE: usize = 32;
+    pub const MAX_SIZE: usize = 40;
 }
 
 #[cfg(feature = "solana")]
@@ -121,6 +157,8 @@ mod tests {
         assert_eq!(raw_data::REORG_DEPTH, 128);
         assert_eq!(raw_data::COMPACTION_INTERVAL_SECS, 10);
         assert_eq!(raw_data::TRANSFORM_RETRY_GRACE_PERIOD_SECS, 300);
+        assert_eq!(raw_data::EVENT_CALL_WINDOW_MULTIPLIER, 3);
+        assert_eq!(raw_data::EVENT_CALL_TRIGGER_BATCH_SIZE, 50000);
     }
 
     #[test]
@@ -132,6 +170,18 @@ mod tests {
 
     #[test]
     fn test_db_pool_defaults() {
-        assert_eq!(db_pool::MAX_SIZE, 32);
+        assert_eq!(db_pool::MAX_SIZE, 40);
+    }
+
+    #[test]
+    fn test_storage_defaults() {
+        assert_eq!(storage::REGION, "us-east-1");
+        assert_eq!(storage::MAX_SIZE_GB, 100);
+        assert!((storage::EVICTION_THRESHOLD - 0.8).abs() < f64::EPSILON);
+        assert_eq!(storage::MARKER_FRESHNESS_RANGES, 10);
+        assert_eq!(storage::MANIFEST_REFRESH_SECS, 60);
+        assert_eq!(storage::RETRY_INTERVAL_SECS, 30);
+        assert_eq!(storage::MAX_RETRIES, 10);
+        assert_eq!(storage::PINNED_PREFIXES, &["factories", "decoded"]);
     }
 }

@@ -28,6 +28,14 @@ pub struct RawDataCollectionConfig {
     /// Higher values improve throughput during catchup but use more RPC bandwidth.
     /// Default: 4
     pub event_call_concurrency: Option<usize>,
+    /// Maximum number of event-call log-range tasks alive in the JoinSet at once.
+    /// Lower values reduce peak memory; higher values improve pipeline throughput.
+    /// Default: event_call_concurrency * 3
+    pub event_call_window_size: Option<usize>,
+    /// Maximum number of event triggers to process per RPC batch within a single range.
+    /// Lower values reduce peak memory; set to 0 to disable chunking (old behavior).
+    /// Default: 50000
+    pub event_call_trigger_batch_size: Option<usize>,
     /// Enable WebSocket live mode after catchup completes.
     /// Requires ws_url_env_var to be set in chain config.
     pub live_mode: Option<bool>,
@@ -40,6 +48,15 @@ pub struct RawDataCollectionConfig {
     /// Grace period in seconds before retrying stuck transformations.
     /// Default: 300
     pub transform_retry_grace_period_secs: Option<u64>,
+    /// Maximum number of concurrent receipt batch ranges held in memory.
+    /// Lower values reduce peak memory at the cost of throughput.
+    /// Default: 5
+    pub max_receipt_ranges: Option<usize>,
+    /// Maximum number of log ranges buffered in the log and factory collectors
+    /// before backpressure stops draining from the channel.
+    /// Lower values reduce peak memory; higher values improve pipeline throughput.
+    /// Default: 10
+    pub max_pending_log_ranges: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

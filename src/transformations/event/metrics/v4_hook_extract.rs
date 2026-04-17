@@ -4,7 +4,7 @@
 //! share the same Swap event format and need getSlot0 call results for sqrtPriceX96/tick.
 //! ModifyLiquidity comes in two formats: tuple (multicurve, dhook) and flat (decay, scheduled).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use alloy_primitives::U256;
 
@@ -13,6 +13,7 @@ use crate::transformations::error::TransformationError;
 use crate::types::uniswap::v4::PoolKey;
 
 use super::swap_data::{LiquidityInput, SwapInput};
+use super::tvl::TvlTarget;
 
 /// Extract swap inputs from V4 hook Swap events, matching each with its getSlot0 call result.
 ///
@@ -79,6 +80,62 @@ pub fn extract_v4_hook_swaps(
     }
 
     Ok(swaps)
+}
+
+/// Extract TVL targets from V4 hook Swap events, deduplicated by (pool_id, block_number).
+///
+/// Uses the same getSlot0 matching as [`extract_v4_hook_swaps`] but produces
+/// [`TvlTarget`]s instead of [`SwapInput`]s. For each (pool, block), keeps the
+/// last swap's tick/sqrtPriceX96 (end-of-block state).
+pub fn extract_v4_hook_tvl_targets(
+    ctx: &TransformationContext,
+    event_source: &str,
+    call_source: &str,
+) -> Result<Vec<TvlTarget>, TransformationError> {
+    let slot0_by_event_key: HashMap<(u64, u32), _> = ctx
+        .calls_of_type(call_source, "getSlot0")
+        .filter_map(|call| {
+            call.trigger_log_index
+                .map(|idx| ((call.block_number, idx), call))
+        })
+        .collect();
+
+    let mut by_pool_block: BTreeMap<(Vec<u8>, u64), TvlTarget> = BTreeMap::new();
+
+    for event in ctx.events_of_type(event_source, "Swap") {
+        let pool_id = event.extract_bytes32("poolId")?;
+
+        let Some(slot0) = slot0_by_event_key
+            .get(&(event.block_number, event.log_index))
+            .copied()
+        else {
+            return Err(TransformationError::MissingData(format!(
+                "No getSlot0 call for TVL target at block {} log_index {} (source: {})",
+                event.block_number, event.log_index, call_source
+            )));
+        };
+
+        if slot0.is_reverted {
+            continue;
+        }
+
+        let sqrt_price_x96 = slot0.extract_uint256("sqrtPriceX96")?;
+        let tick = slot0.extract_i32_flexible("tick")?;
+
+        let key = (pool_id.to_vec(), event.block_number);
+        by_pool_block.insert(
+            key,
+            TvlTarget {
+                pool_id: pool_id.to_vec(),
+                block_number: event.block_number,
+                block_timestamp: event.block_timestamp,
+                tick,
+                sqrt_price_x96,
+            },
+        );
+    }
+
+    Ok(by_pool_block.into_values().collect())
 }
 
 /// Extract liquidity deltas from tuple-format ModifyLiquidity events (multicurve, dhook).
@@ -179,7 +236,7 @@ mod tests {
             Arc::new(events),
             Arc::new(calls),
             Arc::new(Vec::new()),
-            HashMap::new(),
+            Arc::new(HashMap::new()),
             historical,
             Some(rpc),
             Some(Arc::new(HashMap::new())),
@@ -198,9 +255,9 @@ mod tests {
         amount1: i128,
     ) -> DecodedEvent {
         let mut params = HashMap::new();
-        params.insert("poolId".to_string(), DecodedValue::Bytes32(pool_id));
-        params.insert("amount0".to_string(), DecodedValue::Int128(amount0));
-        params.insert("amount1".to_string(), DecodedValue::Int128(amount1));
+        params.insert(Arc::from("poolId"), DecodedValue::Bytes32(pool_id));
+        params.insert(Arc::from("amount0"), DecodedValue::Int128(amount0));
+        params.insert(Arc::from("amount1"), DecodedValue::Int128(amount1));
         DecodedEvent {
             block_number,
             block_timestamp: 1000,
@@ -232,10 +289,10 @@ mod tests {
     ) -> DecodedCall {
         let mut result = HashMap::new();
         result.insert(
-            "sqrtPriceX96".to_string(),
+            Arc::from("sqrtPriceX96"),
             DecodedValue::Uint256(sqrt_price_x96),
         );
-        result.insert("tick".to_string(), DecodedValue::Int32(tick));
+        result.insert(Arc::from("tick"), DecodedValue::Int32(tick));
         DecodedCall {
             block_number,
             block_timestamp: 1000,
@@ -363,24 +420,18 @@ mod tests {
         let tick_spacing = 60i32;
 
         let mut params = HashMap::new();
+        params.insert(Arc::from("key.currency0"), DecodedValue::Address(currency0));
+        params.insert(Arc::from("key.currency1"), DecodedValue::Address(currency1));
+        params.insert(Arc::from("key.fee"), DecodedValue::Uint32(fee));
         params.insert(
-            "key.currency0".to_string(),
-            DecodedValue::Address(currency0),
-        );
-        params.insert(
-            "key.currency1".to_string(),
-            DecodedValue::Address(currency1),
-        );
-        params.insert("key.fee".to_string(), DecodedValue::Uint32(fee));
-        params.insert(
-            "key.tickSpacing".to_string(),
+            Arc::from("key.tickSpacing"),
             DecodedValue::Int32(tick_spacing),
         );
-        params.insert("key.hooks".to_string(), DecodedValue::Address(hooks));
-        params.insert("params.tickLower".to_string(), DecodedValue::Int32(-100));
-        params.insert("params.tickUpper".to_string(), DecodedValue::Int32(100));
+        params.insert(Arc::from("key.hooks"), DecodedValue::Address(hooks));
+        params.insert(Arc::from("params.tickLower"), DecodedValue::Int32(-100));
+        params.insert(Arc::from("params.tickUpper"), DecodedValue::Int32(100));
         params.insert(
-            "params.liquidityDelta".to_string(),
+            Arc::from("params.liquidityDelta"),
             DecodedValue::Int256(I256::try_from(500_000i64).unwrap()),
         );
 
@@ -426,11 +477,11 @@ mod tests {
         let pool_id = [3u8; 32];
 
         let mut params = HashMap::new();
-        params.insert("id".to_string(), DecodedValue::Bytes32(pool_id));
-        params.insert("tickLower".to_string(), DecodedValue::Int32(-200));
-        params.insert("tickUpper".to_string(), DecodedValue::Int32(200));
+        params.insert(Arc::from("id"), DecodedValue::Bytes32(pool_id));
+        params.insert(Arc::from("tickLower"), DecodedValue::Int32(-200));
+        params.insert(Arc::from("tickUpper"), DecodedValue::Int32(200));
         params.insert(
-            "liquidityDelta".to_string(),
+            Arc::from("liquidityDelta"),
             DecodedValue::Int256(I256::try_from(-250_000i64).unwrap()),
         );
 

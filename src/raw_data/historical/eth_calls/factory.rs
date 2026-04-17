@@ -188,6 +188,7 @@ pub(crate) fn event_output_exists(
 }
 
 /// Async wrapper for read_logs_from_parquet
+#[allow(dead_code)]
 pub(crate) async fn read_logs_from_parquet_async(
     file_path: PathBuf,
 ) -> Result<

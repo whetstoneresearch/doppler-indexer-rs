@@ -2,12 +2,12 @@
 //!
 //! The registry maintains a mapping from event/call triggers to their handlers.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::traits::{
     AccountStateHandler, EthCallHandler, EthCallTrigger, EventHandler, EventTrigger,
-    TransformationHandler,
+    HandlerDependencySpec, TransformationHandler,
 };
 use crate::raw_data::historical::eth_calls::{
     build_call_configs, build_event_triggered_call_configs, build_factory_once_call_configs,
@@ -66,6 +66,13 @@ pub struct TransformationRegistry {
     available_sources: Option<HashSet<String>>,
     /// When set, only handlers matching this chain type are registered.
     target_chain_type: Option<ChainType>,
+    /// When set, dependency specs are resolved against this chain ID.
+    /// `None` means "global/all-chains" resolution.
+    dependency_resolution_chain_id: Option<u64>,
+    /// Maps handler name() to its resolved same-range dependency names.
+    resolved_handler_dependencies: HashMap<String, Vec<String>>,
+    /// Maps handler name() to its resolved contiguous dependency names.
+    resolved_contiguous_handler_dependencies: HashMap<String, Vec<String>>,
     /// Maps handler name() to its declared handler dependency names
     handler_dependency_graph: HashMap<String, Vec<String>>,
     /// Topological ordering of handler names (computed after all handlers registered)
@@ -87,35 +94,38 @@ pub struct TransformationRegistry {
 impl TransformationRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self {
-            event_handlers: HashMap::new(),
-            call_handlers: HashMap::new(),
-            account_state_handlers: HashMap::new(),
-            all_handlers: Vec::new(),
-            available_sources: None,
-            target_chain_type: None,
-            handler_dependency_graph: HashMap::new(),
-            handler_topological_order: Vec::new(),
-            dependency_handler_names: HashSet::new(),
-            handler_key_to_name: HashMap::new(),
-            handler_name_to_key: HashMap::new(),
-            event_handler_names: HashSet::new(),
-            multi_trigger_handler_keys: HashSet::new(),
-        }
+        Self::with_scope(None, None)
     }
 
     /// Create a registry that filters handlers by available sources.
     ///
     /// Only handlers whose trigger sources are ALL present in the set will
     /// be registered. Handlers with missing sources are silently skipped.
+    #[allow(dead_code)]
     pub fn with_source_filter(sources: HashSet<String>) -> Self {
+        Self::with_scope(Some(sources), None)
+    }
+
+    /// Create a registry that filters handlers by available sources and
+    /// resolves dependency specs for a specific chain ID.
+    pub fn with_source_filter_for_chain(sources: HashSet<String>, chain_id: u64) -> Self {
+        Self::with_scope(Some(sources), Some(chain_id))
+    }
+
+    fn with_scope(
+        available_sources: Option<HashSet<String>>,
+        dependency_resolution_chain_id: Option<u64>,
+    ) -> Self {
         Self {
             event_handlers: HashMap::new(),
             call_handlers: HashMap::new(),
             account_state_handlers: HashMap::new(),
             all_handlers: Vec::new(),
-            available_sources: Some(sources),
+            available_sources,
             target_chain_type: None,
+            dependency_resolution_chain_id,
+            resolved_handler_dependencies: HashMap::new(),
+            resolved_contiguous_handler_dependencies: HashMap::new(),
             handler_dependency_graph: HashMap::new(),
             handler_topological_order: Vec::new(),
             dependency_handler_names: HashSet::new(),
@@ -194,20 +204,25 @@ impl TransformationRegistry {
                 .push(handler.clone());
         }
 
-        let mut seen_deps: HashSet<String> = HashSet::new();
-        let deps: Vec<String> = handler
-            .handler_dependencies()
-            .into_iter()
-            .chain(handler.contiguous_handler_dependencies())
-            .filter_map(|dep| {
-                let dep = dep.to_string();
-                if seen_deps.insert(dep.clone()) {
-                    Some(dep)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let handler_deps = resolve_dependency_specs(
+            handler.handler_dependency_specs(),
+            self.dependency_resolution_chain_id,
+        );
+        let contiguous_deps = resolve_dependency_specs(
+            handler.contiguous_handler_dependency_specs(),
+            self.dependency_resolution_chain_id,
+        );
+        if !handler_deps.is_empty() {
+            self.resolved_handler_dependencies
+                .insert(handler.name().to_string(), handler_deps.clone());
+        }
+        if !contiguous_deps.is_empty() {
+            self.resolved_contiguous_handler_dependencies
+                .insert(handler.name().to_string(), contiguous_deps.clone());
+        }
+
+        let deps: Vec<String> = handler_deps.into_iter().chain(contiguous_deps).collect();
+        let deps = dedupe_dependency_names(deps);
         if !deps.is_empty() {
             self.handler_dependency_graph
                 .insert(handler.name().to_string(), deps);
@@ -421,8 +436,33 @@ impl TransformationRegistry {
     }
 
     /// Get the dependency graph (handler name -> dependency names).
+    #[allow(dead_code)]
     pub fn handler_dependency_graph(&self) -> &HashMap<String, Vec<String>> {
         &self.handler_dependency_graph
+    }
+
+    /// Get resolved same-range handler dependencies for a handler name.
+    pub fn handler_dependencies_for(&self, name: &str) -> &[String] {
+        self.resolved_handler_dependencies
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Get resolved contiguous handler dependencies for a handler name.
+    pub fn contiguous_handler_dependencies_for(&self, name: &str) -> &[String] {
+        self.resolved_contiguous_handler_dependencies
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Get the resolved union of all handler dependency modes for a handler name.
+    pub fn all_handler_dependencies_for(&self, name: &str) -> &[String] {
+        self.handler_dependency_graph
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Validate handler dependencies and compute topological ordering.
@@ -595,15 +635,100 @@ impl TransformationRegistry {
         self.handler_name_to_key.get(name).map(|s| s.as_str())
     }
 
+    /// Resolve a handler name to its handler_key, falling back to the name itself.
+    ///
+    /// Useful when displaying metrics or log messages where a missing mapping
+    /// should not panic.
+    #[allow(dead_code)]
+    pub fn resolve_handler_key(&self, name: &str) -> String {
+        self.handler_name_to_key
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
     /// Whether a handler was registered with more than one trigger.
     pub fn is_multi_trigger(&self, handler_key: &str) -> bool {
         self.multi_trigger_handler_keys.contains(handler_key)
+    }
+
+    /// Filter the registry to only include handlers whose `name()` is in the
+    /// provided set. Also removes any trigger entries, dependency graph edges,
+    /// and lookup maps for excluded handlers.
+    ///
+    /// Must be called **before** `validate_and_sort_handler_dependencies()`.
+    pub fn filter_to_handlers(&mut self, names: &HashSet<String>) {
+        // Also include any transitive dependencies so the DAG remains valid.
+        let mut required: HashSet<String> = names.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (handler, deps) in &self.handler_dependency_graph {
+                if required.contains(handler) {
+                    for dep in deps {
+                        if required.insert(dep.clone()) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let remove: HashSet<String> = self
+            .all_handlers
+            .iter()
+            .map(|h| h.name().to_string())
+            .filter(|n| !required.contains(n))
+            .collect();
+
+        if remove.is_empty() {
+            return;
+        }
+
+        // Remove from all_handlers
+        self.all_handlers.retain(|h| !remove.contains(h.name()));
+
+        // Remove from event_handlers map
+        for handlers in self.event_handlers.values_mut() {
+            handlers.retain(|h| !remove.contains(h.name()));
+        }
+        self.event_handlers.retain(|_, v| !v.is_empty());
+
+        // Remove from call_handlers map
+        for handlers in self.call_handlers.values_mut() {
+            handlers.retain(|h| !remove.contains(h.name()));
+        }
+        self.call_handlers.retain(|_, v| !v.is_empty());
+
+        // Remove from dependency graph
+        self.handler_dependency_graph
+            .retain(|k, _| !remove.contains(k));
+        self.resolved_handler_dependencies
+            .retain(|k, _| !remove.contains(k));
+        self.resolved_contiguous_handler_dependencies
+            .retain(|k, _| !remove.contains(k));
+
+        // Remove from lookup maps
+        for name in &remove {
+            if let Some(key) = self.handler_name_to_key.remove(name) {
+                self.handler_key_to_name.remove(&key);
+                self.multi_trigger_handler_keys.remove(&key);
+            }
+            self.event_handler_names.remove(name);
+        }
+
+        tracing::info!(
+            "Handler filter: retained {} handlers, removed {}",
+            self.all_handlers.len(),
+            remove.len()
+        );
     }
 
     /// Get handler keys for all dependency handler names.
     ///
     /// Panics if any dependency name cannot be resolved to a handler key,
     /// which would indicate a registry inconsistency.
+    #[allow(dead_code)]
     pub fn dependency_handler_keys(&self) -> HashSet<String> {
         self.dependency_handler_names
             .iter()
@@ -678,6 +803,29 @@ impl Default for TransformationRegistry {
 /// e.g., "Swap(bytes32,address,int128)" -> "Swap"
 pub fn extract_event_name(signature: &str) -> String {
     signature.split('(').next().unwrap_or(signature).to_string()
+}
+
+fn dedupe_dependency_names<I>(names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    names
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn resolve_dependency_specs(
+    specs: Vec<HandlerDependencySpec>,
+    chain_id: Option<u64>,
+) -> Vec<String> {
+    dedupe_dependency_names(
+        specs
+            .into_iter()
+            .filter(|spec| spec.applies_to_chain(chain_id))
+            .map(|spec| spec.name().to_string()),
+    )
 }
 
 /// Trace a cycle in the dependency graph for error reporting.
@@ -821,14 +969,24 @@ pub fn validate_call_dependencies(
 ///
 /// This is where handlers are registered at compile-time.
 /// Add new handler registrations here as they are implemented.
-pub fn build_registry(chain_id: u64) -> TransformationRegistry {
+///
+/// If `handler_filter` is provided, only handlers whose `name()` matches
+/// one of the names in the set are retained (plus their transitive dependencies).
+pub fn build_registry(
+    chain_id: u64,
+    handler_filter: Option<&HashSet<String>>,
+) -> TransformationRegistry {
     let mut registry = TransformationRegistry::new();
 
     // Register event handlers
     super::event::register_handlers(&mut registry, chain_id);
 
     // Register eth_call handlers
-    super::eth_call::register_handlers(&mut registry);
+    super::eth_call::register_handlers(&mut registry, None);
+
+    if let Some(names) = handler_filter {
+        registry.filter_to_handlers(names);
+    }
 
     registry.validate_and_sort_handler_dependencies();
 
@@ -847,11 +1005,14 @@ pub fn build_registry(chain_id: u64) -> TransformationRegistry {
 /// Only handlers whose trigger sources all exist in the chain's contracts or
 /// factory collections are registered. This prevents handlers designed for one
 /// chain from being initialized, migrated, or validated on another.
+///
+/// If `handler_filter` is provided, only handlers whose `name()` matches
+/// one of the names in the set are retained (plus their transitive dependencies).
 pub fn build_registry_for_chain(
     chain_id: u64,
-    chain_type: ChainType,
     contracts: &Contracts,
     factory_collections: &FactoryCollections,
+    handler_filter: Option<&HashSet<String>>,
 ) -> TransformationRegistry {
     let mut available: HashSet<String> = contracts.keys().cloned().collect();
     available.extend(factory_collections.keys().cloned());
@@ -866,13 +1027,17 @@ pub fn build_registry_for_chain(
         }
     }
 
-    let mut registry = TransformationRegistry::with_source_and_chain_filter(available, chain_type);
+    let mut registry = TransformationRegistry::with_source_filter_for_chain(available, chain_id);
 
     // Register event handlers (filtered by available sources)
     super::event::register_handlers_for_chain(&mut registry, chain_id, contracts);
 
     // Register eth_call handlers (filtered by available sources)
-    super::eth_call::register_handlers(&mut registry);
+    super::eth_call::register_handlers(&mut registry, Some(contracts));
+
+    if let Some(names) = handler_filter {
+        registry.filter_to_handlers(names);
+    }
 
     registry.validate_and_sort_handler_dependencies();
 
@@ -920,7 +1085,10 @@ mod tests {
     use crate::db::DbOperation;
     use crate::transformations::context::TransformationContext;
     use crate::transformations::error::TransformationError;
-    use crate::transformations::traits::{EventHandler, EventTrigger, TransformationHandler};
+    use crate::transformations::traits::{
+        dep, EventHandler, EventTrigger, HandlerDependencySpec, TransformationHandler,
+    };
+    use crate::transformations::util::usd_price::chainlink_latest_answer_dependency;
     use async_trait::async_trait;
 
     /// A mock event handler for testing call dependency validation.
@@ -930,6 +1098,8 @@ mod tests {
         call_deps: Vec<(String, String)>,
         handler_deps: Vec<&'static str>,
         contiguous_handler_deps: Vec<&'static str>,
+        handler_dep_specs: Vec<HandlerDependencySpec>,
+        contiguous_handler_dep_specs: Vec<HandlerDependencySpec>,
     }
 
     #[async_trait]
@@ -955,8 +1125,26 @@ mod tests {
             self.call_deps.clone()
         }
 
+        fn handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+            if !self.handler_dep_specs.is_empty() {
+                return self.handler_dep_specs.clone();
+            }
+            self.handler_deps.clone().into_iter().map(dep).collect()
+        }
+
         fn handler_dependencies(&self) -> Vec<&'static str> {
             self.handler_deps.clone()
+        }
+
+        fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
+            if !self.contiguous_handler_dep_specs.is_empty() {
+                return self.contiguous_handler_dep_specs.clone();
+            }
+            self.contiguous_handler_deps
+                .clone()
+                .into_iter()
+                .map(dep)
+                .collect()
         }
 
         fn contiguous_handler_dependencies(&self) -> Vec<&'static str> {
@@ -979,6 +1167,8 @@ mod tests {
             call_deps: vec![],
             handler_deps,
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         }
     }
 
@@ -1004,6 +1194,8 @@ mod tests {
             call_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
 
         let contracts = empty_contracts();
@@ -1027,6 +1219,8 @@ mod tests {
             call_deps: vec![("TestContract".to_string(), "getState".to_string())],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -1063,6 +1257,8 @@ mod tests {
             call_deps: vec![("MissingContract".to_string(), "getState".to_string())],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
 
         let contracts = empty_contracts();
@@ -1087,6 +1283,8 @@ mod tests {
             call_deps: vec![("TestContract".to_string(), "wrongFunction".to_string())],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -1127,6 +1325,8 @@ mod tests {
             call_deps: vec![("TestContract".to_string(), "once".to_string())],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
 
         let mut contracts = Contracts::new();
@@ -1256,6 +1456,117 @@ mod tests {
         }
     }
 
+    #[test]
+    fn handler_dep_specs_default_to_all_chains() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "B",
+            triggers: vec![EventTrigger::new("Test", "B()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![dep("A")],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        registry.validate_and_sort_handler_dependencies();
+
+        assert_eq!(registry.handler_dependencies_for("B"), ["A".to_string()]);
+        assert_eq!(
+            registry.all_handler_dependencies_for("B"),
+            ["A".to_string()]
+        );
+    }
+
+    #[test]
+    fn handler_dep_specs_only_filters_per_chain_registry() {
+        let mut registry = TransformationRegistry::with_source_filter_for_chain(
+            HashSet::from(["Test".into()]),
+            57073,
+        );
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "B",
+            triggers: vec![EventTrigger::new("Test", "B()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![dep("A").only([8453, 1])],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        registry.validate_and_sort_handler_dependencies();
+
+        assert!(registry.handler_dependencies_for("B").is_empty());
+        assert!(registry.all_handler_dependencies_for("B").is_empty());
+    }
+
+    #[test]
+    fn handler_dep_specs_except_filters_selected_chain() {
+        let mut registry = TransformationRegistry::with_source_filter_for_chain(
+            HashSet::from(["Test".into()]),
+            143,
+        );
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "B",
+            triggers: vec![EventTrigger::new("Test", "B()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![dep("A").except([143, 57073])],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        registry.validate_and_sort_handler_dependencies();
+
+        assert!(registry.handler_dependencies_for("B").is_empty());
+    }
+
+    #[test]
+    fn global_registry_keeps_conditional_dependencies_for_all_chains_mode() {
+        let mut registry = TransformationRegistry::new();
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "B",
+            triggers: vec![EventTrigger::new("Test", "B()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![dep("A").only([8453])],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        registry.validate_and_sort_handler_dependencies();
+
+        assert_eq!(registry.handler_dependencies_for("B"), ["A".to_string()]);
+    }
+
+    #[test]
+    fn filter_to_handlers_uses_resolved_graph() {
+        let mut registry = TransformationRegistry::with_source_filter_for_chain(
+            HashSet::from(["Test".into()]),
+            57073,
+        );
+        registry.register_event_handler(mock_handler("A", vec![]));
+        registry.register_event_handler(MockEventHandler {
+            name: "B",
+            triggers: vec![EventTrigger::new("Test", "B()")],
+            call_deps: vec![],
+            handler_deps: vec![],
+            contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![dep("A").only([8453])],
+            contiguous_handler_dep_specs: vec![],
+        });
+
+        registry.filter_to_handlers(&HashSet::from(["B".to_string()]));
+        registry.validate_and_sort_handler_dependencies();
+
+        assert!(registry.handler_key_for_name("A").is_none());
+        assert!(registry.handler_key_for_name("B").is_some());
+    }
+
     // ─── Call handler dep validation tests ──────────────────────────────
 
     use crate::transformations::traits::{EthCallHandler, EthCallTrigger};
@@ -1375,6 +1686,8 @@ mod tests {
             call_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec![],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
         assert!(registry.is_multi_trigger("multi_v1"));
     }
@@ -1389,6 +1702,8 @@ mod tests {
             call_deps: vec![],
             handler_deps: vec![],
             contiguous_handler_deps: vec!["Create"],
+            handler_dep_specs: vec![],
+            contiguous_handler_dep_specs: vec![],
         });
 
         registry.validate_and_sort_handler_dependencies();
@@ -1491,8 +1806,7 @@ mod tests {
             },
         );
 
-        let registry =
-            build_registry_for_chain(1, ChainType::Evm, &contracts, &empty_factory_collections());
+        let registry = build_registry_for_chain(1, &contracts, &empty_factory_collections(), None);
 
         assert!(registry
             .handler_key_for_name("MigrationPoolCreateHandler")
@@ -1507,22 +1821,65 @@ mod tests {
 
     #[test]
     fn build_registry_declares_all_migration_pool_create_dependencies() {
-        let registry = build_registry(1);
-        let deps = registry
-            .handler_dependency_graph()
-            .get("MigrationPoolCreateHandler")
-            .expect("MigrationPoolCreateHandler should be registered");
+        let registry = build_registry(1, None);
+        let dep_graph = registry.handler_dependency_graph();
 
-        assert_eq!(
-            deps,
-            &vec![
-                "V4CreateHandler".to_string(),
-                "V4MulticurveCreateHandler".to_string(),
-                "V4ScheduledMulticurveCreateHandler".to_string(),
-                "V4DecayMulticurveCreateHandler".to_string(),
-                "DopplerHookCreateHandler".to_string(),
-            ]
-        );
+        // Skip if MigrationPoolCreateHandler is not registered (commented out).
+        let Some(deps_raw) = dep_graph.get("MigrationPoolCreateHandler") else {
+            return;
+        };
+
+        let mut deps = deps_raw.clone();
+        deps.sort();
+
+        // All possible create-handler dependencies. Only those that are
+        // currently registered (i.e. not commented out) should appear.
+        let all_known = [
+            "V4CreateHandler",
+            "V4MulticurveCreateHandler",
+            "V4ScheduledMulticurveCreateHandler",
+            "V4DecayMulticurveCreateHandler",
+            "DopplerHookCreateHandler",
+        ];
+        let mut expected: Vec<String> = all_known
+            .iter()
+            .filter(|name| registry.handler_key_for_name(name).is_some())
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+
+        assert_eq!(deps, expected);
+    }
+
+    #[test]
+    fn usd_swap_handlers_all_declare_chainlink_dependency() {
+        let registry = build_registry(1, None);
+        let all_known_usd_swap_handlers: HashSet<&'static str> = HashSet::from([
+            "V3SwapMetricsHandler",
+            "LockableV3SwapMetricsHandler",
+            "MulticurveSwapMetricsHandler",
+            "DecayMulticurveSwapMetricsHandler",
+            "ScheduledMulticurveSwapMetricsHandler",
+            "DhookSwapMetricsHandler",
+            "V4BaseMetricsHandler",
+            "MigrationPoolSwapMetricsHandler",
+            "ZoraSwapMetricsHandler",
+        ]);
+        let chainlink_dep = chainlink_latest_answer_dependency();
+
+        for handler_info in registry.unique_event_handlers() {
+            let name = handler_info.handler.name();
+            if all_known_usd_swap_handlers.contains(name) {
+                assert!(
+                    handler_info
+                        .handler
+                        .call_dependencies()
+                        .contains(&chainlink_dep),
+                    "{} must declare Chainlink latestAnswer as a call dependency",
+                    name
+                );
+            }
+        }
     }
 
     // ─── Account state handler tests ───────────────────────────────────

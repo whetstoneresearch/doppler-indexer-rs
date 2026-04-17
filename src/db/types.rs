@@ -92,8 +92,40 @@ pub enum DbOperation {
         table: String,
         where_clause: WhereClause,
     },
-    /// Raw SQL for complex operations (use sparingly)
-    RawSql { query: String, params: Vec<DbValue> },
+    /// Raw SQL for complex operations (use sparingly).
+    ///
+    /// `snapshot` is optional metadata for live-mode rollback. When present,
+    /// the executor snapshots the targeted row before executing the SQL and can
+    /// later restore it during reorg handling.
+    RawSql {
+        query: String,
+        params: Vec<DbValue>,
+        snapshot: Option<DbSnapshot>,
+    },
+    /// Named-parameter SQL for complex operations.
+    ///
+    /// Like `RawSql`, but uses `:param_name` placeholders instead of positional
+    /// `$N`. The build step replaces each `:name` with the correct `$N` and
+    /// applies type-specific casts via `placeholder_for()` (e.g.
+    /// `$5::text::numeric` for `DbValue::Numeric`), eliminating manual cast
+    /// errors.
+    ///
+    /// Same `:name` referenced multiple times reuses the same `$N` index.
+    /// Template names not found in params cause a panic with a descriptive
+    /// message.
+    NamedSql {
+        template: String,
+        params: Vec<(String, DbValue)>,
+        snapshot: Option<DbSnapshot>,
+    },
+}
+
+/// Snapshot metadata for row-modifying operations that cannot be expressed as a
+/// standard Upsert.
+#[derive(Debug, Clone)]
+pub struct DbSnapshot {
+    pub table: String,
+    pub key_columns: Vec<(String, DbValue)>,
 }
 
 /// WHERE clause for UPDATE and DELETE operations.

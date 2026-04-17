@@ -71,6 +71,7 @@ pub(super) async fn handle_event_trigger_message(
                             inclusive_end,
                             &state.contracts,
                             false,
+                            0, // no trigger batching in live mode
                         )
                         .await?
                     } else {
@@ -83,6 +84,7 @@ pub(super) async fn handle_event_trigger_message(
                             inclusive_end,
                             &state.contracts,
                             false,
+                            0, // no trigger batching in live mode
                         )
                         .await?
                     };

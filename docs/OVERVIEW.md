@@ -6,7 +6,9 @@
 
 Doppler Indexer is a high-performance Ethereum blockchain indexer written in Rust. It collects raw blockchain data (blocks, receipts, logs), tracks dynamically created contracts via factory events, reads historical on-chain state via `eth_call`, decodes events and call results into typed Parquet files, and runs custom transformation handlers that write to PostgreSQL.
 
-Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`).
+Operating modes: Full (historical + live), Decode-Only (`--decode-only`), Live-Only (`--live-only`), Catch-Up-Only (`--catch-up-only`), Transformation-Only (`--transformation-only`). The `--transformation-handlers` flag filters which handlers run (comma-separated names) and works with any mode.
+
+Per-chain block range overrides (`from_block`/`to_block`) limit all phases to a specific block range. Set via config JSON per chain or CLI (`--from-block [chain:]block`, `--to-block [chain:]block`). When `to_block` is set, live mode is suppressed. Priority: per-chain CLI > global CLI > config JSON.
 
 ### Subsystems
 
@@ -105,7 +107,7 @@ migrations/
 ## Features Index
 
 ### raw_data_collection
-- **description**: Fetches blocks, transaction receipts, and logs from EVM chains. Two-phase processing (catchup then current). Parquet output with configurable field selection.
+- **description**: Fetches blocks, transaction receipts, and logs from EVM chains. Two-phase processing (catchup then current). Parquet output with configurable field selection. Log writes are pipelined via JoinSet so the select loop remains responsive during I/O.
 - **entry_points**: `src/raw_data/historical/blocks.rs`, `src/raw_data/historical/receipts.rs`, `src/raw_data/historical/logs.rs`, `src/raw_data/historical/catchup/`, `src/raw_data/historical/current/`
 - **depends_on**: [rpc]
 - **doc**: `docs/features/block_collection.md`, `docs/features/receipts_collection.md`, `docs/features/logs_collection.md`
@@ -147,10 +149,16 @@ migrations/
 - **doc**: `docs/features/transformation_utils.md`
 
 ### pool_metrics
-- **description**: Per-block OHLC snapshots and hot-query pool_state table for all pool types (V3, LockableV3, V4 hooks). Shared BlockAccumulator and process_swaps/process_liquidity_deltas functions. liquidity_deltas append-only log for future TVL reconstruction.
+- **description**: Per-block OHLC snapshots, hot-query pool_state table, USD pricing, rolling metrics, and TVL computation for all pool types (V3, LockableV3, V4 hooks, migration pools). Shared BlockAccumulator, process_swaps/process_liquidity_deltas, and process_tvl functions. Per-pool-type TVL handlers compute amount0/1, tvl_usd, market_cap_usd, and active_liquidity_usd from stateless liquidity_deltas re-aggregation. USD price resolution supports any token with a configured anchor pool in tokens.json via transitive multi-hop resolution (e.g., Bankr → WETH → USD).
 - **entry_points**: `src/transformations/event/v3/metrics.rs`, `src/transformations/event/metrics/`
 - **depends_on**: [transformations, transformation_utils]
-- **doc**: `docs/pool-metrics/metrics_implementation_phases.md`
+- **doc**: `docs/designs/pool-metrics/metrics_implementation_phases.md`
+
+### quote_token_pricing
+- **description**: Dynamic USD price resolution for pool quote tokens. Phase 1: config-driven anchor pools discovered from tokens.json (e.g., BankrWethPool) with transitive resolution. Phase 2 (planned): graph-based frontier expansion through indexed pools for unconfigured tokens.
+- **entry_points**: `src/transformations/eth_call/price.rs`, `src/transformations/util/usd_price.rs`
+- **depends_on**: [pool_metrics, transformation_utils]
+- **doc**: `docs/features/quote_token_pricing.md`
 
 ### live_mode
 - **description**: Real-time block processing via WebSocket. Bincode storage for fast per-block writes, reorg detection, automatic compaction to parquet, and gap backfill on reconnect.
@@ -241,7 +249,8 @@ src/
       "rpc": {
         "concurrency": 100,
         "requests_per_second": 7500,
-        "batch_size": 1000
+        "batch_size": 1000,
+        "http2": true
       }
     }
   ],

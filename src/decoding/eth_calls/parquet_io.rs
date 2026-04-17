@@ -515,6 +515,7 @@ pub(super) fn write_decoded_event_calls_to_parquet(
 }
 
 /// Build an Arrow array for decoded values
+#[allow(dead_code)]
 pub(super) fn build_value_array(
     records: &[DecodedCallRecord],
     output_type: &EvmType,
@@ -523,6 +524,7 @@ pub(super) fn build_value_array(
 }
 
 /// Build an Arrow array for event call decoded values
+#[allow(dead_code)]
 pub(super) fn build_event_value_array(
     records: &[DecodedEventCallRecord],
     output_type: &EvmType,
@@ -531,6 +533,7 @@ pub(super) fn build_event_value_array(
 }
 
 /// Build an Arrow ListArray for array-typed decoded values
+#[allow(dead_code)]
 pub(super) fn build_array_value_array(
     records: &[DecodedCallRecord],
     inner_type: &EvmType,
@@ -539,6 +542,7 @@ pub(super) fn build_array_value_array(
 }
 
 /// Build an Arrow ListArray for array-typed decoded values in event calls
+#[allow(dead_code)]
 pub(super) fn build_event_array_value_array(
     records: &[DecodedEventCallRecord],
     inner_type: &EvmType,

@@ -1,29 +1,48 @@
-//! Completion tracking with notify-based wake-up for dependency waiters.
+//! Completion tracking with per-handler watch channels for dependency waiters.
 //!
 //! [`CompletionTracker`] is the synchronization primitive used by [`DagScheduler`]
-//! to gate each `(handler, range_start)` work item on its dependencies. Each
-//! waiter constructs a `Notify::notified()` future, checks shared state, and
-//! awaits the future if any dep is still pending. Every `mark_completed` /
-//! `mark_failed` call wakes all waiters so they can re-check. The ordering
-//! "construct notified() *before* probe" is load-bearing: tokio's Notified
-//! captures the notify_waiters call count at construction and honors any
-//! call that happens before first poll, so no wake can be lost between
-//! probe and `.await`.
+//! to gate each `(handler, range_start)` work item on its dependencies.
 //!
 //! # Wake mechanism
 //!
-//! [`tokio::sync::Notify`] with `notify_waiters` on every completion/failure.
-//! The codebase has no other `Notify` usage, but here it's the natural primitive:
-//! each waiter re-checks its predicate against shared state after being woken.
-//! Under heavy cascade-failure the wake-storm could become noisy; a per-handler
-//! `watch<HashSet<u64>>` would be an isolated drop-in swap if profiling shows
-//! contention.
+//! Per-handler `tokio::sync::watch<()>` channels notify only the waiters that
+//! depend on a specific handler, avoiding the O(total_waiters) wake-storm that
+//! a single global `Notify` would cause. A separate global `Notify` is used for
+//! call-dep file registration events (infrequent, from the background scanner).
+//!
+//! Waiters subscribe to their dep handlers' watch channels before probing state.
+//! `watch::Receiver::changed()` is cancellation-safe and captures any send that
+//! occurs between subscription and `.await`, preserving the race-free invariant.
+//!
+//! # Lock ordering
+//!
+//! Three independent RwLocks: `state`, `contiguous`, `call_dep_ranges`.
+//!
+//! **Invariant**: never hold `state` write lock and `contiguous` write lock
+//! simultaneously. `advance_contiguous_watermark` reads `state` then writes
+//! `contiguous` — safe ordering. `call_dep_ranges` is independent.
+//!
+//! `handler_watches` uses `std::sync::RwLock` for synchronous access (never held
+//! across `.await`).
 //!
 //! [`DagScheduler`]: super::dag::DagScheduler
 
 use std::collections::{HashMap, HashSet};
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, Notify, RwLock};
+
+/// Per-handler completed/failed/blocked range state, grouped under one lock.
+struct HandlerRangeState {
+    completed: HashMap<String, HashSet<u64>>,
+    failed: HashMap<String, HashSet<u64>>,
+    blocked: HashMap<String, HashSet<u64>>,
+}
+
+/// Per-handler contiguous watermark state, grouped under one lock.
+struct ContiguousState {
+    watermarks: HashMap<String, Option<u64>>,
+    positions: HashMap<String, usize>,
+}
 
 /// In-memory state of per-`(handler_name, range_start)` completion/failure.
 ///
@@ -44,21 +63,26 @@ use tokio::sync::{Notify, RwLock};
 /// [`WorkItem`]: super::dag::WorkItem
 /// [`wait_ready`]: CompletionTracker::wait_ready
 pub(crate) struct CompletionTracker {
-    completed: RwLock<HashMap<String, HashSet<u64>>>,
-    failed: RwLock<HashMap<String, HashSet<u64>>>,
-    blocked: RwLock<HashMap<String, HashSet<u64>>>,
-    notify: Notify,
-    /// Sorted list of all available range_starts (immutable after construction).
-    available_starts: Vec<u64>,
-    /// Per-handler contiguous watermark: highest `range_start` where all ranges
-    /// from the first available through this one are completed with no gaps.
-    contiguous_watermarks: RwLock<HashMap<String, Option<u64>>>,
-    /// Per-handler index into `available_starts` for O(1) amortized watermark advance.
-    contiguous_positions: RwLock<HashMap<String, usize>>,
+    state: RwLock<HandlerRangeState>,
+    contiguous: RwLock<ContiguousState>,
     /// Per-`(source, function)` set of available call-dep range_starts.
     /// Matched by range_start only (log and call-dep files may have different range sizes).
     /// Updated by the background `CallDepScanner`.
     call_dep_ranges: RwLock<HashMap<(String, String), HashSet<u64>>>,
+    /// Per-handler watch channels. Sends on completion/failure/block wake only
+    /// the waiters that depend on that specific handler. Lazily populated via
+    /// `get_or_create_watch`. Uses `std::sync::RwLock` (never held across await).
+    handler_watches: std::sync::RwLock<HashMap<String, watch::Sender<()>>>,
+    /// Global notify for call-dep file registration (background scanner).
+    global_notify: Notify,
+    /// Sorted list of all available range_starts (immutable after construction).
+    available_starts: Vec<u64>,
+    /// Range_start value at or below which all `completed` entries have been
+    /// pruned to reclaim memory. All handlers completed these ranges
+    /// contiguously, so queries treat them as implicitly completed.
+    /// Uses `std::sync::RwLock` because the critical section is trivial and
+    /// never held across `.await`.
+    pruned_up_to: std::sync::RwLock<Option<u64>>,
 }
 
 /// Snapshot view of whether a set of dependencies is satisfied for a range.
@@ -88,14 +112,20 @@ pub(crate) enum DepWaitError {
 impl CompletionTracker {
     pub(crate) fn new() -> Self {
         Self {
-            completed: RwLock::new(HashMap::new()),
-            failed: RwLock::new(HashMap::new()),
-            blocked: RwLock::new(HashMap::new()),
-            notify: Notify::new(),
-            available_starts: Vec::new(),
-            contiguous_watermarks: RwLock::new(HashMap::new()),
-            contiguous_positions: RwLock::new(HashMap::new()),
+            state: RwLock::new(HandlerRangeState {
+                completed: HashMap::new(),
+                failed: HashMap::new(),
+                blocked: HashMap::new(),
+            }),
+            contiguous: RwLock::new(ContiguousState {
+                watermarks: HashMap::new(),
+                positions: HashMap::new(),
+            }),
             call_dep_ranges: RwLock::new(HashMap::new()),
+            handler_watches: std::sync::RwLock::new(HashMap::new()),
+            global_notify: Notify::new(),
+            available_starts: Vec::new(),
+            pruned_up_to: std::sync::RwLock::new(None),
         }
     }
 
@@ -109,15 +139,60 @@ impl CompletionTracker {
             "starts must be sorted"
         );
         Self {
-            completed: RwLock::new(HashMap::new()),
-            failed: RwLock::new(HashMap::new()),
-            blocked: RwLock::new(HashMap::new()),
-            notify: Notify::new(),
-            available_starts: starts,
-            contiguous_watermarks: RwLock::new(HashMap::new()),
-            contiguous_positions: RwLock::new(HashMap::new()),
+            state: RwLock::new(HandlerRangeState {
+                completed: HashMap::new(),
+                failed: HashMap::new(),
+                blocked: HashMap::new(),
+            }),
+            contiguous: RwLock::new(ContiguousState {
+                watermarks: HashMap::new(),
+                positions: HashMap::new(),
+            }),
             call_dep_ranges: RwLock::new(HashMap::new()),
+            handler_watches: std::sync::RwLock::new(HashMap::new()),
+            global_notify: Notify::new(),
+            available_starts: starts,
+            pruned_up_to: std::sync::RwLock::new(None),
         }
+    }
+
+    // ─── Per-handler watch helpers ─────────────────────────────────────
+
+    /// Send a notification on the handler's watch channel.
+    /// Lazily creates the channel if it doesn't exist.
+    fn notify_handler(&self, handler_name: &str) {
+        // Fast path: read lock
+        {
+            let watches = self.handler_watches.read().unwrap();
+            if let Some(tx) = watches.get(handler_name) {
+                let _ = tx.send(());
+                return;
+            }
+        }
+        // Slow path: create and send
+        let mut watches = self.handler_watches.write().unwrap();
+        let tx = watches
+            .entry(handler_name.to_string())
+            .or_insert_with(|| watch::channel(()).0);
+        let _ = tx.send(());
+    }
+
+    /// Subscribe to a handler's watch channel. Returns `None` if the handler
+    /// has no watch yet (caller should fall back to global_notify).
+    fn subscribe_handler(&self, handler_name: &str) -> watch::Receiver<()> {
+        // Fast path: read lock
+        {
+            let watches = self.handler_watches.read().unwrap();
+            if let Some(tx) = watches.get(handler_name) {
+                return tx.subscribe();
+            }
+        }
+        // Slow path: create watch and subscribe
+        let mut watches = self.handler_watches.write().unwrap();
+        let tx = watches
+            .entry(handler_name.to_string())
+            .or_insert_with(|| watch::channel(()).0);
+        tx.subscribe()
     }
 
     /// Pre-populate completed ranges for a handler. Intended for startup
@@ -132,8 +207,9 @@ impl CompletionTracker {
         ranges: impl IntoIterator<Item = u64>,
     ) {
         {
-            let mut completed = self.completed.write().await;
-            let entry = completed
+            let mut state = self.state.write().await;
+            let entry = state
+                .completed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new);
             for range in ranges {
@@ -144,46 +220,47 @@ impl CompletionTracker {
         if !self.available_starts.is_empty() {
             self.recompute_contiguous_watermark(handler_name).await;
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
     }
 
     /// Snapshot check: are all `deps` completed for `range_start`?
+    ///
+    /// Takes ONE read lock on `state` for all failed/blocked/completed checks.
+    /// Ranges at or below the pruned watermark are implicitly completed.
+    #[allow(dead_code)]
     pub(crate) async fn probe(&self, deps: &[String], range_start: u64) -> DepState {
+        if self.is_pruned(range_start) {
+            return DepState::Ready;
+        }
+        let state = self.state.read().await;
         // Check failed first so a failed dep is reported even if others are completed.
-        {
-            let failed = self.failed.read().await;
-            for dep in deps {
-                if failed
-                    .get(dep)
-                    .map(|ranges| ranges.contains(&range_start))
-                    .unwrap_or(false)
-                {
-                    return DepState::DepFailed {
-                        dep_name: dep.clone(),
-                    };
-                }
-            }
-        }
-        {
-            let blocked = self.blocked.read().await;
-            for dep in deps {
-                if blocked
-                    .get(dep)
-                    .map(|ranges| ranges.contains(&range_start))
-                    .unwrap_or(false)
-                {
-                    return DepState::DepBlocked {
-                        dep_name: dep.clone(),
-                    };
-                }
-            }
-        }
-        let completed = self.completed.read().await;
         for dep in deps {
-            let has = completed
+            if state
+                .failed
                 .get(dep)
-                .map(|ranges| ranges.contains(&range_start))
-                .unwrap_or(false);
+                .is_some_and(|ranges| ranges.contains(&range_start))
+            {
+                return DepState::DepFailed {
+                    dep_name: dep.clone(),
+                };
+            }
+        }
+        for dep in deps {
+            if state
+                .blocked
+                .get(dep)
+                .is_some_and(|ranges| ranges.contains(&range_start))
+            {
+                return DepState::DepBlocked {
+                    dep_name: dep.clone(),
+                };
+            }
+        }
+        for dep in deps {
+            let has = state
+                .completed
+                .get(dep)
+                .is_some_and(|ranges| ranges.contains(&range_start));
             if !has {
                 return DepState::Waiting;
             }
@@ -201,16 +278,19 @@ impl CompletionTracker {
     /// `poll_notified` compares it to the current count and, if it changed,
     /// transitions directly to `Done`. That's what makes the bare
     /// `notified()` / `probe()` / `.await` sequence race-free here.
+    #[allow(dead_code)]
     pub(crate) async fn wait_ready(
         &self,
         deps: &[String],
         range_start: u64,
     ) -> Result<(), DepWaitError> {
+        // Subscribe to each dep handler's watch channel before the first probe.
+        // `watch::Receiver::changed()` captures any send after subscription,
+        // preserving the same race-free invariant as the old `notified()` pattern.
+        let mut receivers: Vec<watch::Receiver<()>> =
+            deps.iter().map(|d| self.subscribe_handler(d)).collect();
+
         loop {
-            // MUST be created before probing: the stored notify_waiters_calls
-            // counter is the mechanism that catches a mark that fires after
-            // our probe read but before we park on notified.
-            let notified = self.notify.notified();
             match self.probe(deps, range_start).await {
                 DepState::Ready => return Ok(()),
                 DepState::DepFailed { dep_name } => {
@@ -225,35 +305,50 @@ impl CompletionTracker {
                         range_start,
                     })
                 }
-                DepState::Waiting => notified.await,
+                DepState::Waiting => {
+                    wait_any_changed(&mut receivers).await;
+                }
             }
         }
     }
 
     /// Mark `(handler_name, range_start)` as completed and wake all waiters.
     ///
+    /// Takes ONE write lock on `state` for both the completed insert and the
+    /// blocked cleanup (was 2 separate locks).
+    ///
     /// Also advances the contiguous watermark for this handler if applicable.
     pub(crate) async fn mark_completed(&self, handler_name: &str, range_start: u64) {
         {
-            let mut completed = self.completed.write().await;
-            completed
+            let mut state = self.state.write().await;
+            state
+                .completed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
-        }
-        {
-            let mut blocked = self.blocked.write().await;
-            if let Some(ranges) = blocked.get_mut(handler_name) {
+            if let Some(ranges) = state.blocked.get_mut(handler_name) {
                 ranges.remove(&range_start);
                 if ranges.is_empty() {
-                    blocked.remove(handler_name);
+                    state.blocked.remove(handler_name);
                 }
             }
         }
         if !self.available_starts.is_empty() {
             self.advance_contiguous_watermark(handler_name).await;
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
+    }
+
+    /// Check whether `(handler_name, range_start)` has been marked as completed.
+    pub(crate) async fn is_completed(&self, handler_name: &str, range_start: u64) -> bool {
+        if self.is_pruned(range_start) {
+            return true;
+        }
+        let state = self.state.read().await;
+        state
+            .completed
+            .get(handler_name)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 
     /// Check whether `(handler_name, range_start)` has been marked as failed.
@@ -262,53 +357,56 @@ impl CompletionTracker {
     /// deps failed in a previous scheduler pass, avoiding wasted submissions
     /// that would immediately cascade-fail.
     pub(crate) async fn is_failed(&self, handler_name: &str, range_start: u64) -> bool {
-        let failed = self.failed.read().await;
-        failed
+        let state = self.state.read().await;
+        state
+            .failed
             .get(handler_name)
-            .map(|ranges| ranges.contains(&range_start))
-            .unwrap_or(false)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 
     /// Mark `(handler_name, range_start)` as failed and wake all waiters.
+    ///
+    /// Takes ONE write lock on `state` for both the failed insert and the
+    /// blocked cleanup (was 2 separate locks).
     pub(crate) async fn mark_failed(&self, handler_name: &str, range_start: u64) {
         {
-            let mut failed = self.failed.write().await;
-            failed
+            let mut state = self.state.write().await;
+            state
+                .failed
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
-        }
-        {
-            let mut blocked = self.blocked.write().await;
-            if let Some(ranges) = blocked.get_mut(handler_name) {
+            if let Some(ranges) = state.blocked.get_mut(handler_name) {
                 ranges.remove(&range_start);
                 if ranges.is_empty() {
-                    blocked.remove(handler_name);
+                    state.blocked.remove(handler_name);
                 }
             }
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
     }
 
     /// Mark `(handler_name, range_start)` as transiently blocked for this pass.
     pub(crate) async fn mark_blocked(&self, handler_name: &str, range_start: u64) {
         {
-            let mut blocked = self.blocked.write().await;
-            blocked
+            let mut state = self.state.write().await;
+            state
+                .blocked
                 .entry(handler_name.to_string())
                 .or_insert_with(HashSet::new)
                 .insert(range_start);
         }
-        self.notify.notify_waiters();
+        self.notify_handler(handler_name);
     }
 
     /// Clear a transient blocked mark before the next scheduler pass.
+    #[allow(dead_code)]
     pub(crate) async fn clear_blocked(&self, handler_name: &str, range_start: u64) {
-        let mut blocked = self.blocked.write().await;
-        if let Some(ranges) = blocked.get_mut(handler_name) {
+        let mut state = self.state.write().await;
+        if let Some(ranges) = state.blocked.get_mut(handler_name) {
             ranges.remove(&range_start);
             if ranges.is_empty() {
-                blocked.remove(handler_name);
+                state.blocked.remove(handler_name);
             }
         }
     }
@@ -316,20 +414,22 @@ impl CompletionTracker {
     /// Check whether `(handler_name, range_start)` is transiently blocked.
     #[cfg(test)]
     pub(crate) async fn is_blocked(&self, handler_name: &str, range_start: u64) -> bool {
-        let blocked = self.blocked.read().await;
-        blocked
+        let state = self.state.read().await;
+        state
+            .blocked
             .get(handler_name)
-            .map(|ranges| ranges.contains(&range_start))
-            .unwrap_or(false)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 
     // ─── Contiguous watermark tracking ──────────────────────────────────
 
     /// Full recomputation of contiguous watermark from position 0.
     /// Used during `seed_completed`.
+    ///
+    /// Reads `state` (read lock) then writes `contiguous` (write lock).
     async fn recompute_contiguous_watermark(&self, handler_name: &str) {
-        let completed = self.completed.read().await;
-        let handler_completed = completed.get(handler_name);
+        let state = self.state.read().await;
+        let handler_completed = state.completed.get(handler_name);
         let mut pos = 0usize;
         let mut watermark: Option<u64> = None;
         for (i, &start) in self.available_starts.iter().enumerate() {
@@ -340,11 +440,12 @@ impl CompletionTracker {
                 break;
             }
         }
-        drop(completed);
-        let mut watermarks = self.contiguous_watermarks.write().await;
-        watermarks.insert(handler_name.to_string(), watermark);
-        let mut positions = self.contiguous_positions.write().await;
-        positions.insert(handler_name.to_string(), pos);
+        drop(state);
+        let mut contiguous = self.contiguous.write().await;
+        contiguous
+            .watermarks
+            .insert(handler_name.to_string(), watermark);
+        contiguous.positions.insert(handler_name.to_string(), pos);
     }
 
     /// Incrementally advance the contiguous watermark after a new completion.
@@ -353,19 +454,28 @@ impl CompletionTracker {
     /// `available_starts` while each successive range_start is in
     /// `completed[handler_name]`. O(k) amortized where k = newly-contiguous
     /// ranges (typically 0 or 1).
+    ///
+    /// Reads `state` (read lock), then reads/writes `contiguous` as needed.
+    /// Never holds both write locks simultaneously.
     async fn advance_contiguous_watermark(&self, handler_name: &str) {
-        let completed = self.completed.read().await;
-        let handler_completed = match completed.get(handler_name) {
+        let state = self.state.read().await;
+        let handler_completed = match state.completed.get(handler_name) {
             Some(c) => c,
             None => return,
         };
 
-        let watermarks_read = self.contiguous_watermarks.read().await;
-        let current_watermark = watermarks_read.get(handler_name).copied().flatten();
-        let positions_read = self.contiguous_positions.read().await;
-        let current_pos = positions_read.get(handler_name).copied().unwrap_or(0);
-        drop(positions_read);
-        drop(watermarks_read);
+        let contiguous_read = self.contiguous.read().await;
+        let current_watermark = contiguous_read
+            .watermarks
+            .get(handler_name)
+            .copied()
+            .flatten();
+        let current_pos = contiguous_read
+            .positions
+            .get(handler_name)
+            .copied()
+            .unwrap_or(0);
+        drop(contiguous_read);
 
         // Determine the starting index for the walk. If there is no watermark
         // yet, start from 0 (the handler might now have completed the first
@@ -387,20 +497,24 @@ impl CompletionTracker {
             }
         }
 
-        // Only take write locks if something changed.
+        // Only take write lock if something changed.
         if new_watermark != current_watermark {
-            drop(completed);
-            let mut watermarks = self.contiguous_watermarks.write().await;
-            watermarks.insert(handler_name.to_string(), new_watermark);
-            let mut positions = self.contiguous_positions.write().await;
-            positions.insert(handler_name.to_string(), new_pos);
+            drop(state);
+            let mut contiguous = self.contiguous.write().await;
+            contiguous
+                .watermarks
+                .insert(handler_name.to_string(), new_watermark);
+            contiguous
+                .positions
+                .insert(handler_name.to_string(), new_pos);
         }
     }
 
     /// Read the current contiguous watermark for a handler.
+    #[allow(dead_code)]
     pub(crate) async fn contiguous_watermark(&self, handler_name: &str) -> Option<u64> {
-        let watermarks = self.contiguous_watermarks.read().await;
-        watermarks.get(handler_name).copied().flatten()
+        let contiguous = self.contiguous.read().await;
+        contiguous.watermarks.get(handler_name).copied().flatten()
     }
 
     // ─── Call-dep range tracking ────────────────────────────────────────
@@ -427,13 +541,99 @@ impl CompletionTracker {
         let grew = entry.len() > old_len;
         drop(call_deps);
         if grew {
-            self.notify.notify_waiters();
+            self.global_notify.notify_waiters();
         }
+    }
+
+    // ─── Compaction ──────────────────────────────────────────────────────
+
+    /// Check whether `range_start` falls at or below the pruned watermark.
+    ///
+    /// Entries below this threshold have been removed from the per-handler
+    /// `completed` sets but are implicitly treated as completed by all
+    /// handlers.
+    fn is_pruned(&self, range_start: u64) -> bool {
+        self.pruned_up_to
+            .read()
+            .unwrap()
+            .is_some_and(|wm| range_start <= wm)
+    }
+
+    /// Prune `completed` entries that all handlers have resolved
+    /// contiguously, reclaiming memory from ranges that will never be
+    /// queried again.
+    ///
+    /// The pruning threshold is the minimum contiguous watermark across
+    /// the supplied `handler_names`. Every handler completed all ranges
+    /// from the first available up to that watermark, so:
+    ///
+    /// - `is_completed` / `probe` / `probe_extended` treat pruned
+    ///   range_starts as implicitly completed (via [`is_pruned`]).
+    /// - `advance_contiguous_watermark` starts its walk from
+    ///   `current_pos + 1`, which is always above the pruned threshold
+    ///   (since the handler's own watermark >= the minimum).
+    ///
+    /// If **any** supplied handler has no contiguous watermark (i.e. it
+    /// has not covered the prefix of `available_starts` from the first
+    /// range), this is a no-op — pruning would otherwise cause
+    /// `is_pruned` to silently report unprocessed early ranges as
+    /// completed for that handler, short-circuiting its work items in
+    /// `build_catchup_work_items`.
+    ///
+    /// Only effective when `available_starts` is non-empty (catchup
+    /// trackers created with [`with_available_starts`]).
+    ///
+    /// [`is_pruned`]: Self::is_pruned
+    /// [`with_available_starts`]: Self::with_available_starts
+    pub(crate) async fn compact(&self, handler_names: &[&str]) {
+        if self.available_starts.is_empty() || handler_names.is_empty() {
+            return;
+        }
+
+        // Collect each handler's contiguous watermark. `Vec<Option<u64>>`
+        // collected into `Option<Vec<u64>>` short-circuits to `None` if any
+        // handler has no contiguous coverage from start — in which case we
+        // must not prune (see the doc comment above).
+        let contiguous = self.contiguous.read().await;
+        let watermarks: Option<Vec<u64>> = handler_names
+            .iter()
+            .map(|name| contiguous.watermarks.get(*name).copied().unwrap_or(None))
+            .collect();
+        drop(contiguous);
+
+        let Some(min_wm) = watermarks.and_then(|ws| ws.into_iter().min()) else {
+            return;
+        };
+
+        // Only advance the pruned watermark, never regress.
+        {
+            let current = *self.pruned_up_to.read().unwrap();
+            if current.is_some_and(|c| c >= min_wm) {
+                return;
+            }
+        }
+
+        // Prune completed entries at or below the watermark.
+        let mut state = self.state.write().await;
+        for completed in state.completed.values_mut() {
+            completed.retain(|r| *r > min_wm);
+        }
+        drop(state);
+
+        *self.pruned_up_to.write().unwrap() = Some(min_wm);
+
+        tracing::debug!(
+            "CompletionTracker compacted: pruned completed entries at or below range_start {}",
+            min_wm
+        );
     }
 
     // ─── Extended wait (handler deps + contiguous deps + call deps) ─────
 
     /// Snapshot check for the extended readiness condition.
+    ///
+    /// Takes ONE read lock on `state` for all failed/blocked/completed checks
+    /// (was 3 separate locks).
     pub(crate) async fn probe_extended(
         &self,
         handler_deps: &[String],
@@ -441,43 +641,55 @@ impl CompletionTracker {
         call_dep_keys: &[(String, String)],
         range_start: u64,
     ) -> DepState {
-        // 1. Check handler deps failed/blocked/waiting (existing logic).
-        {
-            let failed = self.failed.read().await;
-            for dep in handler_deps {
-                if failed.get(dep).is_some_and(|r| r.contains(&range_start)) {
-                    return DepState::DepFailed {
-                        dep_name: dep.clone(),
-                    };
-                }
-            }
-        }
-        {
-            let blocked = self.blocked.read().await;
-            for dep in handler_deps {
-                if blocked.get(dep).is_some_and(|r| r.contains(&range_start)) {
-                    return DepState::DepBlocked {
-                        dep_name: dep.clone(),
-                    };
-                }
-            }
-        }
-        {
-            let completed = self.completed.read().await;
-            for dep in handler_deps {
-                if !completed.get(dep).is_some_and(|r| r.contains(&range_start)) {
-                    return DepState::Waiting;
-                }
-            }
-        }
+        let pruned = self.is_pruned(range_start);
 
-        // 2. Check contiguous handler deps.
-        if !contiguous_deps.is_empty() {
-            let watermarks = self.contiguous_watermarks.read().await;
-            for dep in contiguous_deps {
-                let watermark = watermarks.get(dep).copied().flatten();
-                if watermark.is_none_or(|w| w < range_start) {
-                    return DepState::Waiting;
+        // 1. Check handler deps failed/blocked/waiting under one read lock.
+        //    Pruned ranges are implicitly completed by all handlers, so handler
+        //    deps and contiguous deps are satisfied. Skip to call-dep checks.
+        if !pruned {
+            {
+                let state = self.state.read().await;
+                for dep in handler_deps {
+                    if state
+                        .failed
+                        .get(dep)
+                        .is_some_and(|r| r.contains(&range_start))
+                    {
+                        return DepState::DepFailed {
+                            dep_name: dep.clone(),
+                        };
+                    }
+                }
+                for dep in handler_deps {
+                    if state
+                        .blocked
+                        .get(dep)
+                        .is_some_and(|r| r.contains(&range_start))
+                    {
+                        return DepState::DepBlocked {
+                            dep_name: dep.clone(),
+                        };
+                    }
+                }
+                for dep in handler_deps {
+                    if !state
+                        .completed
+                        .get(dep)
+                        .is_some_and(|r| r.contains(&range_start))
+                    {
+                        return DepState::Waiting;
+                    }
+                }
+            }
+
+            // 2. Check contiguous handler deps.
+            if !contiguous_deps.is_empty() {
+                let contiguous = self.contiguous.read().await;
+                for dep in contiguous_deps {
+                    let watermark = contiguous.watermarks.get(dep).copied().flatten();
+                    if watermark.is_none_or(|w| w < range_start) {
+                        return DepState::Waiting;
+                    }
                 }
             }
         }
@@ -505,8 +717,10 @@ impl CompletionTracker {
     /// Call-dep availability is matched by `range_start` only (not range_end)
     /// since log and call-dep parquet files may use different range sizes.
     ///
-    /// Same wake-safety invariant as [`wait_ready`]: `notified()` is constructed
-    /// before probing.
+    /// Subscribes to per-handler watch channels for handler deps and contiguous
+    /// deps before the first probe. `watch::Receiver::changed()` is
+    /// cancellation-safe and captures any send after subscription, preserving
+    /// the race-free invariant. Call-dep changes use the global `Notify`.
     pub(crate) async fn wait_ready_extended(
         &self,
         handler_deps: &[String],
@@ -514,8 +728,35 @@ impl CompletionTracker {
         call_dep_keys: &[(String, String)],
         range_start: u64,
     ) -> Result<(), DepWaitError> {
+        // Collect unique dep handler names from both handler and contiguous deps.
+        let mut unique_dep_names: Vec<&str> = Vec::new();
+        for dep in handler_deps {
+            if !unique_dep_names.contains(&dep.as_str()) {
+                unique_dep_names.push(dep);
+            }
+        }
+        for dep in contiguous_deps {
+            if !unique_dep_names.contains(&dep.as_str()) {
+                unique_dep_names.push(dep);
+            }
+        }
+
+        // Subscribe to each dep handler's watch channel once before any probing.
+        let mut receivers: Vec<watch::Receiver<()>> = unique_dep_names
+            .iter()
+            .map(|d| self.subscribe_handler(d))
+            .collect();
+
+        let has_call_deps = !call_dep_keys.is_empty();
+
         loop {
-            let notified = self.notify.notified();
+            // For call-dep changes, use global notify (created before probe).
+            let global_notified = if has_call_deps {
+                Some(self.global_notify.notified())
+            } else {
+                None
+            };
+
             match self
                 .probe_extended(handler_deps, contiguous_deps, call_dep_keys, range_start)
                 .await
@@ -533,7 +774,17 @@ impl CompletionTracker {
                         range_start,
                     })
                 }
-                DepState::Waiting => notified.await,
+                DepState::Waiting => match global_notified {
+                    Some(global) => {
+                        tokio::select! {
+                            _ = wait_any_changed(&mut receivers) => {},
+                            _ = global => {},
+                        }
+                    }
+                    None => {
+                        wait_any_changed(&mut receivers).await;
+                    }
+                },
             }
         }
     }
@@ -543,23 +794,45 @@ impl CompletionTracker {
     /// Snapshot of per-handler progress for periodic logging.
     ///
     /// Returns `(completed_count, failed_count, blocked_count)` per handler.
+    /// Takes ONE read lock on `state` (was 3 separate locks).
     pub(crate) async fn snapshot_progress(&self) -> HashMap<String, (usize, usize, usize)> {
-        let completed = self.completed.read().await;
-        let failed = self.failed.read().await;
-        let blocked = self.blocked.read().await;
+        let state = self.state.read().await;
 
         let mut result: HashMap<String, (usize, usize, usize)> = HashMap::new();
-        for (name, ranges) in completed.iter() {
+        for (name, ranges) in state.completed.iter() {
             result.entry(name.clone()).or_default().0 = ranges.len();
         }
-        for (name, ranges) in failed.iter() {
+        for (name, ranges) in state.failed.iter() {
             result.entry(name.clone()).or_default().1 = ranges.len();
         }
-        for (name, ranges) in blocked.iter() {
+        for (name, ranges) in state.blocked.iter() {
             result.entry(name.clone()).or_default().2 = ranges.len();
         }
         result
     }
+}
+
+/// Wait until any of the given watch receivers reports a change.
+///
+/// Returns immediately if `receivers` is empty (no deps to wait on).
+/// Cancellation-safe: cancelled `changed()` futures do not lose events.
+async fn wait_any_changed(receivers: &mut [watch::Receiver<()>]) {
+    if receivers.is_empty() {
+        // No deps: yield once and return (avoids infinite pending).
+        tokio::task::yield_now().await;
+        return;
+    }
+    if receivers.len() == 1 {
+        // Fast path: single dep, no select overhead.
+        let _ = receivers[0].changed().await;
+        return;
+    }
+    // General case: wait for any receiver to report a change.
+    let futures: Vec<_> = receivers
+        .iter_mut()
+        .map(|rx| Box::pin(rx.changed()))
+        .collect();
+    let _ = futures::future::select_all(futures).await;
 }
 
 #[cfg(test)]
@@ -1029,5 +1302,149 @@ mod tests {
         let snap = tracker.snapshot_progress().await;
         assert_eq!(snap.get("A"), Some(&(2, 0, 1)));
         assert_eq!(snap.get("B"), Some(&(0, 1, 0)));
+    }
+
+    // ─── Compaction tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn compact_prunes_completed_entries_below_min_watermark() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300, 400, 500]);
+        tracker.seed_completed("A", [100, 200, 300, 400, 500]).await;
+        tracker.seed_completed("B", [100, 200, 300]).await;
+
+        // A's watermark = 500, B's watermark = 300, min = 300.
+        tracker.compact(&["A", "B"]).await;
+
+        // Entries at or below 300 are pruned but still report as completed.
+        assert!(tracker.is_completed("A", 100).await);
+        assert!(tracker.is_completed("A", 200).await);
+        assert!(tracker.is_completed("A", 300).await);
+        assert!(tracker.is_completed("B", 100).await);
+        assert!(tracker.is_completed("B", 200).await);
+        assert!(tracker.is_completed("B", 300).await);
+
+        // Entries above 300 are still in the set.
+        assert!(tracker.is_completed("A", 400).await);
+        assert!(tracker.is_completed("A", 500).await);
+        // B never completed 400, so it's not completed.
+        assert!(!tracker.is_completed("B", 400).await);
+
+        // Verify the actual HashSet was pruned.
+        let state = tracker.state.read().await;
+        let a_completed = state.completed.get("A").unwrap();
+        assert!(!a_completed.contains(&100));
+        assert!(!a_completed.contains(&200));
+        assert!(!a_completed.contains(&300));
+        assert!(a_completed.contains(&400));
+        assert!(a_completed.contains(&500));
+    }
+
+    #[tokio::test]
+    async fn compact_pruned_ranges_satisfy_deps() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300]);
+        tracker.seed_completed("A", [100, 200, 300]).await;
+        tracker.seed_completed("B", [100, 200, 300]).await;
+
+        tracker.compact(&["A", "B"]).await;
+
+        // Pruned ranges should satisfy dependency checks.
+        assert_eq!(tracker.probe(&names(&["A"]), 100).await, DepState::Ready);
+        assert_eq!(tracker.probe(&names(&["A"]), 200).await, DepState::Ready);
+        assert_eq!(
+            tracker.probe_extended(&names(&["A"]), &[], &[], 100).await,
+            DepState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_does_not_prune_past_failure() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300, 400]);
+        tracker.seed_completed("A", [100, 200, 300, 400]).await;
+        // B completed 100, failed at 200 → contiguous watermark = 100.
+        tracker.seed_completed("B", [100]).await;
+        tracker.mark_failed("B", 200).await;
+
+        // min watermark = min(400, 100) = 100.
+        tracker.compact(&["A", "B"]).await;
+
+        // Only range 100 pruned.
+        assert!(tracker.is_completed("A", 100).await); // pruned, implicit
+        assert!(tracker.is_completed("A", 200).await); // still in set
+        assert!(tracker.is_failed("B", 200).await); // failure preserved
+
+        let state = tracker.state.read().await;
+        let a_completed = state.completed.get("A").unwrap();
+        assert!(!a_completed.contains(&100)); // pruned
+        assert!(a_completed.contains(&200)); // not pruned
+    }
+
+    #[tokio::test]
+    async fn compact_contiguous_watermark_advances_after_prune() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300, 400]);
+        tracker.seed_completed("A", [100, 200]).await;
+        tracker.seed_completed("B", [100, 200]).await;
+        assert_eq!(tracker.contiguous_watermark("A").await, Some(200));
+
+        // Compact prunes up to 200.
+        tracker.compact(&["A", "B"]).await;
+
+        // Now complete 300 — watermark should advance from 200 to 300.
+        tracker.mark_completed("A", 300).await;
+        assert_eq!(tracker.contiguous_watermark("A").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn compact_noop_without_available_starts() {
+        let tracker = CompletionTracker::new();
+        tracker.mark_completed("A", 100).await;
+        tracker.compact(&["A"]).await;
+
+        // No pruning should occur.
+        let state = tracker.state.read().await;
+        assert!(state.completed.get("A").unwrap().contains(&100));
+    }
+
+    /// Regression: a handler with no contiguous coverage from the first
+    /// available range (watermark = None) must block pruning entirely,
+    /// otherwise `is_pruned` would silently mark its unprocessed early
+    /// ranges as completed and `build_catchup_work_items` would skip them.
+    #[tokio::test]
+    async fn compact_skips_when_handler_has_no_watermark() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300, 400, 500]);
+        // A is fully contiguous → watermark = 500.
+        tracker.seed_completed("A", [100, 200, 300, 400, 500]).await;
+        // B has only a sparse middle entry → watermark = None.
+        tracker.seed_completed("B", [300]).await;
+
+        tracker.compact(&["A", "B"]).await;
+
+        // Pruning must NOT happen: B's early ranges are not actually completed.
+        assert!(
+            !tracker.is_completed("B", 100).await,
+            "B@100 must remain not-completed; otherwise the scheduler would skip it"
+        );
+        assert!(!tracker.is_completed("B", 200).await);
+        // A's entries are still in the in-memory set (not pruned).
+        let state = tracker.state.read().await;
+        let a_completed = state.completed.get("A").unwrap();
+        assert!(a_completed.contains(&100));
+        assert!(a_completed.contains(&500));
+    }
+
+    /// A handler not present in the watermarks map at all (e.g. freshly
+    /// registered, never seeded) must also block pruning.
+    #[tokio::test]
+    async fn compact_skips_when_handler_missing_from_watermarks() {
+        let tracker = CompletionTracker::with_available_starts(vec![100, 200, 300]);
+        tracker.seed_completed("A", [100, 200, 300]).await;
+        // "B" was never seeded or marked — has no entry in `watermarks`.
+
+        tracker.compact(&["A", "B"]).await;
+
+        // Pruning skipped → B@100 still reports as not-completed.
+        assert!(!tracker.is_completed("B", 100).await);
+        // And A's entries remain in memory.
+        let state = tracker.state.read().await;
+        assert!(state.completed.get("A").unwrap().contains(&100));
     }
 }

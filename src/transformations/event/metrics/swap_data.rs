@@ -4,19 +4,20 @@
 //! then call process_swaps()/process_liquidity_deltas() to produce DbOperations.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use alloy_primitives::{I256, U256};
 use deadpool_postgres::Pool;
 
-use crate::db::DbOperation;
+use crate::db::{DbOperation, DbSnapshot, DbValue};
 use crate::transformations::error::TransformationError;
 use crate::transformations::util::db::pool_metrics::{
     insert_liquidity_delta, insert_pool_snapshot, upsert_pool_state, LiquidityDeltaData,
     PoolStateData, SnapshotData,
 };
-use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
 use crate::transformations::util::price::sqrt_price_x96_to_price;
+use crate::transformations::util::usd_price::UsdPriceContext;
 
 use super::accumulator::BlockAccumulator;
 
@@ -52,12 +53,17 @@ pub struct LiquidityInput {
 /// then emits one snapshot row per group and one pool_state upsert per pool (latest block).
 /// Groups where no valid price could be computed (e.g. all swaps had zero sqrtPriceX96)
 /// are silently skipped — no ghost snapshot rows are emitted.
+///
+/// When `usd_ctx` is provided, computes `volume_usd` for each snapshot and emits
+/// `NamedSql` UPDATE operations for rolling metrics on `pool_state`.
 pub fn process_swaps(
     swaps: &[SwapInput],
     metadata_cache: &PoolMetadataCache,
     chain_id: u64,
     handler_name: &str,
     source_name: &str,
+    usd_ctx: Option<&UsdPriceContext>,
+    source_version: u32,
 ) -> Vec<DbOperation> {
     if swaps.is_empty() {
         return Vec::new();
@@ -77,8 +83,9 @@ pub fn process_swaps(
     // Track the latest block per pool for pool_state upserts
     let mut latest_per_pool: BTreeMap<Vec<u8>, (u64, &BlockAccumulator)> = BTreeMap::new();
 
-    // We need to collect accumulators first, then reference them
-    let mut accumulators: Vec<(Vec<u8>, u64, BlockAccumulator)> = Vec::new();
+    // We need to collect accumulators first, then reference them.
+    // Metadata is cached alongside each accumulator to avoid a second cache lookup.
+    let mut accumulators: Vec<(Vec<u8>, u64, BlockAccumulator, Arc<PoolMetadata>)> = Vec::new();
 
     // Track skipped swaps for a single summary log at the end.
     // Collect a few (pool, block, tx_hash) samples for debugging.
@@ -134,7 +141,7 @@ pub fn process_swaps(
             continue;
         }
 
-        accumulators.push((pool_id.clone(), *block_number, acc));
+        accumulators.push((pool_id.clone(), *block_number, acc, meta));
     }
 
     if skipped_swap_count > 0 {
@@ -152,12 +159,23 @@ pub fn process_swaps(
         );
     }
 
-    for (pool_id, block_number, acc) in &accumulators {
+    for (pool_id, block_number, acc, meta) in &accumulators {
         // price_open/close/high/low are guaranteed Some because swap_count > 0.
         let price_open = acc.price_open.as_ref().unwrap().to_string();
         let price_close = acc.price_close.as_ref().unwrap().to_string();
         let price_high = acc.price_high.as_ref().unwrap().to_string();
         let price_low = acc.price_low.as_ref().unwrap().to_string();
+
+        // Compute volume_usd from quote-side volume if USD context is available.
+        let volume_usd = usd_ctx.and_then(|ctx| {
+            // Quote-side volume: volume1 if base is token0, volume0 otherwise.
+            let quote_volume = if meta.is_token_0 {
+                &acc.volume1
+            } else {
+                &acc.volume0
+            };
+            ctx.quote_volume_to_usd(quote_volume, &meta.quote_token, meta.quote_decimals)
+        });
 
         ops.push(insert_pool_snapshot(&SnapshotData {
             chain_id,
@@ -172,6 +190,7 @@ pub fn process_swaps(
             volume0: acc.volume0.to_string(),
             volume1: acc.volume1.to_string(),
             swap_count: i32::try_from(acc.swap_count).unwrap_or(i32::MAX),
+            volume_usd: volume_usd.map(|v| v.to_string()),
         }));
 
         // Track latest block for pool_state.
@@ -191,12 +210,132 @@ pub fn process_swaps(
             block_timestamp: acc.block_timestamp,
             tick: acc.last_tick,
             sqrt_price_x96: acc.last_sqrt_price_x96.to_string(),
-            price: price_close,
+            price: price_close.clone(),
             active_liquidity: acc.last_liquidity.to_string(),
         }));
+
+        // Emit NamedSql to update rolling metrics on pool_state.
+        // This executes after the snapshot upserts (NamedSql sorts last in the
+        // transaction), so the LATERAL subqueries see the just-inserted data.
+        if usd_ctx.is_some() {
+            ops.push(build_rolling_metrics_update(
+                chain_id,
+                pool_id,
+                &price_close,
+                *block_number,
+                acc.block_timestamp,
+                handler_name,
+                source_version,
+            ));
+        }
     }
 
     ops
+}
+
+/// Build a NamedSql UPDATE for rolling metrics on pool_state.
+///
+/// Uses backward-looking LATERAL subqueries: "what was the price N hours ago?"
+/// finds the last known price_close at or before the target timestamp.
+fn build_rolling_metrics_update(
+    chain_id: u64,
+    pool_id: &[u8],
+    price_close: &str,
+    block_number: u64,
+    block_timestamp: u64,
+    handler_name: &str,
+    source_version: u32,
+) -> DbOperation {
+    let template = r#"
+UPDATE pool_state SET
+  volume_24h_usd = sub.vol_24h,
+  swap_count_24h = sub.swaps_24h,
+  price_change_1h = sub.pc_1h,
+  price_change_24h = sub.pc_24h
+FROM (
+  SELECT
+    agg.vol_24h,
+    agg.swaps_24h,
+    CASE WHEN h1h.price_close IS NOT NULL AND h1h.price_close != 0
+         THEN (:price_close - h1h.price_close) / h1h.price_close
+    END AS pc_1h,
+    CASE WHEN h24h.price_close IS NOT NULL AND h24h.price_close != 0
+         THEN (:price_close - h24h.price_close) / h24h.price_close
+    END AS pc_24h
+  FROM (
+    SELECT
+      COALESCE(SUM(s.volume_usd), 0) AS vol_24h,
+      COALESCE(SUM(s.swap_count), 0)::integer AS swaps_24h
+    FROM pool_snapshots s
+    WHERE s.chain_id = :chain_id AND s.pool_id = :pool_id
+      AND s.block_timestamp > (:block_timestamp::bigint - 86400)
+      AND s.block_timestamp <= :block_timestamp::bigint
+      AND s.source = :source AND s.source_version = :source_version
+  ) agg
+  LEFT JOIN LATERAL (
+    SELECT price_close FROM pool_snapshots
+    WHERE chain_id = :chain_id AND pool_id = :pool_id
+      AND block_timestamp <= (:block_timestamp::bigint - 3600)
+      AND source = :source AND source_version = :source_version
+    ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
+  ) h1h ON true
+  LEFT JOIN LATERAL (
+    SELECT price_close FROM pool_snapshots
+    WHERE chain_id = :chain_id AND pool_id = :pool_id
+      AND block_timestamp <= (:block_timestamp::bigint - 86400)
+      AND source = :source AND source_version = :source_version
+    ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
+  ) h24h ON true
+) sub
+WHERE pool_state.chain_id = :chain_id
+  AND pool_state.pool_id = :pool_id
+  AND pool_state.block_number = :block_number
+  AND pool_state.source = :source
+  AND pool_state.source_version = :source_version
+"#;
+
+    DbOperation::NamedSql {
+        template: template.to_string(),
+        params: vec![
+            ("chain_id".to_string(), DbValue::Int64(chain_id as i64)),
+            ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
+            (
+                "price_close".to_string(),
+                DbValue::Numeric(price_close.to_string()),
+            ),
+            (
+                "block_timestamp".to_string(),
+                DbValue::Int64(block_timestamp as i64),
+            ),
+            (
+                "block_number".to_string(),
+                DbValue::Int64(block_number as i64),
+            ),
+            (
+                "source".to_string(),
+                DbValue::VarChar(handler_name.to_string()),
+            ),
+            (
+                "source_version".to_string(),
+                DbValue::Int32(source_version as i32),
+            ),
+        ],
+        snapshot: Some(DbSnapshot {
+            table: "pool_state".to_string(),
+            key_columns: vec![
+                ("chain_id".to_string(), DbValue::Int64(chain_id as i64)),
+                ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
+                (
+                    "source".to_string(),
+                    DbValue::Text(handler_name.to_string()),
+                ),
+                (
+                    "source_version".to_string(),
+                    DbValue::Int32(source_version as i32),
+                ),
+            ],
+        }),
+    }
 }
 
 /// Process a batch of liquidity inputs into liquidity_deltas INSERT operations.
@@ -230,6 +369,7 @@ pub async fn refresh_cache_if_needed(
     contracts: &crate::types::config::contract::Contracts,
     handler_name: &str,
     source_name: &str,
+    block_window: Option<(u64, u64)>,
 ) -> Result<(), TransformationError> {
     let missing: Vec<_> = {
         let unique: HashSet<&Vec<u8>> = pool_ids.collect();
@@ -246,7 +386,11 @@ pub async fn refresh_cache_if_needed(
         return Ok(());
     };
 
-    match cache.refresh(pool, chain_id, contracts).await {
+    let missing_owned: Vec<Vec<u8>> = missing.iter().map(|id| (*id).clone()).collect();
+    match cache
+        .refresh(pool, chain_id, contracts, &missing_owned, block_window)
+        .await
+    {
         Ok(new_count) if new_count > 0 => {
             tracing::info!(
                 handler = handler_name,
@@ -291,13 +435,11 @@ mod tests {
         cache.insert_if_absent(
             pool_id.clone(),
             PoolMetadata {
-                pool_id,
-                base_token: [0u8; 20],
                 quote_token: [1u8; 20],
                 is_token_0: true,
-                pool_type: "v3".to_string(),
                 base_decimals: 18,
                 quote_decimals: 18,
+                total_supply: None,
             },
         );
         cache
@@ -326,7 +468,7 @@ mod tests {
             liquidity: U256::from(1000u64),
         }];
 
-        let ops = process_swaps(&swaps, &cache, 8453, "test", "test");
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test", None, 1);
         assert!(ops.is_empty(), "zero sqrtPrice should produce no ops");
     }
 
@@ -363,7 +505,7 @@ mod tests {
             },
         ];
 
-        let ops = process_swaps(&swaps, &cache, 8453, "test", "test");
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test", None, 1);
         assert!(ops.is_empty(), "all-invalid swaps should produce no ops");
     }
 
@@ -385,8 +527,106 @@ mod tests {
             liquidity: U256::from(1000u64),
         }];
 
-        let ops = process_swaps(&swaps, &cache, 8453, "test", "test");
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test", None, 1);
         // Expect one pool_snapshots upsert + one pool_state upsert
         assert_eq!(ops.len(), 2, "valid swap should emit snapshot + state");
+    }
+
+    #[test]
+    fn test_valid_swap_with_usd_ctx_emits_rolling_metrics() {
+        let pool_id = vec![0u8; 20];
+        let cache = make_cache_with_pool(pool_id.clone());
+
+        let usd_ctx = {
+            let mut prices = std::collections::HashMap::new();
+            prices.insert([1u8; 20], bigdecimal::BigDecimal::from(2000)); // WETH / quote_token
+            UsdPriceContext::new_for_test(prices, Some([1u8; 20]))
+        };
+
+        let swaps = vec![SwapInput {
+            pool_id: pool_id.clone(),
+            transaction_hash: [0u8; 32],
+            block_number: 100,
+            block_timestamp: 1000,
+            log_index: 0,
+            amount0: I256::try_from(100i64).unwrap(),
+            amount1: I256::try_from(-100i64).unwrap(),
+            sqrt_price_x96: q96(),
+            tick: 0,
+            liquidity: U256::from(1000u64),
+        }];
+
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test", Some(&usd_ctx), 1);
+        // snapshot + pool_state + rolling_metrics NamedSql
+        assert_eq!(
+            ops.len(),
+            3,
+            "USD context should add rolling metrics NamedSql"
+        );
+
+        // Verify the third op is a NamedSql
+        match &ops[2] {
+            DbOperation::NamedSql {
+                template,
+                params,
+                snapshot,
+            } => {
+                assert!(template.contains("volume_24h_usd"));
+                assert!(template.contains("price_change_1h"));
+                assert!(template.contains("agg.vol_24h"));
+                assert!(template.contains(
+                    "FROM (\n    SELECT\n      COALESCE(SUM(s.volume_usd), 0) AS vol_24h"
+                ));
+                assert!(template.contains(":price_close"));
+                assert!(template.contains(":block_timestamp::bigint - 86400"));
+                assert!(template.contains("pool_state.block_number = :block_number"));
+                assert!(template.contains("s.block_timestamp <= :block_timestamp::bigint"));
+                assert_eq!(params.len(), 7);
+                // Verify named params have the expected keys
+                let param_names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+                assert!(param_names.contains(&"chain_id"));
+                assert!(param_names.contains(&"pool_id"));
+                assert!(param_names.contains(&"price_close"));
+                assert!(param_names.contains(&"block_timestamp"));
+                assert!(param_names.contains(&"block_number"));
+                assert!(param_names.contains(&"source"));
+                assert!(param_names.contains(&"source_version"));
+                let snapshot = snapshot
+                    .as_ref()
+                    .expect("rolling metrics should be snapshotted");
+                assert_eq!(snapshot.table, "pool_state");
+                assert_eq!(snapshot.key_columns.len(), 4);
+            }
+            _ => panic!("Expected NamedSql for rolling metrics"),
+        }
+    }
+
+    #[test]
+    fn test_no_rolling_metrics_without_usd_ctx() {
+        let pool_id = vec![0u8; 20];
+        let cache = make_cache_with_pool(pool_id.clone());
+
+        let swaps = vec![SwapInput {
+            pool_id: pool_id.clone(),
+            transaction_hash: [0u8; 32],
+            block_number: 100,
+            block_timestamp: 1000,
+            log_index: 0,
+            amount0: I256::try_from(100i64).unwrap(),
+            amount1: I256::try_from(-100i64).unwrap(),
+            sqrt_price_x96: q96(),
+            tick: 0,
+            liquidity: U256::from(1000u64),
+        }];
+
+        let ops = process_swaps(&swaps, &cache, 8453, "test", "test", None, 1);
+        // snapshot + pool_state only — no NamedSql
+        assert_eq!(ops.len(), 2);
+        for op in &ops {
+            assert!(
+                !matches!(op, DbOperation::NamedSql { .. }),
+                "Should not emit NamedSql without USD context"
+            );
+        }
     }
 }

@@ -78,6 +78,7 @@ fn take_pending_fallback_batch(
 }
 
 /// Drain one pending fallback micro-batch and spawn its fetch task into the JoinSet.
+#[allow(clippy::too_many_arguments)]
 fn spawn_fallback_flush(
     pending: &mut VecDeque<(u64, BlockInfo)>,
     pending_tx_count: &mut usize,
@@ -119,6 +120,7 @@ fn spawn_fallback_flush(
 
 /// Spawn as many fallback micro-batches as possible without exceeding the
 /// configured in-flight limit.
+#[allow(clippy::too_many_arguments)]
 fn spawn_ready_fallback_flushes(
     pending: &mut VecDeque<(u64, BlockInfo)>,
     pending_tx_count: &mut usize,
@@ -184,10 +186,9 @@ async fn try_finalize_range(
     };
 
     let range_end = state.range_end;
-    let expected: HashSet<u64> = (range_start..range_end).collect();
-    let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
-    let all_received = expected.is_subset(&received);
-    let all_completed = all_received && expected.is_subset(&state.blocks_completed);
+    let range_len = (range_end - range_start) as usize;
+    let all_received = state.blocks_received.len() == range_len;
+    let all_completed = all_received && state.blocks_completed.len() == range_len;
 
     if !all_completed {
         return Ok(false);
@@ -303,6 +304,7 @@ pub async fn collect_receipts(
 
     // Batch states for per-block receipt fetching
     let mut batch_states: HashMap<u64, ReceiptBatchState> = HashMap::new();
+    let max_concurrent_ranges = raw_data_config.max_receipt_ranges.unwrap_or(5);
 
     // Build output channels and metrics structs
     let channels = ReceiptOutputChannels {
@@ -371,12 +373,14 @@ pub async fn collect_receipts(
             // Fallback mode: backpressure via pending tx/block buffer caps.
             // Both caps scale with fetch concurrency so sparse chains can queue
             // enough work to keep multiple micro-batches in flight.
-            block_result = block_rx.recv(), if !block_rx_closed && if is_block_receipt_mode {
-                receipt_join_set.len() < receipt_fetch_concurrency
-            } else {
-                pending_tx_count < rpc_batch_size * receipt_fetch_concurrency * 2
-                    && pending_fallback_blocks.len() < rpc_batch_size * receipt_fetch_concurrency * 2
-            } => {
+            block_result = block_rx.recv(), if !block_rx_closed
+                && batch_states.len() < max_concurrent_ranges
+                && if is_block_receipt_mode {
+                    receipt_join_set.len() < receipt_fetch_concurrency
+                } else {
+                    pending_tx_count < rpc_batch_size * receipt_fetch_concurrency * 2
+                        && pending_fallback_blocks.len() < rpc_batch_size * receipt_fetch_concurrency * 2
+                } => {
                 match block_result {
                     Some((block_number, timestamp, tx_hashes)) => {
                         let range_start = (block_number / range_size) * range_size;
@@ -411,9 +415,7 @@ pub async fn collect_receipts(
                             state.blocks_completed.insert(block_number);
 
                             // Check if range is now complete
-                            let expected: HashSet<u64> = (range_start..range_end).collect();
-                            let received: HashSet<u64> = state.blocks_received.keys().copied().collect();
-                            if expected.is_subset(&received) {
+                            if state.blocks_received.len() == (range_end - range_start) as usize {
                                 tracing::info!(
                                     "Skipping receipts for blocks {}-{} (already exists)",
                                     range.start,

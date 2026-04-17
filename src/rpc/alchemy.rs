@@ -197,6 +197,9 @@ pub struct AlchemyConfig {
     pub retry: RetryConfig,
     /// Max concurrent in-flight RPC requests. Configurable via RPC_CONCURRENCY env var.
     pub rpc_concurrency: usize,
+    /// When true, force the underlying HTTP transport to HTTP/2 prior knowledge
+    /// with adaptive window sizing and keep-alive.
+    pub force_http2: bool,
 }
 
 #[allow(dead_code)]
@@ -210,6 +213,7 @@ impl AlchemyConfig {
             batching_enabled: true,
             retry: RetryConfig::default(),
             rpc_concurrency: 100,
+            force_http2: false,
         }
     }
 
@@ -232,6 +236,11 @@ impl AlchemyConfig {
         self.rpc_concurrency = concurrency;
         self
     }
+
+    pub fn with_force_http2(mut self, force: bool) -> Self {
+        self.force_http2 = force;
+        self
+    }
 }
 
 /// Default compute units per second for Alchemy.
@@ -251,6 +260,7 @@ impl Default for AlchemyConfig {
             batching_enabled: true,
             retry: RetryConfig::default(),
             rpc_concurrency: 100,
+            force_http2: false,
         }
     }
 }
@@ -263,6 +273,9 @@ pub struct AlchemyClient {
     /// to prevent TCP connection exhaustion.
     rpc_semaphore: Arc<Semaphore>,
     config: AlchemyConfig,
+    /// Cached chain label for metrics. Computed once from the URL in the constructor,
+    /// so repeated `.clone()` is a cheap refcount bump instead of re-parsing.
+    chain_label: Arc<str>,
 }
 
 /// Helper struct that captures concurrency control for batch operations.
@@ -275,8 +288,9 @@ struct ConcurrentExecutor {
     /// Tasks beyond this limit are spawned only as earlier tasks complete,
     /// preventing unbounded task creation for large request sets.
     max_in_flight: usize,
-    /// Chain label for metrics.
-    chain: String,
+    /// Chain label for metrics. Uses `Arc<str>` so clones into spawned tasks
+    /// are cheap refcount bumps instead of heap allocations.
+    chain: Arc<str>,
 }
 
 impl ConcurrentExecutor {
@@ -356,7 +370,9 @@ impl AlchemyClient {
     ) -> Result<Self, RpcError> {
         let rpc_config = RpcClientConfig::new(config.url.clone())
             .with_batch_size(config.max_batch_size)
-            .with_batching(config.batching_enabled);
+            .with_concurrency(config.rpc_concurrency)
+            .with_batching(config.batching_enabled)
+            .with_force_http2(config.force_http2);
 
         let inner = Arc::new(RpcClient::new(rpc_config)?);
 
@@ -367,12 +383,14 @@ impl AlchemyClient {
         });
 
         let rpc_semaphore = Arc::new(Semaphore::new(config.rpc_concurrency));
+        let chain_label: Arc<str> = chain_label_from_url(&config.url).into();
 
         Ok(Self {
             inner,
             rate_limiter,
             rpc_semaphore,
             config,
+            chain_label,
         })
     }
 
@@ -388,11 +406,13 @@ impl AlchemyClient {
         rpc_concurrency: usize,
         max_batch_size: usize,
         shared_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+        force_http2: bool,
     ) -> Result<Self, RpcError> {
         let url = Url::parse(url).map_err(|e| RpcError::InvalidUrl(e.to_string()))?;
         let config = AlchemyConfig::new(url, compute_units_per_second)
             .with_rpc_concurrency(rpc_concurrency)
-            .with_batch_size(max_batch_size);
+            .with_batch_size(max_batch_size)
+            .with_force_http2(force_http2);
         Self::new_with_limiter(config, shared_limiter)
     }
 
@@ -408,9 +428,10 @@ impl AlchemyClient {
         &self.config.retry
     }
 
-    /// Get the chain label for metrics, derived from the RPC URL.
-    fn chain_label(&self) -> String {
-        chain_label_from_url(&self.config.url)
+    /// Get the cached chain label for metrics.
+    /// Returns a cheap `Arc<str>` clone (refcount bump) instead of re-parsing the URL.
+    fn chain_label(&self) -> Arc<str> {
+        self.chain_label.clone()
     }
 
     /// Consume compute units, waiting if necessary.
@@ -438,7 +459,7 @@ impl AlchemyClient {
             rate_limiter: self.rate_limiter.clone(),
             cost_per_request,
             max_in_flight: (self.config.rpc_concurrency * 2).max(1),
-            chain,
+            chain: self.chain_label(),
         }
     }
 
@@ -490,6 +511,7 @@ impl AlchemyClient {
 
         let num_requests = requests.len();
         let executor = self.create_concurrent_executor(cost_per_request);
+        let chain = executor.chain.clone();
         let make_request = Arc::new(make_request);
         let mut join_set = JoinSet::new();
         let mut requests_iter = requests.into_iter().enumerate().peekable();
@@ -515,7 +537,11 @@ impl AlchemyClient {
             match result {
                 Ok((idx, value)) => indexed_results.push((idx, value)),
                 Err(e) => {
-                    tracing::error!("Task panicked in execute_concurrent_ordered: {:?}", e);
+                    tracing::error!(
+                        "[{}] Task panicked in execute_concurrent_ordered: {:?}",
+                        chain,
+                        e
+                    );
                     had_panic = true;
                 }
             }
@@ -525,7 +551,8 @@ impl AlchemyClient {
                 && indexed_results.len() < num_requests
             {
                 tracing::debug!(
-                    "Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    "[{}] Batch progress: {}/{} ({:.0}%) in {:.1}s",
+                    chain,
                     indexed_results.len(),
                     num_requests,
                     indexed_results.len() as f64 / num_requests as f64 * 100.0,
@@ -577,6 +604,7 @@ impl AlchemyClient {
         use tokio::task::JoinSet;
 
         let executor = self.create_concurrent_executor(cost_per_request);
+        let chain = executor.chain.clone();
         let make_request = Arc::new(make_request);
 
         tokio::spawn(async move {
@@ -600,7 +628,7 @@ impl AlchemyClient {
             // Wait for tasks to complete, spawning replacements to keep the pipeline full
             while let Some(result) = join_set.join_next().await {
                 if let Err(e) = result {
-                    tracing::error!("Task panicked in execute_streaming: {:?}", e);
+                    tracing::error!("[{}] Task panicked in execute_streaming: {:?}", chain, e);
                 }
 
                 // Spawn replacements
@@ -708,12 +736,18 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::BLOCK_NUMBER)
             .await;
         with_metrics(RpcMethod::GetBlockNumber, &chain, || async {
-            with_retry(&retry_config, "get_block_number", &chain, || async {
-                provider
-                    .get_block_number()
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_blockNumber",
+                "eth_blockNumber",
+                &chain,
+                || async {
+                    provider
+                        .get_block_number()
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -735,19 +769,25 @@ impl AlchemyClient {
 
         self.consume_compute_units(cost).await;
         with_metrics(RpcMethod::GetBlock, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
-                let builder = provider.get_block(block_id);
-                if full_transactions {
-                    builder
-                        .full()
-                        .await
-                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                } else {
-                    builder
-                        .await
-                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                }
-            })
+            with_retry(
+                &retry_config,
+                "eth_getBlockByNumber",
+                &op_name,
+                &chain,
+                || async {
+                    let builder = provider.get_block(block_id);
+                    if full_transactions {
+                        builder
+                            .full()
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    } else {
+                        builder
+                            .await
+                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                    }
+                },
+            )
             .await
         })
         .await
@@ -770,12 +810,18 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_BY_HASH)
             .await;
         with_metrics(RpcMethod::GetTransaction, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
-                provider
-                    .get_transaction_by_hash(hash)
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_getTransactionByHash",
+                &op_name,
+                &chain,
+                || async {
+                    provider
+                        .get_transaction_by_hash(hash)
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -792,12 +838,18 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_TRANSACTION_RECEIPT)
             .await;
         with_metrics(RpcMethod::GetTransactionReceipt, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
-                provider
-                    .get_transaction_receipt(hash)
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_getTransactionReceipt",
+                &op_name,
+                &chain,
+                || async {
+                    provider
+                        .get_transaction_receipt(hash)
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -827,6 +879,7 @@ impl AlchemyClient {
     /// * `block_numbers` - Block numbers to fetch receipts for
     /// * `concurrency` - Maximum concurrency for this batch. The effective concurrency
     ///   is the minimum of this value and the client's configured `rpc_concurrency`.
+    #[allow(clippy::type_complexity)]
     pub async fn get_block_receipts_concurrent(
         &self,
         method_name: &str,
@@ -914,7 +967,7 @@ impl AlchemyClient {
         let provider = self.inner.provider().clone();
         self.consume_compute_units(ComputeUnitCost::GET_LOGS).await;
         with_metrics(RpcMethod::GetLogs, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
+            with_retry(&retry_config, "eth_getLogs", &op_name, &chain, || async {
                 provider
                     .get_logs(&filter)
                     .await
@@ -937,13 +990,19 @@ impl AlchemyClient {
         self.consume_compute_units(ComputeUnitCost::GET_BALANCE)
             .await;
         with_metrics(RpcMethod::GetBalance, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
-                provider
-                    .get_balance(address)
-                    .block_id(block.unwrap_or(BlockId::latest()))
-                    .await
-                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-            })
+            with_retry(
+                &retry_config,
+                "eth_getBalance",
+                &op_name,
+                &chain,
+                || async {
+                    provider
+                        .get_balance(address)
+                        .block_id(block.unwrap_or(BlockId::latest()))
+                        .await
+                        .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                },
+            )
             .await
         })
         .await
@@ -960,7 +1019,7 @@ impl AlchemyClient {
         let provider = self.inner.provider().clone();
         self.consume_compute_units(ComputeUnitCost::GET_CODE).await;
         with_metrics(RpcMethod::GetCode, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
+            with_retry(&retry_config, "eth_getCode", &op_name, &chain, || async {
                 provider
                     .get_code_at(address)
                     .block_id(block.unwrap_or(BlockId::latest()))
@@ -984,7 +1043,7 @@ impl AlchemyClient {
         let provider = self.inner.provider().clone();
         self.consume_compute_units(ComputeUnitCost::ETH_CALL).await;
         with_metrics(RpcMethod::EthCall, &chain, || async {
-            with_retry(&retry_config, &op_name, &chain, || async {
+            with_retry(&retry_config, "eth_call", &op_name, &chain, || async {
                 provider
                     .call(tx.clone())
                     .block(block.unwrap_or(BlockId::latest()))
@@ -1015,19 +1074,25 @@ impl AlchemyClient {
                 let chain = chain.clone();
                 async move {
                     let op_name = format!("eth_getBlockByNumber({:?})", number);
-                    with_retry(&retry_config, &op_name, &chain, || async {
-                        let builder = provider.get_block(BlockId::Number(number));
-                        if full_transactions {
-                            builder
-                                .full()
-                                .await
-                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                        } else {
-                            builder
-                                .await
-                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                        }
-                    })
+                    with_retry(
+                        &retry_config,
+                        "eth_getBlockByNumber",
+                        &op_name,
+                        &chain,
+                        || async {
+                            let builder = provider.get_block(BlockId::Number(number));
+                            if full_transactions {
+                                builder
+                                    .full()
+                                    .await
+                                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                            } else {
+                                builder
+                                    .await
+                                    .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                            }
+                        },
+                    )
                     .await
                 }
             },
@@ -1062,19 +1127,25 @@ impl AlchemyClient {
             let chain = chain.clone();
             async move {
                 let op_name = format!("eth_getBlockByNumber({:?})", number);
-                let result = with_retry(&retry_config, &op_name, &chain, || async {
-                    let builder = provider.get_block(BlockId::Number(number));
-                    if full_transactions {
-                        builder
-                            .full()
-                            .await
-                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                    } else {
-                        builder
-                            .await
-                            .map_err(|e| RpcError::ProviderError(error_chain(&e)))
-                    }
-                })
+                let result = with_retry(
+                    &retry_config,
+                    "eth_getBlockByNumber",
+                    &op_name,
+                    &chain,
+                    || async {
+                        let builder = provider.get_block(BlockId::Number(number));
+                        if full_transactions {
+                            builder
+                                .full()
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        } else {
+                            builder
+                                .await
+                                .map_err(|e| RpcError::ProviderError(error_chain(&e)))
+                        }
+                    },
+                )
                 .await;
                 (number, result)
             }
@@ -1086,6 +1157,8 @@ impl AlchemyClient {
         hashes: Vec<B256>,
     ) -> Result<Vec<Option<TransactionReceipt>>, RpcError> {
         let provider = self.inner.provider().clone();
+        let per_request_chain = self.chain_label();
+        let fallback_chain = per_request_chain.clone();
 
         // This method swallows errors and returns None for failed receipts,
         // so we use execute_batch_with_metrics (no error unwrapping)
@@ -1095,23 +1168,34 @@ impl AlchemyClient {
             ComputeUnitCost::GET_TRANSACTION_RECEIPT.cost(),
             move |hash| {
                 let provider = provider.clone();
+                let chain = per_request_chain.clone();
                 async move {
                     match provider.get_transaction_receipt(hash).await {
                         Ok(receipt) => receipt,
                         Err(e) => {
-                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            tracing::debug!(
+                                "[{}] Skipping receipt for tx {:?}: {}",
+                                chain,
+                                hash,
+                                e
+                            );
                             None
                         }
                     }
                 }
             },
-            |hashes| async move {
+            move |hashes| async move {
                 let mut results = Vec::with_capacity(hashes.len());
                 for hash in hashes {
                     match self.get_transaction_receipt(hash).await {
                         Ok(receipt) => results.push(receipt),
                         Err(e) => {
-                            tracing::debug!("Skipping receipt for tx {:?}: {}", hash, e);
+                            tracing::debug!(
+                                "[{}] Skipping receipt for tx {:?}: {}",
+                                fallback_chain,
+                                hash,
+                                e
+                            );
                             results.push(None);
                         }
                     }
@@ -1141,7 +1225,7 @@ impl AlchemyClient {
                         filter.get_from_block(),
                         filter.get_to_block()
                     );
-                    with_retry(&retry_config, &op_name, &chain, || async {
+                    with_retry(&retry_config, "eth_getLogs", &op_name, &chain, || async {
                         provider
                             .get_logs(&filter)
                             .await
@@ -1181,7 +1265,7 @@ impl AlchemyClient {
                 let chain = chain.clone();
                 async move {
                     let op_name = format!("eth_call(to={:?}, block={:?})", tx.to, block);
-                    with_retry(&retry_config, &op_name, &chain, || async {
+                    with_retry(&retry_config, "eth_call", &op_name, &chain, || async {
                         provider
                             .call(tx.clone())
                             .block(block)
@@ -1298,6 +1382,7 @@ impl std::fmt::Debug for AlchemyClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use url::Url;
 
     /// Test that an entry exactly at the window boundary is considered expired.
     ///
@@ -1411,5 +1496,58 @@ mod tests {
             usage_after, usage,
             "Usage should be the same before and after cleanup"
         );
+    }
+
+    #[test]
+    fn test_inner_rpc_client_inherits_configured_concurrency() {
+        let config = AlchemyConfig::new(
+            Url::parse("https://eth-mainnet.g.alchemy.com/v2/test").unwrap(),
+            7500,
+        )
+        .with_rpc_concurrency(17);
+
+        let client = AlchemyClient::new(config).unwrap();
+
+        assert_eq!(client.config().rpc_concurrency, 17);
+        assert_eq!(client.inner().config().concurrency, 17);
+    }
+
+    /// force_http2 defaults to false and the builder flips it on.
+    #[test]
+    fn test_alchemy_config_force_http2_builder() {
+        let config = AlchemyConfig::default();
+        assert!(!config.force_http2);
+
+        let config = AlchemyConfig::default().with_force_http2(true);
+        assert!(config.force_http2);
+    }
+
+    /// force_http2 propagates from AlchemyConfig into the inner RpcClientConfig.
+    #[test]
+    fn test_alchemy_client_propagates_force_http2() {
+        let config = AlchemyConfig::new(
+            Url::parse("https://eth-mainnet.g.alchemy.com/v2/test").unwrap(),
+            7500,
+        )
+        .with_force_http2(true);
+
+        let client = AlchemyClient::new(config).unwrap();
+        assert!(client.config().force_http2);
+        assert!(client.inner().config().force_http2);
+    }
+
+    /// AlchemyClient::from_url_with_options accepts and honors the flag.
+    #[test]
+    fn test_alchemy_from_url_with_options_http2() {
+        let client = AlchemyClient::from_url_with_options(
+            "https://eth-mainnet.g.alchemy.com/v2/test",
+            7500,
+            100,
+            100,
+            None,
+            true,
+        )
+        .expect("should build Alchemy HTTP/2 client");
+        assert!(client.config().force_http2);
     }
 }

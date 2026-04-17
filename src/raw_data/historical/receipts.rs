@@ -305,8 +305,10 @@ pub fn extract_event_triggers(
 ///
 /// This avoids materializing full `LogData` rows when only event-trigger audit
 /// data is needed from historical log parquet.
+/// Takes ownership of batches so each is freed immediately after its triggers
+/// are extracted, avoiding holding all Arrow data alongside the growing triggers Vec.
 pub fn extract_event_triggers_from_batches(
-    batches: &[RecordBatch],
+    batches: Vec<RecordBatch>,
     matchers: &[EventTriggerMatcher],
 ) -> Vec<EventTriggerData> {
     let mut triggers = Vec::new();
@@ -869,7 +871,7 @@ pub(crate) async fn fetch_block_receipts_bounded(
         total_rpc_time += rpc_start.elapsed();
 
         let process_start = Instant::now();
-        for (block, result) in chunk.iter().zip(results.into_iter()) {
+        for (block, result) in chunk.iter().zip(results) {
             let receipts = result?;
             let tx_block_info: Vec<(B256, u64, u64)> = receipts
                 .iter()

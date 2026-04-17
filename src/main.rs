@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[cfg(feature = "bench")]
 mod bench;
 mod db;
@@ -14,21 +17,22 @@ mod types;
 #[cfg(feature = "solana")]
 mod solana;
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
 use db::DbPool;
 use decoding::{decode_eth_calls, decode_logs, DecoderMessage};
 use live::{
-    CompactionService, LiveCollector, LiveEthCallCollector, LiveMessage, LiveModeConfig,
-    LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
+    CompactionService, LiveCollector, LiveCollectorConfig, LiveEthCallCollector, LiveMessage,
+    LiveModeConfig, LivePipelineExpectations, LiveProgressTracker, TransformRetryRequest,
 };
 use raw_data::historical::catchup::blocks::collect_blocks;
 use raw_data::historical::factories::{
@@ -37,8 +41,10 @@ use raw_data::historical::factories::{
 use raw_data::historical::receipts::{
     build_event_trigger_matchers, EventTriggerMessage, LogMessage,
 };
-use rpc::{UnifiedRpcClient, WsClient};
-use runtime::{build_rpc_client, ChainFeatures, ChainRuntime, CommonChannels};
+use rpc::{SlidingWindowRateLimiter, UnifiedRpcClient, WsClient};
+use runtime::{
+    build_rpc_client, build_rpc_client_with_limiter, ChainFeatures, ChainRuntime, CommonChannels,
+};
 use storage::{InitialSyncService, LocalBackend, RetryQueue, S3Backend, StorageManager};
 use transformations::{
     ExecutionMode, ReorgMessage, TransformationEngine, TransformationEngineConfig,
@@ -104,68 +110,74 @@ fn collect_flag_values(args: &[String], flag: &str) -> anyhow::Result<Vec<String
     Ok(values)
 }
 
-fn parse_optional_u64_flag(args: &[String], flag: &str) -> anyhow::Result<Option<u64>> {
-    let mut value = None;
-    let mut idx = 0usize;
-
-    while idx < args.len() {
-        let arg = &args[idx];
-        if arg == flag {
-            let Some(next) = args.get(idx + 1) else {
-                anyhow::bail!("Missing value for {}", flag);
-            };
-            if next.starts_with("--") {
-                anyhow::bail!("Missing value for {}", flag);
-            }
-            value = Some(
-                next.parse::<u64>()
-                    .with_context(|| format!("Invalid numeric value '{}' for {}", next, flag))?,
-            );
-            idx += 2;
-            continue;
-        }
-
-        let prefix = format!("{}=", flag);
-        if let Some(raw) = arg.strip_prefix(&prefix) {
-            value = Some(
-                raw.parse::<u64>()
-                    .with_context(|| format!("Invalid numeric value '{}' for {}", raw, flag))?,
-            );
-        }
-
-        idx += 1;
-    }
-
-    Ok(value)
+/// Parsed per-chain and global block overrides from CLI.
+struct BlockOverrides {
+    global_from: Option<u64>,
+    global_to: Option<u64>,
+    per_chain_from: HashMap<String, u64>,
+    per_chain_to: HashMap<String, u64>,
 }
 
-fn build_repair_scope(args: &[String]) -> anyhow::Result<Option<RepairScope>> {
-    let from_block = parse_optional_u64_flag(args, "--from-block")?;
-    let to_block = parse_optional_u64_flag(args, "--to-block")?;
-    let sources = collect_flag_values(args, "--source")?;
-    let functions = collect_flag_values(args, "--function")?;
+fn parse_block_overrides(args: &[String]) -> anyhow::Result<BlockOverrides> {
+    let from_values = collect_flag_values(args, "--from-block")?;
+    let to_values = collect_flag_values(args, "--to-block")?;
 
-    if let (Some(from_block), Some(to_block)) = (from_block, to_block) {
+    let mut global_from: Option<u64> = None;
+    let mut per_chain_from: HashMap<String, u64> = HashMap::new();
+
+    for val in &from_values {
+        if let Some((chain, block_str)) = val.split_once(':') {
+            let block = block_str.parse::<u64>().with_context(|| {
+                format!(
+                    "Invalid numeric value '{}' for --from-block (chain '{}')",
+                    block_str, chain
+                )
+            })?;
+            per_chain_from.insert(chain.to_string(), block);
+        } else {
+            let block = val
+                .parse::<u64>()
+                .with_context(|| format!("Invalid numeric value '{}' for --from-block", val))?;
+            global_from = Some(block);
+        }
+    }
+
+    let mut global_to: Option<u64> = None;
+    let mut per_chain_to: HashMap<String, u64> = HashMap::new();
+
+    for val in &to_values {
+        if let Some((chain, block_str)) = val.split_once(':') {
+            let block = block_str.parse::<u64>().with_context(|| {
+                format!(
+                    "Invalid numeric value '{}' for --to-block (chain '{}')",
+                    block_str, chain
+                )
+            })?;
+            per_chain_to.insert(chain.to_string(), block);
+        } else {
+            let block = val
+                .parse::<u64>()
+                .with_context(|| format!("Invalid numeric value '{}' for --to-block", val))?;
+            global_to = Some(block);
+        }
+    }
+
+    // Validate global from <= to when both set
+    if let (Some(from), Some(to)) = (global_from, global_to) {
         anyhow::ensure!(
-            from_block <= to_block,
+            from <= to,
             "--from-block ({}) cannot be greater than --to-block ({})",
-            from_block,
-            to_block
+            from,
+            to
         );
     }
 
-    let scope = RepairScope {
-        from_block,
-        to_block,
-        sources: (!sources.is_empty()).then(|| sources.into_iter().collect()),
-        functions: (!functions.is_empty()).then(|| functions.into_iter().collect()),
-    };
-
-    if scope.is_unscoped() {
-        Ok(None)
-    } else {
-        Ok(Some(scope))
-    }
+    Ok(BlockOverrides {
+        global_from,
+        global_to,
+        per_chain_from,
+        per_chain_to,
+    })
 }
 
 fn live_pipeline_expectations(
@@ -195,9 +207,22 @@ async fn main() -> anyhow::Result<()> {
     let live_only = args.iter().any(|a| a == "--live-only");
     let catch_up_only = args.iter().any(|a| a == "--catch-up-only");
     let repair_only = args.iter().any(|a| a == "--repair-only");
+    let repair_factories = args.iter().any(|a| a == "--repair-factories");
     let repair_flag = args.iter().any(|a| a == "--repair");
+    let transformation_only = args.iter().any(|a| a == "--transformation-only");
     let repair = repair_flag || repair_only;
-    let repair_scope = build_repair_scope(&args)?;
+    let block_overrides = parse_block_overrides(&args)?;
+    let parsed_sources = collect_flag_values(&args, "--source")?;
+    let parsed_functions = collect_flag_values(&args, "--function")?;
+
+    let transformation_handlers: Option<HashSet<String>> = {
+        let values = collect_flag_values(&args, "--transformation-handlers")?;
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.into_iter().collect())
+        }
+    };
 
     if live_only && decode_only {
         anyhow::bail!("Cannot use --live-only and --decode-only together");
@@ -217,13 +242,50 @@ async fn main() -> anyhow::Result<()> {
     if repair_only && catch_up_only {
         anyhow::bail!("Cannot use --repair-only and --catch-up-only together");
     }
+    if repair_factories && live_only {
+        anyhow::bail!("Cannot use --repair-factories and --live-only together");
+    }
+    if repair_factories && decode_only {
+        anyhow::bail!("Cannot use --repair-factories and --decode-only together");
+    }
+    if repair_factories && catch_up_only {
+        anyhow::bail!("Cannot use --repair-factories and --catch-up-only together");
+    }
+    if repair_factories && repair_only {
+        anyhow::bail!("Cannot use --repair-factories and --repair-only together");
+    }
+    if repair_factories && repair_flag {
+        anyhow::bail!("Cannot use --repair-factories and --repair together");
+    }
     if repair_flag && live_only {
         anyhow::bail!("Cannot use --repair and --live-only together");
     }
-    if repair_scope.is_some() && !repair {
-        anyhow::bail!(
-            "--from-block/--to-block/--source/--function require --repair or --repair-only"
-        );
+    if transformation_only && decode_only {
+        anyhow::bail!("Cannot use --transformation-only and --decode-only together");
+    }
+    if transformation_only && live_only {
+        anyhow::bail!("Cannot use --transformation-only and --live-only together");
+    }
+    if transformation_only && catch_up_only {
+        anyhow::bail!("Cannot use --transformation-only and --catch-up-only together");
+    }
+    if transformation_only && repair_only {
+        anyhow::bail!("Cannot use --transformation-only and --repair-only together");
+    }
+    if transformation_only && repair_flag {
+        anyhow::bail!("Cannot use --transformation-only and --repair together");
+    }
+    let has_source_or_function = args
+        .iter()
+        .any(|a| a == "--source" || a.starts_with("--source="))
+        || args
+            .iter()
+            .any(|a| a == "--function" || a.starts_with("--function="));
+    if has_source_or_function && repair_factories {
+        anyhow::bail!("--source/--function are not supported with --repair-factories");
+    }
+    if has_source_or_function && !repair {
+        anyhow::bail!("--source/--function require --repair or --repair-only");
     }
 
     let chains_filter: Option<Vec<String>> = args
@@ -262,8 +324,39 @@ async fn main() -> anyhow::Result<()> {
             filter
         );
     }
-    if !decode_only {
-        let require_ws = !catch_up_only && !repair_only;
+
+    // Merge CLI block range overrides into chain configs
+    for chain in &mut config.chains {
+        // Priority: per-chain CLI > global CLI > config JSON
+        chain.from_block = block_overrides
+            .per_chain_from
+            .get(&chain.name)
+            .copied()
+            .or(block_overrides.global_from)
+            .or(chain.from_block);
+        chain.to_block = block_overrides
+            .per_chain_to
+            .get(&chain.name)
+            .copied()
+            .or(block_overrides.global_to)
+            .or(chain.to_block);
+    }
+
+    // Validate per-chain from <= to after merging
+    for chain in &config.chains {
+        if let (Some(from), Some(to)) = (chain.from_block, chain.to_block) {
+            anyhow::ensure!(
+                from <= to,
+                "from_block ({}) cannot be greater than to_block ({}) for chain '{}'",
+                from,
+                to,
+                chain.name
+            );
+        }
+    }
+
+    if !decode_only && !repair_factories {
+        let require_ws = !catch_up_only && !repair_only && !transformation_only;
         load_required_env_vars(&config, require_ws)?;
     }
 
@@ -282,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
             .context("Invalid metrics.addr in config")?;
         metrics::init_metrics_server(addr);
         metrics::describe_rpc_metrics();
+        metrics::describe_db_metrics();
         metrics::describe_transformation_metrics();
         metrics::describe_collection_metrics();
     }
@@ -416,6 +510,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Running in live-only mode (skips historical processing)");
     } else if catch_up_only {
         tracing::info!("Running in catch-up-only mode (fills gaps in existing data, no live mode)");
+    } else if repair_factories {
+        tracing::info!(
+            "Running in repair-factories mode (rebuild factory parquet and contract indexes from raw logs)"
+        );
+    } else if transformation_only {
+        tracing::info!("Running in transformation-only mode (transformation catchup only, no collection/decoding/live)");
+    }
+    if let Some(ref handlers) = transformation_handlers {
+        tracing::info!("Transformation handler filter: {:?}", handlers);
     }
     if repair_only {
         tracing::info!("Running in repair-only mode (eth_call repair passes only, no live mode)");
@@ -424,15 +527,22 @@ async fn main() -> anyhow::Result<()> {
             "Repair mode enabled: rebuilding once indexes from parquet, auditing raw-vs-decoded once schema drift, and repairing legacy factory-once sidecars"
         );
     }
-    if let Some(scope) = &repair_scope {
-        tracing::info!("Repair scope: {:?}", scope);
+    for chain in &config.chains {
+        if chain.from_block.is_some() || chain.to_block.is_some() {
+            tracing::info!(
+                "Chain {} block range override: from={:?}, to={:?}",
+                chain.name,
+                chain.from_block,
+                chain.to_block
+            );
+        }
     }
 
     tracing::info!("Loaded config with {} chain(s)", config.chains.len());
 
-    let shared_db_pool: Option<Arc<DbPool>> = if !decode_only && !repair_only {
+    let shared_db_pool: Option<Arc<DbPool>> = if !decode_only && !repair_only && !repair_factories {
         if let Some(ref tc) = config.transformations {
-            let registry = transformations::build_registry(0);
+            let registry = transformations::build_registry(0, transformation_handlers.as_ref());
             if !registry.is_empty() {
                 let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
                     format!(
@@ -461,6 +571,38 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Spawn pool metrics sampler if we have a shared pool
+    if let Some(ref pool) = shared_db_pool {
+        tokio::spawn(metrics::sample_pool_stats(
+            Arc::clone(pool),
+            std::time::Duration::from_secs(5),
+        ));
+    }
+
+    // Build shared rate limiters for rate_limit_group references.
+    // Chains that share a group (e.g. "alchemy") will share a single limiter instance,
+    // ensuring the aggregate CU/s across all chains stays within the account-level budget.
+    let shared_rate_limiters: HashMap<String, Arc<SlidingWindowRateLimiter>> = config
+        .rpc_rate_limits
+        .as_ref()
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|(name, group)| {
+                    tracing::info!(
+                        "Created shared rate limiter for group '{}': {} units/s",
+                        name,
+                        group.units_per_second
+                    );
+                    (
+                        name.clone(),
+                        Arc::new(SlidingWindowRateLimiter::new(group.units_per_second)),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut chain_tasks: JoinSet<(String, anyhow::Result<()>)> = JoinSet::new();
 
     for chain in &config.chains {
@@ -469,7 +611,33 @@ async fn main() -> anyhow::Result<()> {
         let storage_manager = storage_manager.clone();
         let shared_db_pool = shared_db_pool.clone();
         let chain = chain.clone();
-        let repair_scope = repair_scope.clone();
+        let transformation_handlers = transformation_handlers.clone();
+
+        // Build per-chain repair scope from the chain's merged block overrides
+        let repair_scope = if repair {
+            let scope = RepairScope {
+                from_block: chain.from_block,
+                to_block: chain.to_block,
+                sources: (!parsed_sources.is_empty())
+                    .then(|| parsed_sources.iter().cloned().collect()),
+                functions: (!parsed_functions.is_empty())
+                    .then(|| parsed_functions.iter().cloned().collect()),
+            };
+            if scope.is_unscoped() {
+                None
+            } else {
+                Some(scope)
+            }
+        } else {
+            None
+        };
+
+        // Look up shared rate limiter for this chain's group
+        let shared_rate_limiter = chain
+            .rpc
+            .rate_limit_group
+            .as_ref()
+            .and_then(|group| shared_rate_limiters.get(group).cloned());
 
         chain_tasks.spawn(async move {
             let result = {
@@ -503,10 +671,34 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     }
+                } else if transformation_only {
+                    transformation_only_chain(
+                        &config,
+                        &chain,
+                        shared_db_pool,
+                        transformation_handlers.as_ref(),
+                    )
+                    .await
                 } else if live_only {
-                    process_chain_live_only(&config, &chain, shared_db_pool).await
+                    process_chain_live_only(
+                        &config,
+                        &chain,
+                        shared_db_pool,
+                        shared_rate_limiter,
+                        transformation_handlers.as_ref(),
+                    )
+                    .await
                 } else if repair_only {
-                    repair_only_chain(&config, &chain, storage_manager, repair_scope).await
+                    repair_only_chain(
+                        &config,
+                        &chain,
+                        storage_manager,
+                        repair_scope,
+                        shared_rate_limiter,
+                    )
+                    .await
+                } else if repair_factories {
+                    repair_factories_chain(&config, &chain, storage_manager).await
                 } else if decode_only {
                     decode_only_chain(&config, &chain, repair, repair_scope).await
                 } else {
@@ -518,16 +710,42 @@ async fn main() -> anyhow::Result<()> {
                         repair,
                         repair_scope,
                         shared_db_pool,
+                        shared_rate_limiter,
+                        transformation_handlers.as_ref(),
                     )
                     .await
                 }
 
                 // Without solana feature, all chains use the EVM pipeline
                 #[cfg(not(feature = "solana"))]
-                if live_only {
-                    process_chain_live_only(&config, &chain, shared_db_pool).await
+                if transformation_only {
+                    transformation_only_chain(
+                        &config,
+                        &chain,
+                        shared_db_pool,
+                        transformation_handlers.as_ref(),
+                    )
+                    .await
+                } else if live_only {
+                    process_chain_live_only(
+                        &config,
+                        &chain,
+                        shared_db_pool,
+                        shared_rate_limiter,
+                        transformation_handlers.as_ref(),
+                    )
+                    .await
                 } else if repair_only {
-                    repair_only_chain(&config, &chain, storage_manager, repair_scope).await
+                    repair_only_chain(
+                        &config,
+                        &chain,
+                        storage_manager,
+                        repair_scope,
+                        shared_rate_limiter,
+                    )
+                    .await
+                } else if repair_factories {
+                    repair_factories_chain(&config, &chain, storage_manager).await
                 } else if decode_only {
                     decode_only_chain(&config, &chain, repair, repair_scope).await
                 } else {
@@ -539,6 +757,8 @@ async fn main() -> anyhow::Result<()> {
                         repair,
                         repair_scope,
                         shared_db_pool,
+                        shared_rate_limiter,
+                        transformation_handlers.as_ref(),
                     )
                     .await
                 }
@@ -691,8 +911,6 @@ async fn decode_only_chain(
                     &cfg,
                     rx,
                     outputs,
-                    None,
-                    None,
                     false,
                     repair,
                     repair_scope,
@@ -715,6 +933,136 @@ async fn decode_only_chain(
     Ok(())
 }
 
+/// Transformation-only mode: runs transformation catchup on existing decoded
+/// parquet files without any collection, decoding, or live mode.
+///
+/// Useful for re-running transformations after handler changes without
+/// re-collecting or re-decoding raw data.
+async fn transformation_only_chain(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+    shared_db_pool: Option<Arc<DbPool>>,
+    handler_filter: Option<&HashSet<String>>,
+) -> anyhow::Result<()> {
+    tracing::info!("Transformation-only processing for chain: {}", chain.name);
+
+    let tc = config.transformations.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("transformations config required for --transformation-only mode")
+    })?;
+
+    // Build handler registry filtered to this chain (and optionally by handler names)
+    let registry = transformations::build_registry_for_chain(
+        chain.chain_id,
+        &chain.contracts,
+        &chain.factory_collections,
+        handler_filter,
+    );
+
+    if registry.is_empty() {
+        tracing::info!(
+            "No transformation handlers registered for chain {}, nothing to do",
+            chain.name
+        );
+        return Ok(());
+    }
+
+    let registry = Arc::new(registry);
+
+    // Setup database pool
+    let db_pool = if let Some(pool) = shared_db_pool {
+        pool
+    } else {
+        let database_url = std::env::var(&tc.database_url_env_var).with_context(|| {
+            format!(
+                "env var {} not set for transformations",
+                tc.database_url_env_var
+            )
+        })?;
+        let pool = DbPool::new(&database_url, tc.db_pool_size)
+            .await
+            .context("failed to create database pool")?;
+        pool.run_migrations()
+            .await
+            .context("failed to run database migrations")?;
+        pool.run_handler_migrations(&registry)
+            .await
+            .context("failed to run handler migrations")?;
+        Arc::new(pool)
+    };
+
+    // Build a minimal RPC client (needed by transformation engine for ad-hoc queries).
+    let rpc_url = std::env::var(&chain.rpc_url_env_var).with_context(|| {
+        format!(
+            "env var {} not set for chain {} (needed for transformation ad-hoc RPC queries)",
+            chain.rpc_url_env_var, chain.name
+        )
+    })?;
+    let rpc_batch_size = chain
+        .rpc
+        .batch_size
+        .or(config.raw_data_collection.rpc_batch_size)
+        .unwrap_or(types::config::defaults::rpc::MAX_BATCH_SIZE) as usize;
+    let (_rate_limiter, rpc_client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+
+    // Validate call dependencies
+    transformations::registry::validate_call_dependencies(
+        &registry,
+        &chain.contracts,
+        &chain.factory_collections,
+    );
+
+    let mode = if tc.mode.batch_for_catchup {
+        ExecutionMode::Batch {
+            batch_size: tc.mode.catchup_batch_size,
+        }
+    } else {
+        ExecutionMode::Streaming
+    };
+
+    let engine = TransformationEngine::new(
+        registry.clone(),
+        db_pool,
+        rpc_client,
+        TransformationEngineConfig {
+            chain_name: chain.name.clone(),
+            chain_id: chain.chain_id,
+            mode,
+            contracts: chain.contracts.clone(),
+            factory_collections: chain.factory_collections.clone(),
+            handler_concurrency: tc.handler_concurrency,
+            expect_log_completion: false,
+            expect_eth_call_completion: false,
+            from_block: chain.from_block,
+            to_block: chain.to_block,
+        },
+        None, // No live progress tracker
+    )
+    .await
+    .context("failed to create transformation engine")?;
+
+    engine
+        .initialize()
+        .await
+        .context("failed to initialize transformation handlers")?;
+
+    tracing::info!(
+        "Transformation engine initialized for chain {} with {} handlers, running catchup",
+        chain.name,
+        registry.handler_count()
+    );
+
+    engine
+        .run_catchup()
+        .await
+        .map_err(|e| anyhow::anyhow!("transformation catchup error: {}", e))?;
+
+    tracing::info!(
+        "Transformation-only processing complete for chain {}",
+        chain.name
+    );
+    Ok(())
+}
+
 /// Repair-only mode: run eth_call repair passes on existing raw/decoded files
 /// without normal collection, transformations, or live mode.
 async fn repair_only_chain(
@@ -722,6 +1070,7 @@ async fn repair_only_chain(
     chain: &ChainConfig,
     storage_manager: Arc<StorageManager>,
     repair_scope: Option<RepairScope>,
+    shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Repair-only processing for chain: {}", chain.name);
 
@@ -747,9 +1096,14 @@ async fn repair_only_chain(
         .batch_size
         .or(config.raw_data_collection.rpc_batch_size)
         .unwrap_or(rpc_defaults::MAX_BATCH_SIZE) as usize;
-    let (_rate_limiter, client) = build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?;
+    let (_rate_limiter, client) = if let Some(limiter) = shared_rate_limiter {
+        let client =
+            build_rpc_client_with_limiter(&rpc_url, &chain.rpc, rpc_batch_size, limiter.clone())?;
+        (limiter, Arc::new(client))
+    } else {
+        build_rpc_client(&rpc_url, &chain.rpc, rpc_batch_size)?
+    };
 
-    let no_decoder_tx: Option<mpsc::Sender<DecoderMessage>> = None;
     let s3_manifest = storage_manager.manifest_for(&chain.name);
 
     raw_data::historical::catchup::eth_calls::collect_eth_calls(
@@ -759,11 +1113,10 @@ async fn repair_only_chain(
         true,
         true,
         repair_scope.clone(),
-        &no_decoder_tx,
         features.has_factory_calls,
         features.has_event_triggered_calls,
-        None,
-        None,
+        None, // factory_rx: repair-only skips factory streaming
+        None, // decoder_tx: repair-only mode has no live decoder
         s3_manifest,
         Some(storage_manager),
     )
@@ -782,8 +1135,6 @@ async fn repair_only_chain(
         &config.raw_data_collection,
         rx,
         outputs,
-        None,
-        None,
         false,
         true,
         repair_scope,
@@ -795,12 +1146,55 @@ async fn repair_only_chain(
     Ok(())
 }
 
+/// Repair-factories mode: rebuild factory parquet and contract indexes from
+/// existing raw log parquet without running decoding, transformations, or live mode.
+async fn repair_factories_chain(
+    config: &IndexerConfig,
+    chain: &ChainConfig,
+    storage_manager: Arc<StorageManager>,
+) -> anyhow::Result<()> {
+    tracing::info!("Repair-factories processing for chain: {}", chain.name);
+
+    let has_factories = chain.contracts.values().any(|c| has_items(&c.factories));
+    if !has_factories {
+        tracing::info!(
+            "No factory configs for chain {}, nothing to repair",
+            chain.name
+        );
+        return Ok(());
+    }
+
+    let s3_manifest = storage_manager.manifest_for(&chain.name);
+    raw_data::historical::catchup::factories::collect_factories(
+        chain,
+        &config.raw_data_collection,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        s3_manifest,
+        Some(storage_manager),
+        true,
+    )
+    .await
+    .context("factory repair failed")?;
+
+    tracing::info!(
+        "Repair-factories processing complete for chain {}",
+        chain.name
+    );
+    Ok(())
+}
+
 /// Live-only mode: skips historical processing and starts directly in live mode.
 /// Useful for testing live mode in isolation or running on a dedicated machine.
 async fn process_chain_live_only(
     config: &IndexerConfig,
     chain: &ChainConfig,
     shared_db_pool: Option<Arc<DbPool>>,
+    shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain {} in live-only mode", chain.name);
 
@@ -820,7 +1214,14 @@ async fn process_chain_live_only(
     }
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, None).await?;
+    let runtime = ChainRuntime::build(
+        config,
+        chain,
+        shared_db_pool,
+        shared_rate_limiter,
+        handler_filter,
+    )
+    .await?;
 
     // Build channels with config-derived capacity
     let channels = CommonChannels::build_for_live_only(
@@ -853,6 +1254,8 @@ async fn process_chain_live_only(
                 expect_eth_call_completion: runtime.features.has_calls,
                 expect_account_state_completion: false,
                 expect_instruction_completion: false,
+                from_block: chain.from_block,
+                to_block: chain.to_block,
             },
             runtime.progress_tracker.clone(),
         )
@@ -886,7 +1289,6 @@ async fn process_chain_live_only(
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
                     transform_retry_rx,
-                    None, // No decode catchup signal in live-only mode
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))
@@ -936,7 +1338,7 @@ async fn process_chain_live_only(
                 complete_tx: transform_complete_tx.as_ref(),
                 retry_tx: transform_retry_tx.as_ref(),
             };
-            decode_eth_calls(&chain, &cfg, rx, outputs, None, None, true, false, None)
+            decode_eth_calls(&chain, &cfg, rx, outputs, true, false, None)
                 .await
                 .context("eth_call decoding failed")
         });
@@ -1156,7 +1558,7 @@ impl FullPipelineContext {
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
         log_rx: mpsc::Receiver<LogMessage>,
-        logs_factory_rx: Option<mpsc::Receiver<FactoryAddressData>>,
+        logs_factory_rx: Option<mpsc::Receiver<Arc<FactoryAddressData>>>,
         log_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
     ) {
         let chain = self.chain().clone();
@@ -1180,12 +1582,16 @@ impl FullPipelineContext {
                 }
             },
             move |catchup_state| async move {
+                let max_pending = cfg
+                    .max_pending_log_ranges
+                    .unwrap_or(crate::types::config::defaults::raw_data::MAX_PENDING_LOG_RANGES);
                 raw_data::historical::current::logs::collect_logs(
                     &chain,
                     log_rx,
                     logs_factory_rx,
                     log_decoder_tx,
                     catchup_state,
+                    max_pending,
                 )
                 .await
                 .context("log collection failed")
@@ -1204,8 +1610,6 @@ impl FullPipelineContext {
         call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
         eth_calls_factory_rx: Option<mpsc::Receiver<FactoryMessage>>,
         event_trigger_rx: Option<mpsc::Receiver<EventTriggerMessage>>,
-        factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
-        eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
     ) {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
@@ -1220,37 +1624,44 @@ impl FullPipelineContext {
             tasks,
             {
                 let (chain, cfg, sm) = (chain.clone(), cfg.clone(), sm.clone());
+                // Clone decoder_tx so the catchup phase can stream per-range
+                // EthCallsReady/OnceCallsReady/EventCallsReady messages to the
+                // decoder as raw parquet files are finalized. The original
+                // sender is kept for the current phase (below).
+                let call_decoder_tx_catchup = call_decoder_tx.clone();
                 async move {
                     let sm_for_current = sm.clone();
-                    raw_data::historical::catchup::eth_calls::collect_eth_calls(
-                        &chain,
-                        &eth_calls_client,
-                        &cfg,
-                        repair,
-                        false,
-                        repair_scope.clone(),
-                        &call_decoder_tx,
-                        has_factory_rx,
-                        has_event_trigger_rx,
-                        factory_catchup_done_rx,
-                        eth_calls_catchup_done_tx,
-                        s3_manifest,
-                        Some(sm),
-                    )
-                    .await
-                    .context("eth_calls catchup failed")
-                    .map(|state| {
-                        (
-                            state,
-                            eth_calls_client,
-                            chain,
-                            cfg,
-                            call_decoder_tx,
+                    // The factory Receiver is passed to catchup which drains it
+                    // until AllComplete (for Phase B streaming), then returns it
+                    // so the current phase can continue consuming messages sent
+                    // by the live factories collector.
+                    let (state, eth_calls_factory_rx) =
+                        raw_data::historical::catchup::eth_calls::collect_eth_calls(
+                            &chain,
+                            &eth_calls_client,
+                            &cfg,
+                            repair,
+                            false,
+                            repair_scope.clone(),
+                            has_factory_rx,
+                            has_event_trigger_rx,
                             eth_calls_factory_rx,
-                            event_trigger_rx,
-                            sm_for_current,
+                            call_decoder_tx_catchup,
+                            s3_manifest,
+                            Some(sm),
                         )
-                    })
+                        .await
+                        .context("eth_calls catchup failed")?;
+                    Ok((
+                        state,
+                        eth_calls_client,
+                        chain,
+                        cfg,
+                        call_decoder_tx,
+                        eth_calls_factory_rx,
+                        event_trigger_rx,
+                        sm_for_current,
+                    ))
                 }
             },
             |args| {
@@ -1290,12 +1701,11 @@ impl FullPipelineContext {
         &self,
         tasks: &mut JoinSet<anyhow::Result<()>>,
         factory_log_rx: mpsc::Receiver<LogMessage>,
-        logs_factory_tx: Option<mpsc::Sender<FactoryAddressData>>,
+        logs_factory_tx: Option<mpsc::Sender<Arc<FactoryAddressData>>>,
         eth_calls_factory_tx: Option<mpsc::Sender<FactoryMessage>>,
         log_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
         call_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
         recollect_tx_for_factories: Option<mpsc::Sender<RecollectRequest>>,
-        factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     ) {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
@@ -1306,16 +1716,24 @@ impl FullPipelineContext {
             tasks,
             {
                 let (chain, cfg) = (chain.clone(), cfg.clone());
+                // Clone the streaming senders so catchup and current each have
+                // their own handles. The catchup phase emits FactoryMessage and
+                // DecoderMessage::FactoryAddresses per range to match the live
+                // phase's behavior (see catchup/factories.rs).
+                let eth_calls_factory_tx_catchup = eth_calls_factory_tx.clone();
+                let call_decoder_tx_catchup = call_decoder_tx_for_factories.clone();
                 async move {
                     raw_data::historical::catchup::factories::collect_factories(
                         &chain,
                         &cfg,
                         &logs_factory_tx,
+                        &eth_calls_factory_tx_catchup,
                         &log_decoder_tx_for_factories,
+                        &call_decoder_tx_catchup,
                         &recollect_tx_for_factories,
-                        factory_catchup_done_tx,
                         s3_manifest,
                         Some(sm),
+                        false,
                     )
                     .await
                     .context("factory catchup failed")
@@ -1401,8 +1819,6 @@ impl FullPipelineContext {
         transform_calls_tx: Option<mpsc::Sender<transformations::DecodedCallsMessage>>,
         transform_complete_tx: Option<mpsc::Sender<transformations::RangeCompleteMessage>>,
         transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
-        eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
-        decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     ) {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
@@ -1420,8 +1836,6 @@ impl FullPipelineContext {
                 &cfg,
                 call_decoder_rx,
                 outputs,
-                eth_calls_catchup_done_rx,
-                decode_catchup_done_tx,
                 false,
                 repair,
                 repair_scope,
@@ -1432,6 +1846,7 @@ impl FullPipelineContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_chain(
     config: &IndexerConfig,
     chain: &ChainConfig,
@@ -1440,11 +1855,20 @@ async fn process_chain(
     repair: bool,
     repair_scope: Option<RepairScope>,
     shared_db_pool: Option<Arc<DbPool>>,
+    shared_rate_limiter: Option<Arc<SlidingWindowRateLimiter>>,
+    handler_filter: Option<&HashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Processing chain: {}", chain.name);
 
     // Build unified runtime (RPC client with rate limiter, db pool, registry, progress tracker)
-    let runtime = ChainRuntime::build(config, chain, shared_db_pool, None).await?;
+    let runtime = ChainRuntime::build(
+        config,
+        chain,
+        shared_db_pool,
+        shared_rate_limiter,
+        handler_filter,
+    )
+    .await?;
 
     let features = &runtime.features;
     let has_factories = features.has_factories;
@@ -1500,28 +1924,13 @@ async fn process_chain(
     let (factory_log_tx, factory_log_rx) =
         optional_channel::<LogMessage>(has_factories, channel_cap);
     let (logs_factory_tx, logs_factory_rx) =
-        optional_channel::<FactoryAddressData>(needs_factory_filtering, factory_cap);
+        optional_channel::<Arc<FactoryAddressData>>(needs_factory_filtering, factory_cap);
     let (eth_calls_factory_tx, eth_calls_factory_rx) =
         optional_channel::<FactoryMessage>(has_factory_calls, factory_cap);
     let (event_trigger_tx, event_trigger_rx) =
         optional_channel::<EventTriggerMessage>(has_event_triggered_calls, channel_cap);
     let (recollect_tx, recollect_rx) =
         optional_channel::<RecollectRequest>(needs_recollect, channel_cap);
-
-    // Catchup synchronization barriers
-    let (factory_catchup_done_tx, factory_catchup_done_rx) = if has_factories {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let (eth_calls_catchup_done_tx, eth_calls_catchup_done_rx) = if has_calls {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
 
     let event_matchers = if has_event_triggered_calls {
         build_event_trigger_matchers(&runtime.chain.contracts)
@@ -1556,7 +1965,19 @@ async fn process_chain(
         None
     };
 
-    let live_mode_enabled = !catch_up_only && should_enable_live_mode(config, &runtime.chain);
+    let live_mode_enabled = !catch_up_only
+        && runtime.chain.to_block.is_none()
+        && should_enable_live_mode(config, &runtime.chain);
+
+    if !catch_up_only {
+        if let Some(to_block) = runtime.chain.to_block {
+            tracing::info!(
+                "Live mode suppressed for chain {}: to_block={} is set",
+                runtime.chain.name,
+                to_block
+            );
+        }
+    }
 
     // Clone for live mode transition (before originals are moved)
     let log_decoder_tx_for_live = if live_mode_enabled && has_events {
@@ -1622,8 +2043,6 @@ async fn process_chain(
         call_decoder_tx,
         eth_calls_factory_rx,
         event_trigger_rx,
-        factory_catchup_done_rx,
-        eth_calls_catchup_done_tx,
     );
 
     if has_factories {
@@ -1635,7 +2054,6 @@ async fn process_chain(
             log_decoder_tx_for_factories,
             call_decoder_tx_for_factories,
             recollect_tx_for_factories,
-            factory_catchup_done_tx,
         );
     }
 
@@ -1657,8 +2075,6 @@ async fn process_chain(
             transform_calls_tx.clone(),
             transform_complete_tx.clone(),
             transform_retry_tx.clone(),
-            eth_calls_catchup_done_rx,
-            decode_catchup_done_tx,
         );
     }
 
@@ -1699,6 +2115,8 @@ async fn process_chain(
                 expect_eth_call_completion: has_calls,
                 expect_account_state_completion: false,
                 expect_instruction_completion: false,
+                from_block: pipeline.runtime.chain.from_block,
+                to_block: pipeline.runtime.chain.to_block,
             },
             pipeline.runtime.progress_tracker.clone(),
         )
@@ -1726,7 +2144,6 @@ async fn process_chain(
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
                     retry_rx,
-                    decode_catchup_done_rx,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))
@@ -1971,17 +2388,17 @@ async fn spawn_live_mode(
     );
 
     // Start live collector
-    let collector = LiveCollector::new(
-        chain.clone(),
-        http_client.clone(),
-        live_config.clone(),
-        Some(progress_tracker.clone()),
+    let collector = LiveCollector::new(LiveCollectorConfig {
+        chain: chain.clone(),
+        http_client: http_client.clone(),
+        config: live_config.clone(),
+        progress_tracker: Some(progress_tracker.clone()),
         factory_matchers,
         eth_call_collector,
-        db_pool.clone(),
-        live_expectations,
-        live_channels.transform_retry_tx.clone(),
-    );
+        db_pool: db_pool.clone(),
+        expectations: live_expectations,
+        transform_retry_tx: live_channels.transform_retry_tx.clone(),
+    });
     tasks.spawn(async move {
         collector
             .run(

@@ -177,81 +177,89 @@ impl CompactionService {
             return;
         }
 
+        // Phase 1 (no locks): gather block list and read status files from storage
         let blocks = match self.storage.list_blocks() {
             Ok(b) => b,
             Err(_) => return,
         };
 
         let now = Instant::now();
-        let mut pending_retries = Vec::new();
-        let mut seen_blocks = HashSet::new();
-        let mut stuck_blocks = self.stuck_blocks.lock().await;
+        let seen_blocks: HashSet<u64> = blocks.iter().copied().collect();
 
+        // Collect blocks that are transform-ready but not yet transformed,
+        // along with their failed handlers from the status file.
+        let mut candidates: Vec<(u64, HashSet<String>)> = Vec::new();
         for block_number in blocks {
-            seen_blocks.insert(block_number);
-
             let status = match self.storage.read_status(block_number) {
                 Ok(s) => s,
-                Err(_) => {
-                    stuck_blocks.remove(&block_number);
-                    continue;
-                }
+                Err(_) => continue,
             };
 
             if status.transformed || !status.transform_inputs_ready_with(&self.expectations) {
-                stuck_blocks.remove(&block_number);
                 continue;
             }
 
-            let progress = self.progress_tracker.lock().await;
-            if progress.is_block_complete(block_number) {
-                stuck_blocks.remove(&block_number);
-                continue;
-            }
-
-            // Combine handlers that are pending in the progress tracker with
-            // handlers that explicitly failed (stored in status file)
-            let mut missing_handlers = progress.get_pending_handlers(block_number);
-            drop(progress);
-
-            // Include failed handlers from status file - these need retry
-            missing_handlers.extend(status.failed_handlers.iter().cloned());
-
-            if missing_handlers.is_empty() {
-                stuck_blocks.remove(&block_number);
-                continue;
-            }
-
-            let first_seen = stuck_blocks.entry(block_number).or_insert(now);
-            if now.duration_since(*first_seen) >= self.retry_grace_period {
-                pending_retries.push((block_number, missing_handlers));
-            }
-        }
-
-        stuck_blocks.retain(|block_number, _| seen_blocks.contains(block_number));
-
-        // Only remove from stuck_blocks on successful send. If try_send fails
-        // (channel full), the block keeps its original grace timer so it doesn't
-        // restart the grace period on the next cycle.
-        for (block_number, missing_handlers) in pending_retries {
-            match retry_tx.try_send(TransformRetryRequest {
+            candidates.push((
                 block_number,
-                missing_handlers: Some(missing_handlers),
-            }) {
-                Ok(()) => {
-                    stuck_blocks.remove(&block_number);
-                    tracing::info!(
-                        "Requested transformation retry for stuck block {}",
-                        block_number
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!("Retry channel full for block {}: {}", block_number, e);
-                }
-            }
+                status.failed_handlers.iter().cloned().collect(),
+            ));
         }
 
-        drop(stuck_blocks);
+        // Phase 2a (progress_tracker lock only): collect complete blocks and pending handlers
+        let mut blocks_with_missing: Vec<(u64, HashSet<String>)> = Vec::new();
+        {
+            let progress = self.progress_tracker.lock().await;
+            for (block_number, mut failed_handlers) in candidates {
+                if progress.is_block_complete(block_number) {
+                    continue;
+                }
+
+                // Combine handlers pending in the progress tracker with
+                // handlers that explicitly failed (stored in status file)
+                let mut missing_handlers = progress.get_pending_handlers(block_number);
+                missing_handlers.extend(failed_handlers.drain());
+
+                if !missing_handlers.is_empty() {
+                    blocks_with_missing.push((block_number, missing_handlers));
+                }
+            }
+        } // progress_tracker lock dropped
+
+        // Phase 2b (stuck_blocks lock only): update stuck state and build retry list
+        let mut pending_retries = Vec::new();
+        {
+            let mut stuck_blocks = self.stuck_blocks.lock().await;
+
+            for (block_number, missing_handlers) in blocks_with_missing {
+                let first_seen = stuck_blocks.entry(block_number).or_insert(now);
+                if now.duration_since(*first_seen) >= self.retry_grace_period {
+                    pending_retries.push((block_number, missing_handlers));
+                }
+            }
+
+            stuck_blocks.retain(|block_number, _| seen_blocks.contains(block_number));
+
+            // Only remove from stuck_blocks on successful send. If try_send fails
+            // (channel full), the block keeps its original grace timer so it doesn't
+            // restart the grace period on the next cycle.
+            for (block_number, missing_handlers) in pending_retries {
+                match retry_tx.try_send(TransformRetryRequest {
+                    block_number,
+                    missing_handlers: Some(missing_handlers),
+                }) {
+                    Ok(()) => {
+                        stuck_blocks.remove(&block_number);
+                        tracing::info!(
+                            "Requested transformation retry for stuck block {}",
+                            block_number
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!("Retry channel full for block {}: {}", block_number, e);
+                    }
+                }
+            }
+        } // stuck_blocks lock dropped
     }
 
     /// Find ranges that are ready for compaction.
@@ -456,6 +464,70 @@ impl CompactionService {
                 range.start,
                 range.end
             );
+        }
+
+        // Merge per-block contract indexes into historical format
+        {
+            use crate::storage::contract_index::{
+                range_key, read_contract_index as read_historical_ci,
+                update_contract_index as update_ci, write_contract_index as write_ci,
+                ExpectedContracts,
+            };
+
+            let mut merged: HashMap<String, ExpectedContracts> = HashMap::new();
+            for block_number in range.start..=range.end {
+                if let Ok(block_ci) = self.storage.read_contract_index(block_number) {
+                    for (collection_name, contracts) in block_ci {
+                        let entry = merged.entry(collection_name).or_default();
+                        for (contract_name, addresses) in contracts {
+                            let addr_entry = entry.entry(contract_name).or_default();
+                            for addr in addresses {
+                                if !addr_entry.contains(&addr) {
+                                    addr_entry.push(addr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for contracts in merged.values_mut() {
+                for addresses in contracts.values_mut() {
+                    addresses.sort();
+                }
+            }
+
+            if !merged.is_empty() {
+                let rk = range_key(range.start, range.end);
+                let base_dir =
+                    PathBuf::from(format!("data/{}/historical/raw/eth_calls", self.chain_name));
+
+                for (collection_name, expected) in &merged {
+                    let collection_dir = base_dir.join(collection_name);
+                    if !collection_dir.exists() {
+                        continue;
+                    }
+
+                    if let Ok(entries) = std::fs::read_dir(&collection_dir) {
+                        for entry in entries.flatten() {
+                            if entry.path().is_dir() {
+                                let on_events_dir = entry.path().join("on_events");
+                                if on_events_dir.exists() {
+                                    let mut ci = read_historical_ci(&on_events_dir);
+                                    update_ci(&mut ci, &rk, expected);
+                                    if let Err(e) = write_ci(&on_events_dir, &ci) {
+                                        tracing::warn!(
+                                            "Failed to write compacted contract index for {}: {}",
+                                            on_events_dir.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Compact decoded logs

@@ -1,8 +1,11 @@
 {
     "DecayMulticurveInitializer": {
         "address": "0xd59ce43e53d69f190e15d9822fb4540dccc91178",
+        "start_block": 42019831,
         "events": [
-            { "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)" }
+            {
+                "signature": "Create(address indexed poolOrHook, address indexed asset, address indexed numeraire)"
+            }
         ],
         "calls": [
             {
@@ -15,7 +18,10 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             },
             {
@@ -28,7 +34,10 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             },
             {
@@ -41,16 +50,24 @@
                     }
                 },
                 "params": [
-                    { "type": "address", "from_event": "topics[2]"}
+                    {
+                        "type": "address",
+                        "from_event": "topics[2]"
+                    }
                 ]
             }
-        ]   
+        ]
     },
     "DecayMulticurveHook": {
         "address": "0xbb7784a4d481184283ed89619a3e3ed143e1adc0",
+        "start_block": 42019829,
         "events": [
-            { "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)" },
-            { "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)" }
+            {
+                "signature": "ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)"
+            },
+            {
+                "signature": "Swap(address indexed sender, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) indexed poolKey, bytes32 indexed poolId, (bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96) params, int128 amount0, int128 amount1, bytes hookData)"
+            }
         ],
         "calls": [
             {
@@ -63,7 +80,29 @@
                     }
                 },
                 "target": "UniswapV4StateView",
-                "params": [{ "type": "bytes32", "from_event": "topics[3]" }]
+                "params": [
+                    {
+                        "type": "bytes32",
+                        "from_event": "topics[3]"
+                    }
+                ]
+            },
+            {
+                "function": "getSlot0(bytes32)",
+                "output_type": "(uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+                "frequency": {
+                    "on_events": {
+                        "source": "DecayMulticurveHook",
+                        "event": "ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
+                    }
+                },
+                "target": "UniswapV4StateView",
+                "params": [
+                    {
+                        "type": "bytes32",
+                        "from_event": "topics[1]"
+                    }
+                ]
             }
         ]
     }

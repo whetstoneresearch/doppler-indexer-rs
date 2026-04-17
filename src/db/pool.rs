@@ -1,5 +1,9 @@
+use std::time::Instant;
+
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use metrics::{counter, histogram};
+use rand::Rng;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::NoTls;
@@ -47,6 +51,13 @@ impl DbPool {
         &self.pool
     }
 
+    /// Return a reference to the underlying deadpool pool.
+    ///
+    /// Used by the metrics sampler to call `.status()` for pool gauge updates.
+    pub fn pool_ref(&self) -> &Pool {
+        &self.pool
+    }
+
     pub async fn execute_transaction(&self, operations: Vec<DbOperation>) -> Result<(), DbError> {
         if operations.is_empty() {
             return Ok(());
@@ -55,20 +66,61 @@ impl DbPool {
         let mut operations = operations;
         sort_operations_for_lock_ordering(&mut operations);
 
+        let op_count = operations.len();
+        let txn_start = Instant::now();
+
+        counter!(
+            "db_transaction_operations_total",
+            "method" => "execute_transaction"
+        )
+        .increment(op_count as u64);
+
         for attempt in 0..=DEADLOCK_MAX_RETRIES {
             match self.try_execute_transaction(&operations).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction",
+                        "status" => "success"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction",
+                        "status" => "success"
+                    )
+                    .increment(1);
+                    return Ok(());
+                }
                 Err(e) if is_deadlock(&e) && attempt < DEADLOCK_MAX_RETRIES => {
-                    let delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    let base_delay_ms = DEADLOCK_BASE_DELAY_MS * (1u64 << attempt);
+                    let jitter_range = base_delay_ms / 5;
+                    let jitter_offset = rand::rng().random_range(0..=(jitter_range * 2));
+                    let delay_ms = base_delay_ms - jitter_range + jitter_offset;
                     tracing::warn!(
-                        "Deadlock detected (attempt {}/{}), retrying in {}ms",
+                        "Deadlock detected (attempt {}/{}), retrying in {}ms (base={}ms)",
                         attempt + 1,
                         DEADLOCK_MAX_RETRIES + 1,
                         delay_ms,
+                        base_delay_ms,
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction",
+                        "status" => "error"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction",
+                        "status" => "error"
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
             }
         }
 
@@ -76,7 +128,20 @@ impl DbPool {
     }
 
     async fn try_execute_transaction(&self, operations: &[DbOperation]) -> Result<(), DbError> {
-        let mut client = self.pool.get().await?;
+        let acquire_start = Instant::now();
+        let mut client = match self.pool.get().await {
+            Ok(c) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                c
+            }
+            Err(e) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                return Err(e.into());
+            }
+        };
+
         let transaction = client.transaction().await?;
 
         for op in operations {
@@ -109,8 +174,36 @@ impl DbPool {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let mut client = self.pool.get().await?;
+        let op_count = operations.len();
+
+        let acquire_start = Instant::now();
+        let mut client = match self.pool.get().await {
+            Ok(c) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                c
+            }
+            Err(e) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                counter!(
+                    "db_transactions_total",
+                    "method" => "execute_transaction_with_snapshot_reads",
+                    "status" => "error"
+                )
+                .increment(1);
+                return Err(e.into());
+            }
+        };
+
+        let txn_start = Instant::now();
         let transaction = client.transaction().await?;
+
+        counter!(
+            "db_transaction_operations_total",
+            "method" => "execute_transaction_with_snapshot_reads"
+        )
+        .increment(op_count as u64);
 
         // Run snapshot queries inside the transaction (sees state before our modifications)
         let mut snapshot_results = Vec::new();
@@ -131,12 +224,38 @@ impl DbPool {
                 Err(e) => {
                     let db_err: DbError = e.into();
                     tracing::error!("SQL execution failed\n  SQL: {}\n  Error: {}", sql, db_err);
+                    histogram!(
+                        "db_transaction_duration_seconds",
+                        "method" => "execute_transaction_with_snapshot_reads",
+                        "status" => "error"
+                    )
+                    .record(txn_start.elapsed().as_secs_f64());
+                    counter!(
+                        "db_transactions_total",
+                        "method" => "execute_transaction_with_snapshot_reads",
+                        "status" => "error"
+                    )
+                    .increment(1);
                     return Err(db_err);
                 }
             }
         }
 
         transaction.commit().await?;
+
+        histogram!(
+            "db_transaction_duration_seconds",
+            "method" => "execute_transaction_with_snapshot_reads",
+            "status" => "success"
+        )
+        .record(txn_start.elapsed().as_secs_f64());
+        counter!(
+            "db_transactions_total",
+            "method" => "execute_transaction_with_snapshot_reads",
+            "status" => "success"
+        )
+        .increment(1);
+
         Ok((snapshot_results, affected_rows))
     }
 
@@ -156,9 +275,34 @@ impl DbPool {
         query: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<tokio_postgres::Row>, DbError> {
-        let client = self.pool.get().await?;
-        let rows = client.query(query, params).await?;
-        Ok(rows)
+        let acquire_start = Instant::now();
+        let client = match self.pool.get().await {
+            Ok(c) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                c
+            }
+            Err(e) => {
+                histogram!("db_connection_acquire_duration_seconds")
+                    .record(acquire_start.elapsed().as_secs_f64());
+                counter!("db_queries_total", "status" => "error").increment(1);
+                return Err(e.into());
+            }
+        };
+
+        let query_start = Instant::now();
+        match client.query(query, params).await {
+            Ok(rows) => {
+                histogram!("db_query_duration_seconds").record(query_start.elapsed().as_secs_f64());
+                counter!("db_queries_total", "status" => "success").increment(1);
+                Ok(rows)
+            }
+            Err(e) => {
+                histogram!("db_query_duration_seconds").record(query_start.elapsed().as_secs_f64());
+                counter!("db_queries_total", "status" => "error").increment(1);
+                Err(e.into())
+            }
+        }
     }
 
     /// Query a single row by key columns.
@@ -226,7 +370,12 @@ fn build_operation_sql(op: &DbOperation) -> (String, Vec<SqlParam>) {
             table,
             where_clause,
         } => build_delete_sql(table, where_clause),
-        DbOperation::RawSql { query, params } => (query.clone(), convert_values_to_params(params)),
+        DbOperation::RawSql { query, params, .. } => {
+            (query.clone(), convert_values_to_params(params))
+        }
+        DbOperation::NamedSql {
+            template, params, ..
+        } => build_named_sql(template, params),
     }
 }
 
@@ -476,6 +625,188 @@ fn placeholder_for(value: &DbValue, param_idx: usize) -> String {
     }
 }
 
+// ─── Named-parameter SQL expansion ─────────────────────────────────
+
+/// Walk a SQL template and replace `:param_name` placeholders by calling
+/// `resolve(name)` for each. Handles `::` (PostgreSQL cast operator) and
+/// single/double-quoted string literals without false matches.
+fn expand_named_template(template: &str, mut resolve: impl FnMut(&str) -> String) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let len = chars.len();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        InSingleQuote,
+        InDoubleQuote,
+    }
+    let mut state = State::Normal;
+
+    while i < len {
+        let ch = chars[i];
+        match state {
+            State::InSingleQuote => {
+                out.push(ch);
+                if ch == '\'' {
+                    // '' is an escaped quote inside a string literal
+                    if i + 1 < len && chars[i + 1] == '\'' {
+                        out.push('\'');
+                        i += 2;
+                    } else {
+                        state = State::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::InDoubleQuote => {
+                out.push(ch);
+                if ch == '"' {
+                    if i + 1 < len && chars[i + 1] == '"' {
+                        out.push('"');
+                        i += 2;
+                    } else {
+                        state = State::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            State::Normal => {
+                if ch == '\'' {
+                    state = State::InSingleQuote;
+                    out.push(ch);
+                    i += 1;
+                } else if ch == '"' {
+                    state = State::InDoubleQuote;
+                    out.push(ch);
+                    i += 1;
+                } else if ch == ':' {
+                    if i + 1 < len && chars[i + 1] == ':' {
+                        // PostgreSQL cast operator — emit literally
+                        out.push(':');
+                        out.push(':');
+                        i += 2;
+                    } else if i + 1 < len
+                        && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '_')
+                    {
+                        // Named parameter — capture name
+                        let start = i + 1;
+                        let mut end = start;
+                        while end < len && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                        {
+                            end += 1;
+                        }
+                        let name: String = chars[start..end].iter().collect();
+                        out.push_str(&resolve(&name));
+                        i = end;
+                    } else {
+                        out.push(ch);
+                        i += 1;
+                    }
+                } else {
+                    out.push(ch);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build SQL + SqlParam vec from a named-parameter template and DbValue params.
+///
+/// Each `:name` is replaced with `placeholder_for(value, idx)` which auto-adds
+/// type-specific casts (`::text::numeric`, `to_timestamp()`, `::jsonb`).
+/// Same `:name` used multiple times reuses the same `$N` index.
+fn build_named_sql(template: &str, named_params: &[(String, DbValue)]) -> (String, Vec<SqlParam>) {
+    use std::collections::HashMap;
+
+    let lookup: HashMap<&str, &DbValue> =
+        named_params.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut index_map: HashMap<String, usize> = HashMap::new();
+    let mut sql_params: Vec<SqlParam> = Vec::new();
+
+    let sql = expand_named_template(template, |name| {
+        if let Some(&idx) = index_map.get(name) {
+            // Already assigned — reuse the same $N with the same cast
+            let value = lookup.get(name).expect("param was previously resolved");
+            placeholder_for(value, idx)
+        } else {
+            let value = *lookup.get(name).unwrap_or_else(|| {
+                panic!(
+                    "NamedSql: template references unbound parameter ':{}'",
+                    name
+                )
+            });
+            let idx = sql_params.len() + 1; // 1-based PostgreSQL param index
+            index_map.insert(name.to_string(), idx);
+            sql_params.push(convert_db_value(value));
+            placeholder_for(value, idx)
+        }
+    });
+
+    (sql, sql_params)
+}
+
+/// Reusable named-parameter builder for direct `client.query()`/`execute()` calls.
+///
+/// Uses the same parser as `NamedSql` but works with `&(dyn ToSql + Sync)` params
+/// directly, without `DbValue` wrapping. Type casts must be added in the template
+/// where needed (e.g. `:min_liquidity::bigint`).
+pub struct NamedQueryBuilder<'a> {
+    template: &'a str,
+    params: Vec<(&'a str, &'a (dyn ToSql + Sync))>,
+}
+
+impl<'a> NamedQueryBuilder<'a> {
+    pub fn new(template: &'a str) -> Self {
+        Self {
+            template,
+            params: Vec::new(),
+        }
+    }
+
+    pub fn bind(mut self, name: &'a str, value: &'a (dyn ToSql + Sync)) -> Self {
+        self.params.push((name, value));
+        self
+    }
+
+    /// Expand the template and return (sql, ordered_params).
+    ///
+    /// Panics if the template references a name not provided via `bind()`.
+    pub fn build(&self) -> (String, Vec<&'a (dyn ToSql + Sync)>) {
+        use std::collections::HashMap;
+
+        let lookup: HashMap<&str, &'a (dyn ToSql + Sync)> = self.params.iter().copied().collect();
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        let mut ordered: Vec<&'a (dyn ToSql + Sync)> = Vec::new();
+
+        let sql = expand_named_template(self.template, |name| {
+            if let Some(&idx) = index_map.get(name) {
+                format!("${}", idx)
+            } else {
+                let value = *lookup.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "NamedQueryBuilder: template references unbound parameter ':{}'",
+                        name
+                    )
+                });
+                let idx = ordered.len() + 1;
+                index_map.insert(name.to_string(), idx);
+                ordered.push(value);
+                format!("${}", idx)
+            }
+        });
+
+        (sql, ordered)
+    }
+}
+
 /// Wrap a column name in double quotes to handle reserved keywords.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name)
@@ -707,6 +1038,7 @@ fn operation_sort_key(op: &DbOperation) -> (u8, Vec<u8>) {
             (3, key)
         }
         DbOperation::RawSql { query, .. } => (4, query.as_bytes().to_vec()),
+        DbOperation::NamedSql { template, .. } => (5, template.as_bytes().to_vec()),
     }
 }
 
@@ -946,5 +1278,135 @@ mod tests {
         // Should not panic or reorder arbitrarily
         sort_operations_for_lock_ordering(&mut ops);
         assert_eq!(ops.len(), 2);
+    }
+
+    // ── Named-parameter parser tests ───────────────────────────────
+
+    #[test]
+    fn named_sql_basic_substitution() {
+        let (sql, params) = build_named_sql("SELECT :foo", &[("foo".into(), DbValue::Int64(42))]);
+        assert_eq!(sql, "SELECT $1");
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlParam::Int64(42)));
+    }
+
+    #[test]
+    fn named_sql_numeric_auto_cast() {
+        let (sql, params) = build_named_sql(
+            "INSERT INTO t VALUES (:amount)",
+            &[("amount".into(), DbValue::Numeric("123.45".into()))],
+        );
+        assert_eq!(sql, "INSERT INTO t VALUES ($1::text::numeric)");
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlParam::Text(ref s) if s == "123.45"));
+    }
+
+    #[test]
+    fn named_sql_jsonb_auto_cast() {
+        let (sql, params) = build_named_sql(
+            "INSERT INTO t VALUES (:data)",
+            &[("data".into(), DbValue::JsonB(serde_json::json!({"k": "v"})))],
+        );
+        assert_eq!(sql, "INSERT INTO t VALUES ($1::jsonb)");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn named_sql_timestamp_auto_cast() {
+        let (sql, _) = build_named_sql(
+            "WHERE ts > :ts",
+            &[("ts".into(), DbValue::Timestamp(1700000000))],
+        );
+        assert_eq!(sql, "WHERE ts > to_timestamp($1)");
+    }
+
+    #[test]
+    fn named_sql_deduplication() {
+        let (sql, params) = build_named_sql(
+            "WHERE chain_id = :cid AND s.chain_id = :cid",
+            &[("cid".into(), DbValue::Int64(1))],
+        );
+        assert_eq!(sql, "WHERE chain_id = $1 AND s.chain_id = $1");
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn named_sql_cast_operator_preserved() {
+        let (sql, _) = build_named_sql("SELECT 0::numeric, NULL::text", &[]);
+        assert_eq!(sql, "SELECT 0::numeric, NULL::text");
+    }
+
+    #[test]
+    fn named_sql_single_quoted_string_ignored() {
+        let (sql, params) = build_named_sql("SELECT ':not_a_param'", &[]);
+        assert_eq!(sql, "SELECT ':not_a_param'");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn named_sql_double_quoted_ident_ignored() {
+        let (sql, params) = build_named_sql("SELECT \":not_a_param\"", &[]);
+        assert_eq!(sql, "SELECT \":not_a_param\"");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn named_sql_escaped_single_quote() {
+        let (sql, params) = build_named_sql("SELECT 'it''s :not_a_param'", &[]);
+        assert_eq!(sql, "SELECT 'it''s :not_a_param'");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn named_sql_multiple_distinct_params() {
+        let (sql, params) = build_named_sql(
+            "WHERE a = :x AND b = :y",
+            &[
+                ("x".into(), DbValue::Int64(1)),
+                ("y".into(), DbValue::Int32(2)),
+            ],
+        );
+        assert_eq!(sql, "WHERE a = $1 AND b = $2");
+        assert_eq!(params.len(), 2);
+        assert!(matches!(params[0], SqlParam::Int64(1)));
+        assert!(matches!(params[1], SqlParam::Int32(2)));
+    }
+
+    #[test]
+    fn named_sql_null_no_cast() {
+        let (sql, params) = build_named_sql("SELECT :val", &[("val".into(), DbValue::Null)]);
+        assert_eq!(sql, "SELECT $1");
+        assert_eq!(params.len(), 1);
+        assert!(matches!(params[0], SqlParam::Null));
+    }
+
+    #[test]
+    fn named_sql_param_followed_by_cast() {
+        // :tick::integer — parser captures :tick, then ::integer is literal
+        let (sql, _) = build_named_sql(
+            "SELECT :tick::integer",
+            &[("tick".into(), DbValue::Int32(100))],
+        );
+        assert_eq!(sql, "SELECT $1::integer");
+    }
+
+    #[test]
+    #[should_panic(expected = "unbound parameter ':unknown'")]
+    fn named_sql_missing_param_panics() {
+        build_named_sql("SELECT :unknown", &[]);
+    }
+
+    #[test]
+    fn named_query_builder_basic() {
+        let chain_id: i64 = 8453;
+        let block: i64 = 100;
+        let (sql, params) =
+            NamedQueryBuilder::new("WHERE chain_id = :cid AND block = :block AND chain_id = :cid")
+                .bind("cid", &chain_id)
+                .bind("block", &block)
+                .build();
+
+        assert_eq!(sql, "WHERE chain_id = $1 AND block = $2 AND chain_id = $1");
+        assert_eq!(params.len(), 2);
     }
 }

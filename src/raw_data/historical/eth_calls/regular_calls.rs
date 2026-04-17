@@ -628,7 +628,7 @@ pub(crate) async fn process_factory_range_multicall(
 
 pub(crate) async fn process_range(
     range: &BlockRange,
-    blocks: Vec<BlockInfo>,
+    blocks: &[BlockInfo],
     ctx: &EthCallContext<'_>,
     call_configs: &[CallConfig],
     max_params: usize,
@@ -672,7 +672,7 @@ pub(crate) async fn process_range(
         let state_key = (contract_name.clone(), function_name.clone());
         let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
 
-        let filtered_blocks = filter_blocks_for_frequency(&blocks, frequency, last_call_ts);
+        let filtered_blocks = filter_blocks_for_frequency(blocks, frequency, last_call_ts);
 
         if filtered_blocks.is_empty() {
             tracing::debug!(
@@ -818,7 +818,7 @@ pub(crate) async fn process_range(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_range_multicall(
     range: &BlockRange,
-    blocks: Vec<BlockInfo>,
+    blocks: &[BlockInfo],
     ctx: &EthCallContext<'_>,
     call_configs: &[CallConfig],
     max_params: usize,
@@ -865,7 +865,7 @@ pub(crate) async fn process_range_multicall(
         let frequency = &configs[0].frequency;
         let state_key = (contract_name.clone(), function_name.clone());
         let last_call_ts = frequency_state.last_call_times.get(&state_key).copied();
-        let filtered_blocks = filter_blocks_for_frequency(&blocks, frequency, last_call_ts);
+        let filtered_blocks = filter_blocks_for_frequency(blocks, frequency, last_call_ts);
 
         if filtered_blocks.is_empty() {
             continue;

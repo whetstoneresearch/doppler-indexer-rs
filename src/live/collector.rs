@@ -54,6 +54,19 @@ pub enum CollectorError {
     ReorgCleanupFailed(Vec<u64>),
 }
 
+/// Configuration for creating a `LiveCollector`.
+pub struct LiveCollectorConfig {
+    pub chain: Arc<ChainConfig>,
+    pub http_client: Arc<UnifiedRpcClient>,
+    pub config: LiveModeConfig,
+    pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    pub factory_matchers: Arc<Vec<FactoryMatcher>>,
+    pub eth_call_collector: Option<LiveEthCallCollector>,
+    pub db_pool: Option<Arc<DbPool>>,
+    pub expectations: LivePipelineExpectations,
+    pub transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
+}
+
 /// Collects live blocks from WebSocket and processes them.
 pub struct LiveCollector {
     chain: Arc<ChainConfig>,
@@ -83,18 +96,19 @@ pub struct LiveCollector {
 
 impl LiveCollector {
     /// Create a new LiveCollector.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        chain: Arc<ChainConfig>,
-        http_client: Arc<UnifiedRpcClient>,
-        config: LiveModeConfig,
-        progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
-        factory_matchers: Arc<Vec<FactoryMatcher>>,
-        eth_call_collector: Option<LiveEthCallCollector>,
-        db_pool: Option<Arc<DbPool>>,
-        expectations: LivePipelineExpectations,
-        transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
-    ) -> Self {
+    pub fn new(cfg: LiveCollectorConfig) -> Self {
+        let LiveCollectorConfig {
+            chain,
+            http_client,
+            config,
+            progress_tracker,
+            factory_matchers,
+            eth_call_collector,
+            db_pool,
+            expectations,
+            transform_retry_tx,
+        } = cfg;
+
         let storage = LiveStorage::new(&chain.name);
         let mut reorg_detector = ReorgDetector::new(config.reorg_depth);
 
@@ -1195,6 +1209,14 @@ impl LiveCollector {
             self.storage.write_eth_calls(block_number, &batch.calls)?;
         }
 
+        // Write per-block contract index for factory completeness tracking
+        if let Some(ref collector) = self.eth_call_collector {
+            let expected = collector.expected_factory_contracts();
+            if !expected.is_empty() {
+                self.storage.write_contract_index(block_number, expected)?;
+            }
+        }
+
         let no_decoder = eth_call_decoder_tx.is_none();
         let expectations = &self.expectations;
         self.storage.update_status_atomic(block_number, |status| {
@@ -1642,6 +1664,8 @@ mod tests {
             rpc_url_env_var: "RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: HashMap::new(),
             block_receipts_method: None,
             factory_collections: HashMap::new(),

@@ -14,22 +14,35 @@ use crate::transformations::util::db::pool::{insert_pool, PoolData};
 use crate::transformations::util::db::token::{insert_token, TokenData};
 use crate::transformations::util::metadata::get_metadata_or_skip;
 use crate::transformations::util::migration::resolve_migration_type;
-use crate::transformations::util::pool_metadata::PoolMetadataCache;
+use crate::transformations::util::pool_metadata::{PoolMetadataCache, VersionedSource};
 
 use crate::types::uniswap::v4::PoolAddressOrPoolId;
 
+pub const V3_CREATE_HANDLER_NAME: &str = "V3CreateHandler";
+pub const V3_CREATE_HANDLER_VERSION: u32 = 1;
+pub const V3_CREATE_HANDLER_SCOPE: VersionedSource =
+    VersionedSource::new(V3_CREATE_HANDLER_NAME, V3_CREATE_HANDLER_VERSION);
+
+pub const LOCKABLE_V3_CREATE_HANDLER_NAME: &str = "LockableV3CreateHandler";
+pub const LOCKABLE_V3_CREATE_HANDLER_VERSION: u32 = 1;
+pub const LOCKABLE_V3_CREATE_HANDLER_SCOPE: VersionedSource = VersionedSource::new(
+    LOCKABLE_V3_CREATE_HANDLER_NAME,
+    LOCKABLE_V3_CREATE_HANDLER_VERSION,
+);
+
 pub struct V3CreateHandler {
+    #[allow(dead_code)]
     pub(crate) metadata_cache: Arc<PoolMetadataCache>,
 }
 
 #[async_trait]
 impl TransformationHandler for V3CreateHandler {
     fn name(&self) -> &'static str {
-        "V3CreateHandler"
+        V3_CREATE_HANDLER_NAME
     }
 
     fn version(&self) -> u32 {
-        1
+        V3_CREATE_HANDLER_VERSION
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {
@@ -191,17 +204,18 @@ impl EventHandler for V3CreateHandler {
 }
 
 pub struct LockableV3CreateHandler {
+    #[allow(dead_code)]
     pub(crate) metadata_cache: Arc<PoolMetadataCache>,
 }
 
 #[async_trait]
 impl TransformationHandler for LockableV3CreateHandler {
     fn name(&self) -> &'static str {
-        "LockableV3CreateHandler"
+        LOCKABLE_V3_CREATE_HANDLER_NAME
     }
 
     fn version(&self) -> u32 {
-        1
+        LOCKABLE_V3_CREATE_HANDLER_VERSION
     }
 
     fn migration_paths(&self) -> Vec<&'static str> {
@@ -398,7 +412,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
-            HashMap::new(),
+            Arc::new(HashMap::new()),
             historical,
             Some(rpc),
             Some(Arc::new(HashMap::new())),
