@@ -74,7 +74,7 @@ pub async fn query_tick_map(
         .query(
             "SELECT tick_lower, tick_upper, SUM(liquidity_delta)::text AS net_liquidity_text \
              FROM liquidity_deltas \
-             WHERE chain_id = $1 AND pool_id = $2 AND block_number <= $3 \
+             WHERE chain_id = $1 AND pool_id = $2 AND block_height <= $3 \
                AND source = $4 AND source_version = $5 \
              GROUP BY tick_lower, tick_upper \
              HAVING SUM(liquidity_delta) > 0",
@@ -292,10 +292,10 @@ WITH prev AS (
   FROM pool_snapshots
   WHERE chain_id = :chain_id
     AND pool_id = :pool_id
-    AND block_number <= :block_number
+    AND block_height <= :block_height
     AND source = :source
     AND source_version = :source_version
-  ORDER BY block_number DESC
+  ORDER BY block_height DESC
   LIMIT 1
 ),
 seed_price AS (
@@ -309,7 +309,7 @@ seed_price AS (
 INSERT INTO pool_snapshots (
   chain_id,
   pool_id,
-  block_number,
+  block_height,
   block_timestamp,
   price_open,
   price_close,
@@ -331,7 +331,7 @@ INSERT INTO pool_snapshots (
 SELECT
   :chain_id,
   :pool_id,
-  :block_number,
+  :block_height,
   :block_timestamp,
   seed_price.price_close,
   seed_price.price_close,
@@ -350,7 +350,7 @@ SELECT
   :source,
   :source_version
 FROM seed_price
-ON CONFLICT (chain_id, pool_id, block_number, source, source_version)
+ON CONFLICT (chain_id, pool_id, block_height, source, source_version)
 DO UPDATE SET
   block_timestamp = EXCLUDED.block_timestamp,
   active_liquidity = EXCLUDED.active_liquidity,
@@ -370,7 +370,7 @@ DO UPDATE SET
             ),
             ("pool_id".into(), DbValue::Bytes(pool_id.to_vec())),
             (
-                "block_number".into(),
+                "block_height".into(),
                 DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
             ),
             (
@@ -413,7 +413,7 @@ DO UPDATE SET
                 ),
                 ("pool_id".to_string(), DbValue::Bytes(pool_id.to_vec())),
                 (
-                    "block_number".to_string(),
+                    "block_height".to_string(),
                     DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
                 ),
                 (
@@ -461,7 +461,7 @@ pub fn build_state_tvl_update(
     let template = r#"
 WITH prev AS (
   SELECT
-    block_number,
+    block_height,
     tick,
     sqrt_price,
     price
@@ -470,8 +470,8 @@ WITH prev AS (
     AND pool_id = :pool_id
     AND source = :source
     AND source_version = :source_version
-    AND block_number <= :block_number
-  ORDER BY block_number DESC
+    AND block_height <= :block_height
+  ORDER BY block_height DESC
   LIMIT 1
 ),
 newer AS (
@@ -481,7 +481,7 @@ newer AS (
     AND pool_id = :pool_id
     AND source = :source
     AND source_version = :source_version
-    AND block_number > :block_number
+    AND block_height > :block_height
   LIMIT 1
 ),
 state_seed AS (
@@ -504,7 +504,7 @@ state_seed AS (
 INSERT INTO pool_state (
   chain_id,
   pool_id,
-  block_number,
+  block_height,
   block_timestamp,
   tick,
   sqrt_price,
@@ -526,7 +526,7 @@ INSERT INTO pool_state (
 SELECT
   :chain_id,
   :pool_id,
-  :block_number,
+  :block_height,
   :block_timestamp::bigint,
   state_seed.tick,
   state_seed.sqrt_price,
@@ -575,7 +575,7 @@ CROSS JOIN LATERAL (
       AND block_timestamp <= (:block_timestamp::bigint - 3600)
       AND source = :source
       AND source_version = :source_version
-    ORDER BY block_timestamp DESC, block_number DESC
+    ORDER BY block_timestamp DESC, block_height DESC
     LIMIT 1
   ) h1h ON true
   LEFT JOIN LATERAL (
@@ -586,13 +586,13 @@ CROSS JOIN LATERAL (
       AND block_timestamp <= (:block_timestamp::bigint - 86400)
       AND source = :source
       AND source_version = :source_version
-    ORDER BY block_timestamp DESC, block_number DESC
+    ORDER BY block_timestamp DESC, block_height DESC
     LIMIT 1
   ) h24h ON true
 ) AS rolling
 ON CONFLICT (chain_id, pool_id, source, source_version)
 DO UPDATE SET
-  block_number = EXCLUDED.block_number,
+  block_height = EXCLUDED.block_height,
   block_timestamp = EXCLUDED.block_timestamp,
   tick = EXCLUDED.tick,
   sqrt_price = EXCLUDED.sqrt_price,
@@ -608,7 +608,7 @@ DO UPDATE SET
   market_cap_usd = EXCLUDED.market_cap_usd,
   active_liquidity_usd = EXCLUDED.active_liquidity_usd,
   total_supply = EXCLUDED.total_supply
-WHERE EXCLUDED.block_number >= pool_state.block_number
+WHERE EXCLUDED.block_height >= pool_state.block_height
 "#;
 
     DbOperation::NamedSql {
@@ -620,7 +620,7 @@ WHERE EXCLUDED.block_number >= pool_state.block_number
             ),
             ("pool_id".into(), DbValue::Bytes(pool_id.to_vec())),
             (
-                "block_number".into(),
+                "block_height".into(),
                 DbValue::Int64(i64::try_from(block_number).expect("block_number fits i64")),
             ),
             (
@@ -1229,7 +1229,7 @@ mod tests {
                 assert!(template.contains("FROM seed_price"));
                 assert!(template.contains("SELECT :bootstrap_price"));
                 assert!(template.contains(
-                    "ON CONFLICT (chain_id, pool_id, block_number, source, source_version)"
+                    "ON CONFLICT (chain_id, pool_id, block_height, source, source_version)"
                 ));
                 assert!(template.contains("active_liquidity = EXCLUDED.active_liquidity"));
                 assert!(template.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
@@ -1256,7 +1256,7 @@ mod tests {
                     vec![
                         "chain_id",
                         "pool_id",
-                        "block_number",
+                        "block_height",
                         "source",
                         "source_version"
                     ]
@@ -1344,7 +1344,7 @@ mod tests {
                     template.contains("ON CONFLICT (chain_id, pool_id, source, source_version)")
                 );
                 assert!(template.contains("active_liquidity_usd = EXCLUDED.active_liquidity_usd"));
-                assert!(template.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"));
+                assert!(template.contains("WHERE EXCLUDED.block_height >= pool_state.block_height"));
                 assert_eq!(params.len(), 16);
                 assert_eq!(params[9].0, "active_liquidity_usd");
                 match &params[9].1 {
@@ -1687,7 +1687,7 @@ mod tests {
                     "state_seed must guard against overwriting newer pool_state"
                 );
                 assert!(
-                    template.contains("WHERE EXCLUDED.block_number >= pool_state.block_number"),
+                    template.contains("WHERE EXCLUDED.block_height >= pool_state.block_height"),
                     "conflict update must respect block ordering"
                 );
             }

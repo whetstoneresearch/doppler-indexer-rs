@@ -1241,7 +1241,7 @@ mod tests {
     fn insert_transfer(block: i64, log_idx: i64) -> DbOperation {
         DbOperation::Insert {
             table: "transfers".to_string(),
-            columns: vec!["block_number".to_string(), "log_index".to_string()],
+            columns: vec!["block_height".to_string(), "log_position".to_string()],
             values: vec![DbValue::Int64(block), DbValue::Int64(log_idx)],
         }
     }

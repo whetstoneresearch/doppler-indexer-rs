@@ -80,7 +80,7 @@ pub trait TransformationHandler: Send + Sync + 'static {
 
     /// Tables this handler writes to that can be rolled back on reorg.
     ///
-    /// Each table returned must have a `block_number` column for deletion targeting.
+    /// Each table returned must have a `block_height` column for deletion targeting.
     /// Tables are automatically scoped by `source` and `source_version` during reorg cleanup.
     ///
     /// Handlers opt-in by implementing this method. By default, no tables are tracked

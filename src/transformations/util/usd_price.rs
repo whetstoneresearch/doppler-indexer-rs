@@ -576,14 +576,14 @@ fn build_oracle_price_op(
     chain_id: u64,
     block_number: u64,
     block_timestamp: u64,
-    token_address: &[u8; 20],
+    token_address: &[u8],
     price: &BigDecimal,
 ) -> DbOperation {
     DbOperation::Upsert {
         table: "prices".into(),
         columns: vec![
             "timestamp".into(),
-            "block_number".into(),
+            "block_height".into(),
             "chain_id".into(),
             "token".into(),
             "quote_token".into(),
@@ -593,13 +593,13 @@ fn build_oracle_price_op(
             DbValue::Timestamp(block_timestamp as i64),
             DbValue::Int64(block_number as i64),
             DbValue::Int64(chain_id as i64),
-            DbValue::Address(*token_address),
-            DbValue::Address(USD_QUOTE_TOKEN),
+            DbValue::Bytes(token_address.to_vec()),
+            DbValue::Bytes(USD_QUOTE_TOKEN.to_vec()),
             DbValue::Numeric(price.to_string()),
         ],
         // Handler-level source/source_version are injected later by the executor.
         conflict_columns: vec!["timestamp".into(), "chain_id".into(), "token".into()],
-        update_columns: vec!["block_number".into(), "quote_token".into(), "price".into()],
+        update_columns: vec!["block_height".into(), "quote_token".into(), "price".into()],
         update_condition: None,
     }
 }
@@ -681,10 +681,10 @@ async fn query_latest_price(
         let quote_token_param = quote_token.to_vec();
         client
             .query_opt(
-                "SELECT price, block_number FROM prices \
+                "SELECT price, block_height FROM prices \
                  WHERE chain_id = $1 AND token = $2 AND quote_token = $3 \
-                 AND ($4::bigint IS NULL OR block_number < $4) \
-                 ORDER BY block_number DESC LIMIT 1",
+                 AND ($4::bigint IS NULL OR block_height < $4) \
+                 ORDER BY block_height DESC LIMIT 1",
                 &[
                     &chain_id_param,
                     &token_param,
@@ -696,10 +696,10 @@ async fn query_latest_price(
     } else {
         client
             .query_opt(
-                "SELECT price, block_number FROM prices \
+                "SELECT price, block_height FROM prices \
                  WHERE chain_id = $1 AND token = $2 \
-                 AND ($3::bigint IS NULL OR block_number < $3) \
-                 ORDER BY block_number DESC LIMIT 1",
+                 AND ($3::bigint IS NULL OR block_height < $3) \
+                 ORDER BY block_height DESC LIMIT 1",
                 &[&chain_id_param, &token_param, &max_block_param],
             )
             .await
@@ -715,7 +715,7 @@ async fn query_latest_price(
         })?;
 
     let price: rust_decimal::Decimal = row.get("price");
-    let block_number: i64 = row.get("block_number");
+    let block_number: i64 = row.get("block_height");
     let price = price
         .to_string()
         .parse::<BigDecimal>()
@@ -742,10 +742,10 @@ async fn query_all_latest_prices(
 
     let rows = client
         .query(
-            "SELECT DISTINCT ON (token) token, quote_token, price, block_number \
+            "SELECT DISTINCT ON (token) token, quote_token, price, block_height \
              FROM prices \
-             WHERE chain_id = $1 AND ($2::bigint IS NULL OR block_number < $2) \
-             ORDER BY token, block_number DESC",
+             WHERE chain_id = $1 AND ($2::bigint IS NULL OR block_height < $2) \
+             ORDER BY token, block_height DESC",
             &[&chain_id_param, &max_block_param],
         )
         .await
@@ -769,7 +769,7 @@ async fn query_all_latest_prices(
             Err(_) => continue,
         };
 
-        let block_number: i64 = row.get("block_number");
+        let block_number: i64 = row.get("block_height");
 
         result.push(RawTokenPrice {
             token,

@@ -2235,7 +2235,7 @@ impl TransformationEngine {
 
             client
                 .execute(
-                    "INSERT INTO _call_revert_log (chain_id, block_number, log_index, source_name, function_name, target_address, revert_reason)
+                    "INSERT INTO _call_revert_log (chain_id, block_height, log_position, source_name, function_name, target_address, revert_reason)
                      VALUES ($1, $2, $3, $4, $5, $6, $7)",
                     &[
                         &chain_id,

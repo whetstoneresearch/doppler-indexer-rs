@@ -277,19 +277,19 @@ FROM (
     WHERE chain_id = :chain_id AND pool_id = :pool_id
       AND block_timestamp <= (:block_timestamp::bigint - 3600)
       AND source = :source AND source_version = :source_version
-    ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
+    ORDER BY block_timestamp DESC, block_height DESC LIMIT 1
   ) h1h ON true
   LEFT JOIN LATERAL (
     SELECT price_close FROM pool_snapshots
     WHERE chain_id = :chain_id AND pool_id = :pool_id
       AND block_timestamp <= (:block_timestamp::bigint - 86400)
       AND source = :source AND source_version = :source_version
-    ORDER BY block_timestamp DESC, block_number DESC LIMIT 1
+    ORDER BY block_timestamp DESC, block_height DESC LIMIT 1
   ) h24h ON true
 ) sub
 WHERE pool_state.chain_id = :chain_id
   AND pool_state.pool_id = :pool_id
-  AND pool_state.block_number = :block_number
+  AND pool_state.block_height = :block_height
   AND pool_state.source = :source
   AND pool_state.source_version = :source_version
 "#;
@@ -308,7 +308,7 @@ WHERE pool_state.chain_id = :chain_id
                 DbValue::Int64(block_timestamp as i64),
             ),
             (
-                "block_number".to_string(),
+                "block_height".to_string(),
                 DbValue::Int64(block_number as i64),
             ),
             (
@@ -347,7 +347,7 @@ pub fn process_liquidity_deltas(deltas: &[LiquidityInput], chain_id: u64) -> Vec
                 chain_id,
                 pool_id: d.pool_id.clone(),
                 block_number: d.block_number,
-                log_index: d.log_index,
+                log_position: d.log_index as i64,
                 tick_lower: d.tick_lower,
                 tick_upper: d.tick_upper,
                 liquidity_delta: d.liquidity_delta.to_string(),
@@ -579,7 +579,7 @@ mod tests {
                 ));
                 assert!(template.contains(":price_close"));
                 assert!(template.contains(":block_timestamp::bigint - 86400"));
-                assert!(template.contains("pool_state.block_number = :block_number"));
+                assert!(template.contains("pool_state.block_height = :block_height"));
                 assert!(template.contains("s.block_timestamp <= :block_timestamp::bigint"));
                 assert_eq!(params.len(), 7);
                 // Verify named params have the expected keys
@@ -588,7 +588,7 @@ mod tests {
                 assert!(param_names.contains(&"pool_id"));
                 assert!(param_names.contains(&"price_close"));
                 assert!(param_names.contains(&"block_timestamp"));
-                assert!(param_names.contains(&"block_number"));
+                assert!(param_names.contains(&"block_height"));
                 assert!(param_names.contains(&"source"));
                 assert!(param_names.contains(&"source_version"));
                 let snapshot = snapshot

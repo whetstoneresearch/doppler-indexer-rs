@@ -264,7 +264,7 @@ impl TransformationHandler for PriceHandler {
                     table: "prices".into(),
                     columns: vec![
                         "timestamp".into(),
-                        "block_number".into(),
+                        "block_height".into(),
                         "chain_id".into(),
                         "token".into(),
                         "quote_token".into(),
@@ -280,7 +280,7 @@ impl TransformationHandler for PriceHandler {
                     ],
                     conflict_columns: vec!["timestamp".into(), "chain_id".into(), "token".into()],
                     update_columns: vec![
-                        "block_number".into(),
+                        "block_height".into(),
                         "quote_token".into(),
                         "price".into(),
                     ],

@@ -571,7 +571,7 @@ impl RangeFinalizer {
                     table,
                     where_clause: WhereClause::Raw {
                         condition: format!(
-                            "chain_id = {} AND block_number IN ({})",
+                            "chain_id = {} AND block_height IN ({})",
                             self.chain_id, block_list
                         ),
                         params: vec![],
@@ -619,7 +619,7 @@ impl RangeFinalizer {
             table: "_live_progress".to_string(),
             where_clause: WhereClause::Raw {
                 condition: format!(
-                    "chain_id = {} AND block_number IN ({})",
+                    "chain_id = {} AND block_height IN ({})",
                     self.chain_id, block_list
                 ),
                 params: vec![],

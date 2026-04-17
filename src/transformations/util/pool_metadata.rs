@@ -420,7 +420,7 @@ LEFT JOIN tokens t
        ))
  )
 WHERE p.chain_id = $1
-  AND (p.address = ANY($6) OR (p.block_number >= $7 AND p.block_number <= $8))
+  AND (p.address = ANY($6) OR (p.block_height >= $7 AND p.block_height <= $8))
 "#,
                     &[
                         &(chain_id as i64),
@@ -538,7 +538,7 @@ LEFT JOIN tokens t
        ))
  )
 WHERE p.chain_id = $1
-  AND p.block_number >= $6 AND p.block_number <= $7
+  AND p.block_height >= $6 AND p.block_height <= $7
 "#,
                     &[
                         &(chain_id as i64),

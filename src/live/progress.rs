@@ -188,9 +188,9 @@ impl LiveProgressTracker {
 
             db_pool
                 .query(
-                    "INSERT INTO _live_progress (chain_id, handler_key, block_number)
+                    "INSERT INTO _live_progress (chain_id, handler_key, block_height)
                      VALUES ($1, $2, $3)
-                     ON CONFLICT (chain_id, handler_key, block_number) DO NOTHING",
+                     ON CONFLICT (chain_id, handler_key, block_height) DO NOTHING",
                     &[
                         &self.chain_id as &(dyn ToSql + Sync),
                         &handler_key_str as &(dyn ToSql + Sync),
@@ -318,8 +318,8 @@ impl LiveProgressTracker {
 
         let rows = db_pool
             .query(
-                "SELECT block_number, handler_key FROM _live_progress
-                 WHERE chain_id = $1 AND block_number >= $2 AND block_number <= $3",
+                "SELECT block_height, handler_key FROM _live_progress
+                 WHERE chain_id = $1 AND block_height >= $2 AND block_height <= $3",
                 &[
                     &self.chain_id as &(dyn ToSql + Sync),
                     &from_i64 as &(dyn ToSql + Sync),

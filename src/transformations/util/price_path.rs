@@ -49,7 +49,7 @@ struct PoolEdge {
 /// Returns `Some(path)` if a valid path exists (either cached-fresh or newly resolved).
 /// Returns `None` on DB errors or if the token is already directly priceable.
 ///
-/// `max_block`: if `Some(b)`, only consider snapshot rows with block_number < b.
+/// `max_block`: if `Some(b)`, only consider snapshot rows with block_height < b.
 pub async fn check_or_resolve_path(
     db_pool: &Pool,
     chain_id: u64,
@@ -130,7 +130,7 @@ struct ResolvedPath {
 /// >= $1,000 active liquidity. Tracks the best (highest bottleneck liquidity)
 /// > path to any priceable token found.
 ///
-/// `max_block`: if `Some(b)`, only consider snapshot rows with block_number < b.
+/// `max_block`: if `Some(b)`, only consider snapshot rows with block_height < b.
 async fn resolve_token_price_path(
     db_pool: &Pool,
     chain_id: u64,
@@ -258,7 +258,7 @@ fn trace_path(
 ///
 /// Multiply the final result by the anchor's USD price.
 ///
-/// `max_block`: if `Some(b)`, only consider snapshot rows with block_number < b.
+/// `max_block`: if `Some(b)`, only consider snapshot rows with block_height < b.
 pub async fn derive_price_from_path(
     db_pool: &Pool,
     chain_id: u64,
@@ -452,7 +452,7 @@ pub async fn invalidate_cached_path(
 /// raw `active_liquidity`, so that pools whose quote token isn't yet USD-priceable
 /// can still appear in the frontier.
 ///
-/// `max_block`: if `Some(b)`, only consider snapshot rows with block_number < b.
+/// `max_block`: if `Some(b)`, only consider snapshot rows with block_height < b.
 async fn query_frontier_pools(
     db_pool: &Pool,
     chain_id: u64,
@@ -480,8 +480,8 @@ async fn query_frontier_pools(
              JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
              WHERE p.chain_id = :chain_id \
                AND (p.base_token = ANY(:frontier) OR p.quote_token = ANY(:frontier)) \
-               AND (:max_block::bigint IS NULL OR ps.block_number < :max_block) \
-             ORDER BY p.address, ps.block_number DESC \
+               AND (:max_block::bigint IS NULL OR ps.block_height < :max_block) \
+             ORDER BY p.address, ps.block_height DESC \
          ) \
          SELECT address, base_token, quote_token, \
                 COALESCE(active_liquidity_usd, 0) as liq \
@@ -534,7 +534,7 @@ async fn query_frontier_pools(
 
 /// Query current prices for pools in a path.
 ///
-/// `max_block`: if `Some(b)`, only consider snapshot rows with block_number < b.
+/// `max_block`: if `Some(b)`, only consider snapshot rows with block_height < b.
 async fn query_path_pool_prices(
     db_pool: &Pool,
     chain_id: u64,
@@ -555,8 +555,8 @@ async fn query_path_pool_prices(
          FROM pools p \
          JOIN pool_snapshots ps ON ps.pool_id = p.address AND ps.chain_id = p.chain_id \
          WHERE p.chain_id = :chain_id AND p.address = ANY(:pool_ids) \
-           AND (:max_block::bigint IS NULL OR ps.block_number < :max_block) \
-         ORDER BY p.address, ps.block_number DESC",
+           AND (:max_block::bigint IS NULL OR ps.block_height < :max_block) \
+         ORDER BY p.address, ps.block_height DESC",
     )
     .bind("chain_id", &chain_id_i64)
     .bind("pool_ids", &pool_ids)
