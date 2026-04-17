@@ -196,6 +196,14 @@ pub fn resolve_chain_config(
     raw_config: ChainConfigRaw,
     base_dir: &Path,
 ) -> anyhow::Result<ChainConfig> {
+    #[cfg(not(feature = "solana"))]
+    if raw_config.chain_type == ChainType::Solana {
+        anyhow::bail!(
+            "Chain '{}' is configured with chain_type='solana', but this build does not include Solana support. Rebuild with --features solana.",
+            raw_config.name
+        );
+    }
+
     let contracts = match raw_config.contracts {
         InlineOrPath::Inline(contracts) => contracts,
         InlineOrPath::Path(p) => load_contracts_from_path(base_dir, &p)
@@ -393,6 +401,31 @@ mod tests {
         assert_eq!(raw.chain_type, ChainType::Solana);
     }
 
+    #[cfg(not(feature = "solana"))]
+    #[test]
+    fn test_resolve_chain_config_rejects_solana_without_feature() {
+        let raw = ChainConfigRaw {
+            name: "solana".to_string(),
+            chain_id: 101,
+            chain_type: ChainType::Solana,
+            rpc_url_env_var: "SOLANA_RPC_URL".to_string(),
+            ws_url_env_var: None,
+            start_block: None,
+            from_block: None,
+            to_block: None,
+            contracts: InlineOrPath::Inline(Contracts::new()),
+            block_receipts_method: None,
+            factory_collections: None,
+            rpc: RpcConfig::default(),
+        };
+
+        let err = resolve_chain_config(raw, Path::new("/tmp")).unwrap_err();
+        assert!(
+            err.to_string().contains("Rebuild with --features solana"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[cfg(feature = "solana")]
     mod solana_tests {
         use super::*;
@@ -482,6 +515,8 @@ mod tests {
                 rpc_url_env_var: "SOLANA_RPC_URL".to_string(),
                 ws_url_env_var: None,
                 start_block: None,
+                from_block: None,
+                to_block: None,
                 contracts: InlineOrPath::Inline(Contracts::new()),
                 block_receipts_method: None,
                 factory_collections: None,
@@ -504,6 +539,8 @@ mod tests {
                 rpc_url_env_var: "SOLANA_RPC_URL".to_string(),
                 ws_url_env_var: None,
                 start_block: None,
+                from_block: None,
+                to_block: None,
                 contracts: InlineOrPath::Inline(Contracts::new()),
                 block_receipts_method: None,
                 factory_collections: None,
