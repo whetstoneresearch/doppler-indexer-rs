@@ -1,13 +1,10 @@
-CREATE TABLE IF NOT EXISTS positions (
-    id BIGSERIAL PRIMARY KEY,
-    chain_id BIGINT NOT NULL,
-    pool BYTEA NOT NULL,
-    owner BYTEA NOT NULL,
-    tick_lower INTEGER NOT NULL,
-    tick_upper INTEGER NOT NULL,
-    liquidity NUMERIC NOT NULL,
-    created_at TIMESTAMPTZ,
-    source VARCHAR(255) NOT NULL,
-    source_version INT NOT NULL,
-    UNIQUE (chain_id, pool, owner, tick_lower, tick_upper, source, source_version)
-)
+-- Rename guard: renames the old table name if it exists, no-op otherwise.
+-- Run this before evm_cl_positions.sql.
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'positions')
+    AND NOT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = 'evm_cl_positions')
+    THEN
+        ALTER TABLE positions RENAME TO evm_cl_positions;
+    END IF;
+END $$;
