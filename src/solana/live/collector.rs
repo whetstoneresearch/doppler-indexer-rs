@@ -14,6 +14,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 
+use solana_transaction_status::{EncodedTransaction, UiConfirmedBlock};
+
 use crate::decoding::DecoderMessage;
 use crate::live::bincode_io::StorageError;
 use crate::live::{LiveModeConfig, LiveProgressTracker};
@@ -25,7 +27,8 @@ use crate::transformations::engine::ReorgMessage;
 use super::reorg::{SolanaReorgDetector, SolanaReorgEvent};
 use super::storage::SolanaLiveStorage;
 use super::types::{
-    AccountReadTrigger, LiveSlot, LiveSlotStatus, SolanaLiveMessage, SolanaLivePipelineExpectations,
+    AccountReadTrigger, LiveSlot, LiveSlotStatus, LiveTransaction, SolanaLiveMessage,
+    SolanaLivePipelineExpectations,
 };
 
 // ---------------------------------------------------------------------------
@@ -274,7 +277,11 @@ impl SolanaLiveCollector {
                 status.block_fetched = true;
                 status.events_extracted = true;
                 status.instructions_extracted = true;
-                status.apply_expectations(&self.expectations);
+                status.events_decoded = true;
+                status.instructions_decoded = true;
+                status.accounts_read = true;
+                status.accounts_decoded = true;
+                status.transformed = true;
                 self.storage.write_status(slot, &status)?;
                 return Ok(());
             }
@@ -331,6 +338,11 @@ impl SolanaLiveCollector {
         // 9. Write events and instructions to storage
         self.storage.write_events(slot, &events)?;
         self.storage.write_instructions(slot, &instructions)?;
+
+        // 9b. Write transaction records so compaction can populate
+        //     transaction_signatures in the slots parquet.
+        let live_txs = extract_live_transactions(&block, slot);
+        self.storage.write_transactions(slot, &live_txs)?;
 
         // 10. Update status
         self.storage.update_status_atomic(slot, |s| {
@@ -427,6 +439,7 @@ impl SolanaLiveCollector {
                     block_time: slot_block_time,
                     source_name: String::new(),
                     addresses: Vec::new(),
+                    await_completion_barrier: false,
                     mark_complete_only: false,
                 })
                 .await;
@@ -624,6 +637,65 @@ impl SolanaLiveCollector {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract `LiveTransaction` records from a block for compaction-time signature lookup.
+fn extract_live_transactions(block: &UiConfirmedBlock, slot: u64) -> Vec<LiveTransaction> {
+    let transactions = match &block.transactions {
+        Some(txs) => txs,
+        None => return Vec::new(),
+    };
+    let block_time = block.block_time;
+    let mut result = Vec::with_capacity(transactions.len());
+
+    for encoded_tx in transactions {
+        let signature = match extract_signature(&encoded_tx.transaction) {
+            Some(s) => s,
+            None => continue,
+        };
+        let (is_err, err_msg, fee, compute_units_consumed, log_messages) =
+            match &encoded_tx.meta {
+                Some(meta) => {
+                    let is_err = meta.err.is_some();
+                    let err_msg = meta.err.as_ref().map(|e| e.to_string());
+                    let fee = meta.fee;
+                    let cu: Option<u64> = meta.compute_units_consumed.clone().into();
+                    let logs: Option<&Vec<String>> = meta.log_messages.as_ref().into();
+                    (is_err, err_msg, fee, cu, logs.cloned().unwrap_or_default())
+                }
+                None => (false, None, 0, None, Vec::new()),
+            };
+        result.push(LiveTransaction {
+            slot,
+            block_time,
+            signature,
+            is_err,
+            err_msg,
+            fee,
+            compute_units_consumed,
+            log_messages,
+            account_keys: Vec::new(),
+        });
+    }
+
+    result
+}
+
+fn extract_signature(encoded_tx: &EncodedTransaction) -> Option<[u8; 64]> {
+    if let Some(versioned_tx) = encoded_tx.decode() {
+        let sig = versioned_tx.signatures.first()?;
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        return Some(out);
+    }
+    if let EncodedTransaction::Json(ui_tx) = encoded_tx {
+        let sig_str = ui_tx.signatures.first()?;
+        let sig: solana_sdk::signature::Signature = sig_str.parse().ok()?;
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        return Some(out);
+    }
+    None
+}
 
 /// Parse a base58-encoded blockhash string into a 32-byte array.
 ///
