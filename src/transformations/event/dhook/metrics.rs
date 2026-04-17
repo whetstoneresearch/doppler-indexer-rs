@@ -109,9 +109,6 @@ impl TransformationHandler for DhookSwapMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
         tracing::info!("DhookSwapMetricsHandler initialized");
         Ok(())
     }
@@ -267,9 +264,6 @@ impl TransformationHandler for DhookTvlMetricsHandler {
         self.db_pool.set(db_pool.inner().clone()).ok();
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
-            .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
             .await?;
         tracing::info!("DhookTvlMetricsHandler initialized");
         Ok(())

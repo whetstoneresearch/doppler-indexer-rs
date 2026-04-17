@@ -185,9 +185,6 @@ impl TransformationHandler for V3SwapMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
         tracing::info!("V3SwapMetricsHandler initialized");
         Ok(())
     }
@@ -343,9 +340,6 @@ impl TransformationHandler for LockableV3SwapMetricsHandler {
         self.db_pool.set(db_pool.inner().clone()).ok();
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
-            .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
             .await?;
         tracing::info!("LockableV3SwapMetricsHandler initialized");
         Ok(())
@@ -533,9 +527,6 @@ impl TransformationHandler for V3TvlMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
         tracing::info!("V3TvlMetricsHandler initialized");
         Ok(())
     }
@@ -642,9 +633,6 @@ impl TransformationHandler for LockableV3TvlMetricsHandler {
         self.db_pool.set(db_pool.inner().clone()).ok();
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
-            .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
             .await?;
         tracing::info!("LockableV3TvlMetricsHandler initialized");
         Ok(())

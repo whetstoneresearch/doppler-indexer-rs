@@ -95,7 +95,8 @@ impl PoolMetadataCache {
             .await
             .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
-        let rows = query_pool_metadata_rows(&client, chain_id, pool_scopes, token_scopes).await?;
+        let rows =
+            query_pool_metadata_rows(&client, chain_id, pool_scopes, token_scopes, &[]).await?;
 
         let mut map = HashMap::with_capacity(rows.len());
 
@@ -221,15 +222,21 @@ impl PoolMetadataCache {
         pool: &Pool,
         chain_id: u64,
         contracts: &crate::types::config::contract::Contracts,
+        addresses: &[Vec<u8>],
     ) -> Result<usize, TransformationError> {
         let client = pool
             .get()
             .await
             .map_err(|e| TransformationError::DatabaseError(e.into()))?;
 
-        let rows =
-            query_pool_metadata_rows(&client, chain_id, &self.pool_scopes, &self.token_scopes)
-                .await?;
+        let rows = query_pool_metadata_rows(
+            &client,
+            chain_id,
+            &self.pool_scopes,
+            &self.token_scopes,
+            addresses,
+        )
+        .await?;
 
         let mut inner = self.inner.write().unwrap();
         let mut new_count = 0;
@@ -375,6 +382,7 @@ async fn query_pool_metadata_rows(
     chain_id: u64,
     pool_scopes: &[VersionedSource],
     token_scopes: &[VersionedSource],
+    addresses: &[Vec<u8>],
 ) -> Result<Vec<Row>, TransformationError> {
     if pool_scopes.is_empty() {
         return Err(TransformationError::ConfigError(
@@ -390,9 +398,10 @@ async fn query_pool_metadata_rows(
     let (pool_sources, pool_versions) = scope_params(pool_scopes);
     let (token_sources, token_versions) = scope_params(token_scopes);
 
-    client
-        .query(
-            r#"
+    if addresses.is_empty() {
+        client
+            .query(
+                r#"
 WITH pool_scope AS (
   SELECT * FROM unnest($2::text[], $3::int4[]) AS scope(source, source_version)
 ),
@@ -433,16 +442,73 @@ LEFT JOIN tokens t
  )
 WHERE p.chain_id = $1
 "#,
-            &[
-                &(chain_id as i64),
-                &pool_sources,
-                &pool_versions,
-                &token_sources,
-                &token_versions,
-            ],
-        )
-        .await
-        .map_err(|e| TransformationError::DatabaseError(e.into()))
+                &[
+                    &(chain_id as i64),
+                    &pool_sources,
+                    &pool_versions,
+                    &token_sources,
+                    &token_versions,
+                ],
+            )
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))
+    } else {
+        client
+            .query(
+                r#"
+WITH pool_scope AS (
+  SELECT * FROM unnest($2::text[], $3::int4[]) AS scope(source, source_version)
+),
+token_scope AS (
+  SELECT * FROM unnest($4::text[], $5::int4[]) AS scope(source, source_version)
+)
+SELECT p.address, p.base_token, p.quote_token, p.is_token_0,
+       t.total_supply::text AS total_supply_text
+FROM pools p
+JOIN pool_scope ps
+  ON p.source = ps.source
+ AND p.source_version = ps.source_version
+LEFT JOIN pools orig
+  ON p.chain_id = orig.chain_id
+ AND p.migrated_from = orig.address
+ AND EXISTS (
+      SELECT 1
+      FROM token_scope ts
+      WHERE orig.source = ts.source
+        AND orig.source_version = ts.source_version
+ )
+LEFT JOIN tokens t
+  ON t.chain_id = p.chain_id
+ AND t.address = p.base_token
+ AND (
+      (orig.address IS NOT NULL
+       AND t.source = orig.source
+       AND t.source_version = orig.source_version)
+   OR (p.migrated_from IS NULL
+       AND t.source = p.source
+       AND t.source_version = p.source_version
+       AND EXISTS (
+            SELECT 1
+            FROM token_scope ts
+            WHERE p.source = ts.source
+              AND p.source_version = ts.source_version
+       ))
+ )
+WHERE p.chain_id = $1
+  AND p.address = ANY($6)
+"#,
+                &[
+                    &(chain_id as i64),
+                    &pool_sources,
+                    &pool_versions,
+                    &token_sources,
+                    &token_versions,
+                    &addresses,
+                ],
+            )
+            .await
+            .map_err(|e| TransformationError::DatabaseError(e.into()))
+    }
 }
 
 /// Resolve decimals for a known quote token address by checking against

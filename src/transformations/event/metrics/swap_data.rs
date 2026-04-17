@@ -385,7 +385,8 @@ pub async fn refresh_cache_if_needed(
         return Ok(());
     };
 
-    match cache.refresh(pool, chain_id, contracts).await {
+    let missing_owned: Vec<Vec<u8>> = missing.iter().map(|id| (*id).clone()).collect();
+    match cache.refresh(pool, chain_id, contracts, &missing_owned).await {
         Ok(new_count) if new_count > 0 => {
             tracing::info!(
                 handler = handler_name,

@@ -107,9 +107,6 @@ impl TransformationHandler for ZoraSwapMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
         tracing::info!("ZoraSwapMetricsHandler initialized");
         Ok(())
     }

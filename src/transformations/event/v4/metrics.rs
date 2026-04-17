@@ -266,9 +266,6 @@ impl TransformationHandler for V4BaseMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
         self.load_hook_pool_map(db_pool).await?;
         self.load_all_proceeds_state(db_pool).await?;
         tracing::info!("V4BaseMetricsHandler initialized");

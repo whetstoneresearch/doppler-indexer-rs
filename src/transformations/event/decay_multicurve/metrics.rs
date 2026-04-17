@@ -110,9 +110,6 @@ impl TransformationHandler for DecayMulticurveSwapMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
         tracing::info!("DecayMulticurveSwapMetricsHandler initialized");
         Ok(())
     }
@@ -268,9 +265,6 @@ impl TransformationHandler for DecayMulticurveTvlMetricsHandler {
         self.db_pool.set(db_pool.inner().clone()).ok();
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
-            .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
             .await?;
         tracing::info!("DecayMulticurveTvlMetricsHandler initialized");
         Ok(())

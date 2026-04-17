@@ -209,9 +209,6 @@ impl TransformationHandler for MigrationPoolSwapMetricsHandler {
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
             .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
-            .await?;
 
         // Seed the migration pool ID set from pools that have already graduated.
         let client = db_pool.inner().get().await?;
@@ -468,9 +465,6 @@ impl TransformationHandler for MigrationPoolTvlMetricsHandler {
         self.db_pool.set(db_pool.inner().clone()).ok();
         self.oracle_cache
             .load_from_db_once(db_pool.inner(), self.chain_id)
-            .await?;
-        self.metadata_cache
-            .load_into(db_pool, self.chain_id)
             .await?;
 
         let client = db_pool.inner().get().await?;

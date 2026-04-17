@@ -189,11 +189,11 @@ impl EventHandler for MigrationPoolCreateHandler {
 
     fn contiguous_handler_dependency_specs(&self) -> Vec<HandlerDependencySpec> {
         vec![
-            dep("V4CreateHandler").except([57073, 143]),
-            dep("V4MulticurveCreateHandler").except([57073, 143]),
-            dep("V4ScheduledMulticurveCreateHandler").except([57073, 143]),
-            dep("V4DecayMulticurveCreateHandler"),
-            dep("DopplerHookCreateHandler"),
+            dep("V4CreateHandler"),
+            dep("V4MulticurveCreateHandler").except([1, 11155111, 130]),
+            dep("V4ScheduledMulticurveCreateHandler").except([130]),
+            // "V4DecayMulticurveCreateHandler",
+            // "DopplerHookCreateHandler",
         ]
     }
 }
