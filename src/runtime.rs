@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::db::DbPool;
 use crate::decoding::DecoderMessage;
@@ -200,10 +200,6 @@ pub struct CommonChannels {
     pub transform_reorg_rx: Option<mpsc::Receiver<ReorgMessage>>,
     pub transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
     pub transform_retry_rx: Option<mpsc::Receiver<TransformRetryRequest>>,
-
-    // Decode catchup barrier (full mode only, None for live-only)
-    pub decode_catchup_done_tx: Option<oneshot::Sender<()>>,
-    pub decode_catchup_done_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl CommonChannels {
@@ -263,30 +259,22 @@ impl CommonChannels {
             transform_reorg_rx,
             transform_retry_tx,
             transform_retry_rx,
-            decode_catchup_done_tx: None,
-            decode_catchup_done_rx: None,
         }
     }
 
     /// Build channels for full mode.
     ///
-    /// Same as live-only but also creates the decode catchup barrier
-    /// if transformations and calls are both enabled.
+    /// Historically this branched from `build_for_live_only` to add a
+    /// decode-catchup oneshot barrier; that barrier was removed when the
+    /// engine started running `run_catchup` concurrently with its live loop.
+    /// The two constructors now produce the same channels, but the two
+    /// methods are kept for call-site clarity.
     pub fn build_for_full(
         config: &IndexerConfig,
         features: &ChainFeatures,
         transformations_enabled: bool,
     ) -> Self {
-        let mut channels = Self::build_for_live_only(config, features, transformations_enabled);
-
-        // Add decode catchup barrier for full mode
-        if transformations_enabled && features.has_calls {
-            let (tx, rx) = oneshot::channel();
-            channels.decode_catchup_done_tx = Some(tx);
-            channels.decode_catchup_done_rx = Some(rx);
-        }
-
-        channels
+        Self::build_for_live_only(config, features, transformations_enabled)
     }
 }
 

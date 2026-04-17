@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
@@ -829,8 +829,6 @@ async fn decode_only_chain(
                     &cfg,
                     rx,
                     outputs,
-                    None,
-                    None,
                     false,
                     repair,
                     repair_scope,
@@ -1035,8 +1033,8 @@ async fn repair_only_chain(
         repair_scope.clone(),
         features.has_factory_calls,
         features.has_event_triggered_calls,
-        None,
-        None,
+        None, // factory_rx: repair-only skips factory streaming
+        None, // decoder_tx: repair-only mode has no live decoder
         s3_manifest,
         Some(storage_manager),
     )
@@ -1055,8 +1053,6 @@ async fn repair_only_chain(
         &config.raw_data_collection,
         rx,
         outputs,
-        None,
-        None,
         false,
         true,
         repair_scope,
@@ -1093,7 +1089,8 @@ async fn repair_factories_chain(
         &None,
         &None,
         &None,
-        None,
+        &None,
+        &None,
         s3_manifest,
         Some(storage_manager),
         true,
@@ -1205,7 +1202,6 @@ async fn process_chain_live_only(
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
                     transform_retry_rx,
-                    None, // No decode catchup signal in live-only mode
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))
@@ -1255,7 +1251,7 @@ async fn process_chain_live_only(
                 complete_tx: transform_complete_tx.as_ref(),
                 retry_tx: transform_retry_tx.as_ref(),
             };
-            decode_eth_calls(&chain, &cfg, rx, outputs, None, None, true, false, None)
+            decode_eth_calls(&chain, &cfg, rx, outputs, true, false, None)
                 .await
                 .context("eth_call decoding failed")
         });
@@ -1527,8 +1523,6 @@ impl FullPipelineContext {
         call_decoder_tx: Option<mpsc::Sender<DecoderMessage>>,
         eth_calls_factory_rx: Option<mpsc::Receiver<FactoryMessage>>,
         event_trigger_rx: Option<mpsc::Receiver<EventTriggerMessage>>,
-        factory_catchup_done_rx: Option<oneshot::Receiver<()>>,
-        eth_calls_catchup_done_tx: Option<oneshot::Sender<()>>,
     ) {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
@@ -1543,36 +1537,44 @@ impl FullPipelineContext {
             tasks,
             {
                 let (chain, cfg, sm) = (chain.clone(), cfg.clone(), sm.clone());
+                // Clone decoder_tx so the catchup phase can stream per-range
+                // EthCallsReady/OnceCallsReady/EventCallsReady messages to the
+                // decoder as raw parquet files are finalized. The original
+                // sender is kept for the current phase (below).
+                let call_decoder_tx_catchup = call_decoder_tx.clone();
                 async move {
                     let sm_for_current = sm.clone();
-                    raw_data::historical::catchup::eth_calls::collect_eth_calls(
-                        &chain,
-                        &eth_calls_client,
-                        &cfg,
-                        repair,
-                        false,
-                        repair_scope.clone(),
-                        has_factory_rx,
-                        has_event_trigger_rx,
-                        factory_catchup_done_rx,
-                        eth_calls_catchup_done_tx,
-                        s3_manifest,
-                        Some(sm),
-                    )
-                    .await
-                    .context("eth_calls catchup failed")
-                    .map(|state| {
-                        (
-                            state,
-                            eth_calls_client,
-                            chain,
-                            cfg,
-                            call_decoder_tx,
+                    // The factory Receiver is passed to catchup which drains it
+                    // until AllComplete (for Phase B streaming), then returns it
+                    // so the current phase can continue consuming messages sent
+                    // by the live factories collector.
+                    let (state, eth_calls_factory_rx) =
+                        raw_data::historical::catchup::eth_calls::collect_eth_calls(
+                            &chain,
+                            &eth_calls_client,
+                            &cfg,
+                            repair,
+                            false,
+                            repair_scope.clone(),
+                            has_factory_rx,
+                            has_event_trigger_rx,
                             eth_calls_factory_rx,
-                            event_trigger_rx,
-                            sm_for_current,
+                            call_decoder_tx_catchup,
+                            s3_manifest,
+                            Some(sm),
                         )
-                    })
+                        .await
+                        .context("eth_calls catchup failed")?;
+                    Ok((
+                        state,
+                        eth_calls_client,
+                        chain,
+                        cfg,
+                        call_decoder_tx,
+                        eth_calls_factory_rx,
+                        event_trigger_rx,
+                        sm_for_current,
+                    ))
                 }
             },
             |args| {
@@ -1617,7 +1619,6 @@ impl FullPipelineContext {
         log_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
         call_decoder_tx_for_factories: Option<mpsc::Sender<DecoderMessage>>,
         recollect_tx_for_factories: Option<mpsc::Sender<RecollectRequest>>,
-        factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     ) {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
@@ -1628,14 +1629,21 @@ impl FullPipelineContext {
             tasks,
             {
                 let (chain, cfg) = (chain.clone(), cfg.clone());
+                // Clone the streaming senders so catchup and current each have
+                // their own handles. The catchup phase emits FactoryMessage and
+                // DecoderMessage::FactoryAddresses per range to match the live
+                // phase's behavior (see catchup/factories.rs).
+                let eth_calls_factory_tx_catchup = eth_calls_factory_tx.clone();
+                let call_decoder_tx_catchup = call_decoder_tx_for_factories.clone();
                 async move {
                     raw_data::historical::catchup::factories::collect_factories(
                         &chain,
                         &cfg,
                         &logs_factory_tx,
+                        &eth_calls_factory_tx_catchup,
                         &log_decoder_tx_for_factories,
+                        &call_decoder_tx_catchup,
                         &recollect_tx_for_factories,
-                        factory_catchup_done_tx,
                         s3_manifest,
                         Some(sm),
                         false,
@@ -1724,8 +1732,6 @@ impl FullPipelineContext {
         transform_calls_tx: Option<mpsc::Sender<transformations::DecodedCallsMessage>>,
         transform_complete_tx: Option<mpsc::Sender<transformations::RangeCompleteMessage>>,
         transform_retry_tx: Option<mpsc::Sender<TransformRetryRequest>>,
-        eth_calls_catchup_done_rx: Option<oneshot::Receiver<()>>,
-        decode_catchup_done_tx: Option<oneshot::Sender<()>>,
     ) {
         let chain = self.chain().clone();
         let cfg = self.raw_config.clone();
@@ -1743,8 +1749,6 @@ impl FullPipelineContext {
                 &cfg,
                 call_decoder_rx,
                 outputs,
-                eth_calls_catchup_done_rx,
-                decode_catchup_done_tx,
                 false,
                 repair,
                 repair_scope,
@@ -1805,8 +1809,6 @@ async fn process_chain(
         transform_reorg_rx,
         transform_retry_tx,
         transform_retry_rx,
-        decode_catchup_done_tx,
-        decode_catchup_done_rx,
     } = CommonChannels::build_for_full(config, features, transformations_enabled);
 
     // Historical-only channels
@@ -1833,21 +1835,6 @@ async fn process_chain(
         optional_channel::<EventTriggerMessage>(has_event_triggered_calls, channel_cap);
     let (recollect_tx, recollect_rx) =
         optional_channel::<RecollectRequest>(needs_recollect, channel_cap);
-
-    // Catchup synchronization barriers
-    let (factory_catchup_done_tx, factory_catchup_done_rx) = if has_factories {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let (eth_calls_catchup_done_tx, eth_calls_catchup_done_rx) = if has_calls {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
 
     let event_matchers = if has_event_triggered_calls {
         build_event_trigger_matchers(&runtime.chain.contracts)
@@ -1960,8 +1947,6 @@ async fn process_chain(
         call_decoder_tx,
         eth_calls_factory_rx,
         event_trigger_rx,
-        factory_catchup_done_rx,
-        eth_calls_catchup_done_tx,
     );
 
     if has_factories {
@@ -1973,7 +1958,6 @@ async fn process_chain(
             log_decoder_tx_for_factories,
             call_decoder_tx_for_factories,
             recollect_tx_for_factories,
-            factory_catchup_done_tx,
         );
     }
 
@@ -1995,8 +1979,6 @@ async fn process_chain(
             transform_calls_tx.clone(),
             transform_complete_tx.clone(),
             transform_retry_tx.clone(),
-            eth_calls_catchup_done_rx,
-            decode_catchup_done_tx,
         );
     }
 
@@ -2063,7 +2045,6 @@ async fn process_chain(
                     transform_complete_rx.unwrap(),
                     transform_reorg_rx,
                     retry_rx,
-                    decode_catchup_done_rx,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("transformation engine error: {}", e))

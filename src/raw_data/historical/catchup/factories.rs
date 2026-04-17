@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -12,7 +11,8 @@ use crate::decoding::DecoderMessage;
 use crate::raw_data::historical::factories::{
     build_factory_matchers, get_existing_log_ranges, load_factory_addresses_from_parquet_async,
     process_range_batches, read_log_batches_from_parquet_async, scan_existing_parquet_files,
-    FactoryAddressData, FactoryCatchupState, FactoryCollectionError, RecollectRequest,
+    FactoryAddressData, FactoryCatchupState, FactoryCollectionError, FactoryMessage,
+    RecollectRequest,
 };
 use crate::storage::contract_index::{
     build_address_contract_map, build_expected_factory_contracts_for_range,
@@ -24,6 +24,81 @@ use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManage
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::defaults::raw_data as raw_data_defaults;
 use crate::types::config::raw_data::RawDataCollectionConfig;
+
+/// Streaming send of `IncrementalAddresses` + `RangeComplete` for one
+/// finalized range. Uses `send().await` so a slow consumer back-pressures
+/// the producer (safe now that `collect_eth_calls` drains factory_rx
+/// concurrently — see catchup/eth_calls.rs).
+async fn send_factory_range_to_eth_calls(
+    tx: &Option<Sender<FactoryMessage>>,
+    factory_data: &Arc<FactoryAddressData>,
+) -> Result<(), FactoryCollectionError> {
+    let Some(tx) = tx else {
+        return Ok(());
+    };
+    let range_start = factory_data.range_start;
+    let range_end = factory_data.range_end;
+    if tx
+        .send(FactoryMessage::IncrementalAddresses(Arc::clone(factory_data)))
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "eth_calls_factory_tx (IncrementalAddresses {}-{}) - receiver dropped",
+            range_start, range_end
+        )));
+    }
+    if tx
+        .send(FactoryMessage::RangeComplete {
+            range_start,
+            range_end,
+        })
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "eth_calls_factory_tx (RangeComplete {}-{}) - receiver dropped",
+            range_start, range_end
+        )));
+    }
+    Ok(())
+}
+
+/// Send `DecoderMessage::FactoryAddresses` for a finalized range.
+async fn send_factory_addresses_to_decoder(
+    tx: &Option<Sender<DecoderMessage>>,
+    label: &str,
+    range_start: u64,
+    range_end: u64,
+    addresses: HashMap<String, Vec<Address>>,
+) -> Result<(), FactoryCollectionError> {
+    let Some(tx) = tx else {
+        return Ok(());
+    };
+    if tx
+        .send(DecoderMessage::FactoryAddresses {
+            range_start,
+            range_end,
+            addresses,
+        })
+        .await
+        .is_err()
+    {
+        return Err(FactoryCollectionError::ChannelSend(format!(
+            "{} {}-{}) - receiver dropped",
+            label, range_start, range_end
+        )));
+    }
+    Ok(())
+}
+
+/// Best-effort `AllComplete` send. We tolerate a closed channel because in
+/// catch-up-only mode the eth_calls catchup may have already exited.
+async fn send_factory_all_complete(tx: &Option<Sender<FactoryMessage>>) {
+    if let Some(tx) = tx {
+        let _ = tx.send(FactoryMessage::AllComplete).await;
+    }
+}
 
 fn active_factory_contracts_for_range(
     chain: &ChainConfig,
@@ -76,9 +151,10 @@ pub async fn collect_factories(
     chain: &ChainConfig,
     raw_data_config: &RawDataCollectionConfig,
     logs_factory_tx: &Option<Sender<Arc<FactoryAddressData>>>,
+    eth_calls_factory_tx: &Option<Sender<FactoryMessage>>,
     log_decoder_tx: &Option<Sender<DecoderMessage>>,
+    call_decoder_tx: &Option<Sender<DecoderMessage>>,
     recollect_tx: &Option<Sender<RecollectRequest>>,
-    factory_catchup_done_tx: Option<oneshot::Sender<()>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
     repair_all: bool,
@@ -121,13 +197,11 @@ pub async fn collect_factories(
                 }
             }
 
-            // Note: eth_calls_factory_tx and call_decoder_tx sends are intentionally
-            // skipped during catchup. Both consumers load factory addresses from parquet
-            // during their own catchup phases. Sending here would deadlock because those
-            // channels (capacity 1000) aren't consumed until after factory catchup completes.
-            // The channels are used during the live/current phase instead.
+            // Stream the same data to eth_calls and call_decoder consumers per
+            // range. Safe because those consumers run concurrently with this
+            // task and drain their channels — see catchup/eth_calls.rs.
+            send_factory_range_to_eth_calls(eth_calls_factory_tx, &factory_data).await?;
 
-            // Send to log decoder
             let addresses: HashMap<String, Vec<Address>> = factory_data
                 .addresses_by_block
                 .values()
@@ -137,26 +211,23 @@ pub async fn collect_factories(
                     acc
                 });
 
-            if let Some(ref tx) = log_decoder_tx {
-                if tx
-                    .send(DecoderMessage::FactoryAddresses {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                        addresses,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        "Failed to send factory addresses to log decoder for range {}-{} - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    );
-                    return Err(FactoryCollectionError::ChannelSend(format!(
-                        "log_decoder_tx (existing factory data {}-{}) - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    )));
-                }
-            }
+            send_factory_addresses_to_decoder(
+                log_decoder_tx,
+                "log_decoder_tx (existing factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses.clone(),
+            )
+            .await?;
+
+            send_factory_addresses_to_decoder(
+                call_decoder_tx,
+                "call_decoder_tx (existing factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses,
+            )
+            .await?;
         }
     }
 
@@ -168,9 +239,7 @@ pub async fn collect_factories(
             chain.name
         );
 
-        if let Some(tx) = factory_catchup_done_tx {
-            let _ = tx.send(());
-        }
+        send_factory_all_complete(eth_calls_factory_tx).await;
 
         return Ok(FactoryCatchupState {
             matchers: Arc::new(matchers),
@@ -563,8 +632,7 @@ pub async fn collect_factories(
                 }
             }
 
-            // eth_calls_factory_tx and call_decoder_tx sends skipped during catchup
-            // (see comment in existing data forwarding loop above)
+            send_factory_range_to_eth_calls(eth_calls_factory_tx, &factory_data).await?;
 
             let addresses: HashMap<String, Vec<Address>> = factory_data
                 .addresses_by_block
@@ -575,26 +643,23 @@ pub async fn collect_factories(
                     acc
                 });
 
-            if let Some(ref tx) = log_decoder_tx {
-                if tx
-                    .send(DecoderMessage::FactoryAddresses {
-                        range_start: factory_data.range_start,
-                        range_end: factory_data.range_end,
-                        addresses,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        "Failed to send factory addresses to log decoder for range {}-{} - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    );
-                    return Err(FactoryCollectionError::ChannelSend(format!(
-                        "log_decoder_tx (catchup factory data {}-{}) - receiver dropped",
-                        factory_data.range_start, factory_data.range_end
-                    )));
-                }
-            }
+            send_factory_addresses_to_decoder(
+                log_decoder_tx,
+                "log_decoder_tx (catchup factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses.clone(),
+            )
+            .await?;
+
+            send_factory_addresses_to_decoder(
+                call_decoder_tx,
+                "call_decoder_tx (catchup factory data",
+                factory_data.range_start,
+                factory_data.range_end,
+                addresses,
+            )
+            .await?;
 
             catchup_count += 1;
         }
@@ -643,9 +708,7 @@ pub async fn collect_factories(
         );
     }
 
-    if let Some(tx) = factory_catchup_done_tx {
-        let _ = tx.send(());
-    }
+    send_factory_all_complete(eth_calls_factory_tx).await;
 
     // Extract from Arc - at this point all tasks are done so we're the only owner
     let s3_manifest = Arc::try_unwrap(s3_manifest).unwrap_or_else(|arc| (*arc).clone());

@@ -192,8 +192,8 @@ impl EventHandler for MigrationPoolCreateHandler {
             dep("V4CreateHandler").except([57073, 143]),
             dep("V4MulticurveCreateHandler").except([57073, 143]),
             dep("V4ScheduledMulticurveCreateHandler").except([57073, 143]),
-            "V4DecayMulticurveCreateHandler",
-            "DopplerHookCreateHandler",
+            dep("V4DecayMulticurveCreateHandler"),
+            dep("DopplerHookCreateHandler"),
         ]
     }
 }
