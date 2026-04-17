@@ -173,24 +173,25 @@ pub(crate) async fn process_event_triggered_catchup_range(
     }
 
     // === I/O phase: acquire permit to limit concurrent file reads ===
-    let _io_permit = Arc::clone(&ctx.io_semaphore).acquire_owned().await.unwrap();
+    let _io_permit = Arc::clone(&ctx.io_semaphore)
+        .acquire_owned()
+        .await
+        .unwrap();
 
     // Read projected parquet + extract triggers
-    let batches = match read_event_trigger_log_batches_from_parquet_async(
-        log_range.file_path.clone(),
-    )
-    .await
-    {
-        Ok(batches) => batches,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to read projected logs from {}: {}",
-                log_range.file_path.display(),
-                e
-            );
-            return Ok(None);
-        }
-    };
+    let batches =
+        match read_event_trigger_log_batches_from_parquet_async(log_range.file_path.clone()).await
+        {
+            Ok(batches) => batches,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read projected logs from {}: {}",
+                    log_range.file_path.display(),
+                    e
+                );
+                return Ok(None);
+            }
+        };
 
     let log_count: usize = batches.iter().map(|b| b.num_rows()).sum();
     if log_count == 0 {
@@ -624,19 +625,11 @@ pub async fn collect_eth_calls(
     repair_scope: Option<RepairScope>,
     has_factory_rx: bool,
     has_event_trigger_rx: bool,
-    mut factory_rx: Option<
-        tokio::sync::mpsc::Receiver<crate::raw_data::historical::factories::FactoryMessage>,
-    >,
+    mut factory_rx: Option<tokio::sync::mpsc::Receiver<crate::raw_data::historical::factories::FactoryMessage>>,
     decoder_tx: Option<tokio::sync::mpsc::Sender<crate::decoding::DecoderMessage>>,
     s3_manifest: Option<S3Manifest>,
     storage_manager: Option<Arc<StorageManager>>,
-) -> Result<
-    (
-        EthCallCatchupState,
-        Option<tokio::sync::mpsc::Receiver<crate::raw_data::historical::factories::FactoryMessage>>,
-    ),
-    EthCallCollectionError,
-> {
+) -> Result<(EthCallCatchupState, Option<tokio::sync::mpsc::Receiver<crate::raw_data::historical::factories::FactoryMessage>>), EthCallCollectionError> {
     let base_output_dir = raw_eth_calls_dir(&chain.name);
     tokio::fs::create_dir_all(&base_output_dir).await?;
     let repair_scope = repair.then_some(repair_scope.as_ref()).flatten();
@@ -1083,10 +1076,8 @@ pub async fn collect_eth_calls(
     // In-memory mirror of the factory contract_index sidecars. Populated from
     // the stream so Phase C's readiness check (`contains_key(&range_key)`)
     // works without reading disk.
-    let mut factory_contract_indexes: HashMap<
-        String,
-        crate::storage::contract_index::ContractIndex,
-    > = HashMap::new();
+    let mut factory_contract_indexes: HashMap<String, crate::storage::contract_index::ContractIndex> =
+        HashMap::new();
 
     // Column indexes for factory-once directories (still loaded from disk;
     // these describe column layouts, not range-readiness).
@@ -1153,7 +1144,9 @@ pub async fn collect_eth_calls(
                     let expected =
                         build_expected_factory_contracts_for_range(&chain.contracts, range_end);
                     for (coll, entries) in &expected {
-                        let idx = factory_contract_indexes.entry(coll.clone()).or_default();
+                        let idx = factory_contract_indexes
+                            .entry(coll.clone())
+                            .or_default();
                         update_contract_index(idx, &rk, entries);
                     }
 
@@ -1162,9 +1155,7 @@ pub async fn collect_eth_calls(
                         let run_phase_b = repair_scope
                             .is_none_or(|scope| scope.matches_range(range_start, range_end));
                         if run_phase_b {
-                            let data = range_factory_data
-                                .get(&range_start)
-                                .cloned()
+                            let data = range_factory_data.get(&range_start).cloned()
                                 .unwrap_or_else(|| FactoryAddressData {
                                     range_start,
                                     range_end,
@@ -1219,7 +1210,9 @@ pub async fn collect_eth_calls(
     } else if catchup_has_factory_once_calls {
         // No factory_rx (shouldn't normally happen if factories are configured),
         // fall back to the original disk-load path.
-        tracing::warn!("catchup_has_factory_once_calls=true but no factory_rx; Phase B skipped");
+        tracing::warn!(
+            "catchup_has_factory_once_calls=true but no factory_rx; Phase B skipped"
+        );
     }
 
     // =========================================================================

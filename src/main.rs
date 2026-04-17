@@ -824,9 +824,17 @@ async fn decode_only_chain(
                     complete_tx: None,
                     retry_tx: None,
                 };
-                decode_eth_calls(&chain, &cfg, rx, outputs, false, repair, repair_scope)
-                    .await
-                    .context("eth call decoding failed")
+                decode_eth_calls(
+                    &chain,
+                    &cfg,
+                    rx,
+                    outputs,
+                    false,
+                    repair,
+                    repair_scope,
+                )
+                .await
+                .context("eth call decoding failed")
             }
         });
     }

@@ -343,9 +343,9 @@ impl DbPool {
 }
 
 fn build_tls_connector() -> Result<MakeTlsConnector, DbError> {
-    let tls_connector = TlsConnector::builder().build().map_err(|e| {
-        DbError::ConfigError(format!("failed to build database TLS connector: {e}"))
-    })?;
+    let tls_connector = TlsConnector::builder()
+        .build()
+        .map_err(|e| DbError::ConfigError(format!("failed to build database TLS connector: {e}")))?;
 
     Ok(MakeTlsConnector::new(tls_connector))
 }
