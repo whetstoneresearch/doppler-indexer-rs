@@ -1421,7 +1421,8 @@ impl TransformationEngine {
                 ),
                 Err(e) => tracing::error!(
                     "Transformation catchup failed for chain {}: {}",
-                    self.chain_name, e
+                    self.chain_name,
+                    e
                 ),
             }
             res

@@ -1,0 +1,10 @@
+services:
+  indexer:
+    image: ${IMAGE_REF:?set IMAGE_REF when deploying}
+    container_name: doppler-indexer-dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    working_dir: /app
