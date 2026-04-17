@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS pool_state (
     chain_id         BIGINT NOT NULL,
     pool_id          BYTEA NOT NULL,
-    block_number     BIGINT NOT NULL,
+    block_height     BIGINT NOT NULL,
     block_timestamp  BIGINT NOT NULL,
     tick             INTEGER,
     sqrt_price       NUMERIC,
@@ -17,4 +17,4 @@ CREATE TABLE IF NOT EXISTS pool_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pool_state_price ON pool_state (price DESC NULLS LAST);
-CREATE INDEX IF NOT EXISTS idx_pool_state_reorg ON pool_state (chain_id, block_number);
+CREATE INDEX IF NOT EXISTS idx_pool_state_reorg ON pool_state (chain_id, block_height);

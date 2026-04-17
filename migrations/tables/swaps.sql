@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS swaps (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,
     tx_id BYTEA NOT NULL,
-    block_number BIGINT NOT NULL,
+    block_height BIGINT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     pool BYTEA NOT NULL,
     asset BYTEA NOT NULL,
@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS swaps (
     market_cap_usd_delta BIGINT NOT NULL,
     liquidity_usd_delta BIGINT NOT NULL,
     value_usd BIGINT NOT NULL,
+    log_position BIGINT,
     source VARCHAR(255) NOT NULL,
     source_version INT NOT NULL,
-    UNIQUE (chain_id, tx_id, source, source_version)
+    UNIQUE (chain_id, tx_id, log_position, source, source_version)
 );

@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS token_metrics (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,  
-    block_number BIGINT NOT NULL,
+    block_height BIGINT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     address BYTEA NOT NULL,
     last_seen TIMESTAMPTZ,

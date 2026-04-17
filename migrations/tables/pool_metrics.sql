@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS pool_metrics (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,  
-    block_number BIGINT NOT NULL,
+    block_height BIGINT NOT NULL,
     timestamp TIMESTAMPTZ NOT NULL,
     last_swap_timestamp TIMESTAMPTZ,
     address BYTEA NOT NULL,

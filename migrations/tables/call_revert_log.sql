@@ -1,8 +1,8 @@
 CREATE TABLE IF NOT EXISTS _call_revert_log (
     id BIGSERIAL PRIMARY KEY,
     chain_id BIGINT NOT NULL,
-    block_number BIGINT NOT NULL,
-    log_index BIGINT,
+    block_height BIGINT NOT NULL,
+    log_position BIGINT,
     source_name VARCHAR(255) NOT NULL,
     function_name VARCHAR(255) NOT NULL,
     target_address BYTEA NOT NULL,
@@ -11,4 +11,4 @@ CREATE TABLE IF NOT EXISTS _call_revert_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_call_revert_log_lookup
-    ON _call_revert_log (chain_id, block_number);
+    ON _call_revert_log (chain_id, block_height);

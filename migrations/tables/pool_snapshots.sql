@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS pool_snapshots (
     chain_id         BIGINT NOT NULL,
     pool_id          BYTEA NOT NULL,
-    block_number     BIGINT NOT NULL,
+    block_height     BIGINT NOT NULL,
     block_timestamp  BIGINT NOT NULL,
     price_open       NUMERIC NOT NULL,
     price_close      NUMERIC NOT NULL,
@@ -13,8 +13,8 @@ CREATE TABLE IF NOT EXISTS pool_snapshots (
     swap_count       INT NOT NULL DEFAULT 0,
     source           VARCHAR(255) NOT NULL,
     source_version   INT NOT NULL,
-    UNIQUE (chain_id, pool_id, block_number, source, source_version)
+    UNIQUE (chain_id, pool_id, block_height, source, source_version)
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_time ON pool_snapshots (pool_id, block_timestamp);
-CREATE INDEX IF NOT EXISTS idx_snapshots_reorg ON pool_snapshots (chain_id, block_number);
+CREATE INDEX IF NOT EXISTS idx_snapshots_reorg ON pool_snapshots (chain_id, block_height);
