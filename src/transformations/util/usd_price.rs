@@ -127,19 +127,21 @@ impl OraclePriceCache {
     }
 
     /// Best-effort one-time DB seed for the shared cache during handler
-    /// initialization. Runtime handlers are initialized sequentially, so a
-    /// simple atomic guard is sufficient here.
+    /// initialization. Uses compare_exchange so concurrent callers each skip
+    /// the load once a winner has claimed it.
     pub async fn load_from_db_once(
         &self,
         db_pool: &Pool,
         chain_id: u64,
     ) -> Result<(), TransformationError> {
-        if self.seeded_from_db.load(Ordering::Acquire) {
+        if self
+            .seeded_from_db
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
             return Ok(());
         }
-        self.load_from_db(db_pool, chain_id).await?;
-        self.seeded_from_db.store(true, Ordering::Release);
-        Ok(())
+        self.load_from_db(db_pool, chain_id).await
     }
 
     fn get(&self, token: &[u8; 20], max_block: Option<u64>) -> Option<(BigDecimal, u64)> {

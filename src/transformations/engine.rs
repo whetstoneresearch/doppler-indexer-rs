@@ -478,15 +478,15 @@ impl TransformationEngine {
         // Register handler sources in active_versions table
         self.register_handler_sources().await?;
 
-        // Then run handler initialization
-        for handler in self.registry.all_handlers() {
+        futures::future::try_join_all(self.registry.all_handlers().iter().map(|handler| {
             tracing::debug!(
                 "Initializing handler: {} ({})",
                 handler.name(),
                 handler.handler_key()
             );
-            handler.initialize(&self.db_pool).await?;
-        }
+            handler.initialize(&self.db_pool)
+        }))
+        .await?;
         Ok(())
     }
 
