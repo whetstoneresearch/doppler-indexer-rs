@@ -258,6 +258,37 @@ impl SolanaChainRuntime {
 // ---------------------------------------------------------------------------
 
 /// Build [`ProgramDecoder`] instances from the chain's Solana program configs.
+fn required_decoder_capabilities(
+    program: &crate::types::config::solana::SolanaProgramConfig,
+) -> Vec<&'static str> {
+    let mut capabilities = Vec::new();
+
+    if program
+        .events
+        .as_ref()
+        .is_some_and(|events| !events.is_empty())
+    {
+        capabilities.push("events");
+    }
+    if program
+        .accounts
+        .as_ref()
+        .is_some_and(|accounts| !accounts.is_empty())
+    {
+        capabilities.push("accounts");
+    }
+    if program
+        .discovery
+        .as_ref()
+        .is_some_and(|discovery| !discovery.is_empty())
+    {
+        capabilities.push("discovery");
+    }
+
+    capabilities
+}
+
+/// Build [`ProgramDecoder`] instances from the chain's Solana program configs.
 fn build_decoders(chain: &ChainConfig) -> anyhow::Result<Vec<Arc<dyn ProgramDecoder>>> {
     let mut decoders: Vec<Arc<dyn ProgramDecoder>> = Vec::new();
 
@@ -273,10 +304,10 @@ fn build_decoders(chain: &ChainConfig) -> anyhow::Result<Vec<Arc<dyn ProgramDeco
                     decoders.push(Arc::new(SplTokenDecoder::new()));
                 }
                 other => {
-                    tracing::warn!(
-                        program = name.as_str(),
-                        decoder = other,
-                        "Unknown built-in decoder, skipping"
+                    anyhow::bail!(
+                        "Unknown built-in decoder '{}' configured for Solana program '{}'",
+                        other,
+                        name
                     );
                 }
             }
@@ -303,9 +334,18 @@ fn build_decoders(chain: &ChainConfig) -> anyhow::Result<Vec<Arc<dyn ProgramDeco
             continue;
         }
 
-        tracing::warn!(
+        let required_capabilities = required_decoder_capabilities(program);
+        if !required_capabilities.is_empty() {
+            anyhow::bail!(
+                "Solana program '{}' enables {} but has no decoder or IDL configured",
+                name,
+                required_capabilities.join(", ")
+            );
+        }
+
+        tracing::debug!(
             program = name.as_str(),
-            "No decoder or IDL configured, program events/instructions will not be decoded"
+            "No decoder configured; skipping program without decode-dependent stages"
         );
     }
 
@@ -2513,6 +2553,72 @@ mod tests {
     }
 
     #[test]
+    fn build_decoders_skips_bare_program_without_decoder() {
+        let programs = make_programs(vec![(
+            "bare",
+            bare_program("11111111111111111111111111111111"),
+        )]);
+        let chain = test_chain_config(programs);
+
+        let decoders = build_decoders(&chain).unwrap();
+        assert!(decoders.is_empty());
+    }
+
+    #[test]
+    fn build_decoders_rejects_unknown_builtin_decoder() {
+        let programs = make_programs(vec![(
+            "spl_token",
+            builtin_program("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "typo"),
+        )]);
+        let chain = test_chain_config(programs);
+
+        let err = build_decoders(&chain)
+            .err()
+            .expect("expected decoder error");
+        assert!(
+            err.to_string().contains("Unknown built-in decoder 'typo'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn build_decoders_rejects_events_without_decoder() {
+        let mut prog = bare_program("11111111111111111111111111111111");
+        prog.events = Some(vec![SolanaEventConfig {
+            name: "Transfer".to_string(),
+            discriminator: None,
+        }]);
+        let chain = test_chain_config(make_programs(vec![("test", prog)]));
+
+        let err = build_decoders(&chain)
+            .err()
+            .expect("expected decoder error");
+        assert!(
+            err.to_string().contains("enables events"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn build_decoders_rejects_accounts_without_decoder() {
+        let mut prog = bare_program("11111111111111111111111111111111");
+        prog.accounts = Some(vec![SolanaAccountReadConfig {
+            name: "pool_state".to_string(),
+            account_type: "Pool".to_string(),
+            frequency: Frequency::Once,
+        }]);
+        let chain = test_chain_config(make_programs(vec![("test", prog)]));
+
+        let err = build_decoders(&chain)
+            .err()
+            .expect("expected decoder error");
+        assert!(
+            err.to_string().contains("enables accounts"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn collect_incomplete_live_slots_deduplicates_all_resume_buckets() {
         let scan = SolanaCatchupScanResult {
             slots_needing_collection_resume: vec![SlotCollectionResumeRequest {
@@ -2567,7 +2673,10 @@ mod tests {
             source_name: "whirlpool".to_string(),
             event_name: "Swap".to_string(),
             event_signature: "Swap".to_string(),
-            params: HashMap::from([("amount".to_string(), DecodedValue::Uint64(1))]),
+            params: HashMap::from([(
+                std::sync::Arc::<str>::from("amount"),
+                DecodedValue::Uint64(1),
+            )]),
         }];
 
         assert_eq!(decoded_events_block_time(&events), Some(1_700_000_123));
@@ -2587,6 +2696,8 @@ mod tests {
             rpc_url_env_var: "SOLANA_RPC_URL".to_string(),
             ws_url_env_var: None,
             start_block: None,
+            from_block: None,
+            to_block: None,
             contracts: Contracts::new(),
             block_receipts_method: None,
             factory_collections: FactoryCollections::new(),
