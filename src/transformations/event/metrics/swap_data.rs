@@ -208,8 +208,8 @@ pub fn process_swaps(
             pool_id: pool_id.clone(),
             block_number: *block_number,
             block_timestamp: acc.block_timestamp,
-            tick: acc.last_tick,
-            sqrt_price_x96: acc.last_sqrt_price_x96.to_string(),
+            tick: Some(acc.last_tick),
+            sqrt_price: Some(acc.last_sqrt_price_x96.to_string()),
             price: price_close.clone(),
             active_liquidity: acc.last_liquidity.to_string(),
         }));

@@ -3,7 +3,7 @@ use crate::transformations::TransformationContext;
 
 pub struct SkippedAddressData<'a> {
     pub block_number: u64,
-    pub tx_hash: &'a [u8; 32],
+    pub tx_id: &'a [u8; 32],
     pub asset_address: &'a [u8; 20],
     pub numeraire_address: &'a [u8; 20],
     pub reason: &'a str,
@@ -18,7 +18,7 @@ pub fn insert_skipped_address(
         columns: vec![
             "chain_id".to_string(),
             "block_number".to_string(),
-            "tx_hash".to_string(),
+            "tx_id".to_string(),
             "asset_address".to_string(),
             "numeraire_address".to_string(),
             "reason".to_string(),
@@ -26,14 +26,14 @@ pub fn insert_skipped_address(
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
             DbValue::Int64(data.block_number as i64),
-            DbValue::Bytes32(*data.tx_hash),
+            DbValue::Bytes32(*data.tx_id),
             DbValue::Address(*data.asset_address),
             DbValue::Address(*data.numeraire_address),
             DbValue::Text(data.reason.to_string()),
         ],
         conflict_columns: vec![
             "chain_id".to_string(),
-            "tx_hash".to_string(),
+            "tx_id".to_string(),
             "asset_address".to_string(),
         ],
         update_columns: vec![],

@@ -274,7 +274,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: event.evm_tx_hash_ref(),
+                    tx_id: event.evm_tx_hash_ref(),
                     creator_address: ctx.tx_from_evm(&event.transaction_id),
                     integrator: Some(&asset_metadata.integrator.into()),
                     token_address: &asset,
@@ -297,7 +297,7 @@ impl TransformationHandler for V4MulticurveCreateHandler {
                 &TokenData {
                     block_number: event.block_number,
                     block_timestamp: event.block_timestamp,
-                    tx_hash: event.evm_tx_hash_ref(),
+                    tx_id: event.evm_tx_hash_ref(),
                     creator_address: None,
                     integrator: None,
                     token_address: &numeraire,

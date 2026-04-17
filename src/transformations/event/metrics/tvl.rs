@@ -463,7 +463,7 @@ WITH prev AS (
   SELECT
     block_number,
     tick,
-    sqrt_price_x96,
+    sqrt_price,
     price
   FROM pool_state
   WHERE chain_id = :chain_id
@@ -487,7 +487,7 @@ newer AS (
 state_seed AS (
   SELECT
     prev.tick,
-    prev.sqrt_price_x96,
+    prev.sqrt_price,
     prev.price
   FROM prev
   UNION ALL
@@ -507,7 +507,7 @@ INSERT INTO pool_state (
   block_number,
   block_timestamp,
   tick,
-  sqrt_price_x96,
+  sqrt_price,
   price,
   active_liquidity,
   volume_24h_usd,
@@ -529,7 +529,7 @@ SELECT
   :block_number,
   :block_timestamp::bigint,
   state_seed.tick,
-  state_seed.sqrt_price_x96,
+  state_seed.sqrt_price,
   state_seed.price,
   :active_liquidity,
   rolling.vol_24h,
@@ -595,7 +595,7 @@ DO UPDATE SET
   block_number = EXCLUDED.block_number,
   block_timestamp = EXCLUDED.block_timestamp,
   tick = EXCLUDED.tick,
-  sqrt_price_x96 = EXCLUDED.sqrt_price_x96,
+  sqrt_price = EXCLUDED.sqrt_price,
   price = EXCLUDED.price,
   active_liquidity = EXCLUDED.active_liquidity,
   volume_24h_usd = EXCLUDED.volume_24h_usd,

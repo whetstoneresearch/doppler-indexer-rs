@@ -11,8 +11,10 @@ pub struct PoolStateData {
     pub pool_id: Vec<u8>,
     pub block_number: u64,
     pub block_timestamp: u64,
-    pub tick: i32,
-    pub sqrt_price_x96: String,
+    /// None for AMM types that don't track ticks (e.g. constant-product Solana pools).
+    pub tick: Option<i32>,
+    /// None for AMM types that don't track sqrt price (e.g. constant-product Solana pools).
+    pub sqrt_price: Option<String>,
     pub price: String,
     pub active_liquidity: String,
 }
@@ -63,7 +65,7 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
             "block_number".into(),
             "block_timestamp".into(),
             "tick".into(),
-            "sqrt_price_x96".into(),
+            "sqrt_price".into(),
             "price".into(),
             "active_liquidity".into(),
         ],
@@ -72,8 +74,11 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
             DbValue::Bytes(data.pool_id.clone()),
             DbValue::Int64(data.block_number as i64),
             DbValue::Int64(data.block_timestamp as i64),
-            DbValue::Int32(data.tick),
-            DbValue::Numeric(data.sqrt_price_x96.clone()),
+            data.tick.map(DbValue::Int32).unwrap_or(DbValue::Null),
+            data.sqrt_price
+                .as_ref()
+                .map(|v| DbValue::Numeric(v.clone()))
+                .unwrap_or(DbValue::Null),
             DbValue::Numeric(data.price.clone()),
             DbValue::Numeric(data.active_liquidity.clone()),
         ],
@@ -82,7 +87,7 @@ pub fn upsert_pool_state(data: &PoolStateData) -> DbOperation {
             "block_number".into(),
             "block_timestamp".into(),
             "tick".into(),
-            "sqrt_price_x96".into(),
+            "sqrt_price".into(),
             "price".into(),
             "active_liquidity".into(),
         ],

@@ -250,7 +250,7 @@ pub async fn get_metadata_or_skip(
             ops.push(insert_skipped_address(
                 &SkippedAddressData {
                     block_number: event.block_number,
-                    tx_hash: event.evm_tx_hash_ref(),
+                    tx_id: event.evm_tx_hash_ref(),
                     asset_address: asset,
                     numeraire_address: numeraire,
                     reason: &msg,

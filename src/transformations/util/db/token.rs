@@ -10,7 +10,7 @@ use crate::types::uniswap::v4::PoolAddressOrPoolId;
 pub struct TokenData<'a> {
     pub block_number: u64,
     pub block_timestamp: u64,
-    pub tx_hash: &'a [u8; 32],
+    pub tx_id: &'a [u8; 32],
     pub creator_address: Option<&'a [u8; 20]>,
     pub integrator: Option<&'a [u8; 20]>,
     pub token_address: &'a [u8; 20],
@@ -35,7 +35,7 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
         update_condition: None,
         columns: vec![
             "chain_id".to_string(),
-            "tx_hash".to_string(),
+            "tx_id".to_string(),
             "block_number".to_string(),
             "created_at".to_string(),
             "creator_address".to_string(),
@@ -55,7 +55,7 @@ pub fn insert_token(data: &TokenData<'_>, ctx: &TransformationContext) -> DbOper
         ],
         values: vec![
             DbValue::Int64(ctx.chain_id as i64),
-            DbValue::Bytes32(*data.tx_hash),
+            DbValue::Bytes32(*data.tx_id),
             DbValue::Uint64(data.block_number),
             DbValue::Timestamp(data.block_timestamp as i64),
             match data.creator_address {
