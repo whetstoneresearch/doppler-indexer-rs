@@ -72,10 +72,7 @@ impl SolanaWsClient {
         }
     }
 
-    pub fn with_default_config(
-        ws_url: &str,
-        rpc_client: Arc<SolanaRpcClient>,
-    ) -> Self {
+    pub fn with_default_config(ws_url: &str, rpc_client: Arc<SolanaRpcClient>) -> Self {
         Self::new(ws_url, rpc_client, ReconnectConfig::default())
     }
 
@@ -102,10 +99,7 @@ impl SolanaWsClient {
         let mut reconnect_attempt = 0u32;
 
         loop {
-            match self
-                .connect_and_listen(&event_tx, &mut last_slot)
-                .await
-            {
+            match self.connect_and_listen(&event_tx, &mut last_slot).await {
                 Ok(()) => {
                     tracing::info!("Solana WebSocket subscription ended cleanly");
                     return Ok(());
@@ -130,8 +124,7 @@ impl SolanaWsClient {
                         return Err(e);
                     }
 
-                    let delay =
-                        self.reconnect_config.delay_for_attempt(reconnect_attempt);
+                    let delay = self.reconnect_config.delay_for_attempt(reconnect_attempt);
                     tracing::info!(
                         "Solana WS reconnecting in {delay:?} (attempt {})",
                         reconnect_attempt + 1,
@@ -183,9 +176,7 @@ impl SolanaWsClient {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get current slot for gap detection: {e}"
-                    );
+                    tracing::warn!("Failed to get current slot for gap detection: {e}");
                 }
             }
         }
@@ -270,10 +261,8 @@ mod tests {
             .unwrap(),
         );
 
-        let ws = SolanaWsClient::with_default_config(
-            "wss://api.mainnet-beta.solana.com",
-            rpc_client,
-        );
+        let ws =
+            SolanaWsClient::with_default_config("wss://api.mainnet-beta.solana.com", rpc_client);
 
         assert_eq!(ws.ws_url, "wss://api.mainnet-beta.solana.com");
         let _ = format!("{ws:?}");

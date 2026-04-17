@@ -59,7 +59,10 @@ pub async fn signature_driven_backfill(
     repair_scope: Option<&RepairScope>,
 ) -> Result<(), SolanaCollectionError> {
     if programs.is_empty() {
-        tracing::info!(chain = chain_name, "No Solana programs configured, nothing to backfill");
+        tracing::info!(
+            chain = chain_name,
+            "No Solana programs configured, nothing to backfill"
+        );
         return Ok(());
     }
 
@@ -236,11 +239,7 @@ pub async fn signature_driven_backfill(
 
     // During repair, pass the target slots so collect_slots_selective can
     // merge fresh data with existing records instead of overwriting.
-    let merge_slots = if is_repair {
-        Some(&target_slots)
-    } else {
-        None
-    };
+    let merge_slots = if is_repair { Some(&target_slots) } else { None };
 
     // When repair scopes to specific sources, also scope the program IDs
     // used for event/instruction extraction so unrelated programs in the
@@ -466,8 +465,7 @@ pub fn find_resume_slot(chain_name: &str) -> Option<u64> {
             for (start, end_inclusive, _path) in ranges {
                 let rk = crate::storage::skipped_slots::range_key(start, end_inclusive);
                 if crate::storage::skipped_slots::is_range_complete(&skipped_index, &rk) {
-                    max_slot =
-                        Some(max_slot.map_or(end_inclusive, |m: u64| m.max(end_inclusive)));
+                    max_slot = Some(max_slot.map_or(end_inclusive, |m: u64| m.max(end_inclusive)));
                 }
             }
         }

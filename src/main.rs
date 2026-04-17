@@ -477,11 +477,12 @@ async fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "solana")]
                 if chain.chain_type == types::chain::ChainType::Solana {
                     if live_only {
-                        tracing::warn!(
-                            chain = chain.name.as_str(),
-                            "Live-only mode not yet supported for Solana chains"
-                        );
-                        Ok(())
+                        solana::pipeline::process_solana_chain_live_only(
+                            &config,
+                            &chain,
+                            shared_db_pool,
+                        )
+                        .await
                     } else if repair_only {
                         tracing::warn!(
                             chain = chain.name.as_str(),
@@ -489,7 +490,8 @@ async fn main() -> anyhow::Result<()> {
                         );
                         Ok(())
                     } else if decode_only {
-                        solana::pipeline::decode_only_solana_chain(&config, &chain, repair_scope).await
+                        solana::pipeline::decode_only_solana_chain(&config, &chain, repair_scope)
+                            .await
                     } else {
                         solana::pipeline::process_solana_chain(
                             &config,
@@ -839,7 +841,7 @@ async fn process_chain_live_only(
         let engine = TransformationEngine::new(
             runtime.registry.clone(),
             runtime.db_pool.clone().unwrap(),
-            rpc_client,
+            Some(rpc_client),
             TransformationEngineConfig {
                 chain_name: chain.name.clone(),
                 chain_id: chain.chain_id,
@@ -1685,7 +1687,7 @@ async fn process_chain(
         let engine = TransformationEngine::new(
             pipeline.runtime.registry.clone(),
             pipeline.runtime.db_pool.clone().unwrap(),
-            rpc_client,
+            Some(rpc_client),
             TransformationEngineConfig {
                 chain_name: pipeline.runtime.chain.name.clone(),
                 chain_id: pipeline.runtime.chain.chain_id,

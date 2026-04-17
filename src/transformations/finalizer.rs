@@ -16,7 +16,9 @@ use super::error::TransformationError;
 use super::live_state::{LiveProcessingState, TimedOutPendingHandler};
 use super::registry::TransformationRegistry;
 use crate::db::{DbOperation, DbPool, DbValue, WhereClause};
-use crate::live::{LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, StorageError};
+use crate::live::{
+    LiveProgressTracker, LiveStorage, LiveUpsertSnapshot, ProgressStatusStorage, StorageError,
+};
 
 /// Handles range finalization, reorg cleanup, and progress tracking.
 pub(crate) struct RangeFinalizer {
@@ -25,6 +27,10 @@ pub(crate) struct RangeFinalizer {
     pub chain_name: String,
     pub chain_id: u64,
     pub progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    /// Status-file storage backend (EVM `LiveStorage` or `SolanaLiveStorage`).
+    /// Used for reading/updating `completed_handlers`, `failed_handlers`,
+    /// and the `transformed` flag regardless of the chain family.
+    pub status_storage: Arc<dyn ProgressStatusStorage>,
     pub expect_log_completion: bool,
     pub expect_eth_call_completion: bool,
     pub expect_account_state_completion: bool,
@@ -144,18 +150,16 @@ impl RangeFinalizer {
             // Persist timed-out handlers as failures so they remain retryable
             let is_single_block = range_key.1 - range_key.0 == 1;
             if is_single_block {
-                let storage = LiveStorage::new(&self.chain_name);
-                if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
-                    for timed_out_handler in &timed_out_handlers {
-                        status
-                            .failed_handlers
-                            .insert(timed_out_handler.handler_key.clone());
-                        status
-                            .completed_handlers
-                            .remove(&timed_out_handler.handler_key);
-                    }
-                    status.transformed = false;
-                }) {
+                if let Err(e) = self.status_storage.update_handler_sets_atomic(
+                    range_key.0,
+                    &mut |completed, failed, transformed| {
+                        for timed_out_handler in &timed_out_handlers {
+                            failed.insert(timed_out_handler.handler_key.clone());
+                            completed.remove(&timed_out_handler.handler_key);
+                        }
+                        *transformed = false;
+                    },
+                ) {
                     if !matches!(e, StorageError::NotFound(_)) {
                         tracing::warn!(
                             "Failed to persist timed-out handlers for block {}: {}",
@@ -221,9 +225,8 @@ impl RangeFinalizer {
 
         // Read failed/completed handlers from status file (single-block only)
         let (failed_handlers, completed_handlers) = if is_single_block {
-            let storage = LiveStorage::new(&self.chain_name);
-            match storage.read_status(range_start) {
-                Ok(status) => (status.failed_handlers, status.completed_handlers),
+            match self.status_storage.read_handler_sets(range_start) {
+                Ok(sets) => sets,
                 Err(StorageError::NotFound(_)) => (HashSet::new(), HashSet::new()),
                 Err(e) => {
                     tracing::warn!(
@@ -297,14 +300,15 @@ impl RangeFinalizer {
 
         // Only set transformed=true if no failed handlers remain
         if is_single_block {
-            let storage = LiveStorage::new(&self.chain_name);
             let registered_keys: HashSet<String> = self
                 .registry
                 .all_handlers()
                 .iter()
                 .map(|h| h.handler_key())
                 .collect();
-            if let Err(e) = update_finalization_status(&storage, range_start, &registered_keys) {
+            if let Err(e) =
+                update_finalization_status(&*self.status_storage, range_start, &registered_keys)
+            {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to update status for block {} during finalization: {}",
@@ -896,18 +900,16 @@ mod tests {
 /// half of the two-phase protocol — retry records handler outcomes, finalization
 /// gates the `transformed` flag.
 pub(crate) fn update_finalization_status(
-    storage: &LiveStorage,
+    storage: &dyn ProgressStatusStorage,
     block_number: u64,
     registered_keys: &HashSet<String>,
 ) -> Result<(), StorageError> {
-    storage.update_status_atomic(block_number, |status| {
+    storage.update_handler_sets_atomic(block_number, &mut |_completed, failed, transformed| {
         // Filter stale keys: only keep failed handlers that are still registered
-        status
-            .failed_handlers
-            .retain(|k| registered_keys.contains(k));
+        failed.retain(|k| registered_keys.contains(k));
 
-        if status.failed_handlers.is_empty() {
-            status.transformed = true;
+        if failed.is_empty() {
+            *transformed = true;
         }
     })
 }

@@ -58,7 +58,8 @@ impl TransformationHandler for MulticurveSwapMetricsHandler {
         ctx: &TransformationContext,
     ) -> Result<Vec<DbOperation>, TransformationError> {
         self.decimals_init.call_once(|| {
-            self.metadata_cache.resolve_quote_decimals(&ctx.contracts);
+            self.metadata_cache
+                .resolve_quote_decimals(ctx.contracts_ref());
         });
 
         let swaps = extract_v4_hook_swaps(ctx, SOURCE, SOURCE)?;
@@ -68,7 +69,7 @@ impl TransformationHandler for MulticurveSwapMetricsHandler {
             &self.metadata_cache,
             &self.db_pool,
             self.chain_id,
-            &ctx.contracts,
+            ctx.contracts_ref(),
             self.name(),
             SOURCE,
         )

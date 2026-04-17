@@ -1,6 +1,6 @@
 //! Per-block progress tracking for live mode.
 //!
-//! Tracks which handlers have completed processing for each block,
+//! Tracks which handlers have completed processing for each block/slot,
 //! enabling the compaction service to know when ranges are ready.
 
 use std::collections::{HashMap, HashSet};
@@ -8,11 +8,96 @@ use std::sync::Arc;
 
 use tokio_postgres::types::ToSql;
 
+use super::bincode_io::StorageError;
 use super::error::LiveError;
 use super::storage::LiveStorage;
 use crate::db::DbPool;
 
-/// Tracks per-block progress for all handlers.
+/// Abstracts status-file operations so the progress tracker and the
+/// transformation engine work with both EVM (`LiveBlockStatus`) and
+/// Solana (`LiveSlotStatus`) storage.
+///
+/// Only the shared handler-tracking fields are exposed — completed
+/// handlers, failed handlers, and the `transformed` flag — so callers
+/// never need to know which concrete status type is on disk.
+pub trait ProgressStatusStorage: Send + Sync {
+    /// Atomically insert a handler key into `completed_handlers` and,
+    /// when `all_complete` is true, set `transformed = true`.
+    fn update_handler_completion(
+        &self,
+        number: u64,
+        handler_key: &str,
+        all_complete: bool,
+    ) -> Result<(), StorageError>;
+
+    /// Set `transformed = true` (used when no handlers are registered).
+    fn mark_transformed(&self, number: u64) -> Result<(), StorageError>;
+
+    /// Read `(failed_handlers, completed_handlers)` from the status file.
+    ///
+    /// Returns `Err(StorageError::NotFound(_))` when the file is absent —
+    /// callers typically treat that as a pair of empty sets.
+    fn read_handler_sets(
+        &self,
+        number: u64,
+    ) -> Result<(HashSet<String>, HashSet<String>), StorageError>;
+
+    /// Atomically read-modify-write the handler-tracking fields of a
+    /// status file. The closure receives mutable references to
+    /// `completed_handlers`, `failed_handlers`, and `transformed`.
+    fn update_handler_sets_atomic(
+        &self,
+        number: u64,
+        update_fn: &mut dyn FnMut(&mut HashSet<String>, &mut HashSet<String>, &mut bool),
+    ) -> Result<(), StorageError>;
+}
+
+impl ProgressStatusStorage for LiveStorage {
+    fn update_handler_completion(
+        &self,
+        number: u64,
+        handler_key: &str,
+        all_complete: bool,
+    ) -> Result<(), StorageError> {
+        let hk = handler_key.to_string();
+        self.update_status_atomic(number, move |status| {
+            status.completed_handlers.insert(hk);
+            if all_complete {
+                status.transformed = true;
+            }
+        })
+    }
+
+    fn mark_transformed(&self, number: u64) -> Result<(), StorageError> {
+        self.update_status_atomic(number, |status| {
+            status.transformed = true;
+        })
+    }
+
+    fn read_handler_sets(
+        &self,
+        number: u64,
+    ) -> Result<(HashSet<String>, HashSet<String>), StorageError> {
+        let status = self.read_status(number)?;
+        Ok((status.failed_handlers, status.completed_handlers))
+    }
+
+    fn update_handler_sets_atomic(
+        &self,
+        number: u64,
+        update_fn: &mut dyn FnMut(&mut HashSet<String>, &mut HashSet<String>, &mut bool),
+    ) -> Result<(), StorageError> {
+        self.update_status_atomic(number, |status| {
+            update_fn(
+                &mut status.completed_handlers,
+                &mut status.failed_handlers,
+                &mut status.transformed,
+            );
+        })
+    }
+}
+
+/// Tracks per-block/slot progress for all handlers.
 pub struct LiveProgressTracker {
     chain_id: i64,
     /// Chain name for LiveStorage access.
@@ -23,18 +108,46 @@ pub struct LiveProgressTracker {
     handler_keys: HashSet<String>,
     /// Database pool for persistence (optional).
     db_pool: Option<Arc<DbPool>>,
+    /// Backend for status-file updates. Defaults to EVM `LiveStorage`;
+    /// Solana pipelines override this with `SolanaLiveStorage`.
+    /// Stored as `Arc` so the transformation engine can share the same
+    /// backend for its own status-file reads/writes.
+    status_storage: Arc<dyn ProgressStatusStorage>,
 }
 
 impl LiveProgressTracker {
     /// Create a new progress tracker.
+    ///
+    /// Defaults to EVM `LiveStorage` for status-file updates. Call
+    /// [`set_status_storage`] to override for Solana pipelines.
     pub fn new(chain_id: i64, db_pool: Option<Arc<DbPool>>, chain_name: String) -> Self {
+        let status_storage: Arc<dyn ProgressStatusStorage> =
+            Arc::new(LiveStorage::new(&chain_name));
         Self {
             chain_id,
             chain_name,
             completed: HashMap::new(),
             handler_keys: HashSet::new(),
             db_pool,
+            status_storage,
         }
+    }
+
+    /// Replace the status-file storage backend.
+    ///
+    /// Solana pipelines call this with a `SolanaLiveStorage` so that
+    /// handler completion, failure, and `transformed` flags are written
+    /// to `LiveSlotStatus` files instead of `LiveBlockStatus` files.
+    pub fn set_status_storage(&mut self, storage: Arc<dyn ProgressStatusStorage>) {
+        self.status_storage = storage;
+    }
+
+    /// Return the current status-file storage backend.
+    ///
+    /// Used by the transformation engine to share the same backend for
+    /// its own read/modify/write of status files.
+    pub fn status_storage(&self) -> Arc<dyn ProgressStatusStorage> {
+        self.status_storage.clone()
     }
 
     /// Register a handler key. Must be called before marking progress.
@@ -87,9 +200,8 @@ impl LiveProgressTracker {
                 .await?;
         }
 
-        // Persist handler completion to status file using atomic update
-        // to prevent race conditions when multiple handlers complete simultaneously
-        let storage = LiveStorage::new(&self.chain_name);
+        // Persist handler completion to status file using the configured
+        // storage backend (EVM LiveStorage or SolanaLiveStorage).
         let all_complete = self.is_block_complete(block_number);
         let handler_count = self.handler_keys.len();
         let pending = if all_complete {
@@ -99,15 +211,10 @@ impl LiveProgressTracker {
         } else {
             None
         };
-        let handler_key_owned = handler_key.to_string();
 
-        let update_result = storage.update_status_atomic(block_number, |status| {
-            status.completed_handlers.insert(handler_key_owned.clone());
-
-            if all_complete {
-                status.transformed = true;
-            }
-        });
+        let update_result =
+            self.status_storage
+                .update_handler_completion(block_number, handler_key, all_complete);
 
         match update_result {
             Ok(()) => {
@@ -154,18 +261,15 @@ impl LiveProgressTracker {
         }
     }
 
-    /// Mark a block as transformed when no handlers are registered.
+    /// Mark a block/slot as transformed when no handlers are registered.
     /// This should be called after all collection/decoding is done.
     pub fn mark_transformed_if_no_handlers(&self, block_number: u64) {
         if !self.handler_keys.is_empty() {
             return;
         }
 
-        let storage = LiveStorage::new(&self.chain_name);
-        if let Err(e) = storage.update_status_atomic(block_number, |status| {
-            status.transformed = true;
-        }) {
-            tracing::warn!("Failed to update block status (no handlers): {}", e);
+        if let Err(e) = self.status_storage.mark_transformed(block_number) {
+            tracing::warn!("Failed to update status (no handlers): {}", e);
         }
     }
 
@@ -181,6 +285,20 @@ impl LiveProgressTracker {
     pub fn get_pending_handlers(&self, block_number: u64) -> HashSet<String> {
         let completed = self.get_completed_handlers(block_number);
         self.handler_keys.difference(&completed).cloned().collect()
+    }
+
+    /// Restore completed-handler progress from a persisted source.
+    ///
+    /// Called on startup to reseed the in-memory tracker from saved status
+    /// files so that compaction can recognize slots that finished transformation
+    /// before the last restart.
+    pub fn restore_completed(&mut self, block_number: u64, handlers: HashSet<String>) {
+        if !handlers.is_empty() {
+            self.completed
+                .entry(block_number)
+                .or_default()
+                .extend(handlers);
+        }
     }
 
     /// Clear progress for a block (used after compaction).
@@ -240,7 +358,7 @@ impl LiveProgressTracker {
                             .extend(status.completed_handlers);
                     }
                 }
-                Err(super::storage::StorageError::NotFound(_)) => {
+                Err(super::bincode_io::StorageError::NotFound(_)) => {
                     // Status file doesn't exist, skip
                     continue;
                 }

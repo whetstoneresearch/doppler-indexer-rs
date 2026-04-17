@@ -153,7 +153,7 @@ Read the tables below as target analysis plus branch notes, not a literal invent
 | `ReorgDetector` | At `confirmed` commitment, skip reorg detection (Solana has never reorged a confirmed block). Reject `processed` commitment in config validation |
 | `WsClient` | `eth_subscribe("newHeads")` → `slotSubscribe` or `blockSubscribe` |
 | `CompactionService` | Generic — works for any block-ranged data |
-| `LiveProgressTracker` | Generic — no changes needed |
+| `LiveProgressTracker` | Generic — uses `ProgressStatusStorage` trait; Solana sets `SolanaLiveStorage` backend via `set_status_storage()` |
 
 ---
 

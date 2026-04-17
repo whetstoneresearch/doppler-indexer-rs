@@ -168,9 +168,9 @@ pub fn deserialize_value(
         }
 
         IdlType::Defined(name) => {
-            let type_def = defined_types.get(name).ok_or_else(|| {
-                SolanaDecodeError::UnknownType(name.clone())
-            })?;
+            let type_def = defined_types
+                .get(name)
+                .ok_or_else(|| SolanaDecodeError::UnknownType(name.clone()))?;
 
             match type_def {
                 IdlTypeDef::Struct { fields } => {
@@ -198,8 +198,7 @@ pub fn deserialize_value(
                                 DecodedValue::String(variant.name.clone()),
                             ));
                             for (field_name, field_type) in fields {
-                                let val =
-                                    deserialize_value(cursor, field_type, defined_types)?;
+                                let val = deserialize_value(cursor, field_type, defined_types)?;
                                 pairs.push((field_name.clone(), val));
                             }
                             Ok(DecodedValue::NamedTuple(pairs))
@@ -586,9 +585,12 @@ mod tests {
         data.extend_from_slice(&(-20i32).to_le_bytes());
 
         let mut cursor: &[u8] = &data;
-        let val =
-            deserialize_value(&mut cursor, &IdlType::Defined("Point".to_string()), &defined_types)
-                .unwrap();
+        let val = deserialize_value(
+            &mut cursor,
+            &IdlType::Defined("Point".to_string()),
+            &defined_types,
+        )
+        .unwrap();
 
         match &val {
             DecodedValue::NamedTuple(fields) => {
@@ -632,9 +634,12 @@ mod tests {
         // variant index = 1 => "Green"
         let data = [1u8];
         let mut cursor: &[u8] = &data;
-        let val =
-            deserialize_value(&mut cursor, &IdlType::Defined("Color".to_string()), &defined_types)
-                .unwrap();
+        let val = deserialize_value(
+            &mut cursor,
+            &IdlType::Defined("Color".to_string()),
+            &defined_types,
+        )
+        .unwrap();
 
         assert_eq!(val.as_string(), Some("Green"));
     }
@@ -671,9 +676,12 @@ mod tests {
         data.extend_from_slice(&10u32.to_le_bytes()); // h = 10
 
         let mut cursor: &[u8] = &data;
-        let val =
-            deserialize_value(&mut cursor, &IdlType::Defined("Shape".to_string()), &defined_types)
-                .unwrap();
+        let val = deserialize_value(
+            &mut cursor,
+            &IdlType::Defined("Shape".to_string()),
+            &defined_types,
+        )
+        .unwrap();
 
         match &val {
             DecodedValue::NamedTuple(fields) => {
@@ -716,9 +724,12 @@ mod tests {
         data.extend_from_slice(&42u64.to_le_bytes()); // inner.val = 42
 
         let mut cursor: &[u8] = &data;
-        let val =
-            deserialize_value(&mut cursor, &IdlType::Defined("Outer".to_string()), &defined_types)
-                .unwrap();
+        let val = deserialize_value(
+            &mut cursor,
+            &IdlType::Defined("Outer".to_string()),
+            &defined_types,
+        )
+        .unwrap();
 
         match &val {
             DecodedValue::NamedTuple(fields) => {
@@ -788,8 +799,11 @@ mod tests {
         // variant index 5 is out of range (only 1 variant exists)
         let data = [5u8];
         let mut cursor: &[u8] = &data;
-        let result =
-            deserialize_value(&mut cursor, &IdlType::Defined("Small".to_string()), &defined_types);
+        let result = deserialize_value(
+            &mut cursor,
+            &IdlType::Defined("Small".to_string()),
+            &defined_types,
+        );
         match result {
             Err(SolanaDecodeError::InvalidEnumVariant(5)) => {}
             other => panic!("expected InvalidEnumVariant(5), got {:?}", other),
@@ -838,7 +852,10 @@ mod tests {
                 fields: vec![
                     ("amount".to_string(), IdlType::U64),
                     ("authority".to_string(), IdlType::Pubkey),
-                    ("maybe_fee".to_string(), IdlType::Option(Box::new(IdlType::U32))),
+                    (
+                        "maybe_fee".to_string(),
+                        IdlType::Option(Box::new(IdlType::U32)),
+                    ),
                     ("tags".to_string(), IdlType::Vec(Box::new(IdlType::U8))),
                 ],
             },
@@ -880,10 +897,7 @@ mod tests {
 
                 // authority
                 assert_eq!(fields[1].0, "authority");
-                assert_eq!(
-                    fields[1].1.as_pubkey(),
-                    Some([0xAA; 32])
-                );
+                assert_eq!(fields[1].1.as_pubkey(), Some([0xAA; 32]));
 
                 // maybe_fee
                 assert_eq!(fields[2].0, "maybe_fee");
@@ -915,9 +929,16 @@ mod tests {
         data.extend_from_slice(&[0x01, 0x02]);
 
         let mut cursor: &[u8] = &data;
-        let result = deserialize_value(&mut cursor, &IdlType::Vec(Box::new(IdlType::U8)), &HashMap::new());
+        let result = deserialize_value(
+            &mut cursor,
+            &IdlType::Vec(Box::new(IdlType::U8)),
+            &HashMap::new(),
+        );
         // Must fail with UnexpectedEof, not OOM.
-        assert!(matches!(result, Err(SolanaDecodeError::UnexpectedEof { .. })));
+        assert!(matches!(
+            result,
+            Err(SolanaDecodeError::UnexpectedEof { .. })
+        ));
     }
 
     #[test]

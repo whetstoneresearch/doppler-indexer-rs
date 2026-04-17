@@ -50,7 +50,13 @@ pub fn extract_instructions_from_transaction(
         Some(tx) => tx,
         None => {
             // JSON-encoded transactions: fall back to UiMessage parsing.
-            return extract_from_json_transaction(encoded_tx, meta, slot, block_time, configured_programs);
+            return extract_from_json_transaction(
+                encoded_tx,
+                meta,
+                slot,
+                block_time,
+                configured_programs,
+            );
         }
     };
 
@@ -64,10 +70,7 @@ pub fn extract_instructions_from_transaction(
     };
 
     // Build the full account key list: static keys + loaded addresses (ALT).
-    let mut account_keys: Vec<Pubkey> = versioned_tx
-        .message
-        .static_account_keys()
-        .to_vec();
+    let mut account_keys: Vec<Pubkey> = versioned_tx.message.static_account_keys().to_vec();
     append_loaded_addresses(&mut account_keys, meta);
 
     let mut records = Vec::new();
@@ -343,12 +346,7 @@ mod tests {
             version: None,
         };
 
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            100,
-            None,
-            &HashSet::new(),
-        );
+        let result = extract_instructions_from_transaction(&encoded_tx, 100, None, &HashSet::new());
         assert!(result.is_empty());
     }
 
@@ -366,12 +364,7 @@ mod tests {
             version: None,
         };
 
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            100,
-            None,
-            &HashSet::new(),
-        );
+        let result = extract_instructions_from_transaction(&encoded_tx, 100, None, &HashSet::new());
         assert!(result.is_empty());
     }
 
@@ -388,12 +381,7 @@ mod tests {
             version: None,
         };
 
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            100,
-            None,
-            &HashSet::new(),
-        );
+        let result = extract_instructions_from_transaction(&encoded_tx, 100, None, &HashSet::new());
         // The decode() call returns None, then we try JSON path which also
         // returns empty since it's not JSON.
         assert!(result.is_empty());
@@ -459,10 +447,7 @@ mod tests {
 
         // Serialize and base64-encode.
         let tx_bytes = bincode::serialize(&tx).unwrap();
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         let meta = test_meta(None);
         let encoded_tx = EncodedTransactionWithStatusMeta {
@@ -472,24 +457,15 @@ mod tests {
         };
 
         // Without the program configured, no instructions extracted.
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            42,
-            Some(999),
-            &HashSet::new(),
-        );
+        let result =
+            extract_instructions_from_transaction(&encoded_tx, 42, Some(999), &HashSet::new());
         assert!(result.is_empty());
 
         // With the program configured, we get the instruction.
         let mut configured = HashSet::new();
         configured.insert(program_id.to_bytes());
 
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            42,
-            Some(999),
-            &configured,
-        );
+        let result = extract_instructions_from_transaction(&encoded_tx, 42, Some(999), &configured);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].slot, 42);
         assert_eq!(result[0].block_time, Some(999));
@@ -529,10 +505,7 @@ mod tests {
         let tx = Transaction::new(&[&payer], msg, recent_blockhash);
 
         let tx_bytes = bincode::serialize(&tx).unwrap();
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         // Figure out inner_program's index in the account keys.
         // The transaction's account keys are: [payer, account1, outer_program].
@@ -548,9 +521,7 @@ mod tests {
 
         let inner_group = solana_transaction_status::UiInnerInstructions {
             index: 0, // parent instruction index
-            instructions: vec![solana_transaction_status::UiInstruction::Compiled(
-                inner_ix,
-            )],
+            instructions: vec![solana_transaction_status::UiInstruction::Compiled(inner_ix)],
         };
 
         let loaded = solana_transaction_status::UiLoadedAddresses {
@@ -573,12 +544,7 @@ mod tests {
         configured.insert(outer_program.to_bytes());
         configured.insert(inner_program.to_bytes());
 
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            100,
-            None,
-            &configured,
-        );
+        let result = extract_instructions_from_transaction(&encoded_tx, 100, None, &configured);
 
         assert_eq!(result.len(), 2);
 
@@ -625,10 +591,7 @@ mod tests {
         let tx = Transaction::new(&[&payer], msg, recent_blockhash);
 
         let tx_bytes = bincode::serialize(&tx).unwrap();
-        let b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &tx_bytes,
-        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
         let meta = test_meta(None);
         let encoded_tx = EncodedTransactionWithStatusMeta {
@@ -641,12 +604,7 @@ mod tests {
         let mut configured = HashSet::new();
         configured.insert(program_b.to_bytes());
 
-        let result = extract_instructions_from_transaction(
-            &encoded_tx,
-            500,
-            None,
-            &configured,
-        );
+        let result = extract_instructions_from_transaction(&encoded_tx, 500, None, &configured);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].program_id, program_b.to_bytes());

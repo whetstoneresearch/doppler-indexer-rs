@@ -200,6 +200,11 @@ migrations/
 - **depends_on**: [solana_rpc, configuration]
 - **doc**: `docs/features/solana_raw_data.md`
 
+### solana_live_mode
+- **description**: Solana live mode behind the `solana` feature flag. Real-time slot processing via WebSocket `slotSubscribe`. Reorg detection via parent-slot chain verification with commitment-aware depth (150/processed, 32/confirmed, 0/finalized). Bincode live storage, event-triggered account reads, and compaction to parquet. Parallels the EVM live mode architecture.
+- **entry_points**: `src/solana/live/collector.rs`, `src/solana/live/reorg.rs`, `src/solana/live/storage.rs`, `src/solana/pipeline.rs`
+- **depends_on**: [solana_raw_data, solana_rpc, live_mode]
+
 ---
 
 ## Project Structure

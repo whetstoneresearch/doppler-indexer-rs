@@ -288,8 +288,8 @@ pub(crate) struct CatchupLoader {
     pub decoded_calls_dir: PathBuf,
     pub raw_receipts_dir: PathBuf,
     pub historical_reader: Arc<HistoricalDataReader>,
-    pub rpc_client: Arc<UnifiedRpcClient>,
-    pub contracts: Arc<Contracts>,
+    pub rpc_client: Option<Arc<UnifiedRpcClient>>,
+    pub contracts: Option<Arc<Contracts>>,
     pub chain_name: String,
     pub chain_id: u64,
     pub db_pool: Arc<DbPool>,
@@ -314,13 +314,13 @@ impl CatchupLoader {
                 let evts = self
                     .load_events(range_start, range_end, &payload.triggers)
                     .await?;
-                let evts = filter_events_by_start_block(&self.contracts, evts);
+                let evts = filter_events_by_start_block(self.contracts.as_deref(), evts);
 
                 let calls = if !evts.is_empty() && !payload.call_deps.is_empty() {
                     let raw_calls = self
                         .load_calls(range_start, range_end, &payload.call_deps)
                         .await?;
-                    filter_calls_by_start_block(&self.contracts, raw_calls)
+                    filter_calls_by_start_block(self.contracts.as_deref(), raw_calls)
                 } else {
                     Vec::new()
                 };
@@ -331,7 +331,7 @@ impl CatchupLoader {
                 let raw_calls = self
                     .load_calls(range_start, range_end, &payload.triggers)
                     .await?;
-                let calls = filter_calls_by_start_block(&self.contracts, raw_calls);
+                let calls = filter_calls_by_start_block(self.contracts.as_deref(), raw_calls);
                 (Vec::new(), calls)
             }
         };
@@ -450,7 +450,7 @@ use crate::transformations::scheduler::tracker::CompletionTracker;
 pub(crate) struct CallDepScanner {
     decoded_calls_dir: PathBuf,
     raw_eth_calls_dir: PathBuf,
-    contracts: Arc<Contracts>,
+    contracts: Option<Arc<Contracts>>,
     /// Unique `(source, function)` pairs to scan for.
     call_dep_pairs: Vec<(String, String)>,
 }
@@ -459,7 +459,7 @@ impl CallDepScanner {
     pub(crate) fn new(
         decoded_calls_dir: PathBuf,
         raw_eth_calls_dir: PathBuf,
-        contracts: Arc<Contracts>,
+        contracts: Option<Arc<Contracts>>,
         call_dep_pairs: Vec<(String, String)>,
     ) -> Self {
         Self {
@@ -501,7 +501,10 @@ impl CallDepScanner {
         let function_name = function_name.to_string();
         let decoded_base = self.decoded_calls_dir.join(&source).join(&function_name);
         let raw_base = self.raw_eth_calls_dir.join(&source).join(&function_name);
-        let contracts = self.contracts.clone();
+        let contracts = self
+            .contracts
+            .clone()
+            .unwrap_or_else(|| Arc::new(Contracts::new()));
 
         tokio::task::spawn_blocking(move || {
             fn scan_recursive(

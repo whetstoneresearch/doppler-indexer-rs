@@ -107,8 +107,8 @@ impl TransformationHandler for PriceHandler {
         let mut ops = Vec::new();
 
         for config in POOL_CONFIGS {
-            let token_address = resolve_address(&ctx.contracts, config.token)?;
-            let quote_token_address = resolve_address(&ctx.contracts, config.quote_token)?;
+            let token_address = resolve_address(ctx.contracts_ref(), config.token)?;
+            let quote_token_address = resolve_address(ctx.contracts_ref(), config.quote_token)?;
 
             for call in ctx.calls_of_type(config.source, config.function_name) {
                 let sqrt_price_x96 = call.extract_uint256("sqrtPriceX96")?;

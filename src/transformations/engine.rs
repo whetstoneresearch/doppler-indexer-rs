@@ -37,7 +37,9 @@ use super::scheduler::loader::{
 };
 use super::scheduler::tracker::CompletionTracker;
 use crate::db::DbPool;
-use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
+use crate::live::{
+    LiveProgressTracker, LiveStorage, ProgressStatusStorage, StorageError, TransformRetryRequest,
+};
 use crate::rpc::UnifiedRpcClient;
 use crate::storage::contract_index::{
     build_expected_factory_contracts_for_range, get_missing_contracts, range_key,
@@ -182,7 +184,7 @@ pub struct TransformationEngine {
     decoded_calls_dir: PathBuf,
     raw_eth_calls_dir: PathBuf,
     raw_receipts_dir: PathBuf,
-    contracts: Arc<Contracts>,
+    contracts: Option<Arc<Contracts>>,
     handler_concurrency: usize,
     // Sub-components
     executor: Arc<HandlerExecutor>,
@@ -191,6 +193,11 @@ pub struct TransformationEngine {
     live_state: Mutex<LiveProcessingState>,
     /// Live mode progress tracker for marking block completion.
     progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
+    /// Status-file storage backend. Matches the backend used by the
+    /// `progress_tracker` (when present) so all writes target the same
+    /// on-disk status format (EVM `LiveBlockStatus` or Solana
+    /// `LiveSlotStatus`).
+    status_storage: Arc<dyn ProgressStatusStorage>,
 }
 
 impl TransformationEngine {
@@ -198,7 +205,7 @@ impl TransformationEngine {
     pub async fn new(
         registry: Arc<TransformationRegistry>,
         db_pool: Arc<DbPool>,
-        rpc_client: Arc<UnifiedRpcClient>,
+        rpc_client: Option<Arc<UnifiedRpcClient>>,
         config: TransformationEngineConfig,
         progress_tracker: Option<Arc<Mutex<LiveProgressTracker>>>,
     ) -> Result<Self, TransformationError> {
@@ -213,8 +220,16 @@ impl TransformationEngine {
         let raw_eth_calls_dir = crate::storage::paths::raw_eth_calls_dir(&chain_name);
         let raw_receipts_dir = crate::storage::paths::raw_receipts_dir(&chain_name);
 
-        let contracts = Arc::new(config.contracts);
-        let factory_collections = Arc::new(config.factory_collections);
+        let contracts = if config.contracts.is_empty() {
+            None
+        } else {
+            Some(Arc::new(config.contracts))
+        };
+        let factory_collections = if config.factory_collections.is_empty() {
+            None
+        } else {
+            Some(Arc::new(config.factory_collections))
+        };
 
         let executor = Arc::new(HandlerExecutor {
             db_pool: db_pool.clone(),
@@ -226,12 +241,24 @@ impl TransformationEngine {
             handler_concurrency,
         });
 
+        // Derive status-file storage from the progress tracker when present
+        // so the engine, finalizer, and retry processor all write to the
+        // same on-disk format (EVM LiveBlockStatus or Solana LiveSlotStatus).
+        // Falls back to EVM LiveStorage when no tracker is supplied.
+        let status_storage: Arc<dyn ProgressStatusStorage> =
+            if let Some(ref tracker) = progress_tracker {
+                tracker.lock().await.status_storage()
+            } else {
+                Arc::new(LiveStorage::new(&chain_name))
+            };
+
         let finalizer = Arc::new(RangeFinalizer {
             registry: registry.clone(),
             db_pool: db_pool.clone(),
             chain_name: chain_name.clone(),
             chain_id,
             progress_tracker: progress_tracker.clone(),
+            status_storage: status_storage.clone(),
             expect_log_completion: config.expect_log_completion,
             expect_eth_call_completion: config.expect_eth_call_completion,
             expect_account_state_completion: config.expect_account_state_completion,
@@ -244,11 +271,12 @@ impl TransformationEngine {
             rpc_client: rpc_client.clone(),
             historical_reader: historical_reader.clone(),
             contracts: contracts.clone(),
-            factory_collections: factory_collections.clone(),
+            factory_collections,
             chain_name: chain_name.clone(),
             chain_id,
             handler_concurrency,
             progress_tracker: progress_tracker.clone(),
+            status_storage: status_storage.clone(),
         };
 
         Ok(Self {
@@ -269,6 +297,7 @@ impl TransformationEngine {
             retry_processor,
             live_state: Mutex::new(LiveProcessingState::default()),
             progress_tracker,
+            status_storage,
         })
     }
 
@@ -397,7 +426,10 @@ impl TransformationEngine {
         let function_name = function_name.to_string();
         let decoded_base = self.decoded_calls_dir.join(&source).join(&function_name);
         let raw_base = self.raw_eth_calls_dir.join(&source).join(&function_name);
-        let contracts = self.contracts.clone();
+        let contracts = self
+            .contracts
+            .clone()
+            .unwrap_or_else(|| Arc::new(Contracts::new()));
 
         tokio::task::spawn_blocking(move || -> std::io::Result<HashSet<(u64, u64)>> {
             fn scan_recursive(
@@ -523,8 +555,9 @@ impl TransformationEngine {
         range_key: (u64, u64),
         decoded_file_path: &Path,
     ) -> bool {
-        let expected =
-            build_expected_factory_contracts_for_range(self.contracts.as_ref(), range_key.1);
+        let empty_contracts = Contracts::new();
+        let contracts_ref = self.contracts.as_deref().unwrap_or(&empty_contracts);
+        let expected = build_expected_factory_contracts_for_range(contracts_ref, range_key.1);
         let raw_index_dir =
             self.raw_call_dependency_index_dir(source, function_name, decoded_file_path);
 
@@ -1443,7 +1476,8 @@ impl TransformationEngine {
             );
         }
 
-        let filtered_events = filter_events_by_start_block(&self.contracts, msg.events.clone());
+        let filtered_events =
+            filter_events_by_start_block(self.contracts.as_deref(), msg.events.clone());
 
         if !filtered_events.is_empty() {
             counter!(
@@ -1561,8 +1595,11 @@ impl TransformationEngine {
                         let calls: Vec<_> = calls
                             .into_iter()
                             .filter(|c| {
-                                let start_block =
-                                    self.contracts.get(&c.source_name).and_then(|ct| {
+                                let start_block = self
+                                    .contracts
+                                    .as_ref()
+                                    .and_then(|contracts| contracts.get(&c.source_name))
+                                    .and_then(|ct| {
                                         ct.start_block.map(|u| u.try_into().unwrap_or(u64::MAX))
                                     });
                                 start_block.is_none_or(|sb| c.block_number >= sb)
@@ -1634,14 +1671,16 @@ impl TransformationEngine {
                             .map(|k| k.to_string())
                     })
                     .collect();
-                let storage = LiveStorage::new(&self.chain_name);
-                if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
-                    status.failed_handlers.extend(failed_keys.iter().cloned());
-                    for k in &failed_keys {
-                        status.completed_handlers.remove(k);
-                    }
-                    status.transformed = false;
-                }) {
+                if let Err(e) = self.status_storage.update_handler_sets_atomic(
+                    range_key.0,
+                    &mut |completed, failed, transformed| {
+                        failed.extend(failed_keys.iter().cloned());
+                        for k in &failed_keys {
+                            completed.remove(k);
+                        }
+                        *transformed = false;
+                    },
+                ) {
                     if !matches!(e, StorageError::NotFound(_)) {
                         tracing::warn!(
                             "Failed to persist dep-failed handlers for block {}: {}",
@@ -1807,14 +1846,16 @@ impl TransformationEngine {
         let failed_keys: HashSet<String> =
             submitted_keys.difference(succeeded_keys).cloned().collect();
         if !failed_keys.is_empty() {
-            let storage = LiveStorage::new(&self.chain_name);
-            if let Err(e) = storage.update_status_atomic(block_number, |status| {
-                status.failed_handlers.extend(failed_keys.iter().cloned());
-                for h in &failed_keys {
-                    status.completed_handlers.remove(h);
-                }
-                status.transformed = false;
-            }) {
+            if let Err(e) = self.status_storage.update_handler_sets_atomic(
+                block_number,
+                &mut |completed, failed, transformed| {
+                    failed.extend(failed_keys.iter().cloned());
+                    for h in &failed_keys {
+                        completed.remove(h);
+                    }
+                    *transformed = false;
+                },
+            ) {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to persist failed handlers for block {}: {}",
@@ -1922,7 +1963,7 @@ impl TransformationEngine {
                 .extend(msg.calls.clone());
         }
 
-        let filtered_calls = filter_calls_by_start_block(&self.contracts, msg.calls);
+        let filtered_calls = filter_calls_by_start_block(self.contracts.as_deref(), msg.calls);
 
         if !filtered_calls.is_empty() {
             counter!(
@@ -2197,7 +2238,10 @@ impl TransformationEngine {
             let calls = {
                 let state = self.live_state.lock().await;
                 let calls = state.get_buffered_calls(range_key);
-                Arc::new(filter_calls_by_start_block(&self.contracts, calls))
+                Arc::new(filter_calls_by_start_block(
+                    self.contracts.as_deref(),
+                    calls,
+                ))
             };
 
             // Build HandlerTasks and use executor
@@ -2450,16 +2494,16 @@ impl TransformationEngine {
         // Persist cascaded failures to status file for single-block (live) ranges.
         if range_key.1 - range_key.0 == 1 {
             let cascaded_key_set: HashSet<String> = cascaded_keys.into_iter().collect();
-            let storage = LiveStorage::new(&self.chain_name);
-            if let Err(e) = storage.update_status_atomic(range_key.0, |status| {
-                status
-                    .failed_handlers
-                    .extend(cascaded_key_set.iter().cloned());
-                for k in &cascaded_key_set {
-                    status.completed_handlers.remove(k);
-                }
-                status.transformed = false;
-            }) {
+            if let Err(e) = self.status_storage.update_handler_sets_atomic(
+                range_key.0,
+                &mut |completed, failed, transformed| {
+                    failed.extend(cascaded_key_set.iter().cloned());
+                    for k in &cascaded_key_set {
+                        completed.remove(k);
+                    }
+                    *transformed = false;
+                },
+            ) {
                 if !matches!(e, StorageError::NotFound(_)) {
                     tracing::warn!(
                         "Failed to persist cascaded failures for block {}: {}",

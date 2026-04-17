@@ -157,7 +157,10 @@ mod tests {
     fn solana_program_config_minimal_deserializes() {
         let json = r#"{ "program_id": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" }"#;
         let cfg: SolanaProgramConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.program_id, "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+        assert_eq!(
+            cfg.program_id,
+            "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+        );
         assert!(cfg.idl_path.is_none());
         assert!(cfg.events.is_none());
         assert!(cfg.accounts.is_none());

@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-use super::storage::StorageError;
+use super::bincode_io::StorageError;
 use crate::db::DbError;
 use crate::rpc::RpcError;
 

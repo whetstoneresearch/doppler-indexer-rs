@@ -54,14 +54,20 @@ Implemented (Phase 7):
 - Decoded Solana storage paths (`decoded_solana_events_dir`, `decoded_solana_instructions_dir`)
 - Solana RPC method variants in metrics
 
-Not yet implemented (Phase 8 — Live Mode):
-- Live slot collector via WebSocket subscription
-- Solana reorg detection via parent-slot chain verification
-- Live account reader (event-triggered account state fetches)
-- Live storage types and bincode persistence
-- `TransformationEngine` integration for Solana (requires making the EVM RPC client optional)
+Implemented (Phase 8):
+- `SolanaLiveCollector` for real-time slot processing via WebSocket `slotSubscribe`
+- `SolanaReorgDetector` using parent-slot chain verification (commitment-aware depth)
+- `SolanaLiveAccountReader` for event-triggered account state fetches
+- `SolanaLiveStorage` with bincode persistence and JSON status tracking
+- `SolanaCompactionService` for bincode-to-parquet merging
+- `SolanaLiveCatchupService` for restart recovery of incomplete slots
+- Pipeline wiring in `process_solana_chain()` and `process_solana_chain_live_only()`
+- `main.rs` dispatch for Solana `--live-only` mode
 
-Practical implication: `chain_type: solana` activates the full historical pipeline (backfill, decode, write parquet). Transformation handlers can be registered by implementing `TransformationHandler` with `chain_type() -> ChainType::Solana`. Live mode logs a warning and is skipped.
+Also implemented:
+- `TransformationEngine` integration: RPC client and contracts made `Option` throughout the engine, executor, retry processor, and context. Solana pipelines pass `None` for EVM RPC. EVM-specific context methods (`eth_call`, `find_log_emitter`) return errors on non-EVM chains. Both historical and live Solana pipelines spawn the engine when handlers are registered.
+
+Practical implication: `chain_type: solana` activates the full historical pipeline (backfill, decode, write parquet) and live mode (slot subscription, real-time extraction/decoding, bincode storage, compaction). Transformation handlers can be registered by implementing `TransformationHandler` with `chain_type() -> ChainType::Solana`. TransformationEngine integration is pending — the engine currently requires an EVM RPC client.
 
 ---
 
