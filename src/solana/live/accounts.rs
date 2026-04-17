@@ -478,11 +478,17 @@ impl SolanaLiveAccountReader {
 
         // Persist raw reads to live storage.
         if !all_reads.is_empty() {
+            let resolved_sources: Vec<&str> = decoded_by_source_and_type
+                .keys()
+                .map(|(source, _)| source.as_str())
+                .collect();
+
             self.storage.write_accounts(slot, &all_reads)?;
 
             tracing::debug!(
                 slot,
-                source = %source_name,
+                requested_source = %source_name,
+                resolved_sources = ?resolved_sources,
                 raw_reads = all_reads.len(),
                 decoded_types = decoded_by_source_and_type.len(),
                 "Account reads complete",
@@ -505,7 +511,7 @@ impl SolanaLiveAccountReader {
                 // prevent the reader from blocking.
                 tracing::debug!(
                     slot,
-                    source = %source_name,
+                    source = %effective_source,
                     error = %e,
                     "Account-states channel has no consumer (receiver dropped)",
                 );
