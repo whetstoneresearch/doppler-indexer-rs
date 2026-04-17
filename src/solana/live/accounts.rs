@@ -97,6 +97,10 @@ impl SolanaLiveAccountReader {
         }
     }
 
+    fn should_defer_explicit_trigger_completion(&self, trigger: &AccountReadTrigger) -> bool {
+        self.defer_account_completion && trigger.await_completion_barrier
+    }
+
     /// Main event loop.
     ///
     /// Listens on two channels:
@@ -325,12 +329,11 @@ impl SolanaLiveAccountReader {
                             );
                         }
 
-                        // Discovery-triggered explicit reads participate in
-                        // the same deferred completion barrier. Record failure
-                        // for the later mark_complete_only handler, then
-                        // continue to the next trigger without marking the
-                        // slot complete here.
-                        if self.defer_account_completion {
+                        // Discovery-managed explicit reads participate in the
+                        // same deferred completion barrier. Startup Once reads
+                        // do not, even though they share the explicit-trigger
+                        // path.
+                        if self.should_defer_explicit_trigger_completion(&trigger) {
                             if had_error {
                                 failed_slots.insert(trigger.slot);
                             }
@@ -402,8 +405,8 @@ impl SolanaLiveAccountReader {
         account_states_tx: &mpsc::Sender<DecodedAccountStatesMessage>,
     ) -> Result<(), AccountReaderError> {
         let mut all_reads: Vec<LiveAccountRead> = Vec::new();
-        let mut decoded_by_type: HashMap<
-            String,
+        let mut decoded_by_source_and_type: HashMap<
+            (String, String),
             Vec<crate::transformations::context::DecodedAccountState>,
         > = HashMap::new();
 
@@ -465,8 +468,8 @@ impl SolanaLiveAccountReader {
                     block_time,
                     &effective_source,
                 ) {
-                    decoded_by_type
-                        .entry(decoded.account_type.clone())
+                    decoded_by_source_and_type
+                        .entry((effective_source.clone(), decoded.account_type.clone()))
                         .or_default()
                         .push(decoded);
                 }
@@ -481,17 +484,17 @@ impl SolanaLiveAccountReader {
                 slot,
                 source = %source_name,
                 raw_reads = all_reads.len(),
-                decoded_types = decoded_by_type.len(),
+                decoded_types = decoded_by_source_and_type.len(),
                 "Account reads complete",
             );
         }
 
-        // Send decoded states downstream, grouped by account_type.
-        for (account_type, states) in decoded_by_type {
+        // Send decoded states downstream, grouped by (effective_source, account_type).
+        for ((effective_source, account_type), states) in decoded_by_source_and_type {
             let msg = DecodedAccountStatesMessage {
                 range_start: slot,
                 range_end: slot + 1,
-                source_name: source_name.to_string(),
+                source_name: effective_source,
                 account_type,
                 account_states: states,
             };
@@ -511,5 +514,60 @@ impl SolanaLiveAccountReader {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_reader(defer_account_completion: bool) -> SolanaLiveAccountReader {
+        SolanaLiveAccountReader::new(
+            Arc::new(
+                SolanaRpcClient::new(
+                    "http://127.0.0.1:8899",
+                    crate::types::config::solana::SolanaCommitment::Confirmed,
+                    None,
+                    None,
+                )
+                .expect("rpc client"),
+            ),
+            Arc::new(SolanaAccountDecoder::new(Vec::new())),
+            SolanaLiveStorage::with_base_dir(
+                std::env::temp_dir().join("solana-live-account-reader-tests"),
+            ),
+            Arc::new(HashMap::new()),
+            None,
+            HashMap::new(),
+            defer_account_completion,
+        )
+    }
+
+    #[test]
+    fn explicit_trigger_completion_respects_barrier_flag() {
+        let reader = make_reader(true);
+        let startup_trigger = AccountReadTrigger {
+            slot: 42,
+            block_time: Some(1_700_000_123),
+            source_name: "program".to_string(),
+            addresses: vec![[0xAA; 32]],
+            await_completion_barrier: false,
+            mark_complete_only: false,
+        };
+        let discovery_trigger = AccountReadTrigger {
+            await_completion_barrier: true,
+            ..AccountReadTrigger {
+                slot: 42,
+                block_time: Some(1_700_000_123),
+                source_name: "program".to_string(),
+                addresses: vec![[0xBB; 32]],
+                await_completion_barrier: false,
+                mark_complete_only: false,
+            }
+        };
+
+        assert!(!reader.should_defer_explicit_trigger_completion(&startup_trigger));
+        assert!(reader.should_defer_explicit_trigger_completion(&discovery_trigger));
+        assert!(!make_reader(false).should_defer_explicit_trigger_completion(&discovery_trigger));
     }
 }

@@ -212,6 +212,11 @@ pub struct AccountReadTrigger {
     pub block_time: Option<i64>,
     pub source_name: String,
     pub addresses: Vec<[u8; 32]>,
+    /// When true, this explicit read participates in the deferred
+    /// `mark_complete_only` barrier when deferred account completion is active.
+    /// Startup Once reads set this false because they are not followed by that
+    /// slot-scoped barrier.
+    pub await_completion_barrier: bool,
     /// When true, skip reads and just mark account flags complete.
     /// Sent by the discovery loop after it has enqueued all expected
     /// discovery-managed account reads for a slot.
