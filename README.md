@@ -19,32 +19,28 @@ For API usage and public endpoints, refer to the [Doppler Documentation](https:/
 - Local Docker Postgres can use a plaintext `DATABASE_URL`, typically with `sslmode=disable`.
 - Managed PostgreSQL deployments should use a TLS-enabled `DATABASE_URL`, such as DigitalOcean's default `sslmode=require` connection string.
 
-## Dev Deployment
+## Container Deployment
 
-The intended dev deployment path is:
+This repository publishes a container image suitable for self-hosting.
 
-1. Build a Docker image from this repo.
-2. Push the image to GHCR.
-3. SSH into the dev server.
-4. Pull the new image and restart the service with Docker Compose.
+The intended container flow is:
 
-Deployment assets live under `deploy/dev`.
+1. Build or pull the image.
+2. Provide runtime environment variables.
+3. Mount a persistent `data/` directory.
+4. Run the container with Docker Compose or your preferred orchestrator.
 
-- `deploy/dev/compose.yaml`: runtime definition for the dev server
-- `deploy/dev/.env.example`: required runtime env vars
-- `deploy/dev/redeploy.sh`: idempotent remote redeploy script
+Generic deployment examples live under `deploy`.
 
-The server must provide its own `deploy/dev/.env` equivalent at:
+- `deploy/compose.example.yaml`: example Compose service definition
+- `deploy/.env.example`: runtime env var template
 
-`/opt/doppler-indexer/.env`
+On pushes to `main`, the `Publish Image` workflow builds and pushes the image to:
 
-The GitHub Actions deploy workflow expects these secrets:
+- `ghcr.io/${owner}/doppler-indexer-rs:<git-sha>`
+- `ghcr.io/${owner}/doppler-indexer-rs:main`
 
-- `DEV_SERVER_HOST`
-- `DEV_SERVER_USER`
-- `DEV_SERVER_SSH_KEY`
-
-The workflow builds on merge to `main` and pushes images to `ghcr.io/${owner}/doppler-indexer-rs`.
+Project-specific deployment automation is intentionally kept outside this repository.
 
 ## Questions
 

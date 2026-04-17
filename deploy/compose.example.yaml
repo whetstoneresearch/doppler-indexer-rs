@@ -1,7 +1,6 @@
 services:
   indexer:
-    image: ${IMAGE_REF:?set IMAGE_REF when deploying}
-    container_name: doppler-indexer-dev
+    image: ghcr.io/example/doppler-indexer-rs:main
     restart: unless-stopped
     env_file:
       - .env
