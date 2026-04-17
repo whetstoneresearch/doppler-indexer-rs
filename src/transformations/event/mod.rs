@@ -46,6 +46,7 @@ fn register_handlers_inner(
     //decay_multicurve::create::register_handlers(registry);
     //dhook::create::register_handlers(registry);
     zora::create::register_handlers(registry);
+    zora::migrate::register_handlers(registry);
     //zora::transfer::register_handlers(registry);
 
     // Shared oracle price cache across all swap metrics handlers.
@@ -110,6 +111,7 @@ fn register_handlers_inner(
 
     let zora_cache = Arc::new(PoolMetadataCache::with_shared_scopes(vec![
         zora::create::ZORA_CREATE_HANDLER_SCOPE,
+        zora::migrate::ZORA_MIGRATE_HANDLER_SCOPE,
     ]));
     zora::metrics::register_handlers(registry, chain_id, zora_cache, Arc::clone(&oracle_cache));
 
