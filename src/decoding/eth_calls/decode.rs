@@ -49,16 +49,29 @@ fn evm_type_to_dyn_sol_type(output_type: &EvmType) -> DynSolType {
     }
 }
 
-/// Decode a raw value using the specified type
+/// Decode a raw value using the specified type.
+///
+/// Solidity encodes a function returning a single dynamic struct (e.g.
+/// `returns (PoolCoin)`) as `abi.encode(s)` — a 1-tuple wrapping the struct,
+/// which prepends an outer `0x20` offset. `abi_decode_params` on a
+/// `DynSolType::Tuple` assumes the flat multi-return layout and misreads that
+/// offset. When the params-style decode fails on a tuple type, retry with
+/// `abi_decode`, which expects the single-wrapped-struct layout.
 pub fn decode_value(
     raw: &[u8],
     output_type: &EvmType,
 ) -> Result<DecodedValue, EthCallDecodingError> {
     let sol_type = evm_type_to_dyn_sol_type(output_type);
 
-    let decoded = sol_type
-        .abi_decode_params(raw)
-        .map_err(|e| EthCallDecodingError::Decode(e.to_string()))?;
+    let decoded = match sol_type.abi_decode_params(raw) {
+        Ok(v) => v,
+        Err(primary) => match &sol_type {
+            DynSolType::Tuple(_) => sol_type
+                .abi_decode(raw)
+                .map_err(|_| EthCallDecodingError::Decode(primary.to_string()))?,
+            _ => return Err(EthCallDecodingError::Decode(primary.to_string())),
+        },
+    };
 
     convert_dyn_sol_value(&decoded, output_type)
 }
@@ -285,5 +298,71 @@ mod tests {
         let val = DynSolValue::Int(I256::ZERO, 8);
         let result = convert_dyn_sol_value(&val, &EvmType::Int8).unwrap();
         assert!(matches!(result, DecodedValue::Int8(0)));
+    }
+
+    #[test]
+    fn test_decode_single_dynamic_struct_return() {
+        // Mirrors Zora `getPoolCoin` returning a single dynamic struct
+        // `(address coin, (int24,int24,uint128)[] positions)`. Solidity encodes
+        // this as `abi.encode(poolCoin)` with a leading 0x20 offset, which the
+        // flat-params decoder can't handle.
+        let output_type = EvmType::NamedTuple(vec![
+            ("coin".to_string(), Box::new(EvmType::Address)),
+            (
+                "positions".to_string(),
+                Box::new(EvmType::Array(Box::new(EvmType::NamedTuple(vec![
+                    ("tickLower".to_string(), Box::new(EvmType::Int24)),
+                    ("tickUpper".to_string(), Box::new(EvmType::Int24)),
+                    ("liquidity".to_string(), Box::new(EvmType::Uint128)),
+                ])))),
+            ),
+        ]);
+
+        let value = DynSolValue::Tuple(vec![
+            DynSolValue::Address(
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            ),
+            DynSolValue::Array(vec![DynSolValue::Tuple(vec![
+                DynSolValue::Int(I256::try_from(-100).unwrap(), 24),
+                DynSolValue::Int(I256::try_from(100).unwrap(), 24),
+                DynSolValue::Uint(U256::from(999u64), 128),
+            ])]),
+        ]);
+        // Solidity's `returns (PoolCoin)` encoding: equivalent to abi.encode(s).
+        let raw = value.abi_encode();
+        assert_eq!(
+            &raw[..32],
+            &[0u8; 31].iter().chain([0x20u8].iter()).copied().collect::<Vec<_>>()[..],
+            "expected leading 0x20 offset for single dynamic struct return"
+        );
+
+        let decoded = decode_value(&raw, &output_type).expect("decode should succeed");
+        match decoded {
+            DecodedValue::NamedTuple(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(&*fields[0].0, "coin");
+                assert!(matches!(&fields[1].1, DecodedValue::Array(a) if a.len() == 1));
+            }
+            other => panic!("expected NamedTuple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_flat_multi_return_still_works() {
+        // Flat params encoding must still decode — this is the normal case for
+        // functions with multiple returns (e.g. `returns (uint160, int24, ...)`).
+        let output_type = EvmType::NamedTuple(vec![
+            ("sqrtPriceX96".to_string(), Box::new(EvmType::Uint160)),
+            ("tick".to_string(), Box::new(EvmType::Int24)),
+        ]);
+        let value = DynSolValue::Tuple(vec![
+            DynSolValue::Uint(U256::from(42u64), 160),
+            DynSolValue::Int(I256::try_from(7i64).unwrap(), 24),
+        ]);
+        let raw = value.abi_encode_params();
+        let decoded = decode_value(&raw, &output_type).expect("flat decode should succeed");
+        assert!(matches!(decoded, DecodedValue::NamedTuple(_)));
     }
 }
