@@ -1064,8 +1064,10 @@ pub fn build_registry_for_solana_chain(
     let mut registry =
         TransformationRegistry::with_source_and_chain_filter(available, ChainType::Solana);
 
-    // Solana transformation handlers will be registered here as they're implemented.
-    // For now, the registry is empty but properly source-filtered and chain-type-filtered.
+    crate::transformations::event::solana::cpmm::register_handlers(&mut registry);
+    crate::transformations::event::solana::initializer::register_handlers(&mut registry);
+    crate::transformations::event::solana::cpmm_migrator::register_handlers(&mut registry);
+    crate::transformations::event::solana::prediction::register_handlers(&mut registry);
 
     registry.validate_and_sort_handler_dependencies();
 

@@ -9,6 +9,8 @@ pub mod metrics;
 pub mod migration_pool;
 pub mod multicurve;
 pub mod scheduled_multicurve;
+#[cfg(feature = "solana")]
+pub mod solana;
 pub mod v3;
 pub mod v4;
 pub mod zora;
