@@ -40,6 +40,7 @@ pub(crate) async fn read_decoded_parquet<T>(
         + Send
         + Sync
         + 'static,
+    io_semaphore: &Arc<tokio::sync::Semaphore>,
 ) -> Result<Vec<T>, TransformationError>
 where
     T: Send + 'static,
@@ -59,8 +60,14 @@ where
             let src = source_name.clone();
             let name = secondary_name.clone();
             let read_fn = read_fn.clone();
+            let permit = io_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("parquet IO semaphore never closed");
 
             read_tasks.spawn_blocking(move || {
+                let _permit = permit; // held for duration, dropped on return
                 tracing::debug!("Reading decoded data from {}", file_path.display());
                 match read_fn(reader, &file_path, &src, &name) {
                     Ok(items) => {
@@ -312,15 +319,17 @@ pub(crate) struct CatchupLoader {
     /// Cache of receipt address maps keyed by (range_start, range_end).
     /// Multiple event handlers processing the same range share one Arc'd HashMap.
     pub receipt_cache: ReceiptCache,
+    /// Limits the number of concurrent parquet `spawn_blocking` I/O tasks.
+    pub parquet_io_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl CatchupLoader {
-    /// Drop all cached receipt address maps.
+    /// Evict cached receipt address maps whose range starts at or below `watermark`.
     ///
-    /// Called between scheduler chunks so that ranges processed in earlier chunks
-    /// do not pin their receipt data for the remainder of catchup.
-    pub(crate) async fn clear_receipt_cache(&self) {
-        self.receipt_cache.write().await.clear();
+    /// Ranges above the watermark stay cached for cross-chunk reuse.
+    pub(crate) async fn evict_receipts_below(&self, watermark: u64) {
+        let mut cache = self.receipt_cache.write().await;
+        cache.retain(|(range_start, _), _| *range_start > watermark);
     }
 
     /// Load data, invoke handler, execute DB ops, and record progress for one [`WorkItem`].
@@ -452,6 +461,7 @@ impl CatchupLoader {
             triggers,
             move |source, event| vec![logs_dir.join(source).join(event).join(&file_name)],
             |reader, path, src, evt| reader.read_events_from_file(path, src, evt),
+            &self.parquet_io_semaphore,
         )
         .await
     }
@@ -484,6 +494,7 @@ impl CatchupLoader {
                 .collect()
             },
             |reader, path, src, func| reader.read_calls_from_file(path, src, func),
+            &self.parquet_io_semaphore,
         )
         .await
     }

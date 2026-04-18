@@ -36,7 +36,7 @@ use super::scheduler::loader::{
     read_receipt_addresses, run_call_dep_scanner_loop, CallDepScanner, CatchupLoader,
     CatchupPayload,
 };
-use super::scheduler::tracker::CompletionTracker;
+use super::scheduler::tracker::{CompletionTracker, TrackerSnapshot};
 use crate::db::DbPool;
 use crate::live::{LiveProgressTracker, LiveStorage, StorageError, TransformRetryRequest};
 use crate::metrics::record_chain_head_block;
@@ -883,6 +883,9 @@ impl TransformationEngine {
             db_pool: self.db_pool.clone(),
             finalizer: self.finalizer.clone(),
             receipt_cache: tokio::sync::RwLock::new(HashMap::new()),
+            parquet_io_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                (self.handler_concurrency * 2).max(16).min(64),
+            )),
         });
 
         let scheduler = DagScheduler::new(tracker.clone(), self.handler_concurrency);
@@ -897,15 +900,15 @@ impl TransformationEngine {
         let mut acc = CatchupOutcomeAccumulator::new(handler_name_to_key);
 
         loop {
+            let snapshot = tracker.snapshot_for_item_building().await;
             let (items, per_handler_submitted) = self
                 .build_catchup_work_items(
                     &handlers,
                     &available,
                     &trigger_range_sets,
-                    &tracker,
+                    &snapshot,
                     chunk_size,
-                )
-                .await;
+                );
 
             if items.is_empty() {
                 if !acc.has_outcomes {
@@ -939,10 +942,11 @@ impl TransformationEngine {
 
             acc.ingest(outcomes, kind_label);
 
-            // Release receipt data cached during this chunk and prune
-            // completed entries the tracker no longer needs.
-            loader.clear_receipt_cache().await;
-            tracker.compact(&handler_names).await;
+            // Prune completed entries the tracker no longer needs, and evict
+            // receipt data for ranges at or below the new watermark.
+            if let Some(watermark) = tracker.compact(&handler_names).await {
+                loader.evict_receipts_below(watermark).await;
+            }
         }
 
         histogram!(
@@ -1099,12 +1103,12 @@ impl TransformationEngine {
     /// Skips ranges already completed or failed in the tracker. Stops after
     /// `chunk_size` items to bound peak allocation. The tracker persists across
     /// chunks, so dependency state from earlier chunks is naturally available.
-    async fn build_catchup_work_items(
+    fn build_catchup_work_items(
         &self,
         handlers: &[CatchupHandler],
         available: &[(u64, u64)],
         trigger_range_sets: &HashMap<String, HashSet<(u64, u64)>>,
-        tracker: &Arc<CompletionTracker>,
+        snapshot: &TrackerSnapshot,
         chunk_size: usize,
     ) -> (Vec<WorkItem>, HashMap<String, usize>) {
         let mut items: Vec<WorkItem> = Vec::new();
@@ -1118,15 +1122,15 @@ impl TransformationEngine {
                     return (items, per_handler_submitted);
                 }
 
-                // Skip if already completed in the tracker (DB-seeded + runtime).
-                if tracker.is_completed(&name, range_start).await {
+                // Skip if already completed in the snapshot (DB-seeded + runtime).
+                if snapshot.is_completed(&name, range_start) {
                     continue;
                 }
 
                 // Skip if any handler dep already failed.
                 let mut dep_failed = false;
                 for dep in ch.handler_deps.iter() {
-                    if tracker.is_failed(dep, range_start).await {
+                    if snapshot.is_failed(dep, range_start) {
                         dep_failed = true;
                         break;
                     }
