@@ -30,6 +30,11 @@ pub enum EventFieldLocation {
     /// event data. This is used for tuple-format `ModifyLiquidity` events that
     /// carry a PoolKey but no explicit pool id.
     V4PoolIdFromKeyData,
+    /// Extract a V4 PoolKey tuple (5 words: currency0, currency1, fee,
+    /// tickSpacing, hooks) from event data starting at the given 32-byte word
+    /// offset. Returns a `DynSolValue::Tuple` suitable for ABI-encoding as a
+    /// `(address,address,uint24,int24,address)` call parameter.
+    V4PoolKeyTupleFromData(usize),
 }
 
 impl EventFieldLocation {
@@ -43,6 +48,9 @@ impl EventFieldLocation {
             Self::Topic(idx) => Cow::Owned(format!("topics[{}]", idx)),
             Self::Data(idx) => Cow::Owned(format!("data[{}]", idx)),
             Self::V4PoolIdFromKeyData => Cow::Borrowed("v4_pool_id_from_key_data"),
+            Self::V4PoolKeyTupleFromData(offset) => {
+                Cow::Owned(format!("v4_pool_key_tuple_from_data:{}", offset))
+            }
         }
     }
 }
@@ -67,6 +75,16 @@ impl<'de> Deserialize<'de> for EventFieldLocation {
 
         if s == "v4_pool_id_from_key_data" {
             return Ok(EventFieldLocation::V4PoolIdFromKeyData);
+        }
+
+        if let Some(rest) = s.strip_prefix("v4_pool_key_tuple_from_data:") {
+            let offset: usize = rest.parse().map_err(|_| {
+                de::Error::custom(format!(
+                    "Invalid offset in v4_pool_key_tuple_from_data: {}",
+                    rest
+                ))
+            })?;
+            return Ok(EventFieldLocation::V4PoolKeyTupleFromData(offset));
         }
 
         if let Some(rest) = s.strip_prefix("topics[") {
@@ -96,7 +114,7 @@ impl<'de> Deserialize<'de> for EventFieldLocation {
         }
 
         Err(de::Error::custom(format!(
-            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", \"data[N]\", or \"v4_pool_id_from_key_data\")",
+            "Unknown from_event format: {} (expected \"address\", \"topics[N]\", \"data[N]\", \"v4_pool_id_from_key_data\", or \"v4_pool_key_tuple_from_data:N\")",
             s
         )))
     }

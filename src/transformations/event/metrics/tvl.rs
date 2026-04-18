@@ -882,6 +882,167 @@ pub async fn process_tvl(
     Ok(ops)
 }
 
+// ─── TVL from direct positions (no liquidity_deltas) ──────────────
+
+/// A TVL target that carries its own positions instead of querying
+/// `liquidity_deltas`. Used for pool types (e.g. Zora) where the
+/// hook contract provides a `getPoolCoin` view that returns the full
+/// LP position array directly.
+#[derive(Debug, Clone)]
+pub struct TvlTargetWithPositions {
+    pub pool_id: Vec<u8>,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub tick: i32,
+    pub sqrt_price_x96: U256,
+    pub positions: Vec<TickMapPosition>,
+}
+
+/// Core TVL processing for targets that carry their own position arrays.
+///
+/// Mirrors [`process_tvl`] but skips the `liquidity_deltas` DB query,
+/// using the positions embedded in each target instead.
+pub async fn process_tvl_from_positions(
+    targets: &[TvlTargetWithPositions],
+    metadata_cache: &PoolMetadataCache,
+    chain_id: u64,
+    usd_ctx: &UsdPriceContext,
+    swap_source: &str,
+    swap_source_version: u32,
+) -> Result<Vec<DbOperation>, TransformationError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ops = Vec::new();
+    let mut latest_per_pool: BTreeMap<Vec<u8>, (&TvlTargetWithPositions, TvlComputeResult)> =
+        BTreeMap::new();
+
+    for target in targets {
+        let Some(meta) = metadata_cache.get(&target.pool_id) else {
+            tracing::debug!(
+                pool_id = %hex::encode(&target.pool_id),
+                "TVL (from positions): skipping pool, metadata not found in cache"
+            );
+            continue;
+        };
+
+        if target.positions.is_empty() {
+            tracing::debug!(
+                pool_id = %hex::encode(&target.pool_id),
+                block_number = target.block_number,
+                "TVL (from positions): skipping pool, no liquidity positions"
+            );
+            continue;
+        }
+
+        let price_close = match sqrt_price_x96_to_price(
+            &target.sqrt_price_x96,
+            meta.base_decimals,
+            meta.quote_decimals,
+            meta.is_token_0,
+        ) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    pool_id = %hex::encode(&target.pool_id),
+                    "TVL (from positions): skipping pool, sqrt_price_x96_to_price returned None"
+                );
+                continue;
+            }
+        };
+
+        let (total0, total1) =
+            compute_position_amounts(&target.positions, target.sqrt_price_x96)?;
+        let (active0, active1) = compute_active_position_amounts(
+            &target.positions,
+            target.tick,
+            target.sqrt_price_x96,
+        )?;
+
+        let active_liquidity: u128 = target
+            .positions
+            .iter()
+            .filter(|p| p.tick_lower <= target.tick && target.tick < p.tick_upper)
+            .map(|p| p.liquidity)
+            .fold(0u128, |acc, l| acc.saturating_add(l));
+        let active_liquidity_dec = BigDecimal::from_str(&active_liquidity.to_string())
+            .expect("u128::to_string is valid decimal");
+
+        let amount0 =
+            BigDecimal::from_str(&total0.to_string()).expect("U256::to_string is valid decimal");
+        let amount1 =
+            BigDecimal::from_str(&total1.to_string()).expect("U256::to_string is valid decimal");
+
+        let tvl_usd = compute_tvl_usd(&total0, &total1, &meta, &price_close, usd_ctx);
+        let market_cap_usd = compute_market_cap_usd(&meta, &price_close, usd_ctx);
+        let active_liquidity_usd =
+            compute_tvl_usd(&active0, &active1, &meta, &price_close, usd_ctx);
+
+        let bootstrap_seed = TvlBootstrapSeed {
+            tick: target.tick,
+            sqrt_price_x96: target.sqrt_price_x96,
+            price: price_close,
+        };
+
+        ops.push(build_snapshot_tvl_update(
+            chain_id,
+            &target.pool_id,
+            target.block_number,
+            target.block_timestamp,
+            &active_liquidity_dec,
+            &amount0,
+            &amount1,
+            tvl_usd.as_ref(),
+            market_cap_usd.as_ref(),
+            active_liquidity_usd.as_ref(),
+            Some(&bootstrap_seed),
+            swap_source,
+            swap_source_version,
+        ));
+
+        let result = TvlComputeResult {
+            active_liquidity: active_liquidity_dec,
+            amount0,
+            amount1,
+            tvl_usd,
+            market_cap_usd,
+            active_liquidity_usd,
+            bootstrap_seed,
+            total_supply: meta.total_supply,
+        };
+
+        let update_latest = latest_per_pool
+            .get(&target.pool_id)
+            .is_none_or(|(prev, _)| target.block_number >= prev.block_number);
+        if update_latest {
+            latest_per_pool.insert(target.pool_id.clone(), (target, result));
+        }
+    }
+
+    // Emit pool_state updates for the latest block per pool.
+    for (pool_id, (target, result)) in &latest_per_pool {
+        ops.push(build_state_tvl_update(
+            chain_id,
+            pool_id,
+            target.block_number,
+            target.block_timestamp,
+            &result.active_liquidity,
+            &result.amount0,
+            &result.amount1,
+            result.tvl_usd.as_ref(),
+            result.market_cap_usd.as_ref(),
+            result.active_liquidity_usd.as_ref(),
+            result.total_supply.as_ref(),
+            Some(&result.bootstrap_seed),
+            swap_source,
+            swap_source_version,
+        ));
+    }
+
+    Ok(ops)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
