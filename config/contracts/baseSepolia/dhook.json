@@ -102,7 +102,15 @@
             "0xf848fea3329185529b50228bcb36f3b5a60960c4",
             "0x8bbbe586f9a902c15a759fc134a99a2d28bc20c4"
         ],
-        "start_block": 26638492
+        "start_block": 26638492,
+        "events": [
+            {
+                "signature": "Migrate(address indexed asset, (address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) poolKey)"
+            },
+            {
+                "signature": "ModifyLiquidity((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, (int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt) params)"
+            }
+        ]
     },
     "RehypeDopplerHookMigrator": {
         "address": [

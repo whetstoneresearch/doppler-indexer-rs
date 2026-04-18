@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use alloy_primitives::{I256, U256};
+use bigdecimal::{BigDecimal, Zero};
 use deadpool_postgres::Pool;
 
 use crate::db::{DbOperation, DbSnapshot, DbValue};
@@ -16,7 +17,7 @@ use crate::transformations::util::db::pool_metrics::{
     PoolStateData, SnapshotData,
 };
 use crate::transformations::util::pool_metadata::{PoolMetadata, PoolMetadataCache};
-use crate::transformations::util::price::sqrt_price_x96_to_price;
+use crate::transformations::util::price::{apply_decimal_exp, sqrt_price_x96_to_price};
 use crate::transformations::util::usd_price::UsdPriceContext;
 
 use super::accumulator::BlockAccumulator;
@@ -336,6 +337,232 @@ WHERE pool_state.chain_id = :chain_id
             ],
         }),
     }
+}
+
+/// Normalized V2 swap input (Uniswap V2 Swap event fields).
+#[derive(Debug, Clone)]
+pub struct V2SwapInput {
+    pub pool_id: Vec<u8>,
+    pub transaction_hash: [u8; 32],
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub log_index: u32,
+    pub amount0_in: U256,
+    pub amount1_in: U256,
+    pub amount0_out: U256,
+    pub amount1_out: U256,
+}
+
+/// Compute execution price (quote per base) from V2 swap amounts.
+///
+/// Returns None when both input amounts for a direction are zero (invalid event).
+fn v2_execution_price(
+    amount0_in: U256,
+    amount1_in: U256,
+    amount0_out: U256,
+    amount1_out: U256,
+    base_decimals: u8,
+    quote_decimals: u8,
+    is_token_0: bool,
+) -> Option<BigDecimal> {
+    // Pick quote_raw and base_raw depending on trade direction.
+    // is_token_0=true: base=token0, quote=token1
+    // is_token_0=false: base=token1, quote=token0
+    let (quote_raw, base_raw) = if is_token_0 {
+        if !amount0_in.is_zero() {
+            (amount1_out, amount0_in)
+        } else {
+            (amount1_in, amount0_out)
+        }
+    } else {
+        if !amount1_in.is_zero() {
+            (amount0_out, amount1_in)
+        } else {
+            (amount0_in, amount1_out)
+        }
+    };
+
+    if base_raw.is_zero() || quote_raw.is_zero() {
+        return None;
+    }
+
+    let quote_bd: BigDecimal = quote_raw.to_string().parse().ok()?;
+    let base_bd: BigDecimal = base_raw.to_string().parse().ok()?;
+
+    // price = (quote_raw / 10^quote_dec) / (base_raw / 10^base_dec)
+    //       = (quote_raw / base_raw) * 10^(base_dec - quote_dec)
+    let raw_ratio = &quote_bd / &base_bd;
+    let price = apply_decimal_exp(raw_ratio, base_decimals as i32 - quote_decimals as i32);
+
+    if price.is_zero() {
+        None
+    } else {
+        Some(price)
+    }
+}
+
+/// Process a batch of V2 swap inputs into pool_snapshots + pool_state DbOperations.
+///
+/// Computes execution price from token amounts (bypassing sqrtPriceX96).
+/// tick and liquidity are stored as 0/zero since V2 has no on-chain equivalent.
+pub fn process_v2_swaps(
+    swaps: &[V2SwapInput],
+    metadata_cache: &PoolMetadataCache,
+    chain_id: u64,
+    handler_name: &str,
+    source_name: &str,
+    usd_ctx: Option<&UsdPriceContext>,
+    source_version: u32,
+) -> Vec<DbOperation> {
+    if swaps.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped: BTreeMap<(Vec<u8>, u64), Vec<&V2SwapInput>> = BTreeMap::new();
+    for swap in swaps {
+        grouped
+            .entry((swap.pool_id.clone(), swap.block_number))
+            .or_default()
+            .push(swap);
+    }
+
+    let mut ops = Vec::new();
+    let mut latest_per_pool: BTreeMap<Vec<u8>, (u64, BlockAccumulator)> = BTreeMap::new();
+
+    let mut skipped_swap_count = 0u64;
+    let mut skipped_pool_count = 0u64;
+    let mut skipped_samples: Vec<(String, u64, String)> = Vec::new();
+
+    for ((pool_id, block_number), swap_group) in &grouped {
+        let meta = match metadata_cache.get(pool_id) {
+            Some(m) => m,
+            None => {
+                skipped_swap_count += swap_group.len() as u64;
+                skipped_pool_count += 1;
+                if skipped_samples.len() < 5 {
+                    let tx = swap_group
+                        .first()
+                        .map(|s| hex::encode(s.transaction_hash))
+                        .unwrap_or_default();
+                    skipped_samples.push((hex::encode(pool_id), *block_number, tx));
+                }
+                continue;
+            }
+        };
+
+        let block_timestamp = swap_group[0].block_timestamp;
+        let mut acc = BlockAccumulator::new(block_timestamp);
+
+        let mut sorted: Vec<&&V2SwapInput> = swap_group.iter().collect();
+        sorted.sort_by_key(|s| s.log_index);
+
+        for swap in sorted {
+            let Some(price) = v2_execution_price(
+                swap.amount0_in,
+                swap.amount1_in,
+                swap.amount0_out,
+                swap.amount1_out,
+                meta.base_decimals,
+                meta.quote_decimals,
+                meta.is_token_0,
+            ) else {
+                continue;
+            };
+
+            let amount0 = I256::try_from(swap.amount0_in)
+                .unwrap_or(I256::MAX)
+                .saturating_sub(
+                    I256::try_from(swap.amount0_out).unwrap_or(I256::MAX),
+                );
+            let amount1 = I256::try_from(swap.amount1_in)
+                .unwrap_or(I256::MAX)
+                .saturating_sub(
+                    I256::try_from(swap.amount1_out).unwrap_or(I256::MAX),
+                );
+
+            acc.record_swap(price, amount0, amount1, 0, U256::ZERO, U256::ZERO);
+        }
+
+        if acc.swap_count == 0 {
+            continue;
+        }
+
+        let price_open = acc.price_open.as_ref().unwrap().to_string();
+        let price_close = acc.price_close.as_ref().unwrap().to_string();
+        let price_high = acc.price_high.as_ref().unwrap().to_string();
+        let price_low = acc.price_low.as_ref().unwrap().to_string();
+
+        let volume_usd = usd_ctx.and_then(|ctx| {
+            let quote_volume = if meta.is_token_0 {
+                &acc.volume1
+            } else {
+                &acc.volume0
+            };
+            ctx.quote_volume_to_usd(quote_volume, &meta.quote_token, meta.quote_decimals)
+        });
+
+        ops.push(insert_pool_snapshot(&SnapshotData {
+            chain_id,
+            pool_id: pool_id.clone(),
+            block_number: *block_number,
+            block_timestamp: acc.block_timestamp,
+            price_open,
+            price_close,
+            price_high,
+            price_low,
+            active_liquidity: "0".to_string(),
+            volume0: acc.volume0.to_string(),
+            volume1: acc.volume1.to_string(),
+            swap_count: i32::try_from(acc.swap_count).unwrap_or(i32::MAX),
+            volume_usd: volume_usd.map(|v| v.to_string()),
+        }));
+
+        latest_per_pool.insert(pool_id.clone(), (*block_number, acc));
+    }
+
+    if skipped_swap_count > 0 {
+        let samples_str: Vec<String> = skipped_samples
+            .iter()
+            .map(|(pool, block, tx)| format!("pool={} block={} tx={}", pool, block, tx))
+            .collect();
+        tracing::warn!(
+            handler = handler_name,
+            source = source_name,
+            "Skipped {} V2 swap(s) across {} pool(s) due to missing metadata. Samples: [{}]",
+            skipped_swap_count,
+            skipped_pool_count,
+            samples_str.join("; "),
+        );
+    }
+
+    for (pool_id, (block_number, acc)) in &latest_per_pool {
+        let price_close = acc.price_close.as_ref().unwrap().to_string();
+
+        ops.push(upsert_pool_state(&PoolStateData {
+            chain_id,
+            pool_id: pool_id.clone(),
+            block_number: *block_number,
+            block_timestamp: acc.block_timestamp,
+            tick: 0,
+            sqrt_price_x96: "0".to_string(),
+            price: price_close.clone(),
+            active_liquidity: "0".to_string(),
+        }));
+
+        if usd_ctx.is_some() {
+            ops.push(build_rolling_metrics_update(
+                chain_id,
+                pool_id,
+                &price_close,
+                *block_number,
+                acc.block_timestamp,
+                handler_name,
+                source_version,
+            ));
+        }
+    }
+
+    ops
 }
 
 /// Process a batch of liquidity inputs into liquidity_deltas INSERT operations.

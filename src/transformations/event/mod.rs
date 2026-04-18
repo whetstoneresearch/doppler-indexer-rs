@@ -115,17 +115,28 @@ fn register_handlers_inner(
     ]));
     zora::metrics::register_handlers(registry, chain_id, zora_cache, Arc::clone(&oracle_cache));
 
-    // Register migration pool handlers as a group only on chains with a V4
-    // migrator. The swap handler depends on MigrationPoolCreateHandler, so
-    // letting source filtering split them apart can leave a dangling dependency
+    // Register migration pool handlers as a group on chains with a V4 migrator
+    // or a dhook migrator. The swap handler depends on MigrationPoolCreateHandler,
+    // so letting source filtering split them apart can leave a dangling dependency
     // on PoolManager-only chains.
     let register_migration_pool_handlers = contracts
-        .map(|contracts| contracts.contains_key("UniswapV4Migrator"))
+        .map(|c| c.contains_key("UniswapV4Migrator") || c.contains_key("DopplerHookMigrator"))
         .unwrap_or(true);
     if register_migration_pool_handlers {
         migration_pool::create::register_handlers(registry);
+
+        let register_dhook_migration = contracts
+            .map(|c| c.contains_key("DopplerHookMigrator"))
+            .unwrap_or(true);
+        if register_dhook_migration {
+            dhook::migrate::register_handlers(registry);
+        }
+
         let migration_pool_cache = Arc::new(PoolMetadataCache::with_scopes(
-            vec![migration_pool::create::MIGRATION_POOL_CREATE_HANDLER_SCOPE],
+            vec![
+                migration_pool::create::MIGRATION_POOL_CREATE_HANDLER_SCOPE,
+                dhook::migrate::DHOOK_MIGRATION_POOL_CREATE_HANDLER_SCOPE,
+            ],
             vec![
                 v3::create::V3_CREATE_HANDLER_SCOPE,
                 v3::create::LOCKABLE_V3_CREATE_HANDLER_SCOPE,
@@ -140,6 +151,32 @@ fn register_handlers_inner(
             registry,
             chain_id,
             migration_pool_cache,
+            Arc::clone(&oracle_cache),
+        );
+    }
+
+    // Register V2 migration pool handlers on chains with a V2 migrator.
+    let register_v2_migration_handlers = contracts
+        .map(|c| {
+            c.contains_key("UniswapV2Migrator") || c.contains_key("NimCustomV2Migrator")
+        })
+        .unwrap_or(true);
+    if register_v2_migration_handlers {
+        migration_pool::v2_create::register_handlers(registry);
+        let v2_migration_cache = Arc::new(PoolMetadataCache::with_scopes(
+            vec![migration_pool::v2_create::V2_MIGRATION_POOL_CREATE_HANDLER_SCOPE],
+            vec![
+                v4::create::V4_CREATE_HANDLER_SCOPE,
+                multicurve::create::V4_MULTICURVE_CREATE_HANDLER_SCOPE,
+                decay_multicurve::create::V4_DECAY_MULTICURVE_CREATE_HANDLER_SCOPE,
+                scheduled_multicurve::create::V4_SCHEDULED_MULTICURVE_CREATE_HANDLER_SCOPE,
+                dhook::create::DOPPLER_HOOK_CREATE_HANDLER_SCOPE,
+            ],
+        ));
+        migration_pool::v2_metrics::register_handlers(
+            registry,
+            chain_id,
+            v2_migration_cache,
             Arc::clone(&oracle_cache),
         );
     }
