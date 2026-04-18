@@ -142,7 +142,7 @@ impl EventHandler for ZoraSwapMetricsHandler {
     }
 }
 
-fn extract_zora_swaps(ctx: &TransformationContext) -> Result<Vec<SwapInput>, TransformationError> {
+pub fn extract_zora_swaps(ctx: &TransformationContext) -> Result<Vec<SwapInput>, TransformationError> {
     let mut swaps = Vec::new();
 
     for source in [CREATOR_HOOK_SOURCE, CONTENT_HOOK_SOURCE] {
@@ -370,7 +370,7 @@ fn extract_positions_from_call(
 /// identical getPoolCoin results (same view function, same block state).
 /// We deduplicate by (pool_id, block_number) first and only look up one
 /// call per group, using the latest event's log_index as the representative.
-fn extract_zora_tvl_targets_for_source(
+pub fn extract_zora_tvl_targets_for_source(
     ctx: &TransformationContext,
     source: &str,
 ) -> Result<Vec<TvlTargetWithPositions>, TransformationError> {
