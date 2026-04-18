@@ -1209,10 +1209,75 @@ pub async fn collect_eth_calls(
             );
         }
     } else if catchup_has_factory_once_calls {
-        // No factory_rx (shouldn't normally happen if factories are configured),
-        // fall back to the original disk-load path.
-        tracing::warn!(
-            "catchup_has_factory_once_calls=true but no factory_rx; Phase B skipped"
+        // repair-only mode: factory_rx is None, so load factory data from the
+        // on-disk parquet and replay Phase B per-range, then populate
+        // factory_addresses so Phase C event-trigger filtering also works.
+        tracing::info!(
+            "Phase B (factory-once) repair-only fallback: loading factory addresses from parquet for chain {}",
+            chain.name
+        );
+        let factory_data =
+            match load_factory_addresses_from_parquet_async(factories_dir_path(&chain.name)).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load factory addresses from parquet for chain {}: {}; factory-once and factory event triggers will be skipped",
+                        chain.name,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
+
+        // Populate flat address set for Phase C event-trigger filtering.
+        for data in &factory_data {
+            for addrs in data.addresses_by_block.values() {
+                for (_, addr, coll) in addrs {
+                    factory_addresses
+                        .entry(coll.clone())
+                        .or_default()
+                        .insert(*addr);
+                }
+            }
+        }
+
+        let factory_once_ctx = EthCallContext {
+            client,
+            output_dir: &base_output_dir,
+            existing_files: &existing_files,
+            rpc_batch_size,
+            repair,
+            decoder_tx: &decoder_tx,
+            chain_name: &chain.name,
+            storage_manager: storage_manager.as_ref(),
+            s3_manifest: &s3_manifest,
+        };
+
+        for data in factory_data {
+            let run = repair_scope
+                .is_none_or(|scope| scope.matches_range(data.range_start, data.range_end));
+            if run {
+                let range = BlockRange {
+                    start: data.range_start,
+                    end: data.range_end,
+                };
+                process_factory_once_catchup_range(
+                    &range,
+                    data.addresses_by_block,
+                    &factory_once_ctx,
+                    &catchup_factory_once_configs,
+                    &factory_once_column_indexes,
+                    &chain.contracts,
+                )
+                .await?;
+                factory_once_catchup_count += 1;
+            }
+        }
+
+        tracing::info!(
+            "Factory once calls catchup complete (parquet fallback): processed {} ranges for chain {}",
+            factory_once_catchup_count,
+            chain.name
         );
     }
 
