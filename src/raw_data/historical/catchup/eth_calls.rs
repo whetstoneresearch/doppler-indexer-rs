@@ -19,7 +19,8 @@ use crate::raw_data::historical::eth_calls::{
     EventTriggeredCallConfig, ExistingLogRange, FrequencyState, OnceCallConfig,
 };
 use crate::raw_data::historical::factories::{
-    get_factory_call_configs, FactoryAddressData, FactoryMessage,
+    get_factory_call_configs, load_factory_addresses_from_parquet_async, FactoryAddressData,
+    FactoryMessage,
 };
 use crate::raw_data::historical::receipts::{
     build_event_trigger_matchers, extract_event_triggers_from_batches, EventTriggerData,
@@ -31,7 +32,7 @@ use crate::storage::contract_index::{
     read_contract_index, update_contract_index, write_contract_index, ContractIndex,
 };
 use crate::storage::parquet_readers::read_event_call_row_keys_from_parquet;
-use crate::storage::paths::raw_eth_calls_dir;
+use crate::storage::paths::{factories_dir as factories_dir_path, raw_eth_calls_dir};
 use crate::storage::{upload_sidecar_to_s3, DataLoader, S3Manifest, StorageManager};
 use crate::types::config::chain::ChainConfig;
 use crate::types::config::contract::{AddressOrAddresses, Contracts};
@@ -1219,14 +1220,10 @@ pub async fn collect_eth_calls(
     // Catchup phase for event-triggered calls: Read from existing log parquet files
     // =========================================================================
     if should_run_event_triggered_catchup(catchup_has_event_triggered_calls, repair, repair_only) {
-        // Factory addresses and contract-index readiness are populated from the
-        // factory_rx stream above (see Phase B/drain loop). No disk-load needed —
-        // the streaming producer (catchup/factories.rs) sends IncrementalAddresses
-        // + RangeComplete for every range (both pre-existing on-disk data and
-        // newly-processed ranges), so by the time we reach this point
-        // `factory_addresses` mirrors what `load_factory_addresses_by_collection`
-        // would have returned, and `factory_contract_indexes` mirrors the on-disk
-        // sidecars via `build_expected_factory_contracts_for_range` stamping.
+        // factory_addresses is normally populated by Phase B draining factory_rx. When
+        // factory_rx is None (e.g. --repair-only skips factory streaming), load the
+        // addresses from the on-disk factory parquet so factory-based event triggers
+        // are not silently skipped during the repair pass.
         let factory_collections: HashSet<String> = catchup_event_call_configs
             .values()
             .flatten()
@@ -1234,15 +1231,40 @@ pub async fn collect_eth_calls(
             .map(|c| c.contract_name.clone())
             .collect();
 
+        if factory_rx.is_none() && !factory_collections.is_empty() {
+            match load_factory_addresses_from_parquet_async(factories_dir_path(&chain.name)).await {
+                Ok(factory_data) => {
+                    for data in factory_data {
+                        for addrs in data.addresses_by_block.values() {
+                            for (_, addr, coll) in addrs {
+                                factory_addresses
+                                    .entry(coll.clone())
+                                    .or_default()
+                                    .insert(*addr);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load factory addresses from parquet for repair pass on chain {}: {}; factory event triggers will be skipped",
+                        chain.name,
+                        e
+                    );
+                }
+            }
+        }
+
         for collection_name in &factory_collections {
             let count = factory_addresses
                 .get(collection_name)
                 .map(|s| s.len())
                 .unwrap_or(0);
             tracing::info!(
-                "Using {} streamed factory addresses for collection {}",
+                "Using {} factory addresses for collection {} (source: {})",
                 count,
-                collection_name
+                collection_name,
+                if factory_rx.is_none() { "parquet" } else { "stream" },
             );
         }
 
