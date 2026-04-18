@@ -585,9 +585,9 @@ impl CompletionTracker {
     ///
     /// [`is_pruned`]: Self::is_pruned
     /// [`with_available_starts`]: Self::with_available_starts
-    pub(crate) async fn compact(&self, handler_names: &[&str]) {
+    pub(crate) async fn compact(&self, handler_names: &[&str]) -> Option<u64> {
         if self.available_starts.is_empty() || handler_names.is_empty() {
-            return;
+            return None;
         }
 
         // Collect each handler's contiguous watermark. `Vec<Option<u64>>`
@@ -602,14 +602,14 @@ impl CompletionTracker {
         drop(contiguous);
 
         let Some(min_wm) = watermarks.and_then(|ws| ws.into_iter().min()) else {
-            return;
+            return None;
         };
 
         // Only advance the pruned watermark, never regress.
         {
             let current = *self.pruned_up_to.read().unwrap();
             if current.is_some_and(|c| c >= min_wm) {
-                return;
+                return None;
             }
         }
 
@@ -626,6 +626,8 @@ impl CompletionTracker {
             "CompletionTracker compacted: pruned completed entries at or below range_start {}",
             min_wm
         );
+
+        Some(min_wm)
     }
 
     // ─── Extended wait (handler deps + contiguous deps + call deps) ─────
@@ -809,6 +811,56 @@ impl CompletionTracker {
             result.entry(name.clone()).or_default().2 = ranges.len();
         }
         result
+    }
+
+    /// Create a read-only snapshot of completed/failed state for batch queries.
+    ///
+    /// Takes one read lock on `state` and one read on `pruned_up_to`, then
+    /// returns a [`TrackerSnapshot`] that can answer `is_completed` /
+    /// `is_failed` without further locking.
+    pub(crate) async fn snapshot_for_item_building(&self) -> TrackerSnapshot {
+        let state = self.state.read().await;
+        let completed = state.completed.clone();
+        let failed = state.failed.clone();
+        drop(state);
+        let pruned_up_to = *self.pruned_up_to.read().unwrap();
+        TrackerSnapshot {
+            completed,
+            failed,
+            pruned_up_to,
+        }
+    }
+}
+
+/// Read-only snapshot of completed/failed state for batch queries.
+///
+/// Avoids repeated async lock acquisitions in tight loops like
+/// `build_catchup_work_items` by capturing the state once.
+pub(crate) struct TrackerSnapshot {
+    pub(crate) completed: HashMap<String, HashSet<u64>>,
+    pub(crate) failed: HashMap<String, HashSet<u64>>,
+    pub(crate) pruned_up_to: Option<u64>,
+}
+
+impl TrackerSnapshot {
+    /// Check whether `(handler_name, range_start)` is completed in this snapshot.
+    ///
+    /// Returns true if the range was pruned (at or below `pruned_up_to`) or
+    /// is present in the handler's completed set.
+    pub(crate) fn is_completed(&self, handler_name: &str, range_start: u64) -> bool {
+        if self.pruned_up_to.is_some_and(|wm| range_start <= wm) {
+            return true;
+        }
+        self.completed
+            .get(handler_name)
+            .is_some_and(|ranges| ranges.contains(&range_start))
+    }
+
+    /// Check whether `(handler_name, range_start)` is failed in this snapshot.
+    pub(crate) fn is_failed(&self, handler_name: &str, range_start: u64) -> bool {
+        self.failed
+            .get(handler_name)
+            .is_some_and(|ranges| ranges.contains(&range_start))
     }
 }
 
@@ -1446,5 +1498,62 @@ mod tests {
         // And A's entries remain in memory.
         let state = tracker.state.read().await;
         assert!(state.completed.get("A").unwrap().contains(&100));
+    }
+
+    // ─── TrackerSnapshot tests ─────────────────────────────────────────
+
+    #[test]
+    fn snapshot_is_completed_basic() {
+        let snapshot = TrackerSnapshot {
+            completed: HashMap::from([("A".to_string(), HashSet::from([100, 200]))]),
+            failed: HashMap::new(),
+            pruned_up_to: None,
+        };
+        assert!(snapshot.is_completed("A", 100));
+        assert!(snapshot.is_completed("A", 200));
+        assert!(!snapshot.is_completed("A", 300));
+        assert!(!snapshot.is_completed("B", 100));
+    }
+
+    #[test]
+    fn snapshot_is_completed_with_pruning() {
+        let snapshot = TrackerSnapshot {
+            completed: HashMap::from([("A".to_string(), HashSet::from([300]))]),
+            failed: HashMap::new(),
+            pruned_up_to: Some(200),
+        };
+        assert!(snapshot.is_completed("A", 100)); // pruned
+        assert!(snapshot.is_completed("A", 200)); // pruned (at boundary)
+        assert!(snapshot.is_completed("A", 300)); // in completed set
+        assert!(!snapshot.is_completed("A", 400)); // neither
+        // Pruned ranges are completed for ALL handlers
+        assert!(snapshot.is_completed("B", 100));
+    }
+
+    #[test]
+    fn snapshot_is_failed() {
+        let snapshot = TrackerSnapshot {
+            completed: HashMap::new(),
+            failed: HashMap::from([("A".to_string(), HashSet::from([100]))]),
+            pruned_up_to: None,
+        };
+        assert!(snapshot.is_failed("A", 100));
+        assert!(!snapshot.is_failed("A", 200));
+        assert!(!snapshot.is_failed("B", 100));
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_item_building_captures_state() {
+        let tracker = CompletionTracker::new();
+        tracker.mark_completed("A", 100).await;
+        tracker.mark_completed("A", 200).await;
+        tracker.mark_failed("B", 300).await;
+
+        let snapshot = tracker.snapshot_for_item_building().await;
+        assert!(snapshot.is_completed("A", 100));
+        assert!(snapshot.is_completed("A", 200));
+        assert!(!snapshot.is_completed("A", 300));
+        assert!(snapshot.is_failed("B", 300));
+        assert!(!snapshot.is_failed("B", 100));
     }
 }
