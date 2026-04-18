@@ -150,7 +150,7 @@ async fn process_file(
             let n = client
                 .execute(
                     "INSERT INTO pools (
-                        chain_id, block_number, created_at, address,
+                        chain_id, block_height, created_at, address,
                         base_token, quote_token, is_token_0, type,
                         integrator, initializer, fee,
                         min_threshold, max_threshold,
